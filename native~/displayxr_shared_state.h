@@ -122,14 +122,7 @@ typedef struct DisplayXRState {
     uint32_t readback_height;
     volatile int readback_ready;
 
-    // Shared texture state (zero-copy preview)
-    void *shared_iosurface;          // IOSurfaceRef (macOS) — owned by native side
-    void *shared_d3d_handle;         // HANDLE (Windows) — shared D3D11 texture
-    uint32_t shared_texture_width;
-    uint32_t shared_texture_height;
-    volatile int shared_texture_ready;
-
-    // Editor mode flag: skip window auto-detection (use IOSurface instead)
+    // Editor mode flag: create own preview window instead of auto-detecting app window
     uint8_t editor_mode;
 
     // Viewport (window) size and screen position for window-relative Kooima

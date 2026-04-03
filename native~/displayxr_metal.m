@@ -1,124 +1,87 @@
 // Copyright 2024-2026, DisplayXR contributors
 // SPDX-License-Identifier: BSL-1.0
 //
-// IOSurface creation/destruction for zero-copy GPU texture sharing on macOS.
-// Unity's Metal context wraps the IOSurface via CreateExternalTexture on the C# side.
+// macOS Metal helpers for the hook chain path.
+// Preview window creation (editor Play Mode) and overlay view (built apps).
 
 #import <Metal/Metal.h>
 #import <AppKit/AppKit.h>
 #import <QuartzCore/CAMetalLayer.h>
-#include <IOSurface/IOSurface.h>
-#include <CoreFoundation/CoreFoundation.h>
 
 #include "displayxr_metal.h"
 #include "displayxr_shared_state.h"
 
-// BGRA FourCC as uint32_t: 'B'<<24 | 'G'<<16 | 'R'<<8 | 'A'
-#define PIXEL_FORMAT_BGRA 0x42475241
+// ============================================================================
+// Editor Play Mode: plugin-created preview window
+// ============================================================================
 
-static IOSurfaceRef s_shared_surface = NULL;
-static id<MTLTexture> s_shared_texture = nil;
+static NSWindow *s_preview_window = nil;
+static NSView *s_preview_view = nil;
 
-static void
-cf_dict_set_int(CFMutableDictionaryRef dict, CFStringRef key, int32_t value)
+void *
+displayxr_metal_create_preview_window(uint32_t width, uint32_t height)
 {
-	CFNumberRef num = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &value);
-	CFDictionarySetValue(dict, key, num);
-	CFRelease(num);
-}
+	displayxr_metal_destroy_preview_window();
 
-int
-displayxr_metal_create_shared_surface(uint32_t width, uint32_t height)
-{
-	// Release any existing surface
-	displayxr_metal_destroy_shared_surface();
+	dispatch_block_t create = ^{
+		NSRect frame = NSMakeRect(100, 100, width, height);
+		NSWindowStyleMask style = NSWindowStyleMaskTitled |
+		                          NSWindowStyleMaskClosable |
+		                          NSWindowStyleMaskResizable |
+		                          NSWindowStyleMaskMiniaturizable;
 
-	uint32_t bytes_per_element = 4; // BGRA8
-	uint32_t bytes_per_row = width * bytes_per_element;
-	uint32_t alloc_size = bytes_per_row * height;
+		s_preview_window = [[NSWindow alloc] initWithContentRect:frame
+		                                              styleMask:style
+		                                                backing:NSBackingStoreBuffered
+		                                                  defer:NO];
+		[s_preview_window setTitle:@"DisplayXR Preview"];
+		[s_preview_window setReleasedWhenClosed:NO];
 
-	CFMutableDictionaryRef props = CFDictionaryCreateMutable(
-		kCFAllocatorDefault, 0,
-		&kCFTypeDictionaryKeyCallBacks,
-		&kCFTypeDictionaryValueCallBacks);
+		s_preview_view = [[NSView alloc] initWithFrame:frame];
+		[s_preview_view setWantsLayer:YES];
+		[s_preview_window setContentView:s_preview_view];
 
-	cf_dict_set_int(props, kIOSurfaceWidth, (int32_t)width);
-	cf_dict_set_int(props, kIOSurfaceHeight, (int32_t)height);
-	cf_dict_set_int(props, kIOSurfaceBytesPerElement, (int32_t)bytes_per_element);
-	cf_dict_set_int(props, kIOSurfaceBytesPerRow, (int32_t)bytes_per_row);
-	cf_dict_set_int(props, kIOSurfaceAllocSize, (int32_t)alloc_size);
-	cf_dict_set_int(props, kIOSurfacePixelFormat, (int32_t)PIXEL_FORMAT_BGRA);
+		// Show without stealing keyboard focus from Unity
+		[s_preview_window orderFront:nil];
 
-	s_shared_surface = IOSurfaceCreate(props);
-	CFRelease(props);
+		fprintf(stderr, "[DisplayXR] Preview window created: %ux%u\n", width, height);
+	};
 
-	if (s_shared_surface == NULL) {
-		return 0;
-	}
-
-	// Create a Metal texture backed by the IOSurface.
-	// Unity's CreateExternalTexture needs a MTLTexture*, not an IOSurfaceRef.
-	id<MTLDevice> device = MTLCreateSystemDefaultDevice();
-	if (device != nil) {
-		MTLTextureDescriptor *desc = [MTLTextureDescriptor
-		    texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-		    width:width height:height mipmapped:NO];
-		desc.usage = MTLTextureUsageShaderRead;
-		desc.storageMode = MTLStorageModeShared;
-		s_shared_texture = [device newTextureWithDescriptor:desc
-		    iosurface:s_shared_surface plane:0];
-		if (s_shared_texture == nil) {
-			fprintf(stderr, "[DisplayXR] Failed to create MTLTexture from IOSurface\n");
-		}
+	if ([NSThread isMainThread]) {
+		create();
 	} else {
-		fprintf(stderr, "[DisplayXR] Failed to get default Metal device\n");
+		dispatch_sync(dispatch_get_main_queue(), create);
 	}
 
-	// Store in shared state
-	DisplayXRState *state = displayxr_get_state();
-	state->shared_iosurface = (void *)s_shared_surface;
-	state->shared_texture_width = width;
-	state->shared_texture_height = height;
-	state->shared_texture_ready = 1;
-
-	return 1;
+	return (__bridge void *)s_preview_view;
 }
 
 void
-displayxr_metal_destroy_shared_surface(void)
+displayxr_metal_destroy_preview_window(void)
 {
-	DisplayXRState *state = displayxr_get_state();
+	if (s_preview_window) {
+		dispatch_block_t close = ^{
+			[s_preview_window close];
+			s_preview_window = nil;
+			s_preview_view = nil;
+			fprintf(stderr, "[DisplayXR] Preview window destroyed\n");
+		};
 
-	s_shared_texture = nil; // ARC releases the Metal texture
-
-	if (s_shared_surface != NULL) {
-		CFRelease(s_shared_surface);
-		s_shared_surface = NULL;
+		if ([NSThread isMainThread]) {
+			close();
+		} else {
+			dispatch_sync(dispatch_get_main_queue(), close);
+		}
 	}
-
-	state->shared_iosurface = NULL;
-	state->shared_texture_width = 0;
-	state->shared_texture_height = 0;
-	state->shared_texture_ready = 0;
 }
 
-void *
-displayxr_metal_get_iosurface(void)
-{
-	return (void *)s_shared_surface;
-}
+// ============================================================================
+// Built apps: overlay NSView on top of Unity's window
+// ============================================================================
 
-void *
-displayxr_metal_get_texture(void)
-{
-	return (__bridge void *)s_shared_texture;
-}
-
-// ---------------------------------------------------------------------------
-// Overlay NSView — sits on top of Unity's contentView with its own CAMetalLayer.
-// Unity renders underneath (mirror blit); compositor renders on top via this layer.
+// Sits on top of Unity's contentView with its own CAMetalLayer.
+// Unity renders underneath; compositor renders on top via this layer.
 // hitTest: returns nil so all input passes through to Unity.
-// ---------------------------------------------------------------------------
 
 @interface DisplayXROverlayView : NSView
 @end
@@ -186,4 +149,3 @@ displayxr_get_app_main_view(void)
 		return NULL;
 	}
 }
-
