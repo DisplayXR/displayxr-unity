@@ -78,8 +78,8 @@ namespace DisplayXR
         internal static extern void displayxr_set_window_handle(IntPtr handle);
 
         /// <summary>
-        /// Set editor mode flag. When enabled, native code uses IOSurface/shared texture
-        /// instead of auto-detecting the window and creating an overlay.
+        /// Set editor mode flag. When enabled, native code creates its own preview
+        /// window instead of auto-detecting the app's window.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern void displayxr_set_editor_mode(int enabled);
@@ -141,26 +141,6 @@ namespace DisplayXR
             out int ready);
 
         /// <summary>
-        /// Create a shared GPU texture for zero-copy preview.
-        /// Returns IOSurfaceRef on macOS, HANDLE on Windows, or IntPtr.Zero if not supported.
-        /// </summary>
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr displayxr_create_shared_texture(uint width, uint height);
-
-        /// <summary>
-        /// Destroy the shared GPU texture resources.
-        /// </summary>
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_destroy_shared_texture();
-
-        /// <summary>
-        /// Get shared texture info (native pointer, dimensions, ready flag).
-        /// </summary>
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_get_shared_texture(
-            out IntPtr nativePtr, out uint width, out uint height, out int ready);
-
-        /// <summary>
         /// Kill xrPollEvent forwarding. Call before session/instance teardown.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
@@ -169,9 +149,6 @@ namespace DisplayXR
         // ====================================================================
         // Standalone preview session (bypasses Unity's OpenXR loader)
         // ====================================================================
-
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_standalone_set_unity_device(IntPtr unityNativeTex);
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int displayxr_standalone_start(
@@ -199,30 +176,6 @@ namespace DisplayXR
             out float lx, out float ly, out float lz,
             out float rx, out float ry, out float rz,
             out int isTracked);
-
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_standalone_get_shared_texture(
-            out IntPtr nativePtr, out uint width, out uint height, out int ready);
-
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_standalone_get_atlas_bridge_texture(
-            out IntPtr nativePtr, out uint width, out uint height);
-
-        /// <summary>
-        /// Set the canvas output rect for shared texture compositing (standalone session).
-        /// Tells the runtime where the content should be rendered within the IOSurface.
-        /// </summary>
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_standalone_set_canvas_rect(
-            int x, int y, uint w, uint h);
-
-        /// <summary>
-        /// Set the canvas output rect for shared texture compositing (play mode).
-        /// Tells the runtime where the content should be rendered within the shared texture.
-        /// </summary>
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_set_canvas_rect(
-            int x, int y, uint w, uint h);
 
         /// <summary>
         /// Get the display backing scale factor (Retina).

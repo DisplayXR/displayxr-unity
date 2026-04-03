@@ -1,8 +1,8 @@
 // Copyright 2024-2026, DisplayXR contributors
 // SPDX-License-Identifier: BSL-1.0
 //
-// IOSurface helper for the standalone preview session (macOS).
-// Separate from the hook chain's IOSurface to allow independent lifecycles.
+// Metal helpers for the standalone preview session (macOS).
+// Window creation and GPU blit for atlas → swapchain.
 
 #pragma once
 
@@ -12,18 +12,18 @@
 extern "C" {
 #endif
 
-/// Create a standalone IOSurface + MTLTexture for the preview session.
+/// Create a native NSWindow+NSView for the standalone preview session.
+/// The runtime will create a CAMetalLayer overlay on the view.
+/// @param width  Initial window width in pixels.
+/// @param height Initial window height in pixels.
 /// @return 1 on success, 0 on failure.
-int displayxr_sa_metal_create(uint32_t width, uint32_t height);
+int displayxr_sa_metal_create_window(uint32_t width, uint32_t height);
 
-/// Destroy the standalone IOSurface + MTLTexture.
-void displayxr_sa_metal_destroy(void);
+/// Destroy the preview window.
+void displayxr_sa_metal_destroy_window(void);
 
-/// Get the IOSurfaceRef for the standalone session.
-void *displayxr_sa_metal_get_iosurface(void);
-
-/// Get the MTLTexture* for Unity's CreateExternalTexture.
-void *displayxr_sa_metal_get_texture(void);
+/// Get the NSView* for the standalone session window binding.
+void *displayxr_sa_metal_get_view(void);
 
 /// Get (or lazily create) an MTLCommandQueue for the standalone session.
 /// Required for XrGraphicsBindingMetalKHR.
@@ -35,6 +35,20 @@ void *displayxr_sa_metal_get_command_queue(void);
 /// @param dst_tex Destination id<MTLTexture> (swapchain image).
 /// @return 1 on success, 0 on failure.
 int displayxr_sa_metal_blit(void *src_tex, void *dst_tex);
+
+/// Get the display backing scale factor (Retina).
+/// Returns 2.0 on macOS Retina, 1.0 on non-Retina.
+float displayxr_sa_metal_get_backing_scale(void);
+
+/// Query the preview window's current rect (backing pixels + screen position).
+/// Used to update canvas state for render tiling and window-relative Kooima.
+/// @param out_x    Screen x of window's content area (backing pixels).
+/// @param out_y    Screen y of window's content area (backing pixels).
+/// @param out_w    Width of window's content area (backing pixels).
+/// @param out_h    Height of window's content area (backing pixels).
+/// @return 1 if window exists, 0 otherwise.
+int displayxr_sa_metal_get_window_rect(int32_t *out_x, int32_t *out_y,
+                                        uint32_t *out_w, uint32_t *out_h);
 
 #ifdef __cplusplus
 }

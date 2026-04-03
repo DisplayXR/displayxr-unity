@@ -25,15 +25,9 @@ extern "C" {
 // Session lifecycle
 // ============================================================================
 
-/// (Windows only) Set Unity's D3D12 device for the standalone session.
-/// Must be called BEFORE displayxr_standalone_start().
-/// @param unity_native_tex A native texture pointer from Unity (ID3D12Resource*).
-///        The device is extracted via GetDevice(). Pass any RenderTexture.GetNativeTexturePtr().
-DISPLAYXR_EXPORT void displayxr_standalone_set_unity_device(void *unity_native_tex);
-
 /// Start a standalone OpenXR session for editor preview.
 /// Loads the runtime from the JSON manifest, creates instance/session,
-/// and begins compositing into a shared IOSurface.
+/// and opens a native preview window for compositor output.
 /// @param runtime_json_path Path to the OpenXR runtime JSON manifest.
 /// @return 1 on success, 0 on failure.
 DISPLAYXR_EXPORT int displayxr_standalone_start(const char *runtime_json_path);
@@ -140,24 +134,6 @@ DISPLAYXR_EXPORT void displayxr_standalone_get_eye_positions(
     float *lx, float *ly, float *lz,
     float *rx, float *ry, float *rz,
     int *is_tracked);
-
-/// Get the shared texture info from the standalone session.
-DISPLAYXR_EXPORT void displayxr_standalone_get_shared_texture(
-    void **native_ptr, uint32_t *width, uint32_t *height, int *ready);
-
-/// (Windows D3D12 only) Get the atlas bridge texture opened on Unity's device.
-/// C# uses Graphics.CopyTexture to copy the atlas RT into this each frame.
-DISPLAYXR_EXPORT void displayxr_standalone_get_atlas_bridge_texture(
-    void **native_ptr, uint32_t *width, uint32_t *height);
-
-/// Set the canvas output rect for shared texture compositing.
-/// Calls xrSetSharedTextureOutputRectEXT on the runtime session.
-/// @param x Left edge in client-area pixels.
-/// @param y Top edge in client-area pixels.
-/// @param w Canvas width in pixels.
-/// @param h Canvas height in pixels.
-DISPLAYXR_EXPORT void displayxr_standalone_set_canvas_rect(
-    int32_t x, int32_t y, uint32_t w, uint32_t h);
 
 /// Get the display backing scale factor (Retina).
 /// Returns 2.0 on macOS Retina, 1.0 on non-Retina or non-macOS.

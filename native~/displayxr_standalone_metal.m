@@ -1,115 +1,136 @@
 // Copyright 2024-2026, DisplayXR contributors
 // SPDX-License-Identifier: BSL-1.0
 //
-// IOSurface creation/destruction for the standalone preview session.
-// Independent from the hook chain's IOSurface (displayxr_metal.m).
+// Metal helpers for the standalone preview session (macOS).
+// Creates a native NSWindow for the runtime to composite into,
+// and provides GPU blit for atlas → swapchain.
 
 #import <Metal/Metal.h>
 #import <AppKit/AppKit.h>
-#include <IOSurface/IOSurface.h>
-#include <CoreFoundation/CoreFoundation.h>
 #include <stdio.h>
 
 #include "displayxr_standalone_metal.h"
 
-#define SA_PIXEL_FORMAT_BGRA 0x42475241
-
-static IOSurfaceRef s_sa_surface = NULL;
-static id<MTLTexture> s_sa_texture = nil;
+static NSWindow *s_sa_window = nil;
+static NSView *s_sa_view = nil;
 static id<MTLDevice> s_sa_device = nil;
 static id<MTLCommandQueue> s_sa_queue = nil;
 static id<MTLRenderPipelineState> s_sa_blit_pipeline = nil;
 static int s_sa_blit_log_once = 0;
 
-static void
-sa_cf_dict_set_int(CFMutableDictionaryRef dict, CFStringRef key, int32_t value)
-{
-	CFNumberRef num = CFNumberCreate(kCFAllocatorDefault, kCFNumberSInt32Type, &value);
-	CFDictionarySetValue(dict, key, num);
-	CFRelease(num);
-}
+// ============================================================================
+// Window creation/destruction
+// ============================================================================
 
 int
-displayxr_sa_metal_create(uint32_t width, uint32_t height)
+displayxr_sa_metal_create_window(uint32_t width, uint32_t height)
 {
-	displayxr_sa_metal_destroy();
+	displayxr_sa_metal_destroy_window();
 
-	uint32_t bpe = 4;
-	uint32_t bpr = width * bpe;
-	uint32_t alloc = bpr * height;
+	// Create on the main thread (AppKit requirement)
+	dispatch_block_t create = ^{
+		NSRect frame = NSMakeRect(100, 100, width, height);
+		NSWindowStyleMask style = NSWindowStyleMaskTitled |
+		                          NSWindowStyleMaskClosable |
+		                          NSWindowStyleMaskResizable |
+		                          NSWindowStyleMaskMiniaturizable;
 
-	CFMutableDictionaryRef props = CFDictionaryCreateMutable(
-		kCFAllocatorDefault, 0,
-		&kCFTypeDictionaryKeyCallBacks,
-		&kCFTypeDictionaryValueCallBacks);
+		s_sa_window = [[NSWindow alloc] initWithContentRect:frame
+		                                          styleMask:style
+		                                            backing:NSBackingStoreBuffered
+		                                              defer:NO];
+		[s_sa_window setTitle:@"DisplayXR Preview"];
+		[s_sa_window setReleasedWhenClosed:NO];
 
-	sa_cf_dict_set_int(props, kIOSurfaceWidth, (int32_t)width);
-	sa_cf_dict_set_int(props, kIOSurfaceHeight, (int32_t)height);
-	sa_cf_dict_set_int(props, kIOSurfaceBytesPerElement, (int32_t)bpe);
-	sa_cf_dict_set_int(props, kIOSurfaceBytesPerRow, (int32_t)bpr);
-	sa_cf_dict_set_int(props, kIOSurfaceAllocSize, (int32_t)alloc);
-	sa_cf_dict_set_int(props, kIOSurfacePixelFormat, (int32_t)SA_PIXEL_FORMAT_BGRA);
+		// Layer-backed view so the runtime can add a CAMetalLayer overlay
+		s_sa_view = [[NSView alloc] initWithFrame:frame];
+		[s_sa_view setWantsLayer:YES];
+		[s_sa_window setContentView:s_sa_view];
 
-	s_sa_surface = IOSurfaceCreate(props);
-	CFRelease(props);
+		// Show without stealing keyboard focus from Unity editor
+		[s_sa_window orderFront:nil];
 
-	if (!s_sa_surface) {
-		fprintf(stderr, "[DisplayXR-SA] Failed to create IOSurface\n");
-		return 0;
+		fprintf(stderr, "[DisplayXR-SA] Preview window created: %ux%u\n", width, height);
+	};
+
+	if ([NSThread isMainThread]) {
+		create();
+	} else {
+		dispatch_sync(dispatch_get_main_queue(), create);
 	}
 
-	if (!s_sa_device) {
-		s_sa_device = MTLCreateSystemDefaultDevice();
-	}
-	if (s_sa_device) {
-		MTLTextureDescriptor *desc = [MTLTextureDescriptor
-			texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm
-			width:width height:height mipmapped:NO];
-		desc.usage = MTLTextureUsageShaderRead;
-		desc.storageMode = MTLStorageModeShared;
-		s_sa_texture = [s_sa_device newTextureWithDescriptor:desc
-			iosurface:s_sa_surface plane:0];
-		if (!s_sa_texture) {
-			fprintf(stderr, "[DisplayXR-SA] Failed to create MTLTexture from IOSurface\n");
-		}
-	}
-
-	fprintf(stderr, "[DisplayXR-SA] IOSurface created: %ux%u\n", width, height);
-	return 1;
+	return (s_sa_window != nil) ? 1 : 0;
 }
 
 void
-displayxr_sa_metal_destroy(void)
+displayxr_sa_metal_destroy_window(void)
 {
 	s_sa_blit_pipeline = nil;
 	s_sa_blit_log_once = 0;
-	s_sa_texture = nil;
-	s_sa_queue = nil;
-	s_sa_device = nil;
-	if (s_sa_surface) {
-		CFRelease(s_sa_surface);
-		s_sa_surface = NULL;
+
+	if (s_sa_window) {
+		dispatch_block_t close = ^{
+			[s_sa_window close];
+			s_sa_window = nil;
+			s_sa_view = nil;
+			fprintf(stderr, "[DisplayXR-SA] Preview window destroyed\n");
+		};
+
+		if ([NSThread isMainThread]) {
+			close();
+		} else {
+			dispatch_sync(dispatch_get_main_queue(), close);
+		}
 	}
 }
 
 void *
-displayxr_sa_metal_get_iosurface(void)
+displayxr_sa_metal_get_view(void)
 {
-	return (void *)s_sa_surface;
-}
-
-void *
-displayxr_sa_metal_get_texture(void)
-{
-	return (__bridge void *)s_sa_texture;
+	return (__bridge void *)s_sa_view;
 }
 
 float
 displayxr_sa_metal_get_backing_scale(void)
 {
+	if (s_sa_window) {
+		return (float)[s_sa_window backingScaleFactor];
+	}
 	NSScreen *screen = [NSScreen mainScreen];
 	return screen ? (float)[screen backingScaleFactor] : 2.0f;
 }
+
+// ============================================================================
+// Window rect query
+// ============================================================================
+
+int
+displayxr_sa_metal_get_window_rect(int32_t *out_x, int32_t *out_y,
+                                    uint32_t *out_w, uint32_t *out_h)
+{
+	if (!s_sa_window || !s_sa_view) {
+		*out_x = *out_y = 0;
+		*out_w = *out_h = 0;
+		return 0;
+	}
+
+	// Content rect in screen coordinates (points)
+	NSRect frame = [s_sa_window frame];
+	NSRect content = [s_sa_window contentRectForFrameRect:frame];
+	CGFloat scale = [s_sa_window backingScaleFactor];
+
+	// Convert to backing pixels
+	*out_x = (int32_t)(content.origin.x * scale);
+	*out_y = (int32_t)(content.origin.y * scale);
+	*out_w = (uint32_t)(content.size.width * scale);
+	*out_h = (uint32_t)(content.size.height * scale);
+
+	return 1;
+}
+
+// ============================================================================
+// Metal command queue + blit
+// ============================================================================
 
 void *
 displayxr_sa_metal_get_command_queue(void)
