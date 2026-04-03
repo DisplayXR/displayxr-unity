@@ -490,16 +490,17 @@ hooked_xrGetSystemProperties(XrInstance instance, XrSystemId systemId, XrSystemP
 			        di->displayPixelWidth, di->displayPixelHeight,
 			        di->displaySizeMeters.width, di->displaySizeMeters.height);
 
+			// Editor mode: create a native preview window for the runtime.
+			// Built apps auto-detect the app's window in xrCreateSession.
 #if defined(__APPLE__)
-			// Create shared IOSurface now — before xrCreateSession reads it.
-			// Only in editor mode (IOSurface for zero-copy preview). Built apps
-			// render directly to the overlay CAMetalLayer, no IOSurface needed.
 			if (state->editor_mode &&
-			    state->shared_iosurface == nullptr &&
+			    state->window_handle == nullptr &&
 			    di->displayPixelWidth > 0 && di->displayPixelHeight > 0) {
-				if (displayxr_metal_create_shared_surface(
-				        di->displayPixelWidth, di->displayPixelHeight)) {
-					displayxr_log( "[DisplayXR] Shared IOSurface created: %ux%u\n",
+				void *view = displayxr_metal_create_preview_window(
+				    di->displayPixelWidth, di->displayPixelHeight);
+				if (view != nullptr) {
+					state->window_handle = view;
+					displayxr_log("[DisplayXR] Preview window created: %ux%u\n",
 					        di->displayPixelWidth, di->displayPixelHeight);
 				}
 			}
@@ -572,32 +573,30 @@ hooked_xrCreateSession(XrInstance instance, const XrSessionCreateInfo *createInf
 	// Inject window binding into the next chain.
 	{
 #if defined(__APPLE__)
-		// Create shared IOSurface if display info is available but surface wasn't created yet.
-		// Only in editor mode (IOSurface for zero-copy preview). Built apps auto-detect
-		// the window and render directly to the overlay CAMetalLayer.
+		// Editor mode: create preview window if not already done (fallback).
 		if (state->editor_mode &&
-		    state->shared_iosurface == nullptr && state->display_info.is_valid &&
+		    state->window_handle == nullptr && state->display_info.is_valid &&
 		    state->display_info.display_pixel_width > 0 &&
 		    state->display_info.display_pixel_height > 0) {
-			if (displayxr_metal_create_shared_surface(
-			        state->display_info.display_pixel_width,
-			        state->display_info.display_pixel_height)) {
-				displayxr_log( "[DisplayXR] Shared IOSurface created in xrCreateSession: %ux%u\n",
+			void *view = displayxr_metal_create_preview_window(
+			    state->display_info.display_pixel_width,
+			    state->display_info.display_pixel_height);
+			if (view != nullptr) {
+				state->window_handle = view;
+				displayxr_log("[DisplayXR] Preview window created in xrCreateSession: %ux%u\n",
 				        state->display_info.display_pixel_width,
 				        state->display_info.display_pixel_height);
 			}
 		}
 
-		// Auto-detect the app's main window and create an overlay view/HWND.
-		// Only for built apps (not editor mode) — the editor uses IOSurface
-		// for zero-copy preview and doesn't need window auto-detection.
+		// Built apps: auto-detect the app's main window and create an overlay view.
 		if (state->window_handle == nullptr && !state->editor_mode) {
 			void *view = displayxr_get_app_main_view();
 			if (view != nullptr) {
 				state->window_handle = view;
-				displayxr_log( "[DisplayXR] Auto-detected main window (overlay): %p\n", view);
+				displayxr_log("[DisplayXR] Auto-detected main window (overlay): %p\n", view);
 			} else {
-				displayxr_log( "[DisplayXR] No main window found — offscreen mode\n");
+				displayxr_log("[DisplayXR] No main window found — offscreen mode\n");
 			}
 		}
 #elif defined(_WIN32)
@@ -666,7 +665,7 @@ hooked_xrCreateSession(XrInstance instance, const XrSessionCreateInfo *createInf
 			mac_binding.viewHandle = state->window_handle;
 			mac_binding.readbackCallback = displayxr_readback_callback;
 			mac_binding.readbackUserdata = nullptr;
-			mac_binding.sharedIOSurface = state->shared_iosurface;
+			mac_binding.sharedIOSurface = nullptr;
 
 			displayxr_log( "[DisplayXR] Injecting cocoa window binding: viewHandle=%p, sharedIOSurface=%p\n",
 			        mac_binding.viewHandle, mac_binding.sharedIOSurface);
@@ -710,6 +709,17 @@ hooked_xrDestroySession(XrSession session)
 	displayxr_log( "[DisplayXR] xrDestroySession BEGIN session=%p (DEFERRED)\n", (void *)(uintptr_t)session);
 	s_session_alive = 0;
 	s_local_space = XR_NULL_HANDLE;
+
+	// Destroy the editor preview window (if created by the hook chain)
+#if defined(__APPLE__)
+	{
+		DisplayXRState *state = displayxr_get_state();
+		if (state->editor_mode) {
+			displayxr_metal_destroy_preview_window();
+			state->window_handle = nullptr;
+		}
+	}
+#endif
 
 	// Defer the real destroy — Unity calls xrPollEvent after xrDestroyInstance,
 	// and its dispatch trampolines reference runtime session/compositor objects.
@@ -1433,46 +1443,27 @@ displayxr_get_readback(uint8_t **pixels, uint32_t *width, uint32_t *height, int 
 	*ready = state->readback_ready;
 }
 
+// Deprecated: shared texture functions are no longer used.
+// The plugin now creates its own native window and passes it to the runtime.
 void *
 displayxr_create_shared_texture(uint32_t width, uint32_t height)
 {
-#if defined(__APPLE__)
-	if (displayxr_metal_create_shared_surface(width, height)) {
-		return displayxr_metal_get_texture();
-	}
-#endif
-	// Windows: deferred to a later PR
+	(void)width; (void)height;
 	return nullptr;
 }
 
 void
 displayxr_destroy_shared_texture(void)
 {
-#if defined(__APPLE__)
-	displayxr_metal_destroy_shared_surface();
-#endif
-	DisplayXRState *state = displayxr_get_state();
-	state->shared_iosurface = nullptr;
-	state->shared_d3d_handle = nullptr;
-	state->shared_texture_width = 0;
-	state->shared_texture_height = 0;
-	state->shared_texture_ready = 0;
 }
 
 void
 displayxr_get_shared_texture(void **native_ptr, uint32_t *width, uint32_t *height, int *ready)
 {
-	DisplayXRState *state = displayxr_get_state();
-#if defined(__APPLE__)
-	*native_ptr = displayxr_metal_get_texture();
-#elif defined(_WIN32)
-	*native_ptr = state->shared_d3d_handle;
-#else
 	*native_ptr = nullptr;
-#endif
-	*width = state->shared_texture_width;
-	*height = state->shared_texture_height;
-	*ready = state->shared_texture_ready;
+	*width = 0;
+	*height = 0;
+	*ready = 0;
 }
 
 void
