@@ -92,13 +92,70 @@ static PFN_xrReleaseSwapchainImage s_real_release_swapchain_image = nullptr;
 static ID3D11Device *s_d3d11_device = nullptr;
 static ID3D11DeviceContext *s_d3d11_context = nullptr;
 
-// --- D3D11 TYPELESS workaround attempts (issue #36) ---
-// Runtime creates TYPELESS textures per OpenXR D3D11 spec. Unity has geometry
-// corruption with TYPELESS but crashes with ANY texture pointer substitution
-// (proxy textures crash, COM wrappers crash). Both approaches cause GPU TDR
-// because D3D11 runtime rejects non-original objects in rendering calls.
-// Leaving textures as TYPELESS (corruption but no crash) and exploring
-// synchronization-based fixes instead.
+// --- D3D11 typed swapchain substitution (issue #91: TYPELESS compositor X-pattern) ---
+// Runtime creates R8G8B8A8_TYPELESS swapchain textures (OpenXR D3D11 spec). The
+// compositor cannot create valid SRVs from TYPELESS textures for lenticular weaving,
+// causing the X-pattern artifact in standalone D3D11 builds.
+//
+// Fix: for each color swapchain Unity creates, we silently create a parallel
+// R8G8B8A8_UNORM_SRGB swapchain. xrEnumerateSwapchainImages returns the typed
+// swapchain's images so Unity renders into typed textures. Acquire/wait/release are
+// mirrored on both swapchains. In xrEndFrame we temporarily replace the TYPELESS
+// swapchain handles with the typed ones so the compositor gets typed textures.
+// No CopyResource needed — Unity renders directly into the typed swapchain.
+
+#define DISPLAYXR_MAX_SC_SUBS 8
+
+struct D3D11ScSub {
+	XrSwapchain unity_sc;  // TYPELESS swapchain created by runtime
+	XrSwapchain typed_sc;  // R8G8B8A8_UNORM_SRGB swapchain we created
+	uint32_t width, height; // swapchain pixel dimensions (from xrCreateSwapchain)
+	bool active;
+	// SBS composite support
+	ID3D11Texture2D *typed_textures[8]; // textures from xrEnumerateSwapchainImages
+	uint32_t typed_img_count;
+	uint32_t current_idx;       // image index acquired this frame
+	bool release_pending;       // deferred: composite runs before actual typed_sc release
+};
+
+static D3D11ScSub s_sc_subs[DISPLAYXR_MAX_SC_SUBS];
+static int s_sc_sub_count = 0;
+
+static PFN_xrDestroySwapchain s_real_destroy_swapchain = nullptr;
+
+// SBS output swapchain: single 3840×1080 swapchain that we composite both eyes into.
+// Left eye occupies [0, width/2) and right eye occupies [width/2, width).
+// The compositor always splits at width/2 regardless of submitted rects.
+static XrSwapchain s_sbs_sc = XR_NULL_HANDLE;
+static ID3D11Texture2D *s_sbs_textures[8] = {};
+static uint32_t s_sbs_img_count = 0;
+
+static void d3d11_sub_cleanup_all()
+{
+	for (int i = 0; i < s_sc_sub_count; i++) {
+		if (s_sc_subs[i].active && s_sc_subs[i].typed_sc != XR_NULL_HANDLE) {
+			if (s_real_destroy_swapchain)
+				s_real_destroy_swapchain(s_sc_subs[i].typed_sc);
+			s_sc_subs[i].typed_sc = XR_NULL_HANDLE;
+		}
+		s_sc_subs[i].active = false;
+	}
+	s_sc_sub_count = 0;
+	if (s_sbs_sc != XR_NULL_HANDLE && s_real_destroy_swapchain) {
+		s_real_destroy_swapchain(s_sbs_sc);
+		s_sbs_sc = XR_NULL_HANDLE;
+	}
+	s_sbs_img_count = 0;
+}
+
+static D3D11ScSub *d3d11_sub_find(XrSwapchain unity_sc)
+{
+	for (int i = 0; i < s_sc_sub_count; i++) {
+		if (s_sc_subs[i].active && s_sc_subs[i].unity_sc == unity_sc)
+			return &s_sc_subs[i];
+	}
+	return nullptr;
+}
 #endif
 
 static XrInstance s_instance = XR_NULL_HANDLE;
@@ -709,6 +766,9 @@ hooked_xrDestroySession(XrSession session)
 	displayxr_log( "[DisplayXR] xrDestroySession BEGIN session=%p (DEFERRED)\n", (void *)(uintptr_t)session);
 	s_session_alive = 0;
 	s_local_space = XR_NULL_HANDLE;
+#if defined(_WIN32)
+	d3d11_sub_cleanup_all();
+#endif
 
 	// Destroy the editor preview window before deferring the session destroy.
 	// The compositor is being torn down so the window is no longer needed.
@@ -782,6 +842,142 @@ hooked_xrEndFrame(XrSession session, const XrFrameEndInfo *frameEndInfo)
 
 	DisplayXRState *state = displayxr_get_state();
 
+#if defined(_WIN32)
+	// D3D11 SBS composite (issue #91).
+	//
+	// The compositor always splits the submitted swapchain at width/2 for L/R,
+	// ignoring imageRect.  Unity submits two separate full-res eye swapchains
+	// (sc1=left, sc2=right), each at the full swapchain width — the compositor
+	// treats sc1 as SBS and routes its left half to L eye and right half to R eye,
+	// producing the X-pattern.
+	//
+	// Fix: create one 2×-wide SBS output swapchain (s_sbs_sc) and composite both
+	// eyes into it (left eye in left half, right eye in right half).  Release the
+	// typed_sc swapchains (deferred from xrReleaseSwapchainImage so we can still
+	// read them here), then submit s_sbs_sc with half-width rects for each view.
+	struct EFPatch {
+		XrCompositionLayerProjectionView *view;
+		XrSwapchain orig_sc;
+		XrRect2Di orig_rect;
+	};
+	EFPatch ef_patches[8]; int ef_npatch = 0;
+	if (s_sc_sub_count > 0 && frameEndInfo != nullptr && frameEndInfo->layers != nullptr) {
+		for (uint32_t i = 0; i < frameEndInfo->layerCount && ef_npatch < 8; i++) {
+			const XrCompositionLayerBaseHeader *hdr = frameEndInfo->layers[i];
+			if (!hdr || hdr->type != XR_TYPE_COMPOSITION_LAYER_PROJECTION) continue;
+			const XrCompositionLayerProjection *proj = (const XrCompositionLayerProjection*)hdr;
+			if (!proj->views || proj->viewCount != 2) continue;
+			XrCompositionLayerProjectionView *views = (XrCompositionLayerProjectionView*)proj->views;
+
+			D3D11ScSub *sub1 = d3d11_sub_find(views[0].subImage.swapchain); // left eye
+			D3D11ScSub *sub2 = d3d11_sub_find(views[1].subImage.swapchain); // right eye
+			if (!sub1 || !sub2 || sub1 == sub2) continue;
+
+			uint32_t eye_w = sub1->width;
+			uint32_t eye_h = sub1->height;
+			uint32_t sbs_w = eye_w * 2; // 3840 when eye_w=1920
+
+			// Lazily create the SBS output swapchain on first xrEndFrame.
+			if (s_sbs_sc == XR_NULL_HANDLE && s_real_create_swapchain) {
+				XrSwapchainCreateInfo sbs_info = {};
+				sbs_info.type            = XR_TYPE_SWAPCHAIN_CREATE_INFO;
+				sbs_info.format          = 29; // DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+				sbs_info.width           = sbs_w;
+				sbs_info.height          = eye_h;
+				sbs_info.sampleCount     = 1;
+				sbs_info.faceCount       = 1;
+				sbs_info.arraySize       = 1;
+				sbs_info.mipCount        = 1;
+				sbs_info.usageFlags      = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT
+				                         | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+				XrResult sr = s_real_create_swapchain(session, &sbs_info, &s_sbs_sc);
+				if (XR_SUCCEEDED(sr) && s_real_enumerate_swapchain_images) {
+					uint32_t cnt = 0;
+					s_real_enumerate_swapchain_images(s_sbs_sc, 0, &cnt, nullptr);
+					if (cnt > 0 && cnt <= 8) {
+						XrSwapchainImageD3D11KHR imgs[8] = {};
+						for (uint32_t k = 0; k < cnt; k++)
+							imgs[k].type = XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR;
+						s_real_enumerate_swapchain_images(
+						    s_sbs_sc, cnt, &cnt,
+						    (XrSwapchainImageBaseHeader *)imgs);
+						s_sbs_img_count = cnt;
+						for (uint32_t k = 0; k < cnt; k++)
+							s_sbs_textures[k] = imgs[k].texture;
+					}
+					displayxr_log("[DisplayXR] SBS swapchain created: sc=%p %ux%u imgs=%u\n",
+					              (void *)(uintptr_t)s_sbs_sc, sbs_w, eye_h, s_sbs_img_count);
+				} else {
+					displayxr_log("[DisplayXR] SBS swapchain creation FAILED: %d\n", (int)sr);
+				}
+			}
+			if (s_sbs_sc == XR_NULL_HANDLE) continue;
+
+			// Acquire + wait SBS image.
+			uint32_t sbs_idx = 0;
+			XrSwapchainImageAcquireInfo acq = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
+			XrSwapchainImageWaitInfo    wai = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
+			wai.timeout = XR_INFINITE_DURATION;
+			s_real_acquire_swapchain_image(s_sbs_sc, &acq, &sbs_idx);
+			s_real_wait_swapchain_image(s_sbs_sc, &wai);
+
+			// Composite: copy full left eye → SBS left half, right eye → SBS right half.
+			ID3D11Texture2D *sbs_tex  = (sbs_idx < s_sbs_img_count) ? s_sbs_textures[sbs_idx] : nullptr;
+			ID3D11Texture2D *left_tex = (sub1->current_idx < sub1->typed_img_count)
+			                          ? sub1->typed_textures[sub1->current_idx] : nullptr;
+			ID3D11Texture2D *right_tex = (sub2->current_idx < sub2->typed_img_count)
+			                          ? sub2->typed_textures[sub2->current_idx] : nullptr;
+			if (sbs_tex && left_tex && right_tex && s_d3d11_context) {
+				D3D11_BOX eye_box = { 0, 0, 0, eye_w, eye_h, 1 };
+				s_d3d11_context->CopySubresourceRegion(sbs_tex, 0, 0,     0, 0, left_tex,  0, &eye_box);
+				s_d3d11_context->CopySubresourceRegion(sbs_tex, 0, eye_w, 0, 0, right_tex, 0, &eye_box);
+				s_d3d11_context->Flush();
+			}
+
+			// Release deferred typed swapchains.
+			XrSwapchainImageReleaseInfo rel = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+			for (int si = 0; si < s_sc_sub_count; si++) {
+				if (s_sc_subs[si].active && s_sc_subs[si].release_pending) {
+					s_real_release_swapchain_image(s_sc_subs[si].typed_sc, &rel);
+					s_sc_subs[si].release_pending = false;
+				}
+			}
+			// Release SBS image.
+			s_real_release_swapchain_image(s_sbs_sc, &rel);
+
+			// Patch both views to reference s_sbs_sc with correct half-width rects.
+			for (uint32_t v = 0; v < 2 && ef_npatch < 8; v++) {
+				EFPatch &p  = ef_patches[ef_npatch++];
+				p.view      = &views[v];
+				p.orig_sc   = views[v].subImage.swapchain;
+				p.orig_rect = views[v].subImage.imageRect;
+				views[v].subImage.swapchain              = s_sbs_sc;
+				views[v].subImage.imageRect.offset.x     = (int32_t)(v * eye_w);
+				views[v].subImage.imageRect.offset.y     = 0;
+				views[v].subImage.imageRect.extent.width  = (int32_t)eye_w;
+				views[v].subImage.imageRect.extent.height = (int32_t)eye_h;
+			}
+
+			static int s_sub_log = 0;
+			if (s_sub_log++ < 4) {
+				displayxr_log("[DisplayXR] xrEndFrame: SBS composite OK"
+				              " (eye=%ux%u sbs=%ux%u sbs_tex=%p L=%p R=%p)\n",
+				              eye_w, eye_h, sbs_w, eye_h,
+				              (void *)sbs_tex, (void *)left_tex, (void *)right_tex);
+			}
+		}
+
+		// Release any deferred typed swapchains not handled above.
+		XrSwapchainImageReleaseInfo rel = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+		for (int si = 0; si < s_sc_sub_count; si++) {
+			if (s_sc_subs[si].active && s_sc_subs[si].release_pending) {
+				s_real_release_swapchain_image(s_sc_subs[si].typed_sc, &rel);
+				s_sc_subs[si].release_pending = false;
+			}
+		}
+	}
+#endif
+
 	// Count active window-space layers
 	int active_layers = 0;
 	for (int i = 0; i < DISPLAYXR_MAX_WINDOW_LAYERS; i++) {
@@ -790,10 +986,11 @@ hooked_xrEndFrame(XrSession session, const XrFrameEndInfo *frameEndInfo)
 		}
 	}
 
+	XrResult ef_result;
 	if (active_layers == 0) {
 		// No overlay layers — pass through
-		return s_real_end_frame(session, frameEndInfo);
-	}
+		ef_result = s_real_end_frame(session, frameEndInfo);
+	} else {
 
 	// Build extended layer array: original layers + window-space layers
 	uint32_t total = frameEndInfo->layerCount + (uint32_t)active_layers;
@@ -835,9 +1032,18 @@ hooked_xrEndFrame(XrSession session, const XrFrameEndInfo *frameEndInfo)
 	modified.layerCount = total;
 	modified.layers = layers;
 
-	XrResult result = s_real_end_frame(session, &modified);
+	ef_result = s_real_end_frame(session, &modified);
 	delete[] layers;
-	return result;
+	}
+
+#if defined(_WIN32)
+	// Restore original swapchain handles and rects in projection views.
+	for (int i = 0; i < ef_npatch; i++) {
+		ef_patches[i].view->subImage.swapchain = ef_patches[i].orig_sc;
+		ef_patches[i].view->subImage.imageRect = ef_patches[i].orig_rect;
+	}
+#endif
+	return ef_result;
 }
 
 
@@ -914,6 +1120,30 @@ hooked_xrCreateSwapchain(XrSession session,
 	if (XR_SUCCEEDED(result)) {
 		displayxr_log( "[DisplayXR] xrCreateSwapchain: OK swapchain=%p\n",
 		        (void *)(uintptr_t)*swapchain);
+#if defined(_WIN32)
+		// D3D11: create a parallel R8G8B8A8_UNORM_SRGB swapchain so the compositor
+		// receives typed textures in xrEndFrame (TYPELESS → compositor X-pattern).
+		if (s_d3d11_device != nullptr &&
+		    (createInfo->usageFlags & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT) &&
+		    s_sc_sub_count < DISPLAYXR_MAX_SC_SUBS) {
+			XrSwapchainCreateInfo typed_info = *createInfo;
+			typed_info.format = 29; // DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+			XrSwapchain typed_sc = XR_NULL_HANDLE;
+			XrResult tr = s_real_create_swapchain(session, &typed_info, &typed_sc);
+			if (XR_SUCCEEDED(tr)) {
+				D3D11ScSub &sub = s_sc_subs[s_sc_sub_count++];
+				sub.unity_sc = *swapchain;
+				sub.typed_sc = typed_sc;
+				sub.width    = createInfo->width;
+				sub.height   = createInfo->height;
+				sub.active   = true;
+				displayxr_log("[DisplayXR] Typed swapchain paired: unity=%p typed=%p\n",
+				              (void *)(uintptr_t)*swapchain, (void *)(uintptr_t)typed_sc);
+			} else {
+				displayxr_log("[DisplayXR] Typed swapchain create FAILED: result=%d\n", tr);
+			}
+		}
+#endif
 	} else {
 		displayxr_log( "[DisplayXR] xrCreateSwapchain: FAILED result=%d\n", result);
 	}
@@ -926,6 +1156,36 @@ hooked_xrEnumerateSwapchainImages(XrSwapchain swapchain,
                                    uint32_t *imageCountOutput,
                                    XrSwapchainImageBaseHeader *images)
 {
+#if defined(_WIN32)
+	// D3D11 typed swapchain substitution: route to typed_sc so Unity gets
+	// R8G8B8A8_UNORM_SRGB textures it can create valid RTVs from.
+	D3D11ScSub *sub = d3d11_sub_find(swapchain);
+	if (sub != nullptr) {
+		XrResult result = s_real_enumerate_swapchain_images(
+		    sub->typed_sc, imageCapacityInput, imageCountOutput, images);
+		if (XR_SUCCEEDED(result) && images != nullptr && imageCountOutput != nullptr) {
+			displayxr_log("[DisplayXR] xrEnumerateSwapchainImages: unity_sc=%p → typed_sc=%p count=%u\n",
+			              (void *)(uintptr_t)swapchain,
+			              (void *)(uintptr_t)sub->typed_sc,
+			              *imageCountOutput);
+			if (images->type == XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR) {
+				XrSwapchainImageD3D11KHR *d3d = (XrSwapchainImageD3D11KHR *)images;
+				uint32_t n = *imageCountOutput < 8 ? *imageCountOutput : 8;
+				sub->typed_img_count = n;
+				for (uint32_t i = 0; i < n; i++) {
+					sub->typed_textures[i] = d3d[i].texture;
+					if (d3d[i].texture) {
+						D3D11_TEXTURE2D_DESC desc = {};
+						d3d[i].texture->GetDesc(&desc);
+						displayxr_log("  typed[%u] tex=%p fmt=%u\n", i, (void *)d3d[i].texture, desc.Format);
+					}
+				}
+			}
+		}
+		return result;
+	}
+#endif
+
 	XrResult result = s_real_enumerate_swapchain_images(swapchain, imageCapacityInput,
 	                                                    imageCountOutput, images);
 	if (XR_SUCCEEDED(result) && images != nullptr && imageCountOutput != nullptr) {
@@ -933,7 +1193,6 @@ hooked_xrEnumerateSwapchainImages(XrSwapchain swapchain,
 		        (void *)(uintptr_t)swapchain, *imageCountOutput, (unsigned)images->type);
 
 #if defined(_WIN32)
-		// D3D11: stride is sizeof(XrSwapchainImageD3D11KHR), query texture descriptors
 		if (images->type == XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR) {
 			XrSwapchainImageD3D11KHR *d3d_images = (XrSwapchainImageD3D11KHR *)images;
 			for (uint32_t i = 0; i < *imageCountOutput; i++) {
@@ -943,37 +1202,19 @@ hooked_xrEnumerateSwapchainImages(XrSwapchain swapchain,
 					D3D11_TEXTURE2D_DESC desc = {};
 					tex->GetDesc(&desc);
 					displayxr_log( "\n    D3D11: %ux%u fmt=%u bindFlags=0x%x "
-					        "usage=%u miscFlags=0x%x cpuAccess=0x%x "
-					        "mips=%u arrays=%u samples=%u",
+					        "miscFlags=0x%x",
 					        desc.Width, desc.Height,
 					        (unsigned)desc.Format,
 					        (unsigned)desc.BindFlags,
-					        (unsigned)desc.Usage,
-					        (unsigned)desc.MiscFlags,
-					        (unsigned)desc.CPUAccessFlags,
-					        desc.MipLevels, desc.ArraySize,
-					        desc.SampleDesc.Count);
-					// Annotate bind flags
-					if (desc.BindFlags & D3D11_BIND_RENDER_TARGET)
-						displayxr_log( " [RT]");
-					if (desc.BindFlags & D3D11_BIND_SHADER_RESOURCE)
-						displayxr_log( " [SRV]");
-					if (desc.BindFlags & D3D11_BIND_UNORDERED_ACCESS)
-						displayxr_log( " [UAV]");
-					// Annotate misc flags
-					if (desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED)
-						displayxr_log( " [SHARED]");
-					if (desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_NTHANDLE)
-						displayxr_log( " [SHARED_NTHANDLE]");
-					if (desc.MiscFlags & D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX)
-						displayxr_log( " [KEYED_MUTEX]");
+					        (unsigned)desc.MiscFlags);
+					if (desc.BindFlags & D3D11_BIND_RENDER_TARGET)  displayxr_log( " [RT]");
+					if (desc.BindFlags & D3D11_BIND_SHADER_RESOURCE) displayxr_log( " [SRV]");
 				}
 				displayxr_log( "\n");
 			}
 		} else
 #endif
 		{
-			// Generic fallback: just log type for each image
 			for (uint32_t i = 0; i < *imageCountOutput; i++) {
 				displayxr_log( "  image[%u] type=%u\n", i, (unsigned)images[i].type);
 			}
@@ -987,6 +1228,24 @@ hooked_xrAcquireSwapchainImage(XrSwapchain swapchain,
                                 const XrSwapchainImageAcquireInfo *acquireInfo,
                                 uint32_t *index)
 {
+#if defined(_WIN32)
+	// D3D11: acquire from typed_sc (Unity renders into it) and unity_sc (keep state sane).
+	D3D11ScSub *sub = d3d11_sub_find(swapchain);
+	if (sub != nullptr) {
+		XrResult result = s_real_acquire_swapchain_image(sub->typed_sc, acquireInfo, index);
+		if (XR_SUCCEEDED(result) && index)
+			sub->current_idx = *index;
+		uint32_t dummy = 0;
+		s_real_acquire_swapchain_image(swapchain, acquireInfo, &dummy);
+		static int s_acq_count = 0;
+		if (s_acq_count < 6 || s_acq_count % 120 == 0)
+			displayxr_log("[DisplayXR] xrAcquireSwapchainImage: unity=%p typed=%p typed_idx=%u\n",
+			              (void *)(uintptr_t)swapchain, (void *)(uintptr_t)sub->typed_sc,
+			              index ? *index : 0xFFFFFFFF);
+		s_acq_count++;
+		return result;
+	}
+#endif
 	XrResult result = s_real_acquire_swapchain_image(swapchain, acquireInfo, index);
 	// Log first few acquires per swapchain, then every 120th frame
 	static int s_acq_count = 0;
@@ -1004,6 +1263,13 @@ static XrResult XRAPI_CALL
 hooked_xrWaitSwapchainImage(XrSwapchain swapchain,
                              const XrSwapchainImageWaitInfo *waitInfo)
 {
+#if defined(_WIN32)
+	D3D11ScSub *sub = d3d11_sub_find(swapchain);
+	if (sub != nullptr) {
+		s_real_wait_swapchain_image(sub->typed_sc, waitInfo);
+		return s_real_wait_swapchain_image(swapchain, waitInfo);
+	}
+#endif
 	XrResult result = s_real_wait_swapchain_image(swapchain, waitInfo);
 	static int s_wait_count = 0;
 	if (s_wait_count < 6 || s_wait_count % 120 == 0) {
@@ -1021,14 +1287,20 @@ hooked_xrReleaseSwapchainImage(XrSwapchain swapchain,
                                 const XrSwapchainImageReleaseInfo *releaseInfo)
 {
 #if defined(_WIN32)
-	// D3D11 GPU sync: flush all pending commands before the compositor reads.
-	// Unity's render thread may not have finished submitting draw commands when
-	// the main thread calls xrReleaseSwapchainImage. Without this, the compositor
-	// reads a partially-rendered texture → missing faces, distorted geometry.
-	// RenderDoc serializes execution and masks this issue.
-	if (s_d3d11_context != nullptr) {
-		s_d3d11_context->Flush();
+	D3D11ScSub *sub = d3d11_sub_find(swapchain);
+	if (sub != nullptr) {
+		// Flush so Unity's render commands reach the GPU before we composite.
+		if (s_d3d11_context != nullptr)
+			s_d3d11_context->Flush();
+		// Defer typed_sc release: we still need to write into it (SBS composite)
+		// inside hooked_xrEndFrame before handing it to the compositor.
+		sub->release_pending = true;
+		// Release unity_sc now (we never rendered into it, just keeping state sane).
+		return s_real_release_swapchain_image(swapchain, releaseInfo);
 	}
+	// Non-substituted swapchain: original flush-and-release behavior.
+	if (s_d3d11_context != nullptr)
+		s_d3d11_context->Flush();
 #endif
 
 	static int s_rel_count = 0;
@@ -1075,6 +1347,8 @@ hooked_xrDestroyInstance(XrInstance instance)
 	s_real_wait_swapchain_image = nullptr;
 	s_real_release_swapchain_image = nullptr;
 #if defined(_WIN32)
+	s_real_destroy_swapchain = nullptr;
+	d3d11_sub_cleanup_all();
 	if (s_d3d11_context) { s_d3d11_context->Release(); s_d3d11_context = nullptr; }
 	s_d3d11_device = nullptr; // Not owned by us — don't Release
 #endif
@@ -1197,6 +1471,9 @@ displayxr_hook_xrGetInstanceProcAddr(XrInstance instance, const char *name, PFN_
 	else if (strcmp(name, "xrEnumerateSwapchainFormats") == 0) {
 		s_real_enumerate_swapchain_formats = (PFN_xrEnumerateSwapchainFormats)*function;
 		*function = (PFN_xrVoidFunction)hooked_xrEnumerateSwapchainFormats;
+	} else if (strcmp(name, "xrDestroySwapchain") == 0) {
+		s_real_destroy_swapchain = (PFN_xrDestroySwapchain)*function;
+		// No hook needed — just capture the pointer for typed swapchain cleanup.
 	} else if (strcmp(name, "xrCreateSwapchain") == 0) {
 		s_real_create_swapchain = (PFN_xrCreateSwapchain)*function;
 		*function = (PFN_xrVoidFunction)hooked_xrCreateSwapchain;
