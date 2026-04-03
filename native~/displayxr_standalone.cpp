@@ -155,13 +155,7 @@ typedef struct StandaloneState {
 	ID3D12Fence *d3d12_fence;
 	HANDLE d3d12_fence_event;
 	UINT64 d3d12_fence_value;
-	ID3D12Resource *d3d12_shared_texture;  // On our device
-	HANDLE d3d12_shared_handle;            // DXGI shared handle (cross-device)
-	ID3D12Resource *d3d12_unity_shared;    // Same texture opened on Unity's device
-	// Atlas bridge: shared texture for cross-device atlas blit
-	ID3D12Resource *d3d12_atlas_bridge;       // On our device, SHARED
-	HANDLE d3d12_atlas_bridge_handle;         // DXGI shared handle
-	ID3D12Resource *d3d12_unity_atlas_bridge; // Opened on Unity's device
+	HWND preview_hwnd;                     // Plugin-owned preview window
 #endif
 
 	XrInstance instance;
@@ -187,10 +181,6 @@ typedef struct StandaloneState {
 	float fov_override; // half_tan_vfov for camera-centric
 	XrPosef display_pose;
 	int display_pose_set;
-
-	uint32_t tex_width;
-	uint32_t tex_height;
-	volatile int tex_ready;
 
 	// Single atlas swapchain (all views tiled into one texture)
 	SASwapchain atlas;
@@ -507,11 +497,6 @@ get_render_tiling(const XrDisplayRenderingModeInfoEXT *mode,
 }
 
 
-#if defined(_WIN32)
-// Forward declaration — defined in the public API section below.
-static ID3D12Device *s_unity_d3d12_device;
-#endif
-
 // ============================================================================
 // Swapchain management (single atlas)
 // ============================================================================
@@ -618,51 +603,6 @@ create_atlas_swapchain(void)
 	        atlas_w, atlas_h, count);
 
 	s_sa.atlas_created = 1;
-
-#if defined(_WIN32)
-	// Create atlas bridge shared texture (same dimensions as swapchain atlas).
-	// This bridges Unity's device and our device for cross-device atlas blit.
-	if (s_unity_d3d12_device && s_sa.d3d12_device) {
-		D3D12_HEAP_PROPERTIES heap = {};
-		heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-
-		D3D12_RESOURCE_DESC bd = {};
-		bd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-		bd.Width = atlas_w;
-		bd.Height = atlas_h;
-		bd.DepthOrArraySize = 1;
-		bd.MipLevels = 1;
-		bd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-		bd.SampleDesc.Count = 1;
-		bd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-		bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-
-		HRESULT hr = s_sa.d3d12_device->CreateCommittedResource(
-			&heap, D3D12_HEAP_FLAG_SHARED, &bd,
-			D3D12_RESOURCE_STATE_COMMON, NULL,
-			__uuidof(ID3D12Resource), (void **)&s_sa.d3d12_atlas_bridge);
-		if (FAILED(hr)) {
-			fprintf(stderr, "[DisplayXR-SA] Atlas bridge CreateCommittedResource failed: 0x%08lx\n", hr);
-		} else {
-			hr = s_sa.d3d12_device->CreateSharedHandle(
-				s_sa.d3d12_atlas_bridge, NULL, GENERIC_ALL, NULL,
-				&s_sa.d3d12_atlas_bridge_handle);
-			if (SUCCEEDED(hr) && s_sa.d3d12_atlas_bridge_handle) {
-				hr = s_unity_d3d12_device->OpenSharedHandle(
-					s_sa.d3d12_atlas_bridge_handle,
-					__uuidof(ID3D12Resource), (void **)&s_sa.d3d12_unity_atlas_bridge);
-				if (SUCCEEDED(hr) && s_sa.d3d12_unity_atlas_bridge) {
-					fprintf(stderr, "[DisplayXR-SA] Atlas bridge: %ux%u, handle=%p, unity_res=%p\n",
-					        atlas_w, atlas_h, s_sa.d3d12_atlas_bridge_handle,
-					        (void *)s_sa.d3d12_unity_atlas_bridge);
-				} else {
-					fprintf(stderr, "[DisplayXR-SA] Atlas bridge OpenSharedHandle failed: 0x%08lx\n", hr);
-				}
-			}
-		}
-	}
-#endif
-
 	return 1;
 }
 
@@ -681,47 +621,6 @@ destroy_atlas_swapchain(void)
 // Public API: Session lifecycle
 // ============================================================================
 
-#if defined(_WIN32)
-// Unity's D3D12 device — forward-declared above, initialized here.
-// Extracted from a native texture pointer via GetDevice().
-// Set by C# before calling displayxr_standalone_start().
-// (declaration is above create_atlas_swapchain which uses it)
-#endif
-
-void
-displayxr_standalone_set_unity_device(void *unity_native_tex)
-{
-#if defined(_WIN32)
-	if (!unity_native_tex) {
-		fprintf(stderr, "[DisplayXR-SA] set_unity_device: null texture\n");
-		return;
-	}
-	fprintf(stderr, "[DisplayXR-SA] set_unity_device: native tex ptr=%p\n", unity_native_tex);
-
-	// IUnknown::QueryInterface to verify this is actually an ID3D12Resource
-	// before calling GetDevice. This avoids crashing on D3D11 pointers.
-	IUnknown *unk = (IUnknown *)unity_native_tex;
-	ID3D12Resource *res = NULL;
-	HRESULT hr = unk->QueryInterface(__uuidof(ID3D12Resource), (void **)&res);
-	if (FAILED(hr) || !res) {
-		fprintf(stderr, "[DisplayXR-SA] Texture is not an ID3D12Resource (hr=0x%08lx). "
-		        "Unity may be using D3D11 — set Graphics API to Direct3D12.\n", hr);
-		return;
-	}
-
-	ID3D12Device *dev = NULL;
-	hr = res->GetDevice(__uuidof(ID3D12Device), (void **)&dev);
-	res->Release(); // Release the QI ref
-	if (SUCCEEDED(hr) && dev) {
-		s_unity_d3d12_device = dev;
-		fprintf(stderr, "[DisplayXR-SA] Using Unity's D3D12 device: %p\n", (void *)dev);
-	} else {
-		fprintf(stderr, "[DisplayXR-SA] GetDevice failed: hr=0x%08lx\n", hr);
-	}
-#else
-	(void)unity_native_tex;
-#endif
-}
 
 int
 displayxr_standalone_start(const char *runtime_json_path)
@@ -1029,83 +928,21 @@ displayxr_standalone_start(const char *runtime_json_path)
 		        display_info_ext.displaySizeMeters.width, display_info_ext.displaySizeMeters.height);
 	}
 
-	// --- Step 7: Create shared texture ---
+	// --- Step 7: Create native preview window ---
 #if defined(__APPLE__)
 	if (s_sa.display_info.is_valid &&
 	    s_sa.display_info.display_pixel_width > 0 &&
 	    s_sa.display_info.display_pixel_height > 0) {
-		if (!displayxr_sa_metal_create(s_sa.display_info.display_pixel_width,
-		                                s_sa.display_info.display_pixel_height)) {
-			fprintf(stderr, "[DisplayXR-SA] IOSurface creation failed\n");
+		if (!displayxr_sa_metal_create_window(s_sa.display_info.display_pixel_width,
+		                                       s_sa.display_info.display_pixel_height)) {
+			fprintf(stderr, "[DisplayXR-SA] Preview window creation failed\n");
 			displayxr_standalone_stop();
 			return 0;
 		}
-		s_sa.tex_width = s_sa.display_info.display_pixel_width;
-		s_sa.tex_height = s_sa.display_info.display_pixel_height;
-		s_sa.tex_ready = 1;
 	}
 #elif defined(_WIN32)
-	// --- Step 7: Create D3D12 shared texture ---
-	if (s_sa.display_info.is_valid &&
-	    s_sa.display_info.display_pixel_width > 0 &&
-	    s_sa.display_info.display_pixel_height > 0)
-	{
-		D3D12_HEAP_PROPERTIES heap = {};
-		heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-
-		D3D12_RESOURCE_DESC td = {};
-		td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-		td.Width = s_sa.display_info.display_pixel_width;
-		td.Height = s_sa.display_info.display_pixel_height;
-		td.DepthOrArraySize = 1;
-		td.MipLevels = 1;
-		td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-		td.SampleDesc.Count = 1;
-		td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-		td.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-
-		HRESULT hr = s_sa.d3d12_device->CreateCommittedResource(
-			&heap, D3D12_HEAP_FLAG_SHARED, &td,
-			D3D12_RESOURCE_STATE_COMMON, NULL,
-			__uuidof(ID3D12Resource), (void **)&s_sa.d3d12_shared_texture);
-		if (FAILED(hr)) {
-			fprintf(stderr, "[DisplayXR-SA] CreateCommittedResource (shared) failed: 0x%08lx\n", hr);
-			displayxr_standalone_stop();
-			return 0;
-		}
-
-		hr = s_sa.d3d12_device->CreateSharedHandle(
-			s_sa.d3d12_shared_texture, NULL, GENERIC_ALL, NULL,
-			&s_sa.d3d12_shared_handle);
-		if (FAILED(hr)) {
-			fprintf(stderr, "[DisplayXR-SA] CreateSharedHandle failed: 0x%08lx\n", hr);
-			displayxr_standalone_stop();
-			return 0;
-		}
-
-		s_sa.tex_width = (uint32_t)td.Width;
-		s_sa.tex_height = td.Height;
-		fprintf(stderr, "[DisplayXR-SA] D3D12 shared texture: %ux%u, handle=%p\n",
-		        (unsigned)td.Width, td.Height, s_sa.d3d12_shared_handle);
-
-		// Open the shared texture on Unity's device so C# can wrap it
-		// with CreateExternalTexture (needs an ID3D12Resource* on Unity's device).
-		if (s_unity_d3d12_device && s_sa.d3d12_shared_handle) {
-			hr = s_unity_d3d12_device->OpenSharedHandle(
-				s_sa.d3d12_shared_handle,
-				__uuidof(ID3D12Resource), (void **)&s_sa.d3d12_unity_shared);
-			if (SUCCEEDED(hr) && s_sa.d3d12_unity_shared) {
-				fprintf(stderr, "[DisplayXR-SA] Opened shared texture on Unity device: %p\n",
-				        (void *)s_sa.d3d12_unity_shared);
-				s_sa.tex_ready = 1;
-			} else {
-				fprintf(stderr, "[DisplayXR-SA] OpenSharedHandle on Unity device failed: 0x%08lx\n", hr);
-				s_sa.tex_ready = 1; // Still usable on our device
-			}
-		} else {
-			s_sa.tex_ready = 1;
-		}
-	}
+	// TODO: Create native HWND for Windows preview window
+	// For now, keep finding Unity's HWND (will be replaced in Phase 1 Windows)
 #endif
 
 	// --- Step 8: Create session with Metal graphics binding + window binding ---
@@ -1124,13 +961,13 @@ displayxr_standalone_start(const char *runtime_json_path)
 		return 0;
 	}
 
-	// Cocoa window binding (offscreen with shared IOSurface)
+	// Cocoa window binding (plugin-owned preview window)
 	XrCocoaWindowBindingCreateInfoEXT mac_binding = {};
 	mac_binding.type = XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_EXT;
-	mac_binding.viewHandle = NULL; // offscreen
+	mac_binding.viewHandle = displayxr_sa_metal_get_view();
 	mac_binding.readbackCallback = NULL;
 	mac_binding.readbackUserdata = NULL;
-	mac_binding.sharedIOSurface = displayxr_sa_metal_get_iosurface();
+	mac_binding.sharedIOSurface = NULL;
 
 	// Chain: session_ci → metal_binding → mac_binding
 	metal_binding.next = &mac_binding;
@@ -1174,7 +1011,7 @@ displayxr_standalone_start(const char *runtime_json_path)
 	win_binding.windowHandle = (void *)unity_hwnd;
 	win_binding.readbackCallback = NULL;
 	win_binding.readbackUserdata = NULL;
-	win_binding.sharedTextureHandle = s_sa.d3d12_shared_handle;
+	win_binding.sharedTextureHandle = NULL; // No shared texture — runtime composites to the window
 
 	// Chain: session_ci → d3d12_binding → win_binding
 	d3d12_binding.next = &win_binding;
@@ -1261,18 +1098,13 @@ displayxr_standalone_stop(void)
 	}
 
 #if defined(__APPLE__)
-	displayxr_sa_metal_destroy();
+	displayxr_sa_metal_destroy_window();
 #elif defined(_WIN32)
-	if (s_sa.d3d12_unity_atlas_bridge) { s_sa.d3d12_unity_atlas_bridge->Release(); s_sa.d3d12_unity_atlas_bridge = NULL; }
-	if (s_sa.d3d12_atlas_bridge_handle) { CloseHandle(s_sa.d3d12_atlas_bridge_handle); s_sa.d3d12_atlas_bridge_handle = NULL; }
-	if (s_sa.d3d12_atlas_bridge) { s_sa.d3d12_atlas_bridge->Release(); s_sa.d3d12_atlas_bridge = NULL; }
-	if (s_sa.d3d12_unity_shared) { s_sa.d3d12_unity_shared->Release(); s_sa.d3d12_unity_shared = NULL; }
+	if (s_sa.preview_hwnd) { DestroyWindow(s_sa.preview_hwnd); s_sa.preview_hwnd = NULL; }
 	if (s_sa.d3d12_fence_event) { CloseHandle(s_sa.d3d12_fence_event); s_sa.d3d12_fence_event = NULL; }
 	if (s_sa.d3d12_fence) { s_sa.d3d12_fence->Release(); s_sa.d3d12_fence = NULL; }
 	if (s_sa.d3d12_cmd_list) { s_sa.d3d12_cmd_list->Release(); s_sa.d3d12_cmd_list = NULL; }
 	if (s_sa.d3d12_cmd_alloc) { s_sa.d3d12_cmd_alloc->Release(); s_sa.d3d12_cmd_alloc = NULL; }
-	if (s_sa.d3d12_shared_texture) { s_sa.d3d12_shared_texture->Release(); s_sa.d3d12_shared_texture = NULL; }
-	if (s_sa.d3d12_shared_handle) { CloseHandle(s_sa.d3d12_shared_handle); s_sa.d3d12_shared_handle = NULL; }
 	if (s_sa.d3d12_queue) { s_sa.d3d12_queue->Release(); s_sa.d3d12_queue = NULL; }
 	if (s_sa.d3d12_device) { s_sa.d3d12_device->Release(); s_sa.d3d12_device = NULL; }
 #endif
@@ -1373,6 +1205,32 @@ displayxr_standalone_begin_frame(int *should_render)
 	s_sa.predicted_display_time = frame_state.predictedDisplayTime;
 	s_sa.frame_begun = 1;
 
+	// Update canvas rect from the preview window's current size/position
+#if defined(__APPLE__)
+	{
+		int32_t wx, wy;
+		uint32_t ww, wh;
+		if (displayxr_sa_metal_get_window_rect(&wx, &wy, &ww, &wh)) {
+			s_sa.canvas_x = wx;
+			s_sa.canvas_y = wy;
+			s_sa.canvas_width = ww;
+			s_sa.canvas_height = wh;
+		}
+	}
+#elif defined(_WIN32)
+	if (s_sa.preview_hwnd) {
+		RECT rc;
+		if (GetClientRect(s_sa.preview_hwnd, &rc)) {
+			POINT pt = {0, 0};
+			ClientToScreen(s_sa.preview_hwnd, &pt);
+			s_sa.canvas_x = pt.x;
+			s_sa.canvas_y = pt.y;
+			s_sa.canvas_width = (uint32_t)(rc.right - rc.left);
+			s_sa.canvas_height = (uint32_t)(rc.bottom - rc.top);
+		}
+	}
+#endif
+
 	// Locate views (eye tracking — supports N views for multiview modes)
 	if (s_sa.local_space != XR_NULL_HANDLE && s_sa.pfn_locate_views) {
 		XrViewLocateInfo locate_info = {XR_TYPE_VIEW_LOCATE_INFO};
@@ -1456,42 +1314,12 @@ displayxr_standalone_submit_frame_atlas(void *atlas_tex)
 	}
 #elif defined(_WIN32)
 	{
-		// Cross-device atlas blit via shared bridge texture.
-		// C# copies Unity's atlas RT → bridge (Unity device, via Graphics.CopyTexture).
-		// We copy bridge → swapchain image (our device, same device).
-		// Note: content is Y-flipped (Unity D3D12 convention) — the C# display
-		// flips the final shared texture output via UV coords.
-		ID3D12Resource *bridge = s_sa.d3d12_atlas_bridge;
+		// TODO: Windows D3D12 atlas blit needs rework for own-window architecture.
+		// The old bridge texture path is removed — need direct blit from Unity's
+		// atlas texture to the swapchain. For now, this is a stub.
 		ID3D12Resource *dst = s_sa.atlas.images[index].texture;
-		if (bridge && dst && s_sa.d3d12_cmd_list) {
-			s_sa.d3d12_cmd_alloc->Reset();
-			s_sa.d3d12_cmd_list->Reset(s_sa.d3d12_cmd_alloc, NULL);
-
-			D3D12_TEXTURE_COPY_LOCATION dst_loc = {};
-			dst_loc.pResource = dst;
-			dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-			dst_loc.SubresourceIndex = 0;
-
-			D3D12_TEXTURE_COPY_LOCATION src_loc = {};
-			src_loc.pResource = bridge;
-			src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-			src_loc.SubresourceIndex = 0;
-
-			s_sa.d3d12_cmd_list->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, NULL);
-			s_sa.d3d12_cmd_list->Close();
-
-			ID3D12CommandList *lists[] = { s_sa.d3d12_cmd_list };
-			s_sa.d3d12_queue->ExecuteCommandLists(1, lists);
-
-			s_sa.d3d12_fence_value++;
-			s_sa.d3d12_queue->Signal(s_sa.d3d12_fence, s_sa.d3d12_fence_value);
-			if (s_sa.d3d12_fence->GetCompletedValue() < s_sa.d3d12_fence_value) {
-				s_sa.d3d12_fence->SetEventOnCompletion(s_sa.d3d12_fence_value,
-				                                        s_sa.d3d12_fence_event);
-				WaitForSingleObject(s_sa.d3d12_fence_event, INFINITE);
-			}
-		}
-		(void)atlas_tex; // Unused — C# copies to bridge via Graphics.CopyTexture
+		(void)atlas_tex;
+		(void)dst;
 	}
 #endif
 
@@ -1957,42 +1785,9 @@ displayxr_standalone_get_eye_positions(float *lx, float *ly, float *lz,
 }
 
 
-void
-displayxr_standalone_get_atlas_bridge_texture(void **native_ptr,
-                                               uint32_t *width, uint32_t *height)
-{
-#if defined(_WIN32)
-	*native_ptr = s_sa.d3d12_unity_atlas_bridge
-		? (void *)s_sa.d3d12_unity_atlas_bridge : NULL;
-	*width = s_sa.atlas.width;
-	*height = s_sa.atlas.height;
-#else
-	*native_ptr = NULL;
-	*width = 0;
-	*height = 0;
-#endif
-}
-
-
-void
-displayxr_standalone_get_shared_texture(void **native_ptr, uint32_t *width,
-                                         uint32_t *height, int *ready)
-{
-#if defined(__APPLE__)
-	*native_ptr = displayxr_sa_metal_get_texture();
-#elif defined(_WIN32)
-	// Return the shared texture opened on Unity's device (if available),
-	// otherwise fall back to our device's resource.
-	*native_ptr = s_sa.d3d12_unity_shared
-		? (void *)s_sa.d3d12_unity_shared
-		: (void *)s_sa.d3d12_shared_texture;
-#else
-	*native_ptr = NULL;
-#endif
-	*width = s_sa.tex_width;
-	*height = s_sa.tex_height;
-	*ready = s_sa.tex_ready;
-}
+// displayxr_standalone_get_shared_texture and displayxr_standalone_get_atlas_bridge_texture
+// have been removed — the plugin now creates its own native window and passes
+// it to the runtime via the window binding extension. No shared texture needed.
 
 
 #if defined(__APPLE__)
@@ -2019,26 +1814,8 @@ displayxr_get_backing_scale_factor(void)
 }
 
 
-void
-displayxr_standalone_set_canvas_rect(int32_t x, int32_t y, uint32_t w, uint32_t h)
-{
-	static uint32_t log_count = 0;
-	if (log_count < 5 || (w != s_sa.canvas_width || h != s_sa.canvas_height)) {
-		fprintf(stderr, "[DisplayXR-SA] set_canvas_rect: x=%d y=%d w=%u h=%u "
-		        "(shared_tex=%ux%u, atlas=%ux%u, display=%ux%u)\n",
-		        x, y, w, h, s_sa.tex_width, s_sa.tex_height,
-		        s_sa.atlas.width, s_sa.atlas.height,
-		        s_sa.display_info.display_pixel_width,
-		        s_sa.display_info.display_pixel_height);
-		log_count++;
-	}
-	s_sa.canvas_width = w;
-	s_sa.canvas_height = h;
-	s_sa.canvas_x = x;
-	s_sa.canvas_y = y;
-	if (s_sa.pfn_set_output_rect && s_sa.session != XR_NULL_HANDLE)
-		s_sa.pfn_set_output_rect(s_sa.session, x, y, w, h);
-}
+// displayxr_standalone_set_canvas_rect has been removed — the runtime
+// manages its own window and determines canvas rect from the window size.
 
 
 void

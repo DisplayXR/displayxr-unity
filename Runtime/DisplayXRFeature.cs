@@ -57,9 +57,6 @@ namespace DisplayXR
         /// <summary>Raw right eye position in display space (meters).</summary>
         public Vector3 RightEyePosition { get; private set; }
 
-        /// <summary>Whether a shared GPU texture is available for zero-copy preview.</summary>
-        public bool SharedTextureAvailable { get; private set; }
-
         private bool m_HooksInstalled;
 
         // ====================================================================
@@ -130,22 +127,8 @@ namespace DisplayXR
             // Query it from the native plugin.
             RefreshDisplayInfo();
 
-#if UNITY_EDITOR
-            // Create shared GPU texture now — before xrCreateSession, which
-            // injects the IOSurface pointer into the window binding struct.
-            // Only in editor: built apps render directly to the overlay CAMetalLayer.
-            if (DisplayInfo.isValid && DisplayInfo.displayPixelWidth > 0 && DisplayInfo.displayPixelHeight > 0)
-            {
-                IntPtr ptr = DisplayXRNative.displayxr_create_shared_texture(
-                    DisplayInfo.displayPixelWidth, DisplayInfo.displayPixelHeight);
-                SharedTextureAvailable = (ptr != IntPtr.Zero);
-
-                if (SharedTextureAvailable)
-                    Debug.Log($"[DisplayXR] Shared texture created: {DisplayInfo.displayPixelWidth}x{DisplayInfo.displayPixelHeight}");
-                else
-                    Debug.Log("[DisplayXR] Shared texture not available, using CPU readback");
-            }
-#endif
+            // In editor Play Mode, the native hook chain creates its own window
+            // and passes it to the runtime — no shared texture needed.
 
         }
 
@@ -184,20 +167,6 @@ namespace DisplayXR
                 RefreshDisplayInfo();
             }
 
-#if UNITY_EDITOR
-            // Check if the native layer already created the shared texture
-            if (!SharedTextureAvailable && DisplayInfo.isValid)
-            {
-                DisplayXRNative.displayxr_get_shared_texture(
-                    out IntPtr nativePtr, out uint w, out uint h, out int ready);
-                SharedTextureAvailable = (ready != 0 && nativePtr != IntPtr.Zero);
-
-                if (SharedTextureAvailable)
-                    Debug.Log($"[DisplayXR] Shared texture available: {w}x{h}");
-                else
-                    Debug.Log("[DisplayXR] Shared texture not available, using CPU readback");
-            }
-#endif
         }
 
         /// <inheritdoc />
@@ -211,14 +180,6 @@ namespace DisplayXR
             // pointer so our hook returns XR_EVENT_UNAVAILABLE immediately.
             try { DisplayXRNative.displayxr_stop_polling(); }
             catch (System.Exception e) { Debug.LogWarning($"[DisplayXR] stop_polling: {e.Message}"); }
-
-            if (SharedTextureAvailable)
-            {
-                Debug.Log("[DisplayXR] OnSessionDestroy: destroying shared texture");
-                try { DisplayXRNative.displayxr_destroy_shared_texture(); }
-                catch (System.Exception e) { Debug.LogWarning($"[DisplayXR] Shared texture cleanup: {e.Message}"); }
-                SharedTextureAvailable = false;
-            }
 
             Debug.Log("[DisplayXR] OnSessionDestroy END");
         }

@@ -11,14 +11,12 @@ namespace DisplayXR.Editor
     /// <summary>
     /// Editor window for stereo preview.
     /// Uses the standalone OpenXR session (no play mode required).
-    /// Displays the runtime's shared texture (IOSurface) after compositing.
+    /// Shows the raw eye tile atlas that gets submitted to the OpenXR swapchain.
+    /// The runtime's own native window shows the composited display output.
     /// </summary>
     public class DisplayXRPreviewWindow : EditorWindow
     {
         [SerializeField] private bool m_AutoRefresh = true;
-
-        private Texture2D m_SharedTexture;
-        private IntPtr m_SharedNativePtr;
 
         // Camera selector
         private CameraEntry[] m_CameraList;
@@ -52,7 +50,6 @@ namespace DisplayXR.Editor
         {
             EditorApplication.update -= OnEditorUpdate;
             EditorApplication.hierarchyChanged -= OnHierarchyChanged;
-            CleanupSharedTexture();
             m_RenderingModeNames = null;
             m_ModeViewCounts = null;
             m_ModeTileColumns = null;
@@ -208,40 +205,15 @@ namespace DisplayXR.Editor
             }
             EditorGUILayout.EndHorizontal();
 
-            // Preview area
+            // Preview area — shows the raw eye tile atlas
             Rect previewRect = GUILayoutUtility.GetRect(
                 GUIContent.none, GUIStyle.none,
                 GUILayout.ExpandWidth(true), GUILayout.ExpandHeight(true));
 
-            // Canvas = preview area in backing pixels (Retina-aware)
-            float ppp = EditorGUIUtility.pixelsPerPoint;
-            uint canvasW = (uint)(previewRect.width * ppp);
-            uint canvasH = (uint)(previewRect.height * ppp);
-
-            // Tell the runtime where the canvas is (screen position + size)
-            if (DisplayXRPreviewSession.IsRunning)
+            RenderTexture atlas = DisplayXRPreviewSession.AtlasTexture;
+            if (atlas != null && DisplayXRPreviewSession.IsRunning)
             {
-                Rect winPos = position;
-                int screenX = (int)((winPos.x + previewRect.x) * ppp);
-                int screenY = (int)((winPos.y + previewRect.y) * ppp);
-                DisplayXRNative.displayxr_standalone_set_canvas_rect(
-                    screenX, screenY, canvasW, canvasH);
-            }
-
-            Texture tex = GetPreviewTexture();
-            if (tex != null)
-            {
-                uint surfW = (uint)tex.width;
-                uint surfH = (uint)tex.height;
-
-                // UV crop: canvas portion of IOSurface (compositor writes to top-left)
-                float uMax = (canvasW > 0 && surfW > 0) ? (float)canvasW / surfW : 1f;
-                float vMax = (canvasH > 0 && surfH > 0) ? (float)canvasH / surfH : 1f;
-
-                // Letterbox by canvas aspect (not IOSurface aspect)
-                float texAspect = (canvasW > 0 && canvasH > 0)
-                    ? (float)canvasW / canvasH
-                    : (float)surfW / surfH;
+                float texAspect = (float)atlas.width / atlas.height;
                 float rectAspect = previewRect.width / previewRect.height;
 
                 Rect drawRect;
@@ -261,22 +233,30 @@ namespace DisplayXR.Editor
                         previewRect.width, h);
                 }
 
-                // macOS Metal: Y-flipped. Windows D3D12: not flipped.
-#if UNITY_EDITOR_OSX
-                GUI.DrawTextureWithTexCoords(drawRect, tex, new Rect(0, vMax, uMax, -vMax));
-#else
-                GUI.DrawTextureWithTexCoords(drawRect, tex, new Rect(0, 0, uMax, vMax));
-#endif
+                // Draw the atlas — no Y-flip needed since this is a Unity RenderTexture
+                GUI.DrawTexture(drawRect, atlas, ScaleMode.StretchToFill);
 
-                var labelRect = new Rect(drawRect.x + 4, drawRect.y + 4, 300, 20);
-                GUI.Label(labelRect, $"Canvas: {canvasW}x{canvasH}  Surface: {surfW}x{surfH}",
+                // Draw tile grid overlay
+                DisplayXRNative.displayxr_standalone_get_current_mode_info(
+                    out uint vc, out uint tc, out uint tr,
+                    out uint vw, out uint vh,
+                    out float _, out float _, out int _);
+                if (tc > 0 && tr > 0)
+                {
+                    DrawTileGrid(drawRect, tc, tr, vw, vh, atlas.width, atlas.height);
+                }
+
+                var labelRect = new Rect(drawRect.x + 4, drawRect.y + 4, 400, 20);
+                GUI.Label(labelRect, $"Atlas: {atlas.width}x{atlas.height}  " +
+                    $"Tiles: {tc}x{tr}  View: {vw}x{vh}px",
                     EditorStyles.miniLabel);
             }
             else
             {
                 string hint = DisplayXRPreviewSession.IsRunning
-                    ? "Waiting for shared texture..."
-                    : "Click 'Start Preview' to begin.";
+                    ? "Waiting for atlas..."
+                    : "Click 'Start Preview' to begin.\n" +
+                      "Display output appears in the runtime's own window.";
                 EditorGUI.LabelField(previewRect, hint, EditorStyles.centeredGreyMiniLabel);
             }
 
@@ -435,49 +415,54 @@ namespace DisplayXR.Editor
             }
         }
 
-        private Texture GetPreviewTexture()
+        /// <summary>
+        /// Draw tile boundaries over the atlas preview.
+        /// </summary>
+        private void DrawTileGrid(Rect drawRect, uint tileCols, uint tileRows,
+            uint viewW, uint viewH, int atlasW, int atlasH)
         {
-            if (!DisplayXRPreviewSession.IsRunning || !DisplayXRPreviewSession.SharedTextureAvailable)
-                return null;
+            if (atlasW <= 0 || atlasH <= 0) return;
 
-            return UpdateSharedTexture();
-        }
+            Color gridColor = new Color(1f, 1f, 0f, 0.5f);
+            Handles.BeginGUI();
+            Handles.color = gridColor;
 
-        private Texture UpdateSharedTexture()
-        {
-            DisplayXRNative.displayxr_standalone_get_shared_texture(
-                out IntPtr nativePtr, out uint w, out uint h, out int ready);
-
-            if (ready == 0 || nativePtr == IntPtr.Zero)
-                return null;
-
-            if (m_SharedTexture == null || m_SharedNativePtr != nativePtr ||
-                m_SharedTexture.width != (int)w || m_SharedTexture.height != (int)h)
+            // Vertical lines between tile columns
+            for (uint c = 1; c < tileCols; c++)
             {
-                CleanupSharedTexture();
-
-                m_SharedTexture = Texture2D.CreateExternalTexture(
-                    (int)w, (int)h, TextureFormat.RGBA32, false, true, nativePtr);
-                m_SharedTexture.name = "DisplayXR_SA_Preview";
-                m_SharedTexture.filterMode = FilterMode.Point; // No interpolation — preserves interlacing
-                m_SharedNativePtr = nativePtr;
-            }
-            else
-            {
-                m_SharedTexture.UpdateExternalTexture(nativePtr);
+                float xFrac = (float)(c * viewW) / atlasW;
+                float x = drawRect.x + xFrac * drawRect.width;
+                Handles.DrawLine(
+                    new Vector3(x, drawRect.y, 0),
+                    new Vector3(x, drawRect.yMax, 0));
             }
 
-            return m_SharedTexture;
-        }
-
-        private void CleanupSharedTexture()
-        {
-            if (m_SharedTexture != null)
+            // Horizontal lines between tile rows
+            for (uint r = 1; r < tileRows; r++)
             {
-                DestroyImmediate(m_SharedTexture);
-                m_SharedTexture = null;
+                float yFrac = (float)(r * viewH) / atlasH;
+                float y = drawRect.y + yFrac * drawRect.height;
+                Handles.DrawLine(
+                    new Vector3(drawRect.x, y, 0),
+                    new Vector3(drawRect.xMax, y, 0));
             }
-            m_SharedNativePtr = IntPtr.Zero;
+
+            // Tile labels
+            for (uint r = 0; r < tileRows; r++)
+            {
+                for (uint c = 0; c < tileCols; c++)
+                {
+                    uint viewIdx = r * tileCols + c;
+                    float xFrac = (float)(c * viewW) / atlasW;
+                    float yFrac = (float)(r * viewH) / atlasH;
+                    float x = drawRect.x + xFrac * drawRect.width + 4;
+                    float y = drawRect.y + yFrac * drawRect.height + 4;
+                    GUI.Label(new Rect(x, y, 80, 16), $"Eye {viewIdx}",
+                        EditorStyles.whiteBoldLabel);
+                }
+            }
+
+            Handles.EndGUI();
         }
     }
 }

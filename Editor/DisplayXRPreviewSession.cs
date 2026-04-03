@@ -42,7 +42,11 @@ namespace DisplayXR.Editor
         public static bool IsEyeTracked { get; private set; }
         public static Vector3 LeftEyePosition { get; private set; }
         public static Vector3 RightEyePosition { get; private set; }
-        public static bool SharedTextureAvailable { get; private set; }
+        /// <summary>
+        /// The atlas RenderTexture containing the raw eye tile renders.
+        /// Available when the SA session is running.
+        /// </summary>
+        public static RenderTexture AtlasTexture => s_AtlasRT;
 
         private static bool s_Polling;
         private static bool s_Stopping; // Guard against re-entrant ticks during teardown
@@ -57,9 +61,6 @@ namespace DisplayXR.Editor
         private static float s_NearZ = 0.3f;
         private static float s_FarZ = 1000f;
 
-        // Atlas bridge (Windows D3D12: cross-device shared texture for atlas blit)
-        private static Texture2D s_AtlasBridgeTex;
-
         // Current mode tiling info (cached from native)
         private static uint s_ViewCount = 2;
         private static uint s_TileColumns = 2;
@@ -69,20 +70,10 @@ namespace DisplayXR.Editor
         private static uint s_AtlasWidth;
         private static uint s_AtlasHeight;
 
-        /// <summary>
-        /// When true, entering play mode auto-starts the preview and suppresses Unity's XR.
-        /// </summary>
-        public static bool PlayModeIntegration { get; set; } = true;
-
         // Camera selection
         private const string kSelectedCameraIDKey = "DisplayXR_SA_SelectedCameraID";
         private static Camera s_SelectedSourceCamera;
         public static Camera SelectedCamera => s_SelectedSourceCamera;
-
-        // SessionState survives domain reload (unlike static fields)
-        private const string kPlayModeStartedKey = "DisplayXR_SA_StartedByPlayMode";
-        private const string kXRWasEnabledKey = "DisplayXR_SA_XRWasEnabled";
-        private const string kXRLoaderAssetPathKey = "DisplayXR_SA_XRLoaderAssetPath";
 
         static DisplayXRPreviewSession()
         {
@@ -95,122 +86,15 @@ namespace DisplayXR.Editor
 
         private static void OnPlayModeStateChanged(PlayModeStateChange state)
         {
-            if (!PlayModeIntegration) return;
-
             switch (state)
             {
                 case PlayModeStateChange.ExitingEditMode:
-                    // About to enter play mode — disable Unity's XR loader entirely
-                    // so it never creates an OpenXR instance that conflicts with
-                    // our standalone session. This must happen before the XR subsystem
-                    // initializes (which occurs during the edit→play transition).
-                    bool xrWasEnabled = DisableXRLoader();
-                    SessionState.SetBool(kXRWasEnabledKey, xrWasEnabled);
-                    SessionState.SetBool(kPlayModeStartedKey, !IsRunning);
-                    break;
-
-                case PlayModeStateChange.EnteredPlayMode:
-                    // Play mode is now active — start preview if needed
-                    // (domain reload has wiped static fields, so read from SessionState)
-                    if (SessionState.GetBool(kPlayModeStartedKey, false) && !IsRunning)
-                    {
-                        Start();
-                    }
-                    // Don't focus the preview window — let Game View keep focus
-                    // so DisplayXRGameViewOverlay can receive input
-                    break;
-
-                case PlayModeStateChange.ExitingPlayMode:
-                    // About to exit — stop preview if we started it
-                    if (SessionState.GetBool(kPlayModeStartedKey, false) && IsRunning)
-                    {
+                    // Stop SA session — Unity's XR loader will take over in Play Mode.
+                    // The XR loader runs natively (no loader toggling needed).
+                    if (IsRunning)
                         Stop();
-                        SessionState.SetBool(kPlayModeStartedKey, false);
-                    }
-                    break;
-
-                case PlayModeStateChange.EnteredEditMode:
-                    // Back in edit mode — re-enable XR loader and focus scene view
-                    if (SessionState.GetBool(kXRWasEnabledKey, false))
-                    {
-                        EnableXRLoader();
-                        SessionState.SetBool(kXRWasEnabledKey, false);
-                    }
-                    var sceneView = SceneView.lastActiveSceneView;
-                    if (sceneView != null)
-                        sceneView.Focus();
                     break;
             }
-        }
-
-        /// <summary>
-        /// Disable the OpenXR loader in XR Management so Unity doesn't create
-        /// an XR session during play mode. Returns true if it was enabled.
-        /// </summary>
-        private static bool DisableXRLoader()
-        {
-            var xrSettings = UnityEngine.XR.Management.XRGeneralSettings.Instance;
-            if (xrSettings == null || xrSettings.Manager == null) return false;
-
-            var loaders = xrSettings.Manager.activeLoaders;
-            for (int i = 0; i < loaders.Count; i++)
-            {
-                if (loaders[i].GetType().Name.Contains("OpenXR"))
-                {
-                    // Save asset path so we can re-add after domain reload
-                    string assetPath = AssetDatabase.GetAssetPath(loaders[i]);
-                    if (!string.IsNullOrEmpty(assetPath))
-                        SessionState.SetString(kXRLoaderAssetPathKey, assetPath);
-                    // Silently remove — re-added in EnteredEditMode
-                    xrSettings.Manager.TryRemoveLoader(loaders[i]);
-                    return true;
-                }
-            }
-            return false;
-        }
-
-        /// <summary>
-        /// Re-enable the OpenXR loader after play mode ends.
-        /// Finds the OpenXRLoaderBase ScriptableObject and re-adds it.
-        /// </summary>
-        private static void EnableXRLoader()
-        {
-            var xrSettings = UnityEngine.XR.Management.XRGeneralSettings.Instance;
-            if (xrSettings == null || xrSettings.Manager == null) return;
-
-            // Check if already present
-            foreach (var loader in xrSettings.Manager.activeLoaders)
-            {
-                if (loader.GetType().Name.Contains("OpenXR"))
-                    return;
-            }
-
-            // Load the OpenXR loader from its saved asset path (survives domain reload)
-            string assetPath = SessionState.GetString(kXRLoaderAssetPathKey, "");
-            if (!string.IsNullOrEmpty(assetPath))
-            {
-                var loader = AssetDatabase.LoadAssetAtPath<UnityEngine.XR.Management.XRLoader>(assetPath);
-                if (loader != null)
-                {
-                    // Silently re-add
-                    xrSettings.Manager.TryAddLoader(loader);
-                    SessionState.EraseString(kXRLoaderAssetPathKey);
-                    return;
-                }
-            }
-
-            // Fallback: search all loaded assets
-            var allLoaders = Resources.FindObjectsOfTypeAll<UnityEngine.XR.Management.XRLoader>();
-            foreach (var loader in allLoaders)
-            {
-                if (loader.GetType().Name.Contains("OpenXR"))
-                {
-                    // Re-added via fallback search
-                    xrSettings.Manager.TryAddLoader(loader);
-                    return;
-                }
-            }
-            Debug.LogWarning("[DisplayXR-SA] Could not find OpenXR loader to re-add");
         }
 
         private static void FocusPreviewWindow()
@@ -247,20 +131,6 @@ namespace DisplayXR.Editor
 
             Debug.Log($"[DisplayXR-SA] Starting with runtime: {runtimeJson}");
 
-            // Pass Unity's graphics device to native before session creation.
-            // This ensures all textures (Unity RTs, swapchain images, shared texture)
-            // are on the same device, avoiding cross-device copy failures.
-#if UNITY_EDITOR_WIN
-            {
-                var tempRT = new RenderTexture(4, 4, 0, RenderTextureFormat.ARGB32);
-                tempRT.Create(); // Force native resource allocation
-                var texPtr = tempRT.GetNativeTexturePtr();
-                DisplayXRNative.displayxr_standalone_set_unity_device(texPtr);
-                tempRT.Release();
-                UnityEngine.Object.DestroyImmediate(tempRT);
-            }
-#endif
-
             int result = DisplayXRNative.displayxr_standalone_start(runtimeJson);
 
             if (result != 0)
@@ -270,7 +140,6 @@ namespace DisplayXR.Editor
                 StartPolling();
                 RefreshDisplayInfo();
                 CreateRenderRig();
-                CreateAtlasBridge();
                 return true;
             }
 
@@ -304,7 +173,6 @@ namespace DisplayXR.Editor
             s_IsRunning = false;
 
             StopPolling();
-            CleanupAtlasBridge();
             DestroyRenderRig();
 
             try
@@ -316,7 +184,6 @@ namespace DisplayXR.Editor
                 Debug.LogWarning($"[DisplayXR-SA] Exception during stop: {e.Message}");
             }
 
-            SharedTextureAvailable = false;
             DisplayInfo = default;
             s_DeferredStop = false;
             s_Stopping = false;
@@ -418,12 +285,6 @@ namespace DisplayXR.Editor
                         (int)s_ViewWidth, (int)s_ViewHeight);
                 }
 
-                // Copy atlas RT → bridge texture (Unity device, GPU copy).
-                // Native then copies bridge → swapchain (our device, same device).
-                // TODO(#41): Content is Y-flipped on D3D12 — handle in native blit.
-                if (s_AtlasBridgeTex != null)
-                    Graphics.CopyTexture(s_AtlasRT, s_AtlasBridgeTex);
-
                 IntPtr atlasNative = s_AtlasRT.GetNativeTexturePtr();
                 DisplayXRNative.displayxr_standalone_submit_frame_atlas(atlasNative);
             }
@@ -435,7 +296,6 @@ namespace DisplayXR.Editor
 
             // Refresh cached state for UI
             RefreshEyePositions();
-            RefreshSharedTexture();
         }
 
         // ================================================================
@@ -485,30 +345,6 @@ namespace DisplayXR.Editor
 
             // Restore camera selection (reads from SessionState) and clone settings
             RestoreSelection();
-        }
-
-        private static void CreateAtlasBridge()
-        {
-#if UNITY_EDITOR_WIN
-            DisplayXRNative.displayxr_standalone_get_atlas_bridge_texture(
-                out IntPtr bridgePtr, out uint bw, out uint bh);
-            if (bridgePtr != IntPtr.Zero && bw > 0 && bh > 0)
-            {
-                s_AtlasBridgeTex = Texture2D.CreateExternalTexture(
-                    (int)bw, (int)bh, TextureFormat.RGBA32, false, true, bridgePtr);
-                s_AtlasBridgeTex.name = "DisplayXR_AtlasBridge";
-                Debug.Log($"[DisplayXR-SA] Atlas bridge texture: {bw}x{bh}");
-            }
-#endif
-        }
-
-        private static void CleanupAtlasBridge()
-        {
-            if (s_AtlasBridgeTex != null)
-            {
-                UnityEngine.Object.DestroyImmediate(s_AtlasBridgeTex);
-                s_AtlasBridgeTex = null;
-            }
         }
 
         private static void DestroyRenderRig()
@@ -950,13 +786,6 @@ namespace DisplayXR.Editor
             LeftEyePosition = new Vector3(lx, ly, lz);
             RightEyePosition = new Vector3(rx, ry, rz);
             IsEyeTracked = tracked != 0;
-        }
-
-        private static void RefreshSharedTexture()
-        {
-            DisplayXRNative.displayxr_standalone_get_shared_texture(
-                out IntPtr ptr, out uint w, out uint h, out int ready);
-            SharedTextureAvailable = (ready != 0 && ptr != IntPtr.Zero);
         }
 
         private static string FindRuntimeJson()
