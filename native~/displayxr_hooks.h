@@ -20,6 +20,9 @@ extern "C" {
 #define DISPLAYXR_EXPORT
 #endif
 
+/// Logging helper — writes to displayxr.log and OutputDebugString on Windows.
+void displayxr_log(const char *fmt, ...);
+
 /// Called by Unity's OpenXR Feature via HookGetInstanceProcAddr.
 /// Stores the next xrGetInstanceProcAddr in the chain and returns our interceptor.
 /// @param next The next xrGetInstanceProcAddr function pointer in the chain.
@@ -79,6 +82,16 @@ DISPLAYXR_EXPORT void displayxr_set_scene_transform(float pos_x,
 DISPLAYXR_EXPORT void displayxr_set_window_handle(void *handle);
 
 DISPLAYXR_EXPORT void displayxr_set_editor_mode(int enabled);
+
+/// Check whether the plugin is running in shell/IPC mode.
+/// Detected via DISPLAYXR_SHELL_SESSION=1 environment variable.
+/// Callable from C# via P/Invoke.
+DISPLAYXR_EXPORT int displayxr_is_shell_mode(void);
+
+/// Get shell-mode mouse button state (from WM_INPUT usButtonFlags).
+/// Returns current button mask: bit 0 = left, bit 1 = right, bit 2 = middle.
+/// Also returns mouse position (client coords from shell-forwarded WM_MOUSEMOVE).
+DISPLAYXR_EXPORT void displayxr_get_shell_mouse_state(int *buttons, int *mouseX, int *mouseY);
 
 DISPLAYXR_EXPORT void displayxr_set_viewport_size(uint32_t width, uint32_t height,
                                                   int32_t screen_x, int32_t screen_y);

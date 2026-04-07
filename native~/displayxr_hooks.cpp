@@ -29,7 +29,7 @@
 // --- Logging helper ---
 // On Windows built apps, fprintf(stderr) goes nowhere (no console).
 // Write to a file next to the executable so logs are always accessible.
-static void displayxr_log(const char *fmt, ...)
+void displayxr_log(const char *fmt, ...)
 {
 	va_list args;
 	va_start(args, fmt);
@@ -119,6 +119,7 @@ static PFN_xrDestroyInstance s_deferred_destroy_instance_fn = nullptr;
 static int s_runtime_pinned = 0; // Whether we've pinned the runtime via RTLD_NODELETE
 static volatile int s_stop_polling = 0; // Stop forwarding xrPollEvent after EXITING event
 static PFN_xrSetSharedTextureOutputRectEXT s_pfn_set_output_rect = nullptr;
+static int s_native_viewport_active = 0; // WM_SIZE (native) is authoritative source
 
 
 // ============================================================================
@@ -138,6 +139,33 @@ hooked_xrLocateViews(XrSession session,
 		return s_real_locate_views(session, viewLocateInfo, viewState, viewCapacityInput, viewCountOutput,
 		                           views);
 	}
+
+#if defined(_WIN32)
+	// Shell mode: per-frame maintenance for viewport and input focus.
+	if (displayxr_is_shell_mode()) {
+		DisplayXRState *poll_state = displayxr_get_state();
+		if (poll_state->window_handle != nullptr) {
+			HWND hwnd = (HWND)poll_state->window_handle;
+
+			// Poll window size/position since we have no parent_subclass_proc.
+			// Keeps Kooima projection correct when the shell resizes the app.
+			RECT rc;
+			if (GetClientRect(hwnd, &rc)) {
+				uint32_t w = (uint32_t)(rc.right - rc.left);
+				uint32_t h = (uint32_t)(rc.bottom - rc.top);
+				if (w > 0 && h > 0 &&
+				    (w != poll_state->viewport_width || h != poll_state->viewport_height ||
+				     !s_native_viewport_active)) {
+					POINT origin = {0, 0};
+					ClientToScreen(hwnd, &origin);
+					displayxr_set_viewport_size_native(w, h,
+						(int32_t)origin.x, (int32_t)origin.y);
+				}
+			}
+
+		}
+	}
+#endif
 
 	// Use our LOCAL space if available, otherwise pass through the original space.
 	// LOCAL space gives us raw eye positions relative to the display.
@@ -573,15 +601,29 @@ hooked_xrCreateSession(XrInstance instance, const XrSessionCreateInfo *createInf
 			}
 		}
 #elif defined(_WIN32)
-		// Auto-detect Unity's main HWND and create an overlay child window.
-		// Only for built apps — editor uses shared texture mode.
+		// Auto-detect Unity's main HWND.
+		// Shell mode: pass top-level HWND directly (no overlay).
+		// Standalone mode: create overlay child window for compositor output.
 		if (state->window_handle == nullptr && !state->editor_mode) {
-			void *hwnd = displayxr_get_app_main_view();
-			if (hwnd != nullptr) {
-				state->window_handle = hwnd;
-				displayxr_log( "[DisplayXR] Auto-detected main window HWND (overlay): %p\n", hwnd);
+			if (displayxr_is_shell_mode()) {
+				void *hwnd = displayxr_get_unity_main_hwnd();
+				if (hwnd != nullptr) {
+					state->window_handle = hwnd;
+					displayxr_log("[DisplayXR] Shell mode: using top-level HWND %p (no overlay)\n", hwnd);
+					// Hook GetForegroundWindow so Unity thinks it has focus
+					// and processes the PostMessage'd input from the shell
+					displayxr_install_focus_hook(hwnd);
+				} else {
+					displayxr_log("[DisplayXR] Shell mode: no main HWND found\n");
+				}
 			} else {
-				displayxr_log( "[DisplayXR] No main window HWND found — compositor will create own window\n");
+				void *hwnd = displayxr_get_app_main_view();
+				if (hwnd != nullptr) {
+					state->window_handle = hwnd;
+					displayxr_log("[DisplayXR] Auto-detected main window HWND (overlay): %p\n", hwnd);
+				} else {
+					displayxr_log("[DisplayXR] No main window HWND found — compositor will create own window\n");
+				}
 			}
 		}
 #endif
@@ -601,9 +643,17 @@ hooked_xrCreateSession(XrInstance instance, const XrSessionCreateInfo *createInf
 			win_binding.type = XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT;
 			win_binding.next = nullptr;
 			win_binding.windowHandle = state->window_handle;
-			win_binding.readbackCallback = displayxr_readback_callback;
-			win_binding.readbackUserdata = nullptr;
-			win_binding.sharedTextureHandle = state->shared_d3d_handle;
+			if (displayxr_is_shell_mode()) {
+				// Shell/IPC: function pointers and process-local handles
+				// cannot cross process boundaries
+				win_binding.readbackCallback = nullptr;
+				win_binding.readbackUserdata = nullptr;
+				win_binding.sharedTextureHandle = nullptr;
+			} else {
+				win_binding.readbackCallback = displayxr_readback_callback;
+				win_binding.readbackUserdata = nullptr;
+				win_binding.sharedTextureHandle = state->shared_d3d_handle;
+			}
 
 			displayxr_log( "[DisplayXR] Injecting win32 window binding: windowHandle=%p, sharedTextureHandle=%p\n",
 			        win_binding.windowHandle, win_binding.sharedTextureHandle);
@@ -1293,12 +1343,6 @@ displayxr_set_editor_mode(int enabled)
 	DisplayXRState *state = displayxr_get_state();
 	state->editor_mode = (uint8_t)(enabled != 0);
 }
-
-// When set, the native WM_SIZE handler is the sole source of viewport
-// dimensions.  C# LateUpdate calls (displayxr_set_viewport_size) become
-// no-ops to avoid overwriting the correct values with stale Screen.width/height
-// that lag one frame behind.
-static int s_native_viewport_active = 0;
 
 void
 displayxr_set_viewport_size(uint32_t width, uint32_t height,

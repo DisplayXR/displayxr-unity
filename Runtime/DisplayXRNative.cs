@@ -85,6 +85,21 @@ namespace DisplayXR
         internal static extern void displayxr_set_editor_mode(int enabled);
 
         /// <summary>
+        /// Check whether the plugin is running in shell/IPC mode.
+        /// Detected via DISPLAYXR_SHELL_SESSION=1 environment variable.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int displayxr_is_shell_mode();
+
+        /// <summary>
+        /// Get shell-mode mouse button state from native WM_INPUT tracking.
+        /// Buttons: bit 0 = left, bit 1 = right, bit 2 = middle.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void displayxr_get_shell_mouse_state(
+            out int buttons, out int mouseX, out int mouseY);
+
+        /// <summary>
         /// Set the viewport (window) size and screen position for window-relative
         /// Kooima projection. Screen position is needed to compute the window-center
         /// eye offset on the physical display.

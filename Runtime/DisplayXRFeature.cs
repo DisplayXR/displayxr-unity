@@ -154,6 +154,16 @@ namespace DisplayXR
         {
             Debug.Log("[DisplayXR] OpenXR session created");
 
+#if UNITY_STANDALONE_WIN
+            // Shell mode: ensure Unity continues processing input and rendering
+            // even when the shell's compositor window has foreground focus.
+            if (DisplayXRNative.displayxr_is_shell_mode() != 0)
+            {
+                Application.runInBackground = true;
+                Debug.Log("[DisplayXR] Shell mode: enabled runInBackground");
+            }
+#endif
+
 #if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
             // D3D11 has a known Unity engine bug: TYPELESS swapchain textures (required
             // by OpenXR D3D11 spec) cause geometry corruption. D3D12 works correctly.

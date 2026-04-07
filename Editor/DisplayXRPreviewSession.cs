@@ -655,7 +655,7 @@ namespace DisplayXR.Editor
 
         public static CameraEntry[] DiscoverCameras()
         {
-            var cameras = UnityEngine.Object.FindObjectsByType<Camera>(FindObjectsSortMode.None);
+            var cameras = UnityEngine.Object.FindObjectsByType<Camera>(FindObjectsInactive.Exclude);
             var entries = new List<CameraEntry>();
 
             foreach (var cam in cameras)
@@ -701,9 +701,9 @@ namespace DisplayXR.Editor
         {
             s_SelectedSourceCamera = cam;
             if (cam != null)
-                SessionState.SetInt(kSelectedCameraIDKey, cam.GetInstanceID());
+                SessionState.SetString(kSelectedCameraIDKey, cam.GetEntityId().ToString());
             else
-                SessionState.EraseInt(kSelectedCameraIDKey);
+                SessionState.EraseString(kSelectedCameraIDKey);
 
             if (IsRunning)
                 ApplyCameraSelection();
@@ -714,10 +714,12 @@ namespace DisplayXR.Editor
 
         public static void RestoreSelection()
         {
-            int savedID = SessionState.GetInt(kSelectedCameraIDKey, 0);
-            if (savedID != 0)
+            string savedID = SessionState.GetString(kSelectedCameraIDKey, "");
+            if (!string.IsNullOrEmpty(savedID) && int.TryParse(savedID, out int id) && id != 0)
             {
-                var obj = EditorUtility.EntityIdToObject(savedID) as Camera;
+#pragma warning disable CS0618 // EntityId int cast — no non-deprecated constructor available yet
+                var obj = EditorUtility.EntityIdToObject((EntityId)id) as Camera;
+#pragma warning restore CS0618
                 if (obj != null)
                 {
                     s_SelectedSourceCamera = obj;
@@ -745,7 +747,7 @@ namespace DisplayXR.Editor
 
             if (s_SelectedSourceCamera != null)
             {
-                SessionState.SetInt(kSelectedCameraIDKey, s_SelectedSourceCamera.GetInstanceID());
+                SessionState.SetString(kSelectedCameraIDKey, s_SelectedSourceCamera.GetEntityId().ToString());
                 ApplyCameraSelection();
             }
         }

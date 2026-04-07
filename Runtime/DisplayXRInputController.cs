@@ -91,6 +91,9 @@ namespace DisplayXR
                 return;
             }
 
+#if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
+            UpdateShellMouse();
+#endif
             HandleMouseRotation();
             HandleKeyboardMovement();
             HandleScrollZoom();
@@ -112,6 +115,30 @@ namespace DisplayXR
 
         private void HandleMouseRotation()
         {
+#if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
+            // Shell mode: Mouse.current.position is frozen in background.
+            // Use Mouse.current.delta (Raw Input deltas via RIDEV_INPUTSINK)
+            // and our native button tracker instead.
+            if (IsShellMode() && Mouse.current != null)
+            {
+                if (ShellGetMouseButtonDown(0) && !ShouldIgnoreInput())
+                    m_Dragging = true;
+                if (ShellGetMouseButtonUp(0))
+                    m_Dragging = false;
+                if (m_Dragging)
+                {
+                    Vector2 delta = Mouse.current.delta.ReadValue();
+                    m_Yaw += delta.x * rotationSensitivity;
+                    m_Pitch -= delta.y * rotationSensitivity;
+                    m_Pitch = Mathf.Clamp(m_Pitch, -1.4f, 1.4f);
+                    transform.rotation = Quaternion.Euler(
+                        m_Pitch * Mathf.Rad2Deg,
+                        m_Yaw * Mathf.Rad2Deg,
+                        0f);
+                }
+                return;
+            }
+#endif
             if (GetMouseButtonDown(0) && !ShouldIgnoreInput())
             {
                 m_DragPending = true;
@@ -150,6 +177,53 @@ namespace DisplayXR
                     0f);
             }
         }
+
+        // --- Shell mode mouse input (bypasses Input System entirely) ---
+        // Unity reads mouse buttons from legacy WM_LBUTTONDOWN which only goes
+        // to the foreground window. In shell mode we read button state directly
+        // from the native WM_INPUT tracker via P/Invoke.
+#if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
+        private static bool s_shellModeChecked;
+        private static bool s_shellMode;
+        private static int s_shellButtonsPrev;
+        private static int s_shellButtonsCurr;
+
+        private static bool IsShellMode()
+        {
+            if (!s_shellModeChecked)
+            {
+                s_shellMode = DisplayXRNative.displayxr_is_shell_mode() != 0;
+                s_shellModeChecked = true;
+            }
+            return s_shellMode;
+        }
+
+        /// Call once per frame (from Update) to snapshot shell button state.
+        private static void UpdateShellMouse()
+        {
+            if (!IsShellMode()) return;
+            s_shellButtonsPrev = s_shellButtonsCurr;
+            DisplayXRNative.displayxr_get_shell_mouse_state(
+                out s_shellButtonsCurr, out _, out _);
+        }
+
+        private static bool ShellGetMouseButtonDown(int b)
+        {
+            int mask = 1 << b;
+            return (s_shellButtonsCurr & mask) != 0 && (s_shellButtonsPrev & mask) == 0;
+        }
+
+        private static bool ShellGetMouseButtonUp(int b)
+        {
+            int mask = 1 << b;
+            return (s_shellButtonsCurr & mask) == 0 && (s_shellButtonsPrev & mask) != 0;
+        }
+
+        private static bool ShellGetMouseButton(int b)
+        {
+            return (s_shellButtonsCurr & (1 << b)) != 0;
+        }
+#endif
 
         private void HandleKeyboardMovement()
         {
@@ -260,14 +334,24 @@ namespace DisplayXR
             Keyboard.current != null && Keyboard.current[ToKey(k)].isPressed;
         private static bool GetKeyDown(KeyCode k) =>
             Keyboard.current != null && Keyboard.current[ToKey(k)].wasPressedThisFrame;
-        private static bool GetMouseButtonDown(int b) =>
-            Mouse.current != null && (b == 0 ? Mouse.current.leftButton.wasPressedThisFrame
-            : b == 1 ? Mouse.current.rightButton.wasPressedThisFrame
-            : Mouse.current.middleButton.wasPressedThisFrame);
-        private static bool GetMouseButtonUp(int b) =>
-            Mouse.current != null && (b == 0 ? Mouse.current.leftButton.wasReleasedThisFrame
-            : b == 1 ? Mouse.current.rightButton.wasReleasedThisFrame
-            : Mouse.current.middleButton.wasReleasedThisFrame);
+        private static bool GetMouseButtonDown(int b)
+        {
+#if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
+            if (IsShellMode()) return ShellGetMouseButtonDown(b);
+#endif
+            return Mouse.current != null && (b == 0 ? Mouse.current.leftButton.wasPressedThisFrame
+                : b == 1 ? Mouse.current.rightButton.wasPressedThisFrame
+                : Mouse.current.middleButton.wasPressedThisFrame);
+        }
+        private static bool GetMouseButtonUp(int b)
+        {
+#if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
+            if (IsShellMode()) return ShellGetMouseButtonUp(b);
+#endif
+            return Mouse.current != null && (b == 0 ? Mouse.current.leftButton.wasReleasedThisFrame
+                : b == 1 ? Mouse.current.rightButton.wasReleasedThisFrame
+                : Mouse.current.middleButton.wasReleasedThisFrame);
+        }
         private static Vector2 GetMousePosition() =>
             Mouse.current != null ? Mouse.current.position.ReadValue() : Vector2.zero;
         private static float GetScrollDelta() =>
