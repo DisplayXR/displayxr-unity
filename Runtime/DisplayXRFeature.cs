@@ -207,8 +207,13 @@ namespace DisplayXR
                 // Kill native poll forwarding BEFORE Deinitialize() starts.
                 // This is the primary crash prevention — once set, hooked_xrPollEvent
                 // returns XR_EVENT_UNAVAILABLE without touching the runtime.
-                Debug.Log("[DisplayXR] ExitingPlayMode: killing poll + closing Game Views");
+                Debug.Log("[DisplayXR] ExitingPlayMode: killing poll + destroying preview window + closing Game Views");
                 try { DisplayXRNative.displayxr_stop_polling(); }
+                catch (System.Exception) { }
+
+                // Destroy the preview window before XR teardown.
+                // The compositor may block if it still references the window.
+                try { DisplayXRNative.displayxr_destroy_preview_window(); }
                 catch (System.Exception) { }
 
                 // Close all Game View windows synchronously. Game View's

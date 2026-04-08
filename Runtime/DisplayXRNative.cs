@@ -146,6 +146,13 @@ namespace DisplayXR
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern void displayxr_stop_polling();
 
+        /// <summary>
+        /// Destroy the editor preview window. Call before XR teardown to
+        /// prevent the compositor from blocking on a stale window.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void displayxr_destroy_preview_window();
+
         // ====================================================================
         // Standalone preview session (bypasses Unity's OpenXR loader)
         // ====================================================================

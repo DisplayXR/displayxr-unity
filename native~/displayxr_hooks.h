@@ -134,6 +134,10 @@ DISPLAYXR_EXPORT void displayxr_set_canvas_rect(
 /// teardown to prevent use-after-free when the runtime is unloaded.
 DISPLAYXR_EXPORT void displayxr_stop_polling(void);
 
+/// Destroy the editor preview window (if one exists).
+/// Call from C# before XR teardown to prevent the compositor from blocking.
+DISPLAYXR_EXPORT void displayxr_destroy_preview_window(void);
+
 #ifdef __cplusplus
 }
 #endif
