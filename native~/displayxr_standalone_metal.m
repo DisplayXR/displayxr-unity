@@ -36,22 +36,20 @@ static volatile int s_sa_window_closed = 0;
 	s_sa_view = nil;
 }
 
-- (void)windowDidEndLiveResize:(NSNotification *)notification
+// Post a synthetic mouseUp to Unity's window to clear stale mouse button state.
+// Called at the START of window move/resize to prevent camera rotation during drag,
+// and at the END to clear any residual state.
+static void postMouseUpToUnity(void)
 {
-	// After a live resize drag, the mouseUp event goes to OUR window, not Unity's.
-	// Unity's input system misses the release → Input.GetMouseButton(0) stays true
-	// → DisplayXRInputController thinks user is dragging (camera rotates).
-	// Post a synthetic mouseUp to Unity's key window to clear the stale state.
-	NSWindow *unityWindow = nil;
-	for (NSWindow *w in [[NSApplication sharedApplication] windows]) {
-		if (w != s_sa_window && [w isVisible] && [w isKeyWindow]) {
-			unityWindow = w;
-			break;
+	NSWindow *unityWindow = [[NSApplication sharedApplication] mainWindow];
+	if (!unityWindow || unityWindow == s_sa_window) {
+		// Fallback: find first visible non-preview window
+		for (NSWindow *w in [[NSApplication sharedApplication] windows]) {
+			if (w != s_sa_window && [w isVisible]) {
+				unityWindow = w;
+				break;
+			}
 		}
-	}
-	if (!unityWindow) {
-		// Fallback: main window
-		unityWindow = [[NSApplication sharedApplication] mainWindow];
 	}
 	if (unityWindow) {
 		NSEvent *fakeUp = [NSEvent mouseEventWithType:NSEventTypeLeftMouseUp
@@ -65,6 +63,31 @@ static volatile int s_sa_window_closed = 0;
 		                                     pressure:0.0];
 		[unityWindow sendEvent:fakeUp];
 	}
+}
+
+- (void)windowWillStartLiveResize:(NSNotification *)notification
+{
+	// Clear Unity's mouse button state at the START of resize drag
+	// so InputController doesn't interpret resize mouse delta as camera rotation.
+	postMouseUpToUnity();
+}
+
+- (void)windowDidEndLiveResize:(NSNotification *)notification
+{
+	// Also clear at end, in case Unity picked up the button state again.
+	postMouseUpToUnity();
+}
+
+- (void)windowWillMove:(NSNotification *)notification
+{
+	// Clear Unity's mouse button state when window starts moving.
+	postMouseUpToUnity();
+}
+
+- (void)windowDidMove:(NSNotification *)notification
+{
+	// Also clear at end of move.
+	postMouseUpToUnity();
 }
 
 @end
