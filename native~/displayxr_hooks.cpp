@@ -1222,19 +1222,20 @@ displayxr_install_hooks(PFN_xrGetInstanceProcAddr next_gipa)
 {
 	displayxr_log( "[DisplayXR] install_hooks called (new instance lifecycle)\n");
 
-	// Clear deferred session/instance destruction from the previous lifecycle.
+	// Execute deferred session/instance destruction from the previous lifecycle.
 	// These were deferred because Unity's loader calls xrPollEvent after
 	// xrDestroyInstance through dispatch trampolines that reference runtime memory.
-	// We do NOT call the saved destroy functions here — Unity has already called
-	// Internal_UnloadOpenXRLibrary() (dlclose) between play sessions, so the
-	// saved function pointers are dangling. The runtime cleans up via dlclose.
-	if (s_deferred_destroy_session != XR_NULL_HANDLE) {
-		displayxr_log( "[DisplayXR] Clearing deferred xrDestroySession (runtime was unloaded by Unity)\n");
+	// The runtime is pinned via RTLD_NODELETE, so the function pointers are still
+	// valid and we MUST call them to clean up the runtime's internal state.
+	if (s_deferred_destroy_session != XR_NULL_HANDLE && s_deferred_destroy_session_fn != nullptr) {
+		displayxr_log("[DisplayXR] Executing deferred xrDestroySession\n");
+		s_deferred_destroy_session_fn(s_deferred_destroy_session);
 		s_deferred_destroy_session = XR_NULL_HANDLE;
 		s_deferred_destroy_session_fn = nullptr;
 	}
-	if (s_deferred_destroy_instance != XR_NULL_HANDLE) {
-		displayxr_log( "[DisplayXR] Clearing deferred xrDestroyInstance (runtime was unloaded by Unity)\n");
+	if (s_deferred_destroy_instance != XR_NULL_HANDLE && s_deferred_destroy_instance_fn != nullptr) {
+		displayxr_log("[DisplayXR] Executing deferred xrDestroyInstance\n");
+		s_deferred_destroy_instance_fn(s_deferred_destroy_instance);
 		s_deferred_destroy_instance = XR_NULL_HANDLE;
 		s_deferred_destroy_instance_fn = nullptr;
 	}
