@@ -59,6 +59,61 @@ namespace DisplayXR
 
         private bool m_HooksInstalled;
 
+#if UNITY_EDITOR
+        // Camera suppression: prevent Game View from rendering XR cameras
+        // during Play Mode. Output goes to the runtime's own preview window.
+        // Without this, the Game View's RenderPlayModeViewCamerasInternal
+        // crashes during XR teardown.
+        private struct SuppressedCamera
+        {
+            public Camera camera;
+            public int cullingMask;
+            public CameraClearFlags clearFlags;
+            public Color backgroundColor;
+        }
+        private static System.Collections.Generic.List<SuppressedCamera> s_SuppressedCameras
+            = new System.Collections.Generic.List<SuppressedCamera>();
+        private static bool s_CamerasSuppressed;
+
+        private static void SuppressAllCameras()
+        {
+            if (s_CamerasSuppressed) return;
+            s_SuppressedCameras.Clear();
+
+            foreach (var cam in Camera.allCameras)
+            {
+                if (cam == null) continue;
+                s_SuppressedCameras.Add(new SuppressedCamera
+                {
+                    camera = cam,
+                    cullingMask = cam.cullingMask,
+                    clearFlags = cam.clearFlags,
+                    backgroundColor = cam.backgroundColor,
+                });
+                cam.cullingMask = 0;
+                cam.clearFlags = CameraClearFlags.SolidColor;
+                cam.backgroundColor = Color.black;
+            }
+            s_CamerasSuppressed = true;
+            Debug.Log($"[DisplayXR] Suppressed {s_SuppressedCameras.Count} cameras for XR preview window");
+        }
+
+        private static void RestoreAllCameras()
+        {
+            if (!s_CamerasSuppressed) return;
+            foreach (var sc in s_SuppressedCameras)
+            {
+                if (sc.camera == null) continue;
+                sc.camera.cullingMask = sc.cullingMask;
+                sc.camera.clearFlags = sc.clearFlags;
+                sc.camera.backgroundColor = sc.backgroundColor;
+            }
+            s_SuppressedCameras.Clear();
+            s_CamerasSuppressed = false;
+            Debug.Log("[DisplayXR] Restored camera rendering");
+        }
+#endif
+
         // ====================================================================
         // OpenXR Feature lifecycle
         // ====================================================================
@@ -167,6 +222,13 @@ namespace DisplayXR
                 RefreshDisplayInfo();
             }
 
+#if UNITY_EDITOR
+            // Suppress scene camera rendering in Play Mode.
+            // Output goes to the runtime's own preview window — the Game View
+            // doesn't need to render XR cameras. Suppressing prevents the
+            // RenderPlayModeViewCamerasInternal crash during XR teardown.
+            SuppressAllCameras();
+#endif
         }
 
         /// <inheritdoc />
@@ -180,6 +242,10 @@ namespace DisplayXR
             // pointer so our hook returns XR_EVENT_UNAVAILABLE immediately.
             try { DisplayXRNative.displayxr_stop_polling(); }
             catch (System.Exception e) { Debug.LogWarning($"[DisplayXR] stop_polling: {e.Message}"); }
+
+#if UNITY_EDITOR
+            RestoreAllCameras();
+#endif
 
             Debug.Log("[DisplayXR] OnSessionDestroy END");
         }
