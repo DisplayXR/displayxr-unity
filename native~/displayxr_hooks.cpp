@@ -651,7 +651,7 @@ hooked_xrCreateSession(XrInstance instance, const XrSessionCreateInfo *createInf
 			} else {
 				win_binding.readbackCallback = displayxr_readback_callback;
 				win_binding.readbackUserdata = nullptr;
-				win_binding.sharedTextureHandle = state->shared_d3d_handle;
+				win_binding.sharedTextureHandle = nullptr;
 			}
 
 			displayxr_log( "[DisplayXR] Injecting win32 window binding: windowHandle=%p, sharedTextureHandle=%p\n",

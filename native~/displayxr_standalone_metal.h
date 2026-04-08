@@ -50,6 +50,10 @@ float displayxr_sa_metal_get_backing_scale(void);
 int displayxr_sa_metal_get_window_rect(int32_t *out_x, int32_t *out_y,
                                         uint32_t *out_w, uint32_t *out_h);
 
+/// Returns 1 if the user closed the preview window, 0 otherwise.
+/// Resets the flag after reading.
+int displayxr_sa_metal_window_was_closed(void);
+
 #ifdef __cplusplus
 }
 #endif
