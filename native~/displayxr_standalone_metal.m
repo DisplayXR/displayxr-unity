@@ -64,6 +64,7 @@ displayxr_sa_metal_create_window(uint32_t width, uint32_t height)
 		                                              defer:NO];
 		[s_sa_window setTitle:@"DisplayXR Preview"];
 		[s_sa_window setReleasedWhenClosed:NO];
+		[s_sa_window setMovableByWindowBackground:NO];
 
 		// Set delegate to detect user closing the window
 		s_sa_window_delegate = [[DisplayXRSAWindowDelegate alloc] init];
