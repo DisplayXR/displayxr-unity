@@ -710,16 +710,8 @@ hooked_xrDestroySession(XrSession session)
 	s_session_alive = 0;
 	s_local_space = XR_NULL_HANDLE;
 
-	// Destroy the editor preview window (if created by the hook chain)
-#if defined(__APPLE__)
-	{
-		DisplayXRState *state = displayxr_get_state();
-		if (state->editor_mode) {
-			displayxr_metal_destroy_preview_window();
-			state->window_handle = nullptr;
-		}
-	}
-#endif
+	// NOTE: Do NOT destroy the preview window here — the runtime may still
+	// reference it via the compositor. Defer to hooked_xrDestroyInstance.
 
 	// Defer the real destroy — Unity calls xrPollEvent after xrDestroyInstance,
 	// and its dispatch trampolines reference runtime session/compositor objects.
@@ -1045,6 +1037,18 @@ hooked_xrDestroyInstance(XrInstance instance)
 {
 	displayxr_log( "[DisplayXR] xrDestroyInstance BEGIN (DEFERRED)\n");
 	s_instance_alive = 0;
+
+	// Destroy the editor preview window (if created by the hook chain).
+	// Safe here because the XR session and compositor are being torn down.
+#if defined(__APPLE__)
+	{
+		DisplayXRState *state = displayxr_get_state();
+		if (state->editor_mode) {
+			displayxr_metal_destroy_preview_window();
+			state->window_handle = nullptr;
+		}
+	}
+#endif
 
 	// Defer the real destroy — Unity's OpenXR loader calls xrPollEvent AFTER
 	// xrDestroyInstance returns, through JIT-generated dispatch trampolines that
