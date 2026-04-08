@@ -17,6 +17,28 @@ static id<MTLDevice> s_sa_device = nil;
 static id<MTLCommandQueue> s_sa_queue = nil;
 static id<MTLRenderPipelineState> s_sa_blit_pipeline = nil;
 static int s_sa_blit_log_once = 0;
+static volatile int s_sa_window_closed = 0;
+
+// ============================================================================
+// Window delegate — detect user closing the preview window
+// ============================================================================
+
+@interface DisplayXRSAWindowDelegate : NSObject <NSWindowDelegate>
+@end
+
+@implementation DisplayXRSAWindowDelegate
+
+- (void)windowWillClose:(NSNotification *)notification
+{
+	fprintf(stderr, "[DisplayXR-SA] Preview window closed by user\n");
+	s_sa_window_closed = 1;
+	s_sa_window = nil;
+	s_sa_view = nil;
+}
+
+@end
+
+static DisplayXRSAWindowDelegate *s_sa_window_delegate = nil;
 
 // ============================================================================
 // Window creation/destruction
@@ -26,6 +48,7 @@ int
 displayxr_sa_metal_create_window(uint32_t width, uint32_t height)
 {
 	displayxr_sa_metal_destroy_window();
+	s_sa_window_closed = 0;
 
 	// Create on the main thread (AppKit requirement)
 	dispatch_block_t create = ^{
@@ -41,6 +64,10 @@ displayxr_sa_metal_create_window(uint32_t width, uint32_t height)
 		                                              defer:NO];
 		[s_sa_window setTitle:@"DisplayXR Preview"];
 		[s_sa_window setReleasedWhenClosed:NO];
+
+		// Set delegate to detect user closing the window
+		s_sa_window_delegate = [[DisplayXRSAWindowDelegate alloc] init];
+		[s_sa_window setDelegate:s_sa_window_delegate];
 
 		// Layer-backed view so the runtime can add a CAMetalLayer overlay
 		s_sa_view = [[NSView alloc] initWithFrame:frame];
@@ -60,6 +87,14 @@ displayxr_sa_metal_create_window(uint32_t width, uint32_t height)
 	}
 
 	return (s_sa_window != nil) ? 1 : 0;
+}
+
+int
+displayxr_sa_metal_window_was_closed(void)
+{
+	int closed = s_sa_window_closed;
+	s_sa_window_closed = 0;
+	return closed;
 }
 
 void

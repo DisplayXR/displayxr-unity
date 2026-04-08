@@ -139,6 +139,10 @@ DISPLAYXR_EXPORT void displayxr_standalone_get_eye_positions(
 /// Returns 2.0 on macOS Retina, 1.0 on non-Retina or non-macOS.
 DISPLAYXR_EXPORT float displayxr_get_backing_scale_factor(void);
 
+/// Returns 1 if the user closed the preview window, 0 otherwise.
+/// Resets the flag after reading.
+DISPLAYXR_EXPORT int displayxr_standalone_window_was_closed(void);
+
 /// Get atlas swapchain dimensions (for creating matching RenderTextures in C#).
 DISPLAYXR_EXPORT void displayxr_standalone_get_swapchain_size(
     uint32_t *width, uint32_t *height);

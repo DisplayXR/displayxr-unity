@@ -1814,6 +1814,17 @@ displayxr_get_backing_scale_factor(void)
 }
 
 
+int
+displayxr_standalone_window_was_closed(void)
+{
+#if defined(__APPLE__)
+	return displayxr_sa_metal_window_was_closed();
+#else
+	return 0;
+#endif
+}
+
+
 // displayxr_standalone_set_canvas_rect has been removed — the runtime
 // manages its own window and determines canvas rect from the window size.
 
