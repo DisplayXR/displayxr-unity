@@ -13,7 +13,7 @@ The plugin works with the **openxr-3d-display** runtime ([dfattal/openxr-3d-disp
 This repo root IS the UPM package root (`package.json` is at the top level).
 
 ```
-unity-3d-display/              # repo root = UPM package root
+displayxr-unity/               # repo root = UPM package root
 ├── package.json               # UPM manifest
 ├── Runtime/                   # C# runtime scripts + native plugin binaries
 │   ├── *.cs                   # MonoBehaviours and OpenXR Feature
@@ -161,25 +161,21 @@ Extension struct definitions in `native~/displayxr_extensions.h` must match the 
 
 ## CI and Releases
 
-### Dual-repo setup
+### Repository
 
-This repo is mirrored to two GitHub remotes that must be kept in sync:
+| Remote | URL |
+|--------|-----|
+| `origin` | `https://github.com/DisplayXR/displayxr-unity.git` |
 
-| Remote | URL | Purpose |
-|--------|-----|---------|
-| `origin` | `https://github.com/dfattal/unity-3d-display.git` | Personal / development |
-| `displayxr` | `https://github.com/DisplayXR/displayxr-unity.git` | Org / public-facing install URL |
-
-**Every commit, tag, and release must be pushed to BOTH remotes.** The DisplayXR org repo is the canonical install URL for users. Without pushing to both, the repos diverge and UPM installs break.
+> **History:** This repo was transferred from `dfattal/unity-3d-display` to `DisplayXR/displayxr-unity`. GitHub redirects the old URL.
 
 ### Day-to-day: just push to main
 Every push to `main` that touches `native~/` triggers `build-native.yml`, which builds the DLL (Windows x64) and bundle (macOS Universal) and uploads them as CI artifacts. No tags, no releases. Artifacts are available for 90 days.
 
 C#-only changes don't trigger the workflow (path filter).
 
-**Always push to both remotes:**
 ```bash
-git push origin HEAD && git push displayxr HEAD
+git push origin HEAD
 ```
 
 ### Creating a release (when ready)
@@ -190,12 +186,12 @@ Releases are triggered **only** by manually pushing a `v*` tag. The `upm` branch
 # 2. Bump version in package.json
 # 3. Update CHANGELOG.md with release notes
 # 4. Commit the version bump
-# 5. Tag and push to BOTH remotes:
+# 5. Tag and push:
 git tag v0.1.0
-git push origin main v0.1.0 && git push displayxr main v0.1.0
+git push origin main v0.1.0
 ```
 
-This triggers the `release` job in CI **on both repos**, which:
+This triggers the `release` job in CI, which:
 - Builds both platform binaries
 - Creates a `.tgz` UPM tarball with binaries included
 - Pushes a `upm` branch with binaries committed (for git URL installs)
@@ -203,13 +199,12 @@ This triggers the `release` job in CI **on both repos**, which:
 - Publishes a GitHub Release with changelog notes and the `.tgz` attached
 
 ### Fixing a bad release
-Tags are cheap and deletable — fix on **both** remotes:
+Tags are cheap and deletable:
 ```bash
 git tag -d v0.1.0                         # delete local
 git push origin :refs/tags/v0.1.0         # delete on origin
-git push displayxr :refs/tags/v0.1.0      # delete on displayxr
-# delete GitHub Releases in the web UI on both repos
-# fix the issue, then re-tag and push to both
+# delete GitHub Release in the web UI
+# fix the issue, then re-tag and push
 ```
 
 ### Install paths for users

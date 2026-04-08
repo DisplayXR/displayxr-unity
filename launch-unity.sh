@@ -3,14 +3,14 @@
 # Usage: ./launch-unity.sh [project-path]
 #
 # Package path in test project points to:
-#   /Users/david.fattal/Documents/GitHub/unity-3d-display
+#   /Users/david.fattal/Documents/GitHub/displayxr-unity
 #
 # Logs:
 #   stderr (native plugin [DisplayXR] + runtime) → displayxr.log (in this directory)
 #   Unity Editor.log → ~/Library/Logs/Unity/Editor.log
 #
 # In a second terminal, run:
-#   tail -f /Users/david.fattal/Documents/GitHub/unity-3d-display/displayxr.log
+#   tail -f /Users/david.fattal/Documents/GitHub/displayxr-unity/displayxr.log
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT="${1:-/Users/david.fattal/Documents/Unity/DisplayXR-test}"

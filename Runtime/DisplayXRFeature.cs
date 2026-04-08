@@ -26,7 +26,7 @@ namespace DisplayXR
         Desc = "Enables stereo rendering on 3D light field displays via DisplayXR OpenXR runtime. " +
                "Provides Kooima asymmetric frustum projection, display-centric and camera-centric " +
                "stereo rig modes, and 2D UI overlay support.",
-        DocumentationLink = "https://github.com/dfattal/unity-3d-display",
+        DocumentationLink = "https://github.com/DisplayXR/displayxr-unity",
         OpenxrExtensionStrings = ExtensionStrings,
         Version = "0.1.0",
         FeatureId = FeatureId

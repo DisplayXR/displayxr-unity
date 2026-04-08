@@ -14,12 +14,12 @@
   ],
   "author": {
     "name": "DisplayXR contributors",
-    "url": "https://github.com/dfattal/unity-3d-display"
+    "url": "https://github.com/DisplayXR/displayxr-unity"
   },
   "license": "ISC",
   "repository": {
     "type": "git",
-    "url": "https://github.com/dfattal/unity-3d-display.git"
+    "url": "https://github.com/DisplayXR/displayxr-unity.git"
   },
   "dependencies": {
     "com.unity.xr.openxr": "1.16.1",

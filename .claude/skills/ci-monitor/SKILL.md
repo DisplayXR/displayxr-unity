@@ -73,12 +73,12 @@ Before launching the subagent, determine the related GitHub issue number:
 Pass this complete prompt to the subagent (replace `[USER_MESSAGE]` with the user's commit message or "auto-generate", `[FILES_TO_COMMIT]` with the file list or "AUTO", and `[ISSUE_REF]` with the issue number or "NONE"):
 
 ```
-Execute the unity-3d-display ci-monitor workflow. You have access to Edit and Write tools to fix build errors.
+Execute the displayxr-unity ci-monitor workflow. You have access to Edit and Write tools to fix build errors.
 
-Working directory: /Users/david.fattal/Documents/GitHub/unity-3d-display
+Working directory: /Users/david.fattal/Documents/GitHub/displayxr-unity
 
 ## Configuration
-- Repository: dfattal/unity-3d-display (DisplayXR Unity plugin)
+- Repository: DisplayXR/displayxr-unity (DisplayXR Unity plugin)
 - Workflow: build-native.yml
 - Jobs: build-windows (Windows x64, MSVC), build-macos (macOS Universal, Apple Clang)
 - Artifact Names: displayxr_unity-windows-x64, displayxr_unity-macos, displayxr-unity-plugin
@@ -103,7 +103,7 @@ NEVER use `git add -A` or `git add .` under any circumstances.
 ## PHASE 1: COMMIT AND PUSH
 
 ### Step 1.1: Pre-flight Check
-Run: `cd /Users/david.fattal/Documents/GitHub/unity-3d-display && git status`
+Run: `cd /Users/david.fattal/Documents/GitHub/displayxr-unity && git status`
 - If no changes to commit, report "Nothing to commit" and STOP.
 - Otherwise, continue to Step 1.2.
 
@@ -112,13 +112,13 @@ Run: `cd /Users/david.fattal/Documents/GitHub/unity-3d-display && git status`
 **If the "Files to Commit" section above contains a file list (not "AUTO"):**
 - Stage ONLY those specific files:
   ```bash
-  cd /Users/david.fattal/Documents/GitHub/unity-3d-display && git add path/to/file1 path/to/file2 ...
+  cd /Users/david.fattal/Documents/GitHub/displayxr-unity && git add path/to/file1 path/to/file2 ...
   ```
 
 **If "Files to Commit" is "AUTO" or empty/missing (fallback):**
 - Snapshot the currently dirty files RIGHT NOW to prevent drift during build monitoring:
   ```bash
-  cd /Users/david.fattal/Documents/GitHub/unity-3d-display && git status --short | awk '{print $NF}'
+  cd /Users/david.fattal/Documents/GitHub/displayxr-unity && git status --short | awk '{print $NF}'
   ```
 - Store this list, then stage ONLY those files:
   ```bash
@@ -140,7 +140,7 @@ If the issue reference is "NONE", omit it.
 
 Run:
 ```bash
-cd /Users/david.fattal/Documents/GitHub/unity-3d-display && git commit -m "$(cat <<'EOF'
+cd /Users/david.fattal/Documents/GitHub/displayxr-unity && git commit -m "$(cat <<'EOF'
 [YOUR COMMIT MESSAGE HERE (with issue ref if applicable)]
 
 Co-Authored-By: Claude Opus 4.6 <noreply@anthropic.com>
@@ -160,11 +160,10 @@ If no native files changed, report to the user:
 "Pushed successfully, but no native code changed — the build-native.yml workflow won't trigger. Only C# and editor changes were committed."
 Then STOP (no build to monitor).
 
-### Step 1.6: Push to Both Remotes
-Run: `cd /Users/david.fattal/Documents/GitHub/unity-3d-display && git push origin HEAD && git push displayxr HEAD`
+### Step 1.6: Push
+Run: `cd /Users/david.fattal/Documents/GitHub/displayxr-unity && git push origin HEAD`
 - Note the branch name from output
-- If push to origin fails, report the error and STOP
-- If push to displayxr fails, report a warning but continue (origin is primary)
+- If push fails, report the error and STOP
 
 ---
 
@@ -179,7 +178,7 @@ Run: `sleep 10`
 
 Run this command to find runs and check their commit SHA:
 ```bash
-gh run list -R dfattal/unity-3d-display --limit 5 --json databaseId,status,headBranch,headSha,displayTitle
+gh run list -R DisplayXR/displayxr-unity --limit 5 --json databaseId,status,headBranch,headSha,displayTitle
 ```
 
 **Verification loop:**
@@ -190,10 +189,10 @@ gh run list -R dfattal/unity-3d-display --limit 5 --json databaseId,status,headB
 Once you find the matching run, store its `databaseId` as RUN_ID.
 
 ### Step 2.3: Watch Build
-Run: `gh run watch -R dfattal/unity-3d-display RUN_ID --interval 15` (use timeout 600000ms = 10 min)
+Run: `gh run watch -R DisplayXR/displayxr-unity RUN_ID --interval 15` (use timeout 600000ms = 10 min)
 
 ### Step 2.4: Check Result
-Run: `gh run view -R dfattal/unity-3d-display RUN_ID --json status,conclusion`
+Run: `gh run view -R DisplayXR/displayxr-unity RUN_ID --json status,conclusion`
 - If conclusion is "success": Go to PHASE 4 (Report Success)
 - If conclusion is "failure": Go to PHASE 3 (Diagnose and Fix)
 - If status is still "in_progress": The watch command may have timed out, check again
@@ -208,12 +207,12 @@ Track: fix_files_modified = [] (append every file path you modify with Edit/Writ
 ### Step 3.1: Get Error Logs
 The build has two jobs. Check which failed:
 ```bash
-gh run view -R dfattal/unity-3d-display RUN_ID --json jobs --jq '.jobs[] | select(.conclusion == "failure") | .name'
+gh run view -R DisplayXR/displayxr-unity RUN_ID --json jobs --jq '.jobs[] | select(.conclusion == "failure") | .name'
 ```
 
 Then get the failed logs:
 ```bash
-gh run view -R dfattal/unity-3d-display RUN_ID --log-failed | tail -200
+gh run view -R DisplayXR/displayxr-unity RUN_ID --log-failed | tail -200
 ```
 Save the output for analysis.
 
@@ -288,7 +287,7 @@ Could not find a package configuration file provided by
 1. Extract the missing filename from error
 2. Search for the file in the native~/ source:
    ```bash
-   find /Users/david.fattal/Documents/GitHub/unity-3d-display/native~ -name "FILENAME" 2>/dev/null
+   find /Users/david.fattal/Documents/GitHub/displayxr-unity/native~ -name "FILENAME" 2>/dev/null
    ```
 3. If file exists:
    - Check the include path in the failing file
@@ -303,7 +302,7 @@ Could not find a package configuration file provided by
 1. Extract the identifier name from error
 2. Search for where it's defined:
    ```bash
-   grep -rn "IDENTIFIER" /Users/david.fattal/Documents/GitHub/unity-3d-display/native~/ --include="*.h"
+   grep -rn "IDENTIFIER" /Users/david.fattal/Documents/GitHub/displayxr-unity/native~/ --include="*.h"
    ```
 3. If found in a header:
    - Use Edit tool to add the missing #include to the failing file
@@ -317,7 +316,7 @@ Could not find a package configuration file provided by
 1. Extract struct/class name and member name from error
 2. Find the struct definition:
    ```bash
-   grep -rn "struct StructName" /Users/david.fattal/Documents/GitHub/unity-3d-display/native~/ --include="*.h" -A 50
+   grep -rn "struct StructName" /Users/david.fattal/Documents/GitHub/displayxr-unity/native~/ --include="*.h" -A 50
    ```
 3. Check what members actually exist
 4. Use Edit tool to:
@@ -330,7 +329,7 @@ Could not find a package configuration file provided by
 1. Extract the function name from error
 2. Check if function is declared but not implemented:
    ```bash
-   grep -rn "function_name" /Users/david.fattal/Documents/GitHub/unity-3d-display/native~/ --include="*.c" --include="*.cpp" --include="*.h"
+   grep -rn "function_name" /Users/david.fattal/Documents/GitHub/displayxr-unity/native~/ --include="*.c" --include="*.cpp" --include="*.h"
    ```
 3. If implementation is missing:
    - Find where it should be implemented (look at similar functions)
@@ -344,7 +343,7 @@ Could not find a package configuration file provided by
 
 1. Find all definitions:
    ```bash
-   grep -rn "SYMBOL_NAME" /Users/david.fattal/Documents/GitHub/unity-3d-display/native~/ --include="*.h" --include="*.c" --include="*.cpp"
+   grep -rn "SYMBOL_NAME" /Users/david.fattal/Documents/GitHub/displayxr-unity/native~/ --include="*.h" --include="*.c" --include="*.cpp"
    ```
 2. Identify the issue type:
 
@@ -374,13 +373,13 @@ Could not find a package configuration file provided by
 
 Stage ONLY the files you modified during this fix attempt (from your `fix_files_modified` list):
 ```bash
-cd /Users/david.fattal/Documents/GitHub/unity-3d-display && git add path/to/fixed_file1 path/to/fixed_file2 ...
+cd /Users/david.fattal/Documents/GitHub/displayxr-unity && git add path/to/fixed_file1 path/to/fixed_file2 ...
 ```
 **NEVER use `git add -A` or `git add .`** — only stage files you directly edited with Edit/Write tools.
 
 Then commit:
 ```bash
-cd /Users/david.fattal/Documents/GitHub/unity-3d-display && git commit -m "$(cat <<'EOF'
+cd /Users/david.fattal/Documents/GitHub/displayxr-unity && git commit -m "$(cat <<'EOF'
 Fix: [brief description of what was fixed]
 
 Auto-fix attempt fix_attempt/3
@@ -390,8 +389,8 @@ EOF
 )"
 ```
 
-### Step 3.6: Push the Fix to Both Remotes
-Run: `cd /Users/david.fattal/Documents/GitHub/unity-3d-display && git push origin HEAD && git push displayxr HEAD`
+### Step 3.6: Push the Fix
+Run: `cd /Users/david.fattal/Documents/GitHub/displayxr-unity && git push origin HEAD`
 
 ### Step 3.7: Re-monitor
 - Increment fix_attempt
@@ -410,9 +409,9 @@ The CI builds the Windows DLL with MSVC — this is the canonical binary for the
 Download it and place it in the correct location:
 
 ```bash
-cd /Users/david.fattal/Documents/GitHub/unity-3d-display
+cd /Users/david.fattal/Documents/GitHub/displayxr-unity
 rm -rf /tmp/displayxr-ci-artifacts
-gh run download -R dfattal/unity-3d-display RUN_ID -n displayxr_unity-windows-x64 -D /tmp/displayxr-ci-artifacts
+gh run download -R DisplayXR/displayxr-unity RUN_ID -n displayxr_unity-windows-x64 -D /tmp/displayxr-ci-artifacts
 ```
 
 Then copy the DLL to the plugin directory:
@@ -434,7 +433,7 @@ rm -rf /tmp/displayxr-ci-artifacts
 
 ### Step 4.2: Report
 
-Run: `gh run view -R dfattal/unity-3d-display RUN_ID --json conclusion,databaseId,url,updatedAt`
+Run: `gh run view -R DisplayXR/displayxr-unity RUN_ID --json conclusion,databaseId,url,updatedAt`
 
 Report:
 ```

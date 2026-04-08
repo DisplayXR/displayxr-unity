@@ -6,7 +6,7 @@
 #   stdout/stderr → displayxr-app.log (in this directory)
 #
 # In a second terminal, run:
-#   tail -f /Users/david.fattal/Documents/GitHub/unity-3d-display/displayxr-app.log
+#   tail -f /Users/david.fattal/Documents/GitHub/displayxr-unity/displayxr-app.log
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 APP="${1:-/Users/david.fattal/Documents/Unity/DisplayXR-test/CubeTest.app}"

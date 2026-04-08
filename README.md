@@ -66,14 +66,14 @@ The plugin works by hooking `xrLocateViews` before Unity sees the results, repla
 Clone and build the native plugin, then add the package from disk:
 
 ```bash
-git clone https://github.com/dfattal/unity-3d-display.git
-cd unity-3d-display/native~
+git clone https://github.com/DisplayXR/displayxr-unity.git
+cd displayxr-unity/native~
 mkdir build && cd build
 cmake .. -DCMAKE_BUILD_TYPE=Release    # on Windows, add: -A x64
 cmake --build . --config Release
 ```
 
-In Unity: **Window > Package Manager > + > Add package from disk...** → select `unity-3d-display/package.json`.
+In Unity: **Window > Package Manager > + > Add package from disk...** → select `displayxr-unity/package.json`.
 
 ### Option B: From Git URL (after a release)
 
@@ -87,16 +87,16 @@ In Unity: **Window > Package Manager > + > Add package from disk...** → select
 2. Click **+** > **Add package from git URL...**
 3. Enter:
    ```
-   https://github.com/dfattal/unity-3d-display.git#upm
+   https://github.com/DisplayXR/displayxr-unity.git#upm
    ```
    This installs from the `upm` branch which includes pre-built native binaries. To pin a specific version:
    ```
-   https://github.com/dfattal/unity-3d-display.git#upm/v0.1.0
+   https://github.com/DisplayXR/displayxr-unity.git#upm/v0.1.0
    ```
 
 ### Option C: From Release Tarball
 
-1. Download the `.tgz` file from the [latest release](https://github.com/dfattal/unity-3d-display/releases)
+1. Download the `.tgz` file from the [latest release](https://github.com/DisplayXR/displayxr-unity/releases)
 2. In Unity: **Window > Package Manager**
 3. Click **+** > **Add package from tarball...**
 4. Select the downloaded `.tgz` file
