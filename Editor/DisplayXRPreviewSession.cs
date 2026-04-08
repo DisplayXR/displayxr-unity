@@ -327,12 +327,16 @@ namespace DisplayXR.Editor
             }
 
             // Check if user closed the native preview window
-            if (DisplayXRNative.displayxr_standalone_window_was_closed() != 0)
+            try
             {
-                Debug.Log("[DisplayXR-SA] Preview window closed by user — stopping session");
-                Stop();
-                return;
+                if (DisplayXRNative.displayxr_standalone_window_was_closed() != 0)
+                {
+                    Debug.Log("[DisplayXR-SA] Preview window closed by user — stopping session");
+                    Stop();
+                    return;
+                }
             }
+            catch (System.EntryPointNotFoundException) { /* old binary cached by Unity */ }
 
             // 2. Begin frame (xrWaitFrame + xrBeginFrame)
             int ok = DisplayXRNative.displayxr_standalone_begin_frame(out int shouldRender);
