@@ -70,10 +70,21 @@ namespace DisplayXR.Editor
         private static uint s_AtlasWidth;
         private static uint s_AtlasHeight;
 
+        /// <summary>
+        /// When true, entering play mode auto-starts the SA preview and disables Unity's XR loader.
+        /// This avoids the Game View XR rendering crash during teardown.
+        /// </summary>
+        public static bool PlayModeIntegration { get; set; } = true;
+
         // Camera selection
         private const string kSelectedCameraIDKey = "DisplayXR_SA_SelectedCameraID";
         private static Camera s_SelectedSourceCamera;
         public static Camera SelectedCamera => s_SelectedSourceCamera;
+
+        // SessionState survives domain reload (unlike static fields)
+        private const string kPlayModeStartedKey = "DisplayXR_SA_StartedByPlayMode";
+        private const string kXRWasEnabledKey = "DisplayXR_SA_XRWasEnabled";
+        private const string kXRLoaderAssetPathKey = "DisplayXR_SA_XRLoaderAssetPath";
 
         static DisplayXRPreviewSession()
         {
@@ -81,19 +92,97 @@ namespace DisplayXR.Editor
             AssemblyReloadEvents.beforeAssemblyReload += OnBeforeAssemblyReload;
             EditorApplication.quitting += OnEditorQuitting;
             EditorApplication.playModeStateChanged += OnPlayModeStateChanged;
-
         }
 
         private static void OnPlayModeStateChanged(PlayModeStateChange state)
         {
+            if (!PlayModeIntegration) return;
+
             switch (state)
             {
                 case PlayModeStateChange.ExitingEditMode:
-                    // Stop SA session — Unity's XR loader will take over in Play Mode.
-                    // The XR loader runs natively (no loader toggling needed).
-                    if (IsRunning)
-                        Stop();
+                    // Disable Unity's XR loader so it doesn't create an OpenXR session
+                    // that conflicts with the SA session + causes Game View crash.
+                    bool xrWasEnabled = DisableXRLoader();
+                    SessionState.SetBool(kXRWasEnabledKey, xrWasEnabled);
+                    SessionState.SetBool(kPlayModeStartedKey, !IsRunning);
                     break;
+
+                case PlayModeStateChange.EnteredPlayMode:
+                    // Domain reload wiped statics — read from SessionState
+                    if (SessionState.GetBool(kPlayModeStartedKey, false) && !IsRunning)
+                        Start();
+                    break;
+
+                case PlayModeStateChange.ExitingPlayMode:
+                    if (SessionState.GetBool(kPlayModeStartedKey, false) && IsRunning)
+                    {
+                        Stop();
+                        SessionState.SetBool(kPlayModeStartedKey, false);
+                    }
+                    break;
+
+                case PlayModeStateChange.EnteredEditMode:
+                    if (SessionState.GetBool(kXRWasEnabledKey, false))
+                    {
+                        EnableXRLoader();
+                        SessionState.SetBool(kXRWasEnabledKey, false);
+                    }
+                    var sceneView = SceneView.lastActiveSceneView;
+                    if (sceneView != null)
+                        sceneView.Focus();
+                    break;
+            }
+        }
+
+        private static bool DisableXRLoader()
+        {
+            var xrSettings = UnityEngine.XR.Management.XRGeneralSettings.Instance;
+            if (xrSettings == null || xrSettings.Manager == null) return false;
+
+            var loaders = xrSettings.Manager.activeLoaders;
+            for (int i = 0; i < loaders.Count; i++)
+            {
+                if (loaders[i].GetType().Name.Contains("OpenXR"))
+                {
+                    string assetPath = AssetDatabase.GetAssetPath(loaders[i]);
+                    if (!string.IsNullOrEmpty(assetPath))
+                        SessionState.SetString(kXRLoaderAssetPathKey, assetPath);
+                    xrSettings.Manager.TryRemoveLoader(loaders[i]);
+                    return true;
+                }
+            }
+            return false;
+        }
+
+        private static void EnableXRLoader()
+        {
+            var xrSettings = UnityEngine.XR.Management.XRGeneralSettings.Instance;
+            if (xrSettings == null || xrSettings.Manager == null) return;
+
+            foreach (var loader in xrSettings.Manager.activeLoaders)
+                if (loader.GetType().Name.Contains("OpenXR")) return;
+
+            string assetPath = SessionState.GetString(kXRLoaderAssetPathKey, "");
+            if (!string.IsNullOrEmpty(assetPath))
+            {
+                var loader = AssetDatabase.LoadAssetAtPath<UnityEngine.XR.Management.XRLoader>(assetPath);
+                if (loader != null)
+                {
+                    xrSettings.Manager.TryAddLoader(loader);
+                    SessionState.EraseString(kXRLoaderAssetPathKey);
+                    return;
+                }
+            }
+
+            var allLoaders = Resources.FindObjectsOfTypeAll<UnityEngine.XR.Management.XRLoader>();
+            foreach (var loader in allLoaders)
+            {
+                if (loader.GetType().Name.Contains("OpenXR"))
+                {
+                    xrSettings.Manager.TryAddLoader(loader);
+                    return;
+                }
             }
         }
 
@@ -491,7 +580,7 @@ namespace DisplayXR.Editor
 
         public static CameraEntry[] DiscoverCameras()
         {
-            var cameras = UnityEngine.Object.FindObjectsByType<Camera>(FindObjectsInactive.Exclude);
+            var cameras = UnityEngine.Object.FindObjectsByType<Camera>(FindObjectsInactive.Exclude, FindObjectsSortMode.None);
             var entries = new List<CameraEntry>();
 
             foreach (var cam in cameras)
