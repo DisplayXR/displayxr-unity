@@ -213,41 +213,63 @@ namespace DisplayXR.Editor
             RenderTexture atlas = DisplayXRPreviewSession.AtlasTexture;
             if (atlas != null && DisplayXRPreviewSession.IsRunning)
             {
-                float texAspect = (float)atlas.width / atlas.height;
+                // Get current mode tiling — the actual rendered content region
+                DisplayXRNative.displayxr_standalone_get_current_mode_info(
+                    out uint vc, out uint tc, out uint tr,
+                    out uint vw, out uint vh,
+                    out float _, out float _, out int _);
+
+                // Content region = tiles * per-view size (may be smaller than atlas)
+                uint contentW = tc * vw;
+                uint contentH = tr * vh;
+                if (contentW == 0 || contentH == 0)
+                {
+                    contentW = (uint)atlas.width;
+                    contentH = (uint)atlas.height;
+                }
+
+                // UV crop: show only the rendered content, not the full atlas
+                float uMax = (float)contentW / atlas.width;
+                float vMax = (float)contentH / atlas.height;
+
+                // Letterbox by content aspect ratio
+                float contentAspect = (float)contentW / contentH;
                 float rectAspect = previewRect.width / previewRect.height;
 
                 Rect drawRect;
-                if (rectAspect > texAspect)
+                if (rectAspect > contentAspect)
                 {
-                    float w = previewRect.height * texAspect;
+                    float w = previewRect.height * contentAspect;
                     drawRect = new Rect(
                         previewRect.x + (previewRect.width - w) * 0.5f,
                         previewRect.y, w, previewRect.height);
                 }
                 else
                 {
-                    float h = previewRect.width / texAspect;
+                    float h = previewRect.width / contentAspect;
                     drawRect = new Rect(
                         previewRect.x,
                         previewRect.y + (previewRect.height - h) * 0.5f,
                         previewRect.width, h);
                 }
 
-                // Draw the atlas — no Y-flip needed since this is a Unity RenderTexture
-                GUI.DrawTexture(drawRect, atlas, ScaleMode.StretchToFill);
+                // macOS Metal: RenderTextures are Y-flipped in GPU memory.
+                // Flip UV.y to display correctly.
+#if UNITY_EDITOR_OSX
+                GUI.DrawTextureWithTexCoords(drawRect, atlas, new Rect(0, vMax, uMax, -vMax));
+#else
+                GUI.DrawTextureWithTexCoords(drawRect, atlas, new Rect(0, 0, uMax, vMax));
+#endif
 
-                // Draw tile grid overlay
-                DisplayXRNative.displayxr_standalone_get_current_mode_info(
-                    out uint vc, out uint tc, out uint tr,
-                    out uint vw, out uint vh,
-                    out float _, out float _, out int _);
+                // Draw tile grid overlay (relative to content, not full atlas)
                 if (tc > 0 && tr > 0)
                 {
-                    DrawTileGrid(drawRect, tc, tr, vw, vh, atlas.width, atlas.height);
+                    DrawTileGrid(drawRect, tc, tr, vw, vh, contentW, contentH);
                 }
 
                 var labelRect = new Rect(drawRect.x + 4, drawRect.y + 4, 400, 20);
-                GUI.Label(labelRect, $"Atlas: {atlas.width}x{atlas.height}  " +
+                GUI.Label(labelRect, $"Content: {contentW}x{contentH}  " +
+                    $"Atlas: {atlas.width}x{atlas.height}  " +
                     $"Tiles: {tc}x{tr}  View: {vw}x{vh}px",
                     EditorStyles.miniLabel);
             }
@@ -419,9 +441,9 @@ namespace DisplayXR.Editor
         /// Draw tile boundaries over the atlas preview.
         /// </summary>
         private void DrawTileGrid(Rect drawRect, uint tileCols, uint tileRows,
-            uint viewW, uint viewH, int atlasW, int atlasH)
+            uint viewW, uint viewH, uint contentW, uint contentH)
         {
-            if (atlasW <= 0 || atlasH <= 0) return;
+            if (contentW == 0 || contentH == 0) return;
 
             Color gridColor = new Color(1f, 1f, 0f, 0.5f);
             Handles.BeginGUI();
@@ -430,7 +452,7 @@ namespace DisplayXR.Editor
             // Vertical lines between tile columns
             for (uint c = 1; c < tileCols; c++)
             {
-                float xFrac = (float)(c * viewW) / atlasW;
+                float xFrac = (float)(c * viewW) / contentW;
                 float x = drawRect.x + xFrac * drawRect.width;
                 Handles.DrawLine(
                     new Vector3(x, drawRect.y, 0),
@@ -440,7 +462,7 @@ namespace DisplayXR.Editor
             // Horizontal lines between tile rows
             for (uint r = 1; r < tileRows; r++)
             {
-                float yFrac = (float)(r * viewH) / atlasH;
+                float yFrac = (float)(r * viewH) / contentH;
                 float y = drawRect.y + yFrac * drawRect.height;
                 Handles.DrawLine(
                     new Vector3(drawRect.x, y, 0),
@@ -453,8 +475,8 @@ namespace DisplayXR.Editor
                 for (uint c = 0; c < tileCols; c++)
                 {
                     uint viewIdx = r * tileCols + c;
-                    float xFrac = (float)(c * viewW) / atlasW;
-                    float yFrac = (float)(r * viewH) / atlasH;
+                    float xFrac = (float)(c * viewW) / contentW;
+                    float yFrac = (float)(r * viewH) / contentH;
                     float x = drawRect.x + xFrac * drawRect.width + 4;
                     float y = drawRect.y + yFrac * drawRect.height + 4;
                     GUI.Label(new Rect(x, y, 80, 16), $"Eye {viewIdx}",
