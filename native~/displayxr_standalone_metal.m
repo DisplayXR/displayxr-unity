@@ -36,6 +36,37 @@ static volatile int s_sa_window_closed = 0;
 	s_sa_view = nil;
 }
 
+- (void)windowDidEndLiveResize:(NSNotification *)notification
+{
+	// After a live resize drag, the mouseUp event goes to OUR window, not Unity's.
+	// Unity's input system misses the release → Input.GetMouseButton(0) stays true
+	// → DisplayXRInputController thinks user is dragging (camera rotates).
+	// Post a synthetic mouseUp to Unity's key window to clear the stale state.
+	NSWindow *unityWindow = nil;
+	for (NSWindow *w in [[NSApplication sharedApplication] windows]) {
+		if (w != s_sa_window && [w isVisible] && [w isKeyWindow]) {
+			unityWindow = w;
+			break;
+		}
+	}
+	if (!unityWindow) {
+		// Fallback: main window
+		unityWindow = [[NSApplication sharedApplication] mainWindow];
+	}
+	if (unityWindow) {
+		NSEvent *fakeUp = [NSEvent mouseEventWithType:NSEventTypeLeftMouseUp
+		                                     location:NSMakePoint(0, 0)
+		                                modifierFlags:0
+		                                    timestamp:[[NSProcessInfo processInfo] systemUptime]
+		                                 windowNumber:[unityWindow windowNumber]
+		                                      context:nil
+		                                  eventNumber:0
+		                                   clickCount:1
+		                                     pressure:0.0];
+		[unityWindow sendEvent:fakeUp];
+	}
+}
+
 @end
 
 static DisplayXRSAWindowDelegate *s_sa_window_delegate = nil;
