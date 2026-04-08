@@ -335,6 +335,9 @@ namespace DisplayXR.Editor
                 {
                     Debug.Log("[DisplayXR-SA] Preview window closed by user — stopping session");
                     Stop();
+                    // Also exit Play Mode if running
+                    if (EditorApplication.isPlaying)
+                        EditorApplication.isPlaying = false;
                     return;
                 }
             }
