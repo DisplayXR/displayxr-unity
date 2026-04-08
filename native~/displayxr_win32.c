@@ -347,6 +347,31 @@ shell_subclass_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 			return CallWindowProcW(s_shell_original_wndproc, hwnd, msg, TRUE, lParam);
 		break;
 	}
+
+	// Viewport update on resize/move — mirrors parent_subclass_proc logic
+	// but without overlay HWND (shell mode has no overlay).
+	if (msg == WM_SIZE) {
+		int w = LOWORD(lParam);
+		int h = HIWORD(lParam);
+		if (w > 0 && h > 0) {
+			POINT client_origin = {0, 0};
+			ClientToScreen(hwnd, &client_origin);
+			displayxr_set_viewport_size_native(
+				(uint32_t)w, (uint32_t)h,
+				(int32_t)client_origin.x, (int32_t)client_origin.y);
+		}
+	}
+	if (msg == WM_MOVE) {
+		POINT client_origin = {0, 0};
+		ClientToScreen(hwnd, &client_origin);
+		DisplayXRState *state = displayxr_get_state();
+		if (state->viewport_width > 0) {
+			displayxr_set_viewport_size_native(
+				state->viewport_width, state->viewport_height,
+				(int32_t)client_origin.x, (int32_t)client_origin.y);
+		}
+	}
+
 	return CallWindowProcW(s_shell_original_wndproc, hwnd, msg, wParam, lParam);
 }
 
