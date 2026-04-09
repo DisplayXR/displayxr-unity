@@ -65,6 +65,102 @@ static DisplayXRSAWindowDelegate *s_sa_window_delegate = nil;
 @end
 
 // ============================================================================
+// Content view — forwards mouse events to Unity's key window so the
+// InputController can process click-drag for camera rotation, even though
+// our window is non-key (canBecomeKeyWindow:NO).
+// ============================================================================
+
+static NSWindow *findUnityWindow(void)
+{
+	// Find Unity's key or main window (not our preview window)
+	NSWindow *w = [[NSApplication sharedApplication] keyWindow];
+	if (w && w != s_sa_window) return w;
+	w = [[NSApplication sharedApplication] mainWindow];
+	if (w && w != s_sa_window) return w;
+	for (w in [[NSApplication sharedApplication] windows]) {
+		if (w != s_sa_window && [w isVisible])
+			return w;
+	}
+	return nil;
+}
+
+@interface DisplayXRContentView : NSView
+@end
+
+@implementation DisplayXRContentView
+
+- (void)mouseDown:(NSEvent *)event
+{
+	NSWindow *unity = findUnityWindow();
+	if (unity) {
+		NSEvent *forwarded = [NSEvent mouseEventWithType:event.type
+		                                        location:[unity mouseLocationOutsideOfEventStream]
+		                                   modifierFlags:event.modifierFlags
+		                                       timestamp:event.timestamp
+		                                    windowNumber:[unity windowNumber]
+		                                         context:nil
+		                                     eventNumber:event.eventNumber
+		                                      clickCount:event.clickCount
+		                                        pressure:event.pressure];
+		[unity sendEvent:forwarded];
+	}
+}
+
+- (void)mouseUp:(NSEvent *)event
+{
+	NSWindow *unity = findUnityWindow();
+	if (unity) {
+		NSEvent *forwarded = [NSEvent mouseEventWithType:event.type
+		                                        location:[unity mouseLocationOutsideOfEventStream]
+		                                   modifierFlags:event.modifierFlags
+		                                       timestamp:event.timestamp
+		                                    windowNumber:[unity windowNumber]
+		                                         context:nil
+		                                     eventNumber:event.eventNumber
+		                                      clickCount:event.clickCount
+		                                        pressure:event.pressure];
+		[unity sendEvent:forwarded];
+	}
+}
+
+- (void)mouseDragged:(NSEvent *)event
+{
+	NSWindow *unity = findUnityWindow();
+	if (unity) {
+		// Forward as mouseMoved — Unity reads delta from mouse position changes
+		NSEvent *forwarded = [NSEvent mouseEventWithType:NSEventTypeLeftMouseDragged
+		                                        location:[unity mouseLocationOutsideOfEventStream]
+		                                   modifierFlags:event.modifierFlags
+		                                       timestamp:event.timestamp
+		                                    windowNumber:[unity windowNumber]
+		                                         context:nil
+		                                     eventNumber:event.eventNumber
+		                                      clickCount:event.clickCount
+		                                        pressure:event.pressure];
+		[unity sendEvent:forwarded];
+	}
+}
+
+- (void)scrollWheel:(NSEvent *)event
+{
+	NSWindow *unity = findUnityWindow();
+	if (unity) {
+		NSEvent *forwarded = [NSEvent mouseEventWithType:event.type
+		                                        location:[unity mouseLocationOutsideOfEventStream]
+		                                   modifierFlags:event.modifierFlags
+		                                       timestamp:event.timestamp
+		                                    windowNumber:[unity windowNumber]
+		                                         context:nil
+		                                     eventNumber:event.eventNumber
+		                                      clickCount:event.clickCount
+		                                        pressure:event.pressure];
+		[unity sendEvent:forwarded];
+	}
+}
+
+@end
+
+// ============================================================================
 // Window creation/destruction
 // ============================================================================
 
@@ -93,8 +189,8 @@ displayxr_sa_metal_create_window(uint32_t width, uint32_t height)
 		s_sa_window_delegate = [[DisplayXRSAWindowDelegate alloc] init];
 		[s_sa_window setDelegate:s_sa_window_delegate];
 
-		// Layer-backed view so the runtime can add a CAMetalLayer overlay
-		s_sa_view = [[NSView alloc] initWithFrame:frame];
+		// Layer-backed view that forwards mouse events to Unity
+		s_sa_view = [[DisplayXRContentView alloc] initWithFrame:frame];
 		[s_sa_view setWantsLayer:YES];
 		[s_sa_window setContentView:s_sa_view];
 
