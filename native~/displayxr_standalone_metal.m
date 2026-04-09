@@ -18,7 +18,6 @@ static id<MTLCommandQueue> s_sa_queue = nil;
 static id<MTLRenderPipelineState> s_sa_blit_pipeline = nil;
 static int s_sa_blit_log_once = 0;
 static volatile int s_sa_window_closed = 0;
-static volatile int s_sa_window_interacting = 0; // 1 during move/resize
 
 // ============================================================================
 // Window delegate — detect user closing the preview window
@@ -32,15 +31,10 @@ static volatile int s_sa_window_interacting = 0; // 1 during move/resize
 - (void)windowWillClose:(NSNotification *)notification
 {
 	s_sa_window_closed = 1;
-	s_sa_window_interacting = 0;
 	s_sa_window = nil;
 	s_sa_view = nil;
 }
 
-- (void)windowWillStartLiveResize:(NSNotification *)notification { s_sa_window_interacting = 1; }
-- (void)windowDidEndLiveResize:(NSNotification *)notification    { s_sa_window_interacting = 0; }
-- (void)windowWillMove:(NSNotification *)notification            { s_sa_window_interacting = 1; }
-- (void)windowDidMove:(NSNotification *)notification             { s_sa_window_interacting = 0; }
 
 @end
 
@@ -130,7 +124,14 @@ displayxr_sa_metal_window_was_closed(void)
 int
 displayxr_sa_metal_window_is_interacting(void)
 {
-	return s_sa_window_interacting;
+	if (!s_sa_window) return 0;
+
+	// Check if the mouse cursor is anywhere over the preview window.
+	// If so, suppress scene input — the mouse belongs to the preview window
+	// (move, resize, or just hovering over compositor output).
+	NSPoint mouse = [NSEvent mouseLocation]; // screen coords
+	NSRect frame = [s_sa_window frame];
+	return NSPointInRect(mouse, frame) ? 1 : 0;
 }
 
 void
