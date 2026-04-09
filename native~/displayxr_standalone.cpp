@@ -1944,8 +1944,19 @@ displayxr_standalone_window_is_interacting(void)
 	if (!s_sa.preview_hwnd) return 0;
 	POINT pt;
 	GetCursorPos(&pt);
+	// Check if cursor is over the window at all
 	HWND under = WindowFromPoint(pt);
-	return (under == s_sa.preview_hwnd) ? 1 : 0;
+	if (under != s_sa.preview_hwnd) return 0;
+	// Check if cursor is in the client (content) area — if so, allow interaction
+	RECT clientRect;
+	GetClientRect(s_sa.preview_hwnd, &clientRect);
+	POINT clientPt = pt;
+	ScreenToClient(s_sa.preview_hwnd, &clientPt);
+	if (clientPt.x >= 0 && clientPt.y >= 0 &&
+	    clientPt.x < clientRect.right && clientPt.y < clientRect.bottom)
+		return 0; // Content area — allow camera rotation
+	// Cursor is over the frame (title bar, edges) — suppress input
+	return 1;
 #else
 	return 0;
 #endif
