@@ -78,6 +78,7 @@ namespace DisplayXR.Editor
 
         // Camera selection
         private const string kSelectedCameraIDKey = "DisplayXR_SA_SelectedCameraID";
+        private const string kSelectedCameraNameKey = "DisplayXR_SA_SelectedCameraName";
         private static Camera s_SelectedSourceCamera;
         public static Camera SelectedCamera => s_SelectedSourceCamera;
 
@@ -643,9 +644,15 @@ namespace DisplayXR.Editor
         {
             s_SelectedSourceCamera = cam;
             if (cam != null)
+            {
                 SessionState.SetString(kSelectedCameraIDKey, cam.GetEntityId().ToString());
+                SessionState.SetString(kSelectedCameraNameKey, cam.gameObject.name);
+            }
             else
+            {
                 SessionState.EraseString(kSelectedCameraIDKey);
+                SessionState.EraseString(kSelectedCameraNameKey);
+            }
 
             if (IsRunning)
                 ApplyCameraSelection();
@@ -656,6 +663,7 @@ namespace DisplayXR.Editor
 
         public static void RestoreSelection()
         {
+            // 1. Try EntityId (precise, survives assembly reload in Edit Mode)
             string savedID = SessionState.GetString(kSelectedCameraIDKey, "");
             if (!string.IsNullOrEmpty(savedID) && int.TryParse(savedID, out int id) && id != 0)
             {
@@ -670,26 +678,44 @@ namespace DisplayXR.Editor
                 }
             }
 
-            // Fallback: first DisplayXR rig, then Camera.main, then any camera
-            var entries = DiscoverCameras();
-            if (entries.Length > 0)
+            // 2. Try camera name (survives Play Mode domain reload where EntityId is invalidated)
+            string savedName = SessionState.GetString(kSelectedCameraNameKey, "");
+            if (!string.IsNullOrEmpty(savedName))
             {
-                // Prefer a DisplayXR rig (already sorted first)
-                s_SelectedSourceCamera = entries[0].camera;
-            }
-            else
-            {
-                s_SelectedSourceCamera = Camera.main;
-                if (s_SelectedSourceCamera == null)
+                var entries = DiscoverCameras();
+                foreach (var entry in entries)
                 {
-                    var allCams = Camera.allCameras;
-                    if (allCams.Length > 0) s_SelectedSourceCamera = allCams[0];
+                    if (entry.camera.gameObject.name == savedName)
+                    {
+                        s_SelectedSourceCamera = entry.camera;
+                        ApplyCameraSelection();
+                        return;
+                    }
+                }
+            }
+
+            // 3. Fallback: first DisplayXR rig, then Camera.main, then any camera
+            {
+                var entries = DiscoverCameras();
+                if (entries.Length > 0)
+                {
+                    s_SelectedSourceCamera = entries[0].camera;
+                }
+                else
+                {
+                    s_SelectedSourceCamera = Camera.main;
+                    if (s_SelectedSourceCamera == null)
+                    {
+                        var allCams = Camera.allCameras;
+                        if (allCams.Length > 0) s_SelectedSourceCamera = allCams[0];
+                    }
                 }
             }
 
             if (s_SelectedSourceCamera != null)
             {
                 SessionState.SetString(kSelectedCameraIDKey, s_SelectedSourceCamera.GetEntityId().ToString());
+                SessionState.SetString(kSelectedCameraNameKey, s_SelectedSourceCamera.gameObject.name);
                 ApplyCameraSelection();
             }
         }
