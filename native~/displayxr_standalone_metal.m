@@ -18,6 +18,7 @@ static id<MTLCommandQueue> s_sa_queue = nil;
 static id<MTLRenderPipelineState> s_sa_blit_pipeline = nil;
 static int s_sa_blit_log_once = 0;
 static volatile int s_sa_window_closed = 0;
+static volatile int s_sa_window_interacting = 0; // 1 during move/resize
 
 // ============================================================================
 // Window delegate — detect user closing the preview window
@@ -30,12 +31,16 @@ static volatile int s_sa_window_closed = 0;
 
 - (void)windowWillClose:(NSNotification *)notification
 {
-	fprintf(stderr, "[DisplayXR-SA] Preview window closed by user\n");
 	s_sa_window_closed = 1;
+	s_sa_window_interacting = 0;
 	s_sa_window = nil;
 	s_sa_view = nil;
 }
 
+- (void)windowWillStartLiveResize:(NSNotification *)notification { s_sa_window_interacting = 1; }
+- (void)windowDidEndLiveResize:(NSNotification *)notification    { s_sa_window_interacting = 0; }
+- (void)windowWillMove:(NSNotification *)notification            { s_sa_window_interacting = 1; }
+- (void)windowDidMove:(NSNotification *)notification             { s_sa_window_interacting = 0; }
 
 @end
 
@@ -120,6 +125,12 @@ displayxr_sa_metal_window_was_closed(void)
 	int closed = s_sa_window_closed;
 	s_sa_window_closed = 0;
 	return closed;
+}
+
+int
+displayxr_sa_metal_window_is_interacting(void)
+{
+	return s_sa_window_interacting;
 }
 
 void

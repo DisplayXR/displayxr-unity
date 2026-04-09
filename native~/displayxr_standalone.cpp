@@ -1815,6 +1815,16 @@ displayxr_get_backing_scale_factor(void)
 
 
 int
+displayxr_standalone_window_is_interacting(void)
+{
+#if defined(__APPLE__)
+	return displayxr_sa_metal_window_is_interacting();
+#else
+	return 0;
+#endif
+}
+
+int
 displayxr_standalone_window_was_closed(void)
 {
 #if defined(__APPLE__)
