@@ -36,63 +36,27 @@ static volatile int s_sa_window_closed = 0;
 	s_sa_view = nil;
 }
 
-// Post a synthetic mouseUp to Unity's window to clear stale mouse button state.
-// Called at the START of window move/resize to prevent camera rotation during drag,
-// and at the END to clear any residual state.
-static void postMouseUpToUnity(void)
-{
-	NSWindow *unityWindow = [[NSApplication sharedApplication] mainWindow];
-	if (!unityWindow || unityWindow == s_sa_window) {
-		// Fallback: find first visible non-preview window
-		for (NSWindow *w in [[NSApplication sharedApplication] windows]) {
-			if (w != s_sa_window && [w isVisible]) {
-				unityWindow = w;
-				break;
-			}
-		}
-	}
-	if (unityWindow) {
-		NSEvent *fakeUp = [NSEvent mouseEventWithType:NSEventTypeLeftMouseUp
-		                                     location:NSMakePoint(0, 0)
-		                                modifierFlags:0
-		                                    timestamp:[[NSProcessInfo processInfo] systemUptime]
-		                                 windowNumber:[unityWindow windowNumber]
-		                                      context:nil
-		                                  eventNumber:0
-		                                   clickCount:1
-		                                     pressure:0.0];
-		[unityWindow sendEvent:fakeUp];
-	}
-}
-
-- (void)windowWillStartLiveResize:(NSNotification *)notification
-{
-	// Clear Unity's mouse button state at the START of resize drag
-	// so InputController doesn't interpret resize mouse delta as camera rotation.
-	postMouseUpToUnity();
-}
-
-- (void)windowDidEndLiveResize:(NSNotification *)notification
-{
-	// Also clear at end, in case Unity picked up the button state again.
-	postMouseUpToUnity();
-}
-
-- (void)windowWillMove:(NSNotification *)notification
-{
-	// Clear Unity's mouse button state when window starts moving.
-	postMouseUpToUnity();
-}
-
-- (void)windowDidMove:(NSNotification *)notification
-{
-	// Also clear at end of move.
-	postMouseUpToUnity();
-}
 
 @end
 
 static DisplayXRSAWindowDelegate *s_sa_window_delegate = nil;
+
+// ============================================================================
+// Non-key preview window — never steals keyboard/mouse focus from Unity
+// ============================================================================
+
+@interface DisplayXRPreviewNSWindow : NSWindow
+@end
+
+@implementation DisplayXRPreviewNSWindow
+
+// Never become key window — Unity keeps all mouse/keyboard focus.
+// Title bar drag (move), edge drag (resize), and close button still work
+// because those are handled by the window frame, not the key window.
+- (BOOL)canBecomeKeyWindow { return NO; }
+- (BOOL)canBecomeMainWindow { return NO; }
+
+@end
 
 // ============================================================================
 // Window creation/destruction
@@ -112,13 +76,12 @@ displayxr_sa_metal_create_window(uint32_t width, uint32_t height)
 		                          NSWindowStyleMaskResizable |
 		                          NSWindowStyleMaskMiniaturizable;
 
-		s_sa_window = [[NSWindow alloc] initWithContentRect:frame
-		                                          styleMask:style
-		                                            backing:NSBackingStoreBuffered
-		                                              defer:NO];
+		s_sa_window = [[DisplayXRPreviewNSWindow alloc] initWithContentRect:frame
+		                                                          styleMask:style
+		                                                            backing:NSBackingStoreBuffered
+		                                                              defer:NO];
 		[s_sa_window setTitle:@"DisplayXR Preview"];
 		[s_sa_window setReleasedWhenClosed:NO];
-		[s_sa_window setMovableByWindowBackground:NO];
 
 		// Set delegate to detect user closing the window
 		s_sa_window_delegate = [[DisplayXRSAWindowDelegate alloc] init];
