@@ -322,8 +322,7 @@ namespace DisplayXR
 
         private static bool ShouldIgnoreInput()
         {
-            // Ignore input while the preview window is being moved or resized.
-            // The mouse click/drag belongs to the window frame, not the scene.
+            // Ignore input while the mouse cursor is over the preview window.
             try
             {
                 if (DisplayXRNative.displayxr_standalone_window_is_interacting() != 0)

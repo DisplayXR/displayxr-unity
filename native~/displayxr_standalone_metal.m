@@ -127,8 +127,6 @@ displayxr_sa_metal_window_is_interacting(void)
 	if (!s_sa_window) return 0;
 
 	// Check if the mouse cursor is anywhere over the preview window.
-	// If so, suppress scene input — the mouse belongs to the preview window
-	// (move, resize, or just hovering over compositor output).
 	NSPoint mouse = [NSEvent mouseLocation]; // screen coords
 	NSRect frame = [s_sa_window frame];
 	return NSPointInRect(mouse, frame) ? 1 : 0;

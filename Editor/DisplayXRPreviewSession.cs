@@ -664,19 +664,16 @@ namespace DisplayXR.Editor
 #pragma warning restore CS0618
                 if (obj != null)
                 {
-                    Debug.Log($"[DisplayXR-SA] RestoreSelection: restored '{obj.gameObject.name}' from EntityId {id}");
                     s_SelectedSourceCamera = obj;
                     ApplyCameraSelection();
                     return;
                 }
-                Debug.Log($"[DisplayXR-SA] RestoreSelection: EntityId {id} not found, using fallback");
             }
 
             // Fallback: first DisplayXR rig, then Camera.main, then any camera
             var entries = DiscoverCameras();
             if (entries.Length > 0)
             {
-                Debug.Log($"[DisplayXR-SA] RestoreSelection: fallback → '{entries[0].camera.gameObject.name}' ({entries[0].category}), {entries.Length} cameras found");
                 // Prefer a DisplayXR rig (already sorted first)
                 s_SelectedSourceCamera = entries[0].camera;
             }
