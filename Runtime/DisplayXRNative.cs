@@ -163,6 +163,21 @@ namespace DisplayXR
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int displayxr_standalone_window_is_interacting();
 
+        /// <summary>
+        /// (Windows only) Set Unity's D3D12 device for atlas bridge texture.
+        /// Must be called BEFORE displayxr_standalone_start().
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void displayxr_standalone_set_unity_device(IntPtr unityNativeTex);
+
+        /// <summary>
+        /// (Windows D3D12 only) Get the atlas bridge texture opened on Unity's device.
+        /// C# uses Graphics.CopyTexture to copy the atlas RT into this each frame.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void displayxr_standalone_get_atlas_bridge_texture(
+            out IntPtr nativePtr, out uint width, out uint height);
+
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int displayxr_standalone_start(
             [MarshalAs(UnmanagedType.LPStr)] string runtimeJsonPath);

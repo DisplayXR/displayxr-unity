@@ -156,6 +156,12 @@ typedef struct StandaloneState {
 	HANDLE d3d12_fence_event;
 	UINT64 d3d12_fence_value;
 	HWND preview_hwnd;                     // Plugin-owned preview window
+	// Atlas bridge: cross-device shared texture for atlas blit
+	// Unity's atlas RT (on Unity's D3D12 device) → bridge → swapchain (on SA device)
+	ID3D12Device *unity_device;               // Unity's D3D12 device (not owned)
+	ID3D12Resource *d3d12_atlas_bridge;       // On SA device, SHARED
+	HANDLE d3d12_atlas_bridge_handle;         // DXGI shared handle
+	ID3D12Resource *d3d12_unity_atlas_bridge; // Opened on Unity's device
 #endif
 
 	XrInstance instance;
@@ -603,6 +609,50 @@ create_atlas_swapchain(void)
 	        atlas_w, atlas_h, count);
 
 	s_sa.atlas_created = 1;
+
+#if defined(_WIN32)
+	// Create atlas bridge: a SHARED texture on the SA device that Unity's device
+	// can also access. C# copies atlas RT → bridge (Unity device), native copies
+	// bridge → swapchain (SA device). Both copies are same-device = fast.
+	if (s_sa.unity_device && s_sa.d3d12_device) {
+		D3D12_HEAP_PROPERTIES heap = {};
+		heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+		D3D12_RESOURCE_DESC bd = {};
+		bd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+		bd.Width = atlas_w;
+		bd.Height = atlas_h;
+		bd.DepthOrArraySize = 1;
+		bd.MipLevels = 1;
+		bd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		bd.SampleDesc.Count = 1;
+		bd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+		bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+		HRESULT hr = s_sa.d3d12_device->CreateCommittedResource(
+			&heap, D3D12_HEAP_FLAG_SHARED, &bd,
+			D3D12_RESOURCE_STATE_COMMON, NULL,
+			__uuidof(ID3D12Resource), (void **)&s_sa.d3d12_atlas_bridge);
+		if (SUCCEEDED(hr)) {
+			hr = s_sa.d3d12_device->CreateSharedHandle(
+				s_sa.d3d12_atlas_bridge, NULL, GENERIC_ALL, NULL,
+				&s_sa.d3d12_atlas_bridge_handle);
+			if (SUCCEEDED(hr) && s_sa.d3d12_atlas_bridge_handle) {
+				hr = s_sa.unity_device->OpenSharedHandle(
+					s_sa.d3d12_atlas_bridge_handle,
+					__uuidof(ID3D12Resource), (void **)&s_sa.d3d12_unity_atlas_bridge);
+				if (SUCCEEDED(hr)) {
+					fprintf(stderr, "[DisplayXR-SA] Atlas bridge: %ux%u, handle=%p\n",
+					        atlas_w, atlas_h, s_sa.d3d12_atlas_bridge_handle);
+				}
+			}
+		}
+		if (FAILED(hr)) {
+			fprintf(stderr, "[DisplayXR-SA] Atlas bridge creation failed: 0x%08lx\n", hr);
+		}
+	}
+#endif
+
 	return 1;
 }
 
@@ -941,8 +991,38 @@ displayxr_standalone_start(const char *runtime_json_path)
 		}
 	}
 #elif defined(_WIN32)
-	// TODO: Create native HWND for Windows preview window
-	// For now, keep finding Unity's HWND (will be replaced in Phase 1 Windows)
+	// Create a native preview window (same role as NSWindow on macOS)
+	if (s_sa.display_info.is_valid &&
+	    s_sa.display_info.display_pixel_width > 0 &&
+	    s_sa.display_info.display_pixel_height > 0) {
+		WNDCLASSEXW wc = {};
+		wc.cbSize = sizeof(wc);
+		wc.lpfnWndProc = DefWindowProcW;
+		wc.hInstance = GetModuleHandle(NULL);
+		wc.lpszClassName = L"DisplayXRPreview";
+		wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+		RegisterClassExW(&wc);
+
+		// Size the window to the display dimensions (in physical pixels)
+		s_sa.preview_hwnd = CreateWindowExW(
+			0, L"DisplayXRPreview", L"DisplayXR Preview",
+			WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+			CW_USEDEFAULT, CW_USEDEFAULT,
+			(int)s_sa.display_info.display_pixel_width,
+			(int)s_sa.display_info.display_pixel_height,
+			NULL, NULL, wc.hInstance, NULL);
+
+		if (s_sa.preview_hwnd) {
+			// Show without stealing focus from Unity
+			ShowWindow(s_sa.preview_hwnd, SW_SHOWNOACTIVATE);
+			fprintf(stderr, "[DisplayXR-SA] Preview HWND created: %p (%ux%u)\n",
+			        (void *)s_sa.preview_hwnd,
+			        s_sa.display_info.display_pixel_width,
+			        s_sa.display_info.display_pixel_height);
+		} else {
+			fprintf(stderr, "[DisplayXR-SA] CreateWindowExW failed: %lu\n", GetLastError());
+		}
+	}
 #endif
 
 	// --- Step 8: Create session with Metal graphics binding + window binding ---
@@ -979,39 +1059,16 @@ displayxr_standalone_start(const char *runtime_json_path)
 	d3d12_binding.device = s_sa.d3d12_device;
 	d3d12_binding.queue = s_sa.d3d12_queue;
 
-	// Win32 window binding with Unity's HWND (required by Leia weaver for
-	// pixel-precise interlacing alignment) and shared texture via DXGI handle.
-	// Find Unity's main window by enumerating top-level windows for our process.
-	HWND unity_hwnd = NULL;
-	DWORD our_pid = GetCurrentProcessId();
-	HWND fg = GetForegroundWindow();
-	if (fg) {
-		DWORD fg_pid = 0;
-		GetWindowThreadProcessId(fg, &fg_pid);
-		if (fg_pid == our_pid) unity_hwnd = fg;
-	}
-	if (!unity_hwnd) {
-		HWND hw = NULL;
-		while ((hw = FindWindowExW(NULL, hw, NULL, NULL)) != NULL) {
-			DWORD pid = 0;
-			GetWindowThreadProcessId(hw, &pid);
-			if (pid == our_pid && IsWindowVisible(hw)) {
-				RECT rc;
-				if (GetClientRect(hw, &rc) && (rc.right - rc.left) > 100) {
-					unity_hwnd = hw;
-					break;
-				}
-			}
-		}
-	}
-	fprintf(stderr, "[DisplayXR-SA] Unity HWND: %p\n", (void *)unity_hwnd);
-
+	// Win32 window binding — pass the plugin-owned preview HWND.
+	// The runtime composites directly into this window.
 	XrWin32WindowBindingCreateInfoEXT win_binding = {};
 	win_binding.type = XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT;
-	win_binding.windowHandle = (void *)unity_hwnd;
+	win_binding.windowHandle = (void *)s_sa.preview_hwnd;
 	win_binding.readbackCallback = NULL;
 	win_binding.readbackUserdata = NULL;
-	win_binding.sharedTextureHandle = NULL; // No shared texture — runtime composites to the window
+	win_binding.sharedTextureHandle = NULL;
+
+	fprintf(stderr, "[DisplayXR-SA] Win32 binding: preview HWND=%p\n", (void *)s_sa.preview_hwnd);
 
 	// Chain: session_ci → d3d12_binding → win_binding
 	d3d12_binding.next = &win_binding;
@@ -1101,6 +1158,9 @@ displayxr_standalone_stop(void)
 	displayxr_sa_metal_destroy_window();
 #elif defined(_WIN32)
 	if (s_sa.preview_hwnd) { DestroyWindow(s_sa.preview_hwnd); s_sa.preview_hwnd = NULL; }
+	if (s_sa.d3d12_unity_atlas_bridge) { s_sa.d3d12_unity_atlas_bridge->Release(); s_sa.d3d12_unity_atlas_bridge = NULL; }
+	if (s_sa.d3d12_atlas_bridge_handle) { CloseHandle(s_sa.d3d12_atlas_bridge_handle); s_sa.d3d12_atlas_bridge_handle = NULL; }
+	if (s_sa.d3d12_atlas_bridge) { s_sa.d3d12_atlas_bridge->Release(); s_sa.d3d12_atlas_bridge = NULL; }
 	if (s_sa.d3d12_fence_event) { CloseHandle(s_sa.d3d12_fence_event); s_sa.d3d12_fence_event = NULL; }
 	if (s_sa.d3d12_fence) { s_sa.d3d12_fence->Release(); s_sa.d3d12_fence = NULL; }
 	if (s_sa.d3d12_cmd_list) { s_sa.d3d12_cmd_list->Release(); s_sa.d3d12_cmd_list = NULL; }
@@ -1314,12 +1374,36 @@ displayxr_standalone_submit_frame_atlas(void *atlas_tex)
 	}
 #elif defined(_WIN32)
 	{
-		// TODO: Windows D3D12 atlas blit needs rework for own-window architecture.
-		// The old bridge texture path is removed — need direct blit from Unity's
-		// atlas texture to the swapchain. For now, this is a stub.
+		// Cross-device blit: bridge (SA device) → swapchain (SA device).
+		// C# copies Unity's atlas RT → bridge (Unity device) via Graphics.CopyTexture.
+		ID3D12Resource *bridge = s_sa.d3d12_atlas_bridge;
 		ID3D12Resource *dst = s_sa.atlas.images[index].texture;
-		(void)atlas_tex;
-		(void)dst;
+		if (bridge && dst && s_sa.d3d12_cmd_list) {
+			s_sa.d3d12_cmd_alloc->Reset();
+			s_sa.d3d12_cmd_list->Reset(s_sa.d3d12_cmd_alloc, NULL);
+
+			D3D12_TEXTURE_COPY_LOCATION dst_loc = {};
+			dst_loc.pResource = dst;
+			dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+			D3D12_TEXTURE_COPY_LOCATION src_loc = {};
+			src_loc.pResource = bridge;
+			src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+
+			s_sa.d3d12_cmd_list->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, NULL);
+			s_sa.d3d12_cmd_list->Close();
+
+			ID3D12CommandList *lists[] = { s_sa.d3d12_cmd_list };
+			s_sa.d3d12_queue->ExecuteCommandLists(1, lists);
+
+			s_sa.d3d12_fence_value++;
+			s_sa.d3d12_queue->Signal(s_sa.d3d12_fence, s_sa.d3d12_fence_value);
+			if (s_sa.d3d12_fence->GetCompletedValue() < s_sa.d3d12_fence_value) {
+				s_sa.d3d12_fence->SetEventOnCompletion(s_sa.d3d12_fence_value,
+				                                        s_sa.d3d12_fence_event);
+				WaitForSingleObject(s_sa.d3d12_fence_event, INFINITE);
+			}
+		}
+		(void)atlas_tex; // Unused — C# copies to bridge via Graphics.CopyTexture
 	}
 #endif
 
@@ -1786,8 +1870,45 @@ displayxr_standalone_get_eye_positions(float *lx, float *ly, float *lz,
 
 
 // displayxr_standalone_get_shared_texture and displayxr_standalone_get_atlas_bridge_texture
-// have been removed — the plugin now creates its own native window and passes
-// it to the runtime via the window binding extension. No shared texture needed.
+void
+displayxr_standalone_set_unity_device(void *unity_native_tex)
+{
+#if defined(_WIN32)
+	if (!unity_native_tex) return;
+	IUnknown *unk = (IUnknown *)unity_native_tex;
+	ID3D12Resource *res = NULL;
+	HRESULT hr = unk->QueryInterface(__uuidof(ID3D12Resource), (void **)&res);
+	if (FAILED(hr) || !res) {
+		fprintf(stderr, "[DisplayXR-SA] Texture is not an ID3D12Resource (hr=0x%08lx)\n", hr);
+		return;
+	}
+	ID3D12Device *dev = NULL;
+	hr = res->GetDevice(__uuidof(ID3D12Device), (void **)&dev);
+	res->Release();
+	if (SUCCEEDED(hr) && dev) {
+		s_sa.unity_device = dev;
+		fprintf(stderr, "[DisplayXR-SA] Unity D3D12 device: %p\n", (void *)dev);
+	}
+#else
+	(void)unity_native_tex;
+#endif
+}
+
+void
+displayxr_standalone_get_atlas_bridge_texture(void **native_ptr,
+                                               uint32_t *width, uint32_t *height)
+{
+#if defined(_WIN32)
+	*native_ptr = s_sa.d3d12_unity_atlas_bridge
+		? (void *)s_sa.d3d12_unity_atlas_bridge : NULL;
+	*width = s_sa.atlas.width;
+	*height = s_sa.atlas.height;
+#else
+	*native_ptr = NULL;
+	*width = 0;
+	*height = 0;
+#endif
+}
 
 
 #if defined(__APPLE__)
@@ -1819,6 +1940,12 @@ displayxr_standalone_window_is_interacting(void)
 {
 #if defined(__APPLE__)
 	return displayxr_sa_metal_window_is_interacting();
+#elif defined(_WIN32)
+	if (!s_sa.preview_hwnd) return 0;
+	POINT pt;
+	GetCursorPos(&pt);
+	HWND under = WindowFromPoint(pt);
+	return (under == s_sa.preview_hwnd) ? 1 : 0;
 #else
 	return 0;
 #endif
