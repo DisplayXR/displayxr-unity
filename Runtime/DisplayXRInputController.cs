@@ -115,13 +115,24 @@ namespace DisplayXR
 
         private void HandleMouseRotation()
         {
+            // Cancel any in-progress drag if input should be ignored
+            // (e.g. preview window is being moved/resized).
+            // Checked every frame, not just on mouseDown, because the
+            // window interaction flag may arrive after the mouseDown.
+            if (ShouldIgnoreInput())
+            {
+                m_Dragging = false;
+                m_DragPending = false;
+                return;
+            }
+
 #if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
             // Shell mode: Mouse.current.position is frozen in background.
             // Use Mouse.current.delta (Raw Input deltas via RIDEV_INPUTSINK)
             // and our native button tracker instead.
             if (IsShellMode() && Mouse.current != null)
             {
-                if (ShellGetMouseButtonDown(0) && !ShouldIgnoreInput())
+                if (ShellGetMouseButtonDown(0))
                     m_Dragging = true;
                 if (ShellGetMouseButtonUp(0))
                     m_Dragging = false;
@@ -139,7 +150,7 @@ namespace DisplayXR
                 return;
             }
 #endif
-            if (GetMouseButtonDown(0) && !ShouldIgnoreInput())
+            if (GetMouseButtonDown(0))
             {
                 m_DragPending = true;
                 m_DragStartPos = GetMousePosition();
