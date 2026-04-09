@@ -56,6 +56,13 @@ static DisplayXRSAWindowDelegate *s_sa_window_delegate = nil;
 - (BOOL)canBecomeKeyWindow { return NO; }
 - (BOOL)canBecomeMainWindow { return NO; }
 
+// Freeze content during live resize. macOS blocks the main thread during
+// live resize, so EditorApplication.update (our FrameTick) can't render
+// new frames. Without this, the compositor stretches the last frame into
+// the new window size → distortion. With this, the content stays at the
+// last-rendered size and snaps to the correct size when resize ends.
+- (BOOL)preservesContentDuringLiveResize { return YES; }
+
 @end
 
 // ============================================================================
