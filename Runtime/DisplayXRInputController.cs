@@ -336,12 +336,22 @@ namespace DisplayXR
                 return true;
 
 #if UNITY_EDITOR
-            // Only capture mouse in Game View or Preview Window
+            // Only capture mouse in Game View, Preview Window, or the native
+            // preview NSWindow (which takes key focus away from EditorWindows).
             var focused = UnityEditor.EditorWindow.focusedWindow;
-            if (focused == null) return true;
-            string typeName = focused.GetType().Name;
-            if (typeName != "GameView" && typeName != "DisplayXRPreviewWindow")
-                return true;
+            if (focused == null)
+            {
+                // No EditorWindow focused — allow if SA preview is running
+                // (user may be interacting with the native preview window)
+                if (DisplayXRNative.displayxr_standalone_is_running() == 0)
+                    return true;
+            }
+            else
+            {
+                string typeName = focused.GetType().Name;
+                if (typeName != "GameView" && typeName != "DisplayXRPreviewWindow")
+                    return true;
+            }
 #endif
             return false;
         }
