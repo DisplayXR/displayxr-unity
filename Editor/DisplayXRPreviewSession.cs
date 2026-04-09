@@ -56,6 +56,7 @@ namespace DisplayXR.Editor
 
         // Rendering rig
         private static RenderTexture s_AtlasRT;
+        private static Texture2D s_AtlasBridgeTex; // Windows D3D12: cross-device bridge
         private static Camera[] s_EyeCams;
         private static GameObject s_RigRoot;
         private static float s_NearZ = 0.3f;
@@ -221,6 +222,17 @@ namespace DisplayXR.Editor
 
             Debug.Log($"[DisplayXR-SA] Starting with runtime: {runtimeJson}");
 
+#if UNITY_EDITOR_WIN
+            // Pass Unity's D3D12 device to native for atlas bridge texture
+            {
+                var tempRT = new RenderTexture(4, 4, 0, RenderTextureFormat.ARGB32);
+                tempRT.Create();
+                DisplayXRNative.displayxr_standalone_set_unity_device(tempRT.GetNativeTexturePtr());
+                tempRT.Release();
+                UnityEngine.Object.DestroyImmediate(tempRT);
+            }
+#endif
+
             int result = DisplayXRNative.displayxr_standalone_start(runtimeJson);
 
             if (result != 0)
@@ -230,6 +242,7 @@ namespace DisplayXR.Editor
                 StartPolling();
                 RefreshDisplayInfo();
                 CreateRenderRig();
+                CreateAtlasBridge();
                 DisplayXRGameViewOverlay.AtlasTexture = s_AtlasRT;
                 return true;
             }
@@ -265,6 +278,7 @@ namespace DisplayXR.Editor
 
             StopPolling();
             DisplayXRGameViewOverlay.AtlasTexture = null;
+            CleanupAtlasBridge();
             DestroyRenderRig();
 
             try
@@ -392,6 +406,11 @@ namespace DisplayXR.Editor
                         (int)s_ViewWidth, (int)s_ViewHeight);
                 }
 
+                // Windows D3D12: copy atlas RT → bridge (same Unity device, fast GPU copy).
+                // Native then copies bridge → swapchain (same SA device).
+                if (s_AtlasBridgeTex != null)
+                    Graphics.CopyTexture(s_AtlasRT, s_AtlasBridgeTex);
+
                 IntPtr atlasNative = s_AtlasRT.GetNativeTexturePtr();
                 DisplayXRNative.displayxr_standalone_submit_frame_atlas(atlasNative);
             }
@@ -467,6 +486,34 @@ namespace DisplayXR.Editor
 
             if (s_AtlasRT != null) { s_AtlasRT.Release(); UnityEngine.Object.DestroyImmediate(s_AtlasRT); }
             s_AtlasRT = null;
+        }
+
+        private static void CreateAtlasBridge()
+        {
+#if UNITY_EDITOR_WIN
+            try
+            {
+                DisplayXRNative.displayxr_standalone_get_atlas_bridge_texture(
+                    out IntPtr bridgePtr, out uint bw, out uint bh);
+                if (bridgePtr != IntPtr.Zero && bw > 0 && bh > 0)
+                {
+                    s_AtlasBridgeTex = Texture2D.CreateExternalTexture(
+                        (int)bw, (int)bh, TextureFormat.RGBA32, false, true, bridgePtr);
+                    s_AtlasBridgeTex.name = "DisplayXR_AtlasBridge";
+                    Debug.Log($"[DisplayXR-SA] Atlas bridge texture: {bw}x{bh}");
+                }
+            }
+            catch (System.EntryPointNotFoundException) { }
+#endif
+        }
+
+        private static void CleanupAtlasBridge()
+        {
+            if (s_AtlasBridgeTex != null)
+            {
+                UnityEngine.Object.DestroyImmediate(s_AtlasBridgeTex);
+                s_AtlasBridgeTex = null;
+            }
         }
 
         private static void RenderEyeToAtlas(Camera cam, RenderTexture atlas,

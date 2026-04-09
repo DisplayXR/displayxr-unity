@@ -25,6 +25,16 @@ extern "C" {
 // Session lifecycle
 // ============================================================================
 
+/// (Windows only) Set Unity's D3D12 device for atlas bridge texture.
+/// Must be called BEFORE displayxr_standalone_start().
+/// @param unity_native_tex A native texture pointer from Unity (ID3D12Resource*).
+DISPLAYXR_EXPORT void displayxr_standalone_set_unity_device(void *unity_native_tex);
+
+/// Get the atlas bridge texture opened on Unity's device (Windows D3D12 only).
+/// C# uses Graphics.CopyTexture to copy the atlas RT into this each frame.
+DISPLAYXR_EXPORT void displayxr_standalone_get_atlas_bridge_texture(
+    void **native_ptr, uint32_t *width, uint32_t *height);
+
 /// Start a standalone OpenXR session for editor preview.
 /// Loads the runtime from the JSON manifest, creates instance/session,
 /// and opens a native preview window for compositor output.
