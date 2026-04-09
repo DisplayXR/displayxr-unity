@@ -107,7 +107,10 @@ namespace DisplayXR.Editor
                     // that conflicts with the SA session + causes Game View crash.
                     bool xrWasEnabled = DisableXRLoader();
                     SessionState.SetBool(kXRWasEnabledKey, xrWasEnabled);
-                    SessionState.SetBool(kPlayModeStartedKey, !IsRunning);
+                    // If preview is running, auto-restart it after domain reload.
+                    // Domain reload (assembly reload) will stop the session;
+                    // we restart it in EnteredPlayMode.
+                    SessionState.SetBool(kPlayModeStartedKey, IsRunning);
                     break;
 
                 case PlayModeStateChange.EnteredPlayMode:
@@ -117,7 +120,7 @@ namespace DisplayXR.Editor
                     break;
 
                 case PlayModeStateChange.ExitingPlayMode:
-                    if (SessionState.GetBool(kPlayModeStartedKey, false) && IsRunning)
+                    if (IsRunning)
                     {
                         Stop();
                         SessionState.SetBool(kPlayModeStartedKey, false);
