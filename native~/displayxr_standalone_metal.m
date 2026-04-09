@@ -126,10 +126,20 @@ displayxr_sa_metal_window_is_interacting(void)
 {
 	if (!s_sa_window) return 0;
 
-	// Check if the mouse cursor is anywhere over the preview window.
+	// Check if the cursor is over the window FRAME (title bar, resize edges)
+	// but NOT the content area. Content-area clicks should allow camera rotation.
 	NSPoint mouse = [NSEvent mouseLocation]; // screen coords
-	NSRect frame = [s_sa_window frame];
-	return NSPointInRect(mouse, frame) ? 1 : 0;
+	NSRect windowFrame = [s_sa_window frame];
+	if (!NSPointInRect(mouse, windowFrame))
+		return 0; // Cursor not over window at all
+
+	// Convert to window-local coords and check if inside the content rect
+	NSRect contentRect = [s_sa_window contentRectForFrameRect:windowFrame];
+	if (NSPointInRect(mouse, contentRect))
+		return 0; // Cursor is in the content area — allow interaction
+
+	// Cursor is over the window frame (title bar / resize edges) — suppress input
+	return 1;
 }
 
 void
