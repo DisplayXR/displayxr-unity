@@ -311,6 +311,15 @@ namespace DisplayXR
 
         private static bool ShouldIgnoreInput()
         {
+            // Ignore input while the preview window is being moved or resized.
+            // The mouse click/drag belongs to the window frame, not the scene.
+            try
+            {
+                if (DisplayXRNative.displayxr_standalone_window_is_interacting() != 0)
+                    return true;
+            }
+            catch (System.EntryPointNotFoundException) { }
+
             // Runtime UI (Canvas/EventSystem)
             var es = UnityEngine.EventSystems.EventSystem.current;
             if (es != null && es.IsPointerOverGameObject())

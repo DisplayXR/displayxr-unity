@@ -143,6 +143,9 @@ DISPLAYXR_EXPORT float displayxr_get_backing_scale_factor(void);
 /// Resets the flag after reading.
 DISPLAYXR_EXPORT int displayxr_standalone_window_was_closed(void);
 
+/// Returns 1 if the preview window is being moved or resized.
+DISPLAYXR_EXPORT int displayxr_standalone_window_is_interacting(void);
+
 /// Get atlas swapchain dimensions (for creating matching RenderTextures in C#).
 DISPLAYXR_EXPORT void displayxr_standalone_get_swapchain_size(
     uint32_t *width, uint32_t *height);

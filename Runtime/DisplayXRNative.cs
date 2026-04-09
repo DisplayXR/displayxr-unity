@@ -161,6 +161,9 @@ namespace DisplayXR
         internal static extern int displayxr_standalone_window_was_closed();
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int displayxr_standalone_window_is_interacting();
+
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int displayxr_standalone_start(
             [MarshalAs(UnmanagedType.LPStr)] string runtimeJsonPath);
 

@@ -54,6 +54,9 @@ int displayxr_sa_metal_get_window_rect(int32_t *out_x, int32_t *out_y,
 /// Resets the flag after reading.
 int displayxr_sa_metal_window_was_closed(void);
 
+/// Returns 1 if the preview window is currently being moved or resized.
+int displayxr_sa_metal_window_is_interacting(void);
+
 #ifdef __cplusplus
 }
 #endif
