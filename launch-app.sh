@@ -30,7 +30,7 @@ if [ ! -f "$PLUGINS_DIR/openxr_loader.dylib" ]; then
     LOADER_SRC=""
     for candidate in \
         /Users/david.fattal/Documents/Unity/DisplayXR-test/Library/PackageCache/com.unity.xr.openxr*/RuntimeLoaders/osx/libopenxr_loader.dylib \
-        /Users/david.fattal/Documents/GitHub/openxr-3d-display/_package/DisplayXR-macOS/lib/libopenxr_loader.dylib; do
+        /Users/david.fattal/Documents/GitHub/displayxr-runtime-pvt/_package/DisplayXR-macOS/lib/libopenxr_loader.dylib; do
         if [ -f "$candidate" ]; then
             LOADER_SRC="$candidate"
             break
@@ -44,7 +44,7 @@ if [ ! -f "$PLUGINS_DIR/openxr_loader.dylib" ]; then
     fi
 fi
 
-XR_RUNTIME_JSON=/Users/david.fattal/Documents/GitHub/openxr-3d-display/_package/DisplayXR-macOS/openxr_displayxr.json \
+XR_RUNTIME_JSON=/Users/david.fattal/Documents/GitHub/displayxr-runtime-pvt/_package/DisplayXR-macOS/openxr_displayxr.json \
 SIM_DISPLAY_ENABLE=1 \
 SIM_DISPLAY_OUTPUT=anaglyph \
 XRT_LOG_LEVEL=debug \

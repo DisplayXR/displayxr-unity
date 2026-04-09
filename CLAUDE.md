@@ -6,7 +6,7 @@ This file provides guidance to Claude Code when working with this repository.
 
 Unity plugin for eye-tracked 3D light field displays via the **DisplayXR OpenXR runtime**. This is a Unity Package Manager (UPM) package that intercepts Unity's OpenXR pipeline at the native layer to provide Kooima asymmetric frustum projection for stereo rendering. The primary editor workflow is a **standalone preview window** that creates its own OpenXR session — no Play Mode needed.
 
-The plugin works with the **openxr-3d-display** runtime ([dfattal/openxr-3d-display](https://github.com/dfattal/openxr-3d-display)) but has **no source dependency** on it — native code fetches OpenXR headers independently from Khronos.
+The plugin works with the **DisplayXR runtime** ([DisplayXR/displayxr-runtime-pvt](https://github.com/DisplayXR/displayxr-runtime-pvt)) but has **no source dependency** on it — native code fetches OpenXR headers independently from Khronos.
 
 ## Repository Structure
 
@@ -243,7 +243,7 @@ Automates the complete CI workflow for native plugin builds: commit → push →
 
 ## Cross-Repo References
 
-- Runtime repo: [dfattal/openxr-3d-display](https://github.com/dfattal/openxr-3d-display)
-- Use `dfattal/openxr-3d-display#N` syntax to reference runtime issues
+- Runtime repo: [DisplayXR/displayxr-runtime-pvt](https://github.com/DisplayXR/displayxr-runtime-pvt)
+- Use `DisplayXR/displayxr-runtime-pvt#N` syntax to reference runtime issues
 - The runtime provides the OpenXR compositor, display drivers, and eye tracking
 - The plugin provides the Unity-side stereo rendering pipeline

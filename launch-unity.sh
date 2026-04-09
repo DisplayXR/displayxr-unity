@@ -21,7 +21,7 @@ LOGFILE="$SCRIPT_DIR/displayxr.log"
 # Remove stale lock file (left behind if Unity crashed or was killed)
 rm -f "$PROJECT/Temp/UnityLockfile"
 
-XR_RUNTIME_JSON=/Users/david.fattal/Documents/GitHub/openxr-3d-display/_package/DisplayXR-macOS/openxr_displayxr.json \
+XR_RUNTIME_JSON=/Users/david.fattal/Documents/GitHub/displayxr-runtime-pvt/_package/DisplayXR-macOS/openxr_displayxr.json \
 SIM_DISPLAY_ENABLE=1 \
 SIM_DISPLAY_OUTPUT=anaglyph \
 XRT_LOG_LEVEL=debug \
