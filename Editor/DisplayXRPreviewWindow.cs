@@ -253,13 +253,9 @@ namespace DisplayXR.Editor
                         previewRect.width, h);
                 }
 
-                // macOS Metal: RenderTextures are Y-flipped in GPU memory.
-                // Flip UV.y to display correctly.
-#if UNITY_EDITOR_OSX
+                // Projection Y is flipped during rendering (both platforms) so the
+                // atlas RT content is Y-inverted. Flip UV.y to display correctly.
                 GUI.DrawTextureWithTexCoords(drawRect, atlas, new Rect(0, vMax, uMax, -vMax));
-#else
-                GUI.DrawTextureWithTexCoords(drawRect, atlas, new Rect(0, 0, uMax, vMax));
-#endif
 
                 // Draw tile grid overlay (relative to content, not full atlas)
                 if (tc > 0 && tr > 0)

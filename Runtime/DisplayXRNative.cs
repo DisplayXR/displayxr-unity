@@ -154,6 +154,16 @@ namespace DisplayXR
         internal static extern void displayxr_destroy_preview_window();
 
         // ====================================================================
+        // Native log callback (routes native messages to Debug.Log)
+        // ====================================================================
+
+        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
+        internal delegate void LogCallback([MarshalAs(UnmanagedType.LPStr)] string message);
+
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void displayxr_standalone_set_log_callback(LogCallback callback);
+
+        // ====================================================================
         // Standalone preview session (bypasses Unity's OpenXR loader)
         // ====================================================================
 
@@ -234,15 +244,6 @@ namespace DisplayXR
         // ====================================================================
         // Standalone stereo views (Kooima projection via display3d library)
         // ====================================================================
-
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_standalone_compute_stereo_views(
-            float nearZ, float farZ,
-            [MarshalAs(UnmanagedType.LPArray, SizeConst = 16)] float[] leftView,
-            [MarshalAs(UnmanagedType.LPArray, SizeConst = 16)] float[] leftProj,
-            [MarshalAs(UnmanagedType.LPArray, SizeConst = 16)] float[] rightView,
-            [MarshalAs(UnmanagedType.LPArray, SizeConst = 16)] float[] rightProj,
-            out int valid);
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern void displayxr_standalone_compute_views(

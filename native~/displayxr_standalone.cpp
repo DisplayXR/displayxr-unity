@@ -49,6 +49,7 @@ typedef struct XrGraphicsRequirementsD3D12KHR {
 #endif
 
 #include <math.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -185,6 +186,8 @@ typedef struct StandaloneState {
 	int camera_centric;
 	float inv_convergence_distance;
 	float fov_override; // half_tan_vfov for camera-centric
+	float last_near_z;  // cached from last compute_views call
+	float last_far_z;
 	XrPosef display_pose;
 	int display_pose_set;
 
@@ -242,9 +245,42 @@ typedef struct StandaloneState {
 	int32_t canvas_x;
 	int32_t canvas_y;
 	int has_display_mode_ext;
+#if defined(_WIN32)
+	int window_closed;  // Set to 1 when user closes the preview window
+	int dragging;       // Non-zero while custom (non-modal) window move is active
+	POINT drag_start_cursor;
+	RECT drag_start_rect;
+#endif
 } StandaloneState;
 
 static StandaloneState s_sa = {};
+
+// ============================================================================
+// Log callback — routes native messages to Unity's Debug.Log
+// ============================================================================
+
+static DisplayXRLogCallback s_log_callback = NULL;
+
+DISPLAYXR_EXPORT void
+displayxr_standalone_set_log_callback(DisplayXRLogCallback callback)
+{
+	s_log_callback = callback;
+}
+
+// Helper: log to stderr AND to the Unity callback (if registered).
+static void
+sa_log(const char *fmt, ...)
+{
+	char buf[1024];
+	va_list args;
+	va_start(args, fmt);
+	vsnprintf(buf, sizeof(buf), fmt, args);
+	va_end(args);
+
+	fprintf(stderr, "%s", buf);
+	if (s_log_callback)
+		s_log_callback(buf);
+}
 
 // ============================================================================
 // JSON parsing helper (minimal, no external deps)
@@ -319,7 +355,7 @@ resolve_library_path(const char *json_path, const char *lib_path)
 #define SA_RESOLVE_FN(xr_name, field_name, type) do { \
 	PFN_xrVoidFunction fn = NULL; \
 	if (XR_FAILED(s_sa.gipa(s_sa.instance, #xr_name, &fn)) || !fn) { \
-		fprintf(stderr, "[DisplayXR-SA] Failed to resolve %s\n", #xr_name); \
+		sa_log("[DisplayXR-SA] Failed to resolve %s\n", #xr_name); \
 		return 0; \
 	} \
 	s_sa.field_name = (type)fn; \
@@ -357,22 +393,22 @@ resolve_functions(void)
 		if (XR_SUCCEEDED(s_sa.gipa(s_sa.instance, "xrRequestDisplayModeEXT", &fn)) && fn) {
 			s_sa.pfn_request_display_mode = (PFN_xrRequestDisplayModeEXT)fn;
 			s_sa.has_display_mode_ext = 1;
-			fprintf(stderr, "[DisplayXR-SA] Resolved xrRequestDisplayModeEXT\n");
+			sa_log("[DisplayXR-SA] Resolved xrRequestDisplayModeEXT\n");
 		}
 		fn = NULL;
 		if (XR_SUCCEEDED(s_sa.gipa(s_sa.instance, "xrRequestDisplayRenderingModeEXT", &fn)) && fn) {
 			s_sa.pfn_request_rendering_mode = (PFN_xrRequestDisplayRenderingModeEXT)fn;
-			fprintf(stderr, "[DisplayXR-SA] Resolved xrRequestDisplayRenderingModeEXT\n");
+			sa_log("[DisplayXR-SA] Resolved xrRequestDisplayRenderingModeEXT\n");
 		}
 		fn = NULL;
 		if (XR_SUCCEEDED(s_sa.gipa(s_sa.instance, "xrEnumerateDisplayRenderingModesEXT", &fn)) && fn) {
 			s_sa.pfn_enumerate_rendering_modes = (PFN_xrEnumerateDisplayRenderingModesEXT)fn;
-			fprintf(stderr, "[DisplayXR-SA] Resolved xrEnumerateDisplayRenderingModesEXT\n");
+			sa_log("[DisplayXR-SA] Resolved xrEnumerateDisplayRenderingModesEXT\n");
 		}
 		fn = NULL;
 		if (XR_SUCCEEDED(s_sa.gipa(s_sa.instance, "xrSetSharedTextureOutputRectEXT", &fn)) && fn) {
 			s_sa.pfn_set_output_rect = (PFN_xrSetSharedTextureOutputRectEXT)fn;
-			fprintf(stderr, "[DisplayXR-SA] Resolved xrSetSharedTextureOutputRectEXT\n");
+			sa_log("[DisplayXR-SA] Resolved xrSetSharedTextureOutputRectEXT\n");
 		}
 	}
 
@@ -406,7 +442,7 @@ enumerate_and_store_modes(void)
 
 	s_sa.rendering_mode_count = total;
 	for (uint32_t i = 0; i < total; i++) {
-		fprintf(stderr, "[DisplayXR-SA] Mode[%u]: '%s' views=%u tiles=%ux%u viewPx=%ux%u scale=%.2fx%.2f hw3d=%d\n",
+		sa_log("[DisplayXR-SA] Mode[%u]: '%s' views=%u tiles=%ux%u viewPx=%ux%u scale=%.2fx%.2f hw3d=%d\n",
 		        s_sa.rendering_modes[i].modeIndex,
 		        s_sa.rendering_modes[i].modeName,
 		        s_sa.rendering_modes[i].viewCount,
@@ -537,7 +573,7 @@ create_atlas_swapchain(void)
 	uint32_t fmt_count = 0;
 	s_sa.pfn_enumerate_swapchain_formats(s_sa.session, 0, &fmt_count, NULL);
 	if (fmt_count == 0) {
-		fprintf(stderr, "[DisplayXR-SA] No swapchain formats available\n");
+		sa_log("[DisplayXR-SA] No swapchain formats available\n");
 		return 0;
 	}
 
@@ -548,7 +584,7 @@ create_atlas_swapchain(void)
 	// Pick a suitable format per platform
 	int64_t format = formats[0];
 	for (uint32_t i = 0; i < fmt_count; i++) {
-		fprintf(stderr, "[DisplayXR-SA] Supported format[%u]: %lld\n", i, formats[i]);
+		sa_log("[DisplayXR-SA] Supported format[%u]: %lld\n", i, formats[i]);
 #if defined(__APPLE__)
 		if (formats[i] == 80) { format = 80; break; } // MTLPixelFormatBGRA8Unorm
 		if (formats[i] == 70) { format = 70; }         // MTLPixelFormatRGBA8Unorm
@@ -557,7 +593,7 @@ create_atlas_swapchain(void)
 		if (formats[i] == 87) { format = 87; }          // DXGI_FORMAT_B8G8R8A8_UNORM
 #endif
 	}
-	fprintf(stderr, "[DisplayXR-SA] Selected swapchain format: %lld\n", format);
+	sa_log("[DisplayXR-SA] Selected swapchain format: %lld\n", format);
 
 	XrSwapchainCreateInfo sc_ci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
 	sc_ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
@@ -574,7 +610,7 @@ create_atlas_swapchain(void)
 	XrResult result = s_sa.pfn_create_swapchain(
 		s_sa.session, &sc_ci, &s_sa.atlas.handle);
 	if (XR_FAILED(result)) {
-		fprintf(stderr, "[DisplayXR-SA] xrCreateSwapchain (atlas) failed: %d\n", result);
+		sa_log("[DisplayXR-SA] xrCreateSwapchain (atlas) failed: %d\n", result);
 		return 0;
 	}
 
@@ -601,11 +637,11 @@ create_atlas_swapchain(void)
 		s_sa.atlas.handle, count, &count,
 		(XrSwapchainImageBaseHeader *)s_sa.atlas.images);
 	if (XR_FAILED(result)) {
-		fprintf(stderr, "[DisplayXR-SA] xrEnumerateSwapchainImages (atlas) failed: %d\n", result);
+		sa_log("[DisplayXR-SA] xrEnumerateSwapchainImages (atlas) failed: %d\n", result);
 		return 0;
 	}
 
-	fprintf(stderr, "[DisplayXR-SA] Atlas swapchain: %ux%u, %u images\n",
+	sa_log("[DisplayXR-SA] Atlas swapchain: %ux%u, %u images\n",
 	        atlas_w, atlas_h, count);
 
 	s_sa.atlas_created = 1;
@@ -614,6 +650,8 @@ create_atlas_swapchain(void)
 	// Create atlas bridge: a SHARED texture on the SA device that Unity's device
 	// can also access. C# copies atlas RT → bridge (Unity device), native copies
 	// bridge → swapchain (SA device). Both copies are same-device = fast.
+	sa_log("[DisplayXR-SA] Atlas bridge: unity_device=%p, sa_device=%p\n",
+	        (void *)s_sa.unity_device, (void *)s_sa.d3d12_device);
 	if (s_sa.unity_device && s_sa.d3d12_device) {
 		D3D12_HEAP_PROPERTIES heap = {};
 		heap.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -642,13 +680,13 @@ create_atlas_swapchain(void)
 					s_sa.d3d12_atlas_bridge_handle,
 					__uuidof(ID3D12Resource), (void **)&s_sa.d3d12_unity_atlas_bridge);
 				if (SUCCEEDED(hr)) {
-					fprintf(stderr, "[DisplayXR-SA] Atlas bridge: %ux%u, handle=%p\n",
+					sa_log("[DisplayXR-SA] Atlas bridge: %ux%u, handle=%p\n",
 					        atlas_w, atlas_h, s_sa.d3d12_atlas_bridge_handle);
 				}
 			}
 		}
 		if (FAILED(hr)) {
-			fprintf(stderr, "[DisplayXR-SA] Atlas bridge creation failed: 0x%08lx\n", hr);
+			sa_log("[DisplayXR-SA] Atlas bridge creation failed: 0x%08lx\n", hr);
 		}
 	}
 #endif
@@ -672,42 +710,163 @@ destroy_atlas_swapchain(void)
 // ============================================================================
 
 
+#if defined(_WIN32)
+// Push the canvas rect to the runtime via xrSetSharedTextureOutputRectEXT.
+// canvas_offset_x/y are WINDOW-RELATIVE (offset within the client area),
+// not screen-relative — the SR weaver adds these to its own window position
+// when computing phase alignment. Since our canvas IS the full window with
+// no letterbox, the offset is always (0, 0) and the size is the client area.
+static void
+sa_push_canvas_rect_to_runtime(void)
+{
+	if (s_sa.pfn_set_output_rect && s_sa.session != XR_NULL_HANDLE &&
+	    s_sa.canvas_width > 0 && s_sa.canvas_height > 0) {
+		s_sa.pfn_set_output_rect(s_sa.session,
+		                          0, 0,
+		                          s_sa.canvas_width, s_sa.canvas_height);
+	}
+}
+
+static void
+sa_update_canvas_from_hwnd(HWND hwnd)
+{
+	if (!hwnd) return;
+	RECT rc;
+	if (GetClientRect(hwnd, &rc)) {
+		POINT pt = {0, 0};
+		ClientToScreen(hwnd, &pt);
+		s_sa.canvas_x = pt.x;
+		s_sa.canvas_y = pt.y;
+		s_sa.canvas_width = (uint32_t)(rc.right - rc.left);
+		s_sa.canvas_height = (uint32_t)(rc.bottom - rc.top);
+		sa_push_canvas_rect_to_runtime();
+	}
+}
+
+static LRESULT CALLBACK
+sa_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+	switch (msg) {
+	case WM_CLOSE:
+		s_sa.window_closed = 1;
+		DestroyWindow(hwnd);
+		return 0;
+	case WM_DESTROY:
+		s_sa.preview_hwnd = NULL;
+		return 0;
+	// PARKED: capture-based move handler (SC_MOVE intercept).
+	//
+	// We previously intercepted SC_MOVE here to bypass DefWindowProc's modal
+	// drag loop. That kept Unity's main thread running so FrameTick continued
+	// to fire — C# re-rendered the scene each frame with updated Kooima based
+	// on the new window position. Combined with xrSetSharedTextureOutputRectEXT
+	// (still called from sa_update_canvas_from_hwnd), this gave real-time
+	// Kooima updates during drag.
+	//
+	// HOWEVER: the SR SDK weaver does phase-snapping by intercepting the OS
+	// modal drag loop. By bypassing it, the window lands on pixel positions
+	// that are not phase-aligned to the lenticular grid, producing visible
+	// stutter as the user drags. xrSetSharedTextureOutputRectEXT is REQUIRED
+	// for the weaver to interlace at all in windowed mode (without it,
+	// weaving only works in fullscreen), but it does NOT trigger phase
+	// snapping — that only happens during the modal loop.
+	//
+	// Current behavior: let DefWindowProc handle the modal drag (phase
+	// snapping works, no stutter), accept that Kooima only updates on drag
+	// release (Unity main thread is blocked during the modal loop). See
+	// the "Known Issues" section in CLAUDE.md for the full context.
+	//
+	// Proper fix likely needs runtime API support — e.g. an "external drag"
+	// mode where the app proposes a position and the runtime returns the
+	// snapped position.
+	//
+	// To re-enable real-time Kooima with stutter, uncomment the case
+	// handlers below.
+	//
+	// case WM_SYSCOMMAND:
+	// 	if ((wParam & 0xFFF0) == SC_MOVE) {
+	// 		SetCapture(hwnd);
+	// 		GetCursorPos(&s_sa.drag_start_cursor);
+	// 		GetWindowRect(hwnd, &s_sa.drag_start_rect);
+	// 		s_sa.dragging = 1;
+	// 		return 0;
+	// 	}
+	// 	break;
+	// case WM_MOUSEMOVE:
+	// 	if (s_sa.dragging) {
+	// 		POINT cur;
+	// 		GetCursorPos(&cur);
+	// 		int dx = cur.x - s_sa.drag_start_cursor.x;
+	// 		int dy = cur.y - s_sa.drag_start_cursor.y;
+	// 		SetWindowPos(hwnd, NULL,
+	// 		             s_sa.drag_start_rect.left + dx,
+	// 		             s_sa.drag_start_rect.top + dy,
+	// 		             0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+	// 	}
+	// 	break;
+	// case WM_LBUTTONUP:
+	// 	if (s_sa.dragging) {
+	// 		s_sa.dragging = 0;
+	// 		ReleaseCapture();
+	// 		return 0;
+	// 	}
+	// 	break;
+	// case WM_CAPTURECHANGED:
+	// 	s_sa.dragging = 0;
+	// 	break;
+	case WM_MOVE:
+	case WM_SIZE:
+		// Update canvas rect from current window position and push to runtime
+		// for SR weaver phase calculation. With SC_MOVE intercepted, this fires
+		// continuously during the custom drag (each SetWindowPos call).
+		sa_update_canvas_from_hwnd(s_sa.preview_hwnd);
+		break;
+	}
+	return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+#endif
+
 int
 displayxr_standalone_start(const char *runtime_json_path)
 {
 	if (s_sa.running) {
-		fprintf(stderr, "[DisplayXR-SA] Already running\n");
+		sa_log("[DisplayXR-SA] Already running\n");
 		return 1;
 	}
 
-	memset(&s_sa, 0, sizeof(s_sa));
-
 #if defined(_WIN32)
+	// Preserve Unity device pointer — set before start() via set_unity_device()
+	ID3D12Device *saved_unity_device = s_sa.unity_device;
+#endif
+	memset(&s_sa, 0, sizeof(s_sa));
+#if defined(_WIN32)
+	s_sa.unity_device = saved_unity_device;
+
 	// Set Per-Monitor DPI Awareness V2 so the Leia SR weaver sees physical
 	// pixels from GetClientRect(), matching our canvas rect dimensions.
 	SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
 #endif
 
-	fprintf(stderr, "[DisplayXR-SA] Starting with runtime: %s\n", runtime_json_path);
+	sa_log("[DisplayXR-SA] Starting with runtime: %s\n", runtime_json_path);
 
 	// --- Step 1: Load the runtime library ---
 	char *lib_rel = parse_library_path(runtime_json_path);
 	if (!lib_rel) {
-		fprintf(stderr, "[DisplayXR-SA] Failed to parse library_path from %s\n", runtime_json_path);
+		sa_log("[DisplayXR-SA] Failed to parse library_path from %s\n", runtime_json_path);
 		return 0;
 	}
 
 	char *lib_abs = resolve_library_path(runtime_json_path, lib_rel);
 	free(lib_rel);
 
-	fprintf(stderr, "[DisplayXR-SA] Loading runtime library: %s\n", lib_abs);
+	sa_log("[DisplayXR-SA] Loading runtime library: %s\n", lib_abs);
 
 	XrResult result;
 
 #if defined(_WIN32)
 	HMODULE hmod = LoadLibraryA(lib_abs);
 	if (!hmod) {
-		fprintf(stderr, "[DisplayXR-SA] LoadLibrary failed: %lu\n", GetLastError());
+		sa_log("[DisplayXR-SA] LoadLibrary failed: %lu\n", GetLastError());
 		free(lib_abs);
 		return 0;
 	}
@@ -719,7 +878,7 @@ displayxr_standalone_start(const char *runtime_json_path)
 		(PFN_xrNegotiateLoaderRuntimeInterface)GetProcAddress(hmod,
 		    "xrNegotiateLoaderRuntimeInterface");
 	if (!negotiate) {
-		fprintf(stderr, "[DisplayXR-SA] Runtime doesn't export xrNegotiateLoaderRuntimeInterface\n");
+		sa_log("[DisplayXR-SA] Runtime doesn't export xrNegotiateLoaderRuntimeInterface\n");
 		FreeLibrary(hmod);
 		s_sa.runtime_lib = NULL;
 		return 0;
@@ -741,18 +900,18 @@ displayxr_standalone_start(const char *runtime_json_path)
 
 	result = negotiate(&loader_info, &runtime_req);
 	if (XR_FAILED(result) || !runtime_req.getInstanceProcAddr) {
-		fprintf(stderr, "[DisplayXR-SA] Runtime negotiation failed: %d\n", result);
+		sa_log("[DisplayXR-SA] Runtime negotiation failed: %d\n", result);
 		FreeLibrary(hmod);
 		s_sa.runtime_lib = NULL;
 		return 0;
 	}
 
 	s_sa.gipa = runtime_req.getInstanceProcAddr;
-	fprintf(stderr, "[DisplayXR-SA] Runtime negotiation succeeded\n");
+	sa_log("[DisplayXR-SA] Runtime negotiation succeeded\n");
 #else
 	s_sa.runtime_lib = dlopen(lib_abs, RTLD_LOCAL | RTLD_LAZY);
 	if (!s_sa.runtime_lib) {
-		fprintf(stderr, "[DisplayXR-SA] dlopen failed: %s\n", dlerror());
+		sa_log("[DisplayXR-SA] dlopen failed: %s\n", dlerror());
 		free(lib_abs);
 		return 0;
 	}
@@ -763,7 +922,7 @@ displayxr_standalone_start(const char *runtime_json_path)
 		(PFN_xrNegotiateLoaderRuntimeInterface)dlsym(s_sa.runtime_lib,
 		    "xrNegotiateLoaderRuntimeInterface");
 	if (!negotiate) {
-		fprintf(stderr, "[DisplayXR-SA] Runtime doesn't export xrNegotiateLoaderRuntimeInterface\n");
+		sa_log("[DisplayXR-SA] Runtime doesn't export xrNegotiateLoaderRuntimeInterface\n");
 		dlclose(s_sa.runtime_lib);
 		s_sa.runtime_lib = NULL;
 		return 0;
@@ -785,14 +944,14 @@ displayxr_standalone_start(const char *runtime_json_path)
 
 	result = negotiate(&loader_info, &runtime_req);
 	if (XR_FAILED(result) || !runtime_req.getInstanceProcAddr) {
-		fprintf(stderr, "[DisplayXR-SA] Runtime negotiation failed: %d\n", result);
+		sa_log("[DisplayXR-SA] Runtime negotiation failed: %d\n", result);
 		dlclose(s_sa.runtime_lib);
 		s_sa.runtime_lib = NULL;
 		return 0;
 	}
 
 	s_sa.gipa = runtime_req.getInstanceProcAddr;
-	fprintf(stderr, "[DisplayXR-SA] Runtime negotiation succeeded\n");
+	sa_log("[DisplayXR-SA] Runtime negotiation succeeded\n");
 #endif
 
 	// --- Step 3: Create OpenXR instance ---
@@ -811,7 +970,7 @@ displayxr_standalone_start(const char *runtime_json_path)
 	PFN_xrVoidFunction fn_create = NULL;
 	s_sa.gipa(XR_NULL_HANDLE, "xrCreateInstance", &fn_create);
 	if (!fn_create) {
-		fprintf(stderr, "[DisplayXR-SA] Failed to resolve xrCreateInstance\n");
+		sa_log("[DisplayXR-SA] Failed to resolve xrCreateInstance\n");
 		displayxr_standalone_stop();
 		return 0;
 	}
@@ -827,11 +986,11 @@ displayxr_standalone_start(const char *runtime_json_path)
 
 	result = ((PFN_xrCreateInstance)fn_create)(&instance_ci, &s_sa.instance);
 	if (XR_FAILED(result)) {
-		fprintf(stderr, "[DisplayXR-SA] xrCreateInstance failed: %d\n", result);
+		sa_log("[DisplayXR-SA] xrCreateInstance failed: %d\n", result);
 		displayxr_standalone_stop();
 		return 0;
 	}
-	fprintf(stderr, "[DisplayXR-SA] Instance created\n");
+	sa_log("[DisplayXR-SA] Instance created\n");
 
 	// --- Step 4: Resolve all function pointers ---
 	if (!resolve_functions()) {
@@ -845,11 +1004,11 @@ displayxr_standalone_start(const char *runtime_json_path)
 
 	result = s_sa.pfn_get_system(s_sa.instance, &sys_info, &s_sa.system_id);
 	if (XR_FAILED(result)) {
-		fprintf(stderr, "[DisplayXR-SA] xrGetSystem failed: %d\n", result);
+		sa_log("[DisplayXR-SA] xrGetSystem failed: %d\n", result);
 		displayxr_standalone_stop();
 		return 0;
 	}
-	fprintf(stderr, "[DisplayXR-SA] System acquired\n");
+	sa_log("[DisplayXR-SA] System acquired\n");
 
 	// --- Step 5b: Get Metal graphics requirements ---
 #if defined(__APPLE__)
@@ -862,13 +1021,13 @@ displayxr_standalone_start(const char *runtime_json_path)
 			result = ((PFN_xrGetMetalGraphicsRequirementsKHR)fn_req)(
 				s_sa.instance, s_sa.system_id, &req);
 			if (XR_FAILED(result)) {
-				fprintf(stderr, "[DisplayXR-SA] xrGetMetalGraphicsRequirementsKHR failed: %d\n", result);
+				sa_log("[DisplayXR-SA] xrGetMetalGraphicsRequirementsKHR failed: %d\n", result);
 				displayxr_standalone_stop();
 				return 0;
 			}
-			fprintf(stderr, "[DisplayXR-SA] Metal graphics requirements satisfied\n");
+			sa_log("[DisplayXR-SA] Metal graphics requirements satisfied\n");
 		} else {
-			fprintf(stderr, "[DisplayXR-SA] Warning: xrGetMetalGraphicsRequirementsKHR not found\n");
+			sa_log("[DisplayXR-SA] Warning: xrGetMetalGraphicsRequirementsKHR not found\n");
 		}
 	}
 #elif defined(_WIN32)
@@ -884,12 +1043,12 @@ displayxr_standalone_start(const char *runtime_json_path)
 			result = ((XrResult(XRAPI_CALL *)(XrInstance, XrSystemId, void *))fn_req)(
 				s_sa.instance, s_sa.system_id, &req);
 			if (XR_FAILED(result)) {
-				fprintf(stderr, "[DisplayXR-SA] xrGetD3D12GraphicsRequirementsKHR failed: %d\n", result);
+				sa_log("[DisplayXR-SA] xrGetD3D12GraphicsRequirementsKHR failed: %d\n", result);
 				displayxr_standalone_stop();
 				return 0;
 			}
 			adapter_luid = req.adapterLuid;
-			fprintf(stderr, "[DisplayXR-SA] D3D12 requirements: adapter LUID=%08lx-%08lx, minFeatureLevel=0x%x\n",
+			sa_log("[DisplayXR-SA] D3D12 requirements: adapter LUID=%08lx-%08lx, minFeatureLevel=0x%x\n",
 			        adapter_luid.HighPart, adapter_luid.LowPart, (unsigned)req.minFeatureLevel);
 		}
 
@@ -906,7 +1065,7 @@ displayxr_standalone_start(const char *runtime_json_path)
 				if (SUCCEEDED(hr2)) {
 					DXGI_ADAPTER_DESC1 desc;
 					adapter->GetDesc1(&desc);
-					fprintf(stderr, "[DisplayXR-SA] Found matching adapter: %ls\n", desc.Description);
+					sa_log("[DisplayXR-SA] Found matching adapter: %ls\n", desc.Description);
 				}
 			}
 			HRESULT hr = D3D12CreateDevice(
@@ -915,11 +1074,11 @@ displayxr_standalone_start(const char *runtime_json_path)
 			if (adapter) adapter->Release();
 			if (factory) factory->Release();
 			if (FAILED(hr) || !s_sa.d3d12_device) {
-				fprintf(stderr, "[DisplayXR-SA] D3D12CreateDevice failed: 0x%08lx\n", hr);
+				sa_log("[DisplayXR-SA] D3D12CreateDevice failed: 0x%08lx\n", hr);
 				displayxr_standalone_stop();
 				return 0;
 			}
-			fprintf(stderr, "[DisplayXR-SA] Created own D3D12 device for runtime session\n");
+			sa_log("[DisplayXR-SA] Created own D3D12 device for runtime session\n");
 		}
 
 		// Create command queue on the device
@@ -928,7 +1087,7 @@ displayxr_standalone_start(const char *runtime_json_path)
 		HRESULT hr = s_sa.d3d12_device->CreateCommandQueue(
 			&qd, __uuidof(ID3D12CommandQueue), (void **)&s_sa.d3d12_queue);
 		if (FAILED(hr)) {
-			fprintf(stderr, "[DisplayXR-SA] CreateCommandQueue failed: 0x%08lx\n", hr);
+			sa_log("[DisplayXR-SA] CreateCommandQueue failed: 0x%08lx\n", hr);
 			displayxr_standalone_stop();
 			return 0;
 		}
@@ -949,7 +1108,7 @@ displayxr_standalone_start(const char *runtime_json_path)
 		s_sa.d3d12_fence_event = CreateEvent(NULL, FALSE, FALSE, NULL);
 		s_sa.d3d12_fence_value = 0;
 
-		fprintf(stderr, "[DisplayXR-SA] D3D12 command queue + blit resources created\n");
+		sa_log("[DisplayXR-SA] D3D12 command queue + blit resources created\n");
 	}
 #endif
 
@@ -973,9 +1132,11 @@ displayxr_standalone_start(const char *runtime_json_path)
 		s_sa.display_info.recommended_view_scale_y = display_info_ext.recommendedViewScaleY;
 		s_sa.display_info.is_valid = 1;
 
-		fprintf(stderr, "[DisplayXR-SA] Display: %ux%u, %.3fx%.3fm\n",
+		sa_log("[DisplayXR-SA] Display: %ux%u, %.3fx%.3fm\n",
 		        display_info_ext.displayPixelWidth, display_info_ext.displayPixelHeight,
 		        display_info_ext.displaySizeMeters.width, display_info_ext.displaySizeMeters.height);
+	} else {
+		sa_log("[DisplayXR-SA] xrGetSystemProperties failed: %d\n", result);
 	}
 
 	// --- Step 7: Create native preview window ---
@@ -985,7 +1146,7 @@ displayxr_standalone_start(const char *runtime_json_path)
 	    s_sa.display_info.display_pixel_height > 0) {
 		if (!displayxr_sa_metal_create_window(s_sa.display_info.display_pixel_width,
 		                                       s_sa.display_info.display_pixel_height)) {
-			fprintf(stderr, "[DisplayXR-SA] Preview window creation failed\n");
+			sa_log("[DisplayXR-SA] Preview window creation failed\n");
 			displayxr_standalone_stop();
 			return 0;
 		}
@@ -997,7 +1158,7 @@ displayxr_standalone_start(const char *runtime_json_path)
 	    s_sa.display_info.display_pixel_height > 0) {
 		WNDCLASSEXW wc = {};
 		wc.cbSize = sizeof(wc);
-		wc.lpfnWndProc = DefWindowProcW;
+		wc.lpfnWndProc = sa_wndproc;
 		wc.hInstance = GetModuleHandle(NULL);
 		wc.lpszClassName = L"DisplayXRPreview";
 		wc.hCursor = LoadCursor(NULL, IDC_ARROW);
@@ -1015,13 +1176,18 @@ displayxr_standalone_start(const char *runtime_json_path)
 		if (s_sa.preview_hwnd) {
 			// Show without stealing focus from Unity
 			ShowWindow(s_sa.preview_hwnd, SW_SHOWNOACTIVATE);
-			fprintf(stderr, "[DisplayXR-SA] Preview HWND created: %p (%ux%u)\n",
+			sa_log("[DisplayXR-SA] Preview HWND created: %p (%ux%u)\n",
 			        (void *)s_sa.preview_hwnd,
 			        s_sa.display_info.display_pixel_width,
 			        s_sa.display_info.display_pixel_height);
 		} else {
-			fprintf(stderr, "[DisplayXR-SA] CreateWindowExW failed: %lu\n", GetLastError());
+			sa_log("[DisplayXR-SA] CreateWindowExW failed: %lu\n", GetLastError());
 		}
+	} else {
+		sa_log("[DisplayXR-SA] Skipping window creation: is_valid=%d, pixels=%ux%u\n",
+		        s_sa.display_info.is_valid,
+		        s_sa.display_info.display_pixel_width,
+		        s_sa.display_info.display_pixel_height);
 	}
 #endif
 
@@ -1036,7 +1202,7 @@ displayxr_standalone_start(const char *runtime_json_path)
 	metal_binding.commandQueue = displayxr_sa_metal_get_command_queue();
 
 	if (!metal_binding.commandQueue) {
-		fprintf(stderr, "[DisplayXR-SA] Failed to create MTLCommandQueue\n");
+		sa_log("[DisplayXR-SA] Failed to create MTLCommandQueue\n");
 		displayxr_standalone_stop();
 		return 0;
 	}
@@ -1068,7 +1234,7 @@ displayxr_standalone_start(const char *runtime_json_path)
 	win_binding.readbackUserdata = NULL;
 	win_binding.sharedTextureHandle = NULL;
 
-	fprintf(stderr, "[DisplayXR-SA] Win32 binding: preview HWND=%p\n", (void *)s_sa.preview_hwnd);
+	sa_log("[DisplayXR-SA] Win32 binding: preview HWND=%p\n", (void *)s_sa.preview_hwnd);
 
 	// Chain: session_ci → d3d12_binding → win_binding
 	d3d12_binding.next = &win_binding;
@@ -1077,11 +1243,11 @@ displayxr_standalone_start(const char *runtime_json_path)
 
 	result = s_sa.pfn_create_session(s_sa.instance, &session_ci, &s_sa.session);
 	if (XR_FAILED(result)) {
-		fprintf(stderr, "[DisplayXR-SA] xrCreateSession failed: %d\n", result);
+		sa_log("[DisplayXR-SA] xrCreateSession failed: %d\n", result);
 		displayxr_standalone_stop();
 		return 0;
 	}
-	fprintf(stderr, "[DisplayXR-SA] Session created\n");
+	sa_log("[DisplayXR-SA] Session created\n");
 
 	// --- Step 9: Create LOCAL reference space ---
 	XrReferenceSpaceCreateInfo space_ci = {XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
@@ -1091,7 +1257,7 @@ displayxr_standalone_start(const char *runtime_json_path)
 
 	result = s_sa.pfn_create_reference_space(s_sa.session, &space_ci, &s_sa.local_space);
 	if (XR_FAILED(result)) {
-		fprintf(stderr, "[DisplayXR-SA] xrCreateReferenceSpace failed: %d\n", result);
+		sa_log("[DisplayXR-SA] xrCreateReferenceSpace failed: %d\n", result);
 		s_sa.local_space = XR_NULL_HANDLE;
 	}
 
@@ -1106,11 +1272,11 @@ displayxr_standalone_start(const char *runtime_json_path)
 
 	// --- Step 11: Create atlas swapchain ---
 	if (!create_atlas_swapchain()) {
-		fprintf(stderr, "[DisplayXR-SA] Warning: atlas swapchain creation deferred to session ready\n");
+		sa_log("[DisplayXR-SA] Warning: atlas swapchain creation deferred to session ready\n");
 	}
 
 	s_sa.running = 1;
-	fprintf(stderr, "[DisplayXR-SA] Standalone session started successfully\n");
+	sa_log("[DisplayXR-SA] Standalone session started successfully\n");
 	return 1;
 }
 
@@ -1118,7 +1284,7 @@ displayxr_standalone_start(const char *runtime_json_path)
 void
 displayxr_standalone_stop(void)
 {
-	fprintf(stderr, "[DisplayXR-SA] Stopping standalone session\n");
+	sa_log("[DisplayXR-SA] Stopping standalone session\n");
 	s_sa.running = 0;
 	s_sa.session_ready = 0;
 
@@ -1151,7 +1317,7 @@ displayxr_standalone_stop(void)
 		}
 		s_sa.pfn_destroy_session(s_sa.session);
 		s_sa.session = XR_NULL_HANDLE;
-		fprintf(stderr, "[DisplayXR-SA] Session destroyed\n");
+		sa_log("[DisplayXR-SA] Session destroyed\n");
 	}
 
 #if defined(__APPLE__)
@@ -1172,7 +1338,7 @@ displayxr_standalone_stop(void)
 	if (s_sa.instance != XR_NULL_HANDLE && s_sa.pfn_destroy_instance) {
 		s_sa.pfn_destroy_instance(s_sa.instance);
 		s_sa.instance = XR_NULL_HANDLE;
-		fprintf(stderr, "[DisplayXR-SA] Instance destroyed\n");
+		sa_log("[DisplayXR-SA] Instance destroyed\n");
 	}
 
 	// NOTE: Intentionally skip library unload on both platforms.
@@ -1186,7 +1352,7 @@ displayxr_standalone_stop(void)
 	}
 
 	memset(&s_sa, 0, sizeof(s_sa));
-	fprintf(stderr, "[DisplayXR-SA] Standalone session stopped\n");
+	sa_log("[DisplayXR-SA] Standalone session stopped\n");
 }
 
 
@@ -1206,6 +1372,15 @@ displayxr_standalone_poll_events(void)
 {
 	if (!s_sa.running || !s_sa.pfn_poll_event) return;
 
+#if defined(_WIN32)
+	// Pump Win32 messages so our WndProc receives WM_CLOSE etc.
+	MSG msg;
+	while (PeekMessageW(&msg, s_sa.preview_hwnd, 0, 0, PM_REMOVE)) {
+		TranslateMessage(&msg);
+		DispatchMessageW(&msg);
+	}
+#endif
+
 	XrEventDataBuffer event = {XR_TYPE_EVENT_DATA_BUFFER};
 	while (s_sa.pfn_poll_event(s_sa.instance, &event) == XR_SUCCESS) {
 		if (event.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
@@ -1213,7 +1388,7 @@ displayxr_standalone_poll_events(void)
 				(XrEventDataSessionStateChanged *)&event;
 			s_sa.session_state = ssc->state;
 
-			fprintf(stderr, "[DisplayXR-SA] Session state: %d\n", (int)ssc->state);
+			sa_log("[DisplayXR-SA] Session state: %d\n", (int)ssc->state);
 
 			switch (ssc->state) {
 			case XR_SESSION_STATE_READY: {
@@ -1222,7 +1397,7 @@ displayxr_standalone_poll_events(void)
 				XrResult r = s_sa.pfn_begin_session(s_sa.session, &begin_info);
 				if (XR_SUCCEEDED(r)) {
 					s_sa.session_ready = 1;
-					fprintf(stderr, "[DisplayXR-SA] Session begun\n");
+					sa_log("[DisplayXR-SA] Session begun\n");
 					// Create atlas swapchain now if deferred
 					if (!s_sa.atlas_created) {
 						if (s_sa.rendering_mode_count == 0)
@@ -1278,17 +1453,7 @@ displayxr_standalone_begin_frame(int *should_render)
 		}
 	}
 #elif defined(_WIN32)
-	if (s_sa.preview_hwnd) {
-		RECT rc;
-		if (GetClientRect(s_sa.preview_hwnd, &rc)) {
-			POINT pt = {0, 0};
-			ClientToScreen(s_sa.preview_hwnd, &pt);
-			s_sa.canvas_x = pt.x;
-			s_sa.canvas_y = pt.y;
-			s_sa.canvas_width = (uint32_t)(rc.right - rc.left);
-			s_sa.canvas_height = (uint32_t)(rc.bottom - rc.top);
-		}
-	}
+	sa_update_canvas_from_hwnd(s_sa.preview_hwnd);
 #endif
 
 	// Locate views (eye tracking — supports N views for multiview modes)
@@ -1354,7 +1519,7 @@ displayxr_standalone_submit_frame_atlas(void *atlas_tex)
 	XrSwapchainImageAcquireInfo acq_info = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
 	XrResult r = s_sa.pfn_acquire_swapchain_image(s_sa.atlas.handle, &acq_info, &index);
 	if (XR_FAILED(r)) {
-		fprintf(stderr, "[DisplayXR-SA] Acquire atlas swapchain failed: %d\n", r);
+		sa_log("[DisplayXR-SA] Acquire atlas swapchain failed: %d\n", r);
 		displayxr_standalone_end_frame_empty();
 		return 0;
 	}
@@ -1363,7 +1528,7 @@ displayxr_standalone_submit_frame_atlas(void *atlas_tex)
 	wait_info.timeout = 1000000000; // 1 second
 	r = s_sa.pfn_wait_swapchain_image(s_sa.atlas.handle, &wait_info);
 	if (XR_FAILED(r)) {
-		fprintf(stderr, "[DisplayXR-SA] Wait atlas swapchain failed: %d\n", r);
+		sa_log("[DisplayXR-SA] Wait atlas swapchain failed: %d\n", r);
 	}
 
 	// Blit Unity atlas RenderTexture → swapchain image (platform-specific)
@@ -1527,107 +1692,6 @@ displayxr_standalone_end_frame_empty(void)
 
 
 // ============================================================================
-// Public API: Stereo view computation
-// ============================================================================
-
-void
-displayxr_standalone_compute_stereo_views(float near_z, float far_z,
-                                           float *left_view, float *left_proj,
-                                           float *right_view, float *right_proj,
-                                           int *valid)
-{
-	*valid = 0;
-	if (!s_sa.display_info.is_valid) {
-		static int s_skip_log = 0;
-		if (s_skip_log++ % 300 == 0)
-			fprintf(stderr, "[DisplayXR-SA] compute_stereo_views skipped: display_valid=%d\n",
-				s_sa.display_info.is_valid);
-		return;
-	}
-
-	XrVector3f raw_left = {s_sa.left_eye[0], s_sa.left_eye[1], s_sa.left_eye[2]};
-	XrVector3f raw_right = {s_sa.right_eye[0], s_sa.right_eye[1], s_sa.right_eye[2]};
-	XrVector3f nominal = {
-		s_sa.display_info.nominal_viewer_x,
-		s_sa.display_info.nominal_viewer_y,
-		s_sa.display_info.nominal_viewer_z
-	};
-
-	// Window-relative Kooima (ADR-012): screen = actual window physical size,
-	// eye positions shifted by window-center offset on monitor.
-	Display3DScreen screen;
-	if (s_sa.canvas_width > 0 && s_sa.canvas_height > 0 &&
-	    s_sa.display_info.display_pixel_width > 0 && s_sa.display_info.display_pixel_height > 0) {
-		float pxSizeX = s_sa.display_info.display_width_meters / (float)s_sa.display_info.display_pixel_width;
-		float pxSizeY = s_sa.display_info.display_height_meters / (float)s_sa.display_info.display_pixel_height;
-		screen.width_m = (float)s_sa.canvas_width * pxSizeX;
-		screen.height_m = (float)s_sa.canvas_height * pxSizeY;
-
-		// Shift eyes from display-center to window-center coordinates
-		float winCenterX = (float)s_sa.canvas_x + (float)s_sa.canvas_width * 0.5f;
-		float winCenterY = (float)s_sa.canvas_y + (float)s_sa.canvas_height * 0.5f;
-		float dispCenterX = (float)s_sa.display_info.display_pixel_width * 0.5f;
-		float dispCenterY = (float)s_sa.display_info.display_pixel_height * 0.5f;
-		float eyeOffsetX = (winCenterX - dispCenterX) * pxSizeX;
-		float eyeOffsetY = (winCenterY - dispCenterY) * pxSizeY;
-#ifdef _WIN32
-		eyeOffsetY = -eyeOffsetY; // Win32 Y is top-down, eye coords are Y-up
-#endif
-		raw_left.x -= eyeOffsetX;
-		raw_left.y -= eyeOffsetY;
-		raw_right.x -= eyeOffsetX;
-		raw_right.y -= eyeOffsetY;
-		nominal.x -= eyeOffsetX;
-		nominal.y -= eyeOffsetY;
-	} else {
-		screen.width_m = s_sa.display_info.display_width_meters;
-		screen.height_m = s_sa.display_info.display_height_meters;
-	}
-
-
-	// Use stored tunables (from C# DisplayXRDisplay/Camera) or defaults
-	Display3DTunables tunables = s_sa.tunables_set
-		? s_sa.tunables
-		: display3d_default_tunables();
-
-	// Use stored display pose (from parent camera transform) or identity
-	XrPosef *pose_ptr = s_sa.display_pose_set ? &s_sa.display_pose : NULL;
-
-	XrVector3f raw_eyes[2] = {raw_left, raw_right};
-	Display3DView out_views[2];
-	display3d_compute_views(
-		raw_eyes, 2, &nominal, &screen, &tunables,
-		pose_ptr, near_z, far_z, out_views);
-
-	memcpy(left_view, out_views[0].view_matrix, 16 * sizeof(float));
-	memcpy(left_proj, out_views[0].projection_matrix, 16 * sizeof(float));
-	memcpy(right_view, out_views[1].view_matrix, 16 * sizeof(float));
-	memcpy(right_proj, out_views[1].projection_matrix, 16 * sizeof(float));
-	*valid = 1;
-
-	static int s_log_count = 0;
-	if (s_log_count++ % 300 == 0) {
-		fprintf(stderr, "[DisplayXR-SA] eye_L=(%.3f,%.3f,%.3f) eye_R=(%.3f,%.3f,%.3f) nominal=(%.3f,%.3f,%.3f)\n",
-			raw_left.x, raw_left.y, raw_left.z,
-			raw_right.x, raw_right.y, raw_right.z,
-			nominal.x, nominal.y, nominal.z);
-		fprintf(stderr, "[DisplayXR-SA] screen=(%.3f x %.3f)m near=%.3f far=%.1f\n",
-			screen.width_m, screen.height_m, near_z, far_z);
-		fprintf(stderr, "[DisplayXR-SA] L_view: [%.3f %.3f %.3f %.3f / %.3f %.3f %.3f %.3f / %.3f %.3f %.3f %.3f / %.3f %.3f %.3f %.3f]\n",
-			left_view[0], left_view[4], left_view[8], left_view[12],
-			left_view[1], left_view[5], left_view[9], left_view[13],
-			left_view[2], left_view[6], left_view[10], left_view[14],
-			left_view[3], left_view[7], left_view[11], left_view[15]);
-		fprintf(stderr, "[DisplayXR-SA] L_proj: [%.3f %.3f %.3f %.3f / %.3f %.3f %.3f %.3f / %.3f %.3f %.3f %.3f / %.3f %.3f %.3f %.3f]\n",
-			left_proj[0], left_proj[4], left_proj[8], left_proj[12],
-			left_proj[1], left_proj[5], left_proj[9], left_proj[13],
-			left_proj[2], left_proj[6], left_proj[10], left_proj[14],
-			left_proj[3], left_proj[7], left_proj[11], left_proj[15]);
-	}
-}
-
-
-// ============================================================================
 // Public API: Multiview compute (N views)
 // ============================================================================
 
@@ -1641,6 +1705,10 @@ displayxr_standalone_compute_views(
 {
 	*valid = 0;
 	if (!s_sa.display_info.is_valid || view_count == 0) return;
+
+	// Cache near/far for reuse during drag repositioning
+	s_sa.last_near_z = near_z;
+	s_sa.last_far_z = far_z;
 
 	// Window-relative Kooima (ADR-012): screen = actual window physical size,
 	// eye positions shifted by window-center offset on monitor.
@@ -1879,7 +1947,7 @@ displayxr_standalone_set_unity_device(void *unity_native_tex)
 	ID3D12Resource *res = NULL;
 	HRESULT hr = unk->QueryInterface(__uuidof(ID3D12Resource), (void **)&res);
 	if (FAILED(hr) || !res) {
-		fprintf(stderr, "[DisplayXR-SA] Texture is not an ID3D12Resource (hr=0x%08lx)\n", hr);
+		sa_log("[DisplayXR-SA] Texture is not an ID3D12Resource (hr=0x%08lx)\n", hr);
 		return;
 	}
 	ID3D12Device *dev = NULL;
@@ -1887,7 +1955,7 @@ displayxr_standalone_set_unity_device(void *unity_native_tex)
 	res->Release();
 	if (SUCCEEDED(hr) && dev) {
 		s_sa.unity_device = dev;
-		fprintf(stderr, "[DisplayXR-SA] Unity D3D12 device: %p\n", (void *)dev);
+		sa_log("[DisplayXR-SA] Unity D3D12 device: %p\n", (void *)dev);
 	}
 #else
 	(void)unity_native_tex;
@@ -1924,7 +1992,7 @@ displayxr_get_backing_scale_factor(void)
 	UINT dpi = GetDpiForSystem();
 	static int logged = 0;
 	if (!logged) {
-		fprintf(stderr, "[DisplayXR-SA] GetDpiForSystem=%u, backingScale=%.2f\n",
+		sa_log("[DisplayXR-SA] GetDpiForSystem=%u, backingScale=%.2f\n",
 		        dpi, (float)dpi / 96.0f);
 		logged = 1;
 	}
@@ -1967,6 +2035,10 @@ displayxr_standalone_window_was_closed(void)
 {
 #if defined(__APPLE__)
 	return displayxr_sa_metal_window_was_closed();
+#elif defined(_WIN32)
+	int closed = s_sa.window_closed;
+	s_sa.window_closed = 0;
+	return closed;
 #else
 	return 0;
 #endif
@@ -2007,7 +2079,7 @@ displayxr_standalone_request_display_mode(int mode_3d)
 
 	XrDisplayModeEXT mode = mode_3d ? XR_DISPLAY_MODE_3D_EXT : XR_DISPLAY_MODE_2D_EXT;
 	XrResult result = s_sa.pfn_request_display_mode(s_sa.session, mode);
-	fprintf(stderr, "[DisplayXR-SA] RequestDisplayMode(%s) → %d\n",
+	sa_log("[DisplayXR-SA] RequestDisplayMode(%s) → %d\n",
 		mode_3d ? "3D" : "2D", result);
 	return XR_SUCCEEDED(result) ? 1 : 0;
 }
@@ -2019,7 +2091,7 @@ displayxr_standalone_request_rendering_mode(uint32_t mode_index)
 		return 0;
 
 	XrResult result = s_sa.pfn_request_rendering_mode(s_sa.session, mode_index);
-	fprintf(stderr, "[DisplayXR-SA] RequestRenderingMode(%u) → %d\n",
+	sa_log("[DisplayXR-SA] RequestRenderingMode(%u) → %d\n",
 		mode_index, result);
 	if (XR_SUCCEEDED(result)) {
 		s_sa.current_rendering_mode_index = mode_index;

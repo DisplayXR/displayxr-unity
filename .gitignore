@@ -3,6 +3,10 @@ native~/build/
 native~/build-*/
 native~/cmake-build-*/
 
+# Unity meta files for non-package directories
+docs/**/*.meta
+docs/*.meta
+
 # OS files
 .DS_Store
 Thumbs.db

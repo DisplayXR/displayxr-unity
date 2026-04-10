@@ -22,6 +22,18 @@ extern "C" {
 #endif
 
 // ============================================================================
+// Log callback (routes native messages to Unity's Debug.Log)
+// ============================================================================
+
+/// Signature for the log callback. The string is UTF-8, not null-terminated
+/// beyond the provided length (but in practice it is null-terminated).
+typedef void (*DisplayXRLogCallback)(const char *message);
+
+/// Register a log callback. When set, all [DisplayXR-SA] messages are routed
+/// through this callback instead of (in addition to) stderr.
+DISPLAYXR_EXPORT void displayxr_standalone_set_log_callback(DisplayXRLogCallback callback);
+
+// ============================================================================
 // Session lifecycle
 // ============================================================================
 
@@ -79,22 +91,6 @@ DISPLAYXR_EXPORT void displayxr_standalone_end_frame_empty(void);
 // ============================================================================
 // Stereo view computation (Kooima projection via display3d library)
 // ============================================================================
-
-/// Compute display-centric Kooima stereo view and projection matrices
-/// from the current eye tracking data and display geometry.
-/// Matrices are column-major, OpenXR/OpenGL convention.
-/// @param near_z  Near clip plane distance (meters).
-/// @param far_z   Far clip plane distance (meters).
-/// @param left_view   Output float[16] left view matrix.
-/// @param left_proj   Output float[16] left projection matrix.
-/// @param right_view  Output float[16] right view matrix.
-/// @param right_proj  Output float[16] right projection matrix.
-/// @param valid       Set to 1 if matrices are valid, 0 if not.
-DISPLAYXR_EXPORT void displayxr_standalone_compute_stereo_views(
-    float near_z, float far_z,
-    float *left_view, float *left_proj,
-    float *right_view, float *right_proj,
-    int *valid);
 
 /// Compute Kooima view and projection matrices for N views.
 /// Views are processed in stereo pairs. Matrices are column-major.
