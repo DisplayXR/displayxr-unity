@@ -29,7 +29,7 @@ namespace DisplayXR.Editor
     /// Lifecycle is tied to the preview window, not play/stop transitions.
     ///
     /// Frame loop (each EditorApplication.update tick):
-    ///   poll_events → begin_frame → compute_stereo_views →
+    ///   poll_events → begin_frame → compute_views →
     ///   [render left/right cameras] → submit_frame
     /// </summary>
     [InitializeOnLoad]
@@ -52,6 +52,10 @@ namespace DisplayXR.Editor
         private static bool s_Stopping; // Guard against re-entrant ticks during teardown
         private static bool s_InPollEvents; // True while inside displayxr_standalone_poll_events
         private static bool s_DeferredStop; // Deferred stop when called re-entrantly from poll_events
+
+        // Must be stored as a field to prevent GC from collecting the delegate
+        // while native code still holds the function pointer.
+        private static DisplayXRNative.LogCallback s_LogCallback;
         private static int s_FrameCount;
 
         // Rendering rig
@@ -224,6 +228,17 @@ namespace DisplayXR.Editor
             }
 
             Debug.Log($"[DisplayXR-SA] Starting with runtime: {runtimeJson}");
+
+            // Register log callback so native messages appear in Unity Console
+            if (s_LogCallback == null)
+            {
+                s_LogCallback = (string msg) =>
+                {
+                    if (msg != null)
+                        Debug.Log(msg.TrimEnd('\n'));
+                };
+            }
+            DisplayXRNative.displayxr_standalone_set_log_callback(s_LogCallback);
 
 #if UNITY_EDITOR_WIN
             // Pass Unity's D3D12 device to native for atlas bridge texture
@@ -536,15 +551,16 @@ namespace DisplayXR.Editor
             view.m22 = -view.m22;
             view.m32 = -view.m32;
 
-            // Flip projection Y on macOS only: Metal RenderTextures are Y-inverted
-            // and Unity doesn't auto-correct when projectionMatrix is set manually.
-            // On D3D12/D3D11, the native memory layout matches without this flip.
-#if UNITY_EDITOR_OSX
+            // Flip projection Y: when projectionMatrix is set manually, Unity does not
+            // auto-correct for render target origin conventions.
+            // - macOS Metal: RT origin is bottom-left, Metal blit flips to top-left.
+            // - Windows D3D12: RT origin is top-left, but the runtime expects bottom-left
+            //   in the swapchain (OpenXR convention), and our CopyTextureRegion doesn't flip.
+            // In both cases, flipping Y here produces the correct orientation.
             proj.m10 = -proj.m10;
             proj.m11 = -proj.m11;
             proj.m12 = -proj.m12;
             proj.m13 = -proj.m13;
-#endif
 
             // Reset matrices first so Unity recalculates internal lighting state
             // from the Transform (shadows, light culling, shader built-ins).
@@ -566,16 +582,13 @@ namespace DisplayXR.Editor
             cam.pixelRect = new Rect(vpX, vpY, vpW, vpH);
 
             // The view matrix Z-flip reverses the determinant, flipping triangle
-            // winding order. On macOS, the projection Y-flip reverses it again,
-            // plus Metal's RT Y-inversion adds a third flip → need invertCulling.
-            // On Windows D3D12, only the Z-flip applies → normal culling is correct.
-#if UNITY_EDITOR_OSX
+            // winding order. The projection Y-flip reverses it again.
+            // On macOS, Metal's RT Y-inversion adds a third flip → need invertCulling.
+            // On Windows D3D12, two flips (Z + proj-Y) cancel → need invertCulling too,
+            // because the proj-Y flip we added changes the winding parity.
             GL.invertCulling = true;
-#endif
             cam.Render();
-#if UNITY_EDITOR_OSX
             GL.invertCulling = false;
-#endif
 
             // Reset matrices after rendering so cam.fieldOfView returns the
             // original value on the next frame. Without this, the Y-flipped

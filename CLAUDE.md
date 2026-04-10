@@ -153,6 +153,18 @@ Extension struct definitions in `native~/displayxr_extensions.h` must match the 
 
 **You MUST use `com.unity.xr.openxr` version 1.16.1 or later.** The minimum version in `package.json` is 1.9.1 for broad compatibility, but versions before 1.16.1 ignore the `XR_RUNTIME_JSON` environment variable and the system `active_runtime.json` in editor play mode — they silently fall back to Unity's built-in Mock Runtime. This causes `0x0` display resolution, no IOSurface/shared texture, and no display info from the runtime. The failure is silent (no error logged, just mock runtime loaded). Always pin `1.16.1+` in your test project's `Packages/manifest.json`.
 
+### Known Issues
+
+**Windows preview window: stutter vs. real-time Kooima during drag (parked).**
+The standalone preview window on Windows has two mutually-exclusive behaviors during a window move:
+
+1. **DefWindowProc modal drag** (current default): the SR SDK weaver phase-snaps the window to lenticular-aligned positions (no stutter), but Unity's main thread is blocked, so FrameTick can't run and Kooima only updates on drag release.
+2. **SC_MOVE intercept** (capture-based custom move): FrameTick keeps running so Kooima updates in real time, but the SR weaver doesn't get a chance to phase-snap, producing visible stutter.
+
+We tried calling `xrSetSharedTextureOutputRectEXT` from `WM_MOVE` to push canvas updates to the runtime — this is required for the weaver to interlace at all in windowed mode (without it, weaving only works in fullscreen) — but it doesn't trigger phase-snapping. The SR SDK only phase-snaps when it owns the modal drag loop.
+
+A proper fix likely needs runtime API support: an "external drag" mode where the app proposes a position (e.g. via `xrSetSharedTextureOutputRectEXT` extended) and the runtime returns the snapped position. Until then, the WndProc in `displayxr_standalone.cpp` keeps SC_MOVE handling commented out / parked. See the long comment in `sa_wndproc`'s `WM_SYSCOMMAND` case for context.
+
 ### Code Style
 
 - C# follows Unity conventions (PascalCase for public members, camelCase for private)
