@@ -19,6 +19,8 @@
 #include "displayxr_standalone_metal.h"
 #elif defined(_WIN32)
 #include <windows.h>
+#include <d3d11.h>
+#include <d3d11_1.h>
 #include <d3d12.h>
 #include <dxgi1_4.h>
 #include "displayxr_win32.h"
@@ -159,11 +161,17 @@ typedef struct StandaloneState {
 	UINT64 d3d12_fence_value;
 	HWND preview_hwnd;                     // Plugin-owned preview window
 	// Atlas bridge: cross-device shared texture for atlas blit
-	// Unity's atlas RT (on Unity's D3D12 device) → bridge → swapchain (on SA device)
-	ID3D12Device *unity_device;               // Unity's D3D12 device (not owned)
-	ID3D12Resource *d3d12_atlas_bridge;       // On SA device, SHARED
-	HANDLE d3d12_atlas_bridge_handle;         // DXGI shared handle
-	ID3D12Resource *d3d12_unity_atlas_bridge; // Opened on Unity's device
+	// Unity's atlas RT (on Unity's device) → bridge → swapchain (on SA device)
+	// Unity may be running on D3D12 (unity_device set) or D3D11
+	// (unity_d3d11_device set) depending on the project's graphics API.
+	// The SA-side bridge resource is always D3D12; we open it on whichever
+	// API Unity is using so C# can CopyTexture into it from the atlas RT.
+	ID3D12Device *unity_device;                // Unity's D3D12 device (if D3D12; owned via AddRef from GetDevice)
+	ID3D11Device *unity_d3d11_device;          // Unity's D3D11 device (if D3D11; owned via AddRef from GetDevice)
+	ID3D12Resource *d3d12_atlas_bridge;        // On SA device, SHARED (source of truth)
+	HANDLE d3d12_atlas_bridge_handle;          // DXGI shared NT handle
+	ID3D12Resource *d3d12_unity_atlas_bridge;  // Opened on Unity's D3D12 device (if D3D12)
+	ID3D11Texture2D *d3d11_unity_atlas_bridge; // Opened on Unity's D3D11 device (if D3D11)
 #endif
 
 	XrInstance instance;
@@ -655,9 +663,10 @@ create_atlas_swapchain(void)
 	// Create atlas bridge: a SHARED texture on the SA device that Unity's device
 	// can also access. C# copies atlas RT → bridge (Unity device), native copies
 	// bridge → swapchain (SA device). Both copies are same-device = fast.
-	sa_log("[DisplayXR-SA] Atlas bridge: unity_device=%p, sa_device=%p\n",
-	        (void *)s_sa.unity_device, (void *)s_sa.d3d12_device);
-	if (s_sa.unity_device && s_sa.d3d12_device) {
+	sa_log("[DisplayXR-SA] Atlas bridge: unity_d3d12=%p, unity_d3d11=%p, sa_device=%p\n",
+	        (void *)s_sa.unity_device, (void *)s_sa.unity_d3d11_device,
+	        (void *)s_sa.d3d12_device);
+	if ((s_sa.unity_device || s_sa.unity_d3d11_device) && s_sa.d3d12_device) {
 		D3D12_HEAP_PROPERTIES heap = {};
 		heap.Type = D3D12_HEAP_TYPE_DEFAULT;
 
@@ -681,12 +690,34 @@ create_atlas_swapchain(void)
 				s_sa.d3d12_atlas_bridge, NULL, GENERIC_ALL, NULL,
 				&s_sa.d3d12_atlas_bridge_handle);
 			if (SUCCEEDED(hr) && s_sa.d3d12_atlas_bridge_handle) {
-				hr = s_sa.unity_device->OpenSharedHandle(
-					s_sa.d3d12_atlas_bridge_handle,
-					__uuidof(ID3D12Resource), (void **)&s_sa.d3d12_unity_atlas_bridge);
-				if (SUCCEEDED(hr)) {
-					sa_log("[DisplayXR-SA] Atlas bridge: %ux%u, handle=%p\n",
-					        atlas_w, atlas_h, s_sa.d3d12_atlas_bridge_handle);
+				if (s_sa.unity_device) {
+					// D3D12 Unity: open the NT handle directly on the Unity D3D12 device.
+					hr = s_sa.unity_device->OpenSharedHandle(
+						s_sa.d3d12_atlas_bridge_handle,
+						__uuidof(ID3D12Resource), (void **)&s_sa.d3d12_unity_atlas_bridge);
+					if (SUCCEEDED(hr)) {
+						sa_log("[DisplayXR-SA] Atlas bridge (D3D12): %ux%u, handle=%p\n",
+						        atlas_w, atlas_h, s_sa.d3d12_atlas_bridge_handle);
+					}
+				} else if (s_sa.unity_d3d11_device) {
+					// D3D11 Unity: open the NT handle on the D3D11 device via
+					// ID3D11Device1::OpenSharedResource1, which accepts NT-shared
+					// handles created by D3D12's CreateSharedHandle.
+					ID3D11Device1 *dev1 = NULL;
+					hr = s_sa.unity_d3d11_device->QueryInterface(
+						__uuidof(ID3D11Device1), (void **)&dev1);
+					if (SUCCEEDED(hr) && dev1) {
+						hr = dev1->OpenSharedResource1(
+							s_sa.d3d12_atlas_bridge_handle,
+							__uuidof(ID3D11Texture2D),
+							(void **)&s_sa.d3d11_unity_atlas_bridge);
+						dev1->Release();
+						if (SUCCEEDED(hr)) {
+							sa_log("[DisplayXR-SA] Atlas bridge (D3D11): %ux%u, handle=%p tex=%p\n",
+							        atlas_w, atlas_h, s_sa.d3d12_atlas_bridge_handle,
+							        (void *)s_sa.d3d11_unity_atlas_bridge);
+						}
+					}
 				}
 			}
 		}
@@ -890,12 +921,15 @@ displayxr_standalone_start(const char *runtime_json_path)
 	}
 
 #if defined(_WIN32)
-	// Preserve Unity device pointer — set before start() via set_unity_device()
+	// Preserve Unity device pointer — set before start() via set_unity_device().
+	// Exactly one of these is non-null depending on the editor's graphics API.
 	ID3D12Device *saved_unity_device = s_sa.unity_device;
+	ID3D11Device *saved_unity_d3d11_device = s_sa.unity_d3d11_device;
 #endif
 	memset(&s_sa, 0, sizeof(s_sa));
 #if defined(_WIN32)
 	s_sa.unity_device = saved_unity_device;
+	s_sa.unity_d3d11_device = saved_unity_d3d11_device;
 
 	// Cache Unity's main HWND BEFORE we create our preview window — otherwise
 	// find_unity_hwnd might enumerate our preview window first and we'd
@@ -1396,9 +1430,12 @@ displayxr_standalone_stop(void)
 	displayxr_sa_metal_destroy_window();
 #elif defined(_WIN32)
 	if (s_sa.preview_hwnd) { DestroyWindow(s_sa.preview_hwnd); s_sa.preview_hwnd = NULL; }
+	if (s_sa.d3d11_unity_atlas_bridge) { s_sa.d3d11_unity_atlas_bridge->Release(); s_sa.d3d11_unity_atlas_bridge = NULL; }
 	if (s_sa.d3d12_unity_atlas_bridge) { s_sa.d3d12_unity_atlas_bridge->Release(); s_sa.d3d12_unity_atlas_bridge = NULL; }
 	if (s_sa.d3d12_atlas_bridge_handle) { CloseHandle(s_sa.d3d12_atlas_bridge_handle); s_sa.d3d12_atlas_bridge_handle = NULL; }
 	if (s_sa.d3d12_atlas_bridge) { s_sa.d3d12_atlas_bridge->Release(); s_sa.d3d12_atlas_bridge = NULL; }
+	if (s_sa.unity_d3d11_device) { s_sa.unity_d3d11_device->Release(); s_sa.unity_d3d11_device = NULL; }
+	if (s_sa.unity_device) { s_sa.unity_device->Release(); s_sa.unity_device = NULL; }
 	if (s_sa.d3d12_fence_event) { CloseHandle(s_sa.d3d12_fence_event); s_sa.d3d12_fence_event = NULL; }
 	if (s_sa.d3d12_fence) { s_sa.d3d12_fence->Release(); s_sa.d3d12_fence = NULL; }
 	if (s_sa.d3d12_cmd_list) { s_sa.d3d12_cmd_list->Release(); s_sa.d3d12_cmd_list = NULL; }
@@ -2016,19 +2053,43 @@ displayxr_standalone_set_unity_device(void *unity_native_tex)
 #if defined(_WIN32)
 	if (!unity_native_tex) return;
 	IUnknown *unk = (IUnknown *)unity_native_tex;
-	ID3D12Resource *res = NULL;
-	HRESULT hr = unk->QueryInterface(__uuidof(ID3D12Resource), (void **)&res);
-	if (FAILED(hr) || !res) {
-		sa_log("[DisplayXR-SA] Texture is not an ID3D12Resource (hr=0x%08lx)\n", hr);
-		return;
+
+	// Try D3D12 first. Unity returns an ID3D12Resource* from
+	// RenderTexture.GetNativeTexturePtr() when the editor runs on D3D12.
+	{
+		ID3D12Resource *res = NULL;
+		HRESULT hr = unk->QueryInterface(__uuidof(ID3D12Resource), (void **)&res);
+		if (SUCCEEDED(hr) && res) {
+			ID3D12Device *dev = NULL;
+			hr = res->GetDevice(__uuidof(ID3D12Device), (void **)&dev);
+			res->Release();
+			if (SUCCEEDED(hr) && dev) {
+				s_sa.unity_device = dev;
+				sa_log("[DisplayXR-SA] Unity graphics: D3D12 device=%p\n", (void *)dev);
+				return;
+			}
+		}
 	}
-	ID3D12Device *dev = NULL;
-	hr = res->GetDevice(__uuidof(ID3D12Device), (void **)&dev);
-	res->Release();
-	if (SUCCEEDED(hr) && dev) {
-		s_sa.unity_device = dev;
-		sa_log("[DisplayXR-SA] Unity D3D12 device: %p\n", (void *)dev);
+
+	// Fall back to D3D11. Unity returns an ID3D11Texture2D* (which implements
+	// ID3D11Resource) when the editor runs on D3D11. We need the D3D11 device
+	// so we can OpenSharedResource1 the SA-side D3D12 shared bridge onto it.
+	{
+		ID3D11Resource *res = NULL;
+		HRESULT hr = unk->QueryInterface(__uuidof(ID3D11Resource), (void **)&res);
+		if (SUCCEEDED(hr) && res) {
+			ID3D11Device *dev = NULL;
+			res->GetDevice(&dev);
+			res->Release();
+			if (dev) {
+				s_sa.unity_d3d11_device = dev;
+				sa_log("[DisplayXR-SA] Unity graphics: D3D11 device=%p\n", (void *)dev);
+				return;
+			}
+		}
 	}
+
+	sa_log("[DisplayXR-SA] Texture is neither ID3D12Resource nor ID3D11Resource — atlas bridge disabled\n");
 #else
 	(void)unity_native_tex;
 #endif
@@ -2039,8 +2100,16 @@ displayxr_standalone_get_atlas_bridge_texture(void **native_ptr,
                                                uint32_t *width, uint32_t *height)
 {
 #if defined(_WIN32)
-	*native_ptr = s_sa.d3d12_unity_atlas_bridge
-		? (void *)s_sa.d3d12_unity_atlas_bridge : NULL;
+	// Return whichever Unity-side texture we opened — C# passes this to
+	// Texture2D.CreateExternalTexture, which accepts ID3D11Texture2D* on
+	// D3D11 and ID3D12Resource* on D3D12 based on the editor's graphics API.
+	if (s_sa.d3d11_unity_atlas_bridge) {
+		*native_ptr = (void *)s_sa.d3d11_unity_atlas_bridge;
+	} else if (s_sa.d3d12_unity_atlas_bridge) {
+		*native_ptr = (void *)s_sa.d3d12_unity_atlas_bridge;
+	} else {
+		*native_ptr = NULL;
+	}
 	*width = s_sa.atlas.width;
 	*height = s_sa.atlas.height;
 #else
