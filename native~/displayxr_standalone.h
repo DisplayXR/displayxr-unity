@@ -37,13 +37,18 @@ DISPLAYXR_EXPORT void displayxr_standalone_set_log_callback(DisplayXRLogCallback
 // Session lifecycle
 // ============================================================================
 
-/// (Windows only) Set Unity's D3D12 device for atlas bridge texture.
+/// (Windows only) Set Unity's graphics device for atlas bridge texture.
 /// Must be called BEFORE displayxr_standalone_start().
-/// @param unity_native_tex A native texture pointer from Unity (ID3D12Resource*).
+/// The pointer is auto-detected as either an ID3D12Resource* (if the editor
+/// runs on D3D12) or an ID3D11Texture2D* (if the editor runs on D3D11), and
+/// the corresponding device is extracted via GetDevice().
+/// @param unity_native_tex A native texture pointer from Unity.
 DISPLAYXR_EXPORT void displayxr_standalone_set_unity_device(void *unity_native_tex);
 
-/// Get the atlas bridge texture opened on Unity's device (Windows D3D12 only).
-/// C# uses Graphics.CopyTexture to copy the atlas RT into this each frame.
+/// Get the atlas bridge texture opened on Unity's device (Windows only).
+/// Returns ID3D11Texture2D* if Unity is on D3D11, ID3D12Resource* if on D3D12.
+/// C# passes this to Texture2D.CreateExternalTexture and uses Graphics.CopyTexture
+/// to copy the atlas RT into it each frame.
 DISPLAYXR_EXPORT void displayxr_standalone_get_atlas_bridge_texture(
     void **native_ptr, uint32_t *width, uint32_t *height);
 
