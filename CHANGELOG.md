@@ -5,6 +5,50 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0] - 2026-04-11
+
+First stable release of the DisplayXR Unity plugin. Headline changes: standalone
+editor preview with native HWND + input forwarding, D3D11 hooked path
+generalized to N-view tile atlas, GitHub org transfer to DisplayXR, and full
+documentation structure with ADRs.
+
+### Added
+- **Standalone editor preview window** — native HWND on Windows with D3D11 atlas
+  bridge, D3D12 blit, and input suppression (replaces the earlier IOSurface
+  approach). Works in both Play Mode and Edit Mode.
+- **Edit Mode preview** — live composited 3D output without entering Play Mode
+- **Game View eye tile atlas** displayed during Play Mode for debugging
+- **D3D11 hooked path**: generalized SBS composite to N-view tile atlas (#91)
+- **D3D11 typed swapchain substitution** for the hooked path (#91)
+- **Input forwarding** from preview window to Unity — mouse events, focus-aware
+  handling, camera rotation support
+- **Documentation structure**: ADRs, architecture docs, navigation
+- **`/release` skill** for tagged release orchestration
+- **Shell mode**: full input forwarding from main HWND (#43, #44, #45)
+
+### Changed
+- Repo references updated from `dfattal/openxr-3d-display` to
+  `DisplayXR/displayxr-runtime-pvt` following GitHub org transfer
+- CI triggers restricted to PR validation and tag pushes — no more triggers on
+  main branch (devs use local builds for daily iteration)
+- Shell mode: Kooima viewport updates on window resize/move (#46)
+- Game View camera rendering suppressed during editor Play Mode (preview
+  window takes over)
+
+### Fixed
+- macOS build: gate `xrDestroySwapchain` dispatch on `_WIN32` (#91)
+- Preview window: Play Mode startup, input handling, weaving, Y-flip
+- Play Mode auto-start and camera selection reliability
+- Camera selection after Play Mode domain reload
+- Camera rotation during preview window move/resize/drag (multiple fixes)
+- Closing preview window now correctly exits Play Mode
+- Preview tab: crop atlas to content region and fix Y-flip
+- Crash on second Play Mode entry: execute deferred session/instance destroy
+- Crash on Play Mode exit: defer preview window destruction, destroy preview
+  before XR teardown
+- `EntryPointNotFoundException` for `window_was_closed` handled gracefully
+- Preview window content frozen during live resize
+
 ## [0.7.0] - 2026-03-31
 
 ### Fixed
