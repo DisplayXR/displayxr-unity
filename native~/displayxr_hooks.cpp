@@ -1471,10 +1471,14 @@ displayxr_hook_xrGetInstanceProcAddr(XrInstance instance, const char *name, PFN_
 	else if (strcmp(name, "xrEnumerateSwapchainFormats") == 0) {
 		s_real_enumerate_swapchain_formats = (PFN_xrEnumerateSwapchainFormats)*function;
 		*function = (PFN_xrVoidFunction)hooked_xrEnumerateSwapchainFormats;
-	} else if (strcmp(name, "xrDestroySwapchain") == 0) {
+	}
+#if defined(_WIN32)
+	else if (strcmp(name, "xrDestroySwapchain") == 0) {
 		s_real_destroy_swapchain = (PFN_xrDestroySwapchain)*function;
 		// No hook needed — just capture the pointer for typed swapchain cleanup.
-	} else if (strcmp(name, "xrCreateSwapchain") == 0) {
+	}
+#endif
+	else if (strcmp(name, "xrCreateSwapchain") == 0) {
 		s_real_create_swapchain = (PFN_xrCreateSwapchain)*function;
 		*function = (PFN_xrVoidFunction)hooked_xrCreateSwapchain;
 	} else if (strcmp(name, "xrEnumerateSwapchainImages") == 0) {
