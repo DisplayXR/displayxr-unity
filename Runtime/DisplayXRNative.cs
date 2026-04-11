@@ -171,6 +171,10 @@ namespace DisplayXR
         internal static extern int displayxr_standalone_window_was_closed();
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void displayxr_standalone_get_preview_mouse_state(
+            out int buttons, out int wheelDelta);
+
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int displayxr_standalone_window_is_interacting();
 
         /// <summary>

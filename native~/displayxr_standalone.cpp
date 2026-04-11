@@ -21,6 +21,7 @@
 #include <windows.h>
 #include <d3d12.h>
 #include <dxgi1_4.h>
+#include "displayxr_win32.h"
 
 // D3D12 OpenXR structs (inlined to avoid requiring XR_USE_GRAPHICS_API_D3D12).
 #define XR_TYPE_GRAPHICS_BINDING_D3D12_KHR      ((XrStructureType)1000028000)
@@ -247,6 +248,10 @@ typedef struct StandaloneState {
 	int has_display_mode_ext;
 #if defined(_WIN32)
 	int window_closed;  // Set to 1 when user closes the preview window
+	// Mouse button state tracked by sa_wndproc for the C# input controller
+	// (Unity's new Input System doesn't see our preview window's clicks).
+	volatile int preview_mouse_buttons; // bit 0=L, 1=R, 2=M
+	volatile int preview_wheel_accum;
 	int dragging;       // Non-zero while custom (non-modal) window move is active
 	POINT drag_start_cursor;
 	RECT drag_start_rect;
@@ -743,10 +748,60 @@ sa_update_canvas_from_hwnd(HWND hwnd)
 	}
 }
 
+// Forward input messages from the preview window to Unity's main HWND so
+// game scripts (cameras, controllers, etc.) receive mouse/keyboard input
+// even when the user clicks inside the preview window. The preview window
+// stays the foreground window — we just relay events into Unity's queue.
+//
+// Cache Unity's HWND once at session start (in displayxr_standalone_start)
+// rather than re-querying lazily — find_unity_hwnd() can return our own
+// preview window if it ends up matching FindWindowExW's enumeration before
+// Unity's window, which would cause a feedback loop.
+static HWND s_unity_hwnd = NULL;
+
 static LRESULT CALLBACK
 sa_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
+	// Track mouse buttons + wheel for C# input controller polling.
+	// SetCapture keeps WM_*BUTTONUP flowing even if the cursor leaves the
+	// window during a drag. WM_CAPTURECHANGED clears state if capture is lost
+	// unexpectedly (e.g. Ctrl+Alt+Del).
 	switch (msg) {
+	case WM_LBUTTONDOWN: s_sa.preview_mouse_buttons |= 0x1; SetCapture(hwnd); break;
+	case WM_LBUTTONUP:   s_sa.preview_mouse_buttons &= ~0x1; if (GetCapture() == hwnd) ReleaseCapture(); break;
+	case WM_RBUTTONDOWN: s_sa.preview_mouse_buttons |= 0x2; SetCapture(hwnd); break;
+	case WM_RBUTTONUP:   s_sa.preview_mouse_buttons &= ~0x2; if (GetCapture() == hwnd) ReleaseCapture(); break;
+	case WM_MBUTTONDOWN: s_sa.preview_mouse_buttons |= 0x4; SetCapture(hwnd); break;
+	case WM_MBUTTONUP:   s_sa.preview_mouse_buttons &= ~0x4; if (GetCapture() == hwnd) ReleaseCapture(); break;
+	case WM_MOUSEWHEEL:
+		s_sa.preview_wheel_accum += GET_WHEEL_DELTA_WPARAM(wParam);
+		break;
+	case WM_CAPTURECHANGED:
+		// Capture lost — clear button state to avoid "stuck button" bugs
+		s_sa.preview_mouse_buttons = 0;
+		break;
+	}
+
+	// Forward keyboard messages to Unity's main HWND. Unity normally gets
+	// raw keyboard input directly (it stays foreground via WS_EX_NOACTIVATE),
+	// but this is a safety net for legacy Input.GetKey paths.
+	switch (msg) {
+	case WM_KEYDOWN: case WM_KEYUP:
+	case WM_SYSKEYDOWN: case WM_SYSKEYUP:
+	case WM_CHAR: case WM_SYSCHAR: {
+		if (s_unity_hwnd != NULL && s_unity_hwnd != hwnd && IsWindow(s_unity_hwnd))
+			PostMessageW(s_unity_hwnd, msg, wParam, lParam);
+		break;
+	}
+	}
+
+	switch (msg) {
+	case WM_MOUSEACTIVATE:
+		// Don't activate (don't become foreground) when clicked. Combined
+		// with WS_EX_NOACTIVATE on the window, this keeps Unity foreground
+		// so Raw Input keeps flowing to Unity's new Input System
+		// (Mouse.current.delta etc.).
+		return MA_NOACTIVATE;
 	case WM_CLOSE:
 		s_sa.window_closed = 1;
 		DestroyWindow(hwnd);
@@ -841,6 +896,15 @@ displayxr_standalone_start(const char *runtime_json_path)
 	memset(&s_sa, 0, sizeof(s_sa));
 #if defined(_WIN32)
 	s_sa.unity_device = saved_unity_device;
+
+	// Cache Unity's main HWND BEFORE we create our preview window — otherwise
+	// find_unity_hwnd might enumerate our preview window first and we'd
+	// forward input back to ourselves (feedback loop).
+	s_unity_hwnd = (HWND)displayxr_get_unity_main_hwnd();
+	if (s_unity_hwnd)
+		sa_log("[DisplayXR-SA] Cached Unity main HWND: %p\n", (void *)s_unity_hwnd);
+	else
+		sa_log("[DisplayXR-SA] Could not find Unity main HWND for input forwarding\n");
 
 	// Set Per-Monitor DPI Awareness V2 so the Leia SR weaver sees physical
 	// pixels from GetClientRect(), matching our canvas rect dimensions.
@@ -1164,10 +1228,18 @@ displayxr_standalone_start(const char *runtime_json_path)
 		wc.hCursor = LoadCursor(NULL, IDC_ARROW);
 		RegisterClassExW(&wc);
 
-		// Size the window to the display dimensions (in physical pixels)
+		// Size the window to the display dimensions (in physical pixels).
+		// WS_EX_NOACTIVATE: window cannot become foreground/active. This keeps
+		// Unity foreground so Raw Input keeps flowing to its new Input System.
+		// WS_EX_TOPMOST: window stays above non-topmost windows. Without this,
+		// clicking Unity's editor window would bring it above our preview and
+		// the preview would visually disappear behind Unity.
+		// Don't include WS_VISIBLE in the style — that activates the window on
+		// creation. Show explicitly via SW_SHOWNOACTIVATE.
 		s_sa.preview_hwnd = CreateWindowExW(
-			0, L"DisplayXRPreview", L"DisplayXR Preview",
-			WS_OVERLAPPEDWINDOW | WS_VISIBLE,
+			WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+			L"DisplayXRPreview", L"DisplayXR Preview",
+			WS_OVERLAPPEDWINDOW,
 			CW_USEDEFAULT, CW_USEDEFAULT,
 			(int)s_sa.display_info.display_pixel_width,
 			(int)s_sa.display_info.display_pixel_height,
@@ -2002,6 +2074,21 @@ displayxr_get_backing_scale_factor(void)
 #endif
 }
 
+
+DISPLAYXR_EXPORT void
+displayxr_standalone_get_preview_mouse_state(int *buttons, int *wheel_delta)
+{
+#if defined(_WIN32)
+	if (buttons) *buttons = s_sa.preview_mouse_buttons;
+	if (wheel_delta) {
+		*wheel_delta = s_sa.preview_wheel_accum;
+		s_sa.preview_wheel_accum = 0; // consume
+	}
+#else
+	if (buttons) *buttons = 0;
+	if (wheel_delta) *wheel_delta = 0;
+#endif
+}
 
 int
 displayxr_standalone_window_is_interacting(void)
