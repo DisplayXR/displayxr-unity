@@ -2,10 +2,6 @@ name: Build Native Plugin
 
 on:
   push:
-    branches: [main]
-    paths:
-      - 'native~/**'
-      - '.github/workflows/build-native.yml'
     tags:
       - 'v*'
   pull_request:
