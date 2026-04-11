@@ -123,12 +123,51 @@ static int s_sc_sub_count = 0;
 
 static PFN_xrDestroySwapchain s_real_destroy_swapchain = nullptr;
 
-// SBS output swapchain: single 3840×1080 swapchain that we composite both eyes into.
-// Left eye occupies [0, width/2) and right eye occupies [width/2, width).
-// The compositor always splits at width/2 regardless of submitted rects.
-static XrSwapchain s_sbs_sc = XR_NULL_HANDLE;
-static ID3D11Texture2D *s_sbs_textures[8] = {};
-static uint32_t s_sbs_img_count = 0;
+// Rendering mode tracking — enumerated at xrCreateSession, current index updated
+// via hooked_xrRequestDisplayRenderingModeEXT. Used to compute the tile layout
+// (tile_cols × tile_rows) and view_w × view_h for the atlas composite below.
+#define DISPLAYXR_MAX_RENDERING_MODES 16
+static PFN_xrEnumerateDisplayRenderingModesEXT s_real_enumerate_rendering_modes = nullptr;
+static PFN_xrRequestDisplayRenderingModeEXT s_real_request_rendering_mode = nullptr;
+static XrDisplayRenderingModeInfoEXT s_rendering_modes[DISPLAYXR_MAX_RENDERING_MODES];
+static uint32_t s_rendering_mode_count = 0;
+static uint32_t s_current_rendering_mode_index = 0;
+
+// Tile-layout atlas output swapchain: a single swapchain sized to the current
+// rendering mode's atlas dimensions (tile_cols × view_w by tile_rows × view_h),
+// into which we composite N typed shadow textures (one per view) at their tile
+// positions. Submitting this with per-tile imageRects satisfies u_tiling_can_zero_copy
+// and routes the runtime to its zero-copy fast path regardless of the number of
+// views. Recreated when the rendering mode changes (we clear s_atlas_sc to
+// XR_NULL_HANDLE on mode change and the next xrEndFrame recreates it).
+static XrSwapchain s_atlas_sc = XR_NULL_HANDLE;
+static ID3D11Texture2D *s_atlas_textures[8] = {};
+static uint32_t s_atlas_img_count = 0;
+static uint32_t s_atlas_width = 0;
+static uint32_t s_atlas_height = 0;
+static uint32_t s_atlas_mode_index = 0xFFFFFFFFu; // the mode index the current atlas was sized for
+
+static const XrDisplayRenderingModeInfoEXT *d3d11_get_current_rendering_mode()
+{
+	for (uint32_t i = 0; i < s_rendering_mode_count; i++) {
+		if (s_rendering_modes[i].modeIndex == s_current_rendering_mode_index)
+			return &s_rendering_modes[i];
+	}
+	return (s_rendering_mode_count > 0) ? &s_rendering_modes[0] : nullptr;
+}
+
+static void d3d11_destroy_atlas_swapchain()
+{
+	if (s_atlas_sc != XR_NULL_HANDLE && s_real_destroy_swapchain) {
+		s_real_destroy_swapchain(s_atlas_sc);
+	}
+	s_atlas_sc = XR_NULL_HANDLE;
+	for (uint32_t i = 0; i < 8; i++) s_atlas_textures[i] = nullptr;
+	s_atlas_img_count = 0;
+	s_atlas_width = 0;
+	s_atlas_height = 0;
+	s_atlas_mode_index = 0xFFFFFFFFu;
+}
 
 static void d3d11_sub_cleanup_all()
 {
@@ -141,11 +180,9 @@ static void d3d11_sub_cleanup_all()
 		s_sc_subs[i].active = false;
 	}
 	s_sc_sub_count = 0;
-	if (s_sbs_sc != XR_NULL_HANDLE && s_real_destroy_swapchain) {
-		s_real_destroy_swapchain(s_sbs_sc);
-		s_sbs_sc = XR_NULL_HANDLE;
-	}
-	s_sbs_img_count = 0;
+	d3d11_destroy_atlas_swapchain();
+	s_rendering_mode_count = 0;
+	s_current_rendering_mode_index = 0;
 }
 
 static D3D11ScSub *d3d11_sub_find(XrSwapchain unity_sc)
@@ -755,10 +792,107 @@ hooked_xrCreateSession(XrInstance instance, const XrSessionCreateInfo *createInf
 				displayxr_log( "[DisplayXR] LOCAL reference space created successfully\n");
 			}
 		}
+
+#if defined(_WIN32)
+		// Enumerate display rendering modes for the D3D11 atlas composite path.
+		// Stores mode tile layouts so hooked_xrEndFrame can size and write into
+		// a tiled atlas swapchain regardless of how many views the active mode
+		// has (stereo, quad, light field, etc.). Resolved here rather than in
+		// xrGetInstanceProcAddr dispatch because these are extension functions
+		// that Unity doesn't call itself — we need to resolve them directly.
+		if (s_next_gipa != nullptr && s_instance != XR_NULL_HANDLE) {
+			if (s_real_enumerate_rendering_modes == nullptr) {
+				PFN_xrVoidFunction fn = nullptr;
+				if (XR_SUCCEEDED(s_next_gipa(s_instance,
+				        "xrEnumerateDisplayRenderingModesEXT", &fn)) && fn) {
+					s_real_enumerate_rendering_modes =
+					    (PFN_xrEnumerateDisplayRenderingModesEXT)fn;
+				}
+			}
+			if (s_real_request_rendering_mode == nullptr) {
+				PFN_xrVoidFunction fn = nullptr;
+				if (XR_SUCCEEDED(s_next_gipa(s_instance,
+				        "xrRequestDisplayRenderingModeEXT", &fn)) && fn) {
+					s_real_request_rendering_mode =
+					    (PFN_xrRequestDisplayRenderingModeEXT)fn;
+				}
+			}
+		}
+
+		s_rendering_mode_count = 0;
+		if (s_real_enumerate_rendering_modes != nullptr) {
+			uint32_t total = 0;
+			XrResult er = s_real_enumerate_rendering_modes(
+			    s_session, 0, &total, nullptr);
+			if (XR_SUCCEEDED(er) && total > 0) {
+				if (total > DISPLAYXR_MAX_RENDERING_MODES)
+					total = DISPLAYXR_MAX_RENDERING_MODES;
+				for (uint32_t i = 0; i < total; i++) {
+					s_rendering_modes[i] = {};
+					s_rendering_modes[i].type =
+					    XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT;
+				}
+				er = s_real_enumerate_rendering_modes(
+				    s_session, total, &total, s_rendering_modes);
+				if (XR_SUCCEEDED(er)) {
+					s_rendering_mode_count = total;
+					// Default to first hardware_display_3d mode so we end up
+					// targeting a proper stereo/multi-view layout instead of
+					// the 2D fallback if one is enumerated first.
+					bool picked = false;
+					for (uint32_t i = 0; i < total; i++) {
+						const XrDisplayRenderingModeInfoEXT *m =
+						    &s_rendering_modes[i];
+						displayxr_log(
+						    "[DisplayXR] Mode[%u]: '%s' views=%u tiles=%ux%u "
+						    "viewPx=%ux%u hw3d=%d\n",
+						    m->modeIndex, m->modeName, m->viewCount,
+						    m->tileColumns, m->tileRows,
+						    m->viewWidthPixels, m->viewHeightPixels,
+						    (int)m->hardwareDisplay3D);
+						if (!picked && m->hardwareDisplay3D) {
+							s_current_rendering_mode_index = m->modeIndex;
+							picked = true;
+						}
+					}
+					if (!picked && total > 0)
+						s_current_rendering_mode_index =
+						    s_rendering_modes[0].modeIndex;
+					displayxr_log(
+					    "[DisplayXR] Rendering mode: %u modes enumerated, "
+					    "current=%u\n", total, s_current_rendering_mode_index);
+				} else {
+					displayxr_log(
+					    "[DisplayXR] xrEnumerateDisplayRenderingModesEXT "
+					    "(populate) failed: %d\n", er);
+				}
+			}
+		}
+#endif
 	}
 
 	return result;
 }
+
+#if defined(_WIN32)
+static XrResult XRAPI_CALL
+hooked_xrRequestDisplayRenderingModeEXT(XrSession session, uint32_t modeIndex)
+{
+	if (s_real_request_rendering_mode == nullptr)
+		return XR_ERROR_FUNCTION_UNSUPPORTED;
+	XrResult r = s_real_request_rendering_mode(session, modeIndex);
+	if (XR_SUCCEEDED(r)) {
+		if (modeIndex != s_current_rendering_mode_index) {
+			displayxr_log("[DisplayXR] Rendering mode changed: %u -> %u "
+			              "(forcing atlas swapchain recreation)\n",
+			              s_current_rendering_mode_index, modeIndex);
+			s_current_rendering_mode_index = modeIndex;
+			// Next xrEndFrame will notice size mismatch and recreate.
+		}
+	}
+	return r;
+}
+#endif
 
 static XrResult XRAPI_CALL
 hooked_xrDestroySession(XrSession session)
@@ -843,98 +977,191 @@ hooked_xrEndFrame(XrSession session, const XrFrameEndInfo *frameEndInfo)
 	DisplayXRState *state = displayxr_get_state();
 
 #if defined(_WIN32)
-	// D3D11 SBS composite (issue #91).
+	// D3D11 tile-atlas composite (issue #91 — generalized N-view path).
 	//
-	// The compositor always splits the submitted swapchain at width/2 for L/R,
-	// ignoring imageRect.  Unity submits two separate full-res eye swapchains
-	// (sc1=left, sc2=right), each at the full swapchain width — the compositor
-	// treats sc1 as SBS and routes its left half to L eye and right half to R eye,
-	// producing the X-pattern.
+	// Background:
+	// - Unity renders into plugin-provided "typed shadow" swapchains
+	//   (hooked_xrCreateSwapchain creates a concrete-format sibling per
+	//   Unity-facing swapchain, returned from hooked_xrEnumerateSwapchainImages)
+	//   so Unity's RTV creation works even though the runtime promotes color
+	//   textures to TYPELESS internally.
+	// - The runtime D3D11 compositor has a working zero-copy fast path when the
+	//   submitted projection layer references a single atlas swapchain with
+	//   per-view imageRects matching the current rendering mode's tile layout.
+	//   The per-view renderer fallback is latent-broken for multi-swapchain
+	//   submissions (tracked as runtime issue #143 — parity with D3D12 renderer).
+	// - Unity submits one swapchain per eye, which would otherwise fall into the
+	//   broken fallback. To avoid that and to support any tile layout (stereo,
+	//   quad, light-field), we composite the typed shadow textures into a single
+	//   atlas swapchain sized to the current mode's (tile_cols * view_w,
+	//   tile_rows * view_h) and patch all projection views to reference it with
+	//   tile rects.
 	//
-	// Fix: create one 2×-wide SBS output swapchain (s_sbs_sc) and composite both
-	// eyes into it (left eye in left half, right eye in right half).  Release the
-	// typed_sc swapchains (deferred from xrReleaseSwapchainImage so we can still
-	// read them here), then submit s_sbs_sc with half-width rects for each view.
+	// Per-frame flow:
+	// 1. Look up the current rendering mode's tile layout.
+	// 2. Lazily create (or recreate on mode change) s_atlas_sc.
+	// 3. Acquire an atlas image, CopySubresourceRegion each view's typed shadow
+	//    texture into tile (v % tile_cols, v / tile_cols) of the atlas.
+	// 4. Release the deferred typed shadow images + the atlas image.
+	// 5. Patch views to reference s_atlas_sc with per-tile imageRects.
+	// 6. After s_real_end_frame, restore the original view fields.
 	struct EFPatch {
 		XrCompositionLayerProjectionView *view;
 		XrSwapchain orig_sc;
 		XrRect2Di orig_rect;
 	};
-	EFPatch ef_patches[8]; int ef_npatch = 0;
+	// 16 view tiles covers up to a 4×4 tile layout (light-field modes). Bump
+	// if a future mode enumerates more tiles than this.
+	EFPatch ef_patches[16]; int ef_npatch = 0;
+	const int kMaxEfPatches = (int)(sizeof(ef_patches) / sizeof(ef_patches[0]));
 	if (s_sc_sub_count > 0 && frameEndInfo != nullptr && frameEndInfo->layers != nullptr) {
-		for (uint32_t i = 0; i < frameEndInfo->layerCount && ef_npatch < 8; i++) {
-			const XrCompositionLayerBaseHeader *hdr = frameEndInfo->layers[i];
-			if (!hdr || hdr->type != XR_TYPE_COMPOSITION_LAYER_PROJECTION) continue;
-			const XrCompositionLayerProjection *proj = (const XrCompositionLayerProjection*)hdr;
-			if (!proj->views || proj->viewCount != 2) continue;
-			XrCompositionLayerProjectionView *views = (XrCompositionLayerProjectionView*)proj->views;
+		const XrDisplayRenderingModeInfoEXT *mode = d3d11_get_current_rendering_mode();
 
-			D3D11ScSub *sub1 = d3d11_sub_find(views[0].subImage.swapchain); // left eye
-			D3D11ScSub *sub2 = d3d11_sub_find(views[1].subImage.swapchain); // right eye
-			if (!sub1 || !sub2 || sub1 == sub2) continue;
-
-			uint32_t eye_w = sub1->width;
-			uint32_t eye_h = sub1->height;
-			uint32_t sbs_w = eye_w * 2; // 3840 when eye_w=1920
-
-			// Lazily create the SBS output swapchain on first xrEndFrame.
-			if (s_sbs_sc == XR_NULL_HANDLE && s_real_create_swapchain) {
-				XrSwapchainCreateInfo sbs_info = {};
-				sbs_info.type            = XR_TYPE_SWAPCHAIN_CREATE_INFO;
-				sbs_info.format          = 29; // DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
-				sbs_info.width           = sbs_w;
-				sbs_info.height          = eye_h;
-				sbs_info.sampleCount     = 1;
-				sbs_info.faceCount       = 1;
-				sbs_info.arraySize       = 1;
-				sbs_info.mipCount        = 1;
-				sbs_info.usageFlags      = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT
-				                         | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
-				XrResult sr = s_real_create_swapchain(session, &sbs_info, &s_sbs_sc);
-				if (XR_SUCCEEDED(sr) && s_real_enumerate_swapchain_images) {
-					uint32_t cnt = 0;
-					s_real_enumerate_swapchain_images(s_sbs_sc, 0, &cnt, nullptr);
-					if (cnt > 0 && cnt <= 8) {
-						XrSwapchainImageD3D11KHR imgs[8] = {};
-						for (uint32_t k = 0; k < cnt; k++)
-							imgs[k].type = XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR;
-						s_real_enumerate_swapchain_images(
-						    s_sbs_sc, cnt, &cnt,
-						    (XrSwapchainImageBaseHeader *)imgs);
-						s_sbs_img_count = cnt;
-						for (uint32_t k = 0; k < cnt; k++)
-							s_sbs_textures[k] = imgs[k].texture;
-					}
-					displayxr_log("[DisplayXR] SBS swapchain created: sc=%p %ux%u imgs=%u\n",
-					              (void *)(uintptr_t)s_sbs_sc, sbs_w, eye_h, s_sbs_img_count);
-				} else {
-					displayxr_log("[DisplayXR] SBS swapchain creation FAILED: %d\n", (int)sr);
+		// Derive tile layout. Prefer the enumerated mode; fall back to 2×1 SBS
+		// with per-view dimensions inferred from the first shadow swapchain.
+		uint32_t tile_cols = 0, tile_rows = 0, view_w = 0, view_h = 0;
+		if (mode != nullptr && mode->tileColumns > 0 && mode->tileRows > 0 &&
+		    mode->viewWidthPixels > 0 && mode->viewHeightPixels > 0) {
+			tile_cols = mode->tileColumns;
+			tile_rows = mode->tileRows;
+			view_w    = mode->viewWidthPixels;
+			view_h    = mode->viewHeightPixels;
+		} else {
+			// Fallback: 2-view SBS inferred from the first typed shadow swapchain.
+			// Matches the pre-N-view behavior so stereo apps keep working if the
+			// rendering-mode extension isn't exposed.
+			for (int si = 0; si < s_sc_sub_count; si++) {
+				if (s_sc_subs[si].active) {
+					view_w = s_sc_subs[si].width;
+					view_h = s_sc_subs[si].height;
+					break;
 				}
 			}
-			if (s_sbs_sc == XR_NULL_HANDLE) continue;
+			tile_cols = 2;
+			tile_rows = 1;
+		}
+		uint32_t atlas_w = tile_cols * view_w;
+		uint32_t atlas_h = tile_rows * view_h;
 
-			// Acquire + wait SBS image.
-			uint32_t sbs_idx = 0;
+		// Recreate the atlas swapchain if the target mode (or its dims) changed.
+		if (s_atlas_sc != XR_NULL_HANDLE &&
+		    (s_atlas_width != atlas_w || s_atlas_height != atlas_h ||
+		     s_atlas_mode_index != s_current_rendering_mode_index)) {
+			d3d11_destroy_atlas_swapchain();
+		}
+
+		// Lazily create the atlas output swapchain.
+		if (s_atlas_sc == XR_NULL_HANDLE && s_real_create_swapchain &&
+		    atlas_w > 0 && atlas_h > 0) {
+			XrSwapchainCreateInfo atlas_info = {};
+			atlas_info.type            = XR_TYPE_SWAPCHAIN_CREATE_INFO;
+			atlas_info.format          = 29; // DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+			atlas_info.width           = atlas_w;
+			atlas_info.height          = atlas_h;
+			atlas_info.sampleCount     = 1;
+			atlas_info.faceCount       = 1;
+			atlas_info.arraySize       = 1;
+			atlas_info.mipCount        = 1;
+			atlas_info.usageFlags      = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT
+			                           | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+			XrResult sr = s_real_create_swapchain(session, &atlas_info, &s_atlas_sc);
+			if (XR_SUCCEEDED(sr) && s_real_enumerate_swapchain_images) {
+				uint32_t cnt = 0;
+				s_real_enumerate_swapchain_images(s_atlas_sc, 0, &cnt, nullptr);
+				if (cnt > 0 && cnt <= 8) {
+					XrSwapchainImageD3D11KHR imgs[8] = {};
+					for (uint32_t k = 0; k < cnt; k++)
+						imgs[k].type = XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR;
+					s_real_enumerate_swapchain_images(
+					    s_atlas_sc, cnt, &cnt,
+					    (XrSwapchainImageBaseHeader *)imgs);
+					s_atlas_img_count = cnt;
+					for (uint32_t k = 0; k < cnt; k++)
+						s_atlas_textures[k] = imgs[k].texture;
+				}
+				s_atlas_width = atlas_w;
+				s_atlas_height = atlas_h;
+				s_atlas_mode_index = s_current_rendering_mode_index;
+				displayxr_log(
+				    "[DisplayXR] Atlas swapchain created: sc=%p %ux%u imgs=%u "
+				    "tiles=%ux%u viewPx=%ux%u mode=%u\n",
+				    (void *)(uintptr_t)s_atlas_sc, atlas_w, atlas_h,
+				    s_atlas_img_count, tile_cols, tile_rows, view_w, view_h,
+				    s_current_rendering_mode_index);
+			} else {
+				displayxr_log(
+				    "[DisplayXR] Atlas swapchain creation FAILED: %d\n", (int)sr);
+			}
+		}
+
+		if (s_atlas_sc != XR_NULL_HANDLE) {
+			// Acquire + wait one atlas image for this frame.
+			uint32_t atlas_idx = 0;
 			XrSwapchainImageAcquireInfo acq = { XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO };
 			XrSwapchainImageWaitInfo    wai = { XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO };
 			wai.timeout = XR_INFINITE_DURATION;
-			s_real_acquire_swapchain_image(s_sbs_sc, &acq, &sbs_idx);
-			s_real_wait_swapchain_image(s_sbs_sc, &wai);
+			s_real_acquire_swapchain_image(s_atlas_sc, &acq, &atlas_idx);
+			s_real_wait_swapchain_image(s_atlas_sc, &wai);
+			ID3D11Texture2D *atlas_tex = (atlas_idx < s_atlas_img_count)
+			    ? s_atlas_textures[atlas_idx] : nullptr;
 
-			// Composite: copy full left eye → SBS left half, right eye → SBS right half.
-			ID3D11Texture2D *sbs_tex  = (sbs_idx < s_sbs_img_count) ? s_sbs_textures[sbs_idx] : nullptr;
-			ID3D11Texture2D *left_tex = (sub1->current_idx < sub1->typed_img_count)
-			                          ? sub1->typed_textures[sub1->current_idx] : nullptr;
-			ID3D11Texture2D *right_tex = (sub2->current_idx < sub2->typed_img_count)
-			                          ? sub2->typed_textures[sub2->current_idx] : nullptr;
-			if (sbs_tex && left_tex && right_tex && s_d3d11_context) {
-				D3D11_BOX eye_box = { 0, 0, 0, eye_w, eye_h, 1 };
-				s_d3d11_context->CopySubresourceRegion(sbs_tex, 0, 0,     0, 0, left_tex,  0, &eye_box);
-				s_d3d11_context->CopySubresourceRegion(sbs_tex, 0, eye_w, 0, 0, right_tex, 0, &eye_box);
-				s_d3d11_context->Flush();
+			uint32_t tile_cap = tile_cols * tile_rows;
+
+			// Walk projection layers, tile each view's shadow texture into the
+			// atlas, and patch the view to reference the atlas tile.
+			for (uint32_t i = 0; i < frameEndInfo->layerCount; i++) {
+				const XrCompositionLayerBaseHeader *hdr = frameEndInfo->layers[i];
+				if (!hdr || hdr->type != XR_TYPE_COMPOSITION_LAYER_PROJECTION) continue;
+				const XrCompositionLayerProjection *proj =
+				    (const XrCompositionLayerProjection*)hdr;
+				if (!proj->views || proj->viewCount == 0) continue;
+				XrCompositionLayerProjectionView *views =
+				    (XrCompositionLayerProjectionView*)proj->views;
+
+				uint32_t n = proj->viewCount;
+				if (n > tile_cap) n = tile_cap;
+
+				for (uint32_t v = 0; v < n && ef_npatch < kMaxEfPatches; v++) {
+					D3D11ScSub *sub = d3d11_sub_find(views[v].subImage.swapchain);
+					if (!sub) continue;
+
+					uint32_t col = v % tile_cols;
+					uint32_t row = v / tile_cols;
+					uint32_t dst_x = col * view_w;
+					uint32_t dst_y = row * view_h;
+
+					// Copy the shadow texture into its tile. Use min(source,
+					// tile) dims so oversized shadows don't overrun neighbors.
+					if (atlas_tex && s_d3d11_context) {
+						ID3D11Texture2D *src_tex =
+						    (sub->current_idx < sub->typed_img_count)
+						        ? sub->typed_textures[sub->current_idx]
+						        : nullptr;
+						if (src_tex) {
+							uint32_t copy_w = (sub->width  < view_w) ? sub->width  : view_w;
+							uint32_t copy_h = (sub->height < view_h) ? sub->height : view_h;
+							D3D11_BOX box = { 0, 0, 0, copy_w, copy_h, 1 };
+							s_d3d11_context->CopySubresourceRegion(
+							    atlas_tex, 0, dst_x, dst_y, 0,
+							    src_tex, 0, &box);
+						}
+					}
+
+					EFPatch &p = ef_patches[ef_npatch++];
+					p.view     = &views[v];
+					p.orig_sc  = views[v].subImage.swapchain;
+					p.orig_rect = views[v].subImage.imageRect;
+					views[v].subImage.swapchain               = s_atlas_sc;
+					views[v].subImage.imageRect.offset.x      = (int32_t)dst_x;
+					views[v].subImage.imageRect.offset.y      = (int32_t)dst_y;
+					views[v].subImage.imageRect.extent.width  = (int32_t)view_w;
+					views[v].subImage.imageRect.extent.height = (int32_t)view_h;
+				}
 			}
 
-			// Release deferred typed swapchains.
+			if (s_d3d11_context) s_d3d11_context->Flush();
+
+			// Release the deferred typed shadow images, then the atlas image.
 			XrSwapchainImageReleaseInfo rel = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
 			for (int si = 0; si < s_sc_sub_count; si++) {
 				if (s_sc_subs[si].active && s_sc_subs[si].release_pending) {
@@ -942,37 +1169,27 @@ hooked_xrEndFrame(XrSession session, const XrFrameEndInfo *frameEndInfo)
 					s_sc_subs[si].release_pending = false;
 				}
 			}
-			// Release SBS image.
-			s_real_release_swapchain_image(s_sbs_sc, &rel);
+			s_real_release_swapchain_image(s_atlas_sc, &rel);
 
-			// Patch both views to reference s_sbs_sc with correct half-width rects.
-			for (uint32_t v = 0; v < 2 && ef_npatch < 8; v++) {
-				EFPatch &p  = ef_patches[ef_npatch++];
-				p.view      = &views[v];
-				p.orig_sc   = views[v].subImage.swapchain;
-				p.orig_rect = views[v].subImage.imageRect;
-				views[v].subImage.swapchain              = s_sbs_sc;
-				views[v].subImage.imageRect.offset.x     = (int32_t)(v * eye_w);
-				views[v].subImage.imageRect.offset.y     = 0;
-				views[v].subImage.imageRect.extent.width  = (int32_t)eye_w;
-				views[v].subImage.imageRect.extent.height = (int32_t)eye_h;
+			static int s_atlas_log = 0;
+			if (ef_npatch > 0 && s_atlas_log++ < 4) {
+				displayxr_log(
+				    "[DisplayXR] xrEndFrame: atlas composite OK "
+				    "(n=%d tiles=%ux%u atlas=%ux%u viewPx=%ux%u)\n",
+				    ef_npatch, tile_cols, tile_rows, atlas_w, atlas_h,
+				    view_w, view_h);
 			}
-
-			static int s_sub_log = 0;
-			if (s_sub_log++ < 4) {
-				displayxr_log("[DisplayXR] xrEndFrame: SBS composite OK"
-				              " (eye=%ux%u sbs=%ux%u sbs_tex=%p L=%p R=%p)\n",
-				              eye_w, eye_h, sbs_w, eye_h,
-				              (void *)sbs_tex, (void *)left_tex, (void *)right_tex);
-			}
-		}
-
-		// Release any deferred typed swapchains not handled above.
-		XrSwapchainImageReleaseInfo rel = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
-		for (int si = 0; si < s_sc_sub_count; si++) {
-			if (s_sc_subs[si].active && s_sc_subs[si].release_pending) {
-				s_real_release_swapchain_image(s_sc_subs[si].typed_sc, &rel);
-				s_sc_subs[si].release_pending = false;
+		} else {
+			// Atlas creation failed — release any deferred typed shadows so we
+			// don't leak acquired images, and fall through to end_frame with the
+			// original (broken) view swapchains. The frame will render wrong
+			// but we keep the session alive.
+			XrSwapchainImageReleaseInfo rel = { XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO };
+			for (int si = 0; si < s_sc_sub_count; si++) {
+				if (s_sc_subs[si].active && s_sc_subs[si].release_pending) {
+					s_real_release_swapchain_image(s_sc_subs[si].typed_sc, &rel);
+					s_sc_subs[si].release_pending = false;
+				}
 			}
 		}
 	}
@@ -1476,6 +1693,15 @@ displayxr_hook_xrGetInstanceProcAddr(XrInstance instance, const char *name, PFN_
 	else if (strcmp(name, "xrDestroySwapchain") == 0) {
 		s_real_destroy_swapchain = (PFN_xrDestroySwapchain)*function;
 		// No hook needed — just capture the pointer for typed swapchain cleanup.
+	}
+	else if (strcmp(name, "xrRequestDisplayRenderingModeEXT") == 0) {
+		s_real_request_rendering_mode = (PFN_xrRequestDisplayRenderingModeEXT)*function;
+		*function = (PFN_xrVoidFunction)hooked_xrRequestDisplayRenderingModeEXT;
+	}
+	else if (strcmp(name, "xrEnumerateDisplayRenderingModesEXT") == 0) {
+		s_real_enumerate_rendering_modes = (PFN_xrEnumerateDisplayRenderingModesEXT)*function;
+		// No hook — capture pointer so xrCreateSession's own enumeration call can
+		// reuse it even when the app (e.g. Unity built player) doesn't query it.
 	}
 #endif
 	else if (strcmp(name, "xrCreateSwapchain") == 0) {
