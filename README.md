@@ -77,9 +77,7 @@ cmake --build . --config Release
 
 In Unity: **Window > Package Manager > + > Add package from disk...** → select `displayxr-unity/package.json`.
 
-### Option B: From Git URL (after a release)
-
-> **Note:** The `upm` branch is created by CI when a `v*` tag is pushed. If no release has been published yet, use Option A.
+### Option B: From Git URL (Recommended)
 
 > **Git must be in PATH.** Unity's Package Manager requires Git installed and accessible to GUI apps.
 > - **Windows:** Install [Git for Windows](https://gitforwindows.org/) and ensure it's in your system PATH.
@@ -87,14 +85,21 @@ In Unity: **Window > Package Manager > + > Add package from disk...** → select
 
 1. In Unity: **Window > Package Manager**
 2. Click **+** > **Add package from git URL...**
-3. Enter:
+3. Enter one of:
+
+   **Pinned to a specific version (recommended for production):**
+   ```
+   https://github.com/DisplayXR/displayxr-unity.git#upm/v1.0.0
+   ```
+
+   **Always latest release:**
    ```
    https://github.com/DisplayXR/displayxr-unity.git#upm
    ```
-   This installs from the `upm` branch which includes pre-built native binaries. To pin a specific version:
-   ```
-   https://github.com/DisplayXR/displayxr-unity.git#upm/v0.1.0
-   ```
+
+Both URLs install from the `upm` branch, which includes pre-built native binaries (Windows x64 + macOS Universal) — no local build required. See the [releases page](https://github.com/DisplayXR/displayxr-unity/releases) for available versions.
+
+To **update** to a newer version later: change the URL fragment (e.g., `#upm/v1.0.1`) in `Packages/manifest.json` and use **Package Manager → Refresh**, or re-add the package with the new URL.
 
 ### Option C: From Release Tarball
 
