@@ -127,10 +127,13 @@ namespace DisplayXR
             }
 
 #if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
-            // Shell mode: Mouse.current.position is frozen in background.
-            // Use Mouse.current.delta (Raw Input deltas via RIDEV_INPUTSINK)
-            // and our native button tracker instead.
-            if (IsShellMode() && Mouse.current != null)
+            // Shell mode AND editor SA preview both use the native button
+            // tracker because Unity's new Input System doesn't see clicks
+            // when our preview window has the foreground/click target role.
+            // Mouse position deltas still come via Mouse.current.delta
+            // (Raw Input — works because Unity stays foreground via
+            // WS_EX_NOACTIVATE on the preview HWND).
+            if ((IsShellMode() || IsSAPreviewRunning()) && Mouse.current != null)
             {
                 if (ShellGetMouseButtonDown(0))
                     m_Dragging = true;
@@ -209,13 +212,31 @@ namespace DisplayXR
             return s_shellMode;
         }
 
-        /// Call once per frame (from Update) to snapshot shell button state.
+        private static bool IsSAPreviewRunning()
+        {
+            try { return DisplayXRNative.displayxr_standalone_is_running() != 0; }
+            catch { return false; }
+        }
+
+        /// Call once per frame (from Update) to snapshot mouse button state from
+        /// either the shell-mode tracker or the SA preview window's WndProc.
         private static void UpdateShellMouse()
         {
-            if (!IsShellMode()) return;
             s_shellButtonsPrev = s_shellButtonsCurr;
-            DisplayXRNative.displayxr_get_shell_mouse_state(
-                out s_shellButtonsCurr, out _, out _);
+            if (IsShellMode())
+            {
+                DisplayXRNative.displayxr_get_shell_mouse_state(
+                    out s_shellButtonsCurr, out _, out _);
+            }
+            else if (IsSAPreviewRunning())
+            {
+                try
+                {
+                    DisplayXRNative.displayxr_standalone_get_preview_mouse_state(
+                        out s_shellButtonsCurr, out _);
+                }
+                catch (System.EntryPointNotFoundException) { /* old binary */ }
+            }
         }
 
         private static bool ShellGetMouseButtonDown(int b)
@@ -336,18 +357,19 @@ namespace DisplayXR
                 return true;
 
 #if UNITY_EDITOR
-            // Only capture mouse in Game View, Preview Window, or the native
-            // preview NSWindow (which takes key focus away from EditorWindows).
-            var focused = UnityEditor.EditorWindow.focusedWindow;
-            if (focused == null)
+            // When the SA preview is running, the user is interacting with the
+            // native preview window — which isn't an EditorWindow. Don't gate
+            // input on EditorWindow focus, otherwise clicking the Inspector
+            // or any other editor pane would freeze input until the user
+            // clicks back into Game View or the Preview Window.
+            bool saRunning = false;
+            try { saRunning = DisplayXRNative.displayxr_standalone_is_running() != 0; }
+            catch { }
+            if (!saRunning)
             {
-                // No EditorWindow focused — allow if SA preview is running
-                // (user may be interacting with the native preview window)
-                if (DisplayXRNative.displayxr_standalone_is_running() == 0)
+                var focused = UnityEditor.EditorWindow.focusedWindow;
+                if (focused == null)
                     return true;
-            }
-            else
-            {
                 string typeName = focused.GetType().Name;
                 if (typeName != "GameView" && typeName != "DisplayXRPreviewWindow")
                     return true;

@@ -107,18 +107,20 @@ namespace DisplayXR.Editor
             switch (state)
             {
                 case PlayModeStateChange.ExitingEditMode:
-                    // Disable Unity's XR loader so it doesn't create an OpenXR session
-                    // that conflicts with the SA session + causes Game View crash.
-                    bool xrWasEnabled = DisableXRLoader();
-                    SessionState.SetBool(kXRWasEnabledKey, xrWasEnabled);
-                    // If preview is running, auto-restart it after domain reload.
-                    // Domain reload (assembly reload) will stop the session;
-                    // we restart it in EnteredPlayMode.
-                    SessionState.SetBool(kPlayModeStartedKey, IsRunning);
+                    // Always disable Unity's OpenXR loader and use the standalone
+                    // session for play-mode preview. The SA path gives the same
+                    // experience as edit-mode preview (own window, tile atlas, no
+                    // Game View main render) — this is the supported workflow.
+                    {
+                        bool xrWasEnabled = DisableXRLoader();
+                        SessionState.SetBool(kXRWasEnabledKey, xrWasEnabled);
+                        SessionState.SetBool(kPlayModeStartedKey, true);
+                    }
                     break;
 
                 case PlayModeStateChange.EnteredPlayMode:
-                    // Domain reload wiped statics — read from SessionState
+                    // Always auto-start the SA session in play mode (after domain
+                    // reload wiped statics). Same UX as edit-mode preview.
                     if (SessionState.GetBool(kPlayModeStartedKey, false) && !IsRunning)
                         Start();
                     break;

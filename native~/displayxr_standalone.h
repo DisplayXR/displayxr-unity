@@ -149,6 +149,15 @@ DISPLAYXR_EXPORT float displayxr_get_backing_scale_factor(void);
 /// Resets the flag after reading.
 DISPLAYXR_EXPORT int displayxr_standalone_window_was_closed(void);
 
+/// Get mouse button state tracked by the preview window's WndProc.
+/// Used by the C# input controller in editor preview mode (where Unity's
+/// new Input System doesn't reliably see clicks because the click target
+/// is our preview window, not Unity's).
+/// @param buttons  Bitmask: 1 = left, 2 = right, 4 = middle (currently held).
+/// @param wheel_delta  Accumulated wheel delta since last call (consumed).
+DISPLAYXR_EXPORT void displayxr_standalone_get_preview_mouse_state(
+    int *buttons, int *wheel_delta);
+
 /// Returns 1 if the preview window is being moved or resized.
 DISPLAYXR_EXPORT int displayxr_standalone_window_is_interacting(void);
 
