@@ -21,6 +21,7 @@
 #include <d3d12.h>
 #include <d3d11.h>
 #include <dxgi1_4.h>
+#include "displayxr_win32.h"
 
 // D3D12 OpenXR structs (inlined to avoid requiring XR_USE_GRAPHICS_API_D3D12).
 #define XR_TYPE_GRAPHICS_BINDING_D3D12_KHR      ((XrStructureType)1000028000)
