@@ -795,11 +795,13 @@ hooked_xrEndFrame(XrSession session, const XrFrameEndInfo *frameEndInfo)
 
 	DisplayXRState *state = displayxr_get_state();
 
+#if defined(_WIN32)
 	// Backend-specific end-frame processing (D3D11 atlas composite, etc.).
 	EFPatch ef_patches[16]; int ef_npatch = 0;
 	if (s_backend) {
 		s_backend->prepare_end_frame(session, frameEndInfo, ef_patches, &ef_npatch);
 	}
+#endif
 
 	// Count active window-space layers
 	int active_layers = 0;

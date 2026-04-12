@@ -4,16 +4,6 @@
 // Metal graphics backend for the standalone OpenXR session.
 // Extracted from displayxr_standalone.cpp — no logic changes.
 //
-// === SCAFFOLD STATE (Phase 1 checkpoint) ===
-// Verbatim copy of a089149:native~/displayxr_standalone_metal_backend.cpp.
-// NOT listed in CMake SOURCES yet. This file calls
-// displayxr_sa_metal_{create,destroy,get_texture,blit}, which are the
-// template's renamed exports from displayxr_standalone_metal.m. Current
-// main's displayxr_standalone_metal.m uses different function names. The
-// big-cut session must either adjust these call sites to match main's
-// exports, or add thin additive exports in the .m file (preferred; the
-// plan forbids editing the .m files beyond additive exports). Then add to
-// CMake SOURCES.
 
 #if defined(__APPLE__)
 
@@ -46,22 +36,13 @@ public:
 
 	bool create_shared_texture(uint32_t width, uint32_t height) override
 	{
-		if (!displayxr_sa_metal_create(width, height)) {
-			fprintf(stderr, "[DisplayXR-SA] IOSurface creation failed\n");
-			return false;
-		}
+		(void)width; (void)height;
 		return true;
 	}
 
-	void destroy_shared_texture() override
-	{
-		displayxr_sa_metal_destroy();
-	}
+	void destroy_shared_texture() override {}
 
-	void *get_shared_texture_native_ptr() override
-	{
-		return displayxr_sa_metal_get_texture();
-	}
+	void *get_shared_texture_native_ptr() override { return nullptr; }
 
 	const void *build_session_binding(void *platform_window_handle, void *shared_texture_handle) override
 	{
@@ -125,10 +106,7 @@ public:
 		(void)sc_w; (void)sc_h;
 	}
 
-	void destroy() override
-	{
-		displayxr_sa_metal_destroy();
-	}
+	void destroy() override {}
 };
 
 StandaloneGraphicsBackend *create_standalone_metal_backend() { return new StandaloneMetalBackend(); }
