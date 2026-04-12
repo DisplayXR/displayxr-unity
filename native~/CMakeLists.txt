@@ -40,21 +40,35 @@ endif()
 # --- Plugin sources ---
 set(SOURCES
     displayxr_hooks.cpp
+    displayxr_d3d11_backend.cpp
+    displayxr_d3d12_backend.cpp
+    displayxr_metal_backend.cpp
+    displayxr_vulkan_backend.cpp
+    displayxr_opengl_backend.cpp
+    displayxr_opengles_backend.cpp
     displayxr_kooima.cpp
     displayxr_shared_state.cpp
     displayxr_readback.cpp
     displayxr_standalone.cpp
+    displayxr_standalone_d3d11.cpp
+    displayxr_standalone_d3d12.cpp
+    displayxr_standalone_metal_backend.cpp
+    displayxr_standalone_vulkan.cpp
+    displayxr_standalone_opengl.cpp
+    displayxr_standalone_opengles.cpp
     display3d_view.c
     camera3d_view.c
 )
 
 set(HEADERS
     displayxr_hooks.h
+    displayxr_hooks_internal.h
     displayxr_kooima.h
     displayxr_shared_state.h
     displayxr_readback.h
     displayxr_extensions.h
     displayxr_standalone.h
+    displayxr_standalone_internal.h
     display3d_view.h
     camera3d_view.h
 )
