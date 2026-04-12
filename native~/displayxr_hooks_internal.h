@@ -107,6 +107,12 @@ public:
 	virtual void *create_shared_texture(uint32_t width, uint32_t height) = 0;
 	virtual void  destroy_shared_texture() = 0;
 	virtual void *get_shared_texture_native_ptr() = 0;
+
+	// Rendering-mode extension wiring (D3D11 only today; default no-ops for
+	// backends that don't support tile-layout modes yet).
+	virtual void set_rendering_mode_fns(PFN_xrEnumerateDisplayRenderingModesEXT, PFN_xrRequestDisplayRenderingModeEXT) {}
+	virtual void on_session_ready(XrSession) {}
+	virtual XrResult request_rendering_mode(XrSession, uint32_t) { return XR_ERROR_FUNCTION_UNSUPPORTED; }
 };
 
 // --- Factory functions for concrete backend classes ---
