@@ -2,43 +2,38 @@
 // SPDX-License-Identifier: BSL-1.0
 //
 // D3D12 graphics backend for the standalone OpenXR session.
-// Extracted from displayxr_standalone.cpp — no logic changes.
+// Extracted from displayxr_standalone.cpp.
 //
-// === SCAFFOLD STATE (Phase 1 checkpoint) ===
-// Verbatim copy of a089149:native~/displayxr_standalone_d3d12.cpp. NOT
-// listed in CMake SOURCES yet. The big-cut session must:
-//   1. Diff against current main's displayxr_standalone.cpp D3D12 paths.
-//      The D3D12 atlas bridge (commits a7c91dc, 2a84927) is the most
-//      sensitive code on main — both halves (device capture in
-//      displayxr_standalone_start + cross-device blit in
-//      displayxr_standalone_submit_frame_atlas) must land TOGETHER in this
-//      file or the split is broken (see plan's Failure Modes section).
-//   2. Merge any atlas bridge / fullscreen-window logic superset main has
-//      that the template doesn't (Windows preview HWND-driven resize paths).
-//   3. Add to CMake SOURCES and remove duplicated code from
-//      displayxr_standalone.cpp.
+// The SA session always runs on its own D3D12 device (not Unity's — sharing
+// caused device removal). Atlas blit and shared-texture output cross the
+// device boundary via DXGI shared handles. Unity may be running on either
+// D3D12 or D3D11 — the bridge opens on whichever API Unity is using so that
+// C# can Graphics.CopyTexture into it from the atlas RenderTexture.
 
 #if defined(_WIN32)
 
 #include "displayxr_standalone_internal.h"
+#include <d3d11_1.h>  // ID3D11Device1::OpenSharedResource1
 
 class StandaloneD3D12Backend : public StandaloneGraphicsBackend {
 public:
-	// D3D12 path (when Unity uses Direct3D 12)
-	ID3D12Device                 *d3d12_device         = nullptr; // Our own device (for runtime session)
+	// D3D12 path (SA's own device for runtime session)
+	ID3D12Device                 *d3d12_device         = nullptr;
 	ID3D12CommandQueue           *d3d12_queue           = nullptr;
 	ID3D12CommandAllocator       *d3d12_cmd_alloc       = nullptr;
 	ID3D12GraphicsCommandList    *d3d12_cmd_list        = nullptr;
 	ID3D12Fence                  *d3d12_fence           = nullptr;
 	HANDLE                        d3d12_fence_event      = nullptr;
 	UINT64                        d3d12_fence_value      = 0;
-	ID3D12Resource               *d3d12_shared_texture  = nullptr; // On our device
-	HANDLE                        d3d12_shared_handle    = nullptr; // DXGI shared handle (cross-device)
-	ID3D12Resource               *d3d12_unity_shared     = nullptr; // Same texture opened on Unity's device
-	// D3D12 atlas bridge: shared texture for cross-device atlas blit
-	ID3D12Resource               *d3d12_atlas_bridge        = nullptr; // On our device, SHARED
-	HANDLE                        d3d12_atlas_bridge_handle  = nullptr; // DXGI shared handle
-	ID3D12Resource               *d3d12_unity_atlas_bridge   = nullptr; // Opened on Unity's device
+	ID3D12Resource               *d3d12_shared_texture  = nullptr;
+	HANDLE                        d3d12_shared_handle    = nullptr;
+	ID3D12Resource               *d3d12_unity_shared     = nullptr;
+
+	// Atlas bridge: SHARED on SA device, opened on Unity's device.
+	ID3D12Resource               *d3d12_atlas_bridge        = nullptr;
+	HANDLE                        d3d12_atlas_bridge_handle  = nullptr;
+	ID3D12Resource               *d3d12_unity_atlas_bridge   = nullptr;  // if Unity = D3D12
+	ID3D11Texture2D              *d3d11_unity_atlas_bridge   = nullptr;  // if Unity = D3D11
 
 	// Fullscreen window resources (D3D12)
 	IDXGISwapChain3              *fw_swapchain   = nullptr;
@@ -52,8 +47,9 @@ public:
 	// Swapchain images
 	XrSwapchainImageD3D12KHR      images[SA_MAX_SWAPCHAIN_IMAGES] = {};
 
-	// Unity device (set before start)
-	ID3D12Device                 *unity_device   = nullptr;
+	// Unity devices (set by set_unity_device before start)
+	ID3D12Device                 *unity_device       = nullptr;  // non-null if Unity = D3D12
+	ID3D11Device                 *unity_d3d11_device  = nullptr;  // non-null if Unity = D3D11
 
 	bool create_device(XrInstance instance, XrSystemId system_id, PFN_xrGetInstanceProcAddr gipa) override
 	{
@@ -75,10 +71,6 @@ public:
 			        adapter_luid.HighPart, adapter_luid.LowPart, (unsigned)req.minFeatureLevel);
 		}
 
-		// Always create our own D3D12 device for the runtime session.
-		// Sharing Unity's device caused device removal — the runtime's compositor
-		// and Unity's renderer conflict when operating on the same device.
-		// Cross-device texture sharing is done via DXGI shared handles.
 		{
 			IDXGIFactory4 *factory = NULL;
 			CreateDXGIFactory2(0, __uuidof(IDXGIFactory4), (void **)&factory);
@@ -103,7 +95,6 @@ public:
 			fprintf(stderr, "[DisplayXR-SA] Created own D3D12 device for runtime session\n");
 		}
 
-		// Create command queue on the device
 		D3D12_COMMAND_QUEUE_DESC qd = {};
 		qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
 		HRESULT hr = d3d12_device->CreateCommandQueue(
@@ -113,16 +104,14 @@ public:
 			return false;
 		}
 
-		// Create command allocator + command list for atlas blit
 		d3d12_device->CreateCommandAllocator(
 			D3D12_COMMAND_LIST_TYPE_DIRECT,
 			__uuidof(ID3D12CommandAllocator), (void **)&d3d12_cmd_alloc);
 		d3d12_device->CreateCommandList(
 			0, D3D12_COMMAND_LIST_TYPE_DIRECT, d3d12_cmd_alloc, NULL,
 			__uuidof(ID3D12GraphicsCommandList), (void **)&d3d12_cmd_list);
-		d3d12_cmd_list->Close(); // Start closed
+		d3d12_cmd_list->Close();
 
-		// Create fence for GPU sync
 		d3d12_device->CreateFence(
 			0, D3D12_FENCE_FLAG_NONE,
 			__uuidof(ID3D12Fence), (void **)&d3d12_fence);
@@ -169,8 +158,6 @@ public:
 		fprintf(stderr, "[DisplayXR-SA] D3D12 shared texture: %ux%u, handle=%p\n",
 		        (unsigned)td.Width, td.Height, d3d12_shared_handle);
 
-		// Open the shared texture on Unity's device so C# can wrap it
-		// with CreateExternalTexture (needs an ID3D12Resource* on Unity's device).
 		if (unity_device && d3d12_shared_handle) {
 			hr = unity_device->OpenSharedHandle(
 				d3d12_shared_handle,
@@ -206,7 +193,6 @@ public:
 
 	const void *build_session_binding(void *platform_window_handle, void *shared_texture_handle) override
 	{
-		// Not used directly — D3D12 session binding is assembled in standalone_start
 		(void)platform_window_handle;
 		(void)shared_texture_handle;
 		return nullptr;
@@ -234,8 +220,14 @@ public:
 
 	void create_atlas_bridge(uint32_t atlas_w, uint32_t atlas_h, void *unity_dev) override
 	{
-		ID3D12Device *unity_d3d12 = (ID3D12Device *)unity_dev;
-		if (!unity_d3d12 || !d3d12_device) return;
+		// unity_dev is unused here — we use the devices already captured by
+		// set_unity_device(). The bridge resource is always D3D12 on the SA
+		// device; we open it on whichever API Unity is running.
+		(void)unity_dev;
+		if ((!unity_device && !unity_d3d11_device) || !d3d12_device) return;
+
+		fprintf(stderr, "[DisplayXR-SA] Atlas bridge: unity_d3d12=%p, unity_d3d11=%p, sa_device=%p\n",
+		        (void *)unity_device, (void *)unity_d3d11_device, (void *)d3d12_device);
 
 		D3D12_HEAP_PROPERTIES heap = {};
 		heap.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -257,20 +249,48 @@ public:
 			__uuidof(ID3D12Resource), (void **)&d3d12_atlas_bridge);
 		if (FAILED(hr)) {
 			fprintf(stderr, "[DisplayXR-SA] Atlas bridge CreateCommittedResource failed: 0x%08lx\n", hr);
-		} else {
-			hr = d3d12_device->CreateSharedHandle(
-				d3d12_atlas_bridge, NULL, GENERIC_ALL, NULL,
-				&d3d12_atlas_bridge_handle);
-			if (SUCCEEDED(hr) && d3d12_atlas_bridge_handle) {
-				hr = unity_d3d12->OpenSharedHandle(
+			return;
+		}
+
+		hr = d3d12_device->CreateSharedHandle(
+			d3d12_atlas_bridge, NULL, GENERIC_ALL, NULL,
+			&d3d12_atlas_bridge_handle);
+		if (FAILED(hr) || !d3d12_atlas_bridge_handle) {
+			fprintf(stderr, "[DisplayXR-SA] Atlas bridge CreateSharedHandle failed: 0x%08lx\n", hr);
+			return;
+		}
+
+		if (unity_device) {
+			// D3D12 Unity: open the NT handle directly on the Unity D3D12 device.
+			hr = unity_device->OpenSharedHandle(
+				d3d12_atlas_bridge_handle,
+				__uuidof(ID3D12Resource), (void **)&d3d12_unity_atlas_bridge);
+			if (SUCCEEDED(hr) && d3d12_unity_atlas_bridge) {
+				fprintf(stderr, "[DisplayXR-SA] Atlas bridge (D3D12): %ux%u, handle=%p, unity_res=%p\n",
+				        atlas_w, atlas_h, d3d12_atlas_bridge_handle,
+				        (void *)d3d12_unity_atlas_bridge);
+			} else {
+				fprintf(stderr, "[DisplayXR-SA] Atlas bridge OpenSharedHandle (D3D12) failed: 0x%08lx\n", hr);
+			}
+		} else if (unity_d3d11_device) {
+			// D3D11 Unity: open the NT handle on the D3D11 device via
+			// ID3D11Device1::OpenSharedResource1, which accepts NT-shared
+			// handles created by D3D12's CreateSharedHandle.
+			ID3D11Device1 *dev1 = NULL;
+			hr = unity_d3d11_device->QueryInterface(
+				__uuidof(ID3D11Device1), (void **)&dev1);
+			if (SUCCEEDED(hr) && dev1) {
+				hr = dev1->OpenSharedResource1(
 					d3d12_atlas_bridge_handle,
-					__uuidof(ID3D12Resource), (void **)&d3d12_unity_atlas_bridge);
-				if (SUCCEEDED(hr) && d3d12_unity_atlas_bridge) {
-					fprintf(stderr, "[DisplayXR-SA] Atlas bridge: %ux%u, handle=%p, unity_res=%p\n",
+					__uuidof(ID3D11Texture2D),
+					(void **)&d3d11_unity_atlas_bridge);
+				dev1->Release();
+				if (SUCCEEDED(hr) && d3d11_unity_atlas_bridge) {
+					fprintf(stderr, "[DisplayXR-SA] Atlas bridge (D3D11): %ux%u, handle=%p, tex=%p\n",
 					        atlas_w, atlas_h, d3d12_atlas_bridge_handle,
-					        (void *)d3d12_unity_atlas_bridge);
+					        (void *)d3d11_unity_atlas_bridge);
 				} else {
-					fprintf(stderr, "[DisplayXR-SA] Atlas bridge OpenSharedHandle failed: 0x%08lx\n", hr);
+					fprintf(stderr, "[DisplayXR-SA] Atlas bridge OpenSharedResource1 (D3D11) failed: 0x%08lx\n", hr);
 				}
 			}
 		}
@@ -278,23 +298,24 @@ public:
 
 	void destroy_atlas_bridge() override
 	{
-		if (d3d12_unity_atlas_bridge)  { d3d12_unity_atlas_bridge->Release();              d3d12_unity_atlas_bridge  = nullptr; }
-		if (d3d12_atlas_bridge_handle) { CloseHandle(d3d12_atlas_bridge_handle);           d3d12_atlas_bridge_handle = nullptr; }
-		if (d3d12_atlas_bridge)        { d3d12_atlas_bridge->Release();                    d3d12_atlas_bridge        = nullptr; }
+		if (d3d11_unity_atlas_bridge) { d3d11_unity_atlas_bridge->Release(); d3d11_unity_atlas_bridge = nullptr; }
+		if (d3d12_unity_atlas_bridge) { d3d12_unity_atlas_bridge->Release(); d3d12_unity_atlas_bridge = nullptr; }
+		if (d3d12_atlas_bridge_handle) { CloseHandle(d3d12_atlas_bridge_handle); d3d12_atlas_bridge_handle = nullptr; }
+		if (d3d12_atlas_bridge)       { d3d12_atlas_bridge->Release();          d3d12_atlas_bridge        = nullptr; }
 	}
 
 	void *get_atlas_bridge_unity_ptr() override
 	{
-		return (void *)d3d12_unity_atlas_bridge;
+		// Return whichever Unity-side texture we opened — C# passes this to
+		// Texture2D.CreateExternalTexture, which accepts ID3D11Texture2D* on
+		// D3D11 and ID3D12Resource* on D3D12 based on the editor's graphics API.
+		if (d3d11_unity_atlas_bridge) return (void *)d3d11_unity_atlas_bridge;
+		if (d3d12_unity_atlas_bridge) return (void *)d3d12_unity_atlas_bridge;
+		return nullptr;
 	}
 
 	void blit_atlas(void *atlas_tex, uint32_t index) override
 	{
-		// D3D12 cross-device atlas blit via shared bridge texture.
-		// C# copies Unity's atlas RT → bridge (Unity device, via Graphics.CopyTexture).
-		// We copy bridge → swapchain image (our device, same device).
-		// Note: content is Y-flipped (Unity D3D12 convention) — the C# display
-		// flips the final shared texture output via UV coords.
 		ID3D12Resource *bridge = d3d12_atlas_bridge;
 		ID3D12Resource *dst    = images[index].texture;
 		if (bridge && dst && d3d12_cmd_list) {
@@ -324,7 +345,7 @@ public:
 				WaitForSingleObject(d3d12_fence_event, INFINITE);
 			}
 		}
-		(void)atlas_tex; // Unused — C# copies to bridge via Graphics.CopyTexture
+		(void)atlas_tex;
 	}
 
 	bool fw_create_swapchain(void *hwnd, uint32_t w, uint32_t h) override
@@ -412,7 +433,6 @@ public:
 		if (!fw_swapchain) return;
 		UINT bb_idx = fw_swapchain->GetCurrentBackBufferIndex();
 
-		// D3D12 blit via command list
 		if (!d3d12_shared_texture) return;
 		ID3D12Resource *bb = fw_bb[bb_idx];
 
@@ -434,9 +454,6 @@ public:
 
 		fw_cmd_list->ResourceBarrier(2, barriers);
 
-		// Copy only the canvas-sized content region from the shared texture.
-		// The shared texture is always disp_w×disp_h but the runtime only writes
-		// in the top-left sc_w×sc_h area (= current canvas).
 		{
 			D3D12_TEXTURE_COPY_LOCATION src = {};
 			src.pResource        = d3d12_shared_texture;
@@ -462,7 +479,6 @@ public:
 		ID3D12CommandList *lists[] = { fw_cmd_list };
 		d3d12_queue->ExecuteCommandLists(1, lists);
 
-		// Wait for GPU completion before Present (fence on same queue as runtime)
 		fw_fence_value++;
 		d3d12_queue->Signal(fw_fence, fw_fence_value);
 		if (fw_fence->GetCompletedValue() < fw_fence_value) {
@@ -476,15 +492,54 @@ public:
 	void destroy() override
 	{
 		destroy_atlas_bridge();
-		// Release fence/cmd resources (shared texture destroy also releases these,
-		// but destroy_shared_texture is called separately)
-		if (d3d12_unity_atlas_bridge)  { d3d12_unity_atlas_bridge->Release();  d3d12_unity_atlas_bridge  = nullptr; }
-		if (d3d12_atlas_bridge_handle) { CloseHandle(d3d12_atlas_bridge_handle); d3d12_atlas_bridge_handle = nullptr; }
-		if (d3d12_atlas_bridge)        { d3d12_atlas_bridge->Release();          d3d12_atlas_bridge        = nullptr; }
+		if (unity_d3d11_device)  { unity_d3d11_device->Release();  unity_d3d11_device = nullptr; }
+		if (unity_device)        { unity_device->Release();        unity_device       = nullptr; }
 		destroy_shared_texture();
 	}
 
-	void set_unity_device(void *dev) override { unity_device = (ID3D12Device *)dev; }
+	void set_unity_device(void *native_tex_ptr) override
+	{
+		// Detect Unity's graphics API by QueryInterface on a native texture ptr.
+		// C# passes Texture2D.GetNativeTexturePtr() — ID3D12Resource* on D3D12,
+		// ID3D11Texture2D* on D3D11.
+		if (!native_tex_ptr) return;
+		IUnknown *unk = (IUnknown *)native_tex_ptr;
+
+		// Try D3D12 first.
+		{
+			ID3D12Resource *res = NULL;
+			HRESULT hr = unk->QueryInterface(__uuidof(ID3D12Resource), (void **)&res);
+			if (SUCCEEDED(hr) && res) {
+				ID3D12Device *dev = NULL;
+				hr = res->GetDevice(__uuidof(ID3D12Device), (void **)&dev);
+				res->Release();
+				if (SUCCEEDED(hr) && dev) {
+					unity_device = dev;
+					fprintf(stderr, "[DisplayXR-SA] Unity graphics: D3D12 device=%p\n", (void *)dev);
+					return;
+				}
+			}
+		}
+
+		// Fall back to D3D11.
+		{
+			ID3D11Resource *res = NULL;
+			HRESULT hr = unk->QueryInterface(__uuidof(ID3D11Resource), (void **)&res);
+			if (SUCCEEDED(hr) && res) {
+				ID3D11Device *dev = NULL;
+				res->GetDevice(&dev);
+				res->Release();
+				if (dev) {
+					unity_d3d11_device = dev;
+					fprintf(stderr, "[DisplayXR-SA] Unity graphics: D3D11 device=%p\n", (void *)dev);
+					return;
+				}
+			}
+		}
+
+		fprintf(stderr, "[DisplayXR-SA] Texture is neither ID3D12Resource nor ID3D11Resource — atlas bridge disabled\n");
+	}
+
 	void *get_graphics_device() override { return (void *)d3d12_device; }
 	void *get_graphics_queue() override { return (void *)d3d12_queue; }
 	void *get_shared_handle() override { return (void *)d3d12_shared_handle; }
