@@ -21,7 +21,7 @@ public:
 		mac_binding.viewHandle = state->window_handle;
 		mac_binding.readbackCallback = displayxr_readback_callback;
 		mac_binding.readbackUserdata = nullptr;
-		mac_binding.sharedIOSurface = state->shared_iosurface;
+		mac_binding.sharedIOSurface = nullptr;
 
 		displayxr_log( "[DisplayXR] Injecting cocoa window binding: viewHandle=%p, sharedIOSurface=%p\n",
 		        mac_binding.viewHandle, mac_binding.sharedIOSurface);
@@ -37,21 +37,11 @@ public:
 	void restore_end_frame(void *, int) override {}
 	void *create_shared_texture(uint32_t width, uint32_t height) override
 	{
-		if (displayxr_metal_create_shared_surface(width, height)) {
-			return displayxr_metal_get_texture();
-		}
+		(void)width; (void)height;
 		return nullptr;
 	}
-	void destroy_shared_texture() override
-	{
-		displayxr_metal_destroy_shared_surface();
-		DisplayXRState *state = displayxr_get_state();
-		state->shared_iosurface = nullptr;
-	}
-	void *get_shared_texture_native_ptr() override
-	{
-		return displayxr_metal_get_texture();
-	}
+	void destroy_shared_texture() override {}
+	void *get_shared_texture_native_ptr() override { return nullptr; }
 };
 
 GraphicsBackend *create_metal_backend() { return new MetalBackend(); }
