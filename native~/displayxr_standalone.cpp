@@ -7,59 +7,8 @@
 // the session lifecycle — no deferred destruction, no signal handlers, no
 // teardown races with Unity's Game View repaint cycle.
 
-#include "displayxr_standalone.h"
-#include "displayxr_extensions.h"
-#include "displayxr_shared_state.h"
-#include "display3d_view.h"
-#include "camera3d_view.h"
-
-#include <openxr/openxr.h>
-
-#if defined(__APPLE__)
-#include "displayxr_standalone_metal.h"
-#elif defined(_WIN32)
-#include <windows.h>
-#include <d3d11.h>
-#include <d3d11_1.h>
-#include <d3d12.h>
-#include <dxgi1_4.h>
-#include "displayxr_win32.h"
-
-// D3D12 OpenXR structs (inlined to avoid requiring XR_USE_GRAPHICS_API_D3D12).
-#define XR_TYPE_GRAPHICS_BINDING_D3D12_KHR      ((XrStructureType)1000028000)
-#define XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR       ((XrStructureType)1000028001)
-#define XR_TYPE_GRAPHICS_REQUIREMENTS_D3D12_KHR ((XrStructureType)1000028002)
-
-typedef struct XrSwapchainImageD3D12KHR {
-	XrStructureType type;
-	void *next;
-	ID3D12Resource *texture;
-} XrSwapchainImageD3D12KHR;
-
-typedef struct XrGraphicsBindingD3D12KHR {
-	XrStructureType type;
-	const void *next;
-	ID3D12Device *device;
-	ID3D12CommandQueue *queue;
-} XrGraphicsBindingD3D12KHR;
-
-typedef struct XrGraphicsRequirementsD3D12KHR {
-	XrStructureType type;
-	void *next;
-	LUID adapterLuid;
-	D3D_FEATURE_LEVEL minFeatureLevel;
-} XrGraphicsRequirementsD3D12KHR;
-#endif
-
-#include <math.h>
+#include "displayxr_standalone_internal.h"
 #include <stdarg.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
-
-#if !defined(_WIN32)
-#include <dlfcn.h>
-#endif
 
 // ============================================================================
 // OpenXR loader negotiation types (from openxr_loader_negotiation.h)
@@ -95,83 +44,14 @@ typedef XrResult (*PFN_xrNegotiateLoaderRuntimeInterface)(
 
 
 // ============================================================================
-// XR_KHR_metal_enable types (from openxr_platform.h, defined inline to avoid
-// platform header dependency on the Khronos-fetched headers).
-// ============================================================================
-
-#define XR_TYPE_GRAPHICS_BINDING_METAL_KHR ((XrStructureType)1000029000)
-#define XR_TYPE_SWAPCHAIN_IMAGE_METAL_KHR  ((XrStructureType)1000029001)
-#define XR_TYPE_GRAPHICS_REQUIREMENTS_METAL_KHR ((XrStructureType)1000029002)
-#define XR_KHR_METAL_ENABLE_EXTENSION_NAME "XR_KHR_metal_enable"
-
-typedef struct XrGraphicsBindingMetalKHR {
-	XrStructureType type;
-	const void *next;
-	void *commandQueue;
-} XrGraphicsBindingMetalKHR;
-
-typedef struct XrGraphicsRequirementsMetalKHR {
-	XrStructureType type;
-	void *next;
-	void *metalDevice;
-} XrGraphicsRequirementsMetalKHR;
-
-typedef struct XrSwapchainImageMetalKHR {
-	XrStructureType type;
-	void *next;
-	void *texture; // id<MTLTexture>
-} XrSwapchainImageMetalKHR;
-
-typedef XrResult (XRAPI_PTR *PFN_xrGetMetalGraphicsRequirementsKHR)(
-    XrInstance instance, XrSystemId systemId,
-    XrGraphicsRequirementsMetalKHR *graphicsRequirements);
-
-
-// ============================================================================
 // Standalone session state
 // ============================================================================
-
-#define SA_MAX_SWAPCHAIN_IMAGES 4
-#define SA_MAX_RENDERING_MODES 16
-#define SA_MAX_VIEWS 32
-
-typedef struct SASwapchain {
-	XrSwapchain handle;
-#if defined(__APPLE__)
-	XrSwapchainImageMetalKHR images[SA_MAX_SWAPCHAIN_IMAGES];
-#elif defined(_WIN32)
-	XrSwapchainImageD3D12KHR images[SA_MAX_SWAPCHAIN_IMAGES];
-#endif
-	uint32_t image_count;
-	uint32_t width;
-	uint32_t height;
-	int64_t format; // selected swapchain format (for typed RTV creation)
-} SASwapchain;
 
 typedef struct StandaloneState {
 	void *runtime_lib;
 	PFN_xrGetInstanceProcAddr gipa;
 #if defined(_WIN32)
-	ID3D12Device *d3d12_device;        // Our own device (for runtime session)
-	ID3D12CommandQueue *d3d12_queue;
-	ID3D12CommandAllocator *d3d12_cmd_alloc;
-	ID3D12GraphicsCommandList *d3d12_cmd_list;
-	ID3D12Fence *d3d12_fence;
-	HANDLE d3d12_fence_event;
-	UINT64 d3d12_fence_value;
-	HWND preview_hwnd;                     // Plugin-owned preview window
-	// Atlas bridge: cross-device shared texture for atlas blit
-	// Unity's atlas RT (on Unity's device) → bridge → swapchain (on SA device)
-	// Unity may be running on D3D12 (unity_device set) or D3D11
-	// (unity_d3d11_device set) depending on the project's graphics API.
-	// The SA-side bridge resource is always D3D12; we open it on whichever
-	// API Unity is using so C# can CopyTexture into it from the atlas RT.
-	ID3D12Device *unity_device;                // Unity's D3D12 device (if D3D12; owned via AddRef from GetDevice)
-	ID3D11Device *unity_d3d11_device;          // Unity's D3D11 device (if D3D11; owned via AddRef from GetDevice)
-	ID3D12Resource *d3d12_atlas_bridge;        // On SA device, SHARED (source of truth)
-	HANDLE d3d12_atlas_bridge_handle;          // DXGI shared NT handle
-	ID3D12Resource *d3d12_unity_atlas_bridge;  // Opened on Unity's D3D12 device (if D3D12)
-	ID3D11Texture2D *d3d11_unity_atlas_bridge; // Opened on Unity's D3D11 device (if D3D11)
+	HWND preview_hwnd;
 #endif
 
 	XrInstance instance;
@@ -267,6 +147,8 @@ typedef struct StandaloneState {
 } StandaloneState;
 
 static StandaloneState s_sa = {};
+
+static StandaloneGraphicsBackend *s_sa_backend = nullptr;
 
 // ============================================================================
 // Log callback — routes native messages to Unity's Debug.Log
@@ -631,27 +513,18 @@ create_atlas_swapchain(void)
 	s_sa.atlas.height = atlas_h;
 	s_sa.atlas.format = format;
 
-	// Enumerate swapchain images
+	// Enumerate swapchain images (delegated to backend)
 	uint32_t count = 0;
 	s_sa.pfn_enumerate_swapchain_images(s_sa.atlas.handle, 0, &count, NULL);
 	if (count > SA_MAX_SWAPCHAIN_IMAGES) count = SA_MAX_SWAPCHAIN_IMAGES;
 	s_sa.atlas.image_count = count;
 
-	for (uint32_t i = 0; i < count; i++) {
-#if defined(__APPLE__)
-		s_sa.atlas.images[i].type = XR_TYPE_SWAPCHAIN_IMAGE_METAL_KHR;
-#elif defined(_WIN32)
-		s_sa.atlas.images[i].type = XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR;
-#endif
-		s_sa.atlas.images[i].next = NULL;
-	}
-
-	result = s_sa.pfn_enumerate_swapchain_images(
-		s_sa.atlas.handle, count, &count,
-		(XrSwapchainImageBaseHeader *)s_sa.atlas.images);
-	if (XR_FAILED(result)) {
-		sa_log("[DisplayXR-SA] xrEnumerateSwapchainImages (atlas) failed: %d\n", result);
-		return 0;
+	if (s_sa_backend) {
+		if (!s_sa_backend->enumerate_atlas_images(s_sa.atlas.handle,
+		                                           s_sa.pfn_enumerate_swapchain_images,
+		                                           count)) {
+			return 0;
+		}
 	}
 
 	sa_log("[DisplayXR-SA] Atlas swapchain: %ux%u, %u images\n",
@@ -659,73 +532,9 @@ create_atlas_swapchain(void)
 
 	s_sa.atlas_created = 1;
 
-#if defined(_WIN32)
-	// Create atlas bridge: a SHARED texture on the SA device that Unity's device
-	// can also access. C# copies atlas RT → bridge (Unity device), native copies
-	// bridge → swapchain (SA device). Both copies are same-device = fast.
-	sa_log("[DisplayXR-SA] Atlas bridge: unity_d3d12=%p, unity_d3d11=%p, sa_device=%p\n",
-	        (void *)s_sa.unity_device, (void *)s_sa.unity_d3d11_device,
-	        (void *)s_sa.d3d12_device);
-	if ((s_sa.unity_device || s_sa.unity_d3d11_device) && s_sa.d3d12_device) {
-		D3D12_HEAP_PROPERTIES heap = {};
-		heap.Type = D3D12_HEAP_TYPE_DEFAULT;
-
-		D3D12_RESOURCE_DESC bd = {};
-		bd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
-		bd.Width = atlas_w;
-		bd.Height = atlas_h;
-		bd.DepthOrArraySize = 1;
-		bd.MipLevels = 1;
-		bd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
-		bd.SampleDesc.Count = 1;
-		bd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
-		bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
-
-		HRESULT hr = s_sa.d3d12_device->CreateCommittedResource(
-			&heap, D3D12_HEAP_FLAG_SHARED, &bd,
-			D3D12_RESOURCE_STATE_COMMON, NULL,
-			__uuidof(ID3D12Resource), (void **)&s_sa.d3d12_atlas_bridge);
-		if (SUCCEEDED(hr)) {
-			hr = s_sa.d3d12_device->CreateSharedHandle(
-				s_sa.d3d12_atlas_bridge, NULL, GENERIC_ALL, NULL,
-				&s_sa.d3d12_atlas_bridge_handle);
-			if (SUCCEEDED(hr) && s_sa.d3d12_atlas_bridge_handle) {
-				if (s_sa.unity_device) {
-					// D3D12 Unity: open the NT handle directly on the Unity D3D12 device.
-					hr = s_sa.unity_device->OpenSharedHandle(
-						s_sa.d3d12_atlas_bridge_handle,
-						__uuidof(ID3D12Resource), (void **)&s_sa.d3d12_unity_atlas_bridge);
-					if (SUCCEEDED(hr)) {
-						sa_log("[DisplayXR-SA] Atlas bridge (D3D12): %ux%u, handle=%p\n",
-						        atlas_w, atlas_h, s_sa.d3d12_atlas_bridge_handle);
-					}
-				} else if (s_sa.unity_d3d11_device) {
-					// D3D11 Unity: open the NT handle on the D3D11 device via
-					// ID3D11Device1::OpenSharedResource1, which accepts NT-shared
-					// handles created by D3D12's CreateSharedHandle.
-					ID3D11Device1 *dev1 = NULL;
-					hr = s_sa.unity_d3d11_device->QueryInterface(
-						__uuidof(ID3D11Device1), (void **)&dev1);
-					if (SUCCEEDED(hr) && dev1) {
-						hr = dev1->OpenSharedResource1(
-							s_sa.d3d12_atlas_bridge_handle,
-							__uuidof(ID3D11Texture2D),
-							(void **)&s_sa.d3d11_unity_atlas_bridge);
-						dev1->Release();
-						if (SUCCEEDED(hr)) {
-							sa_log("[DisplayXR-SA] Atlas bridge (D3D11): %ux%u, handle=%p tex=%p\n",
-							        atlas_w, atlas_h, s_sa.d3d12_atlas_bridge_handle,
-							        (void *)s_sa.d3d11_unity_atlas_bridge);
-						}
-					}
-				}
-			}
-		}
-		if (FAILED(hr)) {
-			sa_log("[DisplayXR-SA] Atlas bridge creation failed: 0x%08lx\n", hr);
-		}
+	if (s_sa_backend) {
+		s_sa_backend->create_atlas_bridge(atlas_w, atlas_h, nullptr);
 	}
-#endif
 
 	return 1;
 }
@@ -920,17 +729,10 @@ displayxr_standalone_start(const char *runtime_json_path)
 		return 1;
 	}
 
-#if defined(_WIN32)
-	// Preserve Unity device pointer — set before start() via set_unity_device().
-	// Exactly one of these is non-null depending on the editor's graphics API.
-	ID3D12Device *saved_unity_device = s_sa.unity_device;
-	ID3D11Device *saved_unity_d3d11_device = s_sa.unity_d3d11_device;
-#endif
+	// s_sa_backend (if created by set_unity_device) survives this memset —
+	// it's a separate heap allocation, not part of s_sa.
 	memset(&s_sa, 0, sizeof(s_sa));
 #if defined(_WIN32)
-	s_sa.unity_device = saved_unity_device;
-	s_sa.unity_d3d11_device = saved_unity_d3d11_device;
-
 	// Cache Unity's main HWND BEFORE we create our preview window — otherwise
 	// find_unity_hwnd might enumerate our preview window first and we'd
 	// forward input back to ourselves (feedback loop).
@@ -1108,107 +910,21 @@ displayxr_standalone_start(const char *runtime_json_path)
 	}
 	sa_log("[DisplayXR-SA] System acquired\n");
 
-	// --- Step 5b: Get Metal graphics requirements ---
+	// --- Step 5b: Create graphics device via backend ---
 #if defined(__APPLE__)
-	{
-		PFN_xrVoidFunction fn_req = NULL;
-		s_sa.gipa(s_sa.instance, "xrGetMetalGraphicsRequirementsKHR", &fn_req);
-		if (fn_req) {
-			XrGraphicsRequirementsMetalKHR req = {};
-			req.type = XR_TYPE_GRAPHICS_REQUIREMENTS_METAL_KHR;
-			result = ((PFN_xrGetMetalGraphicsRequirementsKHR)fn_req)(
-				s_sa.instance, s_sa.system_id, &req);
-			if (XR_FAILED(result)) {
-				sa_log("[DisplayXR-SA] xrGetMetalGraphicsRequirementsKHR failed: %d\n", result);
-				displayxr_standalone_stop();
-				return 0;
-			}
-			sa_log("[DisplayXR-SA] Metal graphics requirements satisfied\n");
-		} else {
-			sa_log("[DisplayXR-SA] Warning: xrGetMetalGraphicsRequirementsKHR not found\n");
-		}
-	}
+	if (!s_sa_backend)
+		s_sa_backend = create_standalone_metal_backend();
 #elif defined(_WIN32)
-	// --- Step 5b: Get D3D12 graphics requirements + create device ---
-	{
-		PFN_xrVoidFunction fn_req = NULL;
-		s_sa.gipa(s_sa.instance, "xrGetD3D12GraphicsRequirementsKHR", &fn_req);
-
-		LUID adapter_luid = {};
-		if (fn_req) {
-			XrGraphicsRequirementsD3D12KHR req = {};
-			req.type = XR_TYPE_GRAPHICS_REQUIREMENTS_D3D12_KHR;
-			result = ((XrResult(XRAPI_CALL *)(XrInstance, XrSystemId, void *))fn_req)(
-				s_sa.instance, s_sa.system_id, &req);
-			if (XR_FAILED(result)) {
-				sa_log("[DisplayXR-SA] xrGetD3D12GraphicsRequirementsKHR failed: %d\n", result);
-				displayxr_standalone_stop();
-				return 0;
-			}
-			adapter_luid = req.adapterLuid;
-			sa_log("[DisplayXR-SA] D3D12 requirements: adapter LUID=%08lx-%08lx, minFeatureLevel=0x%x\n",
-			        adapter_luid.HighPart, adapter_luid.LowPart, (unsigned)req.minFeatureLevel);
-		}
-
-		// Always create our own D3D12 device for the runtime session.
-		// Sharing Unity's device caused device removal — the runtime's compositor
-		// and Unity's renderer conflict when operating on the same device.
-		// Cross-device texture sharing is done via DXGI shared handles.
-		{
-			IDXGIFactory4 *factory = NULL;
-			CreateDXGIFactory2(0, __uuidof(IDXGIFactory4), (void **)&factory);
-			IDXGIAdapter1 *adapter = NULL;
-			if (factory && (adapter_luid.HighPart != 0 || adapter_luid.LowPart != 0)) {
-				HRESULT hr2 = factory->EnumAdapterByLuid(adapter_luid, __uuidof(IDXGIAdapter1), (void **)&adapter);
-				if (SUCCEEDED(hr2)) {
-					DXGI_ADAPTER_DESC1 desc;
-					adapter->GetDesc1(&desc);
-					sa_log("[DisplayXR-SA] Found matching adapter: %ls\n", desc.Description);
-				}
-			}
-			HRESULT hr = D3D12CreateDevice(
-				adapter, D3D_FEATURE_LEVEL_11_0,
-				__uuidof(ID3D12Device), (void **)&s_sa.d3d12_device);
-			if (adapter) adapter->Release();
-			if (factory) factory->Release();
-			if (FAILED(hr) || !s_sa.d3d12_device) {
-				sa_log("[DisplayXR-SA] D3D12CreateDevice failed: 0x%08lx\n", hr);
-				displayxr_standalone_stop();
-				return 0;
-			}
-			sa_log("[DisplayXR-SA] Created own D3D12 device for runtime session\n");
-		}
-
-		// Create command queue on the device
-		D3D12_COMMAND_QUEUE_DESC qd = {};
-		qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
-		HRESULT hr = s_sa.d3d12_device->CreateCommandQueue(
-			&qd, __uuidof(ID3D12CommandQueue), (void **)&s_sa.d3d12_queue);
-		if (FAILED(hr)) {
-			sa_log("[DisplayXR-SA] CreateCommandQueue failed: 0x%08lx\n", hr);
+	if (!s_sa_backend)
+		s_sa_backend = create_standalone_d3d12_backend();
+#endif
+	if (s_sa_backend) {
+		if (!s_sa_backend->create_device(s_sa.instance, s_sa.system_id, s_sa.gipa)) {
+			sa_log("[DisplayXR-SA] Backend create_device failed\n");
 			displayxr_standalone_stop();
 			return 0;
 		}
-
-		// Create command allocator + command list for atlas blit
-		s_sa.d3d12_device->CreateCommandAllocator(
-			D3D12_COMMAND_LIST_TYPE_DIRECT,
-			__uuidof(ID3D12CommandAllocator), (void **)&s_sa.d3d12_cmd_alloc);
-		s_sa.d3d12_device->CreateCommandList(
-			0, D3D12_COMMAND_LIST_TYPE_DIRECT, s_sa.d3d12_cmd_alloc, NULL,
-			__uuidof(ID3D12GraphicsCommandList), (void **)&s_sa.d3d12_cmd_list);
-		s_sa.d3d12_cmd_list->Close(); // Start closed
-
-		// Create fence for GPU sync
-		s_sa.d3d12_device->CreateFence(
-			0, D3D12_FENCE_FLAG_NONE,
-			__uuidof(ID3D12Fence), (void **)&s_sa.d3d12_fence);
-		s_sa.d3d12_fence_event = CreateEvent(NULL, FALSE, FALSE, NULL);
-		s_sa.d3d12_fence_value = 0;
-
-		sa_log("[DisplayXR-SA] D3D12 command queue + blit resources created\n");
 	}
-#endif
 
 	// --- Step 6: Get system properties + display info ---
 	XrDisplayInfoEXT display_info_ext = {};
@@ -1325,11 +1041,11 @@ displayxr_standalone_start(const char *runtime_json_path)
 	metal_binding.next = &mac_binding;
 	session_ci.next = &metal_binding;
 #elif defined(_WIN32)
-	// D3D12 graphics binding
+	// D3D12 graphics binding (device + queue from backend)
 	XrGraphicsBindingD3D12KHR d3d12_binding = {};
 	d3d12_binding.type = XR_TYPE_GRAPHICS_BINDING_D3D12_KHR;
-	d3d12_binding.device = s_sa.d3d12_device;
-	d3d12_binding.queue = s_sa.d3d12_queue;
+	d3d12_binding.device = (ID3D12Device *)s_sa_backend->get_graphics_device();
+	d3d12_binding.queue = (ID3D12CommandQueue *)s_sa_backend->get_graphics_queue();
 
 	// Win32 window binding — pass the plugin-owned preview HWND.
 	// The runtime composites directly into this window.
@@ -1430,19 +1146,13 @@ displayxr_standalone_stop(void)
 	displayxr_sa_metal_destroy_window();
 #elif defined(_WIN32)
 	if (s_sa.preview_hwnd) { DestroyWindow(s_sa.preview_hwnd); s_sa.preview_hwnd = NULL; }
-	if (s_sa.d3d11_unity_atlas_bridge) { s_sa.d3d11_unity_atlas_bridge->Release(); s_sa.d3d11_unity_atlas_bridge = NULL; }
-	if (s_sa.d3d12_unity_atlas_bridge) { s_sa.d3d12_unity_atlas_bridge->Release(); s_sa.d3d12_unity_atlas_bridge = NULL; }
-	if (s_sa.d3d12_atlas_bridge_handle) { CloseHandle(s_sa.d3d12_atlas_bridge_handle); s_sa.d3d12_atlas_bridge_handle = NULL; }
-	if (s_sa.d3d12_atlas_bridge) { s_sa.d3d12_atlas_bridge->Release(); s_sa.d3d12_atlas_bridge = NULL; }
-	if (s_sa.unity_d3d11_device) { s_sa.unity_d3d11_device->Release(); s_sa.unity_d3d11_device = NULL; }
-	if (s_sa.unity_device) { s_sa.unity_device->Release(); s_sa.unity_device = NULL; }
-	if (s_sa.d3d12_fence_event) { CloseHandle(s_sa.d3d12_fence_event); s_sa.d3d12_fence_event = NULL; }
-	if (s_sa.d3d12_fence) { s_sa.d3d12_fence->Release(); s_sa.d3d12_fence = NULL; }
-	if (s_sa.d3d12_cmd_list) { s_sa.d3d12_cmd_list->Release(); s_sa.d3d12_cmd_list = NULL; }
-	if (s_sa.d3d12_cmd_alloc) { s_sa.d3d12_cmd_alloc->Release(); s_sa.d3d12_cmd_alloc = NULL; }
-	if (s_sa.d3d12_queue) { s_sa.d3d12_queue->Release(); s_sa.d3d12_queue = NULL; }
-	if (s_sa.d3d12_device) { s_sa.d3d12_device->Release(); s_sa.d3d12_device = NULL; }
 #endif
+
+	if (s_sa_backend) {
+		s_sa_backend->destroy();
+		delete s_sa_backend;
+		s_sa_backend = nullptr;
+	}
 
 	if (s_sa.instance != XR_NULL_HANDLE && s_sa.pfn_destroy_instance) {
 		s_sa.pfn_destroy_instance(s_sa.instance);
@@ -1640,46 +1350,10 @@ displayxr_standalone_submit_frame_atlas(void *atlas_tex)
 		sa_log("[DisplayXR-SA] Wait atlas swapchain failed: %d\n", r);
 	}
 
-	// Blit Unity atlas RenderTexture → swapchain image (platform-specific)
-#if defined(__APPLE__)
-	void *dst = s_sa.atlas.images[index].texture;
-	if (atlas_tex && dst) {
-		displayxr_sa_metal_blit(atlas_tex, dst);
+	// Blit Unity atlas RenderTexture → swapchain image (delegated to backend)
+	if (s_sa_backend) {
+		s_sa_backend->blit_atlas(atlas_tex, index);
 	}
-#elif defined(_WIN32)
-	{
-		// Cross-device blit: bridge (SA device) → swapchain (SA device).
-		// C# copies Unity's atlas RT → bridge (Unity device) via Graphics.CopyTexture.
-		ID3D12Resource *bridge = s_sa.d3d12_atlas_bridge;
-		ID3D12Resource *dst = s_sa.atlas.images[index].texture;
-		if (bridge && dst && s_sa.d3d12_cmd_list) {
-			s_sa.d3d12_cmd_alloc->Reset();
-			s_sa.d3d12_cmd_list->Reset(s_sa.d3d12_cmd_alloc, NULL);
-
-			D3D12_TEXTURE_COPY_LOCATION dst_loc = {};
-			dst_loc.pResource = dst;
-			dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-			D3D12_TEXTURE_COPY_LOCATION src_loc = {};
-			src_loc.pResource = bridge;
-			src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-
-			s_sa.d3d12_cmd_list->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, NULL);
-			s_sa.d3d12_cmd_list->Close();
-
-			ID3D12CommandList *lists[] = { s_sa.d3d12_cmd_list };
-			s_sa.d3d12_queue->ExecuteCommandLists(1, lists);
-
-			s_sa.d3d12_fence_value++;
-			s_sa.d3d12_queue->Signal(s_sa.d3d12_fence, s_sa.d3d12_fence_value);
-			if (s_sa.d3d12_fence->GetCompletedValue() < s_sa.d3d12_fence_value) {
-				s_sa.d3d12_fence->SetEventOnCompletion(s_sa.d3d12_fence_value,
-				                                        s_sa.d3d12_fence_event);
-				WaitForSingleObject(s_sa.d3d12_fence_event, INFINITE);
-			}
-		}
-		(void)atlas_tex; // Unused — C# copies to bridge via Graphics.CopyTexture
-	}
-#endif
 
 	XrSwapchainImageReleaseInfo rel_info = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
 	s_sa.pfn_release_swapchain_image(s_sa.atlas.handle, &rel_info);
@@ -2046,50 +1720,13 @@ displayxr_standalone_get_eye_positions(float *lx, float *ly, float *lz,
 }
 
 
-// displayxr_standalone_get_shared_texture and displayxr_standalone_get_atlas_bridge_texture
 void
 displayxr_standalone_set_unity_device(void *unity_native_tex)
 {
 #if defined(_WIN32)
-	if (!unity_native_tex) return;
-	IUnknown *unk = (IUnknown *)unity_native_tex;
-
-	// Try D3D12 first. Unity returns an ID3D12Resource* from
-	// RenderTexture.GetNativeTexturePtr() when the editor runs on D3D12.
-	{
-		ID3D12Resource *res = NULL;
-		HRESULT hr = unk->QueryInterface(__uuidof(ID3D12Resource), (void **)&res);
-		if (SUCCEEDED(hr) && res) {
-			ID3D12Device *dev = NULL;
-			hr = res->GetDevice(__uuidof(ID3D12Device), (void **)&dev);
-			res->Release();
-			if (SUCCEEDED(hr) && dev) {
-				s_sa.unity_device = dev;
-				sa_log("[DisplayXR-SA] Unity graphics: D3D12 device=%p\n", (void *)dev);
-				return;
-			}
-		}
-	}
-
-	// Fall back to D3D11. Unity returns an ID3D11Texture2D* (which implements
-	// ID3D11Resource) when the editor runs on D3D11. We need the D3D11 device
-	// so we can OpenSharedResource1 the SA-side D3D12 shared bridge onto it.
-	{
-		ID3D11Resource *res = NULL;
-		HRESULT hr = unk->QueryInterface(__uuidof(ID3D11Resource), (void **)&res);
-		if (SUCCEEDED(hr) && res) {
-			ID3D11Device *dev = NULL;
-			res->GetDevice(&dev);
-			res->Release();
-			if (dev) {
-				s_sa.unity_d3d11_device = dev;
-				sa_log("[DisplayXR-SA] Unity graphics: D3D11 device=%p\n", (void *)dev);
-				return;
-			}
-		}
-	}
-
-	sa_log("[DisplayXR-SA] Texture is neither ID3D12Resource nor ID3D11Resource — atlas bridge disabled\n");
+	if (!s_sa_backend)
+		s_sa_backend = create_standalone_d3d12_backend();
+	s_sa_backend->set_unity_device(unity_native_tex);
 #else
 	(void)unity_native_tex;
 #endif
@@ -2099,24 +1736,13 @@ void
 displayxr_standalone_get_atlas_bridge_texture(void **native_ptr,
                                                uint32_t *width, uint32_t *height)
 {
-#if defined(_WIN32)
-	// Return whichever Unity-side texture we opened — C# passes this to
-	// Texture2D.CreateExternalTexture, which accepts ID3D11Texture2D* on
-	// D3D11 and ID3D12Resource* on D3D12 based on the editor's graphics API.
-	if (s_sa.d3d11_unity_atlas_bridge) {
-		*native_ptr = (void *)s_sa.d3d11_unity_atlas_bridge;
-	} else if (s_sa.d3d12_unity_atlas_bridge) {
-		*native_ptr = (void *)s_sa.d3d12_unity_atlas_bridge;
+	if (s_sa_backend) {
+		*native_ptr = s_sa_backend->get_atlas_bridge_unity_ptr();
 	} else {
 		*native_ptr = NULL;
 	}
 	*width = s_sa.atlas.width;
 	*height = s_sa.atlas.height;
-#else
-	*native_ptr = NULL;
-	*width = 0;
-	*height = 0;
-#endif
 }
 
 
