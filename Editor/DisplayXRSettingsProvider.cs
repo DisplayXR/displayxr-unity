@@ -48,6 +48,11 @@ namespace DisplayXR.Editor
 
             // Feature status
             DrawFeatureStatus();
+
+            EditorGUILayout.Space();
+
+            // App manifest sidecar
+            DrawManifestSection();
         }
 
         private void DrawRuntimeStatus()
@@ -168,6 +173,34 @@ namespace DisplayXR.Editor
             else
             {
                 EditorGUILayout.LabelField("Connected", "No (display info not available)");
+            }
+
+            EditorGUILayout.EndVertical();
+        }
+
+        private void DrawManifestSection()
+        {
+            EditorGUILayout.BeginVertical(EditorStyles.helpBox);
+            EditorGUILayout.LabelField("App Manifest", EditorStyles.boldLabel);
+
+            EditorGUILayout.HelpBox(
+                "The DisplayXR launcher discovers apps via a .displayxr.json sidecar file " +
+                "generated next to each built executable. Configure the manifest settings below.",
+                MessageType.Info);
+
+            var settings = DisplayXRManifestSettings.Find();
+            if (settings != null)
+            {
+                EditorGUILayout.LabelField("App Name", settings.EffectiveName);
+                EditorGUILayout.LabelField("Category", settings.category.ToString());
+                if (GUILayout.Button("Select Manifest Settings"))
+                    Selection.activeObject = settings;
+            }
+            else
+            {
+                EditorGUILayout.LabelField("Status", "No settings asset (defaults will be used on build)");
+                if (GUILayout.Button("Create Manifest Settings"))
+                    Selection.activeObject = DisplayXRManifestSettings.GetOrCreate();
             }
 
             EditorGUILayout.EndVertical();
