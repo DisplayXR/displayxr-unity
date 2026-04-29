@@ -23,7 +23,8 @@ namespace DisplayXR.Editor
     ///
     /// Mirrors the runtime-side fix in displayxr-runtime-pvt commit 5d2eee70b
     /// "Shell: pin launched apps to dGPU". This applies the same pin at build
-    /// time so Unity apps work correctly even when launched outside the shell.
+    /// time so Unity apps work correctly even when launched outside a
+    /// workspace controller (e.g. directly from Explorer).
     /// </summary>
     public class DisplayXRGpuPreferenceBuildProcessor : IPostprocessBuildWithReport
     {

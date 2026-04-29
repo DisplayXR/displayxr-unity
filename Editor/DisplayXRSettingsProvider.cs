@@ -184,8 +184,9 @@ namespace DisplayXR.Editor
             EditorGUILayout.LabelField("App Manifest", EditorStyles.boldLabel);
 
             EditorGUILayout.HelpBox(
-                "The DisplayXR launcher discovers apps via a .displayxr.json sidecar file " +
-                "generated next to each built executable. Configure the manifest settings below.",
+                "Any DisplayXR-compatible workspace controller (the DisplayXR Shell is the " +
+                "reference) discovers apps via a .displayxr.json sidecar file generated next " +
+                "to each built executable. Configure the manifest settings below.",
                 MessageType.Info);
 
             var settings = DisplayXRManifestSettings.Find();

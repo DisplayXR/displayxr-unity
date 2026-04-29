@@ -16,6 +16,7 @@ namespace DisplayXR.Editor
         private SerializedProperty icon;
         private SerializedProperty icon3D;
         private SerializedProperty icon3DLayout;
+        private SerializedProperty registerWithDisplayXR;
 
         private void OnEnable()
         {
@@ -26,6 +27,7 @@ namespace DisplayXR.Editor
             icon = serializedObject.FindProperty("icon");
             icon3D = serializedObject.FindProperty("icon3D");
             icon3DLayout = serializedObject.FindProperty("icon3DLayout");
+            registerWithDisplayXR = serializedObject.FindProperty("registerWithDisplayXR");
         }
 
         public override void OnInspectorGUI()
@@ -34,8 +36,9 @@ namespace DisplayXR.Editor
 
             EditorGUILayout.HelpBox(
                 "These settings control the .displayxr.json sidecar file generated " +
-                "next to your built executable. The DisplayXR shell's spatial launcher " +
-                "uses this file to discover and display your app.",
+                "next to your built executable. Any DisplayXR-compatible workspace " +
+                "controller (the DisplayXR Shell is the reference) uses this file to " +
+                "discover and display your app.",
                 MessageType.Info);
 
             EditorGUILayout.Space();
@@ -88,6 +91,14 @@ namespace DisplayXR.Editor
                 EditorGUILayout.PropertyField(icon3DLayout, new GUIContent("Stereo Layout"));
                 EditorGUI.indentLevel--;
             }
+
+            EditorGUILayout.Space();
+
+            // --- Distribution ---
+            EditorGUILayout.LabelField("Distribution", EditorStyles.boldLabel);
+            EditorGUILayout.PropertyField(registerWithDisplayXR, new GUIContent("Register with DisplayXR",
+                "Also write a registered manifest to %LOCALAPPDATA%\\DisplayXR\\apps\\ so DisplayXR-compatible " +
+                "workspace controllers (including the DisplayXR Shell) discover this build without needing it under Program Files."));
 
             serializedObject.ApplyModifiedProperties();
         }
