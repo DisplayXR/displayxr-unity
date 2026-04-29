@@ -79,9 +79,9 @@ if(APPLE)
     list(APPEND HEADERS displayxr_metal.h displayxr_standalone_metal.h)
 endif()
 
-# Windows-only: overlay child window + D3D11/DXGI
+# Windows-only: overlay child window + D3D11/DXGI + dGPU preference exports
 if(WIN32)
-    list(APPEND SOURCES displayxr_win32.c)
+    list(APPEND SOURCES displayxr_win32.c displayxr_gpu_preference.cpp)
     list(APPEND HEADERS displayxr_win32.h)
     link_libraries(d3d11 d3d12 dxgi)
 endif()
