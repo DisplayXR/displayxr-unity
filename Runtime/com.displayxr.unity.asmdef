@@ -4,7 +4,6 @@
   "references": [
     "Unity.XR.OpenXR",
     "Unity.XR.Management",
-    "UnityEngine.UI",
     "Unity.InputSystem"
   ],
   "includePlatforms": [],

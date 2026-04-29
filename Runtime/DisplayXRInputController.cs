@@ -351,10 +351,9 @@ namespace DisplayXR
             }
             catch (System.EntryPointNotFoundException) { }
 
-            // Runtime UI (Canvas/EventSystem)
-            var es = UnityEngine.EventSystems.EventSystem.current;
-            if (es != null && es.IsPointerOverGameObject())
-                return true;
+            // Runtime UI (Canvas/EventSystem). Reflection-based to avoid a hard
+            // UGUI compile dependency from the plugin assembly.
+            if (IsPointerOverUgui()) return true;
 
 #if UNITY_EDITOR
             // When the SA preview is running, the user is interacting with the
@@ -376,6 +375,29 @@ namespace DisplayXR
             }
 #endif
             return false;
+        }
+
+        private static System.Reflection.MethodInfo s_IsPointerOver;
+        private static System.Reflection.PropertyInfo s_CurrentEs;
+        private static bool s_UguiResolved;
+
+        private static bool IsPointerOverUgui()
+        {
+            if (!s_UguiResolved)
+            {
+                s_UguiResolved = true;
+                var t = System.Type.GetType("UnityEngine.EventSystems.EventSystem, UnityEngine.UI");
+                if (t != null)
+                {
+                    s_CurrentEs = t.GetProperty("current",
+                        System.Reflection.BindingFlags.Static | System.Reflection.BindingFlags.Public);
+                    s_IsPointerOver = t.GetMethod("IsPointerOverGameObject", System.Type.EmptyTypes);
+                }
+            }
+            if (s_CurrentEs == null || s_IsPointerOver == null) return false;
+            var es = s_CurrentEs.GetValue(null);
+            if (es == null) return false;
+            return (bool)s_IsPointerOver.Invoke(es, null);
         }
 
         // --- Input abstraction (keyboard + mouse) ---

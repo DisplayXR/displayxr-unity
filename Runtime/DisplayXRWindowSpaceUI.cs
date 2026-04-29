@@ -2,7 +2,6 @@
 // SPDX-License-Identifier: BSL-1.0
 
 using UnityEngine;
-using UnityEngine.UI;
 
 namespace DisplayXR
 {
