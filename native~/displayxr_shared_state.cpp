@@ -60,6 +60,11 @@ displayxr_state_init(void)
 
 	s_state.stereo_matrices_read_idx = 0;
 	s_stereo_matrices_write_idx.store(1, std::memory_order_relaxed);
+
+	// Default to sRGB swapchain (matches Unity Linear color space, the
+	// recommended setting). C# overrides via displayxr_set_use_srgb_swapchain
+	// at feature init.
+	s_state.use_srgb_swapchain = 1;
 }
 
 void

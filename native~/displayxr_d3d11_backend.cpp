@@ -230,14 +230,21 @@ public:
 
 	void on_swapchain_created(XrSession session, const XrSwapchainCreateInfo *createInfo, XrSwapchain unity_sc) override
 	{
-		// Pair a R8G8B8A8_UNORM_SRGB typed sibling to the Unity-facing TYPELESS
-		// color swapchain so Unity's RTV creation works and the compositor gets
-		// typed textures. Non-color swapchains (depth, etc.) are left alone.
+		// Pair a typed sibling to the Unity-facing TYPELESS color swapchain so
+		// Unity's RTV creation works and the compositor gets typed textures.
+		// Format follows the Unity project color space (UNORM for Gamma so the
+		// shader output isn't double-gamma-encoded; UNORM_SRGB for Linear so
+		// Unity's linear→sRGB conversion lands correctly). Non-color swapchains
+		// (depth, etc.) are left alone.
 		if (device != nullptr &&
 		    (createInfo->usageFlags & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT) &&
 		    sc_sub_count < kMaxScSubs) {
+			DisplayXRState *st = displayxr_get_state();
+			int64_t typed_format = st->use_srgb_swapchain
+			    ? 29  // DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+			    : 28; // DXGI_FORMAT_R8G8B8A8_UNORM
 			XrSwapchainCreateInfo typed_info = *createInfo;
-			typed_info.format = 29; // DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+			typed_info.format = typed_format;
 			XrSwapchain typed_sc = XR_NULL_HANDLE;
 			XrResult tr = s_real_create_swapchain(session, &typed_info, &typed_sc);
 			if (XR_SUCCEEDED(tr)) {
@@ -248,8 +255,9 @@ public:
 				sub.height   = createInfo->height;
 				sub.active   = true;
 				displayxr_log(
-				    "[DisplayXR] Typed swapchain paired: unity=%p typed=%p\n",
-				    (void *)(uintptr_t)unity_sc, (void *)(uintptr_t)typed_sc);
+				    "[DisplayXR] Typed swapchain paired: unity=%p typed=%p format=%lld\n",
+				    (void *)(uintptr_t)unity_sc, (void *)(uintptr_t)typed_sc,
+				    (long long)typed_format);
 			} else {
 				displayxr_log("[DisplayXR] Typed swapchain create FAILED: result=%d\n", tr);
 			}
@@ -397,9 +405,13 @@ public:
 			// Lazily create the atlas output swapchain.
 			if (atlas_sc == XR_NULL_HANDLE && s_real_create_swapchain &&
 			    atlas_w > 0 && atlas_h > 0) {
+				DisplayXRState *st = displayxr_get_state();
+				int64_t atlas_format = st->use_srgb_swapchain
+				    ? 29  // DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+				    : 28; // DXGI_FORMAT_R8G8B8A8_UNORM
 				XrSwapchainCreateInfo atlas_info = {};
 				atlas_info.type            = XR_TYPE_SWAPCHAIN_CREATE_INFO;
-				atlas_info.format          = 29; // DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+				atlas_info.format          = atlas_format;
 				atlas_info.width           = atlas_w;
 				atlas_info.height          = atlas_h;
 				atlas_info.sampleCount     = 1;

@@ -125,6 +125,13 @@ typedef struct DisplayXRState {
     // Editor mode flag: create own preview window instead of auto-detecting app window
     uint8_t editor_mode;
 
+    // Color-space hint for typed-swapchain substitution (D3D11).
+    // 1 = use DXGI_FORMAT_R8G8B8A8_UNORM_SRGB (matches Unity Linear color space).
+    // 0 = use DXGI_FORMAT_R8G8B8A8_UNORM (matches Unity Gamma color space; also
+    //     the runtime's preferred format on the test displays).
+    // Defaults to 1 for backward compatibility; C# overrides at OnInstanceCreate.
+    uint8_t use_srgb_swapchain;
+
     // Viewport (window) size and screen position for window-relative Kooima
     uint32_t viewport_width;
     uint32_t viewport_height;

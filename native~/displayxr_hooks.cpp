@@ -913,15 +913,35 @@ hooked_xrCreateSwapchain(XrSession session,
                           const XrSwapchainCreateInfo *createInfo,
                           XrSwapchain *swapchain)
 {
+	// In a Unity Gamma-color-space project, Unity's shader output is already
+	// gamma-encoded. Writing those values to an sRGB-typed swapchain causes
+	// the GPU to apply sRGB encoding a second time (double-gamma → on-display
+	// content is too dark). Downgrade sRGB color formats to their UNORM
+	// equivalents so the values land unchanged. Linear projects keep sRGB.
+	// This works for any graphics backend (D3D11, D3D12, Vulkan, Metal).
+	XrSwapchainCreateInfo info = *createInfo;
+	DisplayXRState *st = displayxr_get_state();
+	if (!st->use_srgb_swapchain &&
+	    (info.usageFlags & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT)) {
+		int64_t orig = info.format;
+		if      (info.format == 29) info.format = 28; // RGBA8 SRGB → UNORM
+		else if (info.format == 91) info.format = 87; // BGRA8 SRGB → UNORM
+		if (info.format != orig) {
+			displayxr_log("[DisplayXR] xrCreateSwapchain: Gamma-space override %lld → %lld\n",
+			    (long long)orig, (long long)info.format);
+		}
+	}
+
 	displayxr_log( "[DisplayXR] xrCreateSwapchain: format=%lld size=%ux%u "
 	        "samples=%u faces=%u arrays=%u mips=%u "
 	        "createFlags=0x%llx usageFlags=0x%llx\n",
-	        (long long)createInfo->format,
-	        createInfo->width, createInfo->height,
-	        createInfo->sampleCount, createInfo->faceCount,
-	        createInfo->arraySize, createInfo->mipCount,
-	        (unsigned long long)createInfo->createFlags,
-	        (unsigned long long)createInfo->usageFlags);
+	        (long long)info.format,
+	        info.width, info.height,
+	        info.sampleCount, info.faceCount,
+	        info.arraySize, info.mipCount,
+	        (unsigned long long)info.createFlags,
+	        (unsigned long long)info.usageFlags);
+	const XrSwapchainCreateInfo *createInfoEffective = &info;
 
 #if defined(_WIN32)
 	// Annotate usage flags
@@ -941,11 +961,11 @@ hooked_xrCreateSwapchain(XrSession session,
 		displayxr_log( "  usage: MUTABLE_FORMAT\n");
 #endif
 
-	XrResult result = s_real_create_swapchain(session, createInfo, swapchain);
+	XrResult result = s_real_create_swapchain(session, createInfoEffective, swapchain);
 	if (XR_SUCCEEDED(result)) {
 		displayxr_log( "[DisplayXR] xrCreateSwapchain: OK swapchain=%p\n",
 		        (void *)(uintptr_t)*swapchain);
-		if (s_backend) s_backend->on_swapchain_created(session, createInfo, *swapchain);
+		if (s_backend) s_backend->on_swapchain_created(session, createInfoEffective, *swapchain);
 	} else {
 		displayxr_log( "[DisplayXR] xrCreateSwapchain: FAILED result=%d\n", result);
 	}
@@ -1404,6 +1424,19 @@ displayxr_set_editor_mode(int enabled)
 {
 	DisplayXRState *state = displayxr_get_state();
 	state->editor_mode = (uint8_t)(enabled != 0);
+}
+
+void
+displayxr_set_use_srgb_swapchain(int enabled)
+{
+	// Must be called BEFORE the OpenXR session creates its swapchains
+	// (i.e. from the OpenXR feature's OnInstanceCreate). Reading is wired
+	// in displayxr_d3d11_backend.cpp on_swapchain_created and the atlas
+	// swapchain creation. 1 = UNORM_SRGB (Unity Linear), 0 = UNORM (Unity Gamma).
+	DisplayXRState *state = displayxr_get_state();
+	state->use_srgb_swapchain = (uint8_t)(enabled != 0);
+	displayxr_log("[DisplayXR] use_srgb_swapchain set to %d (typed sibling will be format %d)\n",
+	    state->use_srgb_swapchain, state->use_srgb_swapchain ? 29 : 28);
 }
 
 void

@@ -101,6 +101,7 @@ namespace DisplayXR
             HandleQuit();
             HandleFullscreen();
             HandleModeCycle();
+            HandleScreenshot();
         }
 
         private bool IsActiveCamera()
@@ -341,6 +342,18 @@ namespace DisplayXR
             Debug.Log($"[DisplayXR] Display mode → {(m_CurrentRenderingMode == 0 ? "2D" : "3D")}");
         }
 
+        private static int s_LastScreenshotFrame = -1;
+        private void HandleScreenshot()
+        {
+            // I key matches the convention used by the C++ test apps and the
+            // Unreal plugin. Guarded against multi-rig double-fire per frame.
+            if (GetKeyDown(KeyCode.I) && Time.frameCount != s_LastScreenshotFrame)
+            {
+                s_LastScreenshotFrame = Time.frameCount;
+                DisplayXRScreenshot.Capture();
+            }
+        }
+
         private static bool ShouldIgnoreInput()
         {
             // Ignore input while the mouse cursor is over the preview window.
@@ -440,6 +453,7 @@ namespace DisplayXR
                 case KeyCode.D: return Key.D;
                 case KeyCode.Q: return Key.Q;
                 case KeyCode.E: return Key.E;
+                case KeyCode.I: return Key.I;
                 case KeyCode.V: return Key.V;
                 case KeyCode.Space: return Key.Space;
                 case KeyCode.Escape: return Key.Escape;

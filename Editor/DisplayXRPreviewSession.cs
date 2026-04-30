@@ -426,6 +426,12 @@ namespace DisplayXR.Editor
                         (int)s_ViewWidth, (int)s_ViewHeight);
                 }
 
+                // Atlas is fully rendered. Service screenshot capture / flash
+                // overlay before the bridge copy so any flash is visible on the
+                // 3D display, the preview window, and the Game View.
+                DisplayXRScreenshot._OnAtlasReady(s_AtlasRT, s_TileColumns, s_TileRows,
+                    s_ViewWidth, s_ViewHeight);
+
                 // Windows D3D12: copy atlas RT → bridge (same Unity device, fast GPU copy).
                 // Native then copies bridge → swapchain (same SA device).
                 if (s_AtlasBridgeTex != null)
@@ -663,7 +669,7 @@ namespace DisplayXR.Editor
 
         public static CameraEntry[] DiscoverCameras()
         {
-            var cameras = UnityEngine.Object.FindObjectsByType<Camera>(FindObjectsInactive.Exclude, FindObjectsSortMode.None);
+            var cameras = UnityEngine.Object.FindObjectsByType<Camera>(FindObjectsInactive.Exclude);
             var entries = new List<CameraEntry>();
 
             foreach (var cam in cameras)

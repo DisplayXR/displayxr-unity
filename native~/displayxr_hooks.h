@@ -83,6 +83,14 @@ DISPLAYXR_EXPORT void displayxr_set_window_handle(void *handle);
 
 DISPLAYXR_EXPORT void displayxr_set_editor_mode(int enabled);
 
+/// Hint the typed-swapchain substitution about Unity's project color space.
+/// Must be called BEFORE Unity creates its OpenXR swapchains (i.e. from the
+/// OpenXR feature's OnInstanceCreate).
+///   1 = Linear color space → UNORM_SRGB typed siblings.
+///   0 = Gamma color space  → UNORM typed siblings (no double gamma encoding).
+/// Default is 1 (sRGB) for backward compatibility.
+DISPLAYXR_EXPORT void displayxr_set_use_srgb_swapchain(int enabled);
+
 /// Check whether the plugin is running in shell/IPC mode.
 /// Detected via DISPLAYXR_SHELL_SESSION=1 environment variable.
 /// Callable from C# via P/Invoke.

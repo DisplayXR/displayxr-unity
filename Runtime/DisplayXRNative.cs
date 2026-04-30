@@ -85,6 +85,14 @@ namespace DisplayXR
         internal static extern void displayxr_set_editor_mode(int enabled);
 
         /// <summary>
+        /// Hint the typed-swapchain substitution about the project color space.
+        /// 1 = Linear (UNORM_SRGB siblings); 0 = Gamma (UNORM siblings).
+        /// Must be called BEFORE Unity creates its OpenXR swapchains.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void displayxr_set_use_srgb_swapchain(int enabled);
+
+        /// <summary>
         /// Check whether the plugin is running in shell/IPC mode.
         /// Detected via DISPLAYXR_SHELL_SESSION=1 environment variable.
         /// </summary>

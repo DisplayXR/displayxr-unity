@@ -86,6 +86,16 @@ namespace DisplayXR
         {
             Instance = this;
 
+            // Tell native code which typed swapchain format to substitute for
+            // Unity's TYPELESS color swapchain (D3D11). Must happen before any
+            // swapchain is created. Mismatch causes double-gamma in built apps
+            // (Gamma project + sRGB swapchain) or wrong tint in Linear projects.
+            var cs = QualitySettings.activeColorSpace;
+            int useSRGB = cs == ColorSpace.Linear ? 1 : 0;
+            DisplayXRNative.displayxr_set_use_srgb_swapchain(useSRGB);
+            string fmtName = useSRGB == 1 ? "29 (UNORM_SRGB)" : "28 (UNORM)";
+            Debug.Log($"[DisplayXR] Color space: {cs} → typed-sibling format = {fmtName}");
+
 #if UNITY_EDITOR
             // Tell native code we're in editor mode — use IOSurface/shared texture
             // instead of auto-detecting the window and creating an overlay.
