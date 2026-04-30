@@ -9,6 +9,18 @@ namespace DisplayXR.Editor
     [CustomEditor(typeof(DisplayXRManifestSettings))]
     public class DisplayXRManifestSettingsEditor : UnityEditor.Editor
     {
+        // Direct shortcut so users don't have to hunt through Project Settings
+        // (which can be empty if the OpenXR feature isn't checked) or guess
+        // where the asset lives in Assets/.
+        [MenuItem("Window/DisplayXR/Manifest Settings")]
+        public static void OpenManifestSettings()
+        {
+            var settings = DisplayXRManifestSettings.Find()
+                ?? DisplayXRManifestSettings.GetOrCreate();
+            Selection.activeObject = settings;
+            EditorGUIUtility.PingObject(settings);
+        }
+
         private SerializedProperty appName;
         private SerializedProperty category;
         private SerializedProperty displayMode;
