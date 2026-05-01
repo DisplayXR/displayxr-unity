@@ -9,7 +9,7 @@ You are continuing work on the DisplayXR Unity plugin. Your job is to graft a kn
 ## Background you need before touching anything
 
 1. **Read the full plan first** — it has all the context, conflict-resolution hints, verification steps, and failure modes:
-   - `docs/roadmap/d3d11-typeless-fix-plan.md`
+   - `docs~/roadmap/d3d11-typeless-fix-plan.md`
 2. **Skim the project README/CLAUDE.md** for the build commands and the "Known Issues" entry on Windows preview drag/phase-snap (that behavior is parked and you should not touch it).
 3. **The branch `d3d11-typeless-fix` already exists on `origin`** and is currently identical to `main`. Do not create it again — just check it out.
 
@@ -71,7 +71,7 @@ Work through these in order. If something fails, diagnose with the failure-modes
    ```
    Optionally run `/ci-monitor --watch-only` to watch the build, but **do not block on CI** — proceed to local testing in parallel.
 
-6. **Run the end-to-end verification on this machine.** Follow steps 1–8 in the "Verification" section of `docs/roadmap/d3d11-typeless-fix-plan.md`. Specifically:
+6. **Run the end-to-end verification on this machine.** Follow steps 1–8 in the "Verification" section of `docs~/roadmap/d3d11-typeless-fix-plan.md`. Specifically:
    - Test project: `DisplayXR-test` (ask the user where it lives if you can't find it; on Mac it's at `/Users/david.fattal/Documents/Unity/DisplayXR-test`, on Windows it's likely under the user's home).
    - Force the project to **D3D11** in Player Settings.
    - Edit-mode preview should render cleanly with no X-pattern.

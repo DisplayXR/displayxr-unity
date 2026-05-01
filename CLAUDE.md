@@ -255,16 +255,16 @@ Automates the complete CI workflow for native plugin builds: commit → push →
 
 ## Documentation Index
 
-For detailed architecture and design decisions, see `docs/`:
+For detailed architecture and design decisions, see `docs~/`:
 
-- Understand the preview system → `docs/architecture/preview-session.md`
-- Understand OpenXR hooking → `docs/architecture/hook-chain.md`
-- Understand stereo math → `docs/architecture/kooima-pipeline.md`
-- Why deferred destruction? → `docs/adr/ADR-001-deferred-destruction.md`
-- Why SA session vs XR loader? → `docs/adr/ADR-002-dual-session.md`
-- Why native window? → `docs/adr/ADR-003-native-preview-window.md`
-- Why two rig modes? → `docs/adr/ADR-004-camera-vs-display-mode.md`
-- Full docs index → `docs/README.md`
+- Understand the preview system → `docs~/architecture/preview-session.md`
+- Understand OpenXR hooking → `docs~/architecture/hook-chain.md`
+- Understand stereo math → `docs~/architecture/kooima-pipeline.md`
+- Why deferred destruction? → `docs~/adr/ADR-001-deferred-destruction.md`
+- Why SA session vs XR loader? → `docs~/adr/ADR-002-dual-session.md`
+- Why native window? → `docs~/adr/ADR-003-native-preview-window.md`
+- Why two rig modes? → `docs~/adr/ADR-004-camera-vs-display-mode.md`
+- Full docs index → `docs~/README.md`
 
 ## Cross-Repo References
 

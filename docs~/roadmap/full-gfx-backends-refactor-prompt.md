@@ -11,9 +11,9 @@ You are continuing work on the DisplayXR Unity plugin. Your job is to port the p
 ## Background you need before touching anything
 
 1. **Read the full plan first** — it has all the context, strategy, file layout, failure modes, and verification steps:
-   - `docs/roadmap/full-gfx-backends-refactor-plan.md`
+   - `docs~/roadmap/full-gfx-backends-refactor-plan.md`
 2. **Read the prior D3D11 fix plan** for related background — the D3D11 typed-swapchain substitution that `main` has today was cherry-picked from the same `full_gfx_apis` branch, and it must survive your refactor untouched:
-   - `docs/roadmap/d3d11-typeless-fix-plan.md`
+   - `docs~/roadmap/d3d11-typeless-fix-plan.md`
 3. **Skim `CLAUDE.md`**, especially:
    - "Building the Native Plugin" — the local build scripts for each platform.
    - "Key Architecture → Three Layers" and "OpenXR Hook Chain" — how the native plugin intercepts Unity's OpenXR calls.
