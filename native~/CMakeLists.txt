@@ -80,10 +80,12 @@ if(APPLE)
 endif()
 
 # Windows-only: overlay child window + D3D11/DXGI + dGPU preference exports
+# user32 is required for SetLayeredWindowAttributes / WS_EX_LAYERED
+# (transparent overlay mode, issue #57).
 if(WIN32)
     list(APPEND SOURCES displayxr_win32.c displayxr_gpu_preference.cpp)
     list(APPEND HEADERS displayxr_win32.h)
-    link_libraries(d3d11 d3d12 dxgi)
+    link_libraries(user32 d3d11 d3d12 dxgi)
 endif()
 
 # --- Build shared library ---

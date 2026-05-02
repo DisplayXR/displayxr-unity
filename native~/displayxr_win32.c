@@ -16,10 +16,20 @@
 #define WIN32_LEAN_AND_MEAN
 #endif
 #include <windows.h>
+#include <windowsx.h>
+#include <dwmapi.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include "displayxr_hooks.h"
 #include "displayxr_shared_state.h"
+
+#pragma comment(lib, "dwmapi.lib")
+
+// DWMWA_CLOAK is defined as 13 in dwmapi.h on newer SDKs. Provide a
+// fallback so we don't need a specific Windows SDK version.
+#ifndef DWMWA_CLOAK
+#define DWMWA_CLOAK 13
+#endif
 
 // ============================================================================
 // Standalone mode: overlay child window
@@ -29,6 +39,21 @@ static HWND s_overlay_hwnd = NULL;
 static WNDPROC s_original_wndproc = NULL;
 static const wchar_t OVERLAY_CLASS_NAME[] = L"DisplayXROverlay";
 static int s_class_registered = 0;
+// True when the overlay HWND is a top-level WS_POPUP + NOREDIRECTIONBITMAP
+// (issue #57 transparent path) instead of a WS_CHILD of Unity's HWND.
+// Set in displayxr_get_app_main_view; consumed by parent_subclass_proc to
+// reposition the overlay in screen coords vs sizing within parent client.
+static int s_overlay_is_toplevel = 0;
+
+// ============================================================================
+// Transparent overlay mode (issue #57): chroma-key + WS_EX_LAYERED on the
+// parent (Unity top-level) HWND. Mutually exclusive with shell mode.
+// ============================================================================
+
+static DWORD s_saved_style    = 0;
+static DWORD s_saved_exstyle  = 0;
+static int   s_overlay_active = 0;
+static RECT  s_hit_rect       = {0, 0, 0, 0};
 
 // ============================================================================
 // Shell mode detection
@@ -52,6 +77,19 @@ displayxr_is_shell_mode(void)
 // Window discovery (shared by both modes)
 // ============================================================================
 
+// Skip our own overlay window (created by displayxr_get_app_main_view) when
+// searching for Unity's main HWND. After the overlay becomes visible it can
+// otherwise win the foreground/visible-window race in find_unity_hwnd and
+// we end up styling our own overlay as Unity, leaving Unity untouched.
+static int
+is_displayxr_overlay_class(HWND hwnd)
+{
+	wchar_t cls[64] = {0};
+	if (GetClassNameW(hwnd, cls, 63) == 0)
+		return 0;
+	return wcscmp(cls, OVERLAY_CLASS_NAME) == 0;
+}
+
 static HWND
 find_unity_hwnd(void)
 {
@@ -59,7 +97,7 @@ find_unity_hwnd(void)
 	HWND unity_hwnd = NULL;
 
 	HWND fg = GetForegroundWindow();
-	if (fg != NULL) {
+	if (fg != NULL && !is_displayxr_overlay_class(fg)) {
 		DWORD fg_pid = 0;
 		GetWindowThreadProcessId(fg, &fg_pid);
 		if (fg_pid == our_pid)
@@ -69,6 +107,8 @@ find_unity_hwnd(void)
 	if (unity_hwnd == NULL) {
 		HWND hwnd = NULL;
 		while ((hwnd = FindWindowExW(NULL, hwnd, NULL, NULL)) != NULL) {
+			if (is_displayxr_overlay_class(hwnd))
+				continue;
 			DWORD pid = 0;
 			GetWindowThreadProcessId(hwnd, &pid);
 			if (pid == our_pid && IsWindowVisible(hwnd)) {
@@ -102,10 +142,30 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 static LRESULT CALLBACK
 parent_subclass_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
+	if (msg == WM_NCHITTEST && s_overlay_active) {
+		POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+		ScreenToClient(hwnd, &pt);
+		if (pt.x >= s_hit_rect.left && pt.x < s_hit_rect.right &&
+		    pt.y >= s_hit_rect.top  && pt.y < s_hit_rect.bottom) {
+			return HTCLIENT;
+		}
+		return HTTRANSPARENT;
+	}
 	if (msg == WM_SIZE && s_overlay_hwnd != NULL && IsWindow(s_overlay_hwnd)) {
 		int w = LOWORD(lParam);
 		int h = HIWORD(lParam);
-		SetWindowPos(s_overlay_hwnd, HWND_TOP, 0, 0, w, h, SWP_NOZORDER);
+		if (s_overlay_is_toplevel) {
+			// Top-level overlay: position in screen coords matching parent's
+			// client area. Keep z-order topmost.
+			POINT client_origin = {0, 0};
+			ClientToScreen(hwnd, &client_origin);
+			SetWindowPos(s_overlay_hwnd, HWND_TOPMOST,
+			             client_origin.x, client_origin.y, w, h,
+			             SWP_NOACTIVATE);
+		} else {
+			// Child overlay: resize within parent's client area.
+			SetWindowPos(s_overlay_hwnd, HWND_TOP, 0, 0, w, h, SWP_NOZORDER);
+		}
 		if (w > 0 && h > 0) {
 			POINT client_origin = {0, 0};
 			ClientToScreen(hwnd, &client_origin);
@@ -117,6 +177,13 @@ parent_subclass_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 	if (msg == WM_MOVE) {
 		POINT client_origin = {0, 0};
 		ClientToScreen(hwnd, &client_origin);
+		// Top-level overlay needs to follow the parent's screen position.
+		if (s_overlay_is_toplevel
+		    && s_overlay_hwnd != NULL && IsWindow(s_overlay_hwnd)) {
+			SetWindowPos(s_overlay_hwnd, HWND_TOPMOST,
+			             client_origin.x, client_origin.y, 0, 0,
+			             SWP_NOSIZE | SWP_NOACTIVATE);
+		}
 		DisplayXRState *state = displayxr_get_state();
 		if (state->viewport_width > 0) {
 			displayxr_set_viewport_size_native(
@@ -170,13 +237,49 @@ displayxr_get_app_main_view(void)
 	int w = client_rc.right - client_rc.left;
 	int h = client_rc.bottom - client_rc.top;
 
+	// Transparent overlay mode (issue #57 / runtime-pvt #191): create the
+	// overlay as a top-level WS_POPUP with WS_EX_NOREDIRECTIONBITMAP.
+	// Without NOREDIRECTIONBITMAP the HWND has an opaque DWM redirection
+	// surface (default-cleared to black), and the runtime's DComp visuals
+	// just paint on top of that — desktop never shows through transparent
+	// pixels. NOREDIRECTIONBITMAP tells DWM "compositing comes purely from
+	// DComp visuals attached to this HWND."
+	//
+	// Top-level (not WS_CHILD of Unity's HWND) avoids Unity's parent-window
+	// swapchain interfering with our compositing. Unity owns the parent for
+	// input/lifecycle; the overlay is a separate top-level window owned by
+	// (not parented to) Unity.
+	DisplayXRState *state = displayxr_get_state();
+	int transparent_mode = (state != NULL && state->transparent_background_requested);
+
+	POINT client_origin = {0, 0};
+	ClientToScreen(unity_hwnd, &client_origin);
+
+	DWORD style    = transparent_mode
+	    ? (DWORD)(WS_POPUP | WS_VISIBLE)
+	    : (DWORD)(WS_CHILD | WS_VISIBLE);
+	DWORD ex_style = transparent_mode
+	    ? (DWORD)(WS_EX_TRANSPARENT | WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOPMOST | WS_EX_TOOLWINDOW)
+	    : (DWORD)(WS_EX_TRANSPARENT);
+	int x = transparent_mode ? client_origin.x : 0;
+	int y = transparent_mode ? client_origin.y : 0;
+
+	// Owner field:
+	// - WS_CHILD path: parent is unity_hwnd. The overlay is automatically
+	//   clipped, z-ordered, and destroyed with Unity. Standard.
+	// - WS_POPUP transparent path: NO owner (NULL). An owned popup follows
+	//   its owner's visibility — when we cloak Unity to hide its grey
+	//   backbuffer, an owned overlay would be cloaked too. Unowned makes
+	//   the overlay genuinely independent of Unity's compositing state.
+	HWND owner = transparent_mode ? NULL : unity_hwnd;
+
 	s_overlay_hwnd = CreateWindowExW(
-	    WS_EX_TRANSPARENT,
+	    ex_style,
 	    OVERLAY_CLASS_NAME,
 	    L"DisplayXR Overlay",
-	    WS_CHILD | WS_VISIBLE,
-	    0, 0, w, h,
-	    unity_hwnd,
+	    style,
+	    x, y, w, h,
+	    owner,
 	    NULL,
 	    GetModuleHandleW(NULL),
 	    NULL);
@@ -187,19 +290,18 @@ displayxr_get_app_main_view(void)
 		return NULL;
 	}
 
+	s_overlay_is_toplevel = transparent_mode;
+
 	s_original_wndproc = (WNDPROC)SetWindowLongPtrW(
 	    unity_hwnd, GWLP_WNDPROC, (LONG_PTR)parent_subclass_proc);
 
-	fprintf(stderr, "[DisplayXR] Created overlay HWND (%dx%d) on Unity window %p\n",
-	        w, h, (void *)unity_hwnd);
+	displayxr_log("[DisplayXR] Created overlay HWND (%dx%d at %d,%d) on Unity window %p — %s\n",
+	              w, h, x, y, (void *)unity_hwnd,
+	              transparent_mode ? "TOP-LEVEL WS_POPUP + NOREDIRECTIONBITMAP (transparent)" : "WS_CHILD (opaque)");
 
-	{
-		POINT client_origin = {0, 0};
-		ClientToScreen(unity_hwnd, &client_origin);
-		displayxr_set_viewport_size_native(
-			(uint32_t)w, (uint32_t)h,
-			(int32_t)client_origin.x, (int32_t)client_origin.y);
-	}
+	displayxr_set_viewport_size_native(
+		(uint32_t)w, (uint32_t)h,
+		(int32_t)client_origin.x, (int32_t)client_origin.y);
 
 	return (void *)s_overlay_hwnd;
 }
@@ -211,6 +313,170 @@ displayxr_get_unity_main_hwnd(void)
 	if (hwnd == NULL)
 		fprintf(stderr, "[DisplayXR] No Unity main window found (shell mode)\n");
 	return (void *)hwnd;
+}
+
+// ============================================================================
+// Transparent overlay mode (issue #57)
+//
+// Chroma-key transparent overlay for desktop avatar use cases. The Leia weaver
+// drops alpha and the D3D11 compositor uses DXGI_ALPHA_MODE_IGNORE, so true
+// per-pixel alpha doesn't survive end-to-end. Workaround: app renders a magic
+// color (default magenta) in transparent regions of both eye views; we flip
+// the parent HWND to WS_POPUP | WS_EX_LAYERED with LWA_COLORKEY so DWM punches
+// those pixels through to the desktop. Click-through outside a rectangular hit
+// region is handled by returning HTTRANSPARENT from WM_NCHITTEST.
+//
+// In standalone mode the DisplayXR runtime presents into a child overlay HWND
+// (created in displayxr_get_app_main_view) — not into Unity's top-level
+// window. DXGI flip-model swap chains in a child window are composed by DWM
+// independently, so a colorkey on the parent doesn't punch through the
+// child's pixels. We mirror WS_EX_LAYERED + LWA_COLORKEY onto the child too;
+// since Win 8, layered child windows are supported and DWM applies the
+// colorkey to the child's composed swapchain content directly.
+//
+// Mutually exclusive with shell mode (early-out below).
+// ============================================================================
+
+void
+displayxr_set_transparent_overlay(int enabled, uint32_t color_key, int topmost)
+{
+	displayxr_log("[DisplayXR] transparent_overlay: called enabled=%d key=0x%08X topmost=%d shell=%d\n",
+	              enabled, (unsigned)color_key, topmost, displayxr_is_shell_mode());
+
+	if (displayxr_is_shell_mode())
+		return;
+
+	HWND hwnd = find_unity_hwnd();
+	if (hwnd == NULL) {
+		displayxr_log("[DisplayXR] transparent_overlay: no Unity HWND\n");
+		return;
+	}
+
+	if (enabled && !s_overlay_active) {
+		s_saved_style   = (DWORD)GetWindowLongPtrW(hwnd, GWL_STYLE);
+		s_saved_exstyle = (DWORD)GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+
+		// Strip decorations on the parent: WS_POPUP gives us a borderless
+		// window. We do NOT add WS_EX_LAYERED — Unity's main HWND has its
+		// own opaque flip-model swapchain that bypasses LWA_COLORKEY anyway.
+		// Transparency comes from the OVERLAY HWND being top-level with
+		// WS_EX_NOREDIRECTIONBITMAP (created in displayxr_get_app_main_view
+		// when transparent_background_requested is set), so the overlay
+		// composites independently of Unity's swapchain.
+		SetWindowLongPtrW(hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+		DWORD ex = s_saved_exstyle & ~WS_EX_LAYERED;
+		if (topmost)
+			ex |= WS_EX_TOPMOST;
+		SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (LONG_PTR)ex);
+
+		SetWindowPos(hwnd, topmost ? HWND_TOPMOST : HWND_TOP, 0, 0, 0, 0,
+		             SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+
+		// Cloak Unity's main window via DWMWA_CLOAK — DWM stops compositing
+		// it (so we don't see Unity's grey/black backbuffer behind the
+		// transparent overlay), but the HWND keeps receiving input and
+		// Unity keeps rendering normally (eye textures still flow to the
+		// runtime via OpenXR). Cloaking is a pure DWM-side hide that
+		// preserves Application.isFocused, input events, and active state.
+		{
+			BOOL cloak = TRUE;
+			HRESULT hr = DwmSetWindowAttribute(hwnd, DWMWA_CLOAK,
+			                                   &cloak, sizeof(cloak));
+			displayxr_log("[DisplayXR] Cloaked Unity main window via DWMWA_CLOAK: hr=0x%08X\n",
+			              (unsigned)hr);
+		}
+
+		// color_key parameter is informational only — runtime owns the
+		// chroma key via the binding struct's chromaKeyColor field.
+		(void)color_key;
+
+		s_overlay_active = 1;
+		displayxr_log("[DisplayXR] transparent_overlay: enabled (topmost=%d, child=%p) — overlay is top-level + NOREDIRECTIONBITMAP; Unity parent cloaked; transparency owned by runtime DComp\n",
+		              topmost, (void *)s_overlay_hwnd);
+
+		// Diagnostic dump — exstyle + layered attrs on parent and overlay
+		// HWND. Note: in transparent mode the overlay is now top-level
+		// (s_overlay_is_toplevel=1), so it won't appear in the descendant
+		// walk below — it's an OWNED top-level, not a child.
+		{
+			HWND ov = s_overlay_hwnd;
+			DWORD pex = (DWORD)GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+			COLORREF k = 0; BYTE a = 0; DWORD f = 0;
+			BOOL ok = GetLayeredWindowAttributes(hwnd, &k, &a, &f);
+			RECT pcr; GetClientRect(hwnd, &pcr);
+			displayxr_log("[DisplayXR] dx parent=%p exstyle=0x%08X layered=%d key=0x%08X flags=0x%X client=%dx%d\n",
+			              (void *)hwnd, (unsigned)pex, ok ? 1 : 0,
+			              (unsigned)k, (unsigned)f,
+			              (int)(pcr.right - pcr.left), (int)(pcr.bottom - pcr.top));
+
+			if (ov != NULL && IsWindow(ov)) {
+				DWORD cex2 = (DWORD)GetWindowLongPtrW(ov, GWL_EXSTYLE);
+				DWORD cst  = (DWORD)GetWindowLongPtrW(ov, GWL_STYLE);
+				COLORREF ck = 0; BYTE ca = 0; DWORD cf = 0;
+				BOOL cok = GetLayeredWindowAttributes(ov, &ck, &ca, &cf);
+				RECT ocr; GetClientRect(ov, &ocr);
+				RECT owr; GetWindowRect(ov, &owr);
+				displayxr_log("[DisplayXR] dx overlay=%p style=0x%08X exstyle=0x%08X layered=%d key=0x%08X flags=0x%X client=%dx%d screen=(%d,%d %dx%d) toplevel=%d\n",
+				              (void *)ov, (unsigned)cst, (unsigned)cex2,
+				              cok ? 1 : 0, (unsigned)ck, (unsigned)cf,
+				              (int)(ocr.right - ocr.left), (int)(ocr.bottom - ocr.top),
+				              (int)owr.left, (int)owr.top,
+				              (int)(owr.right - owr.left), (int)(owr.bottom - owr.top),
+				              s_overlay_is_toplevel);
+			} else {
+				displayxr_log("[DisplayXR] dx overlay=NULL — no overlay HWND set; runtime may present elsewhere\n");
+			}
+
+			// Walk descendant windows of parent owned by our process — so we
+			// can see if the runtime made its own HWND beneath the overlay.
+			HWND walk = NULL;
+			DWORD our_pid = GetCurrentProcessId();
+			while ((walk = FindWindowExW(hwnd, walk, NULL, NULL)) != NULL) {
+				DWORD wpid = 0; GetWindowThreadProcessId(walk, &wpid);
+				if (wpid != our_pid) continue;
+				char cls[64] = {0};
+				GetClassNameA(walk, cls, 63);
+				DWORD wex = (DWORD)GetWindowLongPtrW(walk, GWL_EXSTYLE);
+				DWORD wst = (DWORD)GetWindowLongPtrW(walk, GWL_STYLE);
+				RECT wr; GetClientRect(walk, &wr);
+				displayxr_log("[DisplayXR] dx descendant=%p class=%s style=0x%08X exstyle=0x%08X size=%dx%d\n",
+				              (void *)walk, cls, (unsigned)wst, (unsigned)wex,
+				              (int)(wr.right - wr.left), (int)(wr.bottom - wr.top));
+			}
+		}
+	} else if (!enabled && s_overlay_active) {
+		// Uncloak Unity's main window before restoring styles, so the
+		// frame-changed repaint can run with a visible window.
+		{
+			BOOL cloak = FALSE;
+			DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &cloak, sizeof(cloak));
+		}
+		SetWindowLongPtrW(hwnd, GWL_STYLE, (LONG_PTR)s_saved_style);
+		SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (LONG_PTR)s_saved_exstyle);
+		SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+		             SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED);
+
+		// Drop WS_EX_LAYERED on the child too. We didn't save its prior
+		// exstyle separately because the child is created with a fixed style
+		// (WS_EX_TRANSPARENT) that we know.
+		if (s_overlay_hwnd != NULL && IsWindow(s_overlay_hwnd)) {
+			DWORD cex = (DWORD)GetWindowLongPtrW(s_overlay_hwnd, GWL_EXSTYLE);
+			SetWindowLongPtrW(s_overlay_hwnd, GWL_EXSTYLE,
+			                  (LONG_PTR)(cex & ~WS_EX_LAYERED));
+		}
+
+		s_overlay_active = 0;
+		displayxr_log("[DisplayXR] transparent_overlay: disabled\n");
+	}
+}
+
+void
+displayxr_set_overlay_hit_rect(int x, int y, int w, int h)
+{
+	s_hit_rect.left   = x;
+	s_hit_rect.top    = y;
+	s_hit_rect.right  = x + w;
+	s_hit_rect.bottom = y + h;
 }
 
 // ============================================================================

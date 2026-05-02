@@ -83,6 +83,33 @@ DISPLAYXR_EXPORT void displayxr_set_window_handle(void *handle);
 
 DISPLAYXR_EXPORT void displayxr_set_editor_mode(int enabled);
 
+/// (issue runtime-pvt #191 / displayxr-unity #57) Request the runtime's
+/// transparent-background mode for the next OpenXR session. Sets the
+/// transparentBackgroundEnabled field on XrWin32WindowBindingCreateInfoEXT
+/// (XR_EXT_win32_window_binding spec_version 4) when the next session is
+/// created, opting the bound HWND's swapchain into BitBlt (D3D11) or DComp
+/// (D3D12) presentation.
+///
+/// Must be called BEFORE xrCreateSession runs (typically from
+/// [RuntimeInitializeOnLoadMethod(SubsystemRegistration)] in C#).
+/// On older runtimes that don't implement spec_version 4, the field is at
+/// the end of the struct and is harmlessly ignored.
+DISPLAYXR_EXPORT void displayxr_set_transparent_background(int enabled);
+
+/// (issue runtime-pvt #191, spec v5) Set the chroma-key color for the
+/// runtime's post-weave alpha-conversion shader pass. The runtime samples
+/// the post-weave back buffer and writes alpha=0 for pixels whose RGB
+/// matches this key (alpha=1 otherwise) before Present, letting DComp/DWM
+/// blend per-pixel.
+///
+/// @param color  Win32 COLORREF (0x00BBGGRR). Set 0 to disable the pass.
+///               Plugin renders this same color as the camera clear in
+///               transparent regions; the runtime undoes it after weaving.
+///
+/// Same timing constraint as displayxr_set_transparent_background — call
+/// from C# at SubsystemRegistration before xrCreateSession.
+DISPLAYXR_EXPORT void displayxr_set_transparent_chroma_key(uint32_t color);
+
 /// Hint the typed-swapchain substitution about Unity's project color space.
 /// Must be called BEFORE Unity creates its OpenXR swapchains (i.e. from the
 /// OpenXR feature's OnInstanceCreate).
@@ -145,6 +172,25 @@ DISPLAYXR_EXPORT void displayxr_stop_polling(void);
 /// Destroy the editor preview window (if one exists).
 /// Call from C# before XR teardown to prevent the compositor from blocking.
 DISPLAYXR_EXPORT void displayxr_destroy_preview_window(void);
+
+#ifdef _WIN32
+/// (issue #57) Toggle chroma-key transparent overlay mode on the parent
+/// (Unity top-level) HWND. When enabled, the window is flipped to
+/// WS_POPUP | WS_EX_LAYERED with LWA_COLORKEY so DWM punches the chroma color
+/// through to the desktop. Mutually exclusive with shell mode.
+/// @param enabled   Non-zero to enable, zero to restore the original styles.
+/// @param color_key Windows COLORREF (0x00BBGGRR). Typical: 0x00FF00FF (magenta).
+/// @param topmost   Non-zero to add WS_EX_TOPMOST while enabled.
+DISPLAYXR_EXPORT void displayxr_set_transparent_overlay(int enabled,
+                                                        uint32_t color_key,
+                                                        int topmost);
+
+/// (issue #57) Update the rectangular hit-test region used while transparent
+/// overlay mode is enabled. Inside the rect, WM_NCHITTEST returns HTCLIENT;
+/// outside, HTTRANSPARENT (clicks fall through to whatever's behind).
+/// Coordinates are client-space pixels (top-left origin).
+DISPLAYXR_EXPORT void displayxr_set_overlay_hit_rect(int x, int y, int w, int h);
+#endif // _WIN32
 
 #ifdef __cplusplus
 }

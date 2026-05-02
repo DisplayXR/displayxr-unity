@@ -6,6 +6,8 @@
 
 #pragma once
 
+#include <stdint.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -31,6 +33,22 @@ int displayxr_is_shell_mode(void);
 /// @param unity_hwnd The Unity main HWND.
 /// @return 1 on success, 0 on failure.
 int displayxr_install_focus_hook(void *unity_hwnd);
+
+/// (issue #57) Toggle chroma-key transparent overlay mode on the parent
+/// (Unity top-level) HWND. When enabled, the window is flipped to
+/// WS_POPUP | WS_EX_LAYERED with LWA_COLORKEY so DWM punches the chroma color
+/// through to the desktop, and WM_NCHITTEST is gated by the rect set via
+/// displayxr_set_overlay_hit_rect(). Mutually exclusive with shell mode.
+/// @param enabled   Non-zero to enable, zero to restore the original styles.
+/// @param color_key Windows COLORREF (0x00BBGGRR). Typical: 0x00FF00FF (magenta).
+/// @param topmost   Non-zero to add WS_EX_TOPMOST while enabled.
+void displayxr_set_transparent_overlay(int enabled, uint32_t color_key, int topmost);
+
+/// (issue #57) Update the rectangular hit-test region used while transparent
+/// overlay mode is enabled. Inside the rect, WM_NCHITTEST returns HTCLIENT;
+/// outside, HTTRANSPARENT (clicks fall through to whatever's behind).
+/// Coordinates are client-space pixels (top-left origin).
+void displayxr_set_overlay_hit_rect(int x, int y, int w, int h);
 
 #ifdef __cplusplus
 }

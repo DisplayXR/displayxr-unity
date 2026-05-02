@@ -35,6 +35,11 @@
       "displayName": "Display Scene",
       "description": "Crate test scene matching the native reference app, with full stereo rig controls.",
       "path": "Samples~/DisplayScene"
+    },
+    {
+      "displayName": "Transparent Avatar (Windows)",
+      "description": "Chroma-key transparent overlay mode (issue #57) — capsule avatar floats above the desktop with click-through. Windows standalone only.",
+      "path": "Samples~/TransparentAvatar"
     }
   ]
 }

@@ -85,6 +85,28 @@ namespace DisplayXR
         internal static extern void displayxr_set_editor_mode(int enabled);
 
         /// <summary>
+        /// (runtime-pvt #191 / displayxr-unity #57) Request the runtime's
+        /// transparent-background mode for the next OpenXR session. Sets
+        /// transparentBackgroundEnabled on XrWin32WindowBindingCreateInfoEXT
+        /// (XR_EXT_win32_window_binding spec_version 4) so the runtime opts the
+        /// bound HWND's swapchain into BitBlt (D3D11) or DComp (D3D12)
+        /// presentation.
+        ///
+        /// Must be called BEFORE xrCreateSession runs — typically from
+        /// [RuntimeInitializeOnLoadMethod(SubsystemRegistration)].
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void displayxr_set_transparent_background(int enabled);
+
+        /// <summary>
+        /// (runtime-pvt #191 spec v5) Set the chroma-key color for the
+        /// runtime's post-weave alpha-conversion shader pass.
+        /// COLORREF (0x00BBGGRR). 0 = pass disabled.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void displayxr_set_transparent_chroma_key(uint color);
+
+        /// <summary>
         /// Hint the typed-swapchain substitution about the project color space.
         /// 1 = Linear (UNORM_SRGB siblings); 0 = Gamma (UNORM siblings).
         /// Must be called BEFORE Unity creates its OpenXR swapchains.
@@ -317,6 +339,39 @@ namespace DisplayXR
             [MarshalAs(UnmanagedType.LPArray)] float[] viewScaleX,
             [MarshalAs(UnmanagedType.LPArray)] float[] viewScaleY,
             [MarshalAs(UnmanagedType.LPArray)] int[] hardwareDisplay3D);
+
+        // ====================================================================
+        // Transparent overlay mode (issue #57) — Windows only
+        //
+        // Chroma-key transparent overlay for desktop avatar use cases. The
+        // Leia weaver drops alpha and the D3D11 compositor uses
+        // DXGI_ALPHA_MODE_IGNORE, so true per-pixel alpha doesn't survive
+        // end-to-end. Workaround: render a magic color (default magenta) in
+        // transparent regions of both eye views and let the layered window
+        // (LWA_COLORKEY) punch those pixels through to the desktop.
+        // ====================================================================
+
+#if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
+        /// <summary>
+        /// Toggle chroma-key transparent overlay mode on the parent (Unity
+        /// top-level) HWND. Mutually exclusive with shell mode.
+        /// </summary>
+        /// <param name="enabled">1 to enable, 0 to restore original styles.</param>
+        /// <param name="colorKey">Windows COLORREF (0x00BBGGRR). Typical: 0x00FF00FF (magenta).</param>
+        /// <param name="topmost">1 to add WS_EX_TOPMOST while enabled.</param>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void displayxr_set_transparent_overlay(
+            int enabled, uint colorKey, int topmost);
+
+        /// <summary>
+        /// Set the rectangular hit-test region for transparent overlay mode.
+        /// Inside the rect → HTCLIENT; outside → HTTRANSPARENT (click-through).
+        /// Coordinates are client-space pixels (top-left origin).
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void displayxr_set_overlay_hit_rect(
+            int x, int y, int w, int h);
+#endif
 
     }
 }

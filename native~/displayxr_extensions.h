@@ -72,7 +72,13 @@ typedef void (*PFN_xrReadbackCallback)(const uint8_t *pixels, uint32_t width, ui
 
 // --- XR_EXT_win32_window_binding ---
 #define XR_EXT_WIN32_WINDOW_BINDING_EXTENSION_NAME "XR_EXT_win32_window_binding"
-#define XR_EXT_WIN32_WINDOW_BINDING_SPEC_VERSION 2
+// SPEC_VERSION 5 adds chromaKeyColor — runtime-side post-weave chroma-key
+// conversion that writes alpha=0 for matching pixels before the DComp
+// (D3D12) or BitBlt (D3D11) present (runtime-pvt #191).
+// SPEC_VERSION 4 added transparentBackgroundEnabled.
+// SPEC_VERSION 3 added sharedTextureHandle. We embed v5; older runtimes
+// ignore trailing fields (struct grows at the end, ABI-safe both ways).
+#define XR_EXT_WIN32_WINDOW_BINDING_SPEC_VERSION 5
 
 #define XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT ((XrStructureType)1000999001)
 #define XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT ((XrStructureType)1000999002)
@@ -84,6 +90,8 @@ typedef struct XrWin32WindowBindingCreateInfoEXT {
     PFN_xrReadbackCallback readbackCallback;
     void *readbackUserdata;
     void *sharedTextureHandle; // D3D11 shared HANDLE
+    XrBool32 transparentBackgroundEnabled; // SPEC_VERSION 4: opt-in BitBlt/DComp swapchain
+    uint32_t chromaKeyColor; // SPEC_VERSION 5: Win32 COLORREF (0x00BBGGRR); 0 = no post-weave conversion
 } XrWin32WindowBindingCreateInfoEXT;
 
 typedef struct XrCompositionLayerWindowSpaceEXT {
