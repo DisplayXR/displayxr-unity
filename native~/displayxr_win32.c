@@ -55,6 +55,14 @@ static DWORD s_saved_exstyle  = 0;
 static int   s_overlay_active = 0;
 static RECT  s_hit_rect       = {0, 0, 0, 0};
 
+// Right-click drag state (issue #57 task 2). Cursor anchor is in screen
+// coords; window anchor is unity HWND's top-left at WM_RBUTTONDOWN time.
+// Frame deltas are computed against these so the window tracks the cursor
+// 1:1 even if Windows coalesces or drops mouse-move messages.
+static int   s_drag_active        = 0;
+static POINT s_drag_anchor_screen = {0, 0};
+static POINT s_drag_anchor_window = {0, 0};
+
 // ============================================================================
 // Shell mode detection
 // ============================================================================
@@ -132,11 +140,76 @@ static LRESULT CALLBACK
 overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
 	switch (msg) {
-	case WM_NCHITTEST:
+	case WM_NCHITTEST: {
+		// Per-pixel click-through: HTCLIENT inside the C#-supplied hit
+		// rect (cube silhouette), HTTRANSPARENT outside. The overlay
+		// sits at Unity's client origin, so overlay client coords ≡
+		// Unity client coords ≡ s_hit_rect's coord space.
+		POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+		ScreenToClient(hwnd, &pt);
+		if (pt.x >= s_hit_rect.left && pt.x < s_hit_rect.right &&
+		    pt.y >= s_hit_rect.top  && pt.y < s_hit_rect.bottom)
+			return HTCLIENT;
 		return HTTRANSPARENT;
-	default:
-		return DefWindowProcW(hwnd, msg, wParam, lParam);
 	}
+	case WM_MOUSEACTIVATE:
+		// Belt-and-braces with WS_EX_NOACTIVATE: refuse activation on
+		// click so foreground stays on Unity (cloaked but active).
+		return MA_NOACTIVATE;
+
+	// ----- right-button: drag the Unity window (issue #57 task 2) -----
+	case WM_RBUTTONDOWN: {
+		HWND unity = find_unity_hwnd();
+		if (unity != NULL) {
+			GetCursorPos(&s_drag_anchor_screen);
+			RECT wr;
+			GetWindowRect(unity, &wr);
+			s_drag_anchor_window.x = wr.left;
+			s_drag_anchor_window.y = wr.top;
+			s_drag_active = 1;
+			SetCapture(hwnd);
+		}
+		return 0;
+	}
+	case WM_RBUTTONUP:
+		if (s_drag_active) {
+			ReleaseCapture();
+			s_drag_active = 0;
+			return 0;
+		}
+		break;
+	case WM_CAPTURECHANGED:
+		s_drag_active = 0;
+		break;
+
+	// ----- left/middle-button + mouse-move: forward to Unity (task 1) -----
+	case WM_MOUSEMOVE:
+		if (s_drag_active) {
+			POINT cur;
+			GetCursorPos(&cur);
+			HWND unity = find_unity_hwnd();
+			if (unity != NULL) {
+				int nx = s_drag_anchor_window.x + (cur.x - s_drag_anchor_screen.x);
+				int ny = s_drag_anchor_window.y + (cur.y - s_drag_anchor_screen.y);
+				SetWindowPos(unity, NULL, nx, ny, 0, 0,
+				             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+			}
+			return 0;
+		}
+		// fall through to forward
+	case WM_LBUTTONDOWN: case WM_LBUTTONUP:
+	case WM_LBUTTONDBLCLK:
+	case WM_MBUTTONDOWN: case WM_MBUTTONUP: {
+		HWND unity = find_unity_hwnd();
+		if (unity != NULL)
+			PostMessageW(unity, msg, wParam, lParam);
+		return 0;
+	}
+
+	default:
+		break;
+	}
+	return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
 static LRESULT CALLBACK
@@ -258,8 +331,14 @@ displayxr_get_app_main_view(void)
 	DWORD style    = transparent_mode
 	    ? (DWORD)(WS_POPUP | WS_VISIBLE)
 	    : (DWORD)(WS_CHILD | WS_VISIBLE);
+	// Transparent path: NO WS_EX_TRANSPARENT — that bypasses WM_NCHITTEST so
+	// click-through becomes all-or-nothing. We instead gate per-pixel
+	// click-through via overlay_wnd_proc's WM_NCHITTEST + s_hit_rect.
+	// WS_EX_NOACTIVATE keeps activation/foreground on Unity's (cloaked) HWND
+	// when the user clicks the overlay — otherwise Application.isFocused
+	// flips false and Unity stops processing input.
 	DWORD ex_style = transparent_mode
-	    ? (DWORD)(WS_EX_TRANSPARENT | WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOPMOST | WS_EX_TOOLWINDOW)
+	    ? (DWORD)(WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)
 	    : (DWORD)(WS_EX_TRANSPARENT);
 	int x = transparent_mode ? client_origin.x : 0;
 	int y = transparent_mode ? client_origin.y : 0;

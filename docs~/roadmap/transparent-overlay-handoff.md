@@ -1,12 +1,22 @@
-# Transparent overlay (issue #57) — handoff after first end-to-end session
+# Transparent overlay (issue #57) — handoff after second session
 
 ## Status
 
 **Visual transparency: working end-to-end.** On Leia SR + Unity 6 + D3D12, a `displayxr-unity-test-transparent` build renders the rotating cube above the desktop with proper per-pixel alpha. No chroma fringe inside the cube body. Faint magenta fringe at silhouette / de-occluded edges (binary chroma-key limitation; only fixable with alpha-aware Leia weaver in `displayxr-runtime-pvt#190`).
 
-**What's broken / not yet built (next session):**
-1. **Click-through to Unity** — overlay has `WS_EX_TRANSPARENT`, Unity main HWND is cloaked via `DWMWA_CLOAK`. Clicks pass through both and land on whatever's behind on the desktop. `OnMouseDown` on the cube doesn't fire.
-2. **Right-click + drag the cube to move the window** — needs WM_RBUTTON handling on the overlay's wndproc, plus `SetWindowPos` (or post a synthesized WM_NCLBUTTONDOWN with HTCAPTION) on Unity's main HWND so the overlay can follow it via the existing WM_MOVE handler.
+**Right-click + drag the cube to move the window: working.** Confirmed on hardware in session 2. WM_RBUTTONDOWN on overlay anchors cursor + window position; WM_MOUSEMOVE while dragging calls SetWindowPos on Unity; existing parent_subclass_proc WM_MOVE handler repositions the overlay to follow.
+
+**Mirror-render perf hoist: working.** `XRSettings.gameViewRenderMode = GameViewRenderMode.None` now lives in `DisplayXRFeature.OnSessionCreate`, applied to every DisplayXR Unity app on every session.
+
+**Left-click handling: BROKEN, partial implementation in tree.** Session 2 dropped `WS_EX_TRANSPARENT` and added `WS_EX_NOACTIVATE` + WM_NCHITTEST hit-rect gating + WM_LBUTTONDOWN/UP/DBLCLK + WM_MBUTTONDOWN/UP forwarding via PostMessage to Unity. Two failure modes observed on hardware:
+
+1. **Outside the cube silhouette: clicks no longer fall through to the desktop.** Root cause: `HTTRANSPARENT` from WM_NCHITTEST only re-routes within the same thread (per MSDN), not across processes. To pass clicks to other apps you need `WS_EX_TRANSPARENT`, which we removed. Removing it was a regression for click-through.
+2. **Inside the cube silhouette: PostMessage'd WM_LBUTTONDOWN doesn't fire `OnMouseDown` on the cube.** Most likely cause: modern Unity reads mouse buttons from RawInput (WM_INPUT with raw button flags) rather than legacy WM_LBUTTONDOWN. PostMessage'd legacy messages get queued but Unity's input layer ignores them for button state. (Cursor position via GetCursorPos still works, which is why hover-based things would work, but button-down events don't.)
+
+**Next steps for session 3 (left-click):**
+- For (1) outside-silhouette pass-through: either re-add `WS_EX_TRANSPARENT` and find another way to capture inside-cube clicks (e.g. a small WS_CHILD without WS_EX_TRANSPARENT covering only the hit rect), OR keep WS_EX_TRANSPARENT off and manually forward outside-cube clicks via `WindowFromPoint(pt, CWP_SKIPINVISIBLE | CWP_SKIPTRANSPARENT)` + SendMessage to whatever's beneath. The first option is cleaner.
+- For (2) PostMessage not triggering OnMouseDown: try `SendInput(INPUT_MOUSE, ...)` to inject actual hardware mouse events. SendInput goes through the OS's input queue and is what Unity's RawInput layer expects. Caveat: SendInput hits the cursor position globally — needs careful sequencing (move cursor, click, restore?) and may have weird interactions with the user's actual cursor.
+- Worth testing: does `Application.runInBackground = true` + the existing PostMessage actually fire `OnMouseUp` even if not `OnMouseDown`? If asymmetric, that narrows down the diagnosis.
 
 ## How the transparency stack works (read this before changing anything)
 
@@ -107,6 +117,8 @@ Logs:
 
 ## Next session — concrete tasks
 
+> **Note:** Tasks 2 and 3 below were completed in session 2. Task 1 was partially implemented and exposed a deeper issue — see "Next steps for session 3 (left-click)" at the top of this doc for the current state. The sketch below is preserved because the architectural reasoning (HWND topology, hit-rect, drag math) is still correct; only the assumption that PostMessage'd left-clicks would trigger OnMouseDown turned out to be wrong.
+
 ### Task 1: Click-through to Unity (so cube `OnMouseDown` fires)
 
 The overlay currently has `WS_EX_TRANSPARENT` (every click passes through) and Unity is cloaked (so clicks that pass through don't land anywhere meaningful). Two design choices:
@@ -141,6 +153,11 @@ Hoist `XRSettings.gameViewRenderMode = GameViewRenderMode.None` from the test pr
 - `displayxr-unity#57` — open, will be closed when click-through and drag-by-cube land. Cross-referenced from runtime#191.
 - `docs~/roadmap/d3d11-typeless-fix-plan.md` — Unity D3D11 TYPELESS engine bug fix plan. Not strictly needed for transparent overlay (since Unity 6 defaults to D3D12) but would unblock the D3D11 BitBlt path for the rare D3D11-only Unity build.
 
-## Local commit (not pushed)
+## Local commits (not pushed)
 
-`8c9b912` on `main`. User hasn't pushed yet — can push when ready. Test project (`displayxr-unity-test-transparent`) is not under git; relevant files there are `Assets/TransparentAutoSetup.cs`, `Packages/manifest.json` (points at `file:../../unity-3d-display`), and the modified `ProjectSettings/ProjectSettings.asset` (D3D12 + Auto, currently the right setting).
+Three commits on `main`:
+- `8c9b912` — initial visual transparency (session 1)
+- `0893a01` — handoff doc (session 1)
+- session 2 commit (right-drag + gameViewRenderMode hoist + partial click-through scaffolding) — see HEAD
+
+User hasn't pushed yet — can push when ready. Test project (`displayxr-unity-test-transparent`) is not under git; relevant files there are `Assets/TransparentAutoSetup.cs`, `Assets/CubeClickLog.cs` (added session 2 for click-through verification), `Packages/manifest.json` (points at `file:../../unity-3d-display`), and the modified `ProjectSettings/ProjectSettings.asset` (D3D12 + Auto, currently the right setting).

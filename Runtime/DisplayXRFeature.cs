@@ -147,6 +147,18 @@ namespace DisplayXR
         {
             Debug.Log("[DisplayXR] OpenXR session created");
 
+            // Suppress Unity's per-frame mirror render to the Game View / main
+            // display. DisplayXR builds present through the runtime's overlay
+            // HWND (opaque or transparent), so the mirror is wasted work that
+            // re-renders Camera.main every frame for nothing visible. Standalone
+            // editor preview sessions don't go through this code path, so the
+            // separate DisplayXRGameViewOverlay path is unaffected.
+            if (UnityEngine.XR.XRSettings.gameViewRenderMode != UnityEngine.XR.GameViewRenderMode.None)
+            {
+                Debug.Log("[DisplayXR] Disabling Game View mirror render (gameViewRenderMode = None)");
+                UnityEngine.XR.XRSettings.gameViewRenderMode = UnityEngine.XR.GameViewRenderMode.None;
+            }
+
 #if UNITY_STANDALONE_WIN
             // Shell mode: ensure Unity continues processing input and rendering
             // even when the shell's compositor window has foreground focus.

@@ -115,6 +115,15 @@ namespace DisplayXR
             if (Application.isEditor)
                 return;
 
+            // Unity's input pump only drains the message queue while the
+            // process is in the foreground. The transparent overlay is a
+            // separate top-level HWND and steals the foreground if we don't
+            // set WS_EX_NOACTIVATE on it; even with that, plenty of edge
+            // cases (Alt-Tab, taskbar interaction, RDP) park Unity in the
+            // background. runInBackground keeps PostMessage'd clicks from
+            // the overlay's wndproc reaching OnMouseDown handlers.
+            Application.runInBackground = true;
+
             uint colorRef = ColorRefFromColor(chromaKeyColor);
             DisplayXRNative.displayxr_set_transparent_overlay(
                 1, colorRef, alwaysOnTop ? 1 : 0);
