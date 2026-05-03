@@ -50,6 +50,23 @@ void displayxr_set_transparent_overlay(int enabled, uint32_t color_key, int topm
 /// Coordinates are client-space pixels (top-left origin).
 void displayxr_set_overlay_hit_rect(int x, int y, int w, int h);
 
+/// (issue #57) Per-pixel hit-test override for transparent overlay mode.
+/// AND-ed with the rect check above in WM_NCHITTEST. C# updates this each
+/// frame from a Physics.Raycast at the current cursor — lets clicks fall
+/// through inside the AABB but outside the cube silhouette.
+void displayxr_set_overlay_hit_active(int active);
+
+/// (issue #57) Read the cursor position in overlay-client coords plus the
+/// current mouse-button state. Designed for transparent overlay mode where
+/// Unity's New Input System Mouse.current.position is frozen because the
+/// cloaked Unity HWND isn't OS-foreground (documented Unity limitation).
+/// Position comes from GetCursorPos + ScreenToClient on the overlay HWND;
+/// buttons come from the s_vkey_state table populated by raw-input + shell
+/// subclass. @param clientX Set to client-space X (-1 if no overlay).
+/// @param clientY Set to client-space Y (-1 if no overlay).
+/// @param buttons Bit 0 = left, 1 = right, 2 = middle.
+void displayxr_get_overlay_pointer(int *clientX, int *clientY, int *buttons);
+
 #ifdef __cplusplus
 }
 #endif

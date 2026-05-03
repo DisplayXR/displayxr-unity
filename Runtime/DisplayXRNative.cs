@@ -371,6 +371,28 @@ namespace DisplayXR
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern void displayxr_set_overlay_hit_rect(
             int x, int y, int w, int h);
+
+        /// <summary>
+        /// Per-pixel hit-test override for transparent overlay mode. AND-ed
+        /// with the rect check in WM_NCHITTEST. Set to 1 when the cursor is
+        /// over the cube silhouette (e.g. via Physics.Raycast) and 0 when
+        /// in a transparent zone — lets clicks fall through to the desktop
+        /// even inside the cube's bounding rect.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void displayxr_set_overlay_hit_active(int active);
+
+        /// <summary>
+        /// Read cursor position (overlay-client coords, top-left origin) and
+        /// mouse button state. Designed for transparent overlay mode where
+        /// Unity's New Input System Mouse.current.position is frozen because
+        /// the cloaked Unity HWND isn't OS-foreground (documented Unity
+        /// limitation). Returns (-1, -1) for clientX/Y if no overlay HWND.
+        /// Buttons: bit 0 = left, 1 = right, 2 = middle.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void displayxr_get_overlay_pointer(
+            out int clientX, out int clientY, out int buttons);
 #endif
 
     }

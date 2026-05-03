@@ -163,7 +163,14 @@ The standalone preview window on Windows has two mutually-exclusive behaviors du
 
 We tried calling `xrSetSharedTextureOutputRectEXT` from `WM_MOVE` to push canvas updates to the runtime — this is required for the weaver to interlace at all in windowed mode (without it, weaving only works in fullscreen) — but it doesn't trigger phase-snapping. The SR SDK only phase-snaps when it owns the modal drag loop.
 
-A proper fix likely needs runtime API support: an "external drag" mode where the app proposes a position (e.g. via `xrSetSharedTextureOutputRectEXT` extended) and the runtime returns the snapped position. Until then, the WndProc in `displayxr_standalone.cpp` keeps SC_MOVE handling commented out / parked. See the long comment in `sa_wndproc`'s `WM_SYSCOMMAND` case for context.
+A proper fix likely needs runtime API support: an "external drag" mode where the app proposes a position (e.g. via `xrSetSharedTextureOutputRectEXT` extended) and the runtime returns the snapped position. Tracked in `DisplayXR/displayxr-runtime-pvt#193`. Until then, the WndProc in `displayxr_standalone.cpp` keeps SC_MOVE handling commented out / parked. See the long comment in `sa_wndproc`'s `WM_SYSCOMMAND` case for context.
+
+**Transparent overlay (#57) right-drag — same SR phase-snap blocker as the standalone preview, no workaround possible from the plugin side.** Regular opaque DisplayXR built apps don't stutter when dragged because Unity has a real title bar — drag the title, `DefWindowProc` enters the OS modal drag loop, the SR weaver phase-snaps inside that loop. In transparent overlay mode Unity is `WS_POPUP` + cloaked with no title bar, so the user drags via right-click on the cube body. Two attempts to inherit opaque-mode behavior both failed:
+
+1. `SendMessage(unity_hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0)` from the overlay's `WM_RBUTTONDOWN` — silently ignored by `DefWindowProc` on cloaked `WS_POPUP` Unity. No `WM_ENTERSIZEMOVE`, no drag.
+2. `SendMessage(overlay, WM_SYSCOMMAND, SC_MOVE | HTCAPTION, 0)` — also silently ignored. The overlay has `WS_EX_NOREDIRECTIONBITMAP` (mandatory for per-pixel transparency) + `WS_EX_NOACTIVATE`, and `DefWindowProc`'s modal drag needs a DWM redirection surface to render the drag preview, so it bails. Adding `WS_CAPTION` to the overlay would change the client-area math and break the C#-supplied hit-rect coordinates.
+
+Current implementation is back to capture-based custom drag (`SetCapture` + manual `SetWindowPos(unity)` per `WM_MOUSEMOVE`) in `overlay_wnd_proc`. Cube/Kooima keep animating during drag, but no SR weaver phase-snap → 3D stutter visible during motion. Same fundamental blocker as the standalone preview — the SR SDK only phase-snaps when it owns the modal drag loop, and we can't induce one on a window with our style requirements. Resolution tracked in `DisplayXR/displayxr-runtime-pvt#193` (external drag API).
 
 ### Code Style
 

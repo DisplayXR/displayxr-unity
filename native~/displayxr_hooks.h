@@ -190,6 +190,21 @@ DISPLAYXR_EXPORT void displayxr_set_transparent_overlay(int enabled,
 /// outside, HTTRANSPARENT (clicks fall through to whatever's behind).
 /// Coordinates are client-space pixels (top-left origin).
 DISPLAYXR_EXPORT void displayxr_set_overlay_hit_rect(int x, int y, int w, int h);
+
+/// (issue #57) Per-pixel hit-test override for transparent overlay mode.
+/// AND-ed with the rect check above in WM_NCHITTEST. Set from C# each frame
+/// based on a Physics.Raycast at the polled cursor — lets clicks fall
+/// through inside the AABB but outside the cube silhouette.
+DISPLAYXR_EXPORT void displayxr_set_overlay_hit_active(int active);
+
+/// (issue #57) Read cursor position (overlay-client coords, top-left origin)
+/// + mouse button state. Designed for transparent overlay mode where Unity's
+/// New Input System Mouse.current.position is frozen because the cloaked
+/// Unity HWND isn't OS-foreground (documented Unity limitation). Returns
+/// (-1, -1) for clientX/Y if no overlay HWND. Buttons: bit 0 = left, 1 =
+/// right, 2 = middle.
+DISPLAYXR_EXPORT void displayxr_get_overlay_pointer(int *clientX, int *clientY,
+                                                    int *buttons);
 #endif // _WIN32
 
 #ifdef __cplusplus

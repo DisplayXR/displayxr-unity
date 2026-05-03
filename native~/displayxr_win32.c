@@ -55,6 +55,19 @@ static DWORD s_saved_exstyle  = 0;
 static int   s_overlay_active = 0;
 static RECT  s_hit_rect       = {0, 0, 0, 0};
 
+// Per-pixel hit-test override. When set to 1, WM_NCHITTEST returns HTCLIENT
+// inside the cursor's current frame regardless of s_hit_rect. C# updates this
+// each frame from a Physics.Raycast at the current cursor position so the hit
+// region matches the actual cube silhouette (not just the AABB), and clicks
+// in transparent zones around the cube fall through to the desktop.
+// Default 1 preserves the rect-only behavior when no clickableRenderers are
+// configured.
+static int   s_hit_active     = 1;
+
+// Forward declaration — defined further down in the shell-mode section.
+// displayxr_get_overlay_pointer (above the shell-mode block) reads it.
+static volatile SHORT s_vkey_state[256];
+
 // Right-click drag state (issue #57 task 2). Cursor anchor is in screen
 // coords; window anchor is unity HWND's top-left at WM_RBUTTONDOWN time.
 // Frame deltas are computed against these so the window tracks the cursor
@@ -142,12 +155,13 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 	switch (msg) {
 	case WM_NCHITTEST: {
 		// Per-pixel click-through: HTCLIENT inside the C#-supplied hit
-		// rect (cube silhouette), HTTRANSPARENT outside. The overlay
-		// sits at Unity's client origin, so overlay client coords ≡
-		// Unity client coords ≡ s_hit_rect's coord space.
+		// rect (cube AABB, coarse) AND s_hit_active is set (fine, from
+		// per-frame Physics.Raycast at the cursor in C#). Both gates
+		// must pass.
 		POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
 		ScreenToClient(hwnd, &pt);
-		if (pt.x >= s_hit_rect.left && pt.x < s_hit_rect.right &&
+		if (s_hit_active &&
+		    pt.x >= s_hit_rect.left && pt.x < s_hit_rect.right &&
 		    pt.y >= s_hit_rect.top  && pt.y < s_hit_rect.bottom)
 			return HTCLIENT;
 		return HTTRANSPARENT;
@@ -157,7 +171,25 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		// click so foreground stays on Unity (cloaked but active).
 		return MA_NOACTIVATE;
 
-	// ----- right-button: drag the Unity window (issue #57 task 2) -----
+	// ----- right-button: capture-based drag of the Unity window (task 2) -----
+	//
+	// We've tried twice to inherit opaque-mode-grade no-stutter drag UX via
+	// the OS modal drag loop:
+	//   1. SendMessage(unity, WM_NCLBUTTONDOWN, HTCAPTION, 0) — silently
+	//      ignored. Cloaked Unity HWND or its WS_POPUP-no-WS_CAPTION style
+	//      blocks DefWindowProc from starting the drag.
+	//   2. SendMessage(overlay, WM_SYSCOMMAND, SC_MOVE | HTCAPTION, 0) —
+	//      also silently ignored. Suspect WS_EX_NOREDIRECTIONBITMAP +
+	//      WS_EX_NOACTIVATE on the overlay are incompatible with
+	//      DefWindowProc's modal drag (no DWM redirection surface for the
+	//      drag preview). NOREDIRECTIONBITMAP can't be dropped — it's what
+	//      gives us per-pixel transparency.
+	//
+	// So the SR SDK weaver phase-snap stays unreachable from this side.
+	// The capture-based drag below trades 3D stutter (no phase-snap) for
+	// real-time Kooima updates (cube keeps animating during drag). Proper
+	// fix needs the runtime "external drag" API outlined in CLAUDE.md
+	// "Known Issues" — same blocker as the standalone preview window.
 	case WM_RBUTTONDOWN: {
 		HWND unity = find_unity_hwnd();
 		if (unity != NULL) {
@@ -250,7 +282,7 @@ parent_subclass_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 	if (msg == WM_MOVE) {
 		POINT client_origin = {0, 0};
 		ClientToScreen(hwnd, &client_origin);
-		// Top-level overlay needs to follow the parent's screen position.
+		// Top-level overlay follows Unity's screen position.
 		if (s_overlay_is_toplevel
 		    && s_overlay_hwnd != NULL && IsWindow(s_overlay_hwnd)) {
 			SetWindowPos(s_overlay_hwnd, HWND_TOPMOST,
@@ -442,6 +474,14 @@ displayxr_set_transparent_overlay(int enabled, uint32_t color_key, int topmost)
 		// WS_EX_NOREDIRECTIONBITMAP (created in displayxr_get_app_main_view
 		// when transparent_background_requested is set), so the overlay
 		// composites independently of Unity's swapchain.
+		//
+		// We tried adding WS_EX_TRANSPARENT here for desktop click-through
+		// (clicks falling through both overlay AND Unity to the actual
+		// app behind), but it broke RawInput delivery to Unity — Unity
+		// stopped seeing button events from PostMessage'd clicks too. Per
+		// the log, btn=0x00 stayed throughout test even though clicks were
+		// happening. Cross-process click-through stays unsolved for now;
+		// transparent zone clicks still die on the cloaked Unity HWND.
 		SetWindowLongPtrW(hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
 		DWORD ex = s_saved_exstyle & ~WS_EX_LAYERED;
 		if (topmost)
@@ -455,8 +495,9 @@ displayxr_set_transparent_overlay(int enabled, uint32_t color_key, int topmost)
 		// it (so we don't see Unity's grey/black backbuffer behind the
 		// transparent overlay), but the HWND keeps receiving input and
 		// Unity keeps rendering normally (eye textures still flow to the
-		// runtime via OpenXR). Cloaking is a pure DWM-side hide that
-		// preserves Application.isFocused, input events, and active state.
+		// runtime via OpenXR). Cloaking is a pure DWM-side hide; it does
+		// NOT preserve OS-foreground status though, which is why we need
+		// the focus hook below.
 		{
 			BOOL cloak = TRUE;
 			HRESULT hr = DwmSetWindowAttribute(hwnd, DWMWA_CLOAK,
@@ -464,6 +505,20 @@ displayxr_set_transparent_overlay(int enabled, uint32_t color_key, int topmost)
 			displayxr_log("[DisplayXR] Cloaked Unity main window via DWMWA_CLOAK: hr=0x%08X\n",
 			              (unsigned)hr);
 		}
+
+		// Install the same focus / raw-input hooks shell mode uses. Cloaked
+		// Unity doesn't naturally receive raw input (RAWINPUT defaults to
+		// foreground HWND only), so Mouse.current.position freezes and
+		// button events don't fire. The focus hook adds RIDEV_INPUTSINK to
+		// raw input devices, IAT-hooks GetForegroundWindow / GetFocus to
+		// return Unity's HWND, and subclasses Unity's wndproc to suppress
+		// deactivation messages — all of which let Unity's input system
+		// behave as if Unity were the foreground window. Confirmed via
+		// Player.log showing Mouse.current.position frozen across an
+		// entire session before this hook was added on the transparent
+		// path. Idempotent — safe to call here even though the hook is
+		// also installed in the shell-mode branch of xrCreateSession.
+		displayxr_install_focus_hook(hwnd);
 
 		// color_key parameter is informational only — runtime owns the
 		// chroma key via the binding struct's chromaKeyColor field.
@@ -556,6 +611,56 @@ displayxr_set_overlay_hit_rect(int x, int y, int w, int h)
 	s_hit_rect.top    = y;
 	s_hit_rect.right  = x + w;
 	s_hit_rect.bottom = y + h;
+}
+
+void
+displayxr_set_overlay_hit_active(int active)
+{
+	int new_active = active ? 1 : 0;
+	if (new_active == s_hit_active)
+		return;
+	s_hit_active = new_active;
+
+	// Toggle WS_EX_TRANSPARENT on the overlay HWND to match. With the flag
+	// cleared (cursor off cube) the OS routes clicks past the overlay to
+	// the next window in DWM z-order, which gives us click-through to apps
+	// behind the cube area. (Note: clicks still die on the cloaked Unity
+	// HWND beneath us in the current build — true cross-process click-
+	// through is still unsolved; tracked for the next iteration.)
+	if (s_overlay_is_toplevel && s_overlay_hwnd != NULL && IsWindow(s_overlay_hwnd)) {
+		LONG_PTR ex = GetWindowLongPtrW(s_overlay_hwnd, GWL_EXSTYLE);
+		LONG_PTR new_ex = s_hit_active
+		    ? (ex & ~WS_EX_TRANSPARENT)   // overlay catches clicks
+		    : (ex |  WS_EX_TRANSPARENT);  // OS routes around overlay
+		if (new_ex != ex)
+			SetWindowLongPtrW(s_overlay_hwnd, GWL_EXSTYLE, new_ex);
+	}
+}
+
+void
+displayxr_get_overlay_pointer(int *clientX, int *clientY, int *buttons)
+{
+	if (clientX != NULL) *clientX = -1;
+	if (clientY != NULL) *clientY = -1;
+
+	POINT pt;
+	if (GetCursorPos(&pt) && s_overlay_hwnd != NULL && IsWindow(s_overlay_hwnd)) {
+		ScreenToClient(s_overlay_hwnd, &pt);
+		if (clientX != NULL) *clientX = pt.x;
+		if (clientY != NULL) *clientY = pt.y;
+	}
+
+	if (buttons != NULL) {
+		// s_vkey_state is updated by shell_subclass_proc on Unity's HWND
+		// (installed via displayxr_install_focus_hook from the transparent
+		// path). PostMessage'd left/right/middle clicks from overlay_wnd_proc
+		// flow through Unity's wndproc → subclass → here.
+		int b = 0;
+		if (s_vkey_state[VK_LBUTTON] & 0x8000) b |= 1;
+		if (s_vkey_state[VK_RBUTTON] & 0x8000) b |= 2;
+		if (s_vkey_state[VK_MBUTTON] & 0x8000) b |= 4;
+		*buttons = b;
+	}
 }
 
 // ============================================================================
@@ -773,6 +878,17 @@ displayxr_install_focus_hook(void *unity_hwnd)
 {
 	if (unity_hwnd == NULL)
 		return 0;
+
+	// Idempotent — second call would re-subclass the wndproc and recurse
+	// infinitely (s_shell_original_wndproc would point at our own subclass
+	// proc). Both shell mode and transparent overlay (#57) install this for
+	// the same reason: Unity needs to receive input while not OS-foreground.
+	static int s_focus_hook_installed = 0;
+	if (s_focus_hook_installed) {
+		s_shell_unity_hwnd = (HWND)unity_hwnd;
+		return 1;
+	}
+	s_focus_hook_installed = 1;
 
 	s_shell_unity_hwnd = (HWND)unity_hwnd;
 
