@@ -1,5 +1,8 @@
 # DisplayXR — Unity Plugin
 
+[![Build Native Plugin](https://github.com/DisplayXR/displayxr-unity/actions/workflows/build-native.yml/badge.svg)](https://github.com/DisplayXR/displayxr-unity/actions/workflows/build-native.yml)
+[![License: BSL-1.0](https://img.shields.io/badge/License-BSL--1.0-blue.svg)](LICENSE)
+
 Unity plugin for rendering on eye-tracked 3D light field displays via the DisplayXR OpenXR runtime. Works with any OpenXR-compatible 3D display.
 
 ## Table of Contents
