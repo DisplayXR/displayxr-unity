@@ -28,9 +28,16 @@ namespace DisplayXR
     /// — see CLAUDE.md "Known Issues"). Use the <see cref="onPointerEnter"/>,
     /// <see cref="onPointerExit"/>, <see cref="onPointerDown"/>,
     /// <see cref="onPointerUp"/>, <see cref="onPointerClick"/> UnityEvents
-    /// instead. They're driven by a per-frame Physics.Raycast at the polled
-    /// cursor position (Win32 GetCursorPos, always works) against
-    /// <see cref="clickableRenderers"/>' colliders.
+    /// instead. They're driven by per-pixel Physics.Raycast against the
+    /// renderers' colliders, where the ray is built from the polled cursor
+    /// (Win32 GetCursorPos) by inverse-projecting through a cyclopean
+    /// (midpoint-eye) Kooima view+projection — built by averaging the
+    /// runtime's left and right eye matrices. The cyclopean ray lands on
+    /// the cube where the user perceives it after stereo fusion of the two
+    /// rendered eye images. Camera.ScreenPointToRay can't be used because
+    /// Camera.projectionMatrix is the symmetric pre-Kooima projection —
+    /// rays from it miss the collider where the cube actually appears on
+    /// screen.
     ///
     /// Windows only. No-op in the editor preview window and on macOS.
     /// </summary>
@@ -55,9 +62,10 @@ namespace DisplayXR
 
         [Header("Hit testing")]
 
-        [Tooltip("Renderers (with colliders) that drive the pointer events. " +
-                 "A per-frame Physics.Raycast at the cursor decides which one " +
-                 "is under the pointer; clicks anywhere off the silhouettes " +
+        [Tooltip("Renderers (must have colliders) that drive the pointer events. " +
+                 "Per-frame Physics.Raycast — using a Kooima-aware ray inverse-" +
+                 "projected from the cursor through both eye matrices — decides " +
+                 "which one is under the pointer. Clicks off the silhouettes " +
                  "fall through to the desktop. Empty = whole window blocks.")]
         public Renderer[] clickableRenderers;
 
@@ -76,6 +84,7 @@ namespace DisplayXR
         public PointerEvent onPointerClick = new PointerEvent();
 
         private Camera m_Camera;
+        private DisplayXRFeature m_Feature;
         private CameraClearFlags m_SavedClearFlags;
         private Color m_SavedBackgroundColor;
         private bool m_SavedRestore;
@@ -152,6 +161,7 @@ namespace DisplayXR
             m_Camera = GetComponent<Camera>();
             if (m_Camera == null)
                 return;
+            m_Feature = DisplayXRFeature.Instance;
 
             // Always switch the camera to solid-color clear so transparent
             // regions get the chroma key — even in the editor preview, where
@@ -191,16 +201,13 @@ namespace DisplayXR
                 return;
             if (clickableRenderers == null || clickableRenderers.Length == 0)
                 return;
-            // No active-rig gate — gating to active killed clicks because
-            // the active rig's mono ScreenPointToRay against the asymmetric
-            // Kooima frustum doesn't reliably hit the cube collider where
-            // the user perceives it (binocular stereo render places the
-            // cube slightly off the mono projection's hit area). Both rigs
-            // run; whichever one's raycast lands wins last-writer-wins,
-            // which is reliable enough to catch clicks. Trade-off: in
-            // multi-rig scenes the inactive rig's projection of the cube
-            // creates a phantom hit zone (e.g. top-right of the window).
-            // Cleanest fix is single-rig scenes for the avatar use case.
+            // No active-rig gate: every rig's hit-test reads the same Kooima
+            // matrices from shared state (single source of truth populated by
+            // the runtime each frame), so all rigs compute the same screen
+            // rect and call set_overlay_hit_active with the same value.
+            // No phantom-zone risk like the pre-Kooima Camera.ScreenPointToRay
+            // path had. UnityEvent dispatch may double-fire across rigs in
+            // multi-rig scenes; if that's a problem the caller can dedupe.
 
             // Poll cursor + buttons via native (GetCursorPos + ScreenToClient
             // on the overlay HWND, plus s_vkey_state populated by raw input).
@@ -209,34 +216,41 @@ namespace DisplayXR
             DisplayXRNative.displayxr_get_overlay_pointer(
                 out int clientX, out int clientY, out int buttons);
 
+            // Per-pixel hit test: build a CYCLOPEAN world-space ray from the
+            // cursor pixel through the midpoint-eye Kooima projection, then
+            // Physics.Raycast against the actual cube collider.
+            //
+            // Why cyclopean and not per-eye: the left and right eyes project
+            // the cube to different screen positions (binocular disparity).
+            // A user clicking the visible cube body clicks at its
+            // STEREO-FUSED position, which is roughly the midpoint between
+            // the two eye images. Per-eye rays land at one eye's projection
+            // — offset from the fused position by ~half-disparity in the
+            // direction of the parallax. Tried OR-of-both-eye-rays first;
+            // it produced a hit region shifted off the cube in whichever
+            // direction the parallax dictates. The cyclopean ray (built from
+            // averaged view + projection matrices, equivalent to the Kooima
+            // projection from the midpoint eye position) lands on the cube
+            // where the user sees it.
+            //
+            // Camera.ScreenPointToRay can't be used because Camera.projectionMatrix
+            // is the symmetric pre-Kooima projection — rays from it miss the
+            // collider where the user perceives the cube on screen.
             Renderer hitRenderer = null;
-            if (clientX >= 0 && clientY >= 0)
+            if (clientX >= 0 && clientY >= 0
+                && TryGetStereoMatrices(out Matrix4x4 leftView, out Matrix4x4 leftProj,
+                                         out Matrix4x4 rightView, out Matrix4x4 rightProj))
             {
-                // Cursor in overlay-client coords (= Unity-client coords),
-                // top-left origin, in window pixels (e.g. 0..Screen.width).
-                // Camera.ScreenPointToRay expects camera-pixel coords with
-                // bottom-left origin, in [0..Camera.pixelWidth] etc. The
-                // camera's pixel range is the OpenXR eye render target size,
-                // which is smaller than Screen on HiDPI (e.g. 1920×1080 on a
-                // 4K display at 250% DPI where Screen reports 2498×2248). So:
-                //   1. Y-flip from top-left to bottom-left.
-                //   2. Scale by camPixel/Screen.
-                float camW = Mathf.Max(1, m_Camera.pixelWidth);
-                float camH = Mathf.Max(1, m_Camera.pixelHeight);
-                float sw   = Mathf.Max(1, Screen.width);
-                float sh   = Mathf.Max(1, Screen.height);
-                Vector3 camPos = new Vector3(
-                    clientX           * camW / sw,
-                    (sh - clientY)    * camH / sh,
-                    0f);
-                Ray ray = m_Camera.ScreenPointToRay(camPos);
-                if (Physics.Raycast(ray, out RaycastHit info, m_Camera.farClipPlane))
+                BuildCyclopean(leftView, leftProj, rightView, rightProj,
+                                out Matrix4x4 cycView, out Matrix4x4 cycProj);
+                if (TryBuildEyeRay(clientX, clientY, cycView, cycProj, out Ray ray)
+                    && Physics.Raycast(ray, out RaycastHit info, m_Camera.farClipPlane)
+                    && info.collider != null)
                 {
                     for (int i = 0; i < clickableRenderers.Length; i++)
                     {
                         var r = clickableRenderers[i];
-                        if (r != null && info.collider != null &&
-                            info.collider.transform.IsChildOf(r.transform))
+                        if (r != null && info.collider.transform.IsChildOf(r.transform))
                         {
                             hitRenderer = r;
                             break;
@@ -371,13 +385,23 @@ namespace DisplayXR
             if (clickableRenderers == null || clickableRenderers.Length == 0)
                 return;
 
-            // No active-rig gate — same reason as in Update.
-
             // Coarse hit rect (cube AABB in window pixels) — used by
             // WM_NCHITTEST as a fast reject before the per-pixel hit_active
-            // check from Update kicks in.
-            if (TryGetScreenRect(out int x, out int y, out int w, out int h))
-                DisplayXRNative.displayxr_set_overlay_hit_rect(x, y, w, h);
+            // check from Update kicks in. Projects via the runtime's
+            // cyclopean Kooima matrices (same ones Update uses for the ray)
+            // so the rect lines up with the cube where the user perceives
+            // it after stereo fusion.
+            if (TryGetStereoMatrices(out Matrix4x4 leftView, out Matrix4x4 leftProj,
+                                     out Matrix4x4 rightView, out Matrix4x4 rightProj))
+            {
+                BuildCyclopean(leftView, leftProj, rightView, rightProj,
+                                out Matrix4x4 cycView, out Matrix4x4 cycProj);
+                if (TryGetUnionScreenRect(cycView, cycProj,
+                                           out int x, out int y, out int w, out int h))
+                {
+                    DisplayXRNative.displayxr_set_overlay_hit_rect(x, y, w, h);
+                }
+            }
 #endif
         }
 
@@ -417,79 +441,198 @@ namespace DisplayXR
             return (b << 16) | (g << 8) | r;
         }
 
-        // Project the union of clickableRenderers' world-space bounds into
-        // top-left-origin screen-space pixels. Returns false when fully
-        // off-screen.
+        // Lazy-fetch the feature singleton — DisplayXRFeature.Instance may be
+        // null at OnEnable time if our OnEnable runs before the OpenXR loader
+        // initialises the feature.
+        private bool TryGetStereoMatrices(out Matrix4x4 leftView, out Matrix4x4 leftProj,
+                                           out Matrix4x4 rightView, out Matrix4x4 rightProj)
+        {
+            leftView = leftProj = rightView = rightProj = Matrix4x4.identity;
+            if (m_Feature == null)
+                m_Feature = DisplayXRFeature.Instance;
+            if (m_Feature == null)
+                return false;
+            return m_Feature.GetStereoMatrices(out leftView, out leftProj,
+                                                out rightView, out rightProj);
+        }
+
+        // Unproject a window-pixel cursor through one eye's view + projection
+        // into a Unity-world-space Ray. Inverse path of ProjectThroughEye:
+        // window px → NDC → inverse projection (eye-space, OpenXR convention)
+        // → inverse view (Unity world). Origin = ray's near-plane point;
+        // direction = far-near. Returns false if the projection is degenerate.
+        private static bool TryBuildEyeRay(int clientX, int clientY,
+                                            Matrix4x4 viewOpenXR, Matrix4x4 projOpenXR,
+                                            out Ray ray)
+        {
+            ray = new Ray(Vector3.zero, Vector3.forward);
+            float sw = Mathf.Max(1, Screen.width);
+            float sh = Mathf.Max(1, Screen.height);
+            // Window pixel (top-left origin) → NDC ([-1,1] with +Y up)
+            float ndcX = 2f * clientX / sw - 1f;
+            float ndcY = 1f - 2f * clientY / sh;
+
+            Matrix4x4 projInv = projOpenXR.inverse;
+            Vector4 nearClip = new Vector4(ndcX, ndcY, -1f, 1f);
+            Vector4 farClip  = new Vector4(ndcX, ndcY,  1f, 1f);
+            Vector4 nearEye = projInv * nearClip;
+            Vector4 farEye  = projInv * farClip;
+            if (Mathf.Abs(nearEye.w) < 1e-6f || Mathf.Abs(farEye.w) < 1e-6f)
+                return false;
+            Vector3 nearEye3 = new Vector3(nearEye.x / nearEye.w,
+                                            nearEye.y / nearEye.w,
+                                            nearEye.z / nearEye.w);
+            Vector3 farEye3 = new Vector3(farEye.x / farEye.w,
+                                           farEye.y / farEye.w,
+                                           farEye.z / farEye.w);
+
+            // viewUnity = FlipViewZ(viewOpenXR) maps Unity-world → OpenXR-eye-space.
+            // Its inverse maps OpenXR-eye-space back to Unity-world.
+            Matrix4x4 viewUnity = viewOpenXR;
+            viewUnity.m02 = -viewUnity.m02;
+            viewUnity.m12 = -viewUnity.m12;
+            viewUnity.m22 = -viewUnity.m22;
+            viewUnity.m32 = -viewUnity.m32;
+            Matrix4x4 viewInv = viewUnity.inverse;
+            Vector3 nearWorld = viewInv.MultiplyPoint(nearEye3);
+            Vector3 farWorld  = viewInv.MultiplyPoint(farEye3);
+            Vector3 dir = (farWorld - nearWorld);
+            float len = dir.magnitude;
+            if (len < 1e-4f)
+                return false;
+            ray = new Ray(nearWorld, dir / len);
+            return true;
+        }
+
+        // Project a single world-space point through one eye's view + projection
+        // into top-left-origin window pixels. Returns false if the point is
+        // behind the eye or outside the depth clip range.
         //
-        // Critical detail: Camera.WorldToScreenPoint returns coordinates in
-        // the camera's pixelRect range (Camera.pixelWidth × Camera.pixelHeight),
-        // which on OpenXR DisplayXR builds is the eye render-target size
-        // (e.g. 1920×1080) — NOT Screen.width × Screen.height (e.g. 2498×2248
-        // on a 4K display at 250% DPI). We must rescale to actual window
-        // pixels before Y-flipping for Win32, otherwise the hit-rect lands in
-        // only a fraction of the actual window — historically causing the
-        // "right-drag only works in the bottom half of the window" symptom.
-        private bool TryGetScreenRect(out int x, out int y, out int w, out int h)
+        // The view matrix from the runtime is OpenXR convention (right-hand,
+        // -Z forward); Unity world is +Z forward. FlipViewZ negates the
+        // matrix's Z column, which is equivalent to negating the world Z
+        // input — so the result equals applying the unflipped matrix to
+        // (x, y, -z). We do that here so callers pass plain Unity-world
+        // positions.
+        private static bool ProjectThroughEye(Vector3 worldUnity,
+                                               Matrix4x4 viewOpenXR, Matrix4x4 projOpenXR,
+                                               float screenW, float screenH,
+                                               out Vector2 windowPx)
+        {
+            windowPx = Vector2.zero;
+            Matrix4x4 viewUnity = viewOpenXR;
+            viewUnity.m02 = -viewUnity.m02;
+            viewUnity.m12 = -viewUnity.m12;
+            viewUnity.m22 = -viewUnity.m22;
+            viewUnity.m32 = -viewUnity.m32;
+            Vector4 worldH = new Vector4(worldUnity.x, worldUnity.y, worldUnity.z, 1f);
+            Vector4 eye = viewUnity * worldH;
+            Vector4 clip = projOpenXR * eye;
+            if (clip.w <= 0.0001f) return false;
+            float ndcX = clip.x / clip.w;
+            float ndcY = clip.y / clip.w;
+            float ndcZ = clip.z / clip.w;
+            if (ndcZ < -1f || ndcZ > 1f) return false;
+            // NDC ([-1,1] with +Y up) → window pixels (top-left origin, +Y down).
+            windowPx.x = (ndcX + 1f) * 0.5f * screenW;
+            windowPx.y = (1f - ndcY) * 0.5f * screenH;
+            return true;
+        }
+
+        // Build cyclopean (midpoint-eye) view + projection from the left and
+        // right eye matrices. The two eyes' view matrices share the same
+        // rotation (both face the display) but have different translations
+        // (one per eye position). Averaging the translation column gives the
+        // midpoint eye's view matrix. The two eyes' Kooima projection
+        // matrices share the same depth/aspect terms but have opposite
+        // horizontal skew (left-eye frustum biased one way, right-eye the
+        // other); element-wise averaging produces a symmetric frustum
+        // identical to the Kooima projection that the midpoint eye would
+        // build for itself.
+        private static void BuildCyclopean(Matrix4x4 leftView, Matrix4x4 leftProj,
+                                            Matrix4x4 rightView, Matrix4x4 rightProj,
+                                            out Matrix4x4 cyclopeanView,
+                                            out Matrix4x4 cyclopeanProj)
+        {
+            cyclopeanView = leftView;
+            cyclopeanView.m03 = (leftView.m03 + rightView.m03) * 0.5f;
+            cyclopeanView.m13 = (leftView.m13 + rightView.m13) * 0.5f;
+            cyclopeanView.m23 = (leftView.m23 + rightView.m23) * 0.5f;
+
+            cyclopeanProj = new Matrix4x4();
+            for (int row = 0; row < 4; row++)
+                for (int col = 0; col < 4; col++)
+                    cyclopeanProj[row, col] =
+                        (leftProj[row, col] + rightProj[row, col]) * 0.5f;
+        }
+
+        // Project a renderer's world-space AABB to a window-pixel rect via
+        // cyclopean Kooima projection. 8 corners → take min/max.
+        private bool TryProjectBoundsToScreen(Bounds b,
+                                               Matrix4x4 cyclopeanView,
+                                               Matrix4x4 cyclopeanProj,
+                                               out int x, out int y, out int w, out int h)
         {
             x = y = w = h = 0;
-
+            float sw = Mathf.Max(1, Screen.width);
+            float sh = Mathf.Max(1, Screen.height);
+            Vector3 c = b.center;
+            Vector3 e = b.extents;
             float minX = float.PositiveInfinity, minY = float.PositiveInfinity;
             float maxX = float.NegativeInfinity, maxY = float.NegativeInfinity;
             bool any = false;
+            for (int k = 0; k < 8; k++)
+            {
+                Vector3 corner = c + new Vector3(
+                    ((k & 1) == 0 ? -e.x : e.x),
+                    ((k & 2) == 0 ? -e.y : e.y),
+                    ((k & 4) == 0 ? -e.z : e.z));
+                if (!ProjectThroughEye(corner, cyclopeanView, cyclopeanProj, sw, sh, out Vector2 px))
+                    continue;
+                if (px.x < minX) minX = px.x;
+                if (px.y < minY) minY = px.y;
+                if (px.x > maxX) maxX = px.x;
+                if (px.y > maxY) maxY = px.y;
+                any = true;
+            }
+            if (!any) return false;
+            int xMin = Mathf.Clamp(Mathf.FloorToInt(minX), 0, (int)sw);
+            int xMax = Mathf.Clamp(Mathf.CeilToInt(maxX),  0, (int)sw);
+            int yMin = Mathf.Clamp(Mathf.FloorToInt(minY), 0, (int)sh);
+            int yMax = Mathf.Clamp(Mathf.CeilToInt(maxY),  0, (int)sh);
+            x = xMin; w = xMax - xMin;
+            y = yMin; h = yMax - yMin;
+            return w > 0 && h > 0;
+        }
 
-            float camW = Mathf.Max(1, m_Camera.pixelWidth);
-            float camH = Mathf.Max(1, m_Camera.pixelHeight);
-            float sxScale = Screen.width  / camW;
-            float syScale = Screen.height / camH;
-
+        // Union-rect across all clickableRenderers' projected AABBs — used by
+        // LateUpdate to push a single coarse hit_rect to the native overlay.
+        private bool TryGetUnionScreenRect(Matrix4x4 cyclopeanView,
+                                            Matrix4x4 cyclopeanProj,
+                                            out int x, out int y, out int w, out int h)
+        {
+            x = y = w = h = 0;
+            int unionXMin = int.MaxValue, unionYMin = int.MaxValue;
+            int unionXMax = int.MinValue, unionYMax = int.MinValue;
+            bool any = false;
             for (int i = 0; i < clickableRenderers.Length; i++)
             {
                 var r = clickableRenderers[i];
                 if (r == null || !r.enabled || !r.gameObject.activeInHierarchy)
                     continue;
-
-                Bounds b = r.bounds;
-                Vector3 c = b.center;
-                Vector3 e = b.extents;
-
-                // 8 corners of the AABB → screen space, take min/max.
-                for (int k = 0; k < 8; k++)
-                {
-                    Vector3 corner = c + new Vector3(
-                        ((k & 1) == 0 ? -e.x : e.x),
-                        ((k & 2) == 0 ? -e.y : e.y),
-                        ((k & 4) == 0 ? -e.z : e.z));
-                    Vector3 sp = m_Camera.WorldToScreenPoint(corner);
-                    if (sp.z <= 0f)
-                        continue; // behind camera
-                    float spx = sp.x * sxScale;
-                    float spy = sp.y * syScale;
-                    if (spx < minX) minX = spx;
-                    if (spy < minY) minY = spy;
-                    if (spx > maxX) maxX = spx;
-                    if (spy > maxY) maxY = spy;
-                    any = true;
-                }
+                if (!TryProjectBoundsToScreen(r.bounds, cyclopeanView, cyclopeanProj,
+                                               out int rx, out int ry, out int rw, out int rh))
+                    continue;
+                if (rx < unionXMin) unionXMin = rx;
+                if (ry < unionYMin) unionYMin = ry;
+                if (rx + rw > unionXMax) unionXMax = rx + rw;
+                if (ry + rh > unionYMax) unionYMax = ry + rh;
+                any = true;
             }
-
-            if (!any)
-                return false;
-
-            // Unity screen origin is bottom-left; Win32 client origin is
-            // top-left. Flip Y.
-            int sw = Screen.width;
-            int sh = Screen.height;
-
-            int xMin = Mathf.Clamp(Mathf.FloorToInt(minX), 0, sw);
-            int xMax = Mathf.Clamp(Mathf.CeilToInt(maxX),  0, sw);
-            int yMinUnity = Mathf.Clamp(Mathf.FloorToInt(minY), 0, sh);
-            int yMaxUnity = Mathf.Clamp(Mathf.CeilToInt(maxY),  0, sh);
-
-            x = xMin;
-            w = xMax - xMin;
-            y = sh - yMaxUnity;
-            h = yMaxUnity - yMinUnity;
-
+            if (!any) return false;
+            x = unionXMin; y = unionYMin;
+            w = unionXMax - unionXMin;
+            h = unionYMax - unionYMin;
             return w > 0 && h > 0;
         }
     }

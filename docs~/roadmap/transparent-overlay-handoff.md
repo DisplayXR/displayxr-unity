@@ -1,22 +1,92 @@
-# Transparent overlay (issue #57) — handoff after second session
+# Transparent overlay (issue #57) — handoff after session 4
 
-## Status
+## Kickoff prompt for next session
 
-**Visual transparency: working end-to-end.** On Leia SR + Unity 6 + D3D12, a `displayxr-unity-test-transparent` build renders the rotating cube above the desktop with proper per-pixel alpha. No chroma fringe inside the cube body. Faint magenta fringe at silhouette / de-occluded edges (binary chroma-key limitation; only fixable with alpha-aware Leia weaver in `displayxr-runtime-pvt#190`).
+> Continue the transparent-overlay work for displayxr-unity#57. The authoritative
+> starting point is this handoff doc — read it cover-to-cover before touching code.
+> Sessions 1–4 burned a lot of cycles on dead-end approaches; the "What NOT to try"
+> section lists them.
+>
+> **Current state (session-4 HEAD on `main`):** Approach A (Unity off-screen) is
+> implemented and verified by log readback. Cube hit-detection is correct in both
+> single-rig and multi-rig scenes — clicks register on the cube body where the
+> user perceives it, thanks to a cyclopean Kooima ray (`m_Feature.GetStereoMatrices`
+> + averaged left/right view+projection → `Physics.Raycast`). The
+> session-3 raycast bug and the multi-rig phantom-click-zone bug are both gone.
+>
+> **The remaining problem:** cross-process click-through still does not work
+> reliably. With `WS_EX_TRANSPARENT` correctly toggled on the overlay
+> (verified by exstyle readback log) and Unity confirmed off-screen at
+> `(-32000, -32000)`, OS-level click delivery to underlying apps (e.g.
+> Notepad placed behind the avatar) does not happen — caret never appears,
+> typing doesn't reach the target. Hover routing through to desktop items
+> works *partially / unreliably* — sometimes desktop hover-highlights, sometimes
+> not. The `forward_click_to_underlying_window` Approach-C fallback is wired up
+> in the wndproc but the previous log shows it never fires (overlay isn't
+> receiving the click events to forward), suggesting `WS_EX_TRANSPARENT`
+> is at least taking the overlay out of the hit-test path — yet the click
+> doesn't appear in the underlying app either. Where the click goes is the
+> central mystery to investigate.
+>
+> Your job: figure out where the click ends up after `WS_EX_TRANSPARENT`
+> skips the overlay, and route it to the underlying app reliably.
+> Recommended starting points are in the **"Click-through investigation
+> playbook"** section below. Don't add code defensively — instrument first.
 
-**Right-click + drag the cube to move the window: working.** Confirmed on hardware in session 2. WM_RBUTTONDOWN on overlay anchors cursor + window position; WM_MOUSEMOVE while dragging calls SetWindowPos on Unity; existing parent_subclass_proc WM_MOVE handler repositions the overlay to follow.
+## Status — end of session 4
 
-**Mirror-render perf hoist: working.** `XRSettings.gameViewRenderMode = GameViewRenderMode.None` now lives in `DisplayXRFeature.OnSessionCreate`, applied to every DisplayXR Unity app on every session.
+### What's working (verified on hardware, Leia SR + Unity 6 + D3D12)
 
-**Left-click handling: BROKEN, partial implementation in tree.** Session 2 dropped `WS_EX_TRANSPARENT` and added `WS_EX_NOACTIVATE` + WM_NCHITTEST hit-rect gating + WM_LBUTTONDOWN/UP/DBLCLK + WM_MBUTTONDOWN/UP forwarding via PostMessage to Unity. Two failure modes observed on hardware:
+- **Visual transparency**: cube renders above desktop with per-pixel alpha. Faint magenta silhouette fringe (only fixable by `displayxr-runtime-pvt#190`).
+- **Cube click detection**: cyclopean Kooima ray (built by averaging left + right view+projection matrices from `m_Feature.GetStereoMatrices`) inverse-projects cursor → `Physics.Raycast` against `clickableRenderers`. Hit region matches the cube silhouette at the user's stereo-fused perceived position. No more disparity-driven offset.
+- **Right-click drag the cube to move the window**: `overlay_wnd_proc` `WM_RBUTTONDOWN` captures, `WM_MOUSEMOVE` calls `SetWindowPos` on the overlay HWND directly (not Unity — Unity stays off-screen), `WM_RBUTTONUP` releases.
+- **Approach A (Unity off-screen)**: in `displayxr_set_transparent_overlay` enable path we save Unity's pre-cloak rect, snap the overlay to that rect, then `SetWindowPos(unity_hwnd, NULL, -32000, -32000, w, h, SWP_NOZORDER | SWP_NOACTIVATE)`. `parent_subclass_proc` and `shell_subclass_proc` skip viewport pushes from Unity's WM_MOVE/WM_SIZE in transparent mode (the off-screen position is meaningless for the runtime); the overlay's own WM_MOVE/WM_SIZE handlers push viewport coords using its actual screen rect. On disable we restore Unity to the overlay's current rect (so the windowed app appears where the avatar last was). All verified in `displayxr.log` via readback (`Moved Unity main window off-screen: requested (-32000,-32000 ...) readback (-32000,-32000 ...)`).
+- **Multi-rig works**: both `DisplayXRDisplay` and `DisplayXRCamera` rigs read the same Kooima matrices from shared state (single source of truth populated by the runtime), so they compute the same hit test and write the same `hit_active` value. No more last-writer-wins phantom click zones — multi-rig and single-rig behave identically.
+- **Standard Unity input** (`Mouse.current.leftButton.wasPressedThisFrame`, `OnMouseDown`, EventSystem): works via per-frame `InputSystem.QueueStateEvent(Mouse.current, MouseState{...})` injection of polled cursor + button state. RawInput delivery to off-screen Unity is preserved (RawInput is by HWND target, not by cursor position).
+- **Mirror-render perf hoist**: `XRSettings.gameViewRenderMode = GameViewRenderMode.None` in `DisplayXRFeature.OnSessionCreate` (covers all DisplayXR Unity apps, not just transparent).
 
-1. **Outside the cube silhouette: clicks no longer fall through to the desktop.** Root cause: `HTTRANSPARENT` from WM_NCHITTEST only re-routes within the same thread (per MSDN), not across processes. To pass clicks to other apps you need `WS_EX_TRANSPARENT`, which we removed. Removing it was a regression for click-through.
-2. **Inside the cube silhouette: PostMessage'd WM_LBUTTONDOWN doesn't fire `OnMouseDown` on the cube.** Most likely cause: modern Unity reads mouse buttons from RawInput (WM_INPUT with raw button flags) rather than legacy WM_LBUTTONDOWN. PostMessage'd legacy messages get queued but Unity's input layer ignores them for button state. (Cursor position via GetCursorPos still works, which is why hover-based things would work, but button-down events don't.)
+### What's broken — the only remaining issue
 
-**Next steps for session 3 (left-click):**
-- For (1) outside-silhouette pass-through: either re-add `WS_EX_TRANSPARENT` and find another way to capture inside-cube clicks (e.g. a small WS_CHILD without WS_EX_TRANSPARENT covering only the hit rect), OR keep WS_EX_TRANSPARENT off and manually forward outside-cube clicks via `WindowFromPoint(pt, CWP_SKIPINVISIBLE | CWP_SKIPTRANSPARENT)` + SendMessage to whatever's beneath. The first option is cleaner.
-- For (2) PostMessage not triggering OnMouseDown: try `SendInput(INPUT_MOUSE, ...)` to inject actual hardware mouse events. SendInput goes through the OS's input queue and is what Unity's RawInput layer expects. Caveat: SendInput hits the cursor position globally — needs careful sequencing (move cursor, click, restore?) and may have weird interactions with the user's actual cursor.
-- Worth testing: does `Application.runInBackground = true` + the existing PostMessage actually fire `OnMouseUp` even if not `OnMouseDown`? If asymmetric, that narrows down the diagnosis.
+**Cross-process click-through.** Clicks in magenta transparent zones don't reach apps behind the overlay. Hover sometimes routes through (desktop items hover-highlight) but not consistently. The mystery: `WS_EX_TRANSPARENT` toggle is verified to flip on/off correctly via exstyle readback, Unity is verified off-screen, the `forward_click_to_underlying_window` fallback (in `overlay_wnd_proc`) doesn't fire (no `forward_click:` log lines from previous tests) — meaning the overlay isn't receiving the click events to forward, but the click also doesn't appear at the intended underlying app. Where is the click going?
+
+## Click-through investigation playbook
+
+The next session should start by **instrumenting**, not adding code. Concrete steps:
+
+1. **Confirm the click delivery destination empirically.** Open Notepad, position it precisely under the cursor location where the click will land (avatar at `(393, 0, 3234x2248)` approximately, per latest log — Notepad needs to be at that screen rect). Click in a magenta zone. If Notepad's caret moves and typing lands → `WS_EX_TRANSPARENT` does deliver to underlying apps cross-process; the previous "doesn't work" reports were testing on desktop wallpaper which doesn't show single-click feedback. Done — close the issue.
+
+2. **If Notepad doesn't get the click**, install a global low-level mouse hook (`SetWindowsHookEx(WH_MOUSE_LL, ...)`) inside the plugin (load-time) and log every mouse-down event with `WindowFromPoint(cursor_pos)` resolved at the time of the click. The hook fires before any window's wndproc, so it logs the OS's hit-test result directly. Cross-reference with the overlay's wndproc log — if the LL hook says target = Notepad's HWND but Notepad doesn't respond, the issue is downstream of OS hit-test (UIPI? broken Notepad? topmost-overlay z-order interfering with foreground transition?). If the LL hook says target = our overlay despite `WS_EX_TRANSPARENT` being set, then `WS_EX_TRANSPARENT` isn't actually being honored and we need to investigate why (combination with other ex-styles? specific Windows version behavior?).
+
+3. **Test with `WS_EX_NOACTIVATE` removed.** The handoff doc cited NOACTIVATE for keeping Unity foreground when the overlay was clicked, but with Unity off-screen and IAT-hooked GetForegroundWindow that may be redundant. NOACTIVATE may interfere with cross-process click delivery — without it, clicks delivered past us via `WS_EX_TRANSPARENT` should activate the underlying app cleanly.
+
+4. **Test removing `WS_EX_TOPMOST`** as a probe. Topmost has special z-order semantics that might affect click routing. If dropping it fixes click-through, find a less-aggressive way to keep the overlay visually on top (e.g., just SetWindowPos to top of z-order on a regular cadence).
+
+5. **Force the Approach C fallback by removing `WS_EX_TRANSPARENT` toggle entirely.** Comment out the toggle in `displayxr_set_overlay_hit_active`. The overlay always catches all clicks. `forward_click_to_underlying_window` then runs for every transparent-zone click and unconditionally synthesizes a `PostMessage` to the underlying window. This is the most deterministic path — if it works, ship it as the production approach. The downside is hover behavior: with no `WS_EX_TRANSPARENT` toggling, hover messages always hit the overlay too, blocking desktop hover-feedback. Could be fine for the avatar use case (hover over avatar = hover the avatar; avatar shouldn't pass hover through arbitrarily).
+
+6. **Check whether `SetForegroundWindow` from `forward_click_to_underlying_window` works.** The function calls it on press messages but might silently fail due to Win32 foreground rules. Try the alternative: `BringWindowToTop` + `SetActiveWindow`, or use `AttachThreadInput` to get permission to call SetForegroundWindow.
+
+### What NOT to try (already burned cycles in sessions 1–4):
+
+- `WS_EX_TRANSPARENT` on Unity HWND — kills RawInput button delivery to Unity. (Session 3.)
+- Strict active-rig gate alone with the OLD symmetric `Camera.ScreenPointToRay` — broke click detection because the active rig's projection misses the cube silhouette. (Session 3.) Fixed in session 4 by switching to cyclopean Kooima ray; gate could now be re-introduced safely if event-doubling becomes an issue.
+- `WS_EX_LAYERED + LWA_COLORKEY` on Unity or overlay — flip-model swapchains bypass it (Win10+).
+- `WS_EX_LAYERED` on the overlay alongside DComp — incompatible with `WS_EX_NOREDIRECTIONBITMAP`; would lose per-pixel alpha. Per MSDN, full hit-test transparency for `WS_EX_TRANSPARENT` requires `WS_EX_LAYERED`, but that's blocked here.
+- `SWP_FRAMECHANGED` on the WS_EX_TRANSPARENT toggle — added as a "flush the OS hit-test cache" defensive measure, then reverted. The exstyle readback confirms `SetWindowLongPtr` alone is sufficient; SWP_FRAMECHANGED was suspected of regressing hover and removed.
+- `forward_click_to_underlying_window` for `WM_MOUSEMOVE` — caused message floods on the underlying window when hover dipped into the wndproc. Restricted to button events only in session 4. Don't expand back to MOUSEMOVE without a strong reason.
+- Adding `WS_CAPTION` to overlay so DefWindowProc modal drag works — drag-stutter problem, separate issue, also blocked on `displayxr-runtime-pvt#193` (external drag API).
+
+## Test environment
+
+- Test project: `C:\Users\Sparks i7 3080\Documents\GitHub\displayxr-unity-test-transparent\` (sibling of unity-3d-display, NOT under git).
+  - `Assets/CubeTest.unity` — 2 rigs + Cube + animation.
+  - `Assets/TransparentAutoSetup.cs` — auto-attaches DisplayXRTransparentOverlay to rig cameras, wires inline pointer-event log handlers, ensures Cube has BoxCollider.
+  - `Assets/CubeClickLog.cs` — orphaned (used to be auto-attached via TransparentAutoSetup). Safe to delete.
+  - `Assets/InputDiagnostic.cs` — orphaned. Safe to delete.
+  - `Assets/DragRotateCube.cs` — auto-attached to Cube. Click → red, drag → rotate. Wired via `TransparentAutoSetup`.
+- Build folder: `C:\Users\Sparks i7 3080\Documents\Unity\DisplayXR-Test-Transparent-Build\`.
+- Plugin log: `displayxr.log` next to the exe.
+- Unity log: `C:\Users\Sparks i7 3080\AppData\LocalLow\DisplayXR\DisplayXR-test\Player.log` (where `Debug.Log` lands).
+- Display: 4K @ 250% DPI scaling. Camera.pixel = 1920x1080, Screen = 2498x2248 (window pixels).
 
 ## How the transparency stack works (read this before changing anything)
 
@@ -117,35 +187,10 @@ Logs:
 
 ## Next session — concrete tasks
 
-> **Note:** Tasks 2 and 3 below were completed in session 2. Task 1 was partially implemented and exposed a deeper issue — see "Next steps for session 3 (left-click)" at the top of this doc for the current state. The sketch below is preserved because the architectural reasoning (HWND topology, hit-rect, drag math) is still correct; only the assumption that PostMessage'd left-clicks would trigger OnMouseDown turned out to be wrong.
-
-### Task 1: Click-through to Unity (so cube `OnMouseDown` fires)
-
-The overlay currently has `WS_EX_TRANSPARENT` (every click passes through) and Unity is cloaked (so clicks that pass through don't land anywhere meaningful). Two design choices:
-
-- **Option A (preferred):** drop `WS_EX_TRANSPARENT` from the overlay. The existing `parent_subclass_proc` already handles `WM_NCHITTEST` — returns `HTCLIENT` inside the cube's screen-space bounding rect (set per-frame by `displayxr_set_overlay_hit_rect` from the C# `LateUpdate`), `HTTRANSPARENT` outside. Inside the rect, the overlay receives clicks. Then the overlay's wndproc forwards them to Unity via `PostMessage` (need to translate screen→client coords for Unity).
-- **Option B:** Keep `WS_EX_TRANSPARENT`, un-cloak Unity, accept the grey background back. Unity gets clicks directly. (User explicitly didn't want this — they want the desktop visible.)
-
-Option A is right. Implementation sketch:
-1. In `displayxr_get_app_main_view` transparent path, drop `WS_EX_TRANSPARENT` from the ex-style. The hit-test logic now exclusively governs click-through.
-2. Add `WM_LBUTTONDOWN/UP`, `WM_RBUTTONDOWN/UP`, `WM_MOUSEMOVE` cases to `overlay_wnd_proc`. For each: translate the lParam (overlay client coords) to Unity's client coords (`ClientToScreen` on overlay → `ScreenToClient` on Unity), then `PostMessage(unity_hwnd, msg, wParam, MAKELPARAM(x, y))`.
-3. Verify: scene with a cube + a script that logs `OnMouseDown`. Should fire when you click the cube body, not fire when you click outside (those clicks pass through to the desktop).
-
-### Task 2: Right-click + drag the cube to move the window
-
-User wants to drag the avatar by right-click + drag on the cube. Implementation:
-
-1. In `overlay_wnd_proc`'s `WM_RBUTTONDOWN`: capture the mouse position, set a flag `s_dragging = 1`, `SetCapture(overlay)`.
-2. In `WM_MOUSEMOVE` while `s_dragging`: compute delta from initial position, call `SetWindowPos(unity_hwnd, ...)` to move Unity (the existing `parent_subclass_proc` `WM_MOVE` handler will then reposition the overlay automatically).
-3. In `WM_RBUTTONUP`: clear `s_dragging`, `ReleaseCapture()`.
-
-Alternative: `PostMessage(unity_hwnd, WM_NCLBUTTONDOWN, HTCAPTION, ...)` to trigger the OS's standard window-drag behavior. Cleaner — Windows handles the drag loop, including snap-to-edge. But Unity is `WS_POPUP` so the OS drag may behave oddly.
-
-Test: right-click on cube → drag → cube and Unity HWND move together; release → both stay where dropped.
-
-### Task 3 (smaller, while you're in there)
-
-Hoist `XRSettings.gameViewRenderMode = GameViewRenderMode.None` from the test project's `TransparentAutoSetup.cs` into `DisplayXRFeature.OnSessionBegin` (or wherever XR loader has finished init). Saves a flat re-render of Camera.main per frame for *every* DisplayXR Unity app, transparent or not. Mirror render is wasted work in normal DisplayXR builds anyway (covered by the opaque overlay) — should always be off.
+> Tasks 1–3 from sessions 1–3 (left-click, right-drag, gameViewRenderMode hoist)
+> are all DONE and shipped on `main`. The single remaining task is cross-process
+> click-through — see the **"Click-through investigation playbook"** section
+> near the top.
 
 ## Open issues elsewhere
 
@@ -154,11 +199,13 @@ Hoist `XRSettings.gameViewRenderMode = GameViewRenderMode.None` from the test pr
 - `displayxr-unity#57` — open, will be closed when click-through and drag-by-cube land. Cross-referenced from runtime#191.
 - `docs~/roadmap/d3d11-typeless-fix-plan.md` — Unity D3D11 TYPELESS engine bug fix plan. Not strictly needed for transparent overlay (since Unity 6 defaults to D3D12) but would unblock the D3D11 BitBlt path for the rare D3D11-only Unity build.
 
-## Local commits (not pushed)
+## Local commits
 
-Three commits on `main`:
+The session 1–4 work landed as a sequence of commits on `main`:
 - `8c9b912` — initial visual transparency (session 1)
 - `0893a01` — handoff doc (session 1)
-- session 2 commit (right-drag + gameViewRenderMode hoist + partial click-through scaffolding) — see HEAD
+- `a72ca37` — right-drag + gameViewRenderMode hoist + partial click-through scaffolding (session 2)
+- `40d9edc` — input architecture (session 3)
+- session-4 commit (Approach A Unity-off-screen + cyclopean Kooima ray + click-forward fallback + this handoff update) — see HEAD
 
-User hasn't pushed yet — can push when ready. Test project (`displayxr-unity-test-transparent`) is not under git; relevant files there are `Assets/TransparentAutoSetup.cs`, `Assets/CubeClickLog.cs` (added session 2 for click-through verification), `Packages/manifest.json` (points at `file:../../unity-3d-display`), and the modified `ProjectSettings/ProjectSettings.asset` (D3D12 + Auto, currently the right setting).
+Test project (`displayxr-unity-test-transparent`) is not under git; relevant files there are `Assets/TransparentAutoSetup.cs`, `Assets/DragRotateCube.cs`, `Packages/manifest.json` (points at `file:../../unity-3d-display`), and `ProjectSettings/ProjectSettings.asset` (D3D12 + Auto).

@@ -55,6 +55,22 @@ static DWORD s_saved_exstyle  = 0;
 static int   s_overlay_active = 0;
 static RECT  s_hit_rect       = {0, 0, 0, 0};
 
+// Unity's pre-transparent screen rect, captured in displayxr_set_transparent_overlay
+// just before we move Unity off-screen. We restore Unity to the overlay's current
+// position on disable (so the user's window appears where the avatar last was),
+// but fall back to this rect if the overlay has been destroyed by then.
+static RECT  s_unity_saved_rect = {0, 0, 0, 0};
+static int   s_unity_offscreen  = 0;
+
+// Off-screen position used for Unity's HWND in transparent mode. The cursor
+// never lands here, so OS hit-testing routes transparent-zone clicks past
+// our cloaked-but-still-in-z-order Unity HWND to whatever desktop app is at
+// the actual cursor position. (-32000, -32000) is the canonical Win32
+// off-screen position — same value used for minimized-window placeholder
+// rects.
+#define DISPLAYXR_UNITY_OFFSCREEN_X (-32000)
+#define DISPLAYXR_UNITY_OFFSCREEN_Y (-32000)
+
 // Per-pixel hit-test override. When set to 1, WM_NCHITTEST returns HTCLIENT
 // inside the cursor's current frame regardless of s_hit_rect. C# updates this
 // each frame from a Physics.Raycast at the current cursor position so the hit
@@ -149,6 +165,78 @@ find_unity_hwnd(void)
 // Standalone mode: overlay window + parent subclass
 // ============================================================================
 
+// Forward a click that arrived at the overlay in a transparent zone to the
+// next visible top-level window at the cursor. Defensive fallback for the
+// case where WS_EX_TRANSPARENT routes hover past our overlay but click
+// messages still land here (a known partial-honor case for non-layered
+// windows). We can't add WS_EX_LAYERED because it breaks DComp + flip-model
+// swapchain rendering, so we synthesize click delivery ourselves.
+//
+// FindWindowExW(NULL, prev, ...) iterates top-level windows in z-order
+// top-to-bottom, so the first match below us at the cursor position is the
+// correct target. We skip our own overlay HWND, our cloaked-and-off-screen
+// Unity HWND, anything invisible, anything cloaked, and other
+// WS_EX_TRANSPARENT windows (recursively click-through).
+//
+// NOT used for WM_MOUSEMOVE — the OS already routes hover correctly past
+// our overlay, and forwarding moves here would generate redundant message
+// floods on the underlying window.
+static void
+forward_click_to_underlying_window(UINT msg, WPARAM wParam)
+{
+	POINT cursor;
+	if (!GetCursorPos(&cursor))
+		return;
+
+	HWND unity = find_unity_hwnd();
+	HWND target = NULL;
+	HWND hwnd = NULL;
+	while ((hwnd = FindWindowExW(NULL, hwnd, NULL, NULL)) != NULL) {
+		if (hwnd == s_overlay_hwnd || hwnd == unity)
+			continue;
+		if (!IsWindowVisible(hwnd))
+			continue;
+		BOOL cloaked = FALSE;
+		if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED,
+		                                    &cloaked, sizeof(cloaked)))
+		    && cloaked)
+			continue;
+		DWORD ex = (DWORD)GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+		if (ex & WS_EX_TRANSPARENT)
+			continue;
+		RECT rc;
+		if (!GetWindowRect(hwnd, &rc))
+			continue;
+		if (cursor.x < rc.left || cursor.x >= rc.right ||
+		    cursor.y < rc.top  || cursor.y >= rc.bottom)
+			continue;
+		target = hwnd;
+		break;
+	}
+
+	if (target == NULL) {
+		displayxr_log("[DisplayXR] forward_click: no underlying window at cursor (%d,%d) for msg=0x%04X\n",
+		              (int)cursor.x, (int)cursor.y, (unsigned)msg);
+		return;
+	}
+
+	POINT client_pt = cursor;
+	ScreenToClient(target, &client_pt);
+
+	if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN) {
+		SetForegroundWindow(target);
+	}
+
+	LPARAM client_lp = MAKELPARAM((WORD)client_pt.x, (WORD)client_pt.y);
+	PostMessageW(target, msg, wParam, client_lp);
+
+	wchar_t cls[64] = {0};
+	GetClassNameW(target, cls, 63);
+	displayxr_log("[DisplayXR] forward_click: msg=0x%04X cursor=(%d,%d) → hwnd=%p class=%ls client=(%d,%d)\n",
+	              (unsigned)msg, (int)cursor.x, (int)cursor.y,
+	              (void *)target, cls, (int)client_pt.x, (int)client_pt.y);
+}
+
 static LRESULT CALLBACK
 overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
@@ -171,36 +259,37 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		// click so foreground stays on Unity (cloaked but active).
 		return MA_NOACTIVATE;
 
-	// ----- right-button: capture-based drag of the Unity window (task 2) -----
+	// ----- right-button: capture-based drag of the OVERLAY window -----
 	//
-	// We've tried twice to inherit opaque-mode-grade no-stutter drag UX via
-	// the OS modal drag loop:
-	//   1. SendMessage(unity, WM_NCLBUTTONDOWN, HTCAPTION, 0) — silently
-	//      ignored. Cloaked Unity HWND or its WS_POPUP-no-WS_CAPTION style
-	//      blocks DefWindowProc from starting the drag.
-	//   2. SendMessage(overlay, WM_SYSCOMMAND, SC_MOVE | HTCAPTION, 0) —
-	//      also silently ignored. Suspect WS_EX_NOREDIRECTIONBITMAP +
-	//      WS_EX_NOACTIVATE on the overlay are incompatible with
-	//      DefWindowProc's modal drag (no DWM redirection surface for the
-	//      drag preview). NOREDIRECTIONBITMAP can't be dropped — it's what
-	//      gives us per-pixel transparency.
+	// In transparent mode (Approach A from #57 session 4), Unity's HWND
+	// lives off-screen at (-32000, -32000) so the OS routes transparent-
+	// zone clicks to whatever desktop app is at the cursor — Unity is no
+	// longer in the hit-test path. As a consequence, dragging Unity does
+	// nothing visible and decouples it from the avatar; we drag the
+	// OVERLAY HWND instead. parent_subclass_proc no longer follows Unity
+	// when s_overlay_is_toplevel — the overlay tracks its own position
+	// and pushes it to the runtime via WM_MOVE / WM_SIZE handlers below.
 	//
-	// So the SR SDK weaver phase-snap stays unreachable from this side.
-	// The capture-based drag below trades 3D stutter (no phase-snap) for
-	// real-time Kooima updates (cube keeps animating during drag). Proper
-	// fix needs the runtime "external drag" API outlined in CLAUDE.md
-	// "Known Issues" — same blocker as the standalone preview window.
+	// Same OS-modal-drag caveat as before: SR SDK weaver phase-snap
+	// requires DefWindowProc to own the drag loop, but our window-style
+	// requirements (WS_EX_NOREDIRECTIONBITMAP for per-pixel alpha,
+	// WS_EX_NOACTIVATE) block that. Tracked in displayxr-runtime-pvt#193.
 	case WM_RBUTTONDOWN: {
-		HWND unity = find_unity_hwnd();
-		if (unity != NULL) {
-			GetCursorPos(&s_drag_anchor_screen);
-			RECT wr;
-			GetWindowRect(unity, &wr);
-			s_drag_anchor_window.x = wr.left;
-			s_drag_anchor_window.y = wr.top;
-			s_drag_active = 1;
-			SetCapture(hwnd);
+		// Transparent zone (cursor off cube): forward click to the
+		// desktop window under the cursor. WS_EX_TRANSPARENT routes
+		// hover past us correctly but clicks may still land here on
+		// non-layered windows; this is the Approach C fallback.
+		if (!s_hit_active) {
+			forward_click_to_underlying_window(msg, wParam);
+			return 0;
 		}
+		GetCursorPos(&s_drag_anchor_screen);
+		RECT wr;
+		GetWindowRect(hwnd, &wr);
+		s_drag_anchor_window.x = wr.left;
+		s_drag_anchor_window.y = wr.top;
+		s_drag_active = 1;
+		SetCapture(hwnd);
 		return 0;
 	}
 	case WM_RBUTTONUP:
@@ -209,33 +298,77 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 			s_drag_active = 0;
 			return 0;
 		}
+		// Pair with the transparent-zone WM_RBUTTONDOWN we forwarded
+		// (drag wasn't active because we returned early there).
+		if (!s_hit_active) {
+			forward_click_to_underlying_window(msg, wParam);
+			return 0;
+		}
 		break;
 	case WM_CAPTURECHANGED:
 		s_drag_active = 0;
 		break;
 
-	// ----- left/middle-button + mouse-move: forward to Unity (task 1) -----
+	// ----- mouse-move: drag overlay if active, else forward to Unity -----
 	case WM_MOUSEMOVE:
 		if (s_drag_active) {
 			POINT cur;
 			GetCursorPos(&cur);
-			HWND unity = find_unity_hwnd();
-			if (unity != NULL) {
-				int nx = s_drag_anchor_window.x + (cur.x - s_drag_anchor_screen.x);
-				int ny = s_drag_anchor_window.y + (cur.y - s_drag_anchor_screen.y);
-				SetWindowPos(unity, NULL, nx, ny, 0, 0,
-				             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-			}
+			int nx = s_drag_anchor_window.x + (cur.x - s_drag_anchor_screen.x);
+			int ny = s_drag_anchor_window.y + (cur.y - s_drag_anchor_screen.y);
+			SetWindowPos(hwnd, NULL, nx, ny, 0, 0,
+			             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 			return 0;
 		}
 		// fall through to forward
 	case WM_LBUTTONDOWN: case WM_LBUTTONUP:
 	case WM_LBUTTONDBLCLK:
 	case WM_MBUTTONDOWN: case WM_MBUTTONUP: {
+		// Transparent zone: forward to the desktop window under the
+		// cursor. WS_EX_TRANSPARENT may have routed hover past us
+		// correctly but clicks still land here on non-layered windows.
+		if (!s_hit_active) {
+			forward_click_to_underlying_window(msg, wParam);
+			return 0;
+		}
 		HWND unity = find_unity_hwnd();
 		if (unity != NULL)
 			PostMessageW(unity, msg, wParam, lParam);
 		return 0;
+	}
+
+	// ----- overlay position/size changed: push to runtime -----
+	// In transparent mode the overlay owns its on-screen position; Unity
+	// is off-screen and parent_subclass_proc no longer pushes viewport
+	// info on Unity's WM_MOVE/WM_SIZE. Mirror those updates here based on
+	// the overlay's actual screen rect so the runtime's interlacing stays
+	// pixel-aligned with where the overlay is presented on the lenticular.
+	case WM_MOVE: {
+		if (s_overlay_is_toplevel) {
+			RECT wr;
+			GetWindowRect(hwnd, &wr);
+			DisplayXRState *state = displayxr_get_state();
+			if (state != NULL && state->viewport_width > 0) {
+				displayxr_set_viewport_size_native(
+					state->viewport_width, state->viewport_height,
+					(int32_t)wr.left, (int32_t)wr.top);
+			}
+		}
+		break;
+	}
+	case WM_SIZE: {
+		if (s_overlay_is_toplevel) {
+			int w = LOWORD(lParam);
+			int h = HIWORD(lParam);
+			if (w > 0 && h > 0) {
+				RECT wr;
+				GetWindowRect(hwnd, &wr);
+				displayxr_set_viewport_size_native(
+					(uint32_t)w, (uint32_t)h,
+					(int32_t)wr.left, (int32_t)wr.top);
+			}
+		}
+		break;
 	}
 
 	default:
@@ -260,40 +393,38 @@ parent_subclass_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		int w = LOWORD(lParam);
 		int h = HIWORD(lParam);
 		if (s_overlay_is_toplevel) {
-			// Top-level overlay: position in screen coords matching parent's
-			// client area. Keep z-order topmost.
-			POINT client_origin = {0, 0};
-			ClientToScreen(hwnd, &client_origin);
-			SetWindowPos(s_overlay_hwnd, HWND_TOPMOST,
-			             client_origin.x, client_origin.y, w, h,
-			             SWP_NOACTIVATE);
+			// Transparent mode: Unity lives off-screen at (-32000,-32000)
+			// for cross-process click-through (Approach A, #57 session 4).
+			// Don't follow Unity's position — the overlay owns its own
+			// screen rect and pushes viewport updates from overlay_wnd_proc's
+			// WM_MOVE/WM_SIZE handlers. Skip the viewport push here to avoid
+			// pushing Unity's off-screen client_origin to the runtime.
 		} else {
 			// Child overlay: resize within parent's client area.
 			SetWindowPos(s_overlay_hwnd, HWND_TOP, 0, 0, w, h, SWP_NOZORDER);
-		}
-		if (w > 0 && h > 0) {
-			POINT client_origin = {0, 0};
-			ClientToScreen(hwnd, &client_origin);
-			displayxr_set_viewport_size_native(
-				(uint32_t)w, (uint32_t)h,
-				(int32_t)client_origin.x, (int32_t)client_origin.y);
+			if (w > 0 && h > 0) {
+				POINT client_origin = {0, 0};
+				ClientToScreen(hwnd, &client_origin);
+				displayxr_set_viewport_size_native(
+					(uint32_t)w, (uint32_t)h,
+					(int32_t)client_origin.x, (int32_t)client_origin.y);
+			}
 		}
 	}
 	if (msg == WM_MOVE) {
-		POINT client_origin = {0, 0};
-		ClientToScreen(hwnd, &client_origin);
-		// Top-level overlay follows Unity's screen position.
-		if (s_overlay_is_toplevel
-		    && s_overlay_hwnd != NULL && IsWindow(s_overlay_hwnd)) {
-			SetWindowPos(s_overlay_hwnd, HWND_TOPMOST,
-			             client_origin.x, client_origin.y, 0, 0,
-			             SWP_NOSIZE | SWP_NOACTIVATE);
-		}
-		DisplayXRState *state = displayxr_get_state();
-		if (state->viewport_width > 0) {
-			displayxr_set_viewport_size_native(
-				state->viewport_width, state->viewport_height,
-				(int32_t)client_origin.x, (int32_t)client_origin.y);
+		// In transparent mode, Unity's position is meaningless (off-screen);
+		// the overlay tracks its own position via overlay_wnd_proc WM_MOVE.
+		// In opaque (WS_CHILD) mode, the overlay follows Unity 1:1 and we
+		// also push viewport_size_native from Unity's client_origin.
+		if (!s_overlay_is_toplevel) {
+			POINT client_origin = {0, 0};
+			ClientToScreen(hwnd, &client_origin);
+			DisplayXRState *state = displayxr_get_state();
+			if (state->viewport_width > 0) {
+				displayxr_set_viewport_size_native(
+					state->viewport_width, state->viewport_height,
+					(int32_t)client_origin.x, (int32_t)client_origin.y);
+			}
 		}
 	}
 	return CallWindowProcW(s_original_wndproc, hwnd, msg, wParam, lParam);
@@ -475,13 +606,11 @@ displayxr_set_transparent_overlay(int enabled, uint32_t color_key, int topmost)
 		// when transparent_background_requested is set), so the overlay
 		// composites independently of Unity's swapchain.
 		//
-		// We tried adding WS_EX_TRANSPARENT here for desktop click-through
-		// (clicks falling through both overlay AND Unity to the actual
-		// app behind), but it broke RawInput delivery to Unity — Unity
-		// stopped seeing button events from PostMessage'd clicks too. Per
-		// the log, btn=0x00 stayed throughout test even though clicks were
-		// happening. Cross-process click-through stays unsolved for now;
-		// transparent zone clicks still die on the cloaked Unity HWND.
+		// We do NOT add WS_EX_TRANSPARENT to Unity's HWND for cross-process
+		// click-through — that broke RawInput delivery to Unity. Instead,
+		// we move Unity off-screen (further down in this function) so the
+		// cursor never lands on its HWND in the first place. RawInput
+		// delivery is by HWND, not by cursor position, so it keeps flowing.
 		SetWindowLongPtrW(hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
 		DWORD ex = s_saved_exstyle & ~WS_EX_LAYERED;
 		if (topmost)
@@ -496,14 +625,95 @@ displayxr_set_transparent_overlay(int enabled, uint32_t color_key, int topmost)
 		// transparent overlay), but the HWND keeps receiving input and
 		// Unity keeps rendering normally (eye textures still flow to the
 		// runtime via OpenXR). Cloaking is a pure DWM-side hide; it does
-		// NOT preserve OS-foreground status though, which is why we need
-		// the focus hook below.
+		// NOT remove the HWND from OS hit-testing — that's why we ALSO
+		// move Unity off-screen below (cross-process click-through, #57).
 		{
 			BOOL cloak = TRUE;
 			HRESULT hr = DwmSetWindowAttribute(hwnd, DWMWA_CLOAK,
 			                                   &cloak, sizeof(cloak));
 			displayxr_log("[DisplayXR] Cloaked Unity main window via DWMWA_CLOAK: hr=0x%08X\n",
 			              (unsigned)hr);
+		}
+
+		// Move Unity's HWND off-screen at (-32000, -32000) — Approach A
+		// from #57 session 4 for cross-process click-through.
+		//
+		// Why: cloaking hides Unity from DWM compositing but leaves the
+		// HWND in WindowFromPoint's hit-test path. With WS_EX_TRANSPARENT
+		// toggled on the overlay (in s_hit_active=0 zones), the OS routes
+		// transparent-zone clicks past the overlay to the next window in
+		// z-order — that was cloaked Unity, where the click died on
+		// Unity's wndproc and never reached desktop apps behind. Moving
+		// Unity off-screen takes its HWND out of the hit-test path
+		// entirely (cursor never lands on it). The OS then routes
+		// transparent-zone clicks to whatever desktop app is at the
+		// actual cursor position.
+		//
+		// Unity continues to receive input via:
+		//   - WM_INPUT (RIDEV_INPUTSINK + hwndTarget=unity_hwnd) —
+		//     RawInput is delivered by HWND, not by cursor position.
+		//   - PostMessage'd left/middle/mouse-move from overlay_wnd_proc.
+		//   - IAT-hooked GetForegroundWindow → s_shell_unity_hwnd keeps
+		//     Application.isFocused true.
+		// Unity's main-window swapchain is never read because
+		// XRSettings.gameViewRenderMode = None (set in DisplayXRFeature).
+		{
+			GetWindowRect(hwnd, &s_unity_saved_rect);
+			int w = s_unity_saved_rect.right - s_unity_saved_rect.left;
+			int h = s_unity_saved_rect.bottom - s_unity_saved_rect.top;
+
+			// Snap the overlay to Unity's current window rect before we
+			// disconnect them. The overlay was created at Unity's old
+			// client_origin (still WS_OVERLAPPED with title bar at the
+			// time), so it's slightly inset from Unity's window rect.
+			// After the WS_POPUP style strip Unity's client area is the
+			// full window, and that's what the user perceives as Unity's
+			// boundaries — line the overlay up there. After this snap,
+			// parent_subclass_proc no longer follows Unity (Unity will
+			// be off-screen) and the overlay owns its on-screen position.
+			if (s_overlay_hwnd != NULL && IsWindow(s_overlay_hwnd)) {
+				SetWindowPos(s_overlay_hwnd, HWND_TOPMOST,
+				             s_unity_saved_rect.left,
+				             s_unity_saved_rect.top, w, h,
+				             SWP_NOACTIVATE);
+			}
+
+			SetWindowPos(hwnd, NULL,
+			             DISPLAYXR_UNITY_OFFSCREEN_X,
+			             DISPLAYXR_UNITY_OFFSCREEN_Y,
+			             w, h,
+			             SWP_NOZORDER | SWP_NOACTIVATE);
+			s_unity_offscreen = 1;
+
+			// Verify off-screen move took effect — if Unity engine
+			// (or some hook) re-positions the window, we'd see a
+			// readback rect that's not at -32000,-32000.
+			RECT vrc;
+			GetWindowRect(hwnd, &vrc);
+			displayxr_log("[DisplayXR] Moved Unity main window off-screen: requested (%d,%d %dx%d) readback (%d,%d %dx%d) — was at (%d,%d)\n",
+			              DISPLAYXR_UNITY_OFFSCREEN_X,
+			              DISPLAYXR_UNITY_OFFSCREEN_Y, w, h,
+			              (int)vrc.left, (int)vrc.top,
+			              (int)(vrc.right - vrc.left),
+			              (int)(vrc.bottom - vrc.top),
+			              (int)s_unity_saved_rect.left,
+			              (int)s_unity_saved_rect.top);
+
+			// Also log overlay's actual position for sanity check —
+			// after the snap above, overlay should be at the saved
+			// Unity rect. If overlay is elsewhere, the C# raycast
+			// math will be off.
+			if (s_overlay_hwnd != NULL && IsWindow(s_overlay_hwnd)) {
+				RECT orc;
+				GetWindowRect(s_overlay_hwnd, &orc);
+				DWORD oex = (DWORD)GetWindowLongPtrW(s_overlay_hwnd, GWL_EXSTYLE);
+				displayxr_log("[DisplayXR] Overlay rect after snap: (%d,%d %dx%d) exstyle=0x%08X (TRANSPARENT=%s)\n",
+				              (int)orc.left, (int)orc.top,
+				              (int)(orc.right - orc.left),
+				              (int)(orc.bottom - orc.top),
+				              (unsigned)oex,
+				              (oex & WS_EX_TRANSPARENT) ? "ON" : "OFF");
+			}
 		}
 
 		// Install the same focus / raw-input hooks shell mode uses. Cloaked
@@ -579,6 +789,16 @@ displayxr_set_transparent_overlay(int enabled, uint32_t color_key, int topmost)
 			}
 		}
 	} else if (!enabled && s_overlay_active) {
+		// Pick the rect Unity should restore to before uncloaking. If the
+		// overlay still exists, use its current screen rect — the user
+		// has been dragging the avatar around in transparent mode, and
+		// they expect the windowed app to appear where the avatar last
+		// was. Otherwise fall back to the rect we captured pre-cloak.
+		RECT restore_rc = s_unity_saved_rect;
+		if (s_overlay_hwnd != NULL && IsWindow(s_overlay_hwnd)) {
+			GetWindowRect(s_overlay_hwnd, &restore_rc);
+		}
+
 		// Uncloak Unity's main window before restoring styles, so the
 		// frame-changed repaint can run with a visible window.
 		{
@@ -587,12 +807,25 @@ displayxr_set_transparent_overlay(int enabled, uint32_t color_key, int topmost)
 		}
 		SetWindowLongPtrW(hwnd, GWL_STYLE, (LONG_PTR)s_saved_style);
 		SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (LONG_PTR)s_saved_exstyle);
-		SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
-		             SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED);
 
-		// Drop WS_EX_LAYERED on the child too. We didn't save its prior
-		// exstyle separately because the child is created with a fixed style
-		// (WS_EX_TRANSPARENT) that we know.
+		// Move Unity back on-screen at the restore rect, then frame-change.
+		if (s_unity_offscreen) {
+			int w = restore_rc.right - restore_rc.left;
+			int h = restore_rc.bottom - restore_rc.top;
+			SetWindowPos(hwnd, HWND_NOTOPMOST,
+			             restore_rc.left, restore_rc.top, w, h,
+			             SWP_FRAMECHANGED);
+			s_unity_offscreen = 0;
+			displayxr_log("[DisplayXR] Restored Unity main window to (%d,%d) size=%dx%d\n",
+			              (int)restore_rc.left, (int)restore_rc.top, w, h);
+		} else {
+			SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+			             SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED);
+		}
+
+		// Drop WS_EX_LAYERED on the overlay too. We didn't save its prior
+		// exstyle separately because the overlay is created with a fixed
+		// style that we know.
 		if (s_overlay_hwnd != NULL && IsWindow(s_overlay_hwnd)) {
 			DWORD cex = (DWORD)GetWindowLongPtrW(s_overlay_hwnd, GWL_EXSTYLE);
 			SetWindowLongPtrW(s_overlay_hwnd, GWL_EXSTYLE,
@@ -622,18 +855,21 @@ displayxr_set_overlay_hit_active(int active)
 	s_hit_active = new_active;
 
 	// Toggle WS_EX_TRANSPARENT on the overlay HWND to match. With the flag
-	// cleared (cursor off cube) the OS routes clicks past the overlay to
-	// the next window in DWM z-order, which gives us click-through to apps
-	// behind the cube area. (Note: clicks still die on the cloaked Unity
-	// HWND beneath us in the current build — true cross-process click-
-	// through is still unsolved; tracked for the next iteration.)
+	// set (cursor off cube) the OS skips the overlay in WindowFromPoint
+	// hit-testing, routing the message to the next window at the cursor's
+	// screen position. Combined with Unity moved off-screen (Approach A from
+	// #57), that's whatever desktop app the user actually sees there.
 	if (s_overlay_is_toplevel && s_overlay_hwnd != NULL && IsWindow(s_overlay_hwnd)) {
 		LONG_PTR ex = GetWindowLongPtrW(s_overlay_hwnd, GWL_EXSTYLE);
 		LONG_PTR new_ex = s_hit_active
 		    ? (ex & ~WS_EX_TRANSPARENT)   // overlay catches clicks
 		    : (ex |  WS_EX_TRANSPARENT);  // OS routes around overlay
-		if (new_ex != ex)
+		if (new_ex != ex) {
 			SetWindowLongPtrW(s_overlay_hwnd, GWL_EXSTYLE, new_ex);
+			displayxr_log("[DisplayXR] hit_active=%d WS_EX_TRANSPARENT=%s\n",
+			              s_hit_active,
+			              (new_ex & WS_EX_TRANSPARENT) ? "ON" : "OFF");
+		}
 	}
 }
 
@@ -800,7 +1036,11 @@ shell_subclass_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
 	// Viewport update on resize/move — mirrors parent_subclass_proc logic
 	// but without overlay HWND (shell mode has no overlay).
-	if (msg == WM_SIZE) {
+	//
+	// Skip in transparent overlay mode (#57): Unity is moved off-screen so
+	// its client_origin would be (-32000,-32000); the overlay's own
+	// WM_MOVE/WM_SIZE in overlay_wnd_proc pushes viewport coords instead.
+	if (msg == WM_SIZE && !s_overlay_is_toplevel) {
 		int w = LOWORD(lParam);
 		int h = HIWORD(lParam);
 		if (w > 0 && h > 0) {
@@ -811,7 +1051,7 @@ shell_subclass_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 				(int32_t)client_origin.x, (int32_t)client_origin.y);
 		}
 	}
-	if (msg == WM_MOVE) {
+	if (msg == WM_MOVE && !s_overlay_is_toplevel) {
 		POINT client_origin = {0, 0};
 		ClientToScreen(hwnd, &client_origin);
 		DisplayXRState *state = displayxr_get_state();
