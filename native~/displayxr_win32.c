@@ -165,22 +165,31 @@ find_unity_hwnd(void)
 // Standalone mode: overlay window + parent subclass
 // ============================================================================
 
-// Forward a click that arrived at the overlay in a transparent zone to the
-// next visible top-level window at the cursor. Defensive fallback for the
-// case where WS_EX_TRANSPARENT routes hover past our overlay but click
-// messages still land here (a known partial-honor case for non-layered
-// windows). We can't add WS_EX_LAYERED because it breaks DComp + flip-model
-// swapchain rendering, so we synthesize click delivery ourselves.
+// Forward a click the overlay caught in a transparent zone (Approach C,
+// #57) to the actual deepest input-eligible control under the cursor —
+// e.g., Notepad's RichEditD2DPT child, NOT Notepad's outer frame.
+// PostMessaging to the frame doesn't move the caret; only the deepest
+// child does.
 //
-// FindWindowExW(NULL, prev, ...) iterates top-level windows in z-order
-// top-to-bottom, so the first match below us at the cursor position is the
-// correct target. We skip our own overlay HWND, our cloaked-and-off-screen
-// Unity HWND, anything invisible, anything cloaked, and other
-// WS_EX_TRANSPARENT windows (recursively click-through).
+// Two-stage resolution:
+//   1. Iterate top-level windows in z-order (FindWindowExW). Skip our
+//      overlay, our cloaked Unity HWND, anything else in our process
+//      (the runtime's DComp visual host, class DisplayXRD3D11), and
+//      cloaked / WS_EX_TRANSPARENT windows. Pick the first whose rect
+//      contains the cursor — that's the underlying app's top-level frame.
+//      We use iteration rather than WindowFromPoint because Approach C
+//      makes our WM_NCHITTEST return HTCLIENT, and that overrides any
+//      WS_EX_TRANSPARENT toggle we'd try to hide behind for the call.
+//   2. Recursively descend with ChildWindowFromPointEx until we hit a
+//      leaf — that's the actual control (edit field, button, etc.) the
+//      user is clicking on.
 //
-// NOT used for WM_MOUSEMOVE — the OS already routes hover correctly past
-// our overlay, and forwarding moves here would generate redundant message
-// floods on the underlying window.
+// Activation: SetForegroundWindow on the top-level frame so the deepest
+// control takes focus. We have SFW permission because we are the
+// foreground process (we just received the click in our wndproc).
+//
+// NOT used for WM_MOUSEMOVE — would flood the underlying window per
+// frame. Hover is handled separately in overlay_wnd_proc.
 static void
 forward_click_to_underlying_window(UINT msg, WPARAM wParam)
 {
@@ -189,63 +198,266 @@ forward_click_to_underlying_window(UINT msg, WPARAM wParam)
 		return;
 
 	HWND unity = find_unity_hwnd();
-	HWND target = NULL;
-	HWND hwnd = NULL;
-	while ((hwnd = FindWindowExW(NULL, hwnd, NULL, NULL)) != NULL) {
-		if (hwnd == s_overlay_hwnd || hwnd == unity)
+	DWORD our_pid = GetCurrentProcessId();
+
+	// Stage 1: pick top-level frame.
+	HWND root = NULL;
+	HWND it = NULL;
+	while ((it = FindWindowExW(NULL, it, NULL, NULL)) != NULL) {
+		if (it == s_overlay_hwnd || it == unity)
 			continue;
-		if (!IsWindowVisible(hwnd))
+		if (!IsWindowVisible(it))
+			continue;
+		DWORD wpid = 0;
+		GetWindowThreadProcessId(it, &wpid);
+		if (wpid == our_pid)
 			continue;
 		BOOL cloaked = FALSE;
-		if (SUCCEEDED(DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED,
+		if (SUCCEEDED(DwmGetWindowAttribute(it, DWMWA_CLOAKED,
 		                                    &cloaked, sizeof(cloaked)))
 		    && cloaked)
 			continue;
-		DWORD ex = (DWORD)GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+		DWORD ex = (DWORD)GetWindowLongPtrW(it, GWL_EXSTYLE);
 		if (ex & WS_EX_TRANSPARENT)
 			continue;
 		RECT rc;
-		if (!GetWindowRect(hwnd, &rc))
+		if (!GetWindowRect(it, &rc))
 			continue;
 		if (cursor.x < rc.left || cursor.x >= rc.right ||
 		    cursor.y < rc.top  || cursor.y >= rc.bottom)
 			continue;
-		target = hwnd;
+		root = it;
 		break;
 	}
 
-	if (target == NULL) {
-		displayxr_log("[DisplayXR] forward_click: no underlying window at cursor (%d,%d) for msg=0x%04X\n",
+	if (root == NULL) {
+		displayxr_log("[DisplayXR] forward_click: no underlying top-level at (%d,%d) for msg=0x%04X\n",
 		              (int)cursor.x, (int)cursor.y, (unsigned)msg);
 		return;
 	}
 
-	POINT client_pt = cursor;
-	ScreenToClient(target, &client_pt);
+	// Stage 2: recursively descend to the deepest non-transparent,
+	// visible, enabled child at the cursor. ChildWindowFromPointEx
+	// only goes one level — loop until we stop descending.
+	HWND deepest = root;
+	for (int i = 0; i < 16; i++) {
+		POINT cl = cursor;
+		ScreenToClient(deepest, &cl);
+		HWND child = ChildWindowFromPointEx(deepest, cl,
+		                                    CWP_SKIPINVISIBLE |
+		                                    CWP_SKIPDISABLED |
+		                                    CWP_SKIPTRANSPARENT);
+		if (child == NULL || child == deepest)
+			break;
+		deepest = child;
+	}
 
+	POINT client_pt = cursor;
+	ScreenToClient(deepest, &client_pt);
+
+	// Activate the top-level frame on press messages so the focus
+	// transitions cleanly and the deepest control's caret/focus engages.
 	if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN) {
-		SetForegroundWindow(target);
+		BOOL ok = SetForegroundWindow(root);
+		DWORD err = ok ? 0 : GetLastError();
+		displayxr_log("[DisplayXR] forward_click: SetForegroundWindow(root=%p) ok=%d err=%lu\n",
+		              (void *)root, ok ? 1 : 0,
+		              (unsigned long)err);
 	}
 
 	LPARAM client_lp = MAKELPARAM((WORD)client_pt.x, (WORD)client_pt.y);
-	PostMessageW(target, msg, wParam, client_lp);
+	PostMessageW(deepest, msg, wParam, client_lp);
 
-	wchar_t cls[64] = {0};
-	GetClassNameW(target, cls, 63);
-	displayxr_log("[DisplayXR] forward_click: msg=0x%04X cursor=(%d,%d) → hwnd=%p class=%ls client=(%d,%d)\n",
+	wchar_t root_cls[64]    = {0};
+	wchar_t deepest_cls[64] = {0};
+	DWORD deepest_pid = 0;
+	GetClassNameW(root, root_cls, 63);
+	GetClassNameW(deepest, deepest_cls, 63);
+	GetWindowThreadProcessId(deepest, &deepest_pid);
+	displayxr_log("[DisplayXR] forward_click: msg=0x%04X cursor=(%d,%d) root=%p[%ls] deepest=%p[%ls] client=(%d,%d) pid=%lu\n",
 	              (unsigned)msg, (int)cursor.x, (int)cursor.y,
-	              (void *)target, cls, (int)client_pt.x, (int)client_pt.y);
+	              (void *)root, root_cls,
+	              (void *)deepest, deepest_cls,
+	              (int)client_pt.x, (int)client_pt.y,
+	              (unsigned long)deepest_pid);
+}
+
+// ============================================================================
+// Click-through diagnostic instrumentation (issue #57 session 5)
+//
+// Cross-process click-through is currently broken: WS_EX_TRANSPARENT is
+// toggled correctly on the overlay HWND, Unity is parked off-screen, yet
+// clicks in transparent zones don't reach the underlying app and the
+// forward_click_to_underlying_window fallback never fires either. The
+// click is going *somewhere* and we need to find out where before
+// changing any behavior. The two probes below report:
+//
+//   1. WH_MOUSE_LL (global low-level mouse hook): fires before any
+//      window's wndproc, so we can log WindowFromPoint(cursor) — the
+//      OS's actual hit-test result — for every button event.
+//   2. Entry log at the top of overlay_wnd_proc's button handlers (in the
+//      function below): fires iff the OS dispatched the message to us,
+//      with a live re-read of WS_EX_TRANSPARENT (proves whether the OS
+//      honored the bit at this exact dispatch).
+//
+// Both write to displayxr_log with [LLMouse] / [OvlWnd] prefixes for
+// easy grep. See docs~/roadmap/transparent-overlay-handoff.md
+// "Click-through investigation playbook" and the session-5 plan in
+// .claude/plans/.
+// ============================================================================
+
+static HHOOK         s_ll_mouse_hook    = NULL;
+static volatile LONG s_ll_mouse_seq     = 0;
+static DWORD         s_ll_install_tid   = 0;
+
+static const char *
+ll_msg_name(UINT m)
+{
+	switch (m) {
+	case WM_LBUTTONDOWN:   return "WM_LBUTTONDOWN";
+	case WM_LBUTTONUP:     return "WM_LBUTTONUP";
+	case WM_LBUTTONDBLCLK: return "WM_LBUTTONDBLCLK";
+	case WM_RBUTTONDOWN:   return "WM_RBUTTONDOWN";
+	case WM_RBUTTONUP:     return "WM_RBUTTONUP";
+	case WM_MBUTTONDOWN:   return "WM_MBUTTONDOWN";
+	case WM_MBUTTONUP:     return "WM_MBUTTONUP";
+	default:               return "WM_OTHER";
+	}
+}
+
+static LRESULT CALLBACK
+displayxr_ll_mouse_proc(int nCode, WPARAM wParam, LPARAM lParam)
+{
+	// Win32 contract: anything other than HC_ACTION must chain immediately.
+	if (nCode != HC_ACTION)
+		return CallNextHookEx(NULL, nCode, wParam, lParam);
+
+	// Button events only. Skip WM_MOUSEMOVE / WM_MOUSEWHEEL — global LL
+	// hook fires per pixel of cursor motion across every desktop process,
+	// and Windows silently unhooks slow callbacks (LowLevelHooksTimeout,
+	// default 300 ms; HKCU\Control Panel\Desktop). Keep the hot path tight.
+	UINT msg = (UINT)wParam;
+	if (msg != WM_LBUTTONDOWN && msg != WM_LBUTTONUP &&
+	    msg != WM_RBUTTONDOWN && msg != WM_RBUTTONUP &&
+	    msg != WM_MBUTTONDOWN && msg != WM_MBUTTONUP)
+		return CallNextHookEx(NULL, nCode, wParam, lParam);
+
+	MSLLHOOKSTRUCT *p = (MSLLHOOKSTRUCT *)lParam;
+	HWND target  = WindowFromPoint(p->pt);
+	HWND root    = (target != NULL) ? GetAncestor(target, GA_ROOT) : NULL;
+	HWND unity   = find_unity_hwnd();
+	DWORD our_pid = GetCurrentProcessId();
+
+	wchar_t cls[64]   = {0};
+	wchar_t title[65] = {0};
+	DWORD target_pid = 0;
+	if (target != NULL) {
+		GetClassNameW(target, cls, 63);
+		GetWindowThreadProcessId(target, &target_pid);
+		// Use SendMessageTimeoutW(WM_GETTEXT) instead of GetWindowTextW —
+		// for cross-process targets, GetWindowTextW sends a synchronous
+		// WM_GETTEXT to the target's message pump and blocks us
+		// indefinitely if the target is hung. SMTO_ABORTIFHUNG + 50 ms
+		// keeps the LL callback well under the 300 ms LowLevelHooksTimeout
+		// even when WindowFromPoint resolves to an unresponsive window.
+		DWORD_PTR got = 0;
+		SendMessageTimeoutW(target, WM_GETTEXT, 64, (LPARAM)title,
+		                    SMTO_ABORTIFHUNG | SMTO_BLOCK, 50, &got);
+	}
+
+	int is_overlay = (target == s_overlay_hwnd || root == s_overlay_hwnd) ? 1 : 0;
+	int is_unity   = (unity != NULL && (target == unity || root == unity)) ? 1 : 0;
+
+	LONG seq = InterlockedIncrement(&s_ll_mouse_seq);
+	displayxr_log("[DisplayXR][LLMouse] seq=%ld tick=%lu msg=%s(0x%04X) pt=(%d,%d) "
+	              "hwnd=%p root=%p class='%ls' pid=%lu title='%ls' "
+	              "is_overlay=%d is_unity=%d our_pid=%lu\n",
+	              seq, (unsigned long)GetTickCount(),
+	              ll_msg_name(msg), (unsigned)msg,
+	              (int)p->pt.x, (int)p->pt.y,
+	              (void *)target, (void *)root,
+	              cls, (unsigned long)target_pid, title,
+	              is_overlay, is_unity, (unsigned long)our_pid);
+
+	// Observation only — never block delivery.
+	return CallNextHookEx(NULL, nCode, wParam, lParam);
+}
+
+static void
+displayxr_install_ll_mouse_hook(void)
+{
+	if (s_ll_mouse_hook != NULL)
+		return;
+
+	// WH_MOUSE_LL is global but the OS calls back on the install thread
+	// — and only as long as that thread pumps messages. The transparent
+	// overlay enable runs on Unity's main thread, which has a pump.
+	s_ll_install_tid = GetCurrentThreadId();
+	s_ll_mouse_hook  = SetWindowsHookExW(WH_MOUSE_LL,
+	                                     displayxr_ll_mouse_proc,
+	                                     GetModuleHandleW(NULL), 0);
+	if (s_ll_mouse_hook == NULL) {
+		displayxr_log("[DisplayXR][LLMouse] hook install FAILED tid=%lu err=%lu\n",
+		              (unsigned long)s_ll_install_tid,
+		              (unsigned long)GetLastError());
+	} else {
+		displayxr_log("[DisplayXR][LLMouse] hook installed hhk=%p tid=%lu result=ok\n",
+		              (void *)s_ll_mouse_hook,
+		              (unsigned long)s_ll_install_tid);
+	}
 }
 
 static LRESULT CALLBACK
 overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
+	// Diagnostic entry log for button events (issue #57 session 5). Fires
+	// iff the OS dispatched a button message to us — i.e., WS_EX_TRANSPARENT
+	// did NOT skip us in WindowFromPoint. Re-reads the live exstyle so we
+	// can prove whether the OS honored the bit at this exact dispatch (the
+	// existing toggle log only proves what we *set*). Pair the
+	// `ll_seq_at_entry` value with the [LLMouse] line of the same seq to
+	// see what WindowFromPoint resolved at the OS hit-test that preceded
+	// this dispatch. Not gated on WM_MOUSEMOVE — flooding risk and the
+	// handoff doc explicitly excluded MOUSEMOVE from forward_click.
+	if (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP ||
+	    msg == WM_LBUTTONDBLCLK ||
+	    msg == WM_RBUTTONDOWN || msg == WM_RBUTTONUP ||
+	    msg == WM_MBUTTONDOWN || msg == WM_MBUTTONUP) {
+		DWORD ex_now = (DWORD)GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+		POINT scr;
+		GetCursorPos(&scr);
+		displayxr_log("[DisplayXR][OvlWnd] msg=%s(0x%04X) hit_active=%d "
+		              "ws_ex_transparent=%d client=(%d,%d) screen=(%d,%d) "
+		              "ll_seq_at_entry=%ld\n",
+		              ll_msg_name(msg), (unsigned)msg, s_hit_active,
+		              (ex_now & WS_EX_TRANSPARENT) ? 1 : 0,
+		              GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam),
+		              (int)scr.x, (int)scr.y,
+		              (long)s_ll_mouse_seq);
+	}
+
 	switch (msg) {
 	case WM_NCHITTEST: {
-		// Per-pixel click-through: HTCLIENT inside the C#-supplied hit
-		// rect (cube AABB, coarse) AND s_hit_active is set (fine, from
-		// per-frame Physics.Raycast at the cursor in C#). Both gates
-		// must pass.
+		if (s_overlay_is_toplevel) {
+			// Approach C (#57 session 5): catch every click in the
+			// overlay rect and forward to the underlying app via
+			// SetForegroundWindow + PostMessage from our wndproc. This
+			// is the only way to get cross-process activation while we
+			// are the foreground process — letting the OS route past
+			// us via WS_EX_TRANSPARENT delivers the click but the OS
+			// won't transfer foreground to the target (verified with
+			// WH_MOUSE_LL: WindowFromPoint correctly resolved to
+			// Notepad's RichEditD2DPT, but Notepad never activated).
+			// We catch, we SFW(target), then we PostMessage — and the
+			// "foreground process / received last input" rule grants
+			// us SFW permission. Tradeoff: hover doesn't pass through
+			// to the underlying app's hover-states, only to Unity for
+			// cube interaction. Acceptable for the avatar use case.
+			return HTCLIENT;
+		}
+		// Opaque WS_CHILD path: rect-based click-through is correct
+		// (the runtime composites into the child and its parent stays
+		// opaque, so per-pixel click-through is the right primitive).
 		POINT pt = { GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
 		ScreenToClient(hwnd, &pt);
 		if (s_hit_active &&
@@ -310,7 +522,7 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		break;
 
 	// ----- mouse-move: drag overlay if active, else forward to Unity -----
-	case WM_MOUSEMOVE:
+	case WM_MOUSEMOVE: {
 		if (s_drag_active) {
 			POINT cur;
 			GetCursorPos(&cur);
@@ -320,13 +532,24 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 			             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 			return 0;
 		}
-		// fall through to forward
+		// Forward hover to Unity so cube hover-detection / cursor-state
+		// polling stays accurate. Do NOT call forward_click_to_underlying_window
+		// for WM_MOUSEMOVE — under Approach C the overlay catches every
+		// hover frame, and forwarding each one to the desktop app would
+		// flood it with synthetic mouse-move messages (session 4 lesson).
+		HWND unity_hover = find_unity_hwnd();
+		if (unity_hover != NULL)
+			PostMessageW(unity_hover, msg, wParam, lParam);
+		return 0;
+	}
 	case WM_LBUTTONDOWN: case WM_LBUTTONUP:
 	case WM_LBUTTONDBLCLK:
 	case WM_MBUTTONDOWN: case WM_MBUTTONUP: {
-		// Transparent zone: forward to the desktop window under the
-		// cursor. WS_EX_TRANSPARENT may have routed hover past us
-		// correctly but clicks still land here on non-layered windows.
+		// Transparent zone: forward the click to the underlying app
+		// (Approach C). forward_click handles SetForegroundWindow on
+		// press messages so the target activates and takes keyboard
+		// focus — required because we are the foreground process and
+		// the OS won't auto-transfer activation otherwise.
 		if (!s_hit_active) {
 			forward_click_to_underlying_window(msg, wParam);
 			return 0;
@@ -500,6 +723,12 @@ displayxr_get_app_main_view(void)
 	// WS_EX_NOACTIVATE keeps activation/foreground on Unity's (cloaked) HWND
 	// when the user clicks the overlay — otherwise Application.isFocused
 	// flips false and Unity stops processing input.
+	// WS_EX_TOPMOST keeps the avatar visually above the underlying app
+	// while we forward clicks/keyboard to that app via Approach C
+	// (#57 session 5). WS_EX_NOACTIVATE prevents click-on-cube from
+	// stealing focus from the underlying app — the C# side computes the
+	// raycast in screen space, and we PostMessage to Unity directly, so
+	// we never need foreground.
 	DWORD ex_style = transparent_mode
 	    ? (DWORD)(WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)
 	    : (DWORD)(WS_EX_TRANSPARENT);
@@ -788,6 +1017,11 @@ displayxr_set_transparent_overlay(int enabled, uint32_t color_key, int topmost)
 				              (int)(wr.right - wr.left), (int)(wr.bottom - wr.top));
 			}
 		}
+
+		// Install global low-level mouse hook for click-routing
+		// diagnostics. Idempotent; never uninstalled. See the
+		// instrumentation block above displayxr_set_overlay_hit_active.
+		displayxr_install_ll_mouse_hook();
 	} else if (!enabled && s_overlay_active) {
 		// Pick the rect Unity should restore to before uncloaking. If the
 		// overlay still exists, use its current screen rect — the user
@@ -854,23 +1088,18 @@ displayxr_set_overlay_hit_active(int active)
 		return;
 	s_hit_active = new_active;
 
-	// Toggle WS_EX_TRANSPARENT on the overlay HWND to match. With the flag
-	// set (cursor off cube) the OS skips the overlay in WindowFromPoint
-	// hit-testing, routing the message to the next window at the cursor's
-	// screen position. Combined with Unity moved off-screen (Approach A from
-	// #57), that's whatever desktop app the user actually sees there.
-	if (s_overlay_is_toplevel && s_overlay_hwnd != NULL && IsWindow(s_overlay_hwnd)) {
-		LONG_PTR ex = GetWindowLongPtrW(s_overlay_hwnd, GWL_EXSTYLE);
-		LONG_PTR new_ex = s_hit_active
-		    ? (ex & ~WS_EX_TRANSPARENT)   // overlay catches clicks
-		    : (ex |  WS_EX_TRANSPARENT);  // OS routes around overlay
-		if (new_ex != ex) {
-			SetWindowLongPtrW(s_overlay_hwnd, GWL_EXSTYLE, new_ex);
-			displayxr_log("[DisplayXR] hit_active=%d WS_EX_TRANSPARENT=%s\n",
-			              s_hit_active,
-			              (new_ex & WS_EX_TRANSPARENT) ? "ON" : "OFF");
-		}
-	}
+	// Approach C (#57 session 5): the overlay always catches clicks
+	// (WM_NCHITTEST returns HTCLIENT), and overlay_wnd_proc dispatches
+	// based on s_hit_active — cube path PostMessages to Unity, transparent
+	// zone path calls forward_click_to_underlying_window which does
+	// SetForegroundWindow + PostMessage on the target. We no longer
+	// toggle WS_EX_TRANSPARENT: that path delivered messages to the
+	// underlying window but couldn't transfer foreground from us, so
+	// Notepad-style apps received the click without activating (no caret,
+	// no keyboard). Logging the hit_active transition is kept for log
+	// correlation with the [LLMouse] / [OvlWnd] probes.
+	displayxr_log("[DisplayXR] hit_active=%d (Approach C — overlay always catches)\n",
+	              s_hit_active);
 }
 
 void
