@@ -3,6 +3,7 @@
 
 using UnityEngine;
 using UnityEngine.Events;
+using UnityEngine.Serialization;
 #if HAS_INPUT_SYSTEM
 using UnityEngine.InputSystem;
 using UnityEngine.InputSystem.LowLevel;
@@ -53,7 +54,29 @@ namespace DisplayXR
                  "pixels before Present so DComp/DWM blends per-pixel. " +
                  "Magenta (1,0,1) is the standard pick — pure primary, no " +
                  "sRGB round-trip drift, unlikely to appear in real content.")]
-        public Color chromaKeyColor = new Color(1f, 0f, 1f, 0f);
+        [SerializeField, FormerlySerializedAs("chromaKeyColor")]
+        private Color m_ChromaKeyColor = new Color(1f, 0f, 1f, 0f);
+
+        /// <summary>
+        /// Color rendered in transparent regions. Assignment at runtime is
+        /// safe: the setter immediately re-pushes the new color to both the
+        /// camera clear and the native overlay (LWA_COLORKEY + win32 binding),
+        /// so all three sides — camera clear, layered-window key, runtime
+        /// post-weave — stay in sync without toggling the component.
+        ///
+        /// If you change this from the Inspector at runtime, OnValidate
+        /// re-applies. Pre-build / authoring-time changes are picked up by
+        /// OnEnable as before.
+        /// </summary>
+        public Color chromaKeyColor
+        {
+            get => m_ChromaKeyColor;
+            set
+            {
+                m_ChromaKeyColor = value;
+                ApplyChromaKey();
+            }
+        }
 
         [Header("Window")]
 
@@ -440,6 +463,40 @@ namespace DisplayXR
                 m_Camera.backgroundColor = m_SavedBackgroundColor;
                 m_SavedRestore = false;
             }
+        }
+
+        // Re-apply the current chroma-key color to the camera clear and the
+        // native overlay. Idempotent — safe to call any time. Early-outs
+        // before OnEnable has run (m_SavedRestore is false): OnEnable will
+        // pick up m_ChromaKeyColor itself and the explicit re-push isn't
+        // needed.
+        private void ApplyChromaKey()
+        {
+            if (!m_SavedRestore || m_Camera == null)
+                return;
+
+            m_Camera.backgroundColor = m_ChromaKeyColor;
+
+#if UNITY_STANDALONE_WIN
+            // Editor preview path skips the layered-window plumbing entirely
+            // (see OnEnable); same gate here.
+            if (Application.isEditor)
+                return;
+            if (!enabled || !gameObject.activeInHierarchy)
+                return;
+            DisplayXRNative.displayxr_set_transparent_overlay(
+                1, ColorRefFromColor(m_ChromaKeyColor),
+                alwaysOnTop ? 1 : 0);
+#endif
+        }
+
+        // Inspector-driven changes go straight to the SerializeField backing
+        // and bypass the property setter, so re-apply manually during Play.
+        // Edit-mode changes fall through to the OnEnable path on next Play.
+        void OnValidate()
+        {
+            if (Application.isPlaying)
+                ApplyChromaKey();
         }
 
         // Pack a Unity Color into a Windows COLORREF (0x00BBGGRR).

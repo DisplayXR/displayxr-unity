@@ -25,6 +25,25 @@ namespace DisplayXR.Samples
         [Tooltip("Breathing animation frequency in Hz.")]
         public float breathRate = 0.4f;
 
+        // Chroma-key color used for both the camera clear (LWA_COLORKEY
+        // punch-through) and the runtime's post-weave alpha-conversion pass
+        // (spec v5). Near-mid-gray instead of magenta so silhouette-edge
+        // halos blend invisibly into typical desktop / photo backgrounds.
+        // Trade-off: avatar pixels that land exactly on this color go
+        // transparent — keep the avatar palette clear of (128,127,129).
+        static readonly Color s_ChromaKey = new Color(128f / 255f, 127f / 255f, 129f / 255f, 0f);
+
+        // Must fire BEFORE xrCreateSession so the runtime sees the chroma
+        // color when the win32 window-binding extension is wired up;
+        // RequestTransparentSession + RequestChromaKey both write to plugin
+        // shared state that's read in xrCreateSession.
+        [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
+        static void EnableTransparentSession()
+        {
+            DisplayXR.DisplayXRTransparentOverlay.RequestTransparentSession();
+            DisplayXR.DisplayXRTransparentOverlay.RequestChromaKey(s_ChromaKey);
+        }
+
         private GameObject m_Capsule;
         private Vector3 m_BaseScale;
 
@@ -64,10 +83,13 @@ namespace DisplayXR.Samples
             light.type = LightType.Directional;
             lightGo.transform.rotation = Quaternion.Euler(50f, -30f, 0f);
 
-            // Transparent overlay + chroma-key background.
+            // Transparent overlay + chroma-key background. Override the
+            // component default (magenta) with the same gray we requested
+            // statically above — both sides must agree on the key color.
             var overlay = cam.gameObject.GetComponent<DisplayXR.DisplayXRTransparentOverlay>();
             if (overlay == null)
                 overlay = cam.gameObject.AddComponent<DisplayXR.DisplayXRTransparentOverlay>();
+            overlay.chromaKeyColor = s_ChromaKey;
             overlay.clickableRenderers = new Renderer[] { m_Capsule.GetComponent<Renderer>() };
         }
 
