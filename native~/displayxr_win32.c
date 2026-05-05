@@ -45,6 +45,13 @@ static int s_class_registered = 0;
 // reposition the overlay in screen coords vs sizing within parent client.
 static int s_overlay_is_toplevel = 0;
 
+// Accumulated raw mouse-wheel delta on the overlay (Win32 WHEEL_DELTA units;
+// 120 per notch). WM_MOUSEWHEEL atomically adds; C# reads + zeros via
+// displayxr_consume_overlay_wheel_delta. Used by apps to drive zoom or
+// other interactions — the plugin no longer self-resizes the overlay on
+// wheel events (that was experimental; removed v1.2.2).
+static volatile LONG s_overlay_wheel_accum = 0;
+
 // ============================================================================
 // Transparent overlay mode (issue #57): chroma-key + WS_EX_LAYERED on the
 // parent (Unity top-level) HWND. Mutually exclusive with shell mode.
@@ -587,48 +594,26 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		return 0;
 	}
 
-	// ----- mouse wheel: resize the overlay (transparent mode only) -----
+	// ----- mouse wheel: accumulate delta for the C# layer to consume -----
 	// WM_MOUSEWHEEL is delivered by the OS to the FOCUSED window (not by
 	// cursor position), so this only fires when our overlay is foreground.
 	// After click-through to e.g. Notepad, scroll naturally goes to Notepad
-	// instead of resizing the avatar — exactly the behavior we want.
-	// Uniform scale around the current window center keeps the cube
-	// visually anchored. WM_SIZE / WM_MOVE handlers below propagate the
-	// new geometry to the runtime via displayxr_set_viewport_size_native.
+	// — exactly what we want.
+	//
+	// v1.2.0 / v1.2.1 resized the overlay HWND here (10% per notch). That
+	// was experimental and removed in v1.2.2 — apps now read the delta via
+	// displayxr_consume_overlay_wheel_delta() and decide what to do (e.g.
+	// drive a DisplayXRDisplay rig's virtualDisplayHeight to zoom-in-window,
+	// rotate the avatar, scroll a UI, etc.). We still consume the message
+	// (return 0) so it doesn't bubble to underlying apps in cases where
+	// our overlay isn't the foreground window's intended target.
 	case WM_MOUSEWHEEL: {
 		if (!s_overlay_is_toplevel)
-			break; // opaque WS_CHILD mode: Unity's title bar handles resize
+			break; // opaque WS_CHILD mode: let Unity's input pipeline see it
 
 		short delta = GET_WHEEL_DELTA_WPARAM(wParam);
-		if (delta == 0)
-			return 0;
-
-		RECT wr;
-		GetWindowRect(hwnd, &wr);
-		int cur_w = wr.right - wr.left;
-		int cur_h = wr.bottom - wr.top;
-		int cx = (wr.left + wr.right) / 2;
-		int cy = (wr.top + wr.bottom) / 2;
-
-		// 10% per WHEEL_DELTA notch.
-		float factor = 1.0f + ((float)delta / (float)WHEEL_DELTA) * 0.1f;
-		int new_w = (int)(cur_w * factor);
-		int new_h = (int)(cur_h * factor);
-
-		// Floor at 400x400 — much smaller and the SR weaver gets unhappy
-		// with the lenticular phase-snapping math at sub-display sizes.
-		if (new_w < 400 || new_h < 400) {
-			float fw = 400.0f / (float)new_w;
-			float fh = 400.0f / (float)new_h;
-			float f  = fw > fh ? fw : fh;
-			new_w = (int)(new_w * f);
-			new_h = (int)(new_h * f);
-		}
-
-		int new_x = cx - new_w / 2;
-		int new_y = cy - new_h / 2;
-		SetWindowPos(hwnd, NULL, new_x, new_y, new_w, new_h,
-		             SWP_NOZORDER | SWP_NOACTIVATE);
+		if (delta != 0)
+			InterlockedExchangeAdd(&s_overlay_wheel_accum, delta);
 		return 0;
 	}
 
@@ -1227,6 +1212,13 @@ displayxr_get_overlay_pointer(int *clientX, int *clientY, int *buttons)
 		if (s_vkey_state[VK_MBUTTON] & 0x8000) b |= 4;
 		*buttons = b;
 	}
+}
+
+int
+displayxr_consume_overlay_wheel_delta(void)
+{
+	// Atomic read-and-zero. Win32 raw delta units (120 per notch).
+	return (int)InterlockedExchange(&s_overlay_wheel_accum, 0);
 }
 
 // ============================================================================

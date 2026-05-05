@@ -465,6 +465,29 @@ namespace DisplayXR
             }
         }
 
+        /// <summary>
+        /// Read + consume the overlay's accumulated mouse-wheel delta since
+        /// the last call (Win32 raw units, 120 per notch; positive = wheel
+        /// forward). Returns 0 in the editor or when no transparent overlay
+        /// is active.
+        ///
+        /// The plugin no longer resizes the overlay window on wheel events
+        /// (that was experimental in v1.2.0/v1.2.1 and removed in v1.2.2).
+        /// Apps poll this value each frame and decide what to do — common
+        /// patterns: drive a `DisplayXRDisplay` rig's `virtualDisplayHeight`
+        /// to zoom in-window, scroll a 2D UI canvas, or rotate the avatar.
+        /// </summary>
+        public int ConsumeWheelDelta()
+        {
+#if UNITY_STANDALONE_WIN
+            if (Application.isEditor)
+                return 0;
+            return DisplayXRNative.displayxr_consume_overlay_wheel_delta();
+#else
+            return 0;
+#endif
+        }
+
         // Re-apply the current chroma-key color to the camera clear and the
         // native overlay. Idempotent — safe to call any time. Early-outs
         // before OnEnable has run (m_SavedRestore is false): OnEnable will
@@ -535,8 +558,8 @@ namespace DisplayXR
         {
             ray = new Ray(Vector3.zero, Vector3.forward);
             // Use the overlay's actual client size (not Screen.*, which
-            // reflects Unity's frozen off-screen HWND). After scroll-resize
-            // the overlay rect changes — without this, cursor → NDC drifts
+            // reflects Unity's frozen off-screen HWND). The overlay rect
+            // can change at runtime — without this, cursor → NDC drifts
             // and the ray misses the cube collider.
             float sw = Mathf.Max(1, overlayW);
             float sh = Mathf.Max(1, overlayH);

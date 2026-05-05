@@ -53,6 +53,17 @@ Full chroma-key rationale, math, and ACT (anti-crosstalk) interactions:
 - No speckle holes inside the capsule (would mean avatar pixels are landing
   exactly on `(128, 127, 129)` — adjust palette or tweak the chroma color).
 
+## Mouse-wheel handling (v1.2.2+)
+
+The plugin previously resized the overlay window on scroll-wheel events as a
+quick test. That was removed in v1.2.2. To use the wheel for anything, poll
+`overlay.ConsumeWheelDelta()` each frame — the plugin still consumes the
+raw `WM_MOUSEWHEEL` (so it doesn't bubble to the underlying app when the
+overlay is foreground) and accumulates the delta for you to read. Common
+pattern: drive a `DisplayXRDisplay` rig's `virtualDisplayHeight` to get a
+zoom-in-window effect (smaller vHeight = more zoom) without changing the
+window size. See `displayxr-unity-test-transparent` for a working example.
+
 ## Known limitations (v1)
 
 - Rectangular hit-test (bounding box) only. Per-pixel alpha-mask hit-testing
