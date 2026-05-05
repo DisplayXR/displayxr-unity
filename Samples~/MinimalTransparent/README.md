@@ -211,7 +211,7 @@ OS / DWM  (Windows)
 | Specific renderers receive clicks | Set `overlay.clickableRenderers = new[] { ... }` to your renderer array; everything else falls through to the desktop |
 | Click handler | `overlay.onPointerClick.AddListener(r => Debug.Log($"clicked {r.name}"))` |
 | Drag the cube | Read `overlay.PointerPosition` and `overlay.PointerDelta` each frame in your own `MonoBehaviour.Update` (see how `DragRotateCube` does it in the test-transparent project) |
-| Resize the cube on scroll wheel | Already wired in the native overlay; controlled by the plugin's overlay HWND, no app code needed |
+| Zoom on scroll wheel | Read `overlay.ConsumeWheelDelta()` each frame (returns Win32 raw delta, 120 per notch) and apply to your `DisplayXRDisplay.virtualDisplayHeight` — smaller vHeight = more zoom. Runs at the rig level, so the window stays put |
 | Replace the cube with your own model | Drop your prefab in the scene — the `FindAnyObjectByType<MeshRenderer>` guard in `Install()` will skip the placeholder cube. Wire `overlay.clickableRenderers` to your model's renderer(s) |
 
 ## What this sample deliberately does NOT do

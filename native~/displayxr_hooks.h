@@ -205,11 +205,11 @@ DISPLAYXR_EXPORT void displayxr_set_overlay_hit_active(int active);
 /// from the plugin DLL (whose IAT is not patched) and reflects actual OS state.
 DISPLAYXR_EXPORT int displayxr_is_our_process_foreground(void);
 
-/// (issue #57) Read the overlay's current client size in pixels. After scroll-
-/// resize the overlay's screen rect changes but Unity's Screen.width/height
-/// stay frozen at the off-screen Unity HWND's dimensions — C# raycast code
-/// must use these values for cursor → NDC conversion, not Screen.*.
-/// Returns (0, 0) if no overlay HWND.
+/// (issue #57) Read the overlay's current client size in pixels. The
+/// overlay's screen rect can change at runtime (e.g. an app resizing it
+/// itself) but Unity's Screen.width/height stay frozen at the off-screen
+/// Unity HWND's dimensions — C# raycast code must use these values for
+/// cursor → NDC conversion, not Screen.*. Returns (0, 0) if no overlay HWND.
 DISPLAYXR_EXPORT void displayxr_get_overlay_size(int *width, int *height);
 
 /// (issue #57) Read cursor position (overlay-client coords, top-left origin)
@@ -220,6 +220,14 @@ DISPLAYXR_EXPORT void displayxr_get_overlay_size(int *width, int *height);
 /// right, 2 = middle.
 DISPLAYXR_EXPORT void displayxr_get_overlay_pointer(int *clientX, int *clientY,
                                                     int *buttons);
+
+/// (v1.2.2) Atomically read + zero the overlay's accumulated mouse-wheel
+/// delta. Returns Win32 raw units (120 per notch; positive = wheel forward).
+/// Always 0 in opaque mode (no transparent overlay). The plugin no longer
+/// self-resizes the overlay on wheel events — apps consume the delta here
+/// and decide what to do (e.g. drive a DisplayXRDisplay rig's
+/// virtualDisplayHeight for zoom-in-window).
+DISPLAYXR_EXPORT int displayxr_consume_overlay_wheel_delta(void);
 #endif // _WIN32
 
 #ifdef __cplusplus

@@ -76,6 +76,14 @@ int displayxr_is_our_process_foreground(void);
 /// @param buttons Bit 0 = left, 1 = right, 2 = middle.
 void displayxr_get_overlay_pointer(int *clientX, int *clientY, int *buttons);
 
+/// (v1.2.2) Atomically read + zero the overlay's accumulated mouse-wheel
+/// delta. Returns Win32 raw units (120 per notch; positive = wheel forward).
+/// Always 0 in opaque mode (s_overlay_is_toplevel == 0). The plugin no
+/// longer self-resizes the overlay on wheel events — apps consume the
+/// delta here and choose what to do (e.g. drive a DisplayXRDisplay rig's
+/// virtualDisplayHeight to zoom-in-window).
+int displayxr_consume_overlay_wheel_delta(void);
+
 #ifdef __cplusplus
 }
 #endif

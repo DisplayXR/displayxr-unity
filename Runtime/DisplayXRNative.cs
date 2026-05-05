@@ -415,6 +415,16 @@ namespace DisplayXR
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern void displayxr_get_overlay_pointer(
             out int clientX, out int clientY, out int buttons);
+
+        /// <summary>
+        /// (v1.2.2) Atomically read + zero the overlay's accumulated mouse-
+        /// wheel delta. Returns Win32 raw units (120 per notch; positive =
+        /// wheel forward). Always 0 in opaque mode (no transparent overlay).
+        /// The plugin no longer self-resizes the overlay on wheel events;
+        /// apps consume this value and decide what to do with it.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int displayxr_consume_overlay_wheel_delta();
 #endif
 
     }
