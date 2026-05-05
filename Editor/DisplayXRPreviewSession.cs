@@ -1027,7 +1027,7 @@ namespace DisplayXR.Editor
             {
                 // Local development build
                 Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),
-                    "Documents/GitHub/displayxr-runtime-pvt/_package/DisplayXR-macOS/openxr_displayxr.json"),
+                    "Documents/GitHub/displayxr-runtime/_package/DisplayXR-macOS/openxr_displayxr.json"),
                 // System-wide active runtime
                 "/etc/xdg/openxr/1/active_runtime.json",
                 Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.UserProfile),

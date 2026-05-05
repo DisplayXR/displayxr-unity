@@ -64,7 +64,7 @@ documentation structure with ADRs.
 
 ### Changed
 - Repo references updated from `dfattal/openxr-3d-display` to
-  `DisplayXR/displayxr-runtime-pvt` following GitHub org transfer
+  `DisplayXR/displayxr-runtime` following GitHub org transfer
 - CI triggers restricted to PR validation and tag pushes — no more triggers on
   main branch (devs use local builds for daily iteration)
 - Shell mode: Kooima viewport updates on window resize/move (#46)

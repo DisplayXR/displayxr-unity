@@ -16,7 +16,7 @@ those regions, the weaver passes the magic color through unchanged. Then
 pixels through to the desktop and route mouse input below.
 
 Full chroma-key rationale, math, and ACT (anti-crosstalk) interactions:
-`displayxr-runtime-pvt:docs/reference/chroma-key-transparent-overlay.md`.
+`displayxr-runtime:docs/reference/chroma-key-transparent-overlay.md`.
 
 ## What's included
 

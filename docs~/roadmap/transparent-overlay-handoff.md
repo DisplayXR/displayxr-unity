@@ -129,7 +129,7 @@ will save time on future input issues.
 
 ### What's working (verified on hardware, Leia SR + Unity 6 + D3D12)
 
-- **Visual transparency**: cube renders above desktop with per-pixel alpha. Faint magenta silhouette fringe (only fixable by `displayxr-runtime-pvt#190`).
+- **Visual transparency**: cube renders above desktop with per-pixel alpha. Faint magenta silhouette fringe (only fixable by `displayxr-runtime#190`).
 - **Cube click detection**: cyclopean Kooima ray (built by averaging left + right view+projection matrices from `m_Feature.GetStereoMatrices`) inverse-projects cursor → `Physics.Raycast` against `clickableRenderers`. Hit region matches the cube silhouette at the user's stereo-fused perceived position. No more disparity-driven offset.
 - **Right-click drag the cube to move the window**: `overlay_wnd_proc` `WM_RBUTTONDOWN` captures, `WM_MOUSEMOVE` calls `SetWindowPos` on the overlay HWND directly (not Unity — Unity stays off-screen), `WM_RBUTTONUP` releases.
 - **Approach A (Unity off-screen)**: in `displayxr_set_transparent_overlay` enable path we save Unity's pre-cloak rect, snap the overlay to that rect, then `SetWindowPos(unity_hwnd, NULL, -32000, -32000, w, h, SWP_NOZORDER | SWP_NOACTIVATE)`. `parent_subclass_proc` and `shell_subclass_proc` skip viewport pushes from Unity's WM_MOVE/WM_SIZE in transparent mode (the off-screen position is meaningless for the runtime); the overlay's own WM_MOVE/WM_SIZE handlers push viewport coords using its actual screen rect. On disable we restore Unity to the overlay's current rect (so the windowed app appears where the avatar last was). All verified in `displayxr.log` via readback (`Moved Unity main window off-screen: requested (-32000,-32000 ...) readback (-32000,-32000 ...)`).
@@ -165,7 +165,7 @@ The next session should start by **instrumenting**, not adding code. Concrete st
 - `WS_EX_LAYERED` on the overlay alongside DComp — incompatible with `WS_EX_NOREDIRECTIONBITMAP`; would lose per-pixel alpha. Per MSDN, full hit-test transparency for `WS_EX_TRANSPARENT` requires `WS_EX_LAYERED`, but that's blocked here.
 - `SWP_FRAMECHANGED` on the WS_EX_TRANSPARENT toggle — added as a "flush the OS hit-test cache" defensive measure, then reverted. The exstyle readback confirms `SetWindowLongPtr` alone is sufficient; SWP_FRAMECHANGED was suspected of regressing hover and removed.
 - `forward_click_to_underlying_window` for `WM_MOUSEMOVE` — caused message floods on the underlying window when hover dipped into the wndproc. Restricted to button events only in session 4. Don't expand back to MOUSEMOVE without a strong reason.
-- Adding `WS_CAPTION` to overlay so DefWindowProc modal drag works — drag-stutter problem, separate issue, also blocked on `displayxr-runtime-pvt#193` (external drag API).
+- Adding `WS_CAPTION` to overlay so DefWindowProc modal drag works — drag-stutter problem, separate issue, also blocked on `displayxr-runtime#193` (external drag API).
 
 ## Test environment
 
@@ -217,7 +217,7 @@ typedef struct XrWin32WindowBindingCreateInfoEXT {
 
 Plugin populates both fields in two construction sites in `displayxr_hooks.cpp` (the `win32_inject_window_binding` helper used by D3D11/D3D12 backends, and the `xrCreateSession` chain-walking fallback).
 
-### Runtime side (`displayxr-runtime-pvt` branch `feature/workspace-extensions-2C`, local-only)
+### Runtime side (`displayxr-runtime` branch `feature/workspace-extensions-2C`, local-only)
 
 When `transparentBackgroundEnabled = XR_TRUE`:
 - D3D12: `comp_d3d12_target_create` switches to `IDXGIFactory2::CreateSwapChainForComposition` (HWND-less swapchain) + `FLIP_DISCARD` + `DXGI_ALPHA_MODE_PREMULTIPLIED`. Then `IDCompositionDevice → CreateTargetForHwnd(hwnd, TRUE) → CreateVisual → SetContent(swapchain) → SetRoot(visual) → Commit()`. Logs `Transparent HWND opt-in: DComp + flip-model swapchain (FLIP_DISCARD + PREMULTIPLIED, bc=3)`.
@@ -275,7 +275,7 @@ Logs:
 - Plugin: `C:\Users\Sparks i7 3080\Documents\Unity\DisplayXR-Test-Transparent-Build\displayxr.log` — look for `set_transparent_background: requested=1`, `set_transparent_chroma_key: color=0x00FF00FF`, `Injecting win32 window binding: ... transparentBackgroundEnabled=1, chromaKeyColor=0x00FF00FF`, `Created overlay HWND ... TOP-LEVEL WS_POPUP + NOREDIRECTIONBITMAP (transparent)`, `Cloaked Unity main window via DWMWA_CLOAK`, and the `dx parent` / `dx overlay` diagnostic dump.
 - Service: `%LOCALAPPDATA%\DisplayXR\DisplayXR_DisplayXR-test.exe.*.log` (most recent) — look for `Transparent HWND opt-in: DComp + flip-model swapchain` and `Post-weave chroma-key conversion enabled: 0x00FF00FF`.
 
-`gh` access works — issue lives at `DisplayXR/displayxr-runtime-pvt#191`. Read the full thread for design decisions; the latest comment from May 2 is the runtime author confirming the post-weave shader fix landed.
+`gh` access works — issue lives at `DisplayXR/displayxr-runtime#191`. Read the full thread for design decisions; the latest comment from May 2 is the runtime author confirming the post-weave shader fix landed.
 
 ## Next session — concrete tasks
 
@@ -286,8 +286,8 @@ Logs:
 
 ## Open issues elsewhere
 
-- `displayxr-runtime-pvt#190` — vendor request to Leia for alpha-respecting weaver. When that lands, plugin can drop magenta clear and use `chromaKeyColor = 0`; runtime relies on per-pixel alpha straight through, eliminating the silhouette fringe entirely.
-- `displayxr-runtime-pvt#193` — app-driven "external drag" API for window movement with phase-snap. Required to eliminate the right-drag 3D stutter in transparent overlay mode (and to re-enable real-time Kooima during the standalone preview's parked SC_MOVE intercept). See CLAUDE.md "Known Issues" for the failure modes that block plugin-only solutions.
+- `displayxr-runtime#190` — vendor request to Leia for alpha-respecting weaver. When that lands, plugin can drop magenta clear and use `chromaKeyColor = 0`; runtime relies on per-pixel alpha straight through, eliminating the silhouette fringe entirely.
+- `displayxr-runtime#193` — app-driven "external drag" API for window movement with phase-snap. Required to eliminate the right-drag 3D stutter in transparent overlay mode (and to re-enable real-time Kooima during the standalone preview's parked SC_MOVE intercept). See CLAUDE.md "Known Issues" for the failure modes that block plugin-only solutions.
 - `displayxr-unity#57` — open, will be closed when click-through and drag-by-cube land. Cross-referenced from runtime#191.
 - `docs~/roadmap/d3d11-typeless-fix-plan.md` — Unity D3D11 TYPELESS engine bug fix plan. Not strictly needed for transparent overlay (since Unity 6 defaults to D3D12) but would unblock the D3D11 BitBlt path for the rare D3D11-only Unity build.
 

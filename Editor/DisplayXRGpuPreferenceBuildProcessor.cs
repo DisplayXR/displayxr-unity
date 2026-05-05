@@ -21,7 +21,7 @@ namespace DisplayXR.Editor
     /// with XR_ERROR_GRAPHICS_DEVICE_INVALID. Pinning the built exe to the
     /// high-performance GPU via UserGpuPreferences avoids that.
     ///
-    /// Mirrors the runtime-side fix in displayxr-runtime-pvt commit 5d2eee70b
+    /// Mirrors the runtime-side fix in displayxr-runtime commit 5d2eee70b
     /// "Shell: pin launched apps to dGPU". This applies the same pin at build
     /// time so Unity apps work correctly even when launched outside a
     /// workspace controller (e.g. directly from Explorer).

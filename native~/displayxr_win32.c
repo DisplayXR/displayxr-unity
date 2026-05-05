@@ -485,7 +485,7 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 	// Same OS-modal-drag caveat as before: SR SDK weaver phase-snap
 	// requires DefWindowProc to own the drag loop, but our window-style
 	// requirements (WS_EX_NOREDIRECTIONBITMAP for per-pixel alpha,
-	// WS_EX_NOACTIVATE) block that. Tracked in displayxr-runtime-pvt#193.
+	// WS_EX_NOACTIVATE) block that. Tracked in displayxr-runtime#193.
 	case WM_RBUTTONDOWN: {
 		// Transparent zone (cursor off cube): forward click to the
 		// desktop window under the cursor. WS_EX_TRANSPARENT routes
