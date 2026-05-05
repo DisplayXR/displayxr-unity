@@ -197,6 +197,21 @@ DISPLAYXR_EXPORT void displayxr_set_overlay_hit_rect(int x, int y, int w, int h)
 /// through inside the AABB but outside the cube silhouette.
 DISPLAYXR_EXPORT void displayxr_set_overlay_hit_active(int active);
 
+/// (issue #57) Returns 1 if the OS foreground window belongs to our process,
+/// 0 otherwise. Use to gate input handlers (WASD etc.) that should be
+/// inactive when the user has clicked through the overlay to another app.
+/// The IAT-hooked GetForegroundWindow inside Unity always returns Unity's
+/// HWND for OpenXR purposes — this function calls the real OS GetForegroundWindow
+/// from the plugin DLL (whose IAT is not patched) and reflects actual OS state.
+DISPLAYXR_EXPORT int displayxr_is_our_process_foreground(void);
+
+/// (issue #57) Read the overlay's current client size in pixels. After scroll-
+/// resize the overlay's screen rect changes but Unity's Screen.width/height
+/// stay frozen at the off-screen Unity HWND's dimensions — C# raycast code
+/// must use these values for cursor → NDC conversion, not Screen.*.
+/// Returns (0, 0) if no overlay HWND.
+DISPLAYXR_EXPORT void displayxr_get_overlay_size(int *width, int *height);
+
 /// (issue #57) Read cursor position (overlay-client coords, top-left origin)
 /// + mouse button state. Designed for transparent overlay mode where Unity's
 /// New Input System Mouse.current.position is frozen because the cloaked

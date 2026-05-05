@@ -215,6 +215,12 @@ namespace DisplayXR
             // cloaked windows — see component header comment.
             DisplayXRNative.displayxr_get_overlay_pointer(
                 out int clientX, out int clientY, out int buttons);
+            // Overlay's actual client size — needed for cursor → NDC. Cannot
+            // use Screen.width/height because Unity's HWND is parked off-
+            // screen with frozen dimensions; the overlay can be scroll-
+            // resized independently.
+            DisplayXRNative.displayxr_get_overlay_size(
+                out int overlayW, out int overlayH);
 
             // Per-pixel hit test: build a CYCLOPEAN world-space ray from the
             // cursor pixel through the midpoint-eye Kooima projection, then
@@ -243,7 +249,7 @@ namespace DisplayXR
             {
                 BuildCyclopean(leftView, leftProj, rightView, rightProj,
                                 out Matrix4x4 cycView, out Matrix4x4 cycProj);
-                if (TryBuildEyeRay(clientX, clientY, cycView, cycProj, out Ray ray)
+                if (TryBuildEyeRay(clientX, clientY, overlayW, overlayH, cycView, cycProj, out Ray ray)
                     && Physics.Raycast(ray, out RaycastHit info, m_Camera.farClipPlane)
                     && info.collider != null)
                 {
@@ -293,7 +299,9 @@ namespace DisplayXR
             // are top-left. Flip Y on both position and delta.
             if (Mouse.current != null && clientX >= 0 && clientY >= 0)
             {
-                float invY = Mathf.Max(1, Screen.height) - clientY;
+                // Y-flip relative to the overlay's height (not Screen.height,
+                // which is the off-screen Unity HWND's frozen size).
+                float invY = Mathf.Max(1, overlayH) - clientY;
                 ushort btn = 0;
                 if ((buttons & 1) != 0) btn |= 1 << (int)MouseButton.Left;
                 if ((buttons & 2) != 0) btn |= 1 << (int)MouseButton.Right;
@@ -396,7 +404,9 @@ namespace DisplayXR
             {
                 BuildCyclopean(leftView, leftProj, rightView, rightProj,
                                 out Matrix4x4 cycView, out Matrix4x4 cycProj);
-                if (TryGetUnionScreenRect(cycView, cycProj,
+                DisplayXRNative.displayxr_get_overlay_size(
+                    out int overlayW, out int overlayH);
+                if (TryGetUnionScreenRect(overlayW, overlayH, cycView, cycProj,
                                            out int x, out int y, out int w, out int h))
                 {
                     DisplayXRNative.displayxr_set_overlay_hit_rect(x, y, w, h);
@@ -462,12 +472,17 @@ namespace DisplayXR
         // → inverse view (Unity world). Origin = ray's near-plane point;
         // direction = far-near. Returns false if the projection is degenerate.
         private static bool TryBuildEyeRay(int clientX, int clientY,
+                                            int overlayW, int overlayH,
                                             Matrix4x4 viewOpenXR, Matrix4x4 projOpenXR,
                                             out Ray ray)
         {
             ray = new Ray(Vector3.zero, Vector3.forward);
-            float sw = Mathf.Max(1, Screen.width);
-            float sh = Mathf.Max(1, Screen.height);
+            // Use the overlay's actual client size (not Screen.*, which
+            // reflects Unity's frozen off-screen HWND). After scroll-resize
+            // the overlay rect changes — without this, cursor → NDC drifts
+            // and the ray misses the cube collider.
+            float sw = Mathf.Max(1, overlayW);
+            float sh = Mathf.Max(1, overlayH);
             // Window pixel (top-left origin) → NDC ([-1,1] with +Y up)
             float ndcX = 2f * clientX / sw - 1f;
             float ndcY = 1f - 2f * clientY / sh;
@@ -569,13 +584,15 @@ namespace DisplayXR
         // Project a renderer's world-space AABB to a window-pixel rect via
         // cyclopean Kooima projection. 8 corners → take min/max.
         private bool TryProjectBoundsToScreen(Bounds b,
+                                               int overlayW, int overlayH,
                                                Matrix4x4 cyclopeanView,
                                                Matrix4x4 cyclopeanProj,
                                                out int x, out int y, out int w, out int h)
         {
             x = y = w = h = 0;
-            float sw = Mathf.Max(1, Screen.width);
-            float sh = Mathf.Max(1, Screen.height);
+            // See TryBuildEyeRay: overlay's actual client size, not Screen.*.
+            float sw = Mathf.Max(1, overlayW);
+            float sh = Mathf.Max(1, overlayH);
             Vector3 c = b.center;
             Vector3 e = b.extents;
             float minX = float.PositiveInfinity, minY = float.PositiveInfinity;
@@ -607,7 +624,8 @@ namespace DisplayXR
 
         // Union-rect across all clickableRenderers' projected AABBs — used by
         // LateUpdate to push a single coarse hit_rect to the native overlay.
-        private bool TryGetUnionScreenRect(Matrix4x4 cyclopeanView,
+        private bool TryGetUnionScreenRect(int overlayW, int overlayH,
+                                            Matrix4x4 cyclopeanView,
                                             Matrix4x4 cyclopeanProj,
                                             out int x, out int y, out int w, out int h)
         {
@@ -620,7 +638,8 @@ namespace DisplayXR
                 var r = clickableRenderers[i];
                 if (r == null || !r.enabled || !r.gameObject.activeInHierarchy)
                     continue;
-                if (!TryProjectBoundsToScreen(r.bounds, cyclopeanView, cyclopeanProj,
+                if (!TryProjectBoundsToScreen(r.bounds, overlayW, overlayH,
+                                               cyclopeanView, cyclopeanProj,
                                                out int rx, out int ry, out int rw, out int rh))
                     continue;
                 if (rx < unionXMin) unionXMin = rx;

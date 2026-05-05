@@ -495,6 +495,12 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 			forward_click_to_underlying_window(msg, wParam);
 			return 0;
 		}
+		// Cube area: claim OS foreground so subsequent keyboard goes
+		// to us (Unity via INPUTSINK), not to whichever app we last
+		// forwarded to. WS_EX_NOACTIVATE blocks click-driven
+		// activation, but programmatic SFW from "received last input
+		// event" is allowed. See displayxr_is_our_process_foreground.
+		SetForegroundWindow(hwnd);
 		GetCursorPos(&s_drag_anchor_screen);
 		RECT wr;
 		GetWindowRect(hwnd, &wr);
@@ -554,9 +560,62 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 			forward_click_to_underlying_window(msg, wParam);
 			return 0;
 		}
+		// Cube area: on press, claim OS foreground so keyboard goes to
+		// our process (Unity via INPUTSINK) instead of whichever app
+		// we last forwarded a click to. Skip on UP messages — UP after
+		// the press would be redundant.
+		if (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONDBLCLK ||
+		    msg == WM_MBUTTONDOWN) {
+			SetForegroundWindow(hwnd);
+		}
 		HWND unity = find_unity_hwnd();
 		if (unity != NULL)
 			PostMessageW(unity, msg, wParam, lParam);
+		return 0;
+	}
+
+	// ----- mouse wheel: resize the overlay (transparent mode only) -----
+	// WM_MOUSEWHEEL is delivered by the OS to the FOCUSED window (not by
+	// cursor position), so this only fires when our overlay is foreground.
+	// After click-through to e.g. Notepad, scroll naturally goes to Notepad
+	// instead of resizing the avatar — exactly the behavior we want.
+	// Uniform scale around the current window center keeps the cube
+	// visually anchored. WM_SIZE / WM_MOVE handlers below propagate the
+	// new geometry to the runtime via displayxr_set_viewport_size_native.
+	case WM_MOUSEWHEEL: {
+		if (!s_overlay_is_toplevel)
+			break; // opaque WS_CHILD mode: Unity's title bar handles resize
+
+		short delta = GET_WHEEL_DELTA_WPARAM(wParam);
+		if (delta == 0)
+			return 0;
+
+		RECT wr;
+		GetWindowRect(hwnd, &wr);
+		int cur_w = wr.right - wr.left;
+		int cur_h = wr.bottom - wr.top;
+		int cx = (wr.left + wr.right) / 2;
+		int cy = (wr.top + wr.bottom) / 2;
+
+		// 10% per WHEEL_DELTA notch.
+		float factor = 1.0f + ((float)delta / (float)WHEEL_DELTA) * 0.1f;
+		int new_w = (int)(cur_w * factor);
+		int new_h = (int)(cur_h * factor);
+
+		// Floor at 400x400 — much smaller and the SR weaver gets unhappy
+		// with the lenticular phase-snapping math at sub-display sizes.
+		if (new_w < 400 || new_h < 400) {
+			float fw = 400.0f / (float)new_w;
+			float fh = 400.0f / (float)new_h;
+			float f  = fw > fh ? fw : fh;
+			new_w = (int)(new_w * f);
+			new_h = (int)(new_h * f);
+		}
+
+		int new_x = cx - new_w / 2;
+		int new_y = cy - new_h / 2;
+		SetWindowPos(hwnd, NULL, new_x, new_y, new_w, new_h,
+		             SWP_NOZORDER | SWP_NOACTIVATE);
 		return 0;
 	}
 
@@ -1078,6 +1137,35 @@ displayxr_set_overlay_hit_rect(int x, int y, int w, int h)
 	s_hit_rect.top    = y;
 	s_hit_rect.right  = x + w;
 	s_hit_rect.bottom = y + h;
+}
+
+void
+displayxr_get_overlay_size(int *width, int *height)
+{
+	if (s_overlay_hwnd != NULL && IsWindow(s_overlay_hwnd)) {
+		RECT rc;
+		GetClientRect(s_overlay_hwnd, &rc);
+		if (width)  *width  = (int)(rc.right - rc.left);
+		if (height) *height = (int)(rc.bottom - rc.top);
+	} else {
+		if (width)  *width  = 0;
+		if (height) *height = 0;
+	}
+}
+
+int
+displayxr_is_our_process_foreground(void)
+{
+	// GetForegroundWindow is IAT-hooked in Unity's exe + UnityPlayer.dll
+	// (see displayxr_install_focus_hook) so Unity always sees itself as
+	// foreground. The plugin DLL's IAT is NOT hooked, so this call returns
+	// the actual OS foreground.
+	HWND fg = GetForegroundWindow();
+	if (fg == NULL)
+		return 0;
+	DWORD pid = 0;
+	GetWindowThreadProcessId(fg, &pid);
+	return (pid == GetCurrentProcessId()) ? 1 : 0;
 }
 
 void

@@ -122,6 +122,28 @@ namespace DisplayXR
         internal static extern int displayxr_is_shell_mode();
 
         /// <summary>
+        /// (issue #57) Returns 1 if the OS foreground window belongs to our
+        /// process, 0 otherwise. Use to gate input handlers (WASD, mouse-look)
+        /// that should be inactive when the user has clicked through the
+        /// transparent overlay to another app — otherwise Unity's RawInput
+        /// (which uses RIDEV_INPUTSINK so it receives input regardless of
+        /// foreground) would also process the keypress and e.g. move the cube
+        /// while the user is typing in Notepad.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int displayxr_is_our_process_foreground();
+
+        /// <summary>
+        /// (issue #57) Overlay's current client size in pixels. After scroll-
+        /// resize the overlay's rect changes but Unity's Screen.width/height
+        /// stay frozen at the off-screen Unity HWND's dimensions — raycast
+        /// math must use these values, not Screen.*. Returns (0, 0) if no
+        /// overlay HWND.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void displayxr_get_overlay_size(out int width, out int height);
+
+        /// <summary>
         /// Get shell-mode mouse button state from native WM_INPUT tracking.
         /// Buttons: bit 0 = left, bit 1 = right, bit 2 = middle.
         /// </summary>

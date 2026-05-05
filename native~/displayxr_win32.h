@@ -56,6 +56,15 @@ void displayxr_set_overlay_hit_rect(int x, int y, int w, int h);
 /// through inside the AABB but outside the cube silhouette.
 void displayxr_set_overlay_hit_active(int active);
 
+/// (issue #57) Returns 1 if the OS foreground window belongs to our process,
+/// 0 otherwise. Use this to gate input handlers (e.g. WASD movement) that
+/// should be inactive when the user has clicked through to another app.
+/// The IAT-hooked GetForegroundWindow inside Unity always returns Unity's
+/// HWND so Unity perceives itself as foreground for OpenXR purposes — this
+/// function calls the real OS GetForegroundWindow from the plugin DLL
+/// (whose IAT is not patched) and reflects the actual OS state.
+int displayxr_is_our_process_foreground(void);
+
 /// (issue #57) Read the cursor position in overlay-client coords plus the
 /// current mouse-button state. Designed for transparent overlay mode where
 /// Unity's New Input System Mouse.current.position is frozen because the

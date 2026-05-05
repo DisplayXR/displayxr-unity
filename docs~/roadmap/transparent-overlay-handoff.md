@@ -1,6 +1,98 @@
-# Transparent overlay (issue #57) — handoff after session 4
+# Transparent overlay (issue #57) — RESOLVED in v1.2.0
 
-## Kickoff prompt for next session
+> **Status: closed.** Session 5 landed cross-process click-through end-to-end
+> (Notepad caret, Explorer item selection, keyboard focus all work) plus
+> scroll-to-resize for the overlay window and foreground-aware input gating
+> so the cube doesn't keep responding to WASD while the user is typing in
+> another app. Released as v1.2.0 (2026-05-04).
+>
+> The historical session notes below are kept for context — what was tried
+> and ruled out across sessions 1–4 — and to document the full architecture
+> for future contributors. **Skip to the "Resolution (session 5)" section
+> for the final shipping design.**
+
+## Resolution (session 5)
+
+The remaining bug after session 4 — clicks routed past the overlay via
+`WS_EX_TRANSPARENT` reach the underlying HWND but the OS never transfers
+foreground to it, so Notepad's caret never appears — turned out to be a
+fundamental Win32 limitation, not a routing problem. Verified empirically
+with `WH_MOUSE_LL` instrumentation (`WindowFromPoint` correctly resolved to
+`RichEditD2DPT pid=Notepad` in the LL hook log, but the click was visibly
+inert). Same hover-passes-through-but-clicks-don't asymmetry the user
+observed in early tests: hover doesn't need focus transfer, clicks do.
+
+**The shipping design — Approach C ("catch and forward"):**
+
+1. `WM_NCHITTEST` returns `HTCLIENT` for the entire overlay rect in
+   transparent mode — the OS dispatches every click to us. The
+   `WS_EX_TRANSPARENT` toggle in `displayxr_set_overlay_hit_active` is
+   gone; that function now only updates `s_hit_active` for the wndproc.
+2. `forward_click_to_underlying_window` does a two-stage resolution:
+   - Stage 1: iterate top-level windows in z-order
+     (`FindWindowExW(NULL, prev, ...)`), skip our overlay, our cloaked
+     Unity HWND, anything cloaked / `WS_EX_TRANSPARENT`, **and any
+     window in our process** (the runtime's DComp visual host
+     `class=DisplayXRD3D11` is in our process — forwarding to it is a
+     dead-end). Pick the first whose rect contains the cursor — that's
+     the underlying app's top-level frame.
+   - Stage 2: recursively descend with
+     `ChildWindowFromPointEx(CWP_SKIPINVISIBLE | CWP_SKIPDISABLED |
+     CWP_SKIPTRANSPARENT)` until no more children. That's the actual
+     leaf control (e.g. Notepad's `RichEditD2DPT`, Explorer's
+     `DirectUIHWND`).
+3. `SetForegroundWindow(GetAncestor(target, GA_ROOT))` — SFW applies to
+   top-level windows, calling it on a child HWND is undefined. We have
+   permission via "process received the last input event" since the
+   click came to our wndproc.
+4. `PostMessage(deepest_leaf, msg, wParam, deepest_leaf_client_pt)` —
+   converted to the leaf's own client coords, not the frame's.
+
+WS_EX_TOPMOST is back (avatar stays visually on top); WS_EX_NOACTIVATE is
+back (clicking the cube doesn't passively activate us — we activate
+programmatically via `SetForegroundWindow(overlay)` from the wndproc on
+cube-press only, so click-through to other apps doesn't bounce focus).
+
+**Foreground-aware input gating** (so WASD doesn't keep moving the cube
+while typing in Notepad):
+- New native getter `displayxr_is_our_process_foreground()` — calls real
+  OS `GetForegroundWindow` from the plugin DLL (its IAT isn't patched, so
+  it bypasses the IAT-hooked-for-Unity version that always returns Unity's
+  HWND).
+- `DisplayXRInputController.Update()` early-returns when not foreground.
+- Cube reclaims foreground when clicked: in
+  `overlay_wnd_proc`'s cube-area press paths (`hit_active=1`), we call
+  `SetForegroundWindow(s_overlay_hwnd)`. WS_EX_NOACTIVATE blocks
+  click-driven activation, but programmatic SFW is allowed.
+
+**Mouse-wheel scroll-to-resize**: `WM_MOUSEWHEEL` in `overlay_wnd_proc`,
+transparent mode only, uniform scaling around current center, 10% per
+WHEEL_DELTA notch, floor 400×400. Win32 routes `WM_MOUSEWHEEL` to the
+focused window — so when you've click-through'd to Notepad and Notepad has
+focus, scroll naturally goes to Notepad's document. No explicit foreground
+gate needed in the wndproc.
+
+**Raycast fix**: when the overlay is scroll-resized, its client size
+diverges from `Screen.width/height` (which still reflects Unity's frozen
+off-screen HWND). `TryBuildEyeRay` and `TryProjectBoundsToScreen` were
+using `Screen.*` for cursor → NDC, which made every click after a resize
+register as `hit_active=0`. New native getter `displayxr_get_overlay_size()`
+exposes the overlay's actual client rect; both functions take it as a
+parameter now.
+
+**Diagnostic instrumentation kept in main** (cheap, lifetime-of-process):
+- `WH_MOUSE_LL` global mouse hook, button events only, logs the OS's
+  `WindowFromPoint(cursor)` resolution per click → `[LLMouse]` lines.
+- `overlay_wnd_proc` entry log for button events showing the live
+  `WS_EX_TRANSPARENT` bit + `hit_active` + `ll_seq_at_entry` for
+  cross-correlation → `[OvlWnd]` lines.
+
+Both were indispensable for diagnosing the foreground-transfer bug and
+will save time on future input issues.
+
+---
+
+## Kickoff prompt for next session (historical)
 
 > Continue the transparent-overlay work for displayxr-unity#57. The authoritative
 > starting point is this handoff doc — read it cover-to-cover before touching code.

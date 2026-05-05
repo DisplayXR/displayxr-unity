@@ -92,6 +92,22 @@ namespace DisplayXR
             }
 
 #if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
+            // After click-through to another app (transparent-overlay mode,
+            // issue #57), Unity still receives keyboard via RawInput
+            // INPUTSINK even when not foreground. Skip input handling so
+            // WASD doesn't move the cube while the user is typing in
+            // Notepad/Explorer/etc. Re-engages when the user clicks the
+            // cube — overlay_wnd_proc calls SetForegroundWindow on cube
+            // press messages.
+            if (!IsOurProcessForeground())
+            {
+                m_Dragging = false;
+                m_DragPending = false;
+                return;
+            }
+#endif
+
+#if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
             UpdateShellMouse();
 #endif
             HandleMouseRotation();
@@ -218,6 +234,14 @@ namespace DisplayXR
             try { return DisplayXRNative.displayxr_standalone_is_running() != 0; }
             catch { return false; }
         }
+
+#if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
+        private static bool IsOurProcessForeground()
+        {
+            try { return DisplayXRNative.displayxr_is_our_process_foreground() != 0; }
+            catch { return true; } // fail-open: don't break input if symbol missing
+        }
+#endif
 
         /// Call once per frame (from Update) to snapshot mouse button state from
         /// either the shell-mode tracker or the SA preview window's WndProc.
