@@ -508,12 +508,21 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		s_drag_anchor_window.y = wr.top;
 		s_drag_active = 1;
 		SetCapture(hwnd);
+		// #61: synchronous bracketing so the SR SDK weaver's WndProc
+		// subclass sees the in-drag flag and phase-snaps the window
+		// to lenticular-aligned pixels. Must precede the first
+		// SetWindowPos in WM_MOUSEMOVE.
+		SendMessageW(hwnd, WM_ENTERSIZEMOVE, 0, 0);
 		return 0;
 	}
 	case WM_RBUTTONUP:
 		if (s_drag_active) {
-			ReleaseCapture();
+			// Clear the flag before sending WM_EXITSIZEMOVE so the
+			// recursive WM_CAPTURECHANGED triggered by ReleaseCapture()
+			// won't re-send it.
 			s_drag_active = 0;
+			SendMessageW(hwnd, WM_EXITSIZEMOVE, 0, 0);
+			ReleaseCapture();
 			return 0;
 		}
 		// Pair with the transparent-zone WM_RBUTTONDOWN we forwarded
@@ -523,9 +532,13 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 			return 0;
 		}
 		break;
-	case WM_CAPTURECHANGED:
+	case WM_CAPTURECHANGED: {
+		int was_active = s_drag_active;
 		s_drag_active = 0;
+		if (was_active)
+			SendMessageW(hwnd, WM_EXITSIZEMOVE, 0, 0);
 		break;
+	}
 
 	// ----- mouse-move: drag overlay if active, else forward to Unity -----
 	case WM_MOUSEMOVE: {

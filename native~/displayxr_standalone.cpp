@@ -649,66 +649,52 @@ sa_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 	case WM_DESTROY:
 		s_sa.preview_hwnd = NULL;
 		return 0;
-	// PARKED: capture-based move handler (SC_MOVE intercept).
-	//
-	// We previously intercepted SC_MOVE here to bypass DefWindowProc's modal
-	// drag loop. That kept Unity's main thread running so FrameTick continued
-	// to fire — C# re-rendered the scene each frame with updated Kooima based
-	// on the new window position. Combined with xrSetSharedTextureOutputRectEXT
-	// (still called from sa_update_canvas_from_hwnd), this gave real-time
-	// Kooima updates during drag.
-	//
-	// HOWEVER: the SR SDK weaver does phase-snapping by intercepting the OS
-	// modal drag loop. By bypassing it, the window lands on pixel positions
-	// that are not phase-aligned to the lenticular grid, producing visible
-	// stutter as the user drags. xrSetSharedTextureOutputRectEXT is REQUIRED
-	// for the weaver to interlace at all in windowed mode (without it,
-	// weaving only works in fullscreen), but it does NOT trigger phase
-	// snapping — that only happens during the modal loop.
-	//
-	// Current behavior: let DefWindowProc handle the modal drag (phase
-	// snapping works, no stutter), accept that Kooima only updates on drag
-	// release (Unity main thread is blocked during the modal loop). See
-	// the "Known Issues" section in CLAUDE.md for the full context.
-	//
-	// Proper fix likely needs runtime API support — e.g. an "external drag"
-	// mode where the app proposes a position and the runtime returns the
-	// snapped position.
-	//
-	// To re-enable real-time Kooima with stutter, uncomment the case
-	// handlers below.
-	//
-	// case WM_SYSCOMMAND:
-	// 	if ((wParam & 0xFFF0) == SC_MOVE) {
-	// 		SetCapture(hwnd);
-	// 		GetCursorPos(&s_sa.drag_start_cursor);
-	// 		GetWindowRect(hwnd, &s_sa.drag_start_rect);
-	// 		s_sa.dragging = 1;
-	// 		return 0;
-	// 	}
-	// 	break;
-	// case WM_MOUSEMOVE:
-	// 	if (s_sa.dragging) {
-	// 		POINT cur;
-	// 		GetCursorPos(&cur);
-	// 		int dx = cur.x - s_sa.drag_start_cursor.x;
-	// 		int dy = cur.y - s_sa.drag_start_cursor.y;
-	// 		SetWindowPos(hwnd, NULL,
-	// 		             s_sa.drag_start_rect.left + dx,
-	// 		             s_sa.drag_start_rect.top + dy,
-	// 		             0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-	// 	}
-	// 	break;
-	// case WM_LBUTTONUP:
-	// 	if (s_sa.dragging) {
-	// 		s_sa.dragging = 0;
-	// 		ReleaseCapture();
-	// 		return 0;
-	// 	}
-	// 	break;
-	// case WM_CAPTURECHANGED:
-	// 	s_sa.dragging = 0;
-	// 	break;
+	// #61: capture-based SC_MOVE intercept with synchronous
+	// WM_ENTERSIZEMOVE/EXITSIZEMOVE bracketing. Bypassing DefWindowProc's
+	// modal drag loop keeps Unity's main thread running so FrameTick fires
+	// during the move (real-time Kooima). The bracketing messages drive the
+	// SR SDK weaver's WndProc subclass into its phase-snap state so the
+	// window lands on lenticular-aligned pixels. Order matters: ENTERSIZEMOVE
+	// before the first SetWindowPos, EXITSIZEMOVE after the flag is cleared
+	// so the recursive WM_CAPTURECHANGED from ReleaseCapture() can't re-send
+	// it.
+	case WM_SYSCOMMAND:
+		if ((wParam & 0xFFF0) == SC_MOVE) {
+			SetCapture(hwnd);
+			GetCursorPos(&s_sa.drag_start_cursor);
+			GetWindowRect(hwnd, &s_sa.drag_start_rect);
+			s_sa.dragging = 1;
+			SendMessageW(hwnd, WM_ENTERSIZEMOVE, 0, 0);
+			return 0;
+		}
+		break;
+	case WM_MOUSEMOVE:
+		if (s_sa.dragging) {
+			POINT cur;
+			GetCursorPos(&cur);
+			int dx = cur.x - s_sa.drag_start_cursor.x;
+			int dy = cur.y - s_sa.drag_start_cursor.y;
+			SetWindowPos(hwnd, NULL,
+			             s_sa.drag_start_rect.left + dx,
+			             s_sa.drag_start_rect.top + dy,
+			             0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+		}
+		break;
+	case WM_LBUTTONUP:
+		if (s_sa.dragging) {
+			s_sa.dragging = 0;
+			SendMessageW(hwnd, WM_EXITSIZEMOVE, 0, 0);
+			ReleaseCapture();
+			return 0;
+		}
+		break;
+	case WM_CAPTURECHANGED: {
+		int was_dragging = s_sa.dragging;
+		s_sa.dragging = 0;
+		if (was_dragging)
+			SendMessageW(hwnd, WM_EXITSIZEMOVE, 0, 0);
+		break;
+	}
 	case WM_MOVE:
 	case WM_SIZE:
 		// Update canvas rect from current window position and push to runtime
