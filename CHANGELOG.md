@@ -5,6 +5,18 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] - 2026-05-04
+
+### Added
+- `DisplayXRTransparentOverlay.chromaKeyColor` is now a settable property — assigning at runtime re-pushes camera clear + native overlay state. New `ApplyChromaKey()` private helper + `OnValidate` for live Inspector edits during Play.
+
+### Fixed
+- 3D stutter during right-drag of the transparent overlay and during the standalone preview's SC_MOVE intercept — synchronous WM_ENTERSIZEMOVE/EXITSIZEMOVE bracketing now drives the SR SDK weaver's phase-snap state machine without needing a runtime-side API change (#61).
+
+### Changed
+- `Samples~/TransparentAvatar` default chroma key switched from magenta (1,0,1) to near-mid-gray (128,127,129) so silhouette-edge halos blend invisibly into typical desktop/photo backgrounds. README updated with the rationale and the new palette-clamp trade-off.
+- CI is now PR-driven: `build-native.yml` fires on push-to-main, all PRs (drafts included), v* tags, workflow_dispatch; concurrency cancels in-progress runs on rapid pushes. The `/ci-monitor` skill is retired in favor of opening PRs and letting CI report on the head ref.
+
 ## [1.2.0] - 2026-05-04
 
 ### Added
