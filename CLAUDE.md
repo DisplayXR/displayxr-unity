@@ -6,7 +6,7 @@ This file provides guidance to Claude Code when working with this repository.
 
 Unity plugin for eye-tracked 3D light field displays via the **DisplayXR OpenXR runtime**. This is a Unity Package Manager (UPM) package that intercepts Unity's OpenXR pipeline at the native layer to provide Kooima asymmetric frustum projection for stereo rendering. The primary editor workflow is a **standalone preview window** that creates its own OpenXR session — no Play Mode needed.
 
-The plugin works with the **DisplayXR runtime** ([DisplayXR/displayxr-runtime-pvt](https://github.com/DisplayXR/displayxr-runtime-pvt)) but has **no source dependency** on it — native code fetches OpenXR headers independently from Khronos.
+The plugin works with the **DisplayXR runtime** ([DisplayXR/displayxr-runtime](https://github.com/DisplayXR/displayxr-runtime)) but has **no source dependency** on it — native code fetches OpenXR headers independently from Khronos.
 
 ## Repository Structure
 
@@ -163,14 +163,14 @@ The standalone preview window on Windows has two mutually-exclusive behaviors du
 
 We tried calling `xrSetSharedTextureOutputRectEXT` from `WM_MOVE` to push canvas updates to the runtime — this is required for the weaver to interlace at all in windowed mode (without it, weaving only works in fullscreen) — but it doesn't trigger phase-snapping. The SR SDK only phase-snaps when it owns the modal drag loop.
 
-A proper fix likely needs runtime API support: an "external drag" mode where the app proposes a position (e.g. via `xrSetSharedTextureOutputRectEXT` extended) and the runtime returns the snapped position. Tracked in `DisplayXR/displayxr-runtime-pvt#193`. Until then, the WndProc in `displayxr_standalone.cpp` keeps SC_MOVE handling commented out / parked. See the long comment in `sa_wndproc`'s `WM_SYSCOMMAND` case for context.
+A proper fix likely needs runtime API support: an "external drag" mode where the app proposes a position (e.g. via `xrSetSharedTextureOutputRectEXT` extended) and the runtime returns the snapped position. Tracked in `DisplayXR/displayxr-runtime#193`. Until then, the WndProc in `displayxr_standalone.cpp` keeps SC_MOVE handling commented out / parked. See the long comment in `sa_wndproc`'s `WM_SYSCOMMAND` case for context.
 
 **Transparent overlay (#57) right-drag — same SR phase-snap blocker as the standalone preview, no workaround possible from the plugin side.** Regular opaque DisplayXR built apps don't stutter when dragged because Unity has a real title bar — drag the title, `DefWindowProc` enters the OS modal drag loop, the SR weaver phase-snaps inside that loop. In transparent overlay mode Unity is `WS_POPUP` + cloaked with no title bar, so the user drags via right-click on the cube body. Two attempts to inherit opaque-mode behavior both failed:
 
 1. `SendMessage(unity_hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0)` from the overlay's `WM_RBUTTONDOWN` — silently ignored by `DefWindowProc` on cloaked `WS_POPUP` Unity. No `WM_ENTERSIZEMOVE`, no drag.
 2. `SendMessage(overlay, WM_SYSCOMMAND, SC_MOVE | HTCAPTION, 0)` — also silently ignored. The overlay has `WS_EX_NOREDIRECTIONBITMAP` (mandatory for per-pixel transparency) + `WS_EX_NOACTIVATE`, and `DefWindowProc`'s modal drag needs a DWM redirection surface to render the drag preview, so it bails. Adding `WS_CAPTION` to the overlay would change the client-area math and break the C#-supplied hit-rect coordinates.
 
-Current implementation is back to capture-based custom drag (`SetCapture` + manual `SetWindowPos(unity)` per `WM_MOUSEMOVE`) in `overlay_wnd_proc`. Cube/Kooima keep animating during drag, but no SR weaver phase-snap → 3D stutter visible during motion. Same fundamental blocker as the standalone preview — the SR SDK only phase-snaps when it owns the modal drag loop, and we can't induce one on a window with our style requirements. Resolution tracked in `DisplayXR/displayxr-runtime-pvt#193` (external drag API).
+Current implementation is back to capture-based custom drag (`SetCapture` + manual `SetWindowPos(unity)` per `WM_MOUSEMOVE`) in `overlay_wnd_proc`. Cube/Kooima keep animating during drag, but no SR weaver phase-snap → 3D stutter visible during motion. Same fundamental blocker as the standalone preview — the SR SDK only phase-snaps when it owns the modal drag loop, and we can't induce one on a window with our style requirements. Resolution tracked in `DisplayXR/displayxr-runtime#193` (external drag API).
 
 ### Code Style
 
@@ -188,34 +188,42 @@ Current implementation is back to capture-based custom drag (`SetCapture` + manu
 
 > **History:** This repo was transferred from `dfattal/unity-3d-display` to `DisplayXR/displayxr-unity`. GitHub redirects the old URL.
 
-### Day-to-day: just push to main
-Every push to `main` that touches `native~/` triggers `build-native.yml`, which builds the DLL (Windows x64) and bundle (macOS Universal) and uploads them as CI artifacts. No tags, no releases. Artifacts are available for 90 days.
+### CI policy: contributor-friendly (this is a public repo)
 
-C#-only changes don't trigger the workflow (path filter).
+Public-repo CI is **free** on GitHub-hosted runners — no minute-burn concern,
+no draft-skip patterns. `build-native.yml` fires on every push to `main` that
+touches `native~/`, building the Windows x64 DLL + macOS Universal bundle and
+uploading them as CI artifacts (90-day retention). No tags, no releases on
+day-to-day pushes.
+
+C#-only changes don't trigger the workflow (path filter on `native~/`).
 
 ```bash
 git push origin HEAD
 ```
 
-### Creating a release (when ready)
-Releases are triggered **only** by manually pushing a `v*` tag. The `upm` branch only updates on tagged releases — without a tag, Package Manager stays on the old version.
+### Creating a release: use the `/release` skill (don't tag manually)
 
-```bash
-# 1. Make sure main is clean and CI passes
-# 2. Bump version in package.json
-# 3. Update CHANGELOG.md with release notes
-# 4. Commit the version bump
-# 5. Tag and push:
-git tag v0.1.0
-git push origin main v0.1.0
+`/release` is the official release path for this repo. It bumps the version,
+updates `CHANGELOG.md` if needed, tags, pushes, monitors CI, and verifies the
+GitHub Release + `upm` branch were created. Don't tag and push manually —
+you'll skip the verification steps the skill performs.
+
+```
+/release v1.2.0      # explicit version
+/release patch       # auto-bump from latest v* (e.g. v1.0.0 → v1.0.1)
+/release minor       # auto-bump minor       (e.g. v1.0.0 → v1.1.0)
+/release major       # auto-bump major       (e.g. v1.0.0 → v2.0.0)
 ```
 
-This triggers the `release` job in CI, which:
-- Builds both platform binaries
-- Creates a `.tgz` UPM tarball with binaries included
-- Pushes a `upm` branch with binaries committed (for git URL installs)
-- Creates a `upm/v0.1.0` tag for version-pinned installs
-- Publishes a GitHub Release with changelog notes and the `.tgz` attached
+The skill triggers the CI `release` job which:
+- Builds both platform binaries.
+- Creates a `.tgz` UPM tarball with binaries included.
+- Pushes the `upm` branch (binaries committed) for git URL installs.
+- Creates a `upm/vX.Y.Z` tag for version-pinned installs.
+- Publishes a GitHub Release with changelog notes and the `.tgz` attached.
+
+Since CI is free here, run releases freely — no need to batch.
 
 ### Fixing a bad release
 Tags are cheap and deletable:
@@ -223,7 +231,7 @@ Tags are cheap and deletable:
 git tag -d v0.1.0                         # delete local
 git push origin :refs/tags/v0.1.0         # delete on origin
 # delete GitHub Release in the web UI
-# fix the issue, then re-tag and push
+# fix the issue, then re-run /release
 ```
 
 ### Install paths for users
@@ -275,7 +283,7 @@ For detailed architecture and design decisions, see `docs~/`:
 
 ## Cross-Repo References
 
-- Runtime repo: [DisplayXR/displayxr-runtime-pvt](https://github.com/DisplayXR/displayxr-runtime-pvt)
-- Use `DisplayXR/displayxr-runtime-pvt#N` syntax to reference runtime issues
+- Runtime repo: [DisplayXR/displayxr-runtime](https://github.com/DisplayXR/displayxr-runtime)
+- Use `DisplayXR/displayxr-runtime#N` syntax to reference runtime issues
 - The runtime provides the OpenXR compositor, display drivers, and eye tracking
 - The plugin provides the Unity-side stereo rendering pipeline
