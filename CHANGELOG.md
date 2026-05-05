@@ -5,6 +5,16 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.2] - 2026-05-05
+
+### Added
+- `Samples~/MinimalTransparent/` — minimal teaching sample for the chroma-key transparent overlay technique. ~70-line bootstrap script + long-form README that dissects the four-mechanism pipeline (camera clear, OpenXR extension fields, runtime post-weave shader, OS LWA_COLORKEY) and the layer-ownership map. Companion to the polished `TransparentAvatar` sample.
+- `DisplayXRTransparentOverlay.ConsumeWheelDelta()` — public method on the component returning the accumulated mouse-wheel delta (Win32 raw units, 120 per notch). Apps poll this and decide what to do with the wheel.
+- Native export `displayxr_consume_overlay_wheel_delta()` — atomic read + zero of the overlay's accumulated wheel delta (`InterlockedExchange` on a `volatile LONG`). Declared in `displayxr_hooks.h` and `displayxr_win32.h`.
+
+### Removed
+- The experimental WM_MOUSEWHEEL → resize-overlay-HWND behavior from v1.2.0. Plugin no longer self-resizes the overlay when the user scrolls; apps now drive what the wheel does (e.g. `DisplayXRDisplay.virtualDisplayHeight` for zoom-in-window). The plugin still consumes the wheel message when its overlay is foreground so it doesn't bubble to underlying apps.
+
 ## [1.2.1] - 2026-05-04
 
 ### Added
