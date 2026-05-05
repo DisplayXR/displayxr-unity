@@ -40,6 +40,11 @@
       "displayName": "Transparent Avatar (Windows)",
       "description": "Chroma-key transparent overlay mode (issue #57) — capsule avatar floats above the desktop with click-through. Windows standalone only.",
       "path": "Samples~/TransparentAvatar"
+    },
+    {
+      "displayName": "Minimal Transparent (Windows)",
+      "description": "Smallest working chroma-key transparent overlay scene (~70 lines). Teaching sample — README walks through the four-mechanism pipeline, the OpenXR extensions in use, and the layer ownership map. Windows standalone only.",
+      "path": "Samples~/MinimalTransparent"
     }
   ]
 }
