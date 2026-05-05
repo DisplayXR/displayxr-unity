@@ -58,7 +58,7 @@ native~/build-win.sh
 ```
 Verifies the code compiles for Windows but the DLL stays in `build-win/` (MinGW ABI, not shipped). For native Windows builds, use `build-win.bat` instead.
 
-**Claude Code: After modifying any file in `native~/`, always run the local build script for the current platform — `native~/build-mac.sh` on macOS or `native~\build-win.bat` on Windows — to update the shipping binary. On macOS, also run `native~/build-win.sh` as a cross-compile check. Use `/ci-monitor` to commit, push, and verify CI builds both platforms.**
+**Claude Code: After modifying any file in `native~/`, always run the local build script for the current platform — `native~/build-mac.sh` on macOS or `native~\build-win.bat` on Windows — to update the shipping binary. On macOS, also run `native~/build-win.sh` as a cross-compile check. Then commit (source + your platform's binary), push to a feature branch, and open a PR — CI builds both platforms automatically and reports back on the PR.**
 
 ## Key Architecture
 
@@ -190,17 +190,36 @@ Current implementation is back to capture-based custom drag (`SetCapture` + manu
 
 ### CI policy: contributor-friendly (this is a public repo)
 
-Public-repo CI is **free** on GitHub-hosted runners — no minute-burn concern,
-no draft-skip patterns. `build-native.yml` fires on every push to `main` that
-touches `native~/`, building the Windows x64 DLL + macOS Universal bundle and
-uploading them as CI artifacts (90-day retention). No tags, no releases on
-day-to-day pushes.
+Public-repo CI is **free** on GitHub-hosted runners, so `build-native.yml`
+fires freely — favoring fast contributor feedback over minute-burn. Mirrors
+the policy used by `DisplayXR/displayxr-runtime`:
 
-C#-only changes don't trigger the workflow (path filter on `native~/`).
+| Trigger | Effect |
+|---|---|
+| **Push to `main`** | Builds Windows x64 DLL + macOS Universal bundle. Sanity check that catches the rare admin-bypass merge that lands red. |
+| **All PRs (drafts included)** | Same build runs on the PR head. No path filter — the build is ~45s, not worth the gating complexity. PRs report status before merge. |
+| **`v*` tag push** | Builds + runs the `release` job (UPM tarball, `upm` branch update, GitHub Release). |
+| **`workflow_dispatch`** | Manual run from the Actions tab. |
+| **Concurrency** | `cancel-in-progress: true` — rapid pushes to a PR cancel the in-progress run; only the latest commit's CI completes. |
+
+#### Standard contributor flow
+
+For native or workflow changes, use a feature branch + PR — don't direct-push
+to `main`. The PR run gives you the green checkmark before merge.
 
 ```bash
-git push origin HEAD
+git checkout -b fix/short-description
+# ... edit native~/, run native~\build-win.bat or native~/build-mac.sh ...
+git add native~/<files> Runtime/Plugins/<platform>/<binary>
+git commit -m "Short subject (#123)"     # always include the issue number
+git push -u origin fix/short-description
+gh pr create --fill                       # opens PR; CI fires on the PR head
 ```
+
+C#-only changes can be merged the same way. The native build still fires
+on the PR (cheap and free), and you get a green check before merge.
+
+For tagged releases, use the `/release` skill — see below.
 
 ### Creating a release: use the `/release` skill (don't tag manually)
 
@@ -247,26 +266,16 @@ The `upm` branch and release tarball only exist after the first `v*` tag is push
 
 ## Claude Code Skills
 
-### /ci-monitor - Automated Build Workflow
-Automates the complete CI workflow for native plugin builds: commit → push → monitor → auto-fix.
+### /release - Tagged Release
+Bumps the version, tags, pushes, monitors CI, and verifies the GitHub Release
++ `upm` branch were created. See the "Creating a release" section above for
+usage. Skill at `.claude/skills/release/SKILL.md`.
 
-**Usage:**
-```bash
-/ci-monitor "commit message"    # Commit with message and monitor build
-/ci-monitor                      # Auto-generate commit message from changes
-/ci-monitor --watch-only         # Just monitor current build without committing
-```
-
-**Features:**
-- Launches subagent to preserve main conversation context
-- Monitors GitHub Actions `build-native.yml` (Windows x64 + macOS Universal)
-- Auto-diagnoses common build errors (missing includes, undeclared identifiers, linker errors)
-- Attempts up to 3 automatic fixes before reporting failure
-- Detects when only C# files changed (no native build triggered)
-
-**Important:** Always include the related GitHub issue number in commit messages — e.g., `Fix linker error (#93)`. Check conversation context and recent commits to determine the issue number.
-
-**Skill location:** `.claude/skills/ci-monitor/SKILL.md`
+> **Note:** A `/ci-monitor` skill previously automated direct-push-to-main +
+> watch-the-build. It was retired when the CI policy moved to PR-driven
+> builds — open a PR and let CI report on the PR head. Always include the
+> related GitHub issue number in commit messages (e.g. `Fix linker error
+> (#93)`).
 
 ## Documentation Index
 

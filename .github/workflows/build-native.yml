@@ -1,15 +1,29 @@
 name: Build Native Plugin
 
 on:
+  # Public-repo CI policy: fire freely. CI is free for public repos
+  # on GitHub-hosted runners, so we optimize for contributor experience
+  # rather than minute-burn:
+  # - All PRs run CI (drafts included). Fast feedback without the
+  #   ready-for-review handshake. No path filter — small repo, native
+  #   build is ~45s, not worth the gating complexity.
+  # - Push to main fires the workflow as a sanity check (catches the
+  #   rare admin-bypass merge that lands red).
+  # - Tag pushes (v*) fire the build + release jobs.
+  # - Rapid pushes to a PR cancel the in-progress run (concurrency
+  #   group below) so only the latest commit's CI completes.
   push:
+    branches: [main]
     tags:
       - 'v*'
-  pull_request:
-    branches: [main]
-    paths:
-      - 'native~/**'
-      - '.github/workflows/build-native.yml'
+  pull_request: {}
   workflow_dispatch:
+
+# Cancel any in-progress run for the same PR (or branch) when a new
+# push comes in.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   build-windows:

@@ -65,11 +65,11 @@ Work through these in order. If something fails, diagnose with the failure-modes
    ```
    Use a NEW commit, do not amend.
 
-5. **Push and let CI cross-check both platforms** (this catches any macOS regression — the fix should be a no-op there because it lives inside `_WIN32 && s_d3d11_device != nullptr`, but verify):
+5. **Push and let CI cross-check both platforms** (this catches any macOS regression — the fix should be a no-op there because it lives inside `_WIN32 && s_d3d11_device != nullptr`, but verify). Push to a feature branch and open a PR; the build runs on the PR and reports back via GitHub status checks. **Do not block on CI** — proceed to local testing in parallel.
    ```bash
-   git push
+   git push -u origin <branch>
+   gh pr create --fill
    ```
-   Optionally run `/ci-monitor --watch-only` to watch the build, but **do not block on CI** — proceed to local testing in parallel.
 
 6. **Run the end-to-end verification on this machine.** Follow steps 1–8 in the "Verification" section of `docs~/roadmap/d3d11-typeless-fix-plan.md`. Specifically:
    - Test project: `DisplayXR-test` (ask the user where it lives if you can't find it; on Mac it's at `/Users/david.fattal/Documents/Unity/DisplayXR-test`, on Windows it's likely under the user's home).
