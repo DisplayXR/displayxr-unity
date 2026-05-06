@@ -5,6 +5,29 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.5] - 2026-05-06
+
+### Added
+- macOS standalone builds now auto-bundle the OpenXR loader (`openxr_loader.dylib`)
+  into `<App>.app/Contents/PlugIns/`. Unity's own `OpenXRBuildProcessor` only
+  handles Windows + Android; without this, every macOS build failed at session
+  init with "Failed to load openxr runtime loader". Loader ships at
+  `RuntimeLoaders~/macos/` (ignored by Unity's asset pipeline) and is copied
+  by `DisplayXRBuildProcessor.OnPostprocessBuild`. (#71)
+- `URPBasicScene` sample now ships an editor-only build hook that registers
+  `Universal Render Pipeline/Lit` in **Project Settings > Graphics > Always
+  Included Shaders** before any standalone build, so the shader isn't dropped
+  by Unity's stripper. Also exposed as **Tools > DisplayXR > Register URP/Lit
+  in Always Included Shaders**. (#72)
+
+### Documentation
+- README "macOS Deployment" section now covers the unsigned-`.app` symlink
+  issue (`XR_ERROR_RUNTIME_UNAVAILABLE` despite a working
+  `~/Library/Application Support/openxr/1/active_runtime.json` symlink) and
+  the two workarounds: explicit `XR_RUNTIME_JSON`, or ad-hoc `codesign
+  --deep --force --sign - MyApp.app`. Also covers Developer ID + notarization
+  for distribution. New troubleshooting row mirrors this. (#72)
+
 ## [1.2.4] - 2026-05-06
 
 ### Added
