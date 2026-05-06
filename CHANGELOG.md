@@ -5,6 +5,29 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.8] - 2026-05-07
+
+### Fixed
+- DisplayXRWindowSpaceUI now works under URP. The previous design (Canvas in
+  ScreenSpaceCamera mode + dedicated camera with a depth-less RenderTexture)
+  was silently failing under URP's RenderGraph: empty RT, transparent layer,
+  no UI shown. Rewrote the component to use a private WorldSpace canvas + a
+  dedicated overlay camera with the camera's "up" vector inverted to handle
+  the bottom-left ↔ top-left RT origin convention. The RT is created with
+  explicit GraphicsFormat color + D24_UNorm_S8_UInt depth-stencil to satisfy
+  RenderGraph's render-target requirements. Camera is auto-render-disabled
+  and manually Render()-ed each LateUpdate. [ExecuteAlways] so this works in
+  edit-mode preview as well as Play Mode. (#78)
+- Canvas state (renderMode, transform, layer) is now saved + restored in
+  OnDisable so the host app's Canvas is left as we found it.
+
+### Known limitations
+- WorldSpace-canvas approach means UI elements aren't directly clickable —
+  Unity's GraphicRaycaster expects screen-space mouse coordinates against a
+  canvas in screen-space or a worldCamera-projected canvas. wsui-rendered
+  UI is read-only for now. An input router (mouse → window-fractional →
+  canvas-local → synthetic events) is tracked as a v1.2.9+ follow-up.
+
 ## [1.2.7] - 2026-05-06
 
 ### Fixed
