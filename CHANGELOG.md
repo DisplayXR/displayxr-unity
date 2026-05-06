@@ -5,6 +5,11 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.7] - 2026-05-06
+
+### Fixed
+- Export `displayxr_window_space_ui_set_texture/_set_layer/_clear` with `DISPLAYXR_EXPORT` so Unity's P/Invoke can find them. v1.2.6 was missing these symbols (visibility=hidden on Mac, no `__declspec(dllexport)` on Windows), causing `EntryPointNotFoundException` on first DisplayXRWindowSpaceUI.LateUpdate call. (#67)
+
 ## [1.2.6] - 2026-05-06
 
 ### Added
