@@ -223,6 +223,24 @@ wsui_hooked_pre_end_frame(XrSession session, GraphicsBackend *backend)
 	// Default: layer inactive. Re-enabled below if everything succeeds.
 	state->window_layers[0].active = 0;
 
+#if defined(__APPLE__)
+	// The DisplayXR runtime's Metal compositor (comp_metal_compositor.m)
+	// does not implement xrt_comp_layer_window_space — only D3D11/D3D12/
+	// Vulkan/GL do. The verify path at oxr_session_frame_end.c:1199 accepts
+	// the layer on `is_metal_native_compositor`, but the function-pointer
+	// dispatch is NULL → SIGSEGV in xrEndFrame. Tracked upstream as
+	// displayxr-runtime#TODO. Skip submission on macOS until that lands.
+	(void)session; (void)backend;
+	static int s_warned_apple = 0;
+	if (!s_warned_apple && s_pending.native_tex != nullptr) {
+		s_warned_apple = 1;
+		displayxr_log("[DisplayXR] wsui hooked: skipping window-space layer "
+		    "submission on macOS — runtime Metal compositor lacks "
+		    "layer_window_space (would crash). Tracked upstream.\n");
+	}
+	return;
+#endif
+
 	void *unity_tex = s_pending.native_tex;
 	int tex_w = s_pending.width;
 	int tex_h = s_pending.height;
@@ -341,6 +359,21 @@ wsui_standalone_pre_end_frame(XrSession session,
 {
 	if (out_layer == nullptr) return 0;
 	memset(out_layer, 0, sizeof(*out_layer));
+
+#if defined(__APPLE__)
+	// See comment in wsui_hooked_pre_end_frame above: the runtime's Metal
+	// compositor lacks layer_window_space, so submitting from the
+	// standalone path crashes the runtime in xrEndFrame.
+	(void)session; (void)fns; (void)backend;
+	static int s_warned_apple_sa = 0;
+	if (!s_warned_apple_sa && s_pending.native_tex != nullptr) {
+		s_warned_apple_sa = 1;
+		displayxr_log("[DisplayXR] wsui_sa: skipping window-space layer "
+		    "submission on macOS — runtime Metal compositor lacks "
+		    "layer_window_space (would crash). Tracked upstream.\n");
+	}
+	return 0;
+#endif
 
 	void *unity_tex = s_pending.native_tex;
 	int tex_w = s_pending.width;
