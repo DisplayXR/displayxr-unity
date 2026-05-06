@@ -43,7 +43,10 @@ void displayxr_log(const char *fmt, ...);
 
 // --- D3D11 swapchain image struct (from openxr_platform.h) ---
 // Defined inline to avoid requiring XR_USE_GRAPHICS_API_D3D11 globally.
-#if defined(_WIN32)
+// Guarded so it doesn't collide with the matching definition in
+// displayxr_standalone_internal.h when wsui_window_space_ui.cpp includes both.
+#if defined(_WIN32) && !defined(DISPLAYXR_HAS_D3D11_SWAPCHAIN_IMAGE)
+#define DISPLAYXR_HAS_D3D11_SWAPCHAIN_IMAGE 1
 typedef struct XrSwapchainImageD3D11KHR {
 	XrStructureType type;
 	void *next;
@@ -113,6 +116,21 @@ public:
 	virtual void set_rendering_mode_fns(PFN_xrEnumerateDisplayRenderingModesEXT, PFN_xrRequestDisplayRenderingModeEXT) {}
 	virtual void on_session_ready(XrSession) {}
 	virtual XrResult request_rendering_mode(XrSession, uint32_t) { return XR_ERROR_FUNCTION_UNSUPPORTED; }
+
+	// Window-space UI overlay (issue #67).
+	// Enumerate the named swapchain's images using the platform-appropriate
+	// XrSwapchainImage*KHR struct, extract the native texture pointer
+	// (id<MTLTexture>, ID3D11Texture2D*, ID3D12Resource*) for each image,
+	// and store up to `capacity` of them in `out_native_ptrs`. Writes the
+	// actual count to *out_count. Returns true on success.
+	virtual bool wsui_enumerate_swapchain_images(XrSwapchain, uint32_t /*capacity*/,
+	    uint32_t * /*out_count*/, void * /*out_native_ptrs*/[]) { return false; }
+
+	// Copy the Unity-side native texture (backend-typed) into the named
+	// swapchain image (also backend-typed). w/h are the source/dest extent.
+	// Returns true on success.
+	virtual bool wsui_copy_to_swapchain_image(void * /*unity_tex*/,
+	    void * /*sc_image_native*/, uint32_t /*w*/, uint32_t /*h*/) { return false; }
 };
 
 // --- Factory functions for concrete backend classes ---

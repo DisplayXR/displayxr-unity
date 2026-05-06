@@ -543,6 +543,52 @@ public:
 	void *get_graphics_device() override { return (void *)d3d12_device; }
 	void *get_graphics_queue() override { return (void *)d3d12_queue; }
 	void *get_shared_handle() override { return (void *)d3d12_shared_handle; }
+
+	// --- Window-space UI overlay (issue #67) ---
+	// Same cross-device limitation as the D3D11 standalone backend (see the
+	// matching comment there). Built apps go through the hooked path which
+	// IS supported. Editor Preview Window UI overlay on Windows D3D12 is a
+	// follow-up.
+
+	bool wsui_enumerate_swapchain_images(XrSwapchain sc,
+	                                      PFN_xrEnumerateSwapchainImages pfn_enum,
+	                                      uint32_t capacity,
+	                                      uint32_t *out_count,
+	                                      void *out_native_ptrs[]) override
+	{
+		uint32_t count = 0;
+		if (XR_FAILED(pfn_enum(sc, 0, &count, NULL)) || count == 0) return false;
+		if (count > capacity) count = capacity;
+		XrSwapchainImageD3D12KHR imgs[16] = {};
+		if (count > 16) count = 16;
+		for (uint32_t i = 0; i < count; i++) {
+			imgs[i].type = XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR;
+		}
+		if (XR_FAILED(pfn_enum(sc, count, &count, (XrSwapchainImageBaseHeader *)imgs))) {
+			return false;
+		}
+		for (uint32_t i = 0; i < count; i++) {
+			out_native_ptrs[i] = (void *)imgs[i].texture;
+		}
+		*out_count = count;
+		return true;
+	}
+
+	bool wsui_copy_to_swapchain_image(void * /*unity_tex*/, void * /*sc_image*/,
+	                                    uint32_t /*w*/, uint32_t /*h*/) override
+	{
+		static int warned = 0;
+		if (!warned) {
+			warned = 1;
+			fprintf(stderr,
+			    "[DisplayXR-SA] wsui D3D12: cross-device copy not yet "
+			    "supported (Unity device != standalone device). UI overlay "
+			    "in editor Preview Window will not render on Windows D3D12 "
+			    "until a shared bridge texture is wired up. Built apps are "
+			    "unaffected.\n");
+		}
+		return false;
+	}
 };
 
 StandaloneGraphicsBackend *create_standalone_d3d12_backend() { return new StandaloneD3D12Backend(); }

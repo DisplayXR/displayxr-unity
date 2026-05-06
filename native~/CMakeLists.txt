@@ -56,6 +56,7 @@ set(SOURCES
     displayxr_standalone_vulkan.cpp
     displayxr_standalone_opengl.cpp
     displayxr_standalone_opengles.cpp
+    displayxr_window_space_ui.cpp
     display3d_view.c
     camera3d_view.c
 )
@@ -69,6 +70,7 @@ set(HEADERS
     displayxr_extensions.h
     displayxr_standalone.h
     displayxr_standalone_internal.h
+    displayxr_window_space_ui.h
     display3d_view.h
     camera3d_view.h
 )

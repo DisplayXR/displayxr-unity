@@ -107,6 +107,41 @@ public:
 	}
 
 	void destroy() override {}
+
+	// --- Window-space UI overlay (issue #67) ---
+
+	bool wsui_enumerate_swapchain_images(XrSwapchain sc,
+	                                      PFN_xrEnumerateSwapchainImages pfn_enum,
+	                                      uint32_t capacity,
+	                                      uint32_t *out_count,
+	                                      void *out_native_ptrs[]) override
+	{
+		uint32_t count = 0;
+		if (XR_FAILED(pfn_enum(sc, 0, &count, NULL)) || count == 0) return false;
+		if (count > capacity) count = capacity;
+		XrSwapchainImageMetalKHR imgs[16] = {};
+		if (count > 16) count = 16;
+		for (uint32_t i = 0; i < count; i++) {
+			imgs[i].type = XR_TYPE_SWAPCHAIN_IMAGE_METAL_KHR;
+		}
+		if (XR_FAILED(pfn_enum(sc, count, &count, (XrSwapchainImageBaseHeader *)imgs))) {
+			return false;
+		}
+		for (uint32_t i = 0; i < count; i++) {
+			out_native_ptrs[i] = imgs[i].texture;
+		}
+		*out_count = count;
+		return true;
+	}
+
+	bool wsui_copy_to_swapchain_image(void *unity_tex, void *sc_image_native,
+	                                    uint32_t /*w*/, uint32_t /*h*/) override
+	{
+		if (!unity_tex || !sc_image_native) return false;
+		// Reuse the standalone Metal blit helper — it uses s_sa_queue, which
+		// belongs to the standalone session (the right device for this path).
+		return displayxr_sa_metal_blit(unity_tex, sc_image_native) != 0;
+	}
 };
 
 StandaloneGraphicsBackend *create_standalone_metal_backend() { return new StandaloneMetalBackend(); }

@@ -24,15 +24,24 @@
 #include "displayxr_win32.h"
 
 // D3D12 OpenXR structs (inlined to avoid requiring XR_USE_GRAPHICS_API_D3D12).
+#ifndef XR_TYPE_GRAPHICS_BINDING_D3D12_KHR
 #define XR_TYPE_GRAPHICS_BINDING_D3D12_KHR      ((XrStructureType)1000028000)
+#endif
+#ifndef XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR
 #define XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR       ((XrStructureType)1000028001)
+#endif
+#ifndef XR_TYPE_GRAPHICS_REQUIREMENTS_D3D12_KHR
 #define XR_TYPE_GRAPHICS_REQUIREMENTS_D3D12_KHR ((XrStructureType)1000028002)
+#endif
 
+#ifndef DISPLAYXR_HAS_D3D12_SWAPCHAIN_IMAGE
+#define DISPLAYXR_HAS_D3D12_SWAPCHAIN_IMAGE 1
 typedef struct XrSwapchainImageD3D12KHR {
 	XrStructureType type;
 	void *next;
 	ID3D12Resource *texture;
 } XrSwapchainImageD3D12KHR;
+#endif
 
 typedef struct XrGraphicsBindingD3D12KHR {
 	XrStructureType type;
@@ -49,15 +58,24 @@ typedef struct XrGraphicsRequirementsD3D12KHR {
 } XrGraphicsRequirementsD3D12KHR;
 
 // D3D11 OpenXR structs (inlined to avoid requiring XR_USE_GRAPHICS_API_D3D11).
+#ifndef XR_TYPE_GRAPHICS_BINDING_D3D11_KHR
 #define XR_TYPE_GRAPHICS_BINDING_D3D11_KHR      ((XrStructureType)1000027000)
+#endif
+#ifndef XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR
 #define XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR       ((XrStructureType)1000027001)
+#endif
+#ifndef XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR
 #define XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR ((XrStructureType)1000027002)
+#endif
 
+#ifndef DISPLAYXR_HAS_D3D11_SWAPCHAIN_IMAGE
+#define DISPLAYXR_HAS_D3D11_SWAPCHAIN_IMAGE 1
 typedef struct XrSwapchainImageD3D11KHR {
 	XrStructureType type;
 	void *next;
 	ID3D11Texture2D *texture;
 } XrSwapchainImageD3D11KHR;
+#endif
 
 typedef struct XrGraphicsBindingD3D11KHR {
 	XrStructureType type;
@@ -170,6 +188,18 @@ public:
 	virtual void *get_graphics_device() { return nullptr; }   // D3D device (ID3D11Device* or ID3D12Device*)
 	virtual void *get_graphics_queue() { return nullptr; }    // D3D12 command queue (nullptr for D3D11)
 	virtual void *get_shared_handle() { return nullptr; }     // DXGI shared handle
+
+	// Window-space UI overlay (issue #67). Enumerate `sc`'s images using the
+	// platform-appropriate XrSwapchainImage*KHR struct via `pfn_enum`, then
+	// store up to `capacity` native texture pointers in `out_native_ptrs`.
+	virtual bool wsui_enumerate_swapchain_images(XrSwapchain /*sc*/,
+	    PFN_xrEnumerateSwapchainImages /*pfn_enum*/, uint32_t /*capacity*/,
+	    uint32_t * /*out_count*/, void * /*out_native_ptrs*/[]) { return false; }
+
+	// Copy the Unity-side native texture (backend-typed) into the named
+	// swapchain image (also backend-typed). w/h = extent.
+	virtual bool wsui_copy_to_swapchain_image(void * /*unity_tex*/,
+	    void * /*sc_image_native*/, uint32_t /*w*/, uint32_t /*h*/) { return false; }
 };
 
 // Factory functions (defined in the backend .cpp files)

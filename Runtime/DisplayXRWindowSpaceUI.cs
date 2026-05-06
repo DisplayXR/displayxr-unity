@@ -53,6 +53,9 @@ namespace DisplayXR
         private Canvas m_Canvas;
         private Camera m_OverlayCamera;
 
+        // Cached previous values so LateUpdate only re-pushes when something changed.
+        private float m_LastX, m_LastY, m_LastW, m_LastH, m_LastDisparity;
+
 
         void OnEnable()
         {
@@ -88,12 +91,24 @@ namespace DisplayXR
             m_Canvas.renderMode = RenderMode.ScreenSpaceCamera;
             m_Canvas.worldCamera = m_OverlayCamera;
 
+            // Push initial layer descriptor + texture pointer to native.
+            DisplayXRNative.displayxr_window_space_ui_set_layer(
+                positionX, positionY, width, height, disparity);
+            DisplayXRNative.displayxr_window_space_ui_set_texture(
+                OverlayTexture.GetNativeTexturePtr(), resolution.x, resolution.y);
+
+            m_LastX = positionX; m_LastY = positionY;
+            m_LastW = width;     m_LastH = height;
+            m_LastDisparity = disparity;
+
             Debug.Log($"[DisplayXR] WindowSpaceUI enabled: {resolution.x}x{resolution.y}, " +
                       $"pos=({positionX},{positionY}), size=({width},{height})");
         }
 
         void OnDisable()
         {
+            DisplayXRNative.displayxr_window_space_ui_clear();
+
             if (m_OverlayCamera != null)
             {
                 if (Application.isPlaying)
@@ -115,11 +130,16 @@ namespace DisplayXR
 
         void LateUpdate()
         {
-            // TODO: When the overlay swapchain is created via OpenXR, update the
-            // native window layer descriptor each frame with current position/size/disparity.
-            // For now, the Canvas renders to OverlayTexture each frame automatically.
-            // The actual OpenXR swapchain creation and xrEndFrame injection will be
-            // implemented when we have the overlay swapchain management in place.
+            if (positionX != m_LastX || positionY != m_LastY ||
+                width != m_LastW || height != m_LastH ||
+                disparity != m_LastDisparity)
+            {
+                DisplayXRNative.displayxr_window_space_ui_set_layer(
+                    positionX, positionY, width, height, disparity);
+                m_LastX = positionX; m_LastY = positionY;
+                m_LastW = width;     m_LastH = height;
+                m_LastDisparity = disparity;
+            }
         }
     }
 }
