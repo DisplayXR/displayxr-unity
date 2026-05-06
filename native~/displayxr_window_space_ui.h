@@ -19,6 +19,22 @@
 #include "displayxr_extensions.h"
 #include <stdint.h>
 
+// Local definition of DISPLAYXR_EXPORT (same shape as displayxr_hooks.h /
+// displayxr_standalone.h). Defining it inline rather than including
+// displayxr_hooks.h here avoids dragging that header into translation units
+// that also include displayxr_win32.h — which redeclares some of
+// displayxr_hooks.h's exports without __declspec(dllexport), tripping
+// MSVC C2375 "redefinition; different linkage".
+#ifndef DISPLAYXR_EXPORT
+# if defined(_WIN32)
+#  define DISPLAYXR_EXPORT __declspec(dllexport)
+# elif defined(__GNUC__)
+#  define DISPLAYXR_EXPORT __attribute__((visibility("default")))
+# else
+#  define DISPLAYXR_EXPORT
+# endif
+#endif
+
 #ifdef __cplusplus
 
 // Forward declarations of backend abstract bases.
@@ -78,16 +94,16 @@ extern "C" {
 //   - Windows D3D11: ID3D11Texture2D*
 //   - Windows D3D12: ID3D12Resource*
 // Pass NULL to deregister.
-void displayxr_window_space_ui_set_texture(void *nativeTex, int width, int height);
+DISPLAYXR_EXPORT void displayxr_window_space_ui_set_texture(void *nativeTex, int width, int height);
 
 // Update the layer descriptor (fractional window coords + per-eye disparity).
 // May be called every frame; cheap.
-void displayxr_window_space_ui_set_layer(float x, float y,
+DISPLAYXR_EXPORT void displayxr_window_space_ui_set_layer(float x, float y,
                                           float width, float height,
                                           float disparity);
 
 // Clear the registered texture and mark the layer inactive.
-void displayxr_window_space_ui_clear(void);
+DISPLAYXR_EXPORT void displayxr_window_space_ui_clear(void);
 
 #ifdef __cplusplus
 }
