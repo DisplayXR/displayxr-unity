@@ -13,6 +13,14 @@ fall back to mono.
 
 - `URPBasicSceneSetup.cs` — Spawns colored cubes at varying depths using
   the URP/Lit shader. Attach to any GameObject in a fresh scene.
+- `Editor/URPBasicSceneShaderRegistration.cs` — Editor-only. Before any
+  standalone build (via `IPreprocessBuildWithReport`) and on demand via
+  **Tools > DisplayXR > Register URP/Lit in Always Included Shaders**, adds
+  URP/Lit to **Project Settings > Graphics > Always Included Shaders** so the
+  shader ships in standalone builds. Without this, Unity's build-time shader
+  stripper drops URP/Lit — the script resolves it via `Shader.Find` at runtime,
+  with no static reference visible to the stripper — and the cubes render as
+  the magenta error material in the built `.app`. (Issue #72.) Idempotent.
 
 ## Quick Start
 

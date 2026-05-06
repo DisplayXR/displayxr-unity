@@ -352,6 +352,37 @@ Set before launching the app:
 export XR_RUNTIME_JSON=/path/to/DisplayXR-macOS/share/openxr/1/openxr_displayxr.json
 ```
 
+#### Unsigned builds and the runtime symlink
+
+If you have a runtime symlink at `~/Library/Application Support/openxr/1/active_runtime.json` (the OpenXR loader's standard discovery path), it works for the Unity editor but **not for unsigned built `.app` bundles**. macOS' file-access protections block unsigned apps from reading other apps' Application Support directories, so the loader can't find the runtime manifest. Symptom:
+
+```
+Loading OpenXR loader library at path: openxr_loader
+[XR] [FAILURE] xrCreateInstance: XR_ERROR_RUNTIME_UNAVAILABLE
+[DisplayXR] DisplayXRFeature not active.
+```
+
+Two ways around it:
+
+**1. Set `XR_RUNTIME_JSON` explicitly when launching** (works with any build, signed or not):
+```bash
+XR_RUNTIME_JSON=/path/to/openxr_displayxr.json /path/to/MyApp.app/Contents/MacOS/MyApp
+```
+
+**2. Code-sign the `.app`** so macOS grants it normal user-file access. Ad-hoc signing is enough for local development — no Apple Developer account needed:
+```bash
+codesign --deep --force --sign - MyApp.app
+```
+After signing, the runtime symlink is reachable and you can launch the app without `XR_RUNTIME_JSON`.
+
+For distributing to other users, sign with a Developer ID and notarize:
+```bash
+codesign --deep --force --sign "Developer ID Application: Your Name (TEAMID)" \
+         --options runtime --timestamp MyApp.app
+xcrun notarytool submit MyApp.app --apple-id you@example.com --team-id TEAMID --wait
+xcrun stapler staple MyApp.app
+```
+
 ### What Happens Without the Runtime
 
 If the DisplayXR runtime is not installed, Unity's OpenXR loader fails to find a runtime and logs:
@@ -397,6 +428,7 @@ This lets you develop and test the full stereo pipeline on any machine.
 | UPM "cannot add package from git URL" (Windows) | Git not installed or not in PATH | Install [Git for Windows](https://gitforwindows.org/), restart Unity. Verify with `git --version` in a terminal. |
 | UPM "cannot add package from git URL" (macOS) | GUI apps can't find Homebrew Git | Run `xcode-select --install` to set up `/usr/bin/git`, or launch Unity from terminal (`open -a Unity`). Check `~/Library/Logs/Unity/upm.log` for details. |
 | `DllNotFoundException: displayxr_unity` | Native plugin not found by Unity | Ensure the plugin binaries are in `Runtime/Plugins/Windows/x64/` or `Runtime/Plugins/macOS/` |
+| macOS: `XR_ERROR_RUNTIME_UNAVAILABLE` in built `.app` despite the symlink working in editor | Unsigned `.app` bundles can't read `~/Library/Application Support/openxr/` due to macOS sandbox protections | Either set `XR_RUNTIME_JSON` when launching, or ad-hoc sign with `codesign --deep --force --sign - MyApp.app`. See [macOS Deployment](#macos-deployment). |
 | HDRP stereo artifacts | Single-pass instanced issue | Verify both eye views have correct FOVs in Frame Debugger |
 | Preview shows "Not Connected" | `XR_RUNTIME_JSON` not set or runtime not running | Set the env var before launching Unity; verify the runtime process is active |
 | Preview shows black after Start | Runtime connected but no output | Check runtime logs; verify sim_display or hardware is configured |
