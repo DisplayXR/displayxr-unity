@@ -5,6 +5,13 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.6] - 2026-05-06
+
+### Added
+- Submit `DisplayXRWindowSpaceUI` as `XrCompositionLayerWindowSpaceEXT` so
+  2D UI canvases composite as a stereo overlay layer with proper disparity
+  on the DisplayXR runtime. (#67)
+
 ## [1.2.5] - 2026-05-06
 
 ### Added
