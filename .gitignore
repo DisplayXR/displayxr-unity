@@ -6,6 +6,8 @@ native~/cmake-build-*/
 # Unity meta files for non-package directories
 docs/**/*.meta
 docs/*.meta
+/docs.meta
+/*.md.meta
 
 # OS files
 .DS_Store
@@ -22,6 +24,9 @@ displayxr-app.log.meta
 .vscode/
 *.swp
 *.swo
+
+# Claude Code runtime scratch
+.claude/scheduled_tasks.lock
 
 # Built plugin binaries (committed by CI, not manually)
 # Uncomment these if you want CI to commit binaries:
