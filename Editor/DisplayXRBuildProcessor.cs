@@ -27,6 +27,15 @@ namespace DisplayXR.Editor
 
         public void OnPostprocessBuild(BuildReport report)
         {
+            // Bundle the OpenXR loader into macOS standalone builds. Unity's own
+            // OpenXRBuildProcessor only handles Windows + Android; on macOS the
+            // .app ships without a loader and OpenXR session init fails with
+            // "Failed to load openxr runtime loader". See issue #71.
+            if (report.summary.platform == BuildTarget.StandaloneOSX)
+            {
+                CopyMacOSOpenXRLoader(report.summary.outputPath);
+            }
+
             string exePath = report.summary.outputPath;
             string exeDir = Path.GetDirectoryName(exePath);
             string exeName = Path.GetFileNameWithoutExtension(exePath);
@@ -71,6 +80,36 @@ namespace DisplayXR.Editor
             {
                 WriteRegisteredManifest(exePath, settings,
                     appName, category, displayMode, description, layout);
+            }
+        }
+
+        /// <summary>
+        /// Copy the bundled OpenXR loader dylib into the macOS .app's PlugIns
+        /// directory so OpenXR session init can dlopen it. The loader lives in
+        /// the package at RuntimeLoaders~/macos/openxr_loader.dylib (the ~ suffix
+        /// keeps Unity's asset pipeline from importing it). Unity's own
+        /// OpenXRBuildProcessor only auto-deploys loaders on Windows + Android,
+        /// not macOS, so we ship our own.
+        /// </summary>
+        private static void CopyMacOSOpenXRLoader(string outputPath)
+        {
+            string srcPath = Path.GetFullPath("Packages/com.displayxr.unity/RuntimeLoaders~/macos/openxr_loader.dylib");
+            if (!File.Exists(srcPath))
+            {
+                Debug.LogWarning($"DisplayXR: OpenXR loader not found at {srcPath} — built .app will fail to init OpenXR.");
+                return;
+            }
+
+            string dstPath = Path.Combine(outputPath, "Contents/PlugIns/openxr_loader.dylib");
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(dstPath));
+                File.Copy(srcPath, dstPath, overwrite: true);
+                Debug.Log($"DisplayXR: Bundled OpenXR loader at {dstPath}");
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning($"DisplayXR: Failed to copy OpenXR loader to {dstPath}: {e.Message}");
             }
         }
 
