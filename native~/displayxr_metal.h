@@ -24,6 +24,13 @@ void displayxr_metal_destroy_preview_window(void);
 /// @return NSView* cast to void*, or NULL if no window found.
 void *displayxr_get_app_main_view(void);
 
+/// Hooked-path Metal blit helper (issue #67).
+/// Same-format blit src → dst using a caller-provided MTLCommandQueue.
+/// Returns 1 on success. Differs from displayxr_sa_metal_blit by accepting
+/// an explicit queue (the hooked path can't use the standalone module's
+/// static queue — different session, possibly different MTLDevice).
+int displayxr_metal_blit_textures(void *queue, void *src_tex, void *dst_tex);
+
 #ifdef __cplusplus
 }
 #endif

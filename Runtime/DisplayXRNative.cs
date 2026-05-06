@@ -206,6 +206,37 @@ namespace DisplayXR
         internal static extern void displayxr_destroy_preview_window();
 
         // ====================================================================
+        // Window-space UI overlay (issue #67)
+        //
+        // Routes a Canvas RenderTexture to a XrCompositionLayerWindowSpaceEXT
+        // composition layer. The native side mirrors the Unity texture into
+        // an OpenXR overlay swapchain each frame; the runtime composites it
+        // on top of the eye projection.
+        // ====================================================================
+
+        /// <summary>
+        /// Register the Unity-side native texture pointer that the overlay
+        /// swapchain should mirror each frame. Pass IntPtr.Zero to deregister.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void displayxr_window_space_ui_set_texture(
+            IntPtr nativeTex, int width, int height);
+
+        /// <summary>
+        /// Update the layer descriptor (fractional window coords + per-eye
+        /// horizontal disparity). Cheap; safe to call every frame.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void displayxr_window_space_ui_set_layer(
+            float x, float y, float width, float height, float disparity);
+
+        /// <summary>
+        /// Clear the registered texture and mark the layer inactive.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void displayxr_window_space_ui_clear();
+
+        // ====================================================================
         // Native log callback (routes native messages to Debug.Log)
         // ====================================================================
 

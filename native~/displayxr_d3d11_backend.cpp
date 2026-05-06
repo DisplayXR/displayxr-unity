@@ -572,6 +572,58 @@ public:
 	{
 		return nullptr;
 	}
+
+	// --- Window-space UI overlay (issue #67) ---
+
+	bool wsui_enumerate_swapchain_images(XrSwapchain sc, uint32_t capacity,
+	                                      uint32_t *out_count, void *out_native_ptrs[]) override
+	{
+		if (s_real_enumerate_swapchain_images == nullptr) return false;
+		uint32_t count = 0;
+		if (XR_FAILED(s_real_enumerate_swapchain_images(sc, 0, &count, nullptr)) || count == 0)
+			return false;
+		if (count > capacity) count = capacity;
+
+		XrSwapchainImageD3D11KHR images[16] = {};
+		if (count > 16) count = 16;
+		for (uint32_t i = 0; i < count; i++) {
+			images[i].type = XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR;
+		}
+		if (XR_FAILED(s_real_enumerate_swapchain_images(
+			sc, count, &count, (XrSwapchainImageBaseHeader *)images))) {
+			return false;
+		}
+		for (uint32_t i = 0; i < count; i++) {
+			out_native_ptrs[i] = images[i].texture;
+		}
+		*out_count = count;
+		return true;
+	}
+
+	bool wsui_copy_to_swapchain_image(void *unity_tex, void *sc_image_native,
+	                                    uint32_t w, uint32_t h) override
+	{
+		ID3D11Texture2D *src = (ID3D11Texture2D *)unity_tex;
+		ID3D11Texture2D *dst = (ID3D11Texture2D *)sc_image_native;
+		if (!src || !dst || !context) return false;
+		// CopyResource requires identical descs; use CopySubresourceRegion with
+		// an explicit box clamped to min(src, dst, requested) so a slight
+		// dimension mismatch (e.g. driver-rounded swapchain size) doesn't
+		// crash the runtime.
+		D3D11_TEXTURE2D_DESC src_desc = {}, dst_desc = {};
+		src->GetDesc(&src_desc);
+		dst->GetDesc(&dst_desc);
+		uint32_t copy_w = w;
+		if (src_desc.Width  < copy_w) copy_w = src_desc.Width;
+		if (dst_desc.Width  < copy_w) copy_w = dst_desc.Width;
+		uint32_t copy_h = h;
+		if (src_desc.Height < copy_h) copy_h = src_desc.Height;
+		if (dst_desc.Height < copy_h) copy_h = dst_desc.Height;
+		D3D11_BOX box = { 0, 0, 0, copy_w, copy_h, 1 };
+		context->CopySubresourceRegion(dst, 0, 0, 0, 0, src, 0, &box);
+		context->Flush();
+		return true;
+	}
 };
 
 GraphicsBackend *create_d3d11_backend() { return new D3D11Backend(); }

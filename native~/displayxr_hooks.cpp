@@ -5,6 +5,7 @@
 // Hooks into Unity's OpenXR loader chain via HookGetInstanceProcAddr.
 
 #include "displayxr_hooks_internal.h"
+#include "displayxr_window_space_ui.h"
 
 // --- Logging helper ---
 // On Windows built apps, fprintf(stderr) goes nowhere (no console).
@@ -750,6 +751,7 @@ hooked_xrDestroySession(XrSession session)
 	displayxr_log( "[DisplayXR] xrDestroySession BEGIN session=%p (DEFERRED)\n", (void *)(uintptr_t)session);
 	s_session_alive = 0;
 	s_local_space = XR_NULL_HANDLE;
+	wsui_hooked_on_session_destroyed();
 	if (s_backend) { s_backend->on_session_destroyed(); }
 
 	// Destroy the editor preview window before deferring the session destroy.
@@ -831,6 +833,10 @@ hooked_xrEndFrame(XrSession session, const XrFrameEndInfo *frameEndInfo)
 		s_backend->prepare_end_frame(session, frameEndInfo, ef_patches, &ef_npatch);
 	}
 #endif
+
+	// Window-space UI overlay (issue #67): copy Unity texture into our overlay
+	// swapchain and populate window_layers[0]. The loop below picks it up.
+	wsui_hooked_pre_end_frame(session, s_backend);
 
 	// Count active window-space layers
 	int active_layers = 0;

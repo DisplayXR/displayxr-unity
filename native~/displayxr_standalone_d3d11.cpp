@@ -347,6 +347,57 @@ public:
 	void *get_graphics_device() override { return (void *)d3d11_device; }
 	void *get_graphics_queue() override { return nullptr; } // D3D11 has no explicit queue
 	void *get_shared_handle() override { return (void *)d3d11_shared_handle; }
+
+	// --- Window-space UI overlay (issue #67) ---
+	// Standalone path Windows note: the standalone session uses its own
+	// D3D11 device, while Unity's RenderTexture lives on Unity's device.
+	// A direct ID3D11DeviceContext::CopyResource across devices isn't
+	// allowed — it would need a shared bridge texture (mirroring the atlas
+	// bridge pattern at create_atlas_bridge above). v1 ships hooked-path
+	// support on Windows (built apps + Play Mode without PlayModeIntegration);
+	// the editor Preview Window UI overlay on Windows is tracked as a
+	// follow-up. Mac standalone works because all MTLTextures share the
+	// system MTLDevice.
+
+	bool wsui_enumerate_swapchain_images(XrSwapchain sc,
+	                                      PFN_xrEnumerateSwapchainImages pfn_enum,
+	                                      uint32_t capacity,
+	                                      uint32_t *out_count,
+	                                      void *out_native_ptrs[]) override
+	{
+		uint32_t count = 0;
+		if (XR_FAILED(pfn_enum(sc, 0, &count, NULL)) || count == 0) return false;
+		if (count > capacity) count = capacity;
+		XrSwapchainImageD3D11KHR imgs[16] = {};
+		if (count > 16) count = 16;
+		for (uint32_t i = 0; i < count; i++) {
+			imgs[i].type = XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR;
+		}
+		if (XR_FAILED(pfn_enum(sc, count, &count, (XrSwapchainImageBaseHeader *)imgs))) {
+			return false;
+		}
+		for (uint32_t i = 0; i < count; i++) {
+			out_native_ptrs[i] = (void *)imgs[i].texture;
+		}
+		*out_count = count;
+		return true;
+	}
+
+	bool wsui_copy_to_swapchain_image(void * /*unity_tex*/, void * /*sc_image*/,
+	                                    uint32_t /*w*/, uint32_t /*h*/) override
+	{
+		static int warned = 0;
+		if (!warned) {
+			warned = 1;
+			fprintf(stderr,
+			    "[DisplayXR-SA] wsui D3D11: cross-device copy not yet "
+			    "supported (Unity device != standalone device). UI overlay "
+			    "in editor Preview Window will not render on Windows D3D11 "
+			    "until a shared bridge texture is wired up. Built apps and "
+			    "Play Mode without PlayModeIntegration are unaffected.\n");
+		}
+		return false;
+	}
 };
 
 StandaloneGraphicsBackend *create_standalone_d3d11_backend() { return new StandaloneD3D11Backend(); }

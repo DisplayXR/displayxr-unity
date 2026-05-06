@@ -8,6 +8,7 @@
 // teardown races with Unity's Game View repaint cycle.
 
 #include "displayxr_standalone_internal.h"
+#include "displayxr_window_space_ui.h"
 #include <stdarg.h>
 
 // ============================================================================
@@ -1096,6 +1097,7 @@ displayxr_standalone_stop(void)
 	s_sa.running = 0;
 	s_sa.session_ready = 0;
 
+	wsui_standalone_on_session_destroyed(s_sa.pfn_destroy_swapchain);
 	destroy_atlas_swapchain();
 
 	if (s_sa.local_space != XR_NULL_HANDLE && s_sa.pfn_destroy_space) {
@@ -1416,14 +1418,31 @@ displayxr_standalone_submit_frame_atlas(void *atlas_tex)
 	proj_layer.viewCount = n_views;
 	proj_layer.views = proj_views;
 
-	const XrCompositionLayerBaseHeader *layers[] = {
-		(const XrCompositionLayerBaseHeader *)&proj_layer
+	// Window-space UI overlay (issue #67). Lazily creates an overlay
+	// swapchain on this session, copies Unity's RT into it, and fills
+	// hud_layer if a Unity texture is registered.
+	XrCompositionLayerWindowSpaceEXT hud_layer = {};
+	WsuiStandaloneFns wsui_fns = {
+		s_sa.pfn_enumerate_swapchain_formats,
+		s_sa.pfn_create_swapchain,
+		s_sa.pfn_destroy_swapchain,
+		s_sa.pfn_enumerate_swapchain_images,
+		s_sa.pfn_acquire_swapchain_image,
+		s_sa.pfn_wait_swapchain_image,
+		s_sa.pfn_release_swapchain_image,
+	};
+	int has_hud = wsui_standalone_pre_end_frame(
+		s_sa.session, &wsui_fns, s_sa_backend, &hud_layer);
+
+	const XrCompositionLayerBaseHeader *layers[2] = {
+		(const XrCompositionLayerBaseHeader *)&proj_layer,
+		(const XrCompositionLayerBaseHeader *)&hud_layer,
 	};
 
 	XrFrameEndInfo end_info = {XR_TYPE_FRAME_END_INFO};
 	end_info.displayTime = s_sa.predicted_display_time;
 	end_info.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-	end_info.layerCount = 1;
+	end_info.layerCount = has_hud ? 2 : 1;
 	end_info.layers = layers;
 
 	s_sa.pfn_end_frame(s_sa.session, &end_info);

@@ -76,6 +76,59 @@ displayxr_metal_destroy_preview_window(void)
 }
 
 // ============================================================================
+// Window-space UI overlay (issue #67) — same-format MTLBlitCommandEncoder copy.
+// ============================================================================
+
+int
+displayxr_metal_blit_textures(void *queue_ptr, void *src_ptr, void *dst_ptr)
+{
+	if (!queue_ptr || !src_ptr || !dst_ptr) return 0;
+
+	id<MTLCommandQueue> queue = (__bridge id<MTLCommandQueue>)queue_ptr;
+	id<MTLTexture> src = (__bridge id<MTLTexture>)src_ptr;
+	id<MTLTexture> dst = (__bridge id<MTLTexture>)dst_ptr;
+
+	if (src.pixelFormat != dst.pixelFormat) {
+		// Same-format-only path: log once if mismatched. The format-conversion
+		// blit (render-pass shader) is intentionally not implemented here to
+		// keep the hooked path lean — picking BGRA on Apple in the wsui
+		// format selection should match Unity's RenderTextureFormat.ARGB32.
+		static int warned = 0;
+		if (!warned) {
+			warned = 1;
+			fprintf(stderr,
+			    "[DisplayXR] wsui blit format mismatch: src=%lu dst=%lu — "
+			    "expected match (Unity ARGB32 → BGRA8Unorm)\n",
+			    (unsigned long)src.pixelFormat, (unsigned long)dst.pixelFormat);
+		}
+	}
+
+	id<MTLCommandBuffer> cmd = [queue commandBuffer];
+	if (!cmd) return 0;
+
+	id<MTLBlitCommandEncoder> blit = [cmd blitCommandEncoder];
+	if (!blit) return 0;
+
+	NSUInteger w = MIN(src.width, dst.width);
+	NSUInteger h = MIN(src.height, dst.height);
+
+	[blit copyFromTexture:src
+	          sourceSlice:0
+	          sourceLevel:0
+	         sourceOrigin:MTLOriginMake(0, 0, 0)
+	           sourceSize:MTLSizeMake(w, h, 1)
+	            toTexture:dst
+	     destinationSlice:0
+	     destinationLevel:0
+	    destinationOrigin:MTLOriginMake(0, 0, 0)];
+	[blit endEncoding];
+
+	[cmd commit];
+	[cmd waitUntilCompleted];
+	return 1;
+}
+
+// ============================================================================
 // Built apps: overlay NSView on top of Unity's window
 // ============================================================================
 
