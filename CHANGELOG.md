@@ -5,6 +5,21 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.4] - 2026-05-06
+
+### Added
+- URP and HDRP support for the stereo rig camera callbacks. `DisplayXRDisplay`
+  and `DisplayXRCamera` now route through `RenderPipelineManager.beginCameraRendering`
+  when a Scriptable Render Pipeline is active, and continue to use
+  `Camera.onPreRender` on the Built-in Render Pipeline. Adds a `URPBasicScene`
+  sample mirroring `BasicScene`. (#68)
+
+### Fixed
+- macOS native bundle (`Runtime/Plugins/macOS/displayxr_unity.bundle`) was
+  missing the `displayxr_set_use_srgb_swapchain` export — a regression that
+  caused `EntryPointNotFoundException` on macOS standalone builds. Rebuilt
+  from current `native~/` source. (#68)
+
 ## [1.2.3] - 2026-05-05
 
 ### Fixed
