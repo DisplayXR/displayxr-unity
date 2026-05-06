@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 
 using UnityEngine;
+using UnityEngine.Rendering;
 
 namespace DisplayXR
 {
@@ -40,12 +41,19 @@ namespace DisplayXR
 
         private DisplayXRFeature m_Feature;
         private Camera m_Camera;
+        // True when running under URP/HDRP. BiRP fires Camera.onPreRender; SRP doesn't,
+        // so we route through RenderPipelineManager.beginCameraRendering instead.
+        private bool m_UsingSRP;
 
         void OnEnable()
         {
             m_Camera = GetComponent<Camera>();
             m_Feature = DisplayXRFeature.Instance;
-            Camera.onPreRender += OnCameraPreRender;
+            m_UsingSRP = GraphicsSettings.currentRenderPipeline != null;
+            if (m_UsingSRP)
+                RenderPipelineManager.beginCameraRendering += OnSRPBeginCamera;
+            else
+                Camera.onPreRender += OnCameraPreRender;
             DisplayXRRigManager.Register(m_Camera);
 #if !UNITY_EDITOR
             if (m_Feature == null)
@@ -58,9 +66,14 @@ namespace DisplayXR
 
         void OnDisable()
         {
-            Camera.onPreRender -= OnCameraPreRender;
+            if (m_UsingSRP)
+                RenderPipelineManager.beginCameraRendering -= OnSRPBeginCamera;
+            else
+                Camera.onPreRender -= OnCameraPreRender;
             DisplayXRRigManager.Unregister(m_Camera);
         }
+
+        void OnSRPBeginCamera(ScriptableRenderContext ctx, Camera cam) => OnCameraPreRender(cam);
 
         void OnCameraPreRender(Camera cam)
         {

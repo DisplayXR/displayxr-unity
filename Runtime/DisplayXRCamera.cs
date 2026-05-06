@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 
 using UnityEngine;
+using UnityEngine.Rendering;
 
 namespace DisplayXR
 {
@@ -40,6 +41,9 @@ namespace DisplayXR
         private DisplayXRFeature m_Feature;
         private float m_CachedCameraFov;
         private Camera m_Camera;
+        // True when running under URP/HDRP. BiRP fires Camera.onPreRender; SRP doesn't,
+        // so we route through RenderPipelineManager.beginCameraRendering instead.
+        private bool m_UsingSRP;
 
 #if UNITY_EDITOR
         void OnValidate()
@@ -60,17 +64,26 @@ namespace DisplayXR
             // Guard against XR having already overridden the FOV to near-zero
             if (m_CachedCameraFov < 1.0f)
                 m_CachedCameraFov = 60.0f;
-            Camera.onPreRender += OnCameraPreRender;
+            m_UsingSRP = GraphicsSettings.currentRenderPipeline != null;
+            if (m_UsingSRP)
+                RenderPipelineManager.beginCameraRendering += OnSRPBeginCamera;
+            else
+                Camera.onPreRender += OnCameraPreRender;
             DisplayXRRigManager.Register(m_Camera);
         }
 
         void OnDisable()
         {
             Debug.Log("[DisplayXR] DisplayXRCamera.OnDisable");
-            Camera.onPreRender -= OnCameraPreRender;
+            if (m_UsingSRP)
+                RenderPipelineManager.beginCameraRendering -= OnSRPBeginCamera;
+            else
+                Camera.onPreRender -= OnCameraPreRender;
             DisplayXRRigManager.Unregister(m_Camera);
             m_Feature = null;
         }
+
+        void OnSRPBeginCamera(ScriptableRenderContext ctx, Camera cam) => OnCameraPreRender(cam);
 
         void OnCameraPreRender(Camera cam)
         {
