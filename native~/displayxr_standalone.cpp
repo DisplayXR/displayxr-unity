@@ -1853,6 +1853,34 @@ displayxr_standalone_get_preview_mouse_position(float *out_fx, float *out_fy)
 #endif
 }
 
+#if defined(__APPLE__)
+extern "C" int displayxr_sa_macos_is_key_pressed(int virtual_keycode);
+#endif
+
+DISPLAYXR_EXPORT int
+displayxr_standalone_is_key_pressed(int ascii)
+{
+	// Polls OS key state without requiring window focus. ASCII is mapped to
+	// the platform's virtual keycode internally for letters/digits — meant
+	// for app-side hotkeys (e.g. cycling render modes from a button-bound
+	// shortcut while the user has the standalone NSWindow focused, not the
+	// Unity editor). Returns 1 if currently held, 0 otherwise.
+#if defined(_WIN32)
+	// Win32 happens to use ASCII-uppercase as the VK_* code for letters
+	// and digits — VK_A through VK_Z = 0x41..0x5A, VK_0..VK_9 = 0x30..0x39.
+	if (ascii >= 'a' && ascii <= 'z') ascii -= ('a' - 'A');
+	return (GetAsyncKeyState(ascii) & 0x8000) ? 1 : 0;
+#elif defined(__APPLE__)
+	// Mac kVK_* codes are completely different from ASCII; the .m helper
+	// keeps the platform-specific mapping table next to the rest of the
+	// Cocoa code.
+	return displayxr_sa_macos_is_key_pressed(ascii);
+#else
+	(void)ascii;
+	return 0;
+#endif
+}
+
 DISPLAYXR_EXPORT int
 displayxr_standalone_get_preview_window_size(uint32_t *out_w, uint32_t *out_h)
 {

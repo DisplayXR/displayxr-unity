@@ -402,6 +402,9 @@ namespace DisplayXR
             out uint width, out uint height);
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int displayxr_standalone_is_key_pressed(int ascii);
+
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int displayxr_standalone_enumerate_rendering_modes(
             uint capacity, out uint count,
             [MarshalAs(UnmanagedType.LPArray)] uint[] modeIndices,

@@ -258,6 +258,19 @@ namespace DisplayXR
                 // — cheap, and supports inspector edits to resolution.y too.
                 m_OverlayCamera.orthographicSize = resolution.y * 0.005f;
                 m_OverlayCamera.aspect = panelAspect;
+
+                // Dynamically resize the canvas's RectTransform to MATCH the
+                // camera view. Without this the canvas stays its initial
+                // (square) size and there's pillarboxing/letterboxing inside
+                // the panel rect — the panel image only fills the canvas, not
+                // the camera's full view. Since the runtime stretches the RT
+                // into the panel rect, we want the canvas (and its panel
+                // image) to fill the camera's view exactly so the resulting
+                // panel content has no internal margins.
+                if (m_CanvasRect != null)
+                {
+                    m_CanvasRect.sizeDelta = new Vector2(resolution.y * panelAspect, resolution.y);
+                }
             }
 
             // Manually render the overlay camera into our RT. URP/HDRP only.

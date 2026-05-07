@@ -7,6 +7,7 @@
 
 #import <Metal/Metal.h>
 #import <AppKit/AppKit.h>
+#import <Carbon/Carbon.h> // kVK_ANSI_* keycodes
 #include <stdio.h>
 
 #include "displayxr_standalone_metal.h"
@@ -246,6 +247,57 @@ displayxr_sa_metal_get_preview_mouse_position(float *out_fx, float *out_fy)
 	if (out_fx) *out_fx = (float)fx;
 	if (out_fy) *out_fy = (float)fy;
 	return 1;
+}
+
+int
+displayxr_sa_macos_is_key_pressed(int ascii)
+{
+	// Translate ASCII (letters + digits) to Cocoa kVK_ANSI_* keycodes.
+	// CGEventSourceKeyState polls the global hardware key state regardless
+	// of which window has focus — what we need so app-side hotkeys can fire
+	// while the standalone preview NSWindow owns input focus.
+	int kvk = -1;
+	int up = (ascii >= 'a' && ascii <= 'z') ? (ascii - 'a' + 'A') : ascii;
+	switch (up) {
+		case 'A': kvk = kVK_ANSI_A; break;
+		case 'B': kvk = kVK_ANSI_B; break;
+		case 'C': kvk = kVK_ANSI_C; break;
+		case 'D': kvk = kVK_ANSI_D; break;
+		case 'E': kvk = kVK_ANSI_E; break;
+		case 'F': kvk = kVK_ANSI_F; break;
+		case 'G': kvk = kVK_ANSI_G; break;
+		case 'H': kvk = kVK_ANSI_H; break;
+		case 'I': kvk = kVK_ANSI_I; break;
+		case 'J': kvk = kVK_ANSI_J; break;
+		case 'K': kvk = kVK_ANSI_K; break;
+		case 'L': kvk = kVK_ANSI_L; break;
+		case 'M': kvk = kVK_ANSI_M; break;
+		case 'N': kvk = kVK_ANSI_N; break;
+		case 'O': kvk = kVK_ANSI_O; break;
+		case 'P': kvk = kVK_ANSI_P; break;
+		case 'Q': kvk = kVK_ANSI_Q; break;
+		case 'R': kvk = kVK_ANSI_R; break;
+		case 'S': kvk = kVK_ANSI_S; break;
+		case 'T': kvk = kVK_ANSI_T; break;
+		case 'U': kvk = kVK_ANSI_U; break;
+		case 'V': kvk = kVK_ANSI_V; break;
+		case 'W': kvk = kVK_ANSI_W; break;
+		case 'X': kvk = kVK_ANSI_X; break;
+		case 'Y': kvk = kVK_ANSI_Y; break;
+		case 'Z': kvk = kVK_ANSI_Z; break;
+		case '0': kvk = kVK_ANSI_0; break;
+		case '1': kvk = kVK_ANSI_1; break;
+		case '2': kvk = kVK_ANSI_2; break;
+		case '3': kvk = kVK_ANSI_3; break;
+		case '4': kvk = kVK_ANSI_4; break;
+		case '5': kvk = kVK_ANSI_5; break;
+		case '6': kvk = kVK_ANSI_6; break;
+		case '7': kvk = kVK_ANSI_7; break;
+		case '8': kvk = kVK_ANSI_8; break;
+		case '9': kvk = kVK_ANSI_9; break;
+		default: return 0;
+	}
+	return CGEventSourceKeyState(kCGEventSourceStateHIDSystemState, (CGKeyCode)kvk) ? 1 : 0;
 }
 
 int
