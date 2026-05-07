@@ -1,0 +1,24 @@
+{
+  "name": "com.displayxr.unity",
+  "rootNamespace": "DisplayXR",
+  "references": [
+    "Unity.XR.OpenXR",
+    "Unity.XR.Management",
+    "Unity.InputSystem"
+  ],
+  "includePlatforms": [],
+  "excludePlatforms": [],
+  "allowUnsafeCode": true,
+  "overrideReferences": false,
+  "precompiledReferences": [],
+  "autoReferenced": true,
+  "defineConstraints": [],
+  "versionDefines": [
+    {
+      "name": "com.unity.inputsystem",
+      "expression": "1.0.0",
+      "define": "HAS_INPUT_SYSTEM"
+    }
+  ],
+  "noEngineReferences": false
+}

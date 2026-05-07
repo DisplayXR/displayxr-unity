@@ -1,0 +1,21 @@
+{
+  "name": "com.displayxr.unity.editor",
+  "rootNamespace": "DisplayXR.Editor",
+  "references": [
+    "com.displayxr.unity",
+    "Unity.XR.OpenXR",
+    "Unity.XR.Management",
+    "Unity.XR.Management.Editor"
+  ],
+  "includePlatforms": [
+    "Editor"
+  ],
+  "excludePlatforms": [],
+  "allowUnsafeCode": false,
+  "overrideReferences": false,
+  "precompiledReferences": [],
+  "autoReferenced": true,
+  "defineConstraints": [],
+  "versionDefines": [],
+  "noEngineReferences": false
+}
