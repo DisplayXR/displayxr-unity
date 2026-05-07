@@ -5,6 +5,41 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.13] - 2026-05-07
+
+### Added
+- Window-Space UI: app-side input routing primitives. `DisplayXRPreviewInput`
+  exposes preview-window mouse position / button state / cursor-key polling
+  via OS-level reads, so wsui input routers work while the standalone
+  preview NSWindow has keyboard/mouse focus (Unity's Input System only
+  fires when its own windows are focused).
+- `DisplayXRWindowSpaceUI.IsCursorOverInteractive` — static gate that
+  scene input controllers (`DisplayXRInputController`) consult to pause
+  cube/camera rotation while the user is driving wsui controls.
+- Native: `displayxr_standalone_get_preview_window_size` (cross-platform),
+  `displayxr_standalone_get_rendering_mode_name(slot)` for runtime-supplied
+  mode-name strings, `displayxr_standalone_is_key_pressed` for app-side
+  hotkey polling.
+
+### Fixed
+- `enumerate_rendering_modes` no longer treats a NULL `mode_names` buffer
+  as a count-only query — was the silent root cause of `m_ModeIndices`
+  arriving as all-zeros for callers passing `IntPtr.Zero` for the names
+  buffer.
+- Wsui `Canvas.worldCamera` is now wired to the OverlayCamera so
+  `GraphicRaycaster.Raycast` against the layer actually returns hits.
+- Wsui content stays aspect-correct under window resize via per-frame
+  `OverlayCamera.aspect` + canvas RectTransform updates — no RT
+  recreation needed.
+- Mac: preview-window click state via `[NSEvent pressedMouseButtons]`
+  (wsui sliders/buttons couldn't detect presses before).
+- Mac: `noResponderFor:` override on the preview NSWindow silences the
+  system beep on hotkey poll-only key events.
+
+### Changed
+- Plain `Tab` (camera cycle) is now gated on `!Shift` so apps can bind
+  Shift+Tab to their own actions without the rig manager firing.
+
 ## [1.2.12] - 2026-05-07
 
 ### Fixed
