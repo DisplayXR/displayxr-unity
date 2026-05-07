@@ -5,6 +5,19 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.9] - 2026-05-07
+
+### Fixed
+- Stop shipping dev-only files in the published UPM package. Unity Package
+  Manager was extracting CLAUDE.md, CONTRIBUTING.md, .claude/, .github/,
+  launch-*.sh, .gitignore + .gitattributes from the upm branch — Unity
+  treats unrecognized .md files at the package root as importable assets
+  and warns once per file that the .meta is missing (UPM also strips
+  *.md.meta files at extraction). Each install logged 4+ "Asset has no
+  meta file, in immutable folder" warnings. The CI now strips these
+  files in the upm-branch publish step. Files retained on main; only
+  excluded from the published package.
+
 ## [1.2.8] - 2026-05-07
 
 ### Fixed
