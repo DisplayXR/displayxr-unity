@@ -211,6 +211,12 @@ DISPLAYXR_EXPORT int displayxr_standalone_request_rendering_mode(uint32_t mode_i
 DISPLAYXR_EXPORT int displayxr_standalone_get_rendering_mode_name(
     uint32_t array_slot, char *buffer, uint32_t buffer_size);
 
+/// Preview window content-area size in backing pixels (Mac) / client
+/// pixels (Win). Returns 1 on success, 0 if the window doesn't exist
+/// or the platform isn't supported.
+DISPLAYXR_EXPORT int displayxr_standalone_get_preview_window_size(
+    uint32_t *out_w, uint32_t *out_h);
+
 /// Enumerate available rendering modes with full metadata.
 /// Two-call pattern: first call with capacity=0 to get count,
 /// then allocate and call again. Extended arrays are optional (may be NULL).

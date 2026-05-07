@@ -398,6 +398,10 @@ namespace DisplayXR
             uint bufferSize);
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int displayxr_standalone_get_preview_window_size(
+            out uint width, out uint height);
+
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int displayxr_standalone_enumerate_rendering_modes(
             uint capacity, out uint count,
             [MarshalAs(UnmanagedType.LPArray)] uint[] modeIndices,
