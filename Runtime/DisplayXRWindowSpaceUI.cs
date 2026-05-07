@@ -92,6 +92,17 @@ namespace DisplayXR
 
         private float m_LastX, m_LastY, m_LastW, m_LastH, m_LastDisparity;
 
+        /// <summary>
+        /// Set true by app-side input routers while the cursor is hovering or
+        /// a press is held over a wsui-rendered UI element. Scene input
+        /// controllers (DisplayXRInputController, custom drag handlers, etc.)
+        /// should consult this and skip mouse handling so a slider drag
+        /// doesn't bleed into cube rotation. The plugin owns the flag so all
+        /// routers and controllers can coordinate without referencing each
+        /// other directly.
+        /// </summary>
+        public static bool IsCursorOverInteractive { get; set; }
+
         void OnEnable()
         {
             m_Canvas = GetComponent<Canvas>();

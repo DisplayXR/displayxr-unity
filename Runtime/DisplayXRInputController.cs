@@ -388,6 +388,12 @@ namespace DisplayXR
             }
             catch (System.EntryPointNotFoundException) { }
 
+            // Wsui composition layer: a slider drag or button click in flight
+            // through DisplayXRWindowSpaceUI shouldn't double-route to scene
+            // input. App-side router (e.g. DisplayXRWsuiMouseRouter) flips
+            // this flag while it owns the cursor.
+            if (DisplayXRWindowSpaceUI.IsCursorOverInteractive) return true;
+
             // Runtime UI (Canvas/EventSystem). Reflection-based to avoid a hard
             // UGUI compile dependency from the plugin assembly.
             if (IsPointerOverUgui()) return true;
