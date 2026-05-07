@@ -248,6 +248,22 @@ displayxr_sa_metal_get_preview_mouse_position(float *out_fx, float *out_fy)
 	return 1;
 }
 
+int
+displayxr_sa_metal_get_preview_mouse_buttons(void)
+{
+	// `pressedMouseButtons` is a class method on NSEvent that returns the
+	// global set of currently pressed mouse buttons, regardless of which
+	// view has key focus. Bit layout matches Cocoa's NSEvent buttonNumber
+	// (0=left, 1=right, 2=middle) — same convention as our Win32 path —
+	// so callers can use the result without remapping.
+	NSUInteger m = [NSEvent pressedMouseButtons];
+	int b = 0;
+	if (m & (1u << 0)) b |= 0x1;
+	if (m & (1u << 1)) b |= 0x2;
+	if (m & (1u << 2)) b |= 0x4;
+	return b;
+}
+
 // ============================================================================
 // Metal command queue + blit
 // ============================================================================
