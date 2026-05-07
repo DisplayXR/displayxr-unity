@@ -66,5 +66,19 @@ namespace DisplayXR
                 wheelDelta = 0;
             }
         }
+
+        /// <summary>
+        /// True if the given ASCII key (letters A–Z or digits 0–9) is
+        /// currently held, polled from OS hardware state — works regardless
+        /// of which window has keyboard focus. Pass uppercase for letters
+        /// (e.g. 'V' = 0x56). Apps should track edges themselves; this is a
+        /// raw "is held" reading. Returns false in built apps where Unity's
+        /// Input System sees keyboard input directly.
+        /// </summary>
+        public static bool IsKeyPressed(int ascii)
+        {
+            try { return DisplayXRNative.displayxr_standalone_is_key_pressed(ascii) != 0; }
+            catch (System.EntryPointNotFoundException) { return false; }
+        }
     }
 }

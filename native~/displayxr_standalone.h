@@ -217,6 +217,13 @@ DISPLAYXR_EXPORT int displayxr_standalone_get_rendering_mode_name(
 DISPLAYXR_EXPORT int displayxr_standalone_get_preview_window_size(
     uint32_t *out_w, uint32_t *out_h);
 
+/// Polls the OS for whether the given ASCII-coded key is currently
+/// pressed (focus-independent). Letters and digits only — pass uppercase
+/// ASCII ('V' = 0x56, '0' = 0x30, etc.). For app-side hotkeys that
+/// should fire while the standalone preview NSWindow has focus.
+/// @return 1 if pressed, 0 otherwise.
+DISPLAYXR_EXPORT int displayxr_standalone_is_key_pressed(int ascii);
+
 /// Enumerate available rendering modes with full metadata.
 /// Two-call pattern: first call with capacity=0 to get count,
 /// then allocate and call again. Extended arrays are optional (may be NULL).
