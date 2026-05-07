@@ -144,11 +144,34 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          # Create orphan upm branch from the tag contents + binaries
+          # Create branch from the tag contents + binaries
           git checkout -B upm
+
+          # Strip dev-only files that don't belong in a published Unity
+          # package. Unity Package Manager strips *.md.meta files at the
+          # package root, then warns about every .md file there that isn't
+          # one of its recognized docs (README/CHANGELOG/LICENSE) — so any
+          # extra .md (CLAUDE, CONTRIBUTING, etc.) creates per-install
+          # warnings ("Asset has no meta file, in immutable folder"). Plus
+          # there's no reason to ship dev tooling to consumers.
+          git rm -rf --cached --ignore-unmatch \
+              .claude .github .gitattributes .gitignore \
+              CLAUDE.md CLAUDE.md.meta \
+              CONTRIBUTING.md CONTRIBUTING.md.meta \
+              launch-app.sh launch-app.sh.meta \
+              launch-unity.sh launch-unity.sh.meta \
+              || true
+          rm -rf .claude .github .gitattributes .gitignore \
+                 CLAUDE.md CLAUDE.md.meta \
+                 CONTRIBUTING.md CONTRIBUTING.md.meta \
+                 launch-app.sh launch-app.sh.meta \
+                 launch-unity.sh launch-unity.sh.meta
+
           # Force-add the binaries (normally gitignored or absent)
           git add -f Runtime/Plugins/Windows/x64/displayxr_unity.dll
           git add -f Runtime/Plugins/macOS/displayxr_unity.bundle
+          # Stage all changes (removals + additions)
+          git add -A
           git commit -m "Release ${{ github.ref_name }}: add native binaries for UPM git install"
           git push -f origin upm
           # Also tag the upm branch for version-pinned installs
