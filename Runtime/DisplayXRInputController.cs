@@ -76,8 +76,13 @@ namespace DisplayXR
 
         void Update()
         {
-            // Tab cycles cameras globally (only process once per frame)
-            if (GetKeyDown(KeyCode.Tab) && Time.frameCount != s_LastTabFrame)
+            // Tab cycles cameras globally (only process once per frame).
+            // Shift+Tab is reserved for app-side use (e.g. hiding UI panels)
+            // so we explicitly gate this on Shift NOT being held — otherwise
+            // pressing Shift+Tab would both toggle the app's UI AND cycle
+            // cameras at the same time.
+            if (GetKeyDown(KeyCode.Tab) && !IsShiftHeld() &&
+                Time.frameCount != s_LastTabFrame)
             {
                 s_LastTabFrame = Time.frameCount;
                 DisplayXRRigManager.CycleNext();
@@ -492,6 +497,10 @@ namespace DisplayXR
                 default: return Key.None;
             }
         }
+
+        private static bool IsShiftHeld() =>
+            Keyboard.current != null &&
+            (Keyboard.current.leftShiftKey.isPressed || Keyboard.current.rightShiftKey.isPressed);
 #else
         private static bool GetKey(KeyCode k) => Input.GetKey(k);
         private static bool GetKeyDown(KeyCode k) => Input.GetKeyDown(k);
@@ -499,6 +508,8 @@ namespace DisplayXR
         private static bool GetMouseButtonUp(int b) => Input.GetMouseButtonUp(b);
         private static Vector2 GetMousePosition() => Input.mousePosition;
         private static float GetScrollDelta() => Input.mouseScrollDelta.y;
+        private static bool IsShiftHeld() =>
+            Input.GetKey(KeyCode.LeftShift) || Input.GetKey(KeyCode.RightShift);
 #endif
     }
 }
