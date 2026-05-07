@@ -1934,6 +1934,25 @@ displayxr_standalone_request_display_mode(int mode_3d)
 	return XR_SUCCEEDED(result) ? 1 : 0;
 }
 
+DISPLAYXR_EXPORT int
+displayxr_standalone_get_rendering_mode_name(uint32_t array_slot, char *buffer, uint32_t buffer_size)
+{
+	// Fetches the runtime-reported display name for the rendering mode at
+	// the given array slot (NOT the mode's own modeIndex — slots are 0..count-1
+	// from displayxr_standalone_enumerate_rendering_modes). Bypasses the
+	// awkward marshalling of `char[][256]` from managed code: callers pass a
+	// flat byte buffer + capacity and parse a null-terminated UTF-8 string out.
+	if (!buffer || buffer_size == 0) return 0;
+	buffer[0] = '\0';
+	if (array_slot >= s_sa.rendering_mode_count) return 0;
+	const char *src = s_sa.rendering_modes[array_slot].modeName;
+	uint32_t copy_n = buffer_size - 1;
+	uint32_t i = 0;
+	while (i < copy_n && src[i] != '\0') { buffer[i] = src[i]; i++; }
+	buffer[i] = '\0';
+	return 1;
+}
+
 int
 displayxr_standalone_request_rendering_mode(uint32_t mode_index)
 {
