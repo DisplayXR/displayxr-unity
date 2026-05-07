@@ -242,6 +242,24 @@ namespace DisplayXR
 
         void LateUpdate()
         {
+            // Match the camera aspect to the live panel pixel aspect so UI
+            // content stays at correct aspect when the host window resizes
+            // OR when the wsui rect (positionX/Y/width/height) changes. The
+            // camera renders into a fixed-size RT, but the runtime stretches
+            // that RT into the panel rect — by setting camera.aspect to the
+            // panel's pixel aspect, the camera "pre-distorts" its rendering
+            // so the post-stretch result is aspect-correct in the panel.
+            if (m_OverlayCamera != null && TryGetPanelPixelSize(out float pw, out float ph) &&
+                pw > 0f && ph > 0f)
+            {
+                float panelAspect = pw / ph;
+                // ortho size is half the canvas height in world units (canvas
+                // sizeDelta.y * canvas.localScale.y / 2). Recompute each frame
+                // — cheap, and supports inspector edits to resolution.y too.
+                m_OverlayCamera.orthographicSize = resolution.y * 0.005f;
+                m_OverlayCamera.aspect = panelAspect;
+            }
+
             // Manually render the overlay camera into our RT. URP/HDRP only.
             // (BiRP would auto-render via its loop, but Render() is also
             // perfectly valid there — just slightly redundant.)
@@ -260,6 +278,35 @@ namespace DisplayXR
                 m_LastW = width;     m_LastH = height;
                 m_LastDisparity = disparity;
             }
+        }
+
+        private bool TryGetPanelPixelSize(out float pw, out float ph)
+        {
+            // Standalone preview path: use the runtime preview window's
+            // content size (Unity's Screen.width/height isn't right — that's
+            // the editor Game-view, not the runtime NSWindow/HWND).
+            try
+            {
+                if (DisplayXRNative.displayxr_standalone_get_preview_window_size(
+                        out uint ww, out uint wh) != 0 && ww > 0 && wh > 0)
+                {
+                    pw = ww * Mathf.Clamp01(width);
+                    ph = wh * Mathf.Clamp01(height);
+                    return true;
+                }
+            }
+            catch (System.EntryPointNotFoundException) { /* old plugin */ }
+
+            // Built-app / Play Mode fallback: the runtime composites into
+            // Unity's main window, so Screen.* is meaningful.
+            if (Screen.width > 0 && Screen.height > 0)
+            {
+                pw = Screen.width * Mathf.Clamp01(width);
+                ph = Screen.height * Mathf.Clamp01(height);
+                return true;
+            }
+            pw = ph = 0f;
+            return false;
         }
 
         private static void SetLayerRecursive(GameObject go, int layer)

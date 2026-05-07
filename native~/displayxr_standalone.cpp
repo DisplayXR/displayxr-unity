@@ -1853,6 +1853,41 @@ displayxr_standalone_get_preview_mouse_position(float *out_fx, float *out_fy)
 #endif
 }
 
+DISPLAYXR_EXPORT int
+displayxr_standalone_get_preview_window_size(uint32_t *out_w, uint32_t *out_h)
+{
+	// Returns the preview window's content-area pixel size (backing pixels
+	// on Mac, client pixels on Win32). UI components in the wsui layer
+	// query this each frame to compute the live panel pixel aspect and
+	// scale their own rendering accordingly — Unity's Screen.width/height
+	// reports the editor Game-view dimensions, not the standalone preview
+	// window, so it's not a substitute.
+	if (out_w) *out_w = 0;
+	if (out_h) *out_h = 0;
+#if defined(__APPLE__)
+	int32_t x, y;
+	uint32_t w, h;
+	if (displayxr_sa_metal_get_window_rect(&x, &y, &w, &h)) {
+		if (out_w) *out_w = w;
+		if (out_h) *out_h = h;
+		return 1;
+	}
+	return 0;
+#elif defined(_WIN32)
+	if (!s_sa.preview_hwnd) return 0;
+	RECT rc;
+	if (GetClientRect(s_sa.preview_hwnd, &rc) &&
+	    rc.right > 0 && rc.bottom > 0) {
+		if (out_w) *out_w = (uint32_t)rc.right;
+		if (out_h) *out_h = (uint32_t)rc.bottom;
+		return 1;
+	}
+	return 0;
+#else
+	return 0;
+#endif
+}
+
 int
 displayxr_standalone_window_is_interacting(void)
 {
@@ -2005,6 +2040,8 @@ displayxr_standalone_enumerate_rendering_modes(
 		return 1; // Count-only query
 
 	uint32_t to_fetch = total < capacity ? total : capacity;
+	sa_log("[DisplayXR-SA] enumerate: filling %u mode_indices entries (mode_names=%s)\n",
+		to_fetch, mode_names ? "ptr" : "null");
 	for (uint32_t i = 0; i < to_fetch; i++) {
 		mode_indices[i] = s_sa.rendering_modes[i].modeIndex;
 		if (mode_names) {
