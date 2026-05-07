@@ -167,6 +167,17 @@ jobs:
                  launch-app.sh launch-app.sh.meta \
                  launch-unity.sh launch-unity.sh.meta
 
+          # Drop the tarball staging directory created by the previous job
+          # step ("Create UPM tarball" mkdir's com.displayxr.unity-X.Y.Z/ in
+          # the working tree, then tars it). Without this, `git add -A`
+          # below sweeps that whole subtree into the upm branch and Unity
+          # ends up importing the package TWICE — once at the root and
+          # once nested under com.displayxr.unity-X.Y.Z/. Nested copy lacks
+          # most .meta files (Unity strips them on the outer install), so
+          # consumers see hundreds of "Asset has no meta file" errors.
+          rm -rf "com.displayxr.unity-${{ steps.version.outputs.version }}"
+          rm -f  "com.displayxr.unity-${{ steps.version.outputs.version }}.tgz"
+
           # Force-add the binaries (normally gitignored or absent)
           git add -f Runtime/Plugins/Windows/x64/displayxr_unity.dll
           git add -f Runtime/Plugins/macOS/displayxr_unity.bundle
