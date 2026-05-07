@@ -163,6 +163,14 @@ DISPLAYXR_EXPORT int displayxr_standalone_window_was_closed(void);
 DISPLAYXR_EXPORT void displayxr_standalone_get_preview_mouse_state(
     int *buttons, int *wheel_delta);
 
+/// Cursor position in the preview window's content area as FRACTIONAL
+/// coords (0..1, top-left origin). Returns 1 if the cursor is inside the
+/// content area (out_fx/out_fy filled), 0 otherwise (set to -1.0). The
+/// fractional convention matches wsui layer rects, so app-side input
+/// routers can hit-test directly without needing the window's pixel size.
+DISPLAYXR_EXPORT int displayxr_standalone_get_preview_mouse_position(
+    float *out_fx, float *out_fy);
+
 /// Returns 1 if the preview window is being moved or resized.
 DISPLAYXR_EXPORT int displayxr_standalone_window_is_interacting(void);
 

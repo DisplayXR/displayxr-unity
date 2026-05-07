@@ -208,6 +208,46 @@ displayxr_sa_metal_get_window_rect(int32_t *out_x, int32_t *out_y,
 	return 1;
 }
 
+int
+displayxr_sa_metal_get_preview_mouse_position(float *out_fx, float *out_fy)
+{
+	if (!s_sa_window || !s_sa_view) {
+		if (out_fx) *out_fx = -1.0f;
+		if (out_fy) *out_fy = -1.0f;
+		return 0;
+	}
+
+	// Cursor in screen coords (points). +Y is up, origin at the bottom-left
+	// of the primary screen — Cocoa convention.
+	NSPoint cursor = [NSEvent mouseLocation];
+
+	// Window's content rect in the same screen-coords space.
+	NSRect frame = [s_sa_window frame];
+	NSRect content = [s_sa_window contentRectForFrameRect:frame];
+
+	if (!NSPointInRect(cursor, content)) {
+		if (out_fx) *out_fx = -1.0f;
+		if (out_fy) *out_fy = -1.0f;
+		return 0;
+	}
+
+	// Fractional coords inside the content rect. Y inverts because Cocoa's
+	// screen origin is bottom-left and we want top-left fractional output
+	// (matches wsui layer rect convention).
+	if (content.size.width <= 0 || content.size.height <= 0) {
+		if (out_fx) *out_fx = -1.0f;
+		if (out_fy) *out_fy = -1.0f;
+		return 0;
+	}
+	CGFloat fx = (cursor.x - content.origin.x) / content.size.width;
+	CGFloat fy = ((content.origin.y + content.size.height) - cursor.y) /
+	              content.size.height;
+
+	if (out_fx) *out_fx = (float)fx;
+	if (out_fy) *out_fy = (float)fy;
+	return 1;
+}
+
 // ============================================================================
 // Metal command queue + blit
 // ============================================================================

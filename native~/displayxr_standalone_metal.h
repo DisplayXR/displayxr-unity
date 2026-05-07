@@ -57,6 +57,14 @@ int displayxr_sa_metal_window_was_closed(void);
 /// Returns 1 if the preview window is currently being moved or resized.
 int displayxr_sa_metal_window_is_interacting(void);
 
+/// Cursor position in the preview window's content area as FRACTIONAL
+/// coordinates (0..1, top-left origin). Returns 1 if the cursor is inside
+/// the content area (out_fx/out_fy filled), 0 otherwise (out_fx and out_fy
+/// set to -1.0). The fractional convention is what app-side input routers
+/// already work with — wsui layer rects use the same fractional space — so
+/// callers can hit-test directly without needing the window's pixel size.
+int displayxr_sa_metal_get_preview_mouse_position(float *out_fx, float *out_fy);
+
 #ifdef __cplusplus
 }
 #endif

@@ -141,6 +141,11 @@ typedef struct StandaloneState {
 	// (Unity's new Input System doesn't see our preview window's clicks).
 	volatile int preview_mouse_buttons; // bit 0=L, 1=R, 2=M
 	volatile int preview_wheel_accum;
+	// Cursor position in client-area pixels (top-left origin), updated from
+	// WM_MOUSEMOVE. -1 if cursor is outside content area or untracked.
+	volatile int preview_mouse_x;
+	volatile int preview_mouse_y;
+	volatile int preview_mouse_in_content; // 1 = cursor inside content area
 	int dragging;       // Non-zero while custom (non-modal) window move is active
 	POINT drag_start_cursor;
 	RECT drag_start_rect;
@@ -616,6 +621,26 @@ sa_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 	case WM_MBUTTONUP:   s_sa.preview_mouse_buttons &= ~0x4; if (GetCapture() == hwnd) ReleaseCapture(); break;
 	case WM_MOUSEWHEEL:
 		s_sa.preview_wheel_accum += GET_WHEEL_DELTA_WPARAM(wParam);
+		break;
+	case WM_MOUSEMOVE: {
+		// Track cursor position in client-area pixels (top-left origin), for
+		// app-side input routers that map to a window-space layer.
+		// Decode lParam without windowsx.h: low word = x, high word = y.
+		int x = (int)(short)LOWORD(lParam);
+		int y = (int)(short)HIWORD(lParam);
+		RECT rc;
+		if (GetClientRect(hwnd, &rc) && x >= 0 && y >= 0 &&
+		    x < rc.right && y < rc.bottom) {
+			s_sa.preview_mouse_x = x;
+			s_sa.preview_mouse_y = y;
+			s_sa.preview_mouse_in_content = 1;
+		}
+		break;
+	}
+	case WM_MOUSELEAVE:
+		s_sa.preview_mouse_in_content = 0;
+		s_sa.preview_mouse_x = -1;
+		s_sa.preview_mouse_y = -1;
 		break;
 	case WM_CAPTURECHANGED:
 		// Capture lost — clear button state to avoid "stuck button" bugs
@@ -1787,6 +1812,37 @@ displayxr_standalone_get_preview_mouse_state(int *buttons, int *wheel_delta)
 #else
 	if (buttons) *buttons = 0;
 	if (wheel_delta) *wheel_delta = 0;
+#endif
+}
+
+DISPLAYXR_EXPORT int
+displayxr_standalone_get_preview_mouse_position(float *out_fx, float *out_fy)
+{
+#if defined(__APPLE__)
+	float fx = -1.0f, fy = -1.0f;
+	int ok = displayxr_sa_metal_get_preview_mouse_position(&fx, &fy);
+	if (out_fx) *out_fx = fx;
+	if (out_fy) *out_fy = fy;
+	return ok;
+#elif defined(_WIN32)
+	if (s_sa.preview_mouse_in_content && s_sa.preview_hwnd != NULL) {
+		// Convert tracked client-pixel position to fractional coords using
+		// the current client-area size.
+		RECT rc;
+		if (GetClientRect(s_sa.preview_hwnd, &rc) &&
+		    rc.right > 0 && rc.bottom > 0) {
+			if (out_fx) *out_fx = (float)s_sa.preview_mouse_x / (float)rc.right;
+			if (out_fy) *out_fy = (float)s_sa.preview_mouse_y / (float)rc.bottom;
+			return 1;
+		}
+	}
+	if (out_fx) *out_fx = -1.0f;
+	if (out_fy) *out_fy = -1.0f;
+	return 0;
+#else
+	if (out_fx) *out_fx = -1.0f;
+	if (out_fy) *out_fy = -1.0f;
+	return 0;
 #endif
 }
 

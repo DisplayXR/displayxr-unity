@@ -257,6 +257,18 @@ namespace DisplayXR
         internal static extern void displayxr_standalone_get_preview_mouse_state(
             out int buttons, out int wheelDelta);
 
+        /// <summary>
+        /// (v1.2.10+) Cursor position in the runtime preview window's content
+        /// area as fractional coords (0..1, top-left origin). Returns 1 if
+        /// the cursor is inside the content area, 0 otherwise (fx/fy = -1).
+        /// Fractional convention matches wsui layer rects so callers can
+        /// hit-test directly without needing the window's pixel size.
+        /// Editor-preview only — built apps use Input.mousePosition.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int displayxr_standalone_get_preview_mouse_position(
+            out float fx, out float fy);
+
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int displayxr_standalone_window_is_interacting();
 
