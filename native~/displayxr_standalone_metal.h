@@ -65,6 +65,12 @@ int displayxr_sa_metal_window_is_interacting(void);
 /// callers can hit-test directly without needing the window's pixel size.
 int displayxr_sa_metal_get_preview_mouse_position(float *out_fx, float *out_fy);
 
+/// Bitmask of currently pressed mouse buttons on the preview window
+/// (bit 0 = left, 1 = right, 2 = middle). Polled live via
+/// `[NSEvent pressedMouseButtons]` — works regardless of whether the
+/// window has key focus, as long as the app is foreground.
+int displayxr_sa_metal_get_preview_mouse_buttons(void);
+
 #ifdef __cplusplus
 }
 #endif

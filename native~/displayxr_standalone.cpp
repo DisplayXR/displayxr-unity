@@ -1800,6 +1800,10 @@ displayxr_get_backing_scale_factor(void)
 }
 
 
+#if defined(__APPLE__)
+extern "C" int displayxr_sa_metal_get_preview_mouse_buttons(void);
+#endif
+
 DISPLAYXR_EXPORT void
 displayxr_standalone_get_preview_mouse_state(int *buttons, int *wheel_delta)
 {
@@ -1809,6 +1813,9 @@ displayxr_standalone_get_preview_mouse_state(int *buttons, int *wheel_delta)
 		*wheel_delta = s_sa.preview_wheel_accum;
 		s_sa.preview_wheel_accum = 0; // consume
 	}
+#elif defined(__APPLE__)
+	if (buttons) *buttons = displayxr_sa_metal_get_preview_mouse_buttons();
+	if (wheel_delta) *wheel_delta = 0; // Mac wheel polling not yet implemented
 #else
 	if (buttons) *buttons = 0;
 	if (wheel_delta) *wheel_delta = 0;
