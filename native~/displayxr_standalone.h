@@ -200,6 +200,17 @@ DISPLAYXR_EXPORT int displayxr_standalone_request_display_mode(int mode_3d);
 /// @return 1 on success, 0 on failure or not supported.
 DISPLAYXR_EXPORT int displayxr_standalone_request_rendering_mode(uint32_t mode_index);
 
+/// Fetch the runtime-reported display name for the rendering mode at the
+/// given enumeration array slot (0..count-1). Bypasses the awkward
+/// marshalling of `char[][256]` from managed code: callers pass a flat
+/// byte buffer + capacity and parse a null-terminated UTF-8 string out.
+/// @param array_slot   Enumeration slot from displayxr_standalone_enumerate_rendering_modes.
+/// @param buffer       Output byte buffer (filled with null-terminated UTF-8).
+/// @param buffer_size  Capacity of buffer in bytes (including terminator).
+/// @return 1 on success (buffer is null-terminated), 0 on failure (buffer[0] = '\0').
+DISPLAYXR_EXPORT int displayxr_standalone_get_rendering_mode_name(
+    uint32_t array_slot, char *buffer, uint32_t buffer_size);
+
 /// Enumerate available rendering modes with full metadata.
 /// Two-call pattern: first call with capacity=0 to get count,
 /// then allocate and call again. Extended arrays are optional (may be NULL).

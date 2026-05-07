@@ -392,6 +392,12 @@ namespace DisplayXR
         internal static extern int displayxr_standalone_request_rendering_mode(uint modeIndex);
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern int displayxr_standalone_get_rendering_mode_name(
+            uint arraySlot,
+            [MarshalAs(UnmanagedType.LPArray)] byte[] buffer,
+            uint bufferSize);
+
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int displayxr_standalone_enumerate_rendering_modes(
             uint capacity, out uint count,
             [MarshalAs(UnmanagedType.LPArray)] uint[] modeIndices,
