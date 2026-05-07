@@ -5,6 +5,22 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.12] - 2026-05-07
+
+### Fixed
+- v1.2.11 attempted to fix the nested-package upm bug but the same fix
+  also deleted the .tgz before the GitHub Release step could attach it,
+  leaving v1.2.11's release without a downloadable asset. v1.2.12
+  reverts to a cleaner workflow that doesn't use `git add -A` at all in
+  the upm-publish step (selective `git add -f` for binaries +
+  `git rm --cached` for dev-file removals already covers everything).
+
+### Notes
+- No source-side changes from v1.2.10 or v1.2.11. Packaging-only release.
+- Pin to `#upm/v1.2.12` going forward — both v1.2.9 and v1.2.10 have the
+  nested-package bug; v1.2.11 has a clean upm tag but missing GH Release
+  asset; v1.2.12 is the first fully-clean release.
+
 ## [1.2.11] - 2026-05-07
 
 ### Fixed
