@@ -265,24 +265,9 @@ displayxr_sa_macos_is_key_pressed(int ascii)
 	// CGEventSourceKeyState polls the global hardware key state regardless
 	// of which window has focus — what we need so app-side hotkeys can fire
 	// while the standalone preview NSWindow owns input focus.
-
-	// Modifiers come through NSEvent.modifierFlags rather than HID state
-	// (CGEventSourceKeyState's keycode space conflicts with regular keys).
-	if (ascii == 0x10) { // Shift (any side)
-		return ([NSEvent modifierFlags] & NSEventModifierFlagShift) ? 1 : 0;
-	}
-	if (ascii == 0x11) { // Ctrl
-		return ([NSEvent modifierFlags] & NSEventModifierFlagControl) ? 1 : 0;
-	}
-	if (ascii == 0x12) { // Alt / Option
-		return ([NSEvent modifierFlags] & NSEventModifierFlagOption) ? 1 : 0;
-	}
 	int kvk = -1;
 	int up = (ascii >= 'a' && ascii <= 'z') ? (ascii - 'a' + 'A') : ascii;
 	switch (up) {
-		case 0x09: kvk = kVK_Tab; break;     // Tab (Win VK_TAB compat)
-		case 0x1B: kvk = kVK_Escape; break;  // Esc
-		case ' ':  kvk = kVK_Space; break;
 		case 'A': kvk = kVK_ANSI_A; break;
 		case 'B': kvk = kVK_ANSI_B; break;
 		case 'C': kvk = kVK_ANSI_C; break;
