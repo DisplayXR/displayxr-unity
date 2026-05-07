@@ -5,6 +5,20 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.11] - 2026-05-07
+
+### Fixed
+- CI: stop shipping a duplicate copy of the package nested inside the upm
+  branch under `com.displayxr.unity-X.Y.Z/`. The "Create UPM tarball"
+  step mkdir'd a staging directory in the working tree; the next step's
+  `git add -A` swept it into the upm tag. Consumers saw the package
+  imported twice and Unity raised hundreds of "Asset has no meta file,
+  in immutable folder" errors on first install (forcing safe-mode editor
+  load). v1.2.9 and v1.2.10 upm tags are affected — re-pin to v1.2.11.
+
+### Notes
+- No source-side changes from v1.2.10. This is a packaging hotfix.
+
 ## [1.2.10] - 2026-05-07
 
 ### Added
