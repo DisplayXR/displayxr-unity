@@ -63,6 +63,15 @@ static DisplayXRSAWindowDelegate *s_sa_window_delegate = nil;
 // last-rendered size and snaps to the correct size when resize ends.
 - (BOOL)preservesContentDuringLiveResize { return YES; }
 
+// Suppress the system beep on unhandled keyboard input. Apps polling key
+// state via CGEventSourceKeyState (DisplayXRPreviewInput.IsKeyPressed)
+// don't actually consume the event from the responder chain — so AppKit
+// reaches the bottom and calls -noResponderFor: which plays NSBeep by
+// default. Overriding to no-op silences it without affecting key-state
+// polling. Real menu shortcuts (Cmd+W close, etc.) still work because
+// they're handled higher up the chain.
+- (void)noResponderFor:(SEL)eventSelector { }
+
 @end
 
 // ============================================================================
