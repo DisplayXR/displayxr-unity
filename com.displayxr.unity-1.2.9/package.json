@@ -1,0 +1,55 @@
+{
+  "name": "com.displayxr.unity",
+  "displayName": "DisplayXR",
+  "version": "1.2.9",
+  "unity": "2022.3",
+  "description": "Unity plugin for DisplayXR OpenXR runtime enabling stereo rendering on 3D light field displays. Provides display-centric and camera-centric stereo rig authoring, Kooima asymmetric frustum projection, 2D UI overlay support, and in-editor preview.",
+  "keywords": [
+    "xr",
+    "openxr",
+    "3d-display",
+    "stereo",
+    "displayxr",
+    "light-field"
+  ],
+  "author": {
+    "name": "DisplayXR contributors",
+    "url": "https://github.com/DisplayXR/displayxr-unity"
+  },
+  "license": "ISC",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/DisplayXR/displayxr-unity.git"
+  },
+  "dependencies": {
+    "com.unity.xr.openxr": "1.16.1",
+    "com.unity.xr.management": "4.4.0"
+  },
+  "samples": [
+    {
+      "displayName": "Basic Scene",
+      "description": "Minimal camera-centric stereo setup with a few objects for testing.",
+      "path": "Samples~/BasicScene"
+    },
+    {
+      "displayName": "URP Basic Scene",
+      "description": "URP smoke test for the stereo rig. Same content as Basic Scene; verifies the SRP camera-callback path. Requires URP installed in the host project.",
+      "path": "Samples~/URPBasicScene"
+    },
+    {
+      "displayName": "Display Scene",
+      "description": "Crate test scene matching the native reference app, with full stereo rig controls.",
+      "path": "Samples~/DisplayScene"
+    },
+    {
+      "displayName": "Transparent Avatar (Windows)",
+      "description": "Chroma-key transparent overlay mode (issue #57) — capsule avatar floats above the desktop with click-through. Windows standalone only.",
+      "path": "Samples~/TransparentAvatar"
+    },
+    {
+      "displayName": "Minimal Transparent (Windows)",
+      "description": "Smallest working chroma-key transparent overlay scene (~70 lines). Teaching sample — README walks through the four-mechanism pipeline, the OpenXR extensions in use, and the layer ownership map. Windows standalone only.",
+      "path": "Samples~/MinimalTransparent"
+    }
+  ]
+}
