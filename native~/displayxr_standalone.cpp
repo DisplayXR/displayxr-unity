@@ -1978,14 +1978,20 @@ displayxr_standalone_enumerate_rendering_modes(
 	}
 
 	*count = total;
-	if (capacity == 0 || !mode_indices || !mode_names)
+	// `mode_names` is optional (callers that don't care about names pass
+	// NULL — string-array marshalling from managed code is awkward, and
+	// our test app synthesizes friendly names from the numeric fields).
+	// Only require capacity + mode_indices to be present.
+	if (capacity == 0 || !mode_indices)
 		return 1; // Count-only query
 
 	uint32_t to_fetch = total < capacity ? total : capacity;
 	for (uint32_t i = 0; i < to_fetch; i++) {
 		mode_indices[i] = s_sa.rendering_modes[i].modeIndex;
-		strncpy(mode_names[i], s_sa.rendering_modes[i].modeName, 255);
-		mode_names[i][255] = '\0';
+		if (mode_names) {
+			strncpy(mode_names[i], s_sa.rendering_modes[i].modeName, 255);
+			mode_names[i][255] = '\0';
+		}
 
 		// Extended fields (NULL-safe — callers may pass NULL for fields they don't need)
 		if (view_counts) view_counts[i] = s_sa.rendering_modes[i].viewCount;
