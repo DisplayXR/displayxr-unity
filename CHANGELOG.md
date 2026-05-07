@@ -5,6 +5,22 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.10] - 2026-05-07
+
+### Added
+- New native API `displayxr_standalone_get_preview_mouse_position(out fx, out fy)`
+  exposing the runtime preview window's cursor position as fractional
+  (0..1, top-left) content-area coords. Mac (`NSWindow`/`NSEvent.mouseLocation`)
+  and Windows (`WM_MOUSEMOVE` tracked in `sa_wndproc`) covered. Public C#
+  helper: `DisplayXR.DisplayXRPreviewInput.TryGetPreviewMousePosition()`.
+- This is the *primitive* an app-side input router needs to make
+  `DisplayXRWindowSpaceUI` interactive. The plugin doesn't ship a router
+  — different consumer apps want different input models (mouse, hand-
+  tracking, touch). See the sample
+  [`DisplayXRWsuiMouseRouter.cs`](https://github.com/DisplayXR/displayxr-unity-test-2d-ui/blob/main/Assets/Scripts/DisplayXRWsuiMouseRouter.cs)
+  in `displayxr-unity-test-2d-ui` for the canonical mouse → fractional →
+  canvas-local → `EventSystem.RaycastAll` flow.
+
 ## [1.2.9] - 2026-05-07
 
 ### Fixed
