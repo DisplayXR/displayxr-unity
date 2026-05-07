@@ -87,6 +87,7 @@ namespace DisplayXR
         private Quaternion m_OrigCanvasRot;
         private Vector3 m_OrigCanvasScale;
         private int m_OrigCanvasLayer;
+        private Camera m_OrigCanvasWorldCamera;
         private bool m_StateSaved;
 
         private float m_LastX, m_LastY, m_LastW, m_LastH, m_LastDisparity;
@@ -102,6 +103,7 @@ namespace DisplayXR
             m_OrigCanvasRot = m_CanvasRect.rotation;
             m_OrigCanvasScale = m_CanvasRect.localScale;
             m_OrigCanvasLayer = gameObject.layer;
+            m_OrigCanvasWorldCamera = m_Canvas.worldCamera;
             m_StateSaved = true;
 
             // ---- RT with explicit depth-stencil format (URP RenderGraph requirement) ----
@@ -117,7 +119,8 @@ namespace DisplayXR
 
             // ---- Switch the canvas to WorldSpace + park it on the private layer ----
             m_Canvas.renderMode = RenderMode.WorldSpace;
-            m_Canvas.worldCamera = null;
+            // worldCamera is assigned to the OverlayCamera below (after creation)
+            // so GraphicRaycaster can project screen-cursor input onto the canvas.
             m_CanvasRect.position = kCanvasWorldPos;
             m_CanvasRect.rotation = Quaternion.identity;
             // Use the canvas's existing reference width as the scale baseline.
@@ -162,6 +165,18 @@ namespace DisplayXR
             // pipeline-specific scheduling quirks for offscreen-only cameras.
             m_OverlayCamera.enabled = false;
 
+            // Wire OverlayCamera as the canvas's event camera. GraphicRaycaster
+            // needs a camera reference to project screen-cursor input onto a
+            // WorldSpace canvas — without it, raycasts return empty hits and
+            // app-side input routers (e.g. DisplayXRWsuiMouseRouter) can't drive
+            // sliders/buttons. Using OverlayCamera (which already views the
+            // canvas full-frame) means cursor coords passed in RT-pixel space
+            // map 1:1 to the rendered layout. The camera's flipped up-vector
+            // (down) flips the projection's Y to match the runtime's top-left
+            // texture origin, so callers should pass a Y-flipped cursor coord
+            // to PointerEventData.position to compensate.
+            m_Canvas.worldCamera = m_OverlayCamera;
+
             // ---- Tell native about our texture + initial layer descriptor ----
             DisplayXRNative.displayxr_window_space_ui_set_layer(
                 positionX, positionY, width, height, disparity);
@@ -184,6 +199,7 @@ namespace DisplayXR
             if (m_StateSaved && m_Canvas != null)
             {
                 m_Canvas.renderMode = m_OrigRenderMode;
+                m_Canvas.worldCamera = m_OrigCanvasWorldCamera;
                 if (m_CanvasRect != null)
                 {
                     m_CanvasRect.position = m_OrigCanvasPos;
