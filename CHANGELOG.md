@@ -5,6 +5,36 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-05-09
+
+### Changed
+- Plugin now relies on the displayxr-runtime `chromaKeyColor = 0` -> default
+  magenta convention shipped in runtime PR #213 / #3a / #3b / #3c. Apps that
+  call `RequestChromaKey(Color.magenta)` see no behavior change. Apps that
+  pass `0` (or never call the API) now get the runtime DP's default magenta
+  instead of "no chroma-key conversion" — equivalent to the previous behavior
+  on D3D11/D3D12 where the runtime already used magenta.
+- Transparent backgrounds now also work on Vulkan and OpenGL Win32 standalone
+  builds, not just D3D11/D3D12. Same `RequestTransparentSession()` API. The
+  runtime's GL native compositor falls back to opaque presentation on GPUs
+  without `WGL_NV_DX_interop2` (mainly Intel iGPUs) — the cube still renders
+  but the desktop doesn't show through.
+
+### Compatibility
+- Requires displayxr-runtime ≥ v25.7.0 for Vulkan / OpenGL transparency.
+  D3D11/D3D12 transparency keeps working with older runtimes.
+- `chromaKeyColor` semantics are unchanged; the only difference is that
+  passing `0` is now a useful (and recommended) value, not a no-op.
+
+### Known limitations (no change since v1.2.x)
+- Anti-aliased edges become hard-mask alpha on Leia hardware (alpha=0 or 1,
+  no in-between). This is fundamental to the chroma-key trick used by the
+  SR weaver — fully transparent regions punch through cleanly, but partial-
+  transparency pixels on antialiased edges either snap to opaque (with
+  possible fringing toward the chroma key) or to fully transparent. Apps
+  that need soft alpha should choose a content-safe `chromaKeyColor` to
+  minimize fringing.
+
 ## [1.2.13] - 2026-05-07
 
 ### Added
