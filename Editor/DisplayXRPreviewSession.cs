@@ -669,7 +669,7 @@ namespace DisplayXR.Editor
 
         public static CameraEntry[] DiscoverCameras()
         {
-            var cameras = UnityEngine.Object.FindObjectsByType<Camera>(FindObjectsInactive.Exclude, FindObjectsSortMode.None);
+            var cameras = UnityEngine.Object.FindObjectsByType<Camera>(FindObjectsInactive.Exclude);
             var entries = new List<CameraEntry>();
 
             foreach (var cam in cameras)

@@ -41,7 +41,7 @@ The plugin intercepts Unity's OpenXR pipeline at the native layer to provide:
 - **2D UI overlay** — Route any Canvas to a window-space composition layer with stereo disparity
 - **Standalone editor preview** — Live composited 3D output in a dedicated editor window, no Play Mode required. Camera selector dropdown, rendering mode switching, and zero-copy GPU texture sharing.
 
-The plugin works by hooking `xrLocateViews` before Unity sees the results, replacing the runtime's FOV data with Kooima-computed asymmetric frustums. Unity then builds correct projection matrices through its normal rendering pipeline — no `Camera.SetStereoProjectionMatrix` hacks required.
+The plugin works by hooking `xrLocateViews` before Unity sees the results, replacing the runtime's FOV data with Kooima-computed asymmetric frustums, and then pushing the full Kooima view + projection matrices to each stereo eye via `Camera.SetStereoProjectionMatrix` / `SetStereoViewMatrix`. Because Unity gates those APIs to MultiPass on every platform, DisplayXR force-enables MultiPass at OpenXR instance creation (Single-Pass-Instanced is incompatible — see issue #69 for the experiment that verified this).
 
 ---
 

@@ -109,9 +109,12 @@ namespace DisplayXR
             EditorApplication.playModeStateChanged += OnPlayModeStateChanged;
 #endif
 
-            // Force multi-pass rendering. Single-pass instanced is broken on
-            // macOS/Metal (confirmed Unity bug, Won't Fix) and incompatible
-            // with our per-eye asymmetric Kooima frustum projection.
+            // Force multi-pass rendering. DisplayXRDisplay/DisplayXRCamera push
+            // the Kooima asymmetric projection via Camera.SetStereoProjectionMatrix,
+            // which Unity gates to MultiPass on every platform — in SPI it is
+            // silently rejected ("Can't set custom eye projection matrix when
+            // not in multipass mode") and the scene renders with a degenerate
+            // frustum. Verified by experiment on Windows D3D12, issue #69.
             var settings = OpenXRSettings.Instance;
             if (settings != null && settings.renderMode != OpenXRSettings.RenderMode.MultiPass)
             {
@@ -276,7 +279,9 @@ namespace DisplayXR
             rules.Add(new ValidationRule(this)
             {
                 message = "DisplayXR requires Multi-Pass render mode. " +
-                          "Single-pass instanced is broken on macOS and incompatible with asymmetric frustum projection.",
+                          "Single-pass instanced is incompatible with Camera.SetStereoProjectionMatrix " +
+                          "(MultiPass-only on every platform), which DisplayXR uses to push the Kooima " +
+                          "asymmetric projection per eye.",
                 error = true,
                 checkPredicate = () =>
                 {
