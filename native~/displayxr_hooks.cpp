@@ -9,18 +9,70 @@
 
 // --- Logging helper ---
 // On Windows built apps, fprintf(stderr) goes nowhere (no console).
-// Write to a file next to the executable so logs are always accessible.
+// Write to a file at an absolute path so logs are always findable.
+//
+// Path resolution order on Windows:
+//   1. <ExeDir>\displayxr.log — preferred (alongside the .exe)
+//   2. %TEMP%\displayxr.log   — fallback if the .exe dir is not writable
+//   3. .\displayxr.log        — last resort (CWD); historical behavior
+//
+// The chosen path is reported once via OutputDebugStringA (DbgView) and
+// also written as the first line of the log so it's discoverable post-hoc.
 void displayxr_log(const char *fmt, ...)
 {
 	va_list args;
 	va_start(args, fmt);
 #if defined(_WIN32)
-	// Append to displayxr.log next to the executable
 	static FILE *s_logfile = nullptr;
 	static int s_log_init = 0;
 	if (!s_log_init) {
 		s_log_init = 1;
-		s_logfile = fopen("displayxr.log", "w");
+		char log_path[MAX_PATH * 2] = {};
+
+		// (1) <ExeDir>\displayxr.log. GetModuleFileNameA(NULL, ...) returns
+		// the .exe path even when called from a plugin DLL.
+		char exe_path[MAX_PATH] = {};
+		DWORD got = GetModuleFileNameA(NULL, exe_path, MAX_PATH);
+		if (got > 0 && got < MAX_PATH) {
+			for (DWORD i = got; i > 0; i--) {
+				if (exe_path[i - 1] == '\\' || exe_path[i - 1] == '/') {
+					exe_path[i] = 0;
+					break;
+				}
+			}
+			snprintf(log_path, sizeof(log_path), "%sdisplayxr.log", exe_path);
+			s_logfile = fopen(log_path, "w");
+		}
+
+		// (2) %TEMP%\displayxr.log
+		if (!s_logfile) {
+			char tmp_path[MAX_PATH] = {};
+			DWORD t = GetTempPathA(MAX_PATH, tmp_path);
+			if (t > 0 && t < MAX_PATH - 16) {
+				snprintf(log_path, sizeof(log_path), "%sdisplayxr.log", tmp_path);
+				s_logfile = fopen(log_path, "w");
+			}
+		}
+
+		// (3) CWD fallback (Unity's CWD is not guaranteed to be writable
+		// or to match the .exe directory; kept for parity with old behavior).
+		if (!s_logfile) {
+			snprintf(log_path, sizeof(log_path), "displayxr.log");
+			s_logfile = fopen(log_path, "w");
+		}
+
+		// Announce the chosen path so users can find the file. Always emit
+		// to OutputDebugString (visible in DbgView even if file open failed)
+		// and to the log itself when open.
+		char marker[MAX_PATH + 64];
+		snprintf(marker, sizeof(marker),
+		         "[DisplayXR] log_path=%s (opened=%d)\n",
+		         log_path, s_logfile != nullptr ? 1 : 0);
+		OutputDebugStringA(marker);
+		if (s_logfile) {
+			fputs(marker, s_logfile);
+			fflush(s_logfile);
+		}
 	}
 	if (s_logfile) {
 		va_list args2;

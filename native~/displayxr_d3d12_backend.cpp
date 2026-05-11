@@ -147,6 +147,13 @@ public:
 		return true;
 	}
 
+	int64_t wsui_get_native_texture_format(void *unity_tex) override
+	{
+		ID3D12Resource *res = (ID3D12Resource *)unity_tex;
+		if (res == nullptr) return -1;
+		return (int64_t)res->GetDesc().Format;
+	}
+
 	bool wsui_copy_to_swapchain_image(void *unity_tex, void *sc_image_native,
 	                                    uint32_t w, uint32_t h) override
 	{
@@ -154,15 +161,51 @@ public:
 		ID3D12Resource *dst = (ID3D12Resource *)sc_image_native;
 		if (!src || !dst || !queue || !ensure_copy_resources()) return false;
 
-		// Rely on D3D12 common-state implicit promotion: any resource in
-		// COMMON state implicitly promotes to COPY_SOURCE / COPY_DEST during
-		// CopyTextureRegion and decays back to COMMON when the command list
-		// drains. Unity's RT and the runtime's swapchain image are both
-		// expected to land in COMMON between frames; the standalone D3D12
-		// backend's blit_atlas (displayxr_standalone_d3d12.cpp:317) follows
-		// the same convention.
+		// Explicit resource state transitions around CopyTextureRegion.
+		//
+		// Previously this relied on D3D12 common-state implicit promotion
+		// (COMMON -> COPY_SOURCE / COPY_DEST during the copy, decay back
+		// to COMMON when the command list drains). That contract holds
+		// for opaque sessions, where the runtime composites the wsui
+		// swapchain image as PIXEL_SHADER_RESOURCE and lets it decay to
+		// COMMON before the next acquire.
+		//
+		// In transparent sessions (XR_FB_composition_layer_alpha_blend +
+		// chroma key, DComp swapchain on D3D12), the runtime's compositor
+		// path can leave the swapchain image in a non-COMMON state
+		// between frames, breaking implicit promotion. The result was a
+		// SEGV inside CopyTextureRegion on the second xrEndFrame after
+		// the wsui swapchain was created — see issue #82.
+		//
+		// Explicit transitions make the copy state-independent: the
+		// resource is forced into the copy state regardless of what the
+		// runtime left it in, then put back into COMMON before we
+		// release the swapchain image. Same convention as the standalone
+		// D3D12 backend's blit_atlas (displayxr_standalone_d3d12.cpp).
 		cmd_alloc->Reset();
 		cmd_list->Reset(cmd_alloc, nullptr);
+
+		// dst (runtime's wsui swapchain image): created by the runtime in
+		// D3D12_RESOURCE_STATE_RENDER_TARGET (see displayxr-runtime's
+		// comp_d3d12_swapchain.cpp:284) and expected back in RENDER_TARGET
+		// for the next render_window_space_layer barrier in the runtime's
+		// renderer. Match that contract exactly.
+		// src (Unity's RT): Unity manages, expected to be in COMMON between
+		// frames per OpenXR spec convention.
+		D3D12_RESOURCE_BARRIER pre_barriers[2] = {};
+		pre_barriers[0].Type  = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		pre_barriers[0].Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+		pre_barriers[0].Transition.pResource   = dst;
+		pre_barriers[0].Transition.Subresource = 0;
+		pre_barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+		pre_barriers[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
+		pre_barriers[1].Type  = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		pre_barriers[1].Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+		pre_barriers[1].Transition.pResource   = src;
+		pre_barriers[1].Transition.Subresource = 0;
+		pre_barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+		pre_barriers[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+		cmd_list->ResourceBarrier(2, pre_barriers);
 
 		D3D12_TEXTURE_COPY_LOCATION dst_loc = {};
 		dst_loc.pResource = dst;
@@ -186,6 +229,22 @@ public:
 		D3D12_BOX box = { 0, 0, 0, copy_w, copy_h, 1 };
 
 		cmd_list->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, &box);
+
+		D3D12_RESOURCE_BARRIER post_barriers[2] = {};
+		post_barriers[0].Type  = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		post_barriers[0].Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+		post_barriers[0].Transition.pResource   = dst;
+		post_barriers[0].Transition.Subresource = 0;
+		post_barriers[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+		post_barriers[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
+		post_barriers[1].Type  = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		post_barriers[1].Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+		post_barriers[1].Transition.pResource   = src;
+		post_barriers[1].Transition.Subresource = 0;
+		post_barriers[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+		post_barriers[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_COMMON;
+		cmd_list->ResourceBarrier(2, post_barriers);
+
 		cmd_list->Close();
 
 		ID3D12CommandList *lists[] = { cmd_list };

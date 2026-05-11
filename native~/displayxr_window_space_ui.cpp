@@ -59,8 +59,18 @@ SessionWsui s_standalone = {};
 // On Metal we'll also accept BGRA8 (=80) since CAMetalLayer drawables typically
 // land on BGRA. The runtime test app picks UNORM first per
 // xr_session_common.cpp:534 — match that.
-int64_t pick_overlay_format(const int64_t *formats, uint32_t count)
+// Pick an overlay swapchain format. If `app_pref` is >= 0, we try it first —
+// matching the Unity-side RT's actual format is critical because D3D12
+// CopyTextureRegion is invalid across formats (the runtime's compositor's
+// stricter DComp/transparent path turns this into DXGI_ERROR_INVALID_CALL).
+// See displayxr-unity#82 / displayxr-runtime#216.
+int64_t pick_overlay_format(const int64_t *formats, uint32_t count, int64_t app_pref = -1)
 {
+	if (app_pref >= 0) {
+		for (uint32_t i = 0; i < count; i++) {
+			if (formats[i] == app_pref) return app_pref;
+		}
+	}
 	const int64_t prefs[] = {
 #if defined(__APPLE__)
 		// Prefer BGRA on Apple — Unity's RenderTextureFormat.ARGB32 lands as
@@ -91,7 +101,7 @@ void release_session_state(SessionWsui *s, PFN_xrDestroySwapchain destroy_fn)
 }
 
 // --- Format enumeration helpers per path -------------------------------------
-int64_t enumerate_and_pick_format_hooked(XrSession session)
+int64_t enumerate_and_pick_format_hooked(XrSession session, int64_t app_pref = -1)
 {
 	if (s_real_enumerate_swapchain_formats == nullptr) return -1;
 	uint32_t count = 0;
@@ -101,7 +111,7 @@ int64_t enumerate_and_pick_format_hooked(XrSession session)
 	if (count > 32) count = 32;
 	if (XR_FAILED(s_real_enumerate_swapchain_formats(session, count, &count, formats)))
 		return -1;
-	return pick_overlay_format(formats, count);
+	return pick_overlay_format(formats, count, app_pref);
 }
 
 int64_t enumerate_and_pick_format_standalone(XrSession session, const WsuiStandaloneFns *fns)
@@ -226,6 +236,7 @@ wsui_hooked_pre_end_frame(XrSession session, GraphicsBackend *backend)
 	void *unity_tex = s_pending.native_tex;
 	int tex_w = s_pending.width;
 	int tex_h = s_pending.height;
+
 	if (unity_tex == nullptr || tex_w <= 0 || tex_h <= 0 ||
 	    backend == nullptr || session == XR_NULL_HANDLE) {
 		return;
@@ -260,7 +271,12 @@ wsui_hooked_pre_end_frame(XrSession session, GraphicsBackend *backend)
 			return;
 		}
 
-		int64_t format = enumerate_and_pick_format_hooked(session);
+		// Match the swapchain format to Unity's RT format. CopyTextureRegion
+		// requires identical formats; a mismatch (e.g. R8G8B8A8 dst with
+		// B8G8R8A8 src) makes the GPU work invalid and removes the device
+		// under DComp-backed transparent swapchains. See #82 / runtime#216.
+		int64_t app_pref = backend->wsui_get_native_texture_format(unity_tex);
+		int64_t format = enumerate_and_pick_format_hooked(session, app_pref);
 		if (format < 0) {
 			displayxr_log("[DisplayXR] wsui_hooked: format enumeration failed\n");
 			s_hooked.create_failed_logged = 1;
@@ -268,16 +284,19 @@ wsui_hooked_pre_end_frame(XrSession session, GraphicsBackend *backend)
 		}
 
 		XrSwapchain sc = XR_NULL_HANDLE;
-		if (!create_swapchain_with(session, s_real_create_swapchain, format,
-		                            (uint32_t)tex_w, (uint32_t)tex_h, &sc)) {
-			displayxr_log("[DisplayXR] wsui_hooked: xrCreateSwapchain failed\n");
+		bool sc_ok = create_swapchain_with(session, s_real_create_swapchain, format,
+		                            (uint32_t)tex_w, (uint32_t)tex_h, &sc);
+		if (!sc_ok) {
+			displayxr_log("[DisplayXR] wsui_hooked: xrCreateSwapchain failed (fmt=%lld)\n",
+			    (long long)format);
 			s_hooked.create_failed_logged = 1;
 			return;
 		}
 
 		uint32_t img_count = 0;
-		if (!backend->wsui_enumerate_swapchain_images(
-			sc, kMaxImages, &img_count, s_hooked.image_native_ptrs)) {
+		bool enum_ok = backend->wsui_enumerate_swapchain_images(
+			sc, kMaxImages, &img_count, s_hooked.image_native_ptrs);
+		if (!enum_ok) {
 			displayxr_log("[DisplayXR] wsui_hooked: backend enumerate failed\n");
 #if defined(_WIN32)
 			if (s_real_destroy_swapchain) s_real_destroy_swapchain(sc);

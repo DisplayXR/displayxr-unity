@@ -131,6 +131,16 @@ public:
 	// Returns true on success.
 	virtual bool wsui_copy_to_swapchain_image(void * /*unity_tex*/,
 	    void * /*sc_image_native*/, uint32_t /*w*/, uint32_t /*h*/) { return false; }
+
+	// Query the backend-native format of a texture (Unity's wsui canvas RT).
+	// Returns the OpenXR-spec format code (DXGI_FORMAT on D3D, VkFormat on
+	// Vulkan, MTLPixelFormat on Metal, GLenum on GL), or -1 if unknown /
+	// unsupported. Used to align the wsui swapchain format with Unity's
+	// actual RT format — a mismatch makes D3D12 CopyTextureRegion invalid,
+	// which a DComp swapchain detects and kills the device over (whereas
+	// opaque flip-model swapchains silently tolerate the byte permutation).
+	// See displayxr-unity#82 / displayxr-runtime#216.
+	virtual int64_t wsui_get_native_texture_format(void * /*unity_tex*/) { return -1; }
 };
 
 // --- Factory functions for concrete backend classes ---

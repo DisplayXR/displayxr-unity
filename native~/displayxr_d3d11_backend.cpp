@@ -600,6 +600,15 @@ public:
 		return true;
 	}
 
+	int64_t wsui_get_native_texture_format(void *unity_tex) override
+	{
+		ID3D11Texture2D *res = (ID3D11Texture2D *)unity_tex;
+		if (res == nullptr) return -1;
+		D3D11_TEXTURE2D_DESC d = {};
+		res->GetDesc(&d);
+		return (int64_t)d.Format;
+	}
+
 	bool wsui_copy_to_swapchain_image(void *unity_tex, void *sc_image_native,
 	                                    uint32_t w, uint32_t h) override
 	{
