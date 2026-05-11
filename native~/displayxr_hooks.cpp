@@ -302,6 +302,7 @@ hooked_xrLocateViews(XrSession session,
 		cam_tunables.ipd_factor = tunables.ipd_factor;
 		cam_tunables.parallax_factor = tunables.parallax_factor;
 		cam_tunables.half_tan_vfov = tunables.fov_override;
+		cam_tunables.clip_at_display_plane = tunables.clip_at_display_plane;
 
 		// Parent camera scale: multiply eye positions and nominal viewer,
 		// divide inv_convergence_distance by sz.
@@ -388,6 +389,7 @@ hooked_xrLocateViews(XrSession session,
 		disp_tunables.parallax_factor = tunables.parallax_factor;
 		disp_tunables.perspective_factor = tunables.perspective_factor;
 		disp_tunables.virtual_display_height = vdh;
+		disp_tunables.clip_at_display_plane = tunables.clip_at_display_plane;
 
 		XrVector3f raw_eyes[2] = {raw_left, raw_right};
 
@@ -1392,7 +1394,8 @@ displayxr_set_tunables(float ipd_factor,
                       float fov_override,
                       float near_z,
                       float far_z,
-                      int camera_centric)
+                      int camera_centric,
+                      int clip_at_display_plane)
 {
 	DisplayXRTunables t;
 	t.ipd_factor = ipd_factor;
@@ -1404,6 +1407,7 @@ displayxr_set_tunables(float ipd_factor,
 	t.near_z = near_z > 0.0001f ? near_z : 0.01f;
 	t.far_z = far_z > t.near_z ? far_z : 1000.0f;
 	t.camera_centric = camera_centric ? 1 : 0;
+	t.clip_at_display_plane = clip_at_display_plane ? 1 : 0;
 	displayxr_state_set_tunables(&t);
 }
 

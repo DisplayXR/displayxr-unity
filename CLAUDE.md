@@ -296,3 +296,19 @@ For detailed architecture and design decisions, see `docs~/`:
 - Use `DisplayXR/displayxr-runtime#N` syntax to reference runtime issues
 - The runtime provides the OpenXR compositor, display drivers, and eye tracking
 - The plugin provides the Unity-side stereo rendering pipeline
+
+### Test repos
+
+Three sibling Unity projects exercise the plugin against different feature areas. Treat them as a regression net — when a plugin change risks affecting any of these, fetch and verify before tagging a release.
+
+| Repo | Focus | Notes |
+|------|-------|-------|
+| [`DisplayXR/displayxr-unity-test`](https://github.com/DisplayXR/displayxr-unity-test) | Baseline rendering / stereo correctness | Plain cube + camera-centric and display-centric rigs |
+| [`DisplayXR/displayxr-unity-test-transparent`](https://github.com/DisplayXR/displayxr-unity-test-transparent) | Transparent overlay + chroma key + click-through (#57 family) | Tiger FBX clickable, foreground-only render |
+| [`DisplayXR/displayxr-unity-test-2d-ui`](https://github.com/DisplayXR/displayxr-unity-test-2d-ui) | 2D UI window-space composition layer | Tuning panel built from `DisplayXRWindowSpaceUI` |
+
+All three pin the plugin via `https://github.com/DisplayXR/displayxr-unity.git#upm` (floating; tracks latest release).
+
+### Known compatibility gap
+
+- **Transparent overlay + window-space UI don't compose yet** (issue [#82](https://github.com/DisplayXR/displayxr-unity/issues/82)). Enabling `DisplayXRTransparentOverlay.RequestTransparentSession()` together with a `DisplayXRWindowSpaceUI` layer crashes the runtime in `xrEndFrame` the frame after the wsui swapchain is first created — the BitBlt/DComp transparent path and the wsui composition layer paths haven't been verified together. Workaround: pick one. Apps that need both should drive UI via scene gameobjects / keyboard for now.

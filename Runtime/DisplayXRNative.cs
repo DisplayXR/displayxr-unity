@@ -33,7 +33,8 @@ namespace DisplayXR
             float fovOverride,
             float nearZ,
             float farZ,
-            int cameraCentric);
+            int cameraCentric,
+            int clipAtDisplayPlane);
 
         /// <summary>
         /// Get display info queried from runtime via XR_EXT_display_info.

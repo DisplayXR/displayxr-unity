@@ -441,6 +441,29 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		              GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam),
 		              (int)scr.x, (int)scr.y,
 		              (long)s_ll_mouse_seq);
+
+		// Update s_vkey_state regardless of how this event will be
+		// routed below (captured / forwarded). C# polled state in
+		// displayxr_get_overlay_pointer reads this array; without
+		// the update, forwarded events (hit_active=0) never reach
+		// Unity's wndproc subclass and the polled state stays stale.
+		// Symptom: drag a press from on-target to off-target, release
+		// off-target — overlay forwards the UP, Unity never sees it,
+		// C# thinks left is still held, drag-rotate gets stuck and
+		// keeps following the cursor after release. (#57 / drag stuck.)
+		int vk = -1;
+		BOOL pressed = FALSE;
+		switch (msg) {
+		case WM_LBUTTONDOWN: case WM_LBUTTONDBLCLK: vk = VK_LBUTTON; pressed = TRUE;  break;
+		case WM_LBUTTONUP:                          vk = VK_LBUTTON; pressed = FALSE; break;
+		case WM_RBUTTONDOWN:                        vk = VK_RBUTTON; pressed = TRUE;  break;
+		case WM_RBUTTONUP:                          vk = VK_RBUTTON; pressed = FALSE; break;
+		case WM_MBUTTONDOWN:                        vk = VK_MBUTTON; pressed = TRUE;  break;
+		case WM_MBUTTONUP:                          vk = VK_MBUTTON; pressed = FALSE; break;
+		}
+		if (vk != -1) {
+			s_vkey_state[vk] = pressed ? (SHORT)(0x8000 | 0x0001) : (SHORT)0x0001;
+		}
 	}
 
 	switch (msg) {

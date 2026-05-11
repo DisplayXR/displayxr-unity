@@ -34,6 +34,13 @@ namespace DisplayXR
         [Tooltip("Virtual display height in meters. 0 = use physical display height.")]
         public float virtualDisplayHeight = 0f;
 
+        [Tooltip("Foreground-only render: clip each view at its own |eye.z|*m2v " +
+                 "(i.e. the per-view distance from eye to display plane). Geometry " +
+                 "past the display plane is clipped automatically. N-view safe — " +
+                 "each view's projection uses its own eye-Z. Camera.farClipPlane is " +
+                 "ignored when this is enabled.")]
+        public bool foregroundOnlyClip = false;
+
         [Header("Debug")]
 
         [Tooltip("Show eye tracking status in the console.")]
@@ -144,6 +151,7 @@ namespace DisplayXR
                 nearZ = m_Camera.nearClipPlane,
                 farZ = m_Camera.farClipPlane,
                 cameraCentricMode = false,
+                clipAtDisplayPlane = foregroundOnlyClip,
             };
 
             m_Feature.SetTunables(tunables);
