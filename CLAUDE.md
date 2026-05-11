@@ -308,7 +308,3 @@ Three sibling Unity projects exercise the plugin against different feature areas
 | [`DisplayXR/displayxr-unity-test-2d-ui`](https://github.com/DisplayXR/displayxr-unity-test-2d-ui) | 2D UI window-space composition layer | Tuning panel built from `DisplayXRWindowSpaceUI` |
 
 All three pin the plugin via `https://github.com/DisplayXR/displayxr-unity.git#upm` (floating; tracks latest release).
-
-### Known compatibility gap
-
-- **Transparent overlay + window-space UI don't compose yet** (issue [#82](https://github.com/DisplayXR/displayxr-unity/issues/82)). Enabling `DisplayXRTransparentOverlay.RequestTransparentSession()` together with a `DisplayXRWindowSpaceUI` layer crashes the runtime in `xrEndFrame` the frame after the wsui swapchain is first created — the BitBlt/DComp transparent path and the wsui composition layer paths haven't been verified together. Workaround: pick one. Apps that need both should drive UI via scene gameobjects / keyboard for now.
