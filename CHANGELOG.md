@@ -5,6 +5,76 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-05-11
+
+### Added
+- **Per-view foreground-only clip tunable** — new `clip_at_display_plane`
+  boolean in the native tunables struct (`Display3DTunables` /
+  `Camera3DTunables`) that, when set, overrides each view's projection
+  `far_z` with that view's distance to the display plane. Per-view and
+  N-view safe — the Kooima per-view loop in `xrLocateViews` already runs
+  once per output, so the override scales to 2-view stereo, 4-view quad,
+  and N-view lenticular without further changes. Exposed in C# as
+  `DisplayXRDisplay.foregroundOnlyClip` and `DisplayXRCamera.foregroundOnlyClip`
+  (both inspector-visible with tooltips, pushed in `LateUpdate` alongside
+  the other tunables). Resolves `displayxr-unity-test-transparent#2`.
+  - Why per-view in native: Unity's XR pipeline reads per-eye projection
+    from `xrLocateViews` output, NOT from `Camera.SetStereoProjectionMatrix`.
+    A C# override updates Unity's matrix cache (visible to scene-view,
+    culling, shadows) but never reaches the GPU draw. Doing the per-view
+    `far_z` override inside the native Kooima hook is the only chain that
+    affects the rendered image.
+  - In display-centric rigs the clip distance is `|eye_scaled.z|`; in
+    camera-centric rigs it is `1 / inv_convergence_distance`.
+  - The `displayxr_set_tunables` P/Invoke signature gained one trailing
+    `int` parameter — additive, but recompile required.
+- `CLAUDE.md` Test repos section listing the three sibling Unity test
+  projects (`-test`, `-test-transparent`, `-test-2d-ui`) so future
+  contributors know the regression surface.
+
+### Fixed
+- **`DisplayXRTransparentOverlay` per-triangle SMR hit-test** — clickables
+  with a `SkinnedMeshRenderer` are now ray-tested per-triangle
+  (Möller-Trumbore against the current `BakeMesh` output) instead of via
+  their attached collider. The old `BoxCollider` / `Physics.Raycast` path
+  was always coarse — clicks inside the AABB but outside the visible
+  silhouette were captured, which surfaced once the cube was swapped for
+  a tiger with lots of transparent gaps (between legs, around the hat
+  tip). Each `LateUpdate` (after the Animator step — moved from `Update`
+  to fix head-drift during animation), the plugin calls
+  `smr.BakeMesh(entry.mesh)` and caches `verts[]` + `tris[]`. The
+  cyclopean ray walks every triangle, transforming each vertex via
+  `Matrix4x4.TRS(smr.position, smr.rotation, Vector3.one)` —
+  position + rotation only, NO scale (BakeMesh already applies the rig's
+  scale chain). Forces `SkinnedMeshRenderer.updateWhenOffscreen = true`
+  and `Animator.cullingMode = AlwaysAnimate` on first bake. Active-rig
+  gate via `DisplayXRRigManager.ActiveCamera` so two rigs don't disagree
+  on silhouette-edge pixels. 8-frame hysteresis smooths sub-pixel jitter
+  on the silhouette edge. Non-SMR clickables (e.g. the cube) keep the
+  existing `Physics.Raycast` path — no regression.
+- **Win32 stuck-drag fix for forwarded button events** —
+  `s_vkey_state` is now updated at the top of `overlay_wnd_proc` for
+  EVERY button event (`WM_*BUTTONDOWN/UP/DBLCLK`), regardless of whether
+  the event is captured by the overlay or forwarded to the underlying
+  Unity HWND via `forward_click_to_underlying_window`. Previously,
+  `s_vkey_state` was only updated by Unity's HWND subclass — so when a
+  click on the silhouette dragged across the edge and released over a
+  transparent area, the `WM_LBUTTONUP` was forwarded and Unity's subclass
+  never saw it, leaving C#'s polled left-button state stuck at "pressed"
+  forever (sample `DragRotateCube` kept rotating with cursor motion).
+
+### Changed
+- `CLAUDE.md` drops the now-shipped tiger-session "Unreleased changes"
+  appendix.
+
+### Known limitations
+- Transparent overlay (`#57`) and window-space UI (`#65`) do not compose
+  yet — see issue `#82`. Apps need to pick one or the other for now.
+- SR weaver phase-snap still requires the SDK to own the modal drag loop;
+  the transparent overlay's capture-based drag stutters in 3D during
+  motion (tracked in `DisplayXR/displayxr-runtime#193`). No change since
+  v1.3.0.
+
 ## [1.3.0] - 2026-05-09
 
 ### Changed
