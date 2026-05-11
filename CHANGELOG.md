@@ -5,6 +5,39 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.1] - 2026-05-12
+
+### Fixed
+- **wsui + transparent overlay crash (`#82`)** — combining
+  `DisplayXRTransparentOverlay` with `DisplayXRWindowSpaceUI` no longer
+  crashes the runtime in `xrEndFrame` the first frame the wsui swapchain
+  image is copied into. Root cause was a format mismatch: the plugin's
+  wsui swapchain was created in `DXGI_FORMAT_R8G8B8A8_UNORM` (the picker's
+  hard-coded first preference) while Unity's wsui Canvas `RenderTexture`
+  lands in `DXGI_FORMAT_B8G8R8A8_UNORM` on Windows D3D12.
+  `CopyTextureRegion` across formats is invalid per the D3D12 spec; the
+  release driver silently tolerated the byte permutation on opaque
+  flip-model swapchains (so `-test-2d-ui` always worked), but DComp-backed
+  transparent swapchains hand the cmd list to a stricter compositor-surface
+  validation path that flags it as `DXGI_ERROR_INVALID_CALL` at GPU
+  execution time and removes the device. Fix: the plugin now queries
+  Unity's RT format via a new `GraphicsBackend::wsui_get_native_texture_format()`
+  (implemented for D3D11 and D3D12) and asks the runtime to create the
+  wsui swapchain in that exact format — `pick_overlay_format()` takes an
+  optional app preference that is tried first.
+- **D3D12 resource barriers around the wsui copy** — explicit
+  `ResourceBarrier(COMMON → COPY_DEST/COPY_SOURCE → RENDER_TARGET/COMMON)`
+  bracket `wsui_copy_to_swapchain_image`. Doesn't resolve `#82` on its own
+  but hardens the copy against state-tracking drift regardless of the
+  format-match fix.
+- **`displayxr.log` path resolution** — `displayxr_log` now resolves an
+  absolute path (preferred: `<ExeDir>\displayxr.log`, fallback:
+  `%TEMP%\displayxr.log`, last resort: CWD-relative). Previously
+  `fopen("displayxr.log", "w")` used Unity's CWD, which the built player
+  doesn't guarantee matches the `.exe` directory — so the log file was
+  effectively never created in built apps. The chosen path is announced
+  via `OutputDebugStringA` and as the first line of the log itself.
+
 ## [1.4.0] - 2026-05-11
 
 ### Added
