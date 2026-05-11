@@ -323,7 +323,8 @@ namespace DisplayXR
                 tunables.fovOverride,
                 tunables.nearZ,
                 tunables.farZ,
-                tunables.cameraCentricMode ? 1 : 0);
+                tunables.cameraCentricMode ? 1 : 0,
+                tunables.clipAtDisplayPlane ? 1 : 0);
         }
 
         /// <summary>

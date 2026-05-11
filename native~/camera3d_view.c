@@ -134,6 +134,7 @@ camera3d_default_tunables(void)
 	t.parallax_factor = 1.0f;
 	t.inv_convergence_distance = 1.0f;
 	t.half_tan_vfov = 0.32491969623f; // tan(18 deg) → 36° vFOV
+	t.clip_at_display_plane = 0;
 	return t;
 }
 
@@ -190,9 +191,20 @@ camera3d_compute_view(const XrVector3f *processed_eye,
 	float tan_up = (uo - dy) / denom;
 	float tan_down = (uo + dy) / denom;
 
+	// Foreground-only mode (camera-centric): clip at the convergence distance.
+	// invd == 0 means parallel projection (convergence at infinity) — flag is
+	// a no-op in that case. Otherwise convergence_dist = 1/invd is the analogue
+	// of the display plane and we set far to that.
+	float effective_far = far_z;
+	if (t.clip_at_display_plane && invd > 0.0001f) {
+		float conv = 1.0f / invd;
+		float min_far = near_z + 0.001f;
+		effective_far = (conv > min_far) ? conv : min_far;
+	}
+
 	// Build projection matrix
 	cam3d_build_projection_from_tangents(tan_left, tan_right, tan_down, tan_up,
-	                                     near_z, far_z, out->projection_matrix);
+	                                     near_z, effective_far, out->projection_matrix);
 
 	// Convert tangents to XrFovf
 	out->fov.angleLeft = -atanf(tan_left);

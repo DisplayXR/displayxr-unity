@@ -111,6 +111,7 @@ display3d_default_tunables(void)
 	t.parallax_factor = 1.0f;
 	t.perspective_factor = 1.0f;
 	t.virtual_display_height = 0.0f;
+	t.clip_at_display_plane = 0;
 	return t;
 }
 
@@ -300,8 +301,20 @@ display3d_compute_view(const XrVector3f *processed_eye,
 	// Build view matrix + projection + FOV
 	build_view_matrix(out->view_matrix, disp_ori, eye_world);
 	out->orientation = disp_ori;
+
+	// Foreground-only mode: override far_z per view with this view's distance
+	// to the display plane. eye_scaled is in app units (already m2v-scaled),
+	// so |eye_scaled.z| is the eye-to-display distance in projection-matrix
+	// units. We clamp to a sane minimum above near_z to avoid degenerate
+	// matrices (e.g. far == near → division by zero in m22/m23).
+	float effective_far = far_z;
+	if (t.clip_at_display_plane) {
+		float ez_abs = fabsf(eye_scaled.z);
+		float min_far = near_z + 0.001f;
+		effective_far = (ez_abs > min_far) ? ez_abs : min_far;
+	}
 	display3d_compute_projection(eye_scaled, kScreenW, kScreenH,
-	                             near_z, far_z, out->projection_matrix);
+	                             near_z, effective_far, out->projection_matrix);
 	out->fov = display3d_compute_fov(eye_scaled, kScreenW, kScreenH);
 }
 

@@ -60,6 +60,18 @@ namespace DisplayXR
         [MarshalAs(UnmanagedType.U1)]
         public bool cameraCentricMode;
 
+        /// <summary>
+        /// Foreground-only render: override per-view far plane with each view's distance
+        /// to the display plane. In display-centric mode the per-view far becomes
+        /// |eye_scaled.z| (each view's eye-Z, after virtual-display scaling). In
+        /// camera-centric mode the per-view far becomes 1/invConvergenceDistance
+        /// (the convergence-plane distance). Geometry past the display plane
+        /// is clipped on each view's projection independently — N-view safe.
+        /// Camera.farClipPlane (this struct's farZ) is ignored when this flag is set.
+        /// </summary>
+        [MarshalAs(UnmanagedType.U1)]
+        public bool clipAtDisplayPlane;
+
         /// <summary>Returns default tunables with all factors at 1.0 (natural).</summary>
         public static DisplayXRTunables Default => new DisplayXRTunables
         {
@@ -72,6 +84,7 @@ namespace DisplayXR
             nearZ = 0.3f,
             farZ = 1000.0f,
             cameraCentricMode = false,
+            clipAtDisplayPlane = false,
         };
     }
 }

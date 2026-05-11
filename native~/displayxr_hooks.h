@@ -46,7 +46,8 @@ DISPLAYXR_EXPORT void displayxr_set_tunables(float ipd_factor,
                                            float fov_override,
                                            float near_z,
                                            float far_z,
-                                           int camera_centric);
+                                           int camera_centric,
+                                           int clip_at_display_plane);
 
 DISPLAYXR_EXPORT void displayxr_get_display_info(float *display_width_m,
                                                float *display_height_m,

@@ -33,6 +33,13 @@ namespace DisplayXR
         [Range(0f, 10f)]
         public float invConvergenceDistance = 0f;
 
+        [Tooltip("Foreground-only render: clip each view at the convergence distance " +
+                 "(1/invConvergenceDistance). Geometry past the convergence plane is " +
+                 "clipped. Single convergence is shared by all views, so per-view fars " +
+                 "match each other. No-op when invConvergenceDistance == 0 (parallel " +
+                 "projection has no finite convergence point).")]
+        public bool foregroundOnlyClip = false;
+
         [Header("Debug")]
 
         [Tooltip("Show eye tracking status in the console.")]
@@ -151,6 +158,7 @@ namespace DisplayXR
                 nearZ = m_Camera.nearClipPlane,
                 farZ = m_Camera.farClipPlane,
                 cameraCentricMode = true,
+                clipAtDisplayPlane = foregroundOnlyClip,
             };
 
             m_Feature.SetTunables(tunables);

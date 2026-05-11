@@ -24,6 +24,8 @@
 
 #pragma once
 
+#include <stdint.h>
+
 #include "display3d_view.h" // reuse Display3DScreen, display3d_apply_eye_factors
 
 #ifdef __cplusplus
@@ -37,6 +39,14 @@ typedef struct Camera3DTunables {
 	float parallax_factor;           //!< [0, 1] — lerps eye center toward nominal (0=no tracking, 1=full)
 	float inv_convergence_distance;  //!< 1/convergence_dist (1/meters)
 	float half_tan_vfov;             //!< tan(vFOV/2) — divide by zoom at call site
+	uint8_t clip_at_display_plane;   //!< If non-zero, override per-view far_z with the
+	                                 //!< convergence distance (1/inv_convergence_distance).
+	                                 //!< Foreground-only render: geometry past where the
+	                                 //!< asymmetric frustum axes converge is clipped. In
+	                                 //!< camera-centric mode the convergence point is the
+	                                 //!< analogue of the "display plane" in display-centric
+	                                 //!< mode. When inv_convergence_distance == 0 (parallel
+	                                 //!< projection) the flag is a no-op.
 } Camera3DTunables;
 
 typedef struct Camera3DView {

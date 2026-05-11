@@ -1,6 +1,7 @@
 // Copyright 2026, DisplayXR contributors
 // SPDX-License-Identifier: BSL-1.0
 
+using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.Events;
 using UnityEngine.Serialization;
@@ -121,6 +122,43 @@ namespace DisplayXR
         private bool m_HasPrevPointerPos;
         private static int s_diagCounter;
 
+        // Hit-test hysteresis: hold "captured" state for a short window
+        // after a hit so per-triangle ray-tri intermittent misses don't
+        // drop the user's click.
+        private Renderer m_LastHitRenderer;
+        private int m_LastHitFrame = int.MinValue;
+
+        // Per-triangle hit-test for SkinnedMeshRenderers in clickableRenderers.
+        // Each frame we BakeMesh() the current animated pose, cache the verts/
+        // tris arrays, and test the cyclopean ray against each triangle
+        // manually (transforming through smr.transform.localToWorldMatrix at
+        // test time). Hits only the visible silhouette polygons — transparent
+        // gaps inside the AABB (between legs, around hat tip) register as
+        // misses and clicks fall through.
+        //
+        // Why manual instead of MeshCollider: MeshCollider on a SkinnedMesh
+        // requires getting BakeMesh's frame-of-reference and the host
+        // transform to align exactly, which empirically failed across rigs
+        // (cm-source meshes, non-trivial bone scale chains) — collider bounds
+        // either overshot by 100x or sat stale under bone animation. Manual
+        // ray-triangle is foolproof: the math goes through SMR.localToWorld
+        // directly, no transform-pairing guessing.
+        //
+        // Vendor-agnostic: no knowledge of chroma key or runtime transparency
+        // encoding; we just check whether the cyclopean ray passes through
+        // any rendered triangle.
+        //
+        // Cache is static so multi-rig scenes only bake once per SMR per frame.
+        private class BakedHit
+        {
+            public Mesh mesh;
+            public Vector3[] verts;
+            public int[] tris;
+            public int lastBakeFrame;
+        }
+        private static readonly Dictionary<SkinnedMeshRenderer, BakedHit> s_BakedHits
+            = new Dictionary<SkinnedMeshRenderer, BakedHit>();
+
         /// <summary>Cursor position in window-client pixels (top-left origin).
         /// Only meaningful in standalone Windows build with transparent mode
         /// active. Updated each frame from native polling — works regardless
@@ -217,20 +255,34 @@ namespace DisplayXR
 #endif
         }
 
-        void Update()
+        // Hit-test runs in LateUpdate (not Update) so BakeMesh captures the
+        // CURRENT frame's animated pose. Unity's animation step runs between
+        // Update and LateUpdate; baking in Update would capture frame N-1's
+        // pose while the renderer renders frame N — head triangles in the
+        // collider drift behind the visible head as the animation plays.
+        // Symptom that prompted the move: "head clicks work initially then
+        // stop working as the tiger animates; hips clicks always work"
+        // (head bone moves more than hips per frame, so its drift is bigger).
+        void LateUpdate()
         {
 #if UNITY_STANDALONE_WIN
             if (Application.isEditor || m_Camera == null)
                 return;
             if (clickableRenderers == null || clickableRenderers.Length == 0)
                 return;
-            // No active-rig gate: every rig's hit-test reads the same Kooima
-            // matrices from shared state (single source of truth populated by
-            // the runtime each frame), so all rigs compute the same screen
-            // rect and call set_overlay_hit_active with the same value.
-            // No phantom-zone risk like the pre-Kooima Camera.ScreenPointToRay
-            // path had. UnityEvent dispatch may double-fire across rigs in
-            // multi-rig scenes; if that's a problem the caller can dedupe.
+            // Multi-rig gate: only the active rig drives hit_active.
+            // With the per-triangle MeshCollider hit-test, even a sub-pixel
+            // difference in the rigs' cyclopean rays can put one rig's ray
+            // inside the silhouette and the other's just outside, producing
+            // hit_active flap (1/0/1/0…) that makes clicks at silhouette
+            // edges unpredictable — sometimes captured, sometimes forwarded.
+            // The earlier (BoxCollider) version was tolerant enough that
+            // both rigs agreed and we could skip the gate; per-triangle is
+            // not. Same pattern as DisplayXRDisplay.LateUpdate /
+            // DisplayXRCamera.LateUpdate.
+            if (DisplayXRRigManager.ActiveCamera != null
+                && DisplayXRRigManager.ActiveCamera != m_Camera)
+                return;
 
             // Poll cursor + buttons via native (GetCursorPos + ScreenToClient
             // on the overlay HWND, plus s_vkey_state populated by raw input).
@@ -265,6 +317,11 @@ namespace DisplayXR
             // Camera.ScreenPointToRay can't be used because Camera.projectionMatrix
             // is the symmetric pre-Kooima projection — rays from it miss the
             // collider where the user perceives the cube on screen.
+            // Update per-triangle MeshColliders for any SkinnedMeshRenderers
+            // in clickableRenderers BEFORE the raycast, so hits reflect the
+            // current animated silhouette (no AABB false-positives).
+            UpdateBakedHitColliders();
+
             Renderer hitRenderer = null;
             if (clientX >= 0 && clientY >= 0
                 && TryGetStereoMatrices(out Matrix4x4 leftView, out Matrix4x4 leftProj,
@@ -272,25 +329,79 @@ namespace DisplayXR
             {
                 BuildCyclopean(leftView, leftProj, rightView, rightProj,
                                 out Matrix4x4 cycView, out Matrix4x4 cycProj);
-                if (TryBuildEyeRay(clientX, clientY, overlayW, overlayH, cycView, cycProj, out Ray ray)
-                    && Physics.Raycast(ray, out RaycastHit info, m_Camera.farClipPlane)
-                    && info.collider != null)
+                if (TryBuildEyeRay(clientX, clientY, overlayW, overlayH, cycView, cycProj, out Ray ray))
                 {
+                    float bestT = m_Camera.farClipPlane;
                     for (int i = 0; i < clickableRenderers.Length; i++)
                     {
                         var r = clickableRenderers[i];
-                        if (r != null && info.collider.transform.IsChildOf(r.transform))
+                        if (r == null) continue;
+                        if (r is SkinnedMeshRenderer smrR)
                         {
-                            hitRenderer = r;
-                            break;
+                            if (TryRayHitBakedSkinnedMesh(ray, bestT, smrR, out float t))
+                            {
+                                hitRenderer = r;
+                                bestT = t;
+                            }
+                        }
+                        else
+                        {
+                            if (Physics.Raycast(ray, out RaycastHit info, bestT)
+                                && info.collider != null
+                                && info.collider.transform.IsChildOf(r.transform))
+                            {
+                                hitRenderer = r;
+                                bestT = info.distance;
+                            }
                         }
                     }
                 }
             }
 
+            // Hysteresis: per-triangle ray-tri can give intermittent results
+            // frame-to-frame even for a stationary cursor on dense geometry
+            // (animation pose changes shift triangles a sub-pixel each
+            // frame, ray either hits or slips between adjacent triangles
+            // by luck). Once we've seen a hit, hold the captured state for
+            // a short window so users don't lose clicks just because the
+            // exact frame they pressed happened to land in a precision
+            // miss. Trade-off: clickthrough takes up to STICKY_FRAMES
+            // frames to re-engage after the cursor leaves a renderer.
+            const int STICKY_FRAMES = 8;
+            if (hitRenderer != null)
+            {
+                m_LastHitRenderer = hitRenderer;
+                m_LastHitFrame = Time.frameCount;
+            }
+            else if (m_LastHitRenderer != null
+                     && Time.frameCount - m_LastHitFrame <= STICKY_FRAMES)
+            {
+                // Recent hit — stay captured to absorb single-frame misses.
+                hitRenderer = m_LastHitRenderer;
+            }
+            else
+            {
+                m_LastHitRenderer = null;
+            }
+
             // Drive WM_NCHITTEST: only return HTCLIENT (overlay accepts the
-            // click) when the cursor is on a clickable silhouette. Otherwise
-            // HTTRANSPARENT — clicks fall through within the same thread.
+            // click) when the cursor is on a transparent-region pixel.
+            // Otherwise HTTRANSPARENT — clicks fall through.
+            //
+            // Mechanism: per-pixel test against the camera depth buffer.
+            // Pixels with no geometry rendered have depth at the far plane
+            // (0 reverse-Z, 1 forward-Z). Any other depth value means
+            // something rendered there — opaque from the user's POV
+            // regardless of how the runtime colors transparent pixels
+            // (chroma-key, alpha=0, etc.). This is intentionally vendor-
+            // agnostic: the plugin should never need to know the runtime's
+            // transparency encoding (Leia DP handles it; OpenXR encodes it
+            // differently elsewhere).
+            //
+            // Async readback to avoid stalling the GPU. 1–2 frame latency
+            // is imperceptible for hit-testing (16–33 ms at 60 Hz). Falls
+            // back to the collider raycast if depth isn't available yet
+            // (first couple of frames, or if depthTextureMode wasn't set).
             DisplayXRNative.displayxr_set_overlay_hit_active(hitRenderer != null ? 1 : 0);
 
             // Expose pointer state for app code that wants to drive its own
@@ -373,6 +484,23 @@ namespace DisplayXR
             // right-button events for apps that want them.
             DispatchButton(buttons, 1, ref m_LeftWasDown, hitRenderer);
             DispatchButton(buttons, 2, ref m_RightWasDown, hitRenderer);
+
+            // Coarse AABB hit rect — used by WM_NCHITTEST in the OPAQUE
+            // WS_CHILD path as a fast reject before the per-pixel hit_active
+            // check kicks in. (In transparent-overlay top-level mode the
+            // native side returns HTCLIENT unconditionally, so this rect
+            // is informational; we set it anyway for opaque-mode users.)
+            if (TryGetStereoMatrices(out Matrix4x4 lv2, out Matrix4x4 lp2,
+                                     out Matrix4x4 rv2, out Matrix4x4 rp2))
+            {
+                BuildCyclopean(lv2, lp2, rv2, rp2,
+                               out Matrix4x4 cycView2, out Matrix4x4 cycProj2);
+                if (TryGetUnionScreenRect(overlayW, overlayH, cycView2, cycProj2,
+                                          out int rx, out int ry, out int rw, out int rh))
+                {
+                    DisplayXRNative.displayxr_set_overlay_hit_rect(rx, ry, rw, rh);
+                }
+            }
 #endif
         }
 
@@ -408,35 +536,6 @@ namespace DisplayXR
             wasDown = isDown;
         }
 
-        void LateUpdate()
-        {
-#if UNITY_STANDALONE_WIN
-            if (Application.isEditor || m_Camera == null)
-                return;
-            if (clickableRenderers == null || clickableRenderers.Length == 0)
-                return;
-
-            // Coarse hit rect (cube AABB in window pixels) — used by
-            // WM_NCHITTEST as a fast reject before the per-pixel hit_active
-            // check from Update kicks in. Projects via the runtime's
-            // cyclopean Kooima matrices (same ones Update uses for the ray)
-            // so the rect lines up with the cube where the user perceives
-            // it after stereo fusion.
-            if (TryGetStereoMatrices(out Matrix4x4 leftView, out Matrix4x4 leftProj,
-                                     out Matrix4x4 rightView, out Matrix4x4 rightProj))
-            {
-                BuildCyclopean(leftView, leftProj, rightView, rightProj,
-                                out Matrix4x4 cycView, out Matrix4x4 cycProj);
-                DisplayXRNative.displayxr_get_overlay_size(
-                    out int overlayW, out int overlayH);
-                if (TryGetUnionScreenRect(overlayW, overlayH, cycView, cycProj,
-                                           out int x, out int y, out int w, out int h))
-                {
-                    DisplayXRNative.displayxr_set_overlay_hit_rect(x, y, w, h);
-                }
-            }
-#endif
-        }
 
         void OnDisable()
         {
@@ -529,6 +628,128 @@ namespace DisplayXR
             uint g = (uint)Mathf.Clamp(Mathf.RoundToInt(c.g * 255f), 0, 255);
             uint b = (uint)Mathf.Clamp(Mathf.RoundToInt(c.b * 255f), 0, 255);
             return (b << 16) | (g << 8) | r;
+        }
+
+        // Manual ray-triangle test against the baked skinned mesh.
+        // Walks all triangles transforming each through the SMR's current
+        // localToWorldMatrix at test time. Returns the nearest hit distance
+        // along the ray, or false if no triangle is hit within maxDist.
+        // Möller–Trumbore intersection — branchless, no allocs.
+        private static bool TryRayHitBakedSkinnedMesh(
+            Ray ray, float maxDist, SkinnedMeshRenderer smr, out float hitT)
+        {
+            hitT = 0f;
+            if (!s_BakedHits.TryGetValue(smr, out BakedHit entry)) return false;
+            if (entry.verts == null || entry.tris == null) return false;
+            var verts = entry.verts;
+            var tris = entry.tris;
+            // BakeMesh outputs verts already in world *units* (post-skinning,
+            // with the rig's scale chain pre-applied) but in the SMR's local
+            // rotated frame. So the right "bake-local → world" transform is
+            // SMR.transform's position + rotation only, NO scale — applying
+            // any of the lossyScales (SMR=180×, rootBone=1.8× on Mixamo)
+            // double-scales and puts triangles way off the rendered tiger.
+            // Verified empirically: row D in the [DisplayXR.BakedHit] diag
+            // (SMR.pos+rot, no scale) reproduces renderer.bounds exactly,
+            // while rootBone.lToW and SMR.lToW don't.
+            var l2w = Matrix4x4.TRS(smr.transform.position,
+                                    smr.transform.rotation,
+                                    Vector3.one);
+            Vector3 ro = ray.origin, rd = ray.direction;
+            float closest = maxDist;
+            bool any = false;
+            for (int i = 0; i + 2 < tris.Length; i += 3)
+            {
+                Vector3 v0 = l2w.MultiplyPoint3x4(verts[tris[i]]);
+                Vector3 v1 = l2w.MultiplyPoint3x4(verts[tris[i + 1]]);
+                Vector3 v2 = l2w.MultiplyPoint3x4(verts[tris[i + 2]]);
+                Vector3 e1 = v1 - v0, e2 = v2 - v0;
+                Vector3 h = Vector3.Cross(rd, e2);
+                float a = Vector3.Dot(e1, h);
+                if (a > -1e-7f && a < 1e-7f) continue;
+                float f = 1f / a;
+                Vector3 s = ro - v0;
+                float u = f * Vector3.Dot(s, h);
+                if (u < 0f || u > 1f) continue;
+                Vector3 q = Vector3.Cross(s, e1);
+                float v = f * Vector3.Dot(rd, q);
+                if (v < 0f || u + v > 1f) continue;
+                float t = f * Vector3.Dot(e2, q);
+                if (t > 1e-4f && t < closest)
+                {
+                    closest = t;
+                    any = true;
+                }
+            }
+            hitT = closest;
+            return any;
+        }
+
+        // For each SkinnedMeshRenderer in clickableRenderers, BakeMesh the
+        // current animated pose and cache the verts/tris arrays. The actual
+        // hit test (TryRayHitBakedSkinnedMesh) walks the triangles and
+        // transforms each through the SMR's localToWorldMatrix at test time,
+        // so the visible silhouette is what's hit-tested — no MeshCollider
+        // needed and no transform-pairing to get wrong. Transparent gaps
+        // inside the AABB (between legs, around hat tip, AABB corners)
+        // register as misses, which the native overlay routes via
+        // WM_NCHITTEST = HTTRANSPARENT.
+        //
+        // BakeMesh costs ~1–3 ms per frame for a typical character mesh;
+        // the verts[] copy is one extra alloc per frame (Mesh.vertices
+        // returns a fresh array). Acceptable for a small clickable cast.
+        //
+        // No-op for non-skinned renderers (regular MeshRenderer): they keep
+        // whatever collider the user attached and use Physics.Raycast.
+        private void UpdateBakedHitColliders()
+        {
+            if (clickableRenderers == null) return;
+            int frame = Time.frameCount;
+            for (int i = 0; i < clickableRenderers.Length; i++)
+            {
+                var smr = clickableRenderers[i] as SkinnedMeshRenderer;
+                if (smr == null) continue;
+
+                if (!s_BakedHits.TryGetValue(smr, out BakedHit entry) || entry == null)
+                {
+                    var mesh = new Mesh { name = "DisplayXR_BakedHit_" + smr.name };
+                    mesh.MarkDynamic();
+                    entry = new BakedHit { mesh = mesh, lastBakeFrame = -1 };
+                    s_BakedHits[smr] = entry;
+
+                    // Force the SMR to always re-skin its mesh, regardless
+                    // of visibility / focus. Default (false) makes Unity
+                    // cache the skinned mesh state when it thinks the SMR
+                    // is offscreen — which can include "app lost focus"
+                    // — so the *bones* keep advancing via Animator while
+                    // the *rendered* mesh stays stale. BakeMesh reads
+                    // bone state directly, so we'd test against the
+                    // current pose while the user clicks the stale
+                    // rendered pose: head misses, hips (which barely
+                    // moves) still hits.
+                    if (!smr.updateWhenOffscreen) smr.updateWhenOffscreen = true;
+
+                    // And force the Animator to always update bones.
+                    // Some Animator culling modes (CullUpdateTransforms
+                    // / CullCompletely) skip transform updates when the
+                    // attached SMR is considered offscreen — same kind
+                    // of stale-pose hazard.
+                    var anim = smr.GetComponentInParent<Animator>();
+                    if (anim != null) anim.cullingMode = AnimatorCullingMode.AlwaysAnimate;
+                }
+
+                // Multi-rig dedupe: only bake once per SMR per frame.
+                if (entry.lastBakeFrame == frame) continue;
+
+                smr.BakeMesh(entry.mesh);
+                // Cache mesh data once when the topology stabilises; verts
+                // change every frame so we always re-fetch them.
+                entry.verts = entry.mesh.vertices;
+                if (entry.tris == null || entry.tris.Length != entry.mesh.triangles.Length)
+                    entry.tris = entry.mesh.triangles;
+                entry.lastBakeFrame = frame;
+
+            }
         }
 
         // Lazy-fetch the feature singleton — DisplayXRFeature.Instance may be

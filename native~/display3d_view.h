@@ -19,6 +19,7 @@
 #pragma once
 
 #include <openxr/openxr.h>
+#include <stdint.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -32,6 +33,16 @@ typedef struct Display3DTunables {
 	float perspective_factor;      //!< [0.1, 10] — scales eye XYZ only (changes object perspective)
 	float virtual_display_height;  //!< Virtual display height in app units (always required;
 	                               //!< use physical display height for 1:1 meters)
+	uint8_t clip_at_display_plane; //!< If non-zero, override the `far_z` arg per view with
+	                               //!< |eye_scaled.z| (each view's distance to the display
+	                               //!< plane, in app units after m2v scaling). Lets the
+	                               //!< app render foreground-only content without losing
+	                               //!< per-view geometric accuracy (each view's projection
+	                               //!< clips at its own optical axis intersection with the
+	                               //!< display plane). Scales to N views automatically
+	                               //!< since the per-view loop in display3d_compute_views
+	                               //!< already passes each view's eye position through
+	                               //!< display3d_compute_view.
 } Display3DTunables;
 
 typedef struct Display3DScreen {
