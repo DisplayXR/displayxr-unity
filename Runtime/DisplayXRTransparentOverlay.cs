@@ -196,8 +196,12 @@ namespace DisplayXR
         /// </summary>
         public static void RequestTransparentSession()
         {
-#if UNITY_STANDALONE_WIN
+#if UNITY_STANDALONE_WIN || UNITY_STANDALONE_OSX
             DisplayXRNative.displayxr_set_transparent_background(1);
+            // DisplayXRFeature reads this in OnInstanceCreate to opt the
+            // session into AlphaBlend environment blend mode so Unity
+            // preserves alpha=0 in the swapchain (#85).
+            DisplayXRFeature.s_TransparentBackgroundRequested = true;
 #endif
         }
 
@@ -228,11 +232,19 @@ namespace DisplayXR
             // regions get the chroma key — even in the editor preview, where
             // the layered-window path doesn't run. That makes the preview
             // visually represent what the build will look like.
+            //
+            // On macOS (#85) sim_display is alpha-native — clear straight to
+            // alpha=0 instead of the chroma key. chromaKeyColor is kept on the
+            // inspector for API symmetry but is a no-op on Mac.
             m_SavedClearFlags      = m_Camera.clearFlags;
             m_SavedBackgroundColor = m_Camera.backgroundColor;
             m_SavedRestore         = true;
             m_Camera.clearFlags      = CameraClearFlags.SolidColor;
+#if UNITY_STANDALONE_OSX
+            m_Camera.backgroundColor = new Color(0f, 0f, 0f, 0f);
+#else
             m_Camera.backgroundColor = chromaKeyColor;
+#endif
 
 #if UNITY_STANDALONE_WIN
             // Layered-window mode is build-only: no top-level Unity HWND we
@@ -252,6 +264,18 @@ namespace DisplayXR
             // Default hit rect = whole window until LateUpdate refines it.
             DisplayXRNative.displayxr_set_overlay_hit_rect(
                 0, 0, Screen.width, Screen.height);
+#elif UNITY_STANDALONE_OSX
+            // (#85 Phase 1) Flip Unity's NSWindow opaque flag so the desktop
+            // shows through alpha=0 regions. Runtime handles its own
+            // CAMetalLayer + NSWindow via XR_EXT_cocoa_window_binding v5; the
+            // Unity-owned NSWindow is the app's responsibility. Skip in the
+            // editor unless we're in Play Mode — at edit time the game-view
+            // hasn't been built and we'd mutate the wrong window.
+            if (!Application.isEditor || Application.isPlaying)
+            {
+                Application.runInBackground = true;
+                DisplayXRNative.displayxr_macos_configure_unity_nswindow(1);
+            }
 #endif
         }
 
@@ -545,6 +569,11 @@ namespace DisplayXR
                 DisplayXRNative.displayxr_set_transparent_overlay(0, 0, 0);
                 DisplayXRNative.displayxr_set_overlay_hit_active(0);
             }
+#elif UNITY_STANDALONE_OSX
+            if (!Application.isEditor || Application.isPlaying)
+            {
+                DisplayXRNative.displayxr_macos_configure_unity_nswindow(0);
+            }
 #endif
             // Fire trailing exit so handlers can clean up.
             if (m_HoverRenderer != null)
@@ -597,7 +626,11 @@ namespace DisplayXR
             if (!m_SavedRestore || m_Camera == null)
                 return;
 
+#if UNITY_STANDALONE_OSX
+            m_Camera.backgroundColor = new Color(0f, 0f, 0f, 0f);
+#else
             m_Camera.backgroundColor = m_ChromaKeyColor;
+#endif
 
 #if UNITY_STANDALONE_WIN
             // Editor preview path skips the layered-window plumbing entirely

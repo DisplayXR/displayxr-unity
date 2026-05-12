@@ -108,6 +108,15 @@ namespace DisplayXR
         internal static extern void displayxr_set_transparent_chroma_key(uint color);
 
         /// <summary>
+        /// (displayxr-unity #85) Configure Unity's main render NSWindow for
+        /// transparent overlay mode on macOS. enabled=1 flips setOpaque:NO +
+        /// backgroundColor=clearColor; enabled=0 restores the saved values.
+        /// No-op on non-Apple platforms.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void displayxr_macos_configure_unity_nswindow(int enabled);
+
+        /// <summary>
         /// Hint the typed-swapchain substitution about the project color space.
         /// 1 = Linear (UNORM_SRGB siblings); 0 = Gamma (UNORM siblings).
         /// Must be called BEFORE Unity creates its OpenXR swapchains.

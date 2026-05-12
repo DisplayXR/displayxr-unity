@@ -75,9 +75,9 @@ set(HEADERS
     camera3d_view.h
 )
 
-# Apple-only: IOSurface helpers (Objective-C)
+# Apple-only: IOSurface helpers (Objective-C) + transparent-overlay NSWindow config
 if(APPLE)
-    list(APPEND SOURCES displayxr_metal.m displayxr_standalone_metal.m)
+    list(APPEND SOURCES displayxr_metal.m displayxr_standalone_metal.m displayxr_macos.mm)
     list(APPEND HEADERS displayxr_metal.h displayxr_standalone_metal.h)
 endif()
 
@@ -126,8 +126,8 @@ if(APPLE)
         ${METAL_FRAMEWORK}
         ${QUARTZCORE_FRAMEWORK}
     )
-    # Enable ARC for Objective-C files
-    set_source_files_properties(displayxr_metal.m displayxr_standalone_metal.m PROPERTIES
+    # Enable ARC for Objective-C / Objective-C++ files
+    set_source_files_properties(displayxr_metal.m displayxr_standalone_metal.m displayxr_macos.mm PROPERTIES
         COMPILE_FLAGS "-fobjc-arc"
     )
 endif()
