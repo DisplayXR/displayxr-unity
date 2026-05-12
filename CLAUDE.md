@@ -308,3 +308,10 @@ Three sibling Unity projects exercise the plugin against different feature areas
 | [`DisplayXR/displayxr-unity-test-2d-ui`](https://github.com/DisplayXR/displayxr-unity-test-2d-ui) | 2D UI window-space composition layer | Tuning panel built from `DisplayXRWindowSpaceUI` |
 
 All three pin the plugin via `https://github.com/DisplayXR/displayxr-unity.git#upm` (floating; tracks latest release).
+
+Each test repo also has its own `CLAUDE.md` describing its scene, scripts, and which plugin features it exercises — designed so an agent can work in the test repo without loading the plugin's context.
+
+#### Where to launch Claude Code when working on the test repos
+
+- **Test-only work** (tweak a scene, polish a test-repo script, fix a test-repo bug) → launch from the test repo directly. Its `CLAUDE.md` auto-loads with focused context, git ops target the right repo by default, smaller context is cheaper and faster. The plugin's installed source is still readable at `Library/PackageCache/com.displayxr.unity@<hash>/` if a grep into plugin internals is needed.
+- **Plugin work that also touches a test repo** (new plugin API + test repo update to consume it) → launch from `displayxr-unity`. The plugin is the primary surface; the test repos are reachable via adjacent `../displayxr-unity-test*` paths. Land the plugin change first, let CI publish `#upm`, then update the test repo.
