@@ -1775,6 +1775,40 @@ displayxr_standalone_get_atlas_bridge_texture(void **native_ptr,
 	*height = s_sa.atlas.height;
 }
 
+// Window-space UI cross-device bridge (Windows D3D11/D3D12 only).
+//
+// C# DisplayXRWindowSpaceUI calls this with its RT dimensions; the SA
+// backend lazily creates a shared (NT-handle) texture on the SA device,
+// opens it on Unity's device, and returns the Unity-side native pointer.
+// C# wraps it via Texture2D.CreateExternalTexture and copies its wsui RT
+// into it each frame (Graphics.CopyTexture). The plugin's per-frame
+// wsui_standalone_pre_end_frame then copies the SA-side bridge into the
+// composition layer's swapchain image.
+//
+// Returns null in native_ptr when:
+//   - No standalone session is running (built apps, Play Mode with the
+//     hooked path active — the wsui_set_texture flow already works there).
+//   - The backend doesn't need a bridge (Metal: unified device model).
+//   - Bridge creation failed (logged to stderr).
+// In all those cases C# falls back to its non-bridge path (wsui_set_texture
+// with its own RT pointer, which the hooked path / unified-device backends
+// can copy from directly).
+void
+displayxr_standalone_get_wsui_bridge_texture(uint32_t width, uint32_t height,
+                                              void **native_ptr,
+                                              uint32_t *out_width,
+                                              uint32_t *out_height)
+{
+	if (s_sa_backend && width > 0 && height > 0) {
+		s_sa_backend->wsui_create_bridge(width, height);
+		*native_ptr = s_sa_backend->wsui_get_bridge_unity_ptr();
+	} else {
+		*native_ptr = NULL;
+	}
+	*out_width = width;
+	*out_height = height;
+}
+
 
 #if defined(__APPLE__)
 extern "C" float displayxr_sa_metal_get_backing_scale(void);
