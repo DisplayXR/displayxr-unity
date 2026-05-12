@@ -5,6 +5,30 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2026-05-12
+
+### Added
+- **macOS transparent overlay — Phase 1 visual transparency (`#85`)** —
+  `XR_EXT_cocoa_window_binding` is wired through with the
+  `transparentBackgroundEnabled` flag, and Unity's `NSWindow` is configured
+  for per-pixel alpha so the runtime can render into a transparent surface
+  on macOS. Mirrors the Windows transparent overlay capability (#57) at the
+  plumbing layer; visual transparency now functions end-to-end on macOS.
+
+### Fixed
+- **macOS transparent overlay — clear contentView's CAMetalLayer.contents
+  (`#86`)** — Unity's contentView retains a stale `CAMetalLayer.contents`
+  image that was occluding the runtime's transparent surface, so
+  `alpha = 0` regions appeared opaque even with all other plumbing in
+  place. The plugin now clears `contentView.layer.contents` after the
+  window is reconfigured for transparency, allowing the desktop to show
+  through. Completes the macOS transparent overlay end-to-end visual
+  verification.
+
+### Changed
+- Documentation updates around test-repo workflows and `#82` known-issue
+  cleanup carried in for this release.
+
 ## [1.4.1] - 2026-05-12
 
 ### Fixed
