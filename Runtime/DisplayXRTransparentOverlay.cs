@@ -525,6 +525,39 @@ namespace DisplayXR
                     DisplayXRNative.displayxr_set_overlay_hit_rect(rx, ry, rw, rh);
                 }
             }
+#elif UNITY_STANDALONE_OSX
+            // (#85) Mac equivalent of the Win32 cursor/button polling — Unity
+            // uses a regular NSWindow here (no cloaked-window quirks), so
+            // Mouse.current is the right source. Drives PointerPosition /
+            // PointerDelta / IsLeftPressed for HUD routing and drag-style
+            // app code (e.g. TigerHudMouseRouter, WheelZoomVHeight). Skip in
+            // editor; gate to the active rig.
+            if (Application.isEditor || m_Camera == null)
+                return;
+            if (DisplayXRRigManager.ActiveCamera != null
+                && DisplayXRRigManager.ActiveCamera != m_Camera)
+                return;
+            #if HAS_INPUT_SYSTEM
+            {
+                var mouse = Mouse.current;
+                if (mouse != null)
+                {
+                    Vector2 raw = mouse.position.ReadValue();
+                    // Mouse.current is bottom-left origin; PointerPosition is
+                    // window-client pixels with TOP-LEFT origin (matching
+                    // Win32). Flip Y so HUD math is platform-agnostic.
+                    Vector2 pos = new Vector2(raw.x, Screen.height - raw.y);
+                    PointerDelta = m_HasPrevPointerPos
+                        ? (pos - m_PrevPointerPos)
+                        : Vector2.zero;
+                    m_PrevPointerPos = pos;
+                    m_HasPrevPointerPos = true;
+                    PointerPosition = pos;
+                    IsLeftPressed = mouse.leftButton.isPressed;
+                    IsRightPressed = mouse.rightButton.isPressed;
+                }
+            }
+            #endif
 #endif
         }
 
