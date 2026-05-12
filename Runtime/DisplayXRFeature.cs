@@ -8,6 +8,7 @@ using UnityEngine;
 using UnityEngine.XR.Management;
 using UnityEngine.XR.OpenXR;
 using UnityEngine.XR.OpenXR.Features;
+using UnityEngine.XR.OpenXR.NativeTypes;
 
 #if UNITY_EDITOR
 using UnityEditor;
@@ -44,6 +45,15 @@ namespace DisplayXR
 
         /// <summary>Singleton instance, set during OnInstanceCreate.</summary>
         public static DisplayXRFeature Instance { get; private set; }
+
+        /// <summary>
+        /// Set by <see cref="DisplayXRTransparentOverlay.RequestTransparentSession"/>
+        /// before the OpenXR session is created. Drives the
+        /// XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND opt-in inside OnInstanceCreate
+        /// so Unity's render path preserves alpha=0 in the swapchain image
+        /// — required for the macOS Cocoa per-pixel transparency path (#85).
+        /// </summary>
+        internal static bool s_TransparentBackgroundRequested;
 
         /// <summary>Cached display info from the runtime.</summary>
         public DisplayXRDisplayInfo DisplayInfo { get; private set; }
@@ -127,6 +137,19 @@ namespace DisplayXR
                     System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
                 if (field != null)
                     field.SetValue(settings, OpenXRSettings.RenderMode.MultiPass);
+            }
+
+            // (#85) When the app requested transparent background, opt the
+            // session into AlphaBlend so Unity's render path preserves alpha=0
+            // in the swapchain image. Without this Unity writes alpha=1 in
+            // transparent regions and the runtime's alpha-native sim_display
+            // path sees an opaque atlas — visual transparency never reaches
+            // the desktop. Mirror of the cocoa_window_binding bit on
+            // xrCreateSession (native side).
+            if (s_TransparentBackgroundRequested)
+            {
+                SetEnvironmentBlendMode(XrEnvironmentBlendMode.AlphaBlend);
+                Debug.Log("[DisplayXR] EnvironmentBlendMode = AlphaBlend (transparent session)");
             }
 
             Debug.Log("[DisplayXR] OpenXR instance created");

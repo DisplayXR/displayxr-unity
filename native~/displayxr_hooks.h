@@ -111,6 +111,19 @@ DISPLAYXR_EXPORT void displayxr_set_transparent_background(int enabled);
 /// from C# at SubsystemRegistration before xrCreateSession.
 DISPLAYXR_EXPORT void displayxr_set_transparent_chroma_key(uint32_t color);
 
+/// (issue displayxr-unity #85) Configure Unity's main render NSWindow for
+/// transparent overlay mode on macOS. Pass enabled=1 to flip
+/// `setOpaque:NO` + `backgroundColor=clearColor` so per-pixel alpha from
+/// the camera reaches the desktop; pass 0 to restore the saved values.
+///
+/// The runtime configures the CAMetalLayer it presents into (via the
+/// transparentBackgroundEnabled bit on the cocoa window binding), but
+/// the NSWindow itself is the app's responsibility — Unity won't flip it
+/// for us. Call from DisplayXRTransparentOverlay.OnEnable / OnDisable.
+///
+/// No-op on non-Apple platforms.
+DISPLAYXR_EXPORT void displayxr_macos_configure_unity_nswindow(int enabled);
+
 /// Hint the typed-swapchain substitution about Unity's project color space.
 /// Must be called BEFORE Unity creates its OpenXR swapchains (i.e. from the
 /// OpenXR feature's OnInstanceCreate).

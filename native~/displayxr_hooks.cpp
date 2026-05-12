@@ -741,9 +741,18 @@ hooked_xrCreateSession(XrInstance instance, const XrSessionCreateInfo *createInf
 			mac_binding.readbackCallback = displayxr_readback_callback;
 			mac_binding.readbackUserdata = nullptr;
 			mac_binding.sharedIOSurface = nullptr;
+			// Spec v5: opt-in transparent background. sim_display_processor_metal
+			// is alpha-native, so the runtime preserves per-pixel alpha end-to-end
+			// and flips its NSWindow + CAMetalLayer isOpaque=NO. The plugin still
+			// needs to flip Unity's own NSWindow (see displayxr_macos.mm).
+			mac_binding.transparentBackgroundEnabled =
+			    (state->transparent_background_requested
+			     && !displayxr_is_shell_mode())
+			    ? XR_TRUE : XR_FALSE;
 
-			displayxr_log( "[DisplayXR] Injecting cocoa window binding: viewHandle=%p, sharedIOSurface=%p\n",
-			        mac_binding.viewHandle, mac_binding.sharedIOSurface);
+			displayxr_log( "[DisplayXR] Injecting cocoa window binding: viewHandle=%p, sharedIOSurface=%p, transparentBackgroundEnabled=%d\n",
+			        mac_binding.viewHandle, mac_binding.sharedIOSurface,
+			        (int)mac_binding.transparentBackgroundEnabled);
 
 			((XrBaseOutStructure *)last_in_chain)->next = (XrBaseOutStructure *)&mac_binding;
 #endif
