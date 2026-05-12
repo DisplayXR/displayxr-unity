@@ -35,6 +35,15 @@ public:
 	ID3D12Resource               *d3d12_unity_atlas_bridge   = nullptr;  // if Unity = D3D12
 	ID3D11Texture2D              *d3d11_unity_atlas_bridge   = nullptr;  // if Unity = D3D11
 
+	// WSUI bridge: SHARED on SA device, opened on Unity's device.
+	// Mirrors the atlas bridge but sized to the wsui RT (1024x1024 BGRA8 typical).
+	ID3D12Resource               *d3d12_wsui_bridge         = nullptr;
+	HANDLE                        d3d12_wsui_bridge_handle  = nullptr;
+	ID3D12Resource               *d3d12_unity_wsui_bridge   = nullptr;
+	ID3D11Texture2D              *d3d11_unity_wsui_bridge   = nullptr;
+	uint32_t                      wsui_bridge_w             = 0;
+	uint32_t                      wsui_bridge_h             = 0;
+
 	// Fullscreen window resources (D3D12)
 	IDXGISwapChain3              *fw_swapchain   = nullptr;
 	ID3D12Resource               *fw_bb[2]       = { nullptr, nullptr };
@@ -492,6 +501,7 @@ public:
 	void destroy() override
 	{
 		destroy_atlas_bridge();
+		wsui_destroy_bridge();
 		if (unity_d3d11_device)  { unity_d3d11_device->Release();  unity_d3d11_device = nullptr; }
 		if (unity_device)        { unity_device->Release();        unity_device       = nullptr; }
 		destroy_shared_texture();
@@ -574,20 +584,155 @@ public:
 		return true;
 	}
 
-	bool wsui_copy_to_swapchain_image(void * /*unity_tex*/, void * /*sc_image*/,
-	                                    uint32_t /*w*/, uint32_t /*h*/) override
+	// Cross-device copy via the wsui bridge. Caller is expected to have called
+	// wsui_create_bridge() once (done lazily by wsui_standalone_pre_end_frame)
+	// and Unity-side C# is expected to have copied its RT into the bridge
+	// (Texture2D wrapping d3d12_unity_wsui_bridge / d3d11_unity_wsui_bridge)
+	// before this fires. We just copy SA-bridge → swapchain image on the SA
+	// device queue. unity_tex is unused — the bridge is the data path.
+	bool wsui_copy_to_swapchain_image(void * /*unity_tex*/, void *sc_image,
+	                                    uint32_t w, uint32_t h) override
 	{
-		static int warned = 0;
-		if (!warned) {
-			warned = 1;
-			fprintf(stderr,
-			    "[DisplayXR-SA] wsui D3D12: cross-device copy not yet "
-			    "supported (Unity device != standalone device). UI overlay "
-			    "in editor Preview Window will not render on Windows D3D12 "
-			    "until a shared bridge texture is wired up. Built apps are "
-			    "unaffected.\n");
+		ID3D12Resource *bridge = d3d12_wsui_bridge;
+		ID3D12Resource *dst    = (ID3D12Resource *)sc_image;
+		if (!bridge || !dst || !d3d12_queue || !d3d12_cmd_list || !d3d12_cmd_alloc)
+			return false;
+		// Bridge must be sized to the wsui RT.
+		if (wsui_bridge_w != w || wsui_bridge_h != h) {
+			static int warned_dim = 0;
+			if (!warned_dim) {
+				warned_dim = 1;
+				fprintf(stderr, "[DisplayXR-SA] wsui D3D12: bridge size mismatch "
+				    "(bridge=%ux%u, requested=%ux%u)\n",
+				    wsui_bridge_w, wsui_bridge_h, w, h);
+			}
+			return false;
 		}
-		return false;
+
+		d3d12_cmd_alloc->Reset();
+		d3d12_cmd_list->Reset(d3d12_cmd_alloc, NULL);
+
+		D3D12_TEXTURE_COPY_LOCATION dst_loc = {};
+		dst_loc.pResource = dst;
+		dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+		dst_loc.SubresourceIndex = 0;
+
+		D3D12_TEXTURE_COPY_LOCATION src_loc = {};
+		src_loc.pResource = bridge;
+		src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+		src_loc.SubresourceIndex = 0;
+
+		d3d12_cmd_list->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, NULL);
+		d3d12_cmd_list->Close();
+
+		ID3D12CommandList *lists[] = { d3d12_cmd_list };
+		d3d12_queue->ExecuteCommandLists(1, lists);
+
+		d3d12_fence_value++;
+		d3d12_queue->Signal(d3d12_fence, d3d12_fence_value);
+		if (d3d12_fence->GetCompletedValue() < d3d12_fence_value) {
+			d3d12_fence->SetEventOnCompletion(d3d12_fence_value, d3d12_fence_event);
+			WaitForSingleObject(d3d12_fence_event, INFINITE);
+		}
+		return true;
+	}
+
+	void wsui_create_bridge(uint32_t w, uint32_t h) override
+	{
+		if (d3d12_wsui_bridge != nullptr) {
+			// Already created. Recreate only if dimensions changed.
+			if (wsui_bridge_w == w && wsui_bridge_h == h) return;
+			wsui_destroy_bridge();
+		}
+		if ((!unity_device && !unity_d3d11_device) || !d3d12_device) return;
+		if (w == 0 || h == 0) return;
+
+		D3D12_HEAP_PROPERTIES heap = {};
+		heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+		D3D12_RESOURCE_DESC bd = {};
+		bd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+		bd.Width = w;
+		bd.Height = h;
+		bd.DepthOrArraySize = 1;
+		bd.MipLevels = 1;
+		// Unity C# WSUI creates its RT in B8G8R8A8_UNorm (URP RenderGraph
+		// requirement). Match here so Graphics.CopyTexture on Unity side
+		// and CopyTextureRegion on SA side are identical-format copies.
+		bd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+		bd.SampleDesc.Count = 1;
+		bd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+		bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+		HRESULT hr = d3d12_device->CreateCommittedResource(
+			&heap, D3D12_HEAP_FLAG_SHARED, &bd,
+			D3D12_RESOURCE_STATE_COMMON, NULL,
+			__uuidof(ID3D12Resource), (void **)&d3d12_wsui_bridge);
+		if (FAILED(hr)) {
+			fprintf(stderr, "[DisplayXR-SA] wsui bridge CreateCommittedResource failed: 0x%08lx\n", hr);
+			return;
+		}
+
+		hr = d3d12_device->CreateSharedHandle(
+			d3d12_wsui_bridge, NULL, GENERIC_ALL, NULL, &d3d12_wsui_bridge_handle);
+		if (FAILED(hr) || !d3d12_wsui_bridge_handle) {
+			fprintf(stderr, "[DisplayXR-SA] wsui bridge CreateSharedHandle failed: 0x%08lx\n", hr);
+			wsui_destroy_bridge();
+			return;
+		}
+
+		if (unity_device) {
+			hr = unity_device->OpenSharedHandle(
+				d3d12_wsui_bridge_handle,
+				__uuidof(ID3D12Resource), (void **)&d3d12_unity_wsui_bridge);
+			if (SUCCEEDED(hr) && d3d12_unity_wsui_bridge) {
+				fprintf(stderr, "[DisplayXR-SA] wsui bridge (D3D12): %ux%u, handle=%p, unity_res=%p\n",
+				        w, h, d3d12_wsui_bridge_handle, (void *)d3d12_unity_wsui_bridge);
+			} else {
+				fprintf(stderr, "[DisplayXR-SA] wsui bridge OpenSharedHandle (D3D12) failed: 0x%08lx\n", hr);
+				wsui_destroy_bridge();
+				return;
+			}
+		} else if (unity_d3d11_device) {
+			ID3D11Device1 *dev1 = NULL;
+			hr = unity_d3d11_device->QueryInterface(
+				__uuidof(ID3D11Device1), (void **)&dev1);
+			if (SUCCEEDED(hr) && dev1) {
+				hr = dev1->OpenSharedResource1(
+					d3d12_wsui_bridge_handle,
+					__uuidof(ID3D11Texture2D),
+					(void **)&d3d11_unity_wsui_bridge);
+				dev1->Release();
+				if (SUCCEEDED(hr) && d3d11_unity_wsui_bridge) {
+					fprintf(stderr, "[DisplayXR-SA] wsui bridge (D3D11): %ux%u, handle=%p, tex=%p\n",
+					        w, h, d3d12_wsui_bridge_handle, (void *)d3d11_unity_wsui_bridge);
+				} else {
+					fprintf(stderr, "[DisplayXR-SA] wsui bridge OpenSharedResource1 (D3D11) failed: 0x%08lx\n", hr);
+					wsui_destroy_bridge();
+					return;
+				}
+			}
+		}
+
+		wsui_bridge_w = w;
+		wsui_bridge_h = h;
+	}
+
+	void wsui_destroy_bridge() override
+	{
+		if (d3d11_unity_wsui_bridge) { d3d11_unity_wsui_bridge->Release(); d3d11_unity_wsui_bridge = nullptr; }
+		if (d3d12_unity_wsui_bridge) { d3d12_unity_wsui_bridge->Release(); d3d12_unity_wsui_bridge = nullptr; }
+		if (d3d12_wsui_bridge_handle) { CloseHandle(d3d12_wsui_bridge_handle); d3d12_wsui_bridge_handle = nullptr; }
+		if (d3d12_wsui_bridge)       { d3d12_wsui_bridge->Release();          d3d12_wsui_bridge        = nullptr; }
+		wsui_bridge_w = 0;
+		wsui_bridge_h = 0;
+	}
+
+	void *wsui_get_bridge_unity_ptr() override
+	{
+		if (d3d11_unity_wsui_bridge) return (void *)d3d11_unity_wsui_bridge;
+		if (d3d12_unity_wsui_bridge) return (void *)d3d12_unity_wsui_bridge;
+		return nullptr;
 	}
 };
 

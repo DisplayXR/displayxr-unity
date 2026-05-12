@@ -308,6 +308,22 @@ namespace DisplayXR
         internal static extern void displayxr_standalone_get_atlas_bridge_texture(
             out IntPtr nativePtr, out uint width, out uint height);
 
+        /// <summary>
+        /// (Windows D3D11/D3D12 only) Get the window-space UI bridge texture
+        /// opened on Unity's device. Native lazily creates a shared (NT handle)
+        /// texture matching the requested dimensions on the SA device + opens
+        /// it on Unity's device. Returns IntPtr.Zero when no standalone session
+        /// is running, when the backend doesn't need a bridge (Metal: unified
+        /// device), or when bridge creation failed. C# wraps via
+        /// Texture2D.CreateExternalTexture and Graphics.CopyTexture's the wsui
+        /// RT into it each frame; the per-frame xrEndFrame hook then copies
+        /// the SA-side bridge into the composition layer's swapchain image.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        internal static extern void displayxr_standalone_get_wsui_bridge_texture(
+            uint width, uint height,
+            out IntPtr nativePtr, out uint outWidth, out uint outHeight);
+
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         internal static extern int displayxr_standalone_start(
             [MarshalAs(UnmanagedType.LPStr)] string runtimeJsonPath);

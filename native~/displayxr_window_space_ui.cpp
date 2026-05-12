@@ -114,7 +114,7 @@ int64_t enumerate_and_pick_format_hooked(XrSession session, int64_t app_pref = -
 	return pick_overlay_format(formats, count, app_pref);
 }
 
-int64_t enumerate_and_pick_format_standalone(XrSession session, const WsuiStandaloneFns *fns)
+int64_t enumerate_and_pick_format_standalone(XrSession session, const WsuiStandaloneFns *fns, int64_t app_pref = -1)
 {
 	uint32_t count = 0;
 	if (XR_FAILED(fns->pfn_enumerate_formats(session, 0, &count, nullptr)) || count == 0)
@@ -123,7 +123,7 @@ int64_t enumerate_and_pick_format_standalone(XrSession session, const WsuiStanda
 	if (count > 32) count = 32;
 	if (XR_FAILED(fns->pfn_enumerate_formats(session, count, &count, formats)))
 		return -1;
-	return pick_overlay_format(formats, count);
+	return pick_overlay_format(formats, count, app_pref);
 }
 
 bool create_swapchain_with(XrSession session,
@@ -380,7 +380,21 @@ wsui_standalone_pre_end_frame(XrSession session,
 		}
 		s_standalone.create_attempted = 1;
 
-		int64_t format = enumerate_and_pick_format_standalone(session, fns);
+		// Force the wsui swapchain format to match the cross-device bridge
+		// texture format on Windows (DXGI_FORMAT_B8G8R8A8_UNORM = 87).
+		// Without this, the picker defaults to RGBA8 on non-Apple, the
+		// bridge stays BGRA8, the SA-device CopyTextureRegion(bridge -> sc)
+		// is cross-format, D3D12 strict validation rejects it at GPU exec
+		// time, the runtime device gets removed, and the next atlas
+		// xrEndFrame crashes in the GPU driver. The bridge format is
+		// chosen to match Unity's wsui RT, which the C# code creates as
+		// B8G8R8A8_UNorm (URP RenderGraph requirement).
+#if defined(_WIN32)
+		const int64_t bridge_format_pref = 87;
+#else
+		const int64_t bridge_format_pref = -1;
+#endif
+		int64_t format = enumerate_and_pick_format_standalone(session, fns, bridge_format_pref);
 		if (format < 0) {
 			displayxr_log("[DisplayXR] wsui_sa: format enumeration failed\n");
 			s_standalone.create_failed_logged = 1;
@@ -414,6 +428,15 @@ wsui_standalone_pre_end_frame(XrSession session,
 		s_standalone.registered_h = tex_h;
 		displayxr_log("[DisplayXR] wsui_sa: swapchain created %ux%u (%u images, fmt=%lld)\n",
 		    s_standalone.sc_width, s_standalone.sc_height, img_count, (long long)format);
+
+		// Cross-device bridge for Windows: SA device != Unity device, so a
+		// direct Unity-RT → swapchain copy is invalid. Create a SHARED
+		// texture on the SA device, opened on Unity's device. C# copies its
+		// wsui RT into the Unity-side bridge each frame (Graphics.CopyTexture),
+		// then tick_session below copies SA-side bridge → swapchain image.
+		// No-op on platforms where the backend default-implements the bridge
+		// methods (Metal: unified device, doesn't need a bridge).
+		backend->wsui_create_bridge((uint32_t)tex_w, (uint32_t)tex_h);
 	}
 
 	bool ok = tick_session(&s_standalone, backend,

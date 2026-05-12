@@ -52,6 +52,19 @@ DISPLAYXR_EXPORT void displayxr_standalone_set_unity_device(void *unity_native_t
 DISPLAYXR_EXPORT void displayxr_standalone_get_atlas_bridge_texture(
     void **native_ptr, uint32_t *width, uint32_t *height);
 
+/// Get the window-space UI bridge texture opened on Unity's device.
+/// Caller passes desired RT dimensions; the backend lazily creates a
+/// shared bridge texture matching them on the SA device and opens it on
+/// Unity's device. Returns ID3D11Texture2D* / ID3D12Resource* (Windows)
+/// or NULL on platforms with unified device model (Metal — no bridge
+/// needed, C# uses the original wsui_set_texture path).
+/// C# wraps via Texture2D.CreateExternalTexture and copies its wsui RT
+/// into it each frame; the plugin's per-frame xrEndFrame hook then copies
+/// SA-side bridge to the composition-layer swapchain image.
+DISPLAYXR_EXPORT void displayxr_standalone_get_wsui_bridge_texture(
+    uint32_t width, uint32_t height,
+    void **native_ptr, uint32_t *out_width, uint32_t *out_height);
+
 /// Start a standalone OpenXR session for editor preview.
 /// Loads the runtime from the JSON manifest, creates instance/session,
 /// and opens a native preview window for compositor output.

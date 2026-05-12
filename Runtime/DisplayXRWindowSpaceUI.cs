@@ -80,6 +80,13 @@ namespace DisplayXR
         private Canvas m_Canvas;
         private RectTransform m_CanvasRect;
         private Camera m_OverlayCamera;
+        // Windows D3D11/D3D12 standalone-preview path: a shared bridge texture
+        // (NT-handle) opened on Unity's device. We Graphics.CopyTexture our
+        // OverlayTexture into it each frame, then the plugin's native layer
+        // copies the SA-side bridge to the composition swapchain image. Null
+        // on Mac (Metal: unified device, direct path works) and in built apps
+        // / Play Mode (hooked path; no standalone session, native returns null).
+        private Texture2D m_BridgeTex;
 
         // Saved state, restored in OnDisable.
         private RenderMode m_OrigRenderMode;
@@ -194,12 +201,49 @@ namespace DisplayXR
             DisplayXRNative.displayxr_window_space_ui_set_texture(
                 OverlayTexture.GetNativeTexturePtr(), resolution.x, resolution.y);
 
+            // ---- Windows-only: query the cross-device bridge ----
+            // On Windows the standalone preview session runs on its own
+            // D3D12 device; a direct CopyResource from our RT to the
+            // swapchain image is invalid because the two are on different
+            // devices. Native lazily creates a SHARED (NT-handle) texture
+            // on the SA device + opens it on Unity's device; we wrap it
+            // here as a Texture2D and Graphics.CopyTexture our RT into it
+            // each frame in LateUpdate. Returns null on Mac (unified
+            // device) and in built apps (no standalone session) — both
+            // paths use the direct unity_tex path in native.
+            TryAcquireBridge();
+
             m_LastX = positionX; m_LastY = positionY;
             m_LastW = width;     m_LastH = height;
             m_LastDisparity = disparity;
 
             Debug.Log($"[DisplayXR] WindowSpaceUI enabled: {resolution.x}x{resolution.y} " +
                       $"(WorldSpace canvas, layer {kPrivateLayer}, dedicated camera)");
+        }
+
+        private void TryAcquireBridge()
+        {
+            if (m_BridgeTex != null) return;
+            try
+            {
+                DisplayXRNative.displayxr_standalone_get_wsui_bridge_texture(
+                    (uint)resolution.x, (uint)resolution.y,
+                    out System.IntPtr bridgePtr,
+                    out uint bw, out uint bh);
+                if (bridgePtr != System.IntPtr.Zero && bw > 0 && bh > 0)
+                {
+                    m_BridgeTex = Texture2D.CreateExternalTexture(
+                        (int)bw, (int)bh, TextureFormat.BGRA32, false, true,
+                        bridgePtr);
+                    m_BridgeTex.name = "DisplayXR_WsuiBridge";
+                    Debug.Log($"[DisplayXR] wsui: bridge acquired {bw}x{bh}");
+                }
+            }
+            catch (System.EntryPointNotFoundException)
+            {
+                // Older plugin without the bridge API — non-Windows path or
+                // pre-bridge build. Stay on the direct unity_tex path.
+            }
         }
 
         void OnDisable()
@@ -237,6 +281,19 @@ namespace DisplayXR
                 else
                     DestroyImmediate(OverlayTexture);
                 OverlayTexture = null;
+            }
+
+            if (m_BridgeTex != null)
+            {
+                // Texture2D.CreateExternalTexture'd handles don't own the
+                // underlying native resource — native side keeps the SA-
+                // device bridge alive across enable/disable cycles. Just
+                // drop our Unity-side wrapper.
+                if (Application.isPlaying)
+                    Destroy(m_BridgeTex);
+                else
+                    DestroyImmediate(m_BridgeTex);
+                m_BridgeTex = null;
             }
         }
 
@@ -279,6 +336,17 @@ namespace DisplayXR
             if (m_OverlayCamera != null && OverlayTexture != null)
             {
                 m_OverlayCamera.Render();
+
+                // Windows standalone preview: copy our RT into the shared
+                // cross-device bridge so the SA device can read it via the
+                // shared NT handle. No-op on Mac / hooked path (m_BridgeTex
+                // stays null). Retry bridge acquisition each frame in case
+                // the standalone session came up after our OnEnable.
+                if (m_BridgeTex == null) TryAcquireBridge();
+                if (m_BridgeTex != null)
+                {
+                    Graphics.CopyTexture(OverlayTexture, m_BridgeTex);
+                }
             }
 
             if (positionX != m_LastX || positionY != m_LastY ||

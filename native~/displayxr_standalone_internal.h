@@ -198,8 +198,24 @@ public:
 
 	// Copy the Unity-side native texture (backend-typed) into the named
 	// swapchain image (also backend-typed). w/h = extent.
+	//
+	// On platforms with a unified device model (Metal): unity_tex IS the
+	// Unity-side native texture and the backend can copy from it directly.
+	//
+	// On Windows: the SA session runs on its own D3D12 device separate from
+	// Unity's, so a direct copy is invalid. Use the wsui bridge: Unity
+	// copies its RT into wsui_get_bridge_unity_ptr() first (same-device on
+	// Unity's side), then this function copies the SA-side bridge to the
+	// swapchain image (same-device on SA's side). Mirrors atlas bridge.
 	virtual bool wsui_copy_to_swapchain_image(void * /*unity_tex*/,
 	    void * /*sc_image_native*/, uint32_t /*w*/, uint32_t /*h*/) { return false; }
+
+	// Window-space UI cross-device bridge (Windows D3D11/D3D12). Mirror of
+	// the atlas bridge (create_atlas_bridge / get_atlas_bridge_unity_ptr).
+	// No-op on platforms with unified device model.
+	virtual void wsui_create_bridge(uint32_t /*w*/, uint32_t /*h*/) {}
+	virtual void wsui_destroy_bridge() {}
+	virtual void *wsui_get_bridge_unity_ptr() { return nullptr; }
 };
 
 // Factory functions (defined in the backend .cpp files)
