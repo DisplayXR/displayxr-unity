@@ -5,6 +5,11 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.7] - 2026-05-14
+
+### Added
+- macOS: cyclopean per-triangle hit-test + onPointer events ported from the Win32 path to the Mac overlay's LateUpdate. `DisplayXRTransparentOverlay.onPointerEnter/Exit/Down/Up/Click` now fire on Mac, allowing app code to know when the cursor is over a clickable renderer. Side effects: `DragRotateCube` left-click-drag-rotate-tiger now works on Mac (was silently no-op), and the test repo's `MacRightDragMoveWindow` can gate right-drag-to-move on the cursor being on the tiger. Hit-test logic mirrors Win32 (UpdateBakedHitColliders / TryGetStereoMatrices / BuildCyclopean / TryBuildEyeRay) with the Win32-only click-through plumbing (`displayxr_set_overlay_hit_*`) skipped — Mac click-through is future Phase 2 of #85. #95
+
 ## [1.5.6] - 2026-05-14
 
 ### Added
