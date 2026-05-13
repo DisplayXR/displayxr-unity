@@ -33,15 +33,7 @@ public:
 	D3D11ScSub sc_subs[kMaxScSubs] = {};
 	int sc_sub_count = 0;
 
-	// --- Rendering mode tracking (b7e2d22) ---
-	// Populated by on_session_ready() (called by the hooks.cpp dispatcher after
-	// xrCreateSession succeeds). set_rendering_mode_fns() must be called first
-	// to wire up the extension function pointers.
-	PFN_xrEnumerateDisplayRenderingModesEXT real_enumerate_rendering_modes = nullptr;
-	PFN_xrRequestDisplayRenderingModeEXT    real_request_rendering_mode    = nullptr;
-	XrDisplayRenderingModeInfoEXT rendering_modes[DISPLAYXR_MAX_RENDERING_MODES] = {};
-	uint32_t rendering_mode_count         = 0;
-	uint32_t current_rendering_mode_index = 0;
+	// Rendering mode tracking now lives on GraphicsBackend base — inherited.
 
 	// --- Tile-atlas output swapchain (b7e2d22) ---
 	// Sized to (tile_cols × view_w) × (tile_rows × view_h) for the current
@@ -102,88 +94,10 @@ private:
 	}
 
 public:
-	// --- Rendering mode wiring (called by dispatcher in hooks.cpp) ---
-	// These are not virtual methods on GraphicsBackend because the rendering-mode
-	// extension is currently D3D11-only. Once GL/Vulkan backends need equivalent
-	// tile-layout info, promote to a virtual method. Until then, the dispatcher
-	// casts GraphicsBackend* → D3D11Backend* when the active backend is D3D11.
-
-	void set_rendering_mode_fns(PFN_xrEnumerateDisplayRenderingModesEXT enum_fn,
-	                            PFN_xrRequestDisplayRenderingModeEXT    req_fn)
-	{
-		real_enumerate_rendering_modes = enum_fn;
-		real_request_rendering_mode    = req_fn;
-	}
-
-	// Enumerate rendering modes after the session handle is valid. The
-	// extension function pointers must have been wired via set_rendering_mode_fns
-	// before this is called.
-	void on_session_ready(XrSession session)
-	{
-		rendering_mode_count = 0;
-		if (real_enumerate_rendering_modes == nullptr) return;
-
-		uint32_t total = 0;
-		XrResult er = real_enumerate_rendering_modes(session, 0, &total, nullptr);
-		if (XR_FAILED(er) || total == 0) return;
-		if (total > DISPLAYXR_MAX_RENDERING_MODES) total = DISPLAYXR_MAX_RENDERING_MODES;
-
-		for (uint32_t i = 0; i < total; i++) {
-			rendering_modes[i] = {};
-			rendering_modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT;
-		}
-		er = real_enumerate_rendering_modes(session, total, &total, rendering_modes);
-		if (XR_FAILED(er)) {
-			displayxr_log(
-			    "[DisplayXR] xrEnumerateDisplayRenderingModesEXT (populate) failed: %d\n", er);
-			return;
-		}
-		rendering_mode_count = total;
-
-		// Default to first hardware_display_3d mode so we end up targeting a
-		// proper stereo/multi-view layout instead of the 2D fallback if one is
-		// enumerated first.
-		bool picked = false;
-		for (uint32_t i = 0; i < total; i++) {
-			const XrDisplayRenderingModeInfoEXT *m = &rendering_modes[i];
-			displayxr_log(
-			    "[DisplayXR] Mode[%u]: '%s' views=%u tiles=%ux%u "
-			    "viewPx=%ux%u hw3d=%d\n",
-			    m->modeIndex, m->modeName, m->viewCount,
-			    m->tileColumns, m->tileRows,
-			    m->viewWidthPixels, m->viewHeightPixels,
-			    (int)m->hardwareDisplay3D);
-			if (!picked && m->hardwareDisplay3D) {
-				current_rendering_mode_index = m->modeIndex;
-				picked = true;
-			}
-		}
-		if (!picked && total > 0)
-			current_rendering_mode_index = rendering_modes[0].modeIndex;
-
-		displayxr_log(
-		    "[DisplayXR] Rendering mode: %u modes enumerated, current=%u\n",
-		    total, current_rendering_mode_index);
-	}
-
-	// Called by the dispatcher for hooked_xrRequestDisplayRenderingModeEXT.
-	XrResult request_rendering_mode(XrSession session, uint32_t modeIndex)
-	{
-		if (real_request_rendering_mode == nullptr)
-			return XR_ERROR_FUNCTION_UNSUPPORTED;
-		XrResult r = real_request_rendering_mode(session, modeIndex);
-		if (XR_SUCCEEDED(r)) {
-			if (modeIndex != current_rendering_mode_index) {
-				displayxr_log(
-				    "[DisplayXR] Rendering mode changed: %u -> %u "
-				    "(forcing atlas swapchain recreation)\n",
-				    current_rendering_mode_index, modeIndex);
-				current_rendering_mode_index = modeIndex;
-				// Next prepare_end_frame will notice size mismatch and recreate.
-			}
-		}
-		return r;
-	}
+	// Rendering-mode set_rendering_mode_fns / on_session_ready /
+	// request_rendering_mode now live on GraphicsBackend base class.
+	// D3D11's atlas swapchain recreation triggers from the
+	// current_rendering_mode_index change which prepare_end_frame notices.
 
 	// ========================================================================
 	// GraphicsBackend interface

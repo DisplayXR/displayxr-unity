@@ -114,6 +114,25 @@ PFN_xrDestroySwapchain s_real_destroy_swapchain = nullptr;
 
 // --- Active graphics backend (selected at xrCreateSession time) ---
 static GraphicsBackend *s_backend = nullptr;
+
+GraphicsBackend *displayxr_get_hooked_backend() { return s_backend; }
+// displayxr_get_hooked_session lives further down (after s_session is declared).
+
+// Thin wrappers so callers in other TUs can read rendering-mode state on
+// the active GraphicsBackend without needing the full class definition (which
+// drags in Win32 headers via displayxr_hooks_internal.h → displayxr_win32.h).
+uint32_t displayxr_hooked_get_rendering_mode_count(GraphicsBackend *b)
+{
+	return b ? b->rendering_mode_count : 0;
+}
+const XrDisplayRenderingModeInfoEXT *displayxr_hooked_get_rendering_modes(GraphicsBackend *b)
+{
+	return b ? b->rendering_modes : nullptr;
+}
+XrResult displayxr_hooked_request_rendering_mode(GraphicsBackend *b, XrSession s, uint32_t mode_index)
+{
+	return b ? b->request_rendering_mode(s, mode_index) : XR_ERROR_FUNCTION_UNSUPPORTED;
+}
 enum BackendType { kBackendNone, kBackendD3D11, kBackendD3D12, kBackendMetal };
 static BackendType s_backend_type = kBackendNone;
 
@@ -151,6 +170,7 @@ void win32_inject_window_binding(XrBaseOutStructure *last, DisplayXRState *state
 
 static XrInstance s_instance = XR_NULL_HANDLE;
 static XrSession s_session = XR_NULL_HANDLE;
+XrSession displayxr_get_hooked_session() { return s_session; }
 static XrSpace s_local_space = XR_NULL_HANDLE;
 static volatile int s_session_alive = 0; // Guard for teardown
 static volatile int s_instance_alive = 0; // Guard for post-destroy polling
@@ -783,7 +803,13 @@ hooked_xrCreateSession(XrInstance instance, const XrSessionCreateInfo *createInf
 			}
 		}
 
-#if defined(_WIN32)
+		// Wire the rendering-mode extension function pointers and enumerate
+		// modes from the runtime. Backend default implementation lives on
+		// GraphicsBackend base — all platforms inherit it, so built apps on
+		// any graphics API get the mode list (and can switch via
+		// xrRequestDisplayRenderingModeEXT) without a separate standalone
+		// session. The C ABI displayxr_standalone_*_rendering_mode* shims
+		// fall back to s_backend->rendering_modes when s_sa.session is null.
 		if (s_backend && s_next_gipa && s_instance) {
 			PFN_xrVoidFunction fn_enum = nullptr, fn_req = nullptr;
 			s_next_gipa(s_instance, "xrEnumerateDisplayRenderingModesEXT", &fn_enum);
@@ -793,20 +819,17 @@ hooked_xrCreateSession(XrInstance instance, const XrSessionCreateInfo *createInf
 			    (PFN_xrRequestDisplayRenderingModeEXT)fn_req);
 			s_backend->on_session_ready(s_session);
 		}
-#endif
 	}
 
 	return result;
 }
 
-#if defined(_WIN32)
 static XrResult XRAPI_CALL
 hooked_xrRequestDisplayRenderingModeEXT(XrSession session, uint32_t modeIndex)
 {
 	if (s_backend) return s_backend->request_rendering_mode(session, modeIndex);
 	return XR_ERROR_FUNCTION_UNSUPPORTED;
 }
-#endif
 
 static XrResult XRAPI_CALL
 hooked_xrDestroySession(XrSession session)
@@ -1348,10 +1371,10 @@ displayxr_hook_xrGetInstanceProcAddr(XrInstance instance, const char *name, PFN_
 		s_real_destroy_swapchain = (PFN_xrDestroySwapchain)*function;
 		// No hook needed — just capture the pointer for typed swapchain cleanup.
 	}
+#endif
 	else if (strcmp(name, "xrRequestDisplayRenderingModeEXT") == 0) {
 		*function = (PFN_xrVoidFunction)hooked_xrRequestDisplayRenderingModeEXT;
 	}
-#endif
 	else if (strcmp(name, "xrCreateSwapchain") == 0) {
 		s_real_create_swapchain = (PFN_xrCreateSwapchain)*function;
 		*function = (PFN_xrVoidFunction)hooked_xrCreateSwapchain;
