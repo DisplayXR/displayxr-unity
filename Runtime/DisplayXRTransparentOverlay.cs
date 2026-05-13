@@ -526,12 +526,15 @@ namespace DisplayXR
                 }
             }
 #elif UNITY_STANDALONE_OSX
-            // (#85) Mac equivalent of the Win32 cursor/button polling — Unity
-            // uses a regular NSWindow here (no cloaked-window quirks), so
-            // Mouse.current is the right source. Drives PointerPosition /
-            // PointerDelta / IsLeftPressed for HUD routing and drag-style
-            // app code (e.g. TigerHudMouseRouter, WheelZoomVHeight). Skip in
-            // editor; gate to the active rig.
+            // (#85) Mac cursor/button polling + cyclopean hit-test mirroring
+            // the Win32 path. Unity uses a regular NSWindow here (no cloaked
+            // HWND quirks), so Mouse.current is the right source. Drives
+            // PointerPosition / PointerDelta / IsLeftPressed for HUD routing
+            // AND fires onPointerEnter/Exit/Down/Up/Click events so app code
+            // like DragRotateCube and the new MacRightDragMoveWindow gate
+            // can know whether the cursor is on a clickable renderer.
+            //
+            // Skip in editor; gate to the active rig.
             if (Application.isEditor || m_Camera == null)
                 return;
             if (DisplayXRRigManager.ActiveCamera != null
@@ -540,23 +543,105 @@ namespace DisplayXR
             #if HAS_INPUT_SYSTEM
             {
                 var mouse = Mouse.current;
-                if (mouse != null)
+                if (mouse == null) goto MAC_HITTEST_DONE;
+                Vector2 raw = mouse.position.ReadValue();
+                // Mouse.current is bottom-left origin; PointerPosition is
+                // window-client pixels with TOP-LEFT origin (matches Win32
+                // GetCursorPos+ScreenToClient convention). Flip Y so HUD /
+                // hit-test math is platform-agnostic.
+                int clientXMac = Mathf.RoundToInt(raw.x);
+                int clientYMac = Mathf.RoundToInt(Screen.height - raw.y);
+                Vector2 macPos = new Vector2(clientXMac, clientYMac);
+
+                PointerDelta = m_HasPrevPointerPos
+                    ? (macPos - m_PrevPointerPos)
+                    : Vector2.zero;
+                m_PrevPointerPos = macPos;
+                m_HasPrevPointerPos = true;
+                PointerPosition = macPos;
+                IsLeftPressed = mouse.leftButton.isPressed;
+                IsRightPressed = mouse.rightButton.isPressed;
+                int macButtons = (IsLeftPressed ? 1 : 0)
+                               | (IsRightPressed ? 2 : 0)
+                               | (mouse.middleButton.isPressed ? 4 : 0);
+
+                // Cyclopean hit-test (per-triangle for SMRs). Identical to the
+                // Win32 path — same helpers, same hysteresis. Overlay size on
+                // Mac is just the Unity window size (no off-screen-HWND quirk
+                // to compensate for).
+                if (clickableRenderers != null && clickableRenderers.Length > 0)
                 {
-                    Vector2 raw = mouse.position.ReadValue();
-                    // Mouse.current is bottom-left origin; PointerPosition is
-                    // window-client pixels with TOP-LEFT origin (matching
-                    // Win32). Flip Y so HUD math is platform-agnostic.
-                    Vector2 pos = new Vector2(raw.x, Screen.height - raw.y);
-                    PointerDelta = m_HasPrevPointerPos
-                        ? (pos - m_PrevPointerPos)
-                        : Vector2.zero;
-                    m_PrevPointerPos = pos;
-                    m_HasPrevPointerPos = true;
-                    PointerPosition = pos;
-                    IsLeftPressed = mouse.leftButton.isPressed;
-                    IsRightPressed = mouse.rightButton.isPressed;
+                    int overlayWMac = Screen.width;
+                    int overlayHMac = Screen.height;
+                    UpdateBakedHitColliders();
+
+                    Renderer hitRendererMac = null;
+                    if (clientXMac >= 0 && clientYMac >= 0
+                        && TryGetStereoMatrices(out Matrix4x4 lvM, out Matrix4x4 lpM,
+                                                 out Matrix4x4 rvM, out Matrix4x4 rpM))
+                    {
+                        BuildCyclopean(lvM, lpM, rvM, rpM,
+                                       out Matrix4x4 cvM, out Matrix4x4 cpM);
+                        if (TryBuildEyeRay(clientXMac, clientYMac, overlayWMac, overlayHMac, cvM, cpM, out Ray rayM))
+                        {
+                            float bestTM = m_Camera.farClipPlane;
+                            for (int i = 0; i < clickableRenderers.Length; i++)
+                            {
+                                var r = clickableRenderers[i];
+                                if (r == null) continue;
+                                if (r is SkinnedMeshRenderer smrM)
+                                {
+                                    if (TryRayHitBakedSkinnedMesh(rayM, bestTM, smrM, out float tM))
+                                    {
+                                        hitRendererMac = r;
+                                        bestTM = tM;
+                                    }
+                                }
+                                else
+                                {
+                                    if (Physics.Raycast(rayM, out RaycastHit infoM, bestTM)
+                                        && infoM.collider != null
+                                        && infoM.collider.transform.IsChildOf(r.transform))
+                                    {
+                                        hitRendererMac = r;
+                                        bestTM = infoM.distance;
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Same sticky-frame hysteresis as Win32.
+                    const int STICKY_FRAMES_MAC = 8;
+                    if (hitRendererMac != null)
+                    {
+                        m_LastHitRenderer = hitRendererMac;
+                        m_LastHitFrame = Time.frameCount;
+                    }
+                    else if (m_LastHitRenderer != null
+                             && Time.frameCount - m_LastHitFrame <= STICKY_FRAMES_MAC)
+                    {
+                        hitRendererMac = m_LastHitRenderer;
+                    }
+                    else
+                    {
+                        m_LastHitRenderer = null;
+                    }
+
+                    // Hover transitions
+                    if (hitRendererMac != m_HoverRenderer)
+                    {
+                        if (m_HoverRenderer != null) onPointerExit?.Invoke(m_HoverRenderer);
+                        if (hitRendererMac != null) onPointerEnter?.Invoke(hitRendererMac);
+                        m_HoverRenderer = hitRendererMac;
+                    }
+
+                    // Button transitions (left = click, right = drag-handled-by-app)
+                    DispatchButton(macButtons, 1, ref m_LeftWasDown, hitRendererMac);
+                    DispatchButton(macButtons, 2, ref m_RightWasDown, hitRendererMac);
                 }
             }
+            MAC_HITTEST_DONE:;
             #endif
 #endif
         }
