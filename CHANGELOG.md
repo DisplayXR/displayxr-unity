@@ -5,6 +5,16 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.5] - 2026-05-14
+
+### Fixed
+- **Windows editor preview wsui composition layer rendering** — both `StandaloneD3D12Backend::wsui_copy_to_swapchain_image` and the D3D11 equivalent were stubs that returned false (cross-device copy from Unity's D3D device to the standalone SA D3D device was unimplemented). Filled in by mirroring the existing atlas-bridge pattern: SHARED NT-handle `ID3D12Resource` on the SA device, opened on Unity's D3D12/D3D11 device. C# `Graphics.CopyTexture`s the wsui RT into the bridge each frame; SA backend then copies bridge → swapchain image with a fence wait. Also plumbed `app_pref` through `enumerate_and_pick_format_standalone` so the standalone swapchain matches the bridge's `B8G8R8A8_UNORM` (a cross-format CopyTextureRegion was crashing the runtime in the NVIDIA driver). Mac unaffected (Metal unified MTLDevice).
+- **Built-app cube Y shift under URP** — Unity 6 OpenXR defaults to Floor tracking origin mode (eye Y ≈ user height ≈ 1.5–1.7m). The plugin's `xrLocateViews` hook returns LOCAL-space eye coords for Kooima. Under BiRP, Unity reads these directly — fine. Under URP, the RenderGraph picked up `XRInputSubsystem`'s Floor offset and added it on top → cube rendered shifted by ~head height in built apps using URP (`displayxr-unity-test-2d-ui`), while BiRP test repos (`displayxr-unity-test`, `displayxr-unity-test-transparent`) rendered correctly. Now forced to Device mode at `RuntimeInitializeOnLoadMethod(AfterSceneLoad)`.
+- **Built-app Render Mode button dead on Windows D3D12** — `XR_EXT_display_rendering_mode` wiring was D3D11-only and `#if defined(_WIN32)`-gated, so the D3D12 hooked backend never enumerated modes and the standalone C ABI shims returned 0 in built apps (no `s_sa.session`). Rendering-mode bookkeeping promoted to `GraphicsBackend` base — D3D11, D3D12, Metal, Vulkan, GL all inherit it for free. C ABI shims fall back to the hooked backend's `rendering_modes[]` when no standalone session is running. Render Mode button now cycles in built apps on all platforms.
+
+### Changed
+- Refactored rendering-mode state + methods from `D3D11Backend` to `GraphicsBackend` base class. `D3D11Backend`'s atlas-swapchain logic still reads `current_rendering_mode_index` via the inherited field. No behavior change on D3D11 hooked path.
+
 ## [1.5.4] - 2026-05-13
 
 ### Added
