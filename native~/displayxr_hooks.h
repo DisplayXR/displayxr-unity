@@ -124,6 +124,12 @@ DISPLAYXR_EXPORT void displayxr_set_transparent_chroma_key(uint32_t color);
 /// No-op on non-Apple platforms.
 DISPLAYXR_EXPORT void displayxr_macos_configure_unity_nswindow(int enabled);
 
+/// Move Unity's configured NSWindow by (dx, dy) screen points. Primitive
+/// for app-driven borderless-window drag (right-mouse-drag, etc.). Cocoa
+/// screen coords: +x right, +y up. No-op when no window is configured or
+/// on non-Apple platforms.
+DISPLAYXR_EXPORT void displayxr_macos_offset_window(int dx, int dy);
+
 /// Hint the typed-swapchain substitution about Unity's project color space.
 /// Must be called BEFORE Unity creates its OpenXR swapchains (i.e. from the
 /// OpenXR feature's OnInstanceCreate).

@@ -117,6 +117,17 @@ namespace DisplayXR
         internal static extern void displayxr_macos_configure_unity_nswindow(int enabled);
 
         /// <summary>
+        /// Move Unity's configured NSWindow by (dx, dy) screen points. Used by
+        /// app code that implements borderless-window drag (e.g. right-mouse-
+        /// drag-to-move). Cocoa screen coordinates: +x right, +y UP. If the
+        /// app's input source is top-left pixel space (e.g. flipped Y), negate
+        /// dy. No-op until configure_unity_nswindow has been called. No-op on
+        /// non-Apple platforms.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void displayxr_macos_offset_window(int dx, int dy);
+
+        /// <summary>
         /// Hint the typed-swapchain substitution about the project color space.
         /// 1 = Linear (UNORM_SRGB siblings); 0 = Gamma (UNORM siblings).
         /// Must be called BEFORE Unity creates its OpenXR swapchains.
