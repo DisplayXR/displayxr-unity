@@ -31,6 +31,7 @@ static BOOL      s_saved_content_wantsLayer = NO;
 static BOOL      s_saved_content_layer_opaque = YES;
 static CGColorRef s_saved_content_layer_bg = NULL;
 
+
 static BOOL layer_tree_has_metal(CALayer *layer) {
 	if (layer == nil) return NO;
 	if ([layer isKindOfClass:[CAMetalLayer class]]) return YES;
@@ -138,6 +139,40 @@ displayxr_macos_configure_unity_nswindow(int enabled) {
 		}
 	};
 
+	if ([NSThread isMainThread]) {
+		block();
+	} else {
+		dispatch_async(dispatch_get_main_queue(), block);
+	}
+}
+
+// Move Unity's configured render NSWindow by (dx, dy) screen points. App
+// code calls this from its own input handler (e.g. right-mouse-drag) to
+// implement borderless-window drag — the policy choice (which button,
+// where on the window, when) lives in the app; the plugin just exposes
+// the mechanism. Win32 has an equivalent baked into the overlay HWND's
+// WndProc (#57), but on Mac there is no separate overlay HWND, so the
+// app drives it directly.
+//
+// Coordinates: screen-space delta in points (not pixels). Positive dx
+// moves the window right; positive dy moves the window UP (Cocoa
+// screen-coords are bottom-left origin). If the app's input source is
+// in top-left pixel space (e.g. Unity's Y-flipped PointerPosition),
+// negate dy before calling.
+//
+// No-op if no window has been configured yet (configure_unity_nswindow
+// hasn't been called or already torn down). Marshalled to the AppKit
+// main thread.
+extern "C" DISPLAYXR_EXPORT void
+displayxr_macos_offset_window(int dx, int dy) {
+	dispatch_block_t block = ^{
+		NSWindow *w = s_configured_window;
+		if (w == nil) return;
+		NSRect frame = w.frame;
+		frame.origin.x += (CGFloat)dx;
+		frame.origin.y += (CGFloat)dy;
+		[w setFrameOrigin:frame.origin];
+	};
 	if ([NSThread isMainThread]) {
 		block();
 	} else {
