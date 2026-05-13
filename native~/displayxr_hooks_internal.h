@@ -93,8 +93,22 @@ struct D3D11ScSub {
 // GraphicsBackend abstract base class
 // ============================================================================
 
+#ifndef DISPLAYXR_MAX_RENDERING_MODES
+#define DISPLAYXR_MAX_RENDERING_MODES 16
+#endif
+
 class GraphicsBackend {
 public:
+	// Rendering-mode extension state — generic XR data, shared across backends.
+	// Populated by on_session_ready() (called from the hooks dispatcher after
+	// xrCreateSession succeeds). set_rendering_mode_fns() must be called first
+	// to wire up the extension function pointers.
+	PFN_xrEnumerateDisplayRenderingModesEXT real_enumerate_rendering_modes = nullptr;
+	PFN_xrRequestDisplayRenderingModeEXT    real_request_rendering_mode    = nullptr;
+	XrDisplayRenderingModeInfoEXT rendering_modes[DISPLAYXR_MAX_RENDERING_MODES] = {};
+	uint32_t rendering_mode_count         = 0;
+	uint32_t current_rendering_mode_index = 0;
+
 	virtual ~GraphicsBackend() = default;
 	virtual void on_session_created(const XrSessionCreateInfo *createInfo) = 0;
 	virtual void on_session_destroyed() = 0;
@@ -111,11 +125,49 @@ public:
 	virtual void  destroy_shared_texture() = 0;
 	virtual void *get_shared_texture_native_ptr() = 0;
 
-	// Rendering-mode extension wiring (D3D11 only today; default no-ops for
-	// backends that don't support tile-layout modes yet).
-	virtual void set_rendering_mode_fns(PFN_xrEnumerateDisplayRenderingModesEXT, PFN_xrRequestDisplayRenderingModeEXT) {}
-	virtual void on_session_ready(XrSession) {}
-	virtual XrResult request_rendering_mode(XrSession, uint32_t) { return XR_ERROR_FUNCTION_UNSUPPORTED; }
+	// Rendering-mode extension wiring. Default implementation lives on the
+	// base class so all backends inherit it; D3D11 overrides on_session_ready
+	// to additionally trigger atlas swapchain setup that depends on the mode.
+	virtual void set_rendering_mode_fns(PFN_xrEnumerateDisplayRenderingModesEXT enum_fn,
+	                                     PFN_xrRequestDisplayRenderingModeEXT    req_fn)
+	{
+		real_enumerate_rendering_modes = enum_fn;
+		real_request_rendering_mode    = req_fn;
+	}
+	virtual void on_session_ready(XrSession session)
+	{
+		rendering_mode_count = 0;
+		if (real_enumerate_rendering_modes == nullptr) return;
+		uint32_t total = 0;
+		XrResult er = real_enumerate_rendering_modes(session, 0, &total, nullptr);
+		if (XR_FAILED(er) || total == 0) return;
+		if (total > DISPLAYXR_MAX_RENDERING_MODES) total = DISPLAYXR_MAX_RENDERING_MODES;
+		for (uint32_t i = 0; i < total; i++) {
+			rendering_modes[i] = {};
+			rendering_modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT;
+		}
+		er = real_enumerate_rendering_modes(session, total, &total, rendering_modes);
+		if (XR_FAILED(er)) return;
+		rendering_mode_count = total;
+		// Pick first hardware_display_3d mode as default; fall back to mode 0.
+		bool picked = false;
+		for (uint32_t i = 0; i < total; i++) {
+			if (rendering_modes[i].hardwareDisplay3D) {
+				current_rendering_mode_index = rendering_modes[i].modeIndex;
+				picked = true;
+				break;
+			}
+		}
+		if (!picked && total > 0)
+			current_rendering_mode_index = rendering_modes[0].modeIndex;
+	}
+	virtual XrResult request_rendering_mode(XrSession session, uint32_t modeIndex)
+	{
+		if (real_request_rendering_mode == nullptr) return XR_ERROR_FUNCTION_UNSUPPORTED;
+		XrResult r = real_request_rendering_mode(session, modeIndex);
+		if (XR_SUCCEEDED(r)) current_rendering_mode_index = modeIndex;
+		return r;
+	}
 
 	// Window-space UI overlay (issue #67).
 	// Enumerate the named swapchain's images using the platform-appropriate
@@ -142,6 +194,17 @@ public:
 	// See displayxr-unity#82 / displayxr-runtime#216.
 	virtual int64_t wsui_get_native_texture_format(void * /*unity_tex*/) { return -1; }
 };
+
+// Internal accessor for the currently-active hooked backend. Returns nullptr
+// if no hooked session is running (e.g. inside the standalone preview path,
+// or before xrCreateSession). Used by the standalone C ABI's rendering-mode
+// shims so they can fall back to the hooked backend's enumerated modes when
+// no standalone session exists (built apps).
+GraphicsBackend *displayxr_get_hooked_backend();
+
+// Currently-active hooked session handle, or XR_NULL_HANDLE. Pairs with
+// displayxr_get_hooked_backend() for the fallback path.
+XrSession displayxr_get_hooked_session();
 
 // --- Factory functions for concrete backend classes ---
 // Implementations are in displayxr_d3d11_backend.cpp, displayxr_d3d12_backend.cpp,

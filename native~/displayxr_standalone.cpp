@@ -11,6 +11,19 @@
 #include "displayxr_window_space_ui.h"
 #include <stdarg.h>
 
+// Forward declarations for the hooked-path fallback. We don't pull in
+// displayxr_hooks_internal.h here because it transitively pulls in Win32
+// headers that conflict with this TU's extern "C" wrapping. Definitions
+// live in displayxr_hooks.cpp.
+class GraphicsBackend;
+GraphicsBackend *displayxr_get_hooked_backend();
+XrSession displayxr_get_hooked_session();
+// Accessors on the GraphicsBackend opaque class — defined as a thin wrapper
+// in displayxr_hooks.cpp so we don't need the full class definition here.
+uint32_t displayxr_hooked_get_rendering_mode_count(GraphicsBackend *b);
+const XrDisplayRenderingModeInfoEXT *displayxr_hooked_get_rendering_modes(GraphicsBackend *b);
+XrResult displayxr_hooked_request_rendering_mode(GraphicsBackend *b, XrSession s, uint32_t mode_index);
+
 // ============================================================================
 // OpenXR loader negotiation types (from openxr_loader_negotiation.h)
 // Defined inline to avoid header dependency issues.
@@ -2031,7 +2044,37 @@ displayxr_standalone_request_display_mode(int mode_3d)
 	return XR_SUCCEEDED(result) ? 1 : 0;
 }
 
-DISPLAYXR_EXPORT int
+// --- Internal helper: pick the rendering-modes source ---
+//
+// Standalone preview running → use s_sa's enumerated modes.
+// Otherwise (built app, Play Mode with hooked path) → use the hooked
+// backend's modes. Returns count via *out_count and the pointer to the
+// modes array via *out_modes.
+static void pick_rendering_modes_source(
+	const XrDisplayRenderingModeInfoEXT **out_modes,
+	uint32_t *out_count)
+{
+	if (s_sa.session != XR_NULL_HANDLE && s_sa.rendering_mode_count > 0) {
+		*out_modes = s_sa.rendering_modes;
+		*out_count = s_sa.rendering_mode_count;
+		return;
+	}
+	GraphicsBackend *hb = displayxr_get_hooked_backend();
+	if (hb != nullptr) {
+		uint32_t hc = displayxr_hooked_get_rendering_mode_count(hb);
+		if (hc > 0) {
+			*out_modes = displayxr_hooked_get_rendering_modes(hb);
+			*out_count = hc;
+			return;
+		}
+	}
+	// Standalone exists but hasn't enumerated yet — fall through to old
+	// behavior (try to enumerate via standalone) handled by caller.
+	*out_modes = nullptr;
+	*out_count = 0;
+}
+
+int
 displayxr_standalone_get_rendering_mode_name(uint32_t array_slot, char *buffer, uint32_t buffer_size)
 {
 	// Fetches the runtime-reported display name for the rendering mode at
@@ -2041,8 +2084,11 @@ displayxr_standalone_get_rendering_mode_name(uint32_t array_slot, char *buffer, 
 	// flat byte buffer + capacity and parse a null-terminated UTF-8 string out.
 	if (!buffer || buffer_size == 0) return 0;
 	buffer[0] = '\0';
-	if (array_slot >= s_sa.rendering_mode_count) return 0;
-	const char *src = s_sa.rendering_modes[array_slot].modeName;
+	const XrDisplayRenderingModeInfoEXT *modes = nullptr;
+	uint32_t total = 0;
+	pick_rendering_modes_source(&modes, &total);
+	if (modes == nullptr || array_slot >= total) return 0;
+	const char *src = modes[array_slot].modeName;
 	uint32_t copy_n = buffer_size - 1;
 	uint32_t i = 0;
 	while (i < copy_n && src[i] != '\0') { buffer[i] = src[i]; i++; }
@@ -2053,15 +2099,23 @@ displayxr_standalone_get_rendering_mode_name(uint32_t array_slot, char *buffer, 
 int
 displayxr_standalone_request_rendering_mode(uint32_t mode_index)
 {
-	if (!s_sa.pfn_request_rendering_mode || s_sa.session == XR_NULL_HANDLE)
+	// Standalone session running → use its function pointer + session.
+	if (s_sa.pfn_request_rendering_mode && s_sa.session != XR_NULL_HANDLE) {
+		XrResult result = s_sa.pfn_request_rendering_mode(s_sa.session, mode_index);
+		sa_log("[DisplayXR-SA] RequestRenderingMode(%u) → %d\n",
+			mode_index, result);
+		if (XR_SUCCEEDED(result)) {
+			s_sa.current_rendering_mode_index = mode_index;
+			return 1;
+		}
 		return 0;
-
-	XrResult result = s_sa.pfn_request_rendering_mode(s_sa.session, mode_index);
-	sa_log("[DisplayXR-SA] RequestRenderingMode(%u) → %d\n",
-		mode_index, result);
-	if (XR_SUCCEEDED(result)) {
-		s_sa.current_rendering_mode_index = mode_index;
-		return 1;
+	}
+	// Built-app / hooked-path fallback: call through the hooked backend.
+	GraphicsBackend *hb = displayxr_get_hooked_backend();
+	XrSession hs = displayxr_get_hooked_session();
+	if (hb != nullptr && hs != XR_NULL_HANDLE) {
+		XrResult r = displayxr_hooked_request_rendering_mode(hb, hs, mode_index);
+		return XR_SUCCEEDED(r) ? 1 : 0;
 	}
 	return 0;
 }
@@ -2076,19 +2130,17 @@ displayxr_standalone_enumerate_rendering_modes(
 	float *view_scale_x, float *view_scale_y,
 	int *hardware_display_3d)
 {
-	// Use cached modes if available, otherwise query runtime
-	uint32_t total = s_sa.rendering_mode_count;
-	if (total == 0) {
-		if (!s_sa.pfn_enumerate_rendering_modes || s_sa.session == XR_NULL_HANDLE) {
-			*count = 0;
-			return 0;
-		}
-		// Re-enumerate
+	const XrDisplayRenderingModeInfoEXT *modes = nullptr;
+	uint32_t total = 0;
+	pick_rendering_modes_source(&modes, &total);
+
+	// If no cache yet AND standalone session is running, try a late enumerate.
+	if (total == 0 && s_sa.pfn_enumerate_rendering_modes && s_sa.session != XR_NULL_HANDLE) {
 		enumerate_and_store_modes();
-		total = s_sa.rendering_mode_count;
+		pick_rendering_modes_source(&modes, &total);
 	}
 
-	if (total == 0) {
+	if (total == 0 || modes == nullptr) {
 		*count = 0;
 		return 0;
 	}
@@ -2102,24 +2154,22 @@ displayxr_standalone_enumerate_rendering_modes(
 		return 1; // Count-only query
 
 	uint32_t to_fetch = total < capacity ? total : capacity;
-	sa_log("[DisplayXR-SA] enumerate: filling %u mode_indices entries (mode_names=%s)\n",
-		to_fetch, mode_names ? "ptr" : "null");
 	for (uint32_t i = 0; i < to_fetch; i++) {
-		mode_indices[i] = s_sa.rendering_modes[i].modeIndex;
+		mode_indices[i] = modes[i].modeIndex;
 		if (mode_names) {
-			strncpy(mode_names[i], s_sa.rendering_modes[i].modeName, 255);
+			strncpy(mode_names[i], modes[i].modeName, 255);
 			mode_names[i][255] = '\0';
 		}
 
 		// Extended fields (NULL-safe — callers may pass NULL for fields they don't need)
-		if (view_counts) view_counts[i] = s_sa.rendering_modes[i].viewCount;
-		if (tile_columns) tile_columns[i] = s_sa.rendering_modes[i].tileColumns;
-		if (tile_rows) tile_rows[i] = s_sa.rendering_modes[i].tileRows;
-		if (view_width_pixels) view_width_pixels[i] = s_sa.rendering_modes[i].viewWidthPixels;
-		if (view_height_pixels) view_height_pixels[i] = s_sa.rendering_modes[i].viewHeightPixels;
-		if (view_scale_x) view_scale_x[i] = s_sa.rendering_modes[i].viewScaleX;
-		if (view_scale_y) view_scale_y[i] = s_sa.rendering_modes[i].viewScaleY;
-		if (hardware_display_3d) hardware_display_3d[i] = (int)s_sa.rendering_modes[i].hardwareDisplay3D;
+		if (view_counts) view_counts[i] = modes[i].viewCount;
+		if (tile_columns) tile_columns[i] = modes[i].tileColumns;
+		if (tile_rows) tile_rows[i] = modes[i].tileRows;
+		if (view_width_pixels) view_width_pixels[i] = modes[i].viewWidthPixels;
+		if (view_height_pixels) view_height_pixels[i] = modes[i].viewHeightPixels;
+		if (view_scale_x) view_scale_x[i] = modes[i].viewScaleX;
+		if (view_scale_y) view_scale_y[i] = modes[i].viewScaleY;
+		if (hardware_display_3d) hardware_display_3d[i] = (int)modes[i].hardwareDisplay3D;
 	}
 	return 1;
 }
