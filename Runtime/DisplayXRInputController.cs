@@ -68,6 +68,16 @@ namespace DisplayXR
             m_IsCameraCentric = GetComponent<DisplayXRCamera>() != null;
             if (m_IsCameraCentric)
                 m_InitialFov = m_Camera.fieldOfView;
+
+            // Push the initial rendering mode to the runtime so the C# state
+            // (m_CurrentRenderingMode default = 1 / 3D) and the runtime's
+            // sim_display mode agree from frame 0. Without this the runtime
+            // can default to 2D (mono passthrough), and the first V keypress
+            // re-requests the same mode the C# is about to leave (no visible
+            // effect), making users press V twice to reach 3D. Harmless to
+            // call early — the native side queues the request until the
+            // session is ready to handle it.
+            DisplayXRNative.displayxr_request_display_mode(m_CurrentRenderingMode);
         }
 
         // Rendering mode cycling
