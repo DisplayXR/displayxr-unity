@@ -5,6 +5,14 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.4] - 2026-05-13
+
+### Added
+- macOS: `displayxr_macos_offset_window(dx, dy)` primitive for app-driven borderless-window drag (e.g. right-click-drag-to-move). App owns the input policy, plugin owns the `[NSWindow setFrameOrigin:]` mechanism. Win32 keeps its built-in WndProc-based drag for now (coupled to SR weaver phase-snap on the overlay HWND); architectural unification deferred. #93
+
+### Changed
+- `native~/build-mac.sh` no longer `rm -rf build` on every invocation. Re-runs reuse the FetchContent'd OpenXR-SDK clone — local rebuilds drop from 30-60s to ~5s. Pass `--clean` to force a full rebuild.
+
 ## [1.5.3] - 2026-05-13
 
 ### Fixed
