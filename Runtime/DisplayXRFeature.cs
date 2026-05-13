@@ -47,6 +47,59 @@ namespace DisplayXR
         public static DisplayXRFeature Instance { get; private set; }
 
         /// <summary>
+        /// Force XR tracking origin to Device (head-relative, Y=0 at session
+        /// start) rather than Floor. Unity 6 OpenXR defaults to Floor which is
+        /// correct for VR (eye poses reported relative to floor ≈ user height).
+        /// DisplayXR's native xrLocateViews hook returns LOCAL-space (head-
+        /// relative) eye coords for its Kooima off-axis projection — under
+        /// BiRP, Unity's stereo pipeline reads those directly and everything
+        /// lines up. Under URP, the RenderGraph path picks up
+        /// XRInputSubsystem's Floor-relative pose offset and adds it on top of
+        /// the plugin's eye coords, shifting the rendered image by user height
+        /// (~1.5–1.7m). Forcing Device mode prevents the mismatch.
+        ///
+        /// AfterSceneLoad: subsystems must already be running for
+        /// SubsystemManager.GetSubsystems(XRInputSubsystem) to find them;
+        /// OnSessionCreate is too early.
+        ///
+        /// Verified on Unity 6 + URP 17.0.4 + Windows D3D12 against
+        /// displayxr-unity-test-2d-ui (the URP variant test repo).
+        /// </summary>
+        [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
+        private static void ForceDeviceTrackingOrigin()
+        {
+            try
+            {
+                var subs = new System.Collections.Generic.List<UnityEngine.XR.XRInputSubsystem>();
+                UnityEngine.SubsystemManager.GetSubsystems(subs);
+                if (subs.Count == 0)
+                {
+                    // XR not active in this Player (e.g. running without
+                    // OpenXR loader). Nothing to do.
+                    return;
+                }
+                foreach (var sub in subs)
+                {
+                    var supported = sub.GetSupportedTrackingOriginModes();
+                    var current = sub.GetTrackingOriginMode();
+                    if (current == UnityEngine.XR.TrackingOriginModeFlags.Device) continue;
+                    if ((supported & UnityEngine.XR.TrackingOriginModeFlags.Device) == 0)
+                    {
+                        Debug.LogWarning("[DisplayXR] XRInputSubsystem doesn't support Device " +
+                                         $"tracking origin (supported={supported}); leaving as " + current);
+                        continue;
+                    }
+                    bool ok = sub.TrySetTrackingOriginMode(UnityEngine.XR.TrackingOriginModeFlags.Device);
+                    Debug.Log($"[DisplayXR] Tracking origin: {current} -> Device (ok={ok})");
+                }
+            }
+            catch (System.Exception e)
+            {
+                Debug.LogWarning("[DisplayXR] ForceDeviceTrackingOrigin: " + e.Message);
+            }
+        }
+
+        /// <summary>
         /// Set by <see cref="DisplayXRTransparentOverlay.RequestTransparentSession"/>
         /// before the OpenXR session is created. Drives the
         /// XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND opt-in inside OnInstanceCreate
@@ -184,6 +237,12 @@ namespace DisplayXR
                 Debug.Log("[DisplayXR] Disabling Game View mirror render (gameViewRenderMode = None)");
                 UnityEngine.XR.XRSettings.gameViewRenderMode = UnityEngine.XR.GameViewRenderMode.None;
             }
+
+            // Tracking origin is forced to Device by ForceDeviceTrackingOrigin()
+            // below — that runs at AfterSceneLoad, after XR subsystems have
+            // started. Doing it here in OnSessionCreate is too early:
+            // SubsystemManager.GetSubsystems(XRInputSubsystem) returns empty
+            // before the session is fully begun.
 
 #if UNITY_STANDALONE_WIN
             // Shell mode: ensure Unity continues processing input and rendering
