@@ -163,6 +163,76 @@ displayxr_macos_configure_unity_nswindow(int enabled) {
 // No-op if no window has been configured yet (configure_unity_nswindow
 // hasn't been called or already torn down). Marshalled to the AppKit
 // main thread.
+// ---- Cursor-anchored window drag ----
+//
+// Recommended API for borderless-window drag (replaces the offset_window
+// primitive for the right-mouse-drag use case). Avoids the scale/feedback
+// pitfalls that come from app-side cursor delta on Mac (Mouse.current units
+// vs NSWindow.frame points, HiDPI backing, cursor-position changes as the
+// window moves out from under it).
+//
+// Inside the plugin we use [NSEvent mouseLocation] (true screen position in
+// Cocoa points, independent of any window) + NSWindow.frame.origin (same
+// units). At begin, we snapshot the cursor's offset within the window;
+// every update sets window.origin = cursor_screen - offset, so the cursor
+// stays pinned to the same window-relative spot for the lifetime of the
+// drag. End clears the dragging state.
+//
+// App pattern (Unity):
+//
+//     if (mouse.rightButton.wasPressedThisFrame) Plugin.BeginDrag();
+//     if (mouse.rightButton.isPressed)           Plugin.UpdateDrag();
+//     if (mouse.rightButton.wasReleasedThisFrame) Plugin.EndDrag();
+
+static NSPoint s_drag_window_to_cursor_offset = {0, 0};
+static BOOL    s_drag_active = NO;
+
+extern "C" DISPLAYXR_EXPORT void
+displayxr_macos_begin_window_drag(void) {
+	dispatch_block_t block = ^{
+		NSWindow *w = s_configured_window;
+		if (w == nil) {
+			s_drag_active = NO;
+			return;
+		}
+		NSPoint cursor = [NSEvent mouseLocation];
+		NSPoint origin = w.frame.origin;
+		s_drag_window_to_cursor_offset =
+		    NSMakePoint(cursor.x - origin.x, cursor.y - origin.y);
+		s_drag_active = YES;
+		displayxr_log("[DisplayXR] window drag begin: cursor=(%.0f,%.0f) origin=(%.0f,%.0f) offset=(%.0f,%.0f)\n",
+		              cursor.x, cursor.y, origin.x, origin.y,
+		              s_drag_window_to_cursor_offset.x,
+		              s_drag_window_to_cursor_offset.y);
+	};
+	if ([NSThread isMainThread]) block();
+	else dispatch_async(dispatch_get_main_queue(), block);
+}
+
+extern "C" DISPLAYXR_EXPORT void
+displayxr_macos_update_window_drag(void) {
+	dispatch_block_t block = ^{
+		if (!s_drag_active) return;
+		NSWindow *w = s_configured_window;
+		if (w == nil) {
+			s_drag_active = NO;
+			return;
+		}
+		NSPoint cursor = [NSEvent mouseLocation];
+		NSPoint newOrigin = NSMakePoint(
+		    cursor.x - s_drag_window_to_cursor_offset.x,
+		    cursor.y - s_drag_window_to_cursor_offset.y);
+		[w setFrameOrigin:newOrigin];
+	};
+	if ([NSThread isMainThread]) block();
+	else dispatch_async(dispatch_get_main_queue(), block);
+}
+
+extern "C" DISPLAYXR_EXPORT void
+displayxr_macos_end_window_drag(void) {
+	s_drag_active = NO;
+}
+
 extern "C" DISPLAYXR_EXPORT void
 displayxr_macos_offset_window(int dx, int dy) {
 	dispatch_block_t block = ^{

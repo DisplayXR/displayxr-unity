@@ -130,6 +130,17 @@ DISPLAYXR_EXPORT void displayxr_macos_configure_unity_nswindow(int enabled);
 /// on non-Apple platforms.
 DISPLAYXR_EXPORT void displayxr_macos_offset_window(int dx, int dy);
 
+/// Recommended cursor-anchored window-drag API (v1.5.5+). Begin captures
+/// the cursor's offset within the window; each Update snaps the window
+/// origin so the cursor stays pinned to the same spot. Avoids the
+/// scale/feedback issues of computing deltas in the app from
+/// Mouse.current. App calls Begin on mouse-down, Update each frame while
+/// held, End on mouse-up. All no-ops on non-Apple platforms / before
+/// configure_unity_nswindow.
+DISPLAYXR_EXPORT void displayxr_macos_begin_window_drag(void);
+DISPLAYXR_EXPORT void displayxr_macos_update_window_drag(void);
+DISPLAYXR_EXPORT void displayxr_macos_end_window_drag(void);
+
 /// Hint the typed-swapchain substitution about Unity's project color space.
 /// Must be called BEFORE Unity creates its OpenXR swapchains (i.e. from the
 /// OpenXR feature's OnInstanceCreate).

@@ -128,6 +128,20 @@ namespace DisplayXR
         public static extern void displayxr_macos_offset_window(int dx, int dy);
 
         /// <summary>
+        /// Cursor-anchored window-drag API (recommended over offset_window for
+        /// drag-to-move use cases). Begin captures the cursor's offset within
+        /// the window; Update snaps the origin each frame so the cursor stays
+        /// pinned to the same window-relative spot. End clears state. Avoids
+        /// the scale / feedback issues of app-side cursor deltas on Mac.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void displayxr_macos_begin_window_drag();
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void displayxr_macos_update_window_drag();
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void displayxr_macos_end_window_drag();
+
+        /// <summary>
         /// Hint the typed-swapchain substitution about the project color space.
         /// 1 = Linear (UNORM_SRGB siblings); 0 = Gamma (UNORM siblings).
         /// Must be called BEFORE Unity creates its OpenXR swapchains.
