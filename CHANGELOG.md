@@ -5,6 +5,12 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.3] - 2026-05-13
+
+### Fixed
+- macOS: push initial rendering mode to runtime in DisplayXRInputController.Start so 3D mode is active at first frame (previously the C# default `m_CurrentRenderingMode = 1` was never pushed; macOS sim_display defaults to 2D / passthrough, requiring two V keypresses to reach 3D). #92
+- macOS: `displayxr_is_our_process_foreground` now returns 1 unconditionally on Mac. The Win32 reason for the gate (RIDEV_INPUTSINK delivers keystrokes system-wide) doesn't apply to Cocoa, and `[NSApp isActive]` had transient false-negative windows during app-activation handoff making Shift+Tab feel unreliable. #92
+
 ## [1.5.2] - 2026-05-13
 
 ### Fixed
