@@ -156,17 +156,14 @@ displayxr_is_shell_mode(void) {
 // macOS implementation of "is our process the foreground app?". Win32 uses
 // it to gate keyboard polling (RIDEV_INPUTSINK delivers keystrokes from
 // every window system-wide; without the gate the HUD would toggle on
-// Shift+Tab typed in some other app). On Mac, NSApplication.active is the
-// canonical signal — NSApp is "active" only when one of our app's windows
-// owns the foreground. Returns 1 when active, 0 otherwise. Must run on the
-// AppKit main thread; Unity's main thread IS the AppKit main thread on
-// macOS, so callers on Update / LateUpdate are fine.
+// Shift+Tab typed in some other app). On macOS, Cocoa only delivers
+// keyboard events to the active app — if Unity is seeing a keystroke at
+// all, we are (or have just become) foreground. So returning 1
+// unconditionally is correct AND avoids the [NSApp isActive] transient
+// false-negative window during app-activation handoff that was making
+// Shift+Tab unreliable in transparent-overlay builds. The Win32 reason
+// for gating doesn't apply on Mac.
 extern "C" DISPLAYXR_EXPORT int
 displayxr_is_our_process_foreground(void) {
-	if (![NSThread isMainThread]) {
-		// Off-thread query — be safe and fail-open. Same semantics the C#
-		// wrapper's catch falls back to when the symbol is missing.
-		return 1;
-	}
-	return [NSApp isActive] ? 1 : 0;
+	return 1;
 }
