@@ -5,6 +5,11 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.8] - 2026-05-14
+
+### Added
+- `DisplayXRInputController.mouseLookEnabled` field (default true) to opt out of the controller's built-in left-mouse-drag → camera rotation. Apps that drive their own hit-tested left-drag interactions (e.g. `DragRotateCube` on a scene target) can set it to false to reserve left-drag for the app's hit-tested target. WASD movement, scroll zoom, and keyboard controls are unaffected. #96
+
 ## [1.5.7] - 2026-05-14
 
 ### Added
