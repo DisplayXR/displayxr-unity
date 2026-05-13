@@ -25,6 +25,14 @@ namespace DisplayXR
         [Tooltip("Mouse rotation sensitivity (radians per pixel).")]
         public float rotationSensitivity = 0.005f;
 
+        [Tooltip("When false, left-mouse drag does NOT rotate the camera. " +
+                 "Useful when the app drives object-drag interactions (e.g. " +
+                 "DragRotateCube on a scene object) and wants left-drag to " +
+                 "be reserved for the app's hit-tested target, with no " +
+                 "fallback camera-look on the off-target case. WASD movement " +
+                 "and keyboard controls are unaffected.")]
+        public bool mouseLookEnabled = true;
+
         [Tooltip("Scroll wheel zoom speed (scale factor per scroll tick).")]
         public float zoomSpeed = 0.1f;
 
@@ -147,6 +155,15 @@ namespace DisplayXR
 
         private void HandleMouseRotation()
         {
+            // Opt-out: app wants left-drag reserved for its own hit-tested
+            // interactions (e.g. DragRotateCube on a target object).
+            if (!mouseLookEnabled)
+            {
+                m_Dragging = false;
+                m_DragPending = false;
+                return;
+            }
+
             // Cancel any in-progress drag if input should be ignored
             // (e.g. preview window is being moved/resized).
             // Checked every frame, not just on mouseDown, because the
