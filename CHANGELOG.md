@@ -5,6 +5,11 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.6] - 2026-05-14
+
+### Added
+- macOS: cursor-anchored window-drag API (`displayxr_macos_begin_window_drag` / `_update_window_drag` / `_end_window_drag`). Recommended over the existing `offset_window` primitive for mouse-drag use cases — does all the cursor↔window math in pure Cocoa coords inside the plugin, avoiding the scale/feedback issues that occur when feeding `Mouse.current`-derived deltas to `offset_window` on Retina + HiDPI displays. Cursor stays glued to the same window-relative spot for the full drag. #94
+
 ## [1.5.5] - 2026-05-14
 
 ### Fixed
