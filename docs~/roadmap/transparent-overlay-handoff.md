@@ -1,15 +1,34 @@
 # Transparent overlay (issue #57) — RESOLVED in v1.2.0
 
-> **Status: closed.** Session 5 landed cross-process click-through end-to-end
-> (Notepad caret, Explorer item selection, keyboard focus all work) plus
-> scroll-to-resize for the overlay window and foreground-aware input gating
-> so the cube doesn't keep responding to WASD while the user is typing in
-> another app. Released as v1.2.0 (2026-05-04).
+> ### ⚠️ SUPERSEDED — historical record only (kept for archaeology)
+>
+> This document describes the **chroma-key transparent overlay** as it
+> shipped in v1.2.0 through v1.5.13. **That mechanism is gone as of v1.6.0**
+> ([`DisplayXR/displayxr-unity#103`](https://github.com/DisplayXR/displayxr-unity/issues/103)).
+>
+> The current path is alpha-native end-to-end: the OpenXR session is
+> opted into `XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND`, Unity emits real
+> per-pixel alpha into the swapchain, and the runtime DP composes the
+> desktop under each tile pre-weave + alpha-gates post-weave. No chroma
+> color is painted by the app, the `RequestChromaKey` /
+> `chromaKeyColor` / `displayxr_set_transparent_chroma_key` APIs are
+> removed, and the binding extension's `chromaKeyColor` field is always
+> sent as `0`.
+>
+> For the current design and layer ownership, see
+> `Samples~/MinimalTransparent/README.md`. The session-1-through-5 notes
+> below describe what was true at the time and are kept for context —
+> they are **not a guide to the current implementation**.
+
+> **Status (legacy): closed.** Session 5 landed cross-process click-through
+> end-to-end (Notepad caret, Explorer item selection, keyboard focus all
+> work) plus scroll-to-resize for the overlay window and foreground-aware
+> input gating so the cube doesn't keep responding to WASD while the user
+> is typing in another app. Released as v1.2.0 (2026-05-04).
 >
 > The historical session notes below are kept for context — what was tried
-> and ruled out across sessions 1–4 — and to document the full architecture
-> for future contributors. **Skip to the "Resolution (session 5)" section
-> for the final shipping design.**
+> and ruled out across sessions 1–4 — and to document the architecture
+> that was in effect through v1.5.13.
 
 ## Resolution (session 5)
 

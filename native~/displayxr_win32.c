@@ -53,8 +53,11 @@ static int s_overlay_is_toplevel = 0;
 static volatile LONG s_overlay_wheel_accum = 0;
 
 // ============================================================================
-// Transparent overlay mode (issue #57): chroma-key + WS_EX_LAYERED on the
-// parent (Unity top-level) HWND. Mutually exclusive with shell mode.
+// Transparent overlay mode (issue #57): top-level WS_EX_NOREDIRECTIONBITMAP
+// overlay HWND + alpha-native DComp compositing. Unity is cloaked + moved
+// off-screen so transparent-zone clicks route to whatever's behind. The
+// detailed mechanism comment lives near displayxr_set_transparent_overlay
+// below. Mutually exclusive with shell mode.
 // ============================================================================
 
 static DWORD s_saved_style    = 0;

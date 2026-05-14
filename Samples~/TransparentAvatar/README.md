@@ -1,79 +1,85 @@
-# Transparent Avatar Sample (Windows only)
+# Transparent Avatar Sample
 
-Chroma-key transparent overlay for desktop avatar use cases. The capsule
-floats above the Windows desktop with click-through outside its silhouette.
+Alpha-native transparent overlay for desktop avatar use cases. The capsule
+floats above the desktop with click-through outside its silhouette. Works
+on Windows and macOS standalone builds.
 
 Issue: [#57 — Add transparent overlay mode for desktop avatar use case](https://github.com/DisplayXR/displayxr-unity/issues/57)
 
-## Why chroma key (not alpha)?
+## How transparency works
 
-The Leia weaver writes opaque RGB only and the DisplayXR D3D11 compositor uses
-`DXGI_ALPHA_MODE_IGNORE`, so per-pixel alpha doesn't survive end-to-end.
-Workaround: render a magic color in transparent regions of *both* eye views.
-Because `L == R` per sub-pixel in those regions, the weaver passes the magic
-color through unchanged. Then `WS_EX_LAYERED + LWA_COLORKEY` on the top-level
-HWND tells DWM to punch those pixels through to the desktop and route mouse
-input below.
+The OpenXR session is opted into `XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND`,
+so Unity emits per-pixel alpha into the swapchain. The DisplayXR runtime
+captures the desktop content under each tile pre-weave, composes it under
+the atlas RGBA, then alpha-gates post-weave so anti-aliased silhouettes
+carry true soft alpha. The OS composition layer (DComp on Windows via a
+top-level `WS_EX_NOREDIRECTIONBITMAP` overlay HWND; CAMetalLayer on macOS
+via Unity's `setOpaque:NO` NSWindow) does the final blend against the
+desktop.
 
-This sample uses **near-mid-gray `RGB(128, 127, 129)`** instead of the more
-conventional magenta. Both work as keys; gray makes the silhouette-edge halo
-(anti-aliased pixels that partially blend the key color) blend invisibly into
-typical desktop backgrounds, while magenta produces a visible pink fringe.
-Trade-off: avatar materials must avoid `(128, 127, 129)` ±1 — any pixel that
-happens to land exactly on the key after weaving will go transparent. Pure
-magenta is unlikely to appear in real content, gray is not, so be aware of
-the avatar palette.
-
-Full chroma-key rationale, math, and ACT (anti-crosstalk) interactions:
-`displayxr-runtime:docs/reference/chroma-key-transparent-overlay.md`.
+No chroma color, no `LWA_COLORKEY`, no chroma-key fringing on silhouette
+edges. See the longer-form walk-through in
+`Samples~/MinimalTransparent/README.md` (the layer-ownership map and the
+three-mechanism breakdown).
 
 ## What's included
 
-- `TransparentAvatarSetup.cs` — programmatic scene setup. Creates a capsule
-  avatar with a subtle breathing animation, a `DisplayXRDisplay` rig, and a
-  `DisplayXRTransparentOverlay` on the Main Camera.
+- `TransparentAvatarSetup.cs` — programmatic scene setup. Creates a
+  capsule avatar with a subtle breathing animation, a `DisplayXRDisplay`
+  rig, and a `DisplayXRTransparentOverlay` on the Main Camera.
 
 ## Quick start
 
-1. Import this sample via *Package Manager > DisplayXR > Samples > Transparent
-   Avatar (Windows)*.
-2. Create an empty scene, add an empty GameObject, attach `TransparentAvatarSetup`.
-3. **Build a Windows standalone player** — the layered-window path only runs
-   in a build, not in the editor preview.
-4. Run on a Leia SR machine. The capsule appears above the desktop; the gray
-   chroma key is invisible (DWM punches it).
+1. Import this sample via *Package Manager > DisplayXR > Samples >
+   Transparent Avatar*.
+2. Create an empty scene, add an empty GameObject, attach
+   `TransparentAvatarSetup`.
+3. **Build a standalone player** (Windows or macOS) — the native window
+   restyling path only runs in a build, not in the editor preview.
+4. Run. The capsule appears above the desktop; transparent regions blend
+   the desktop through with true per-pixel alpha.
 
 ## Verification checklist
 
-- Capsule renders with no rectangular background — the chroma key is gone.
-- Clicks on the chroma-key region land on the underlying app (taskbar, browser).
-- Clicks on the capsule reach Unity (`OnMouseDown` fires).
-- Capsule pops convincingly in stereo. Transparent regions stay clean
-  (no shimmer, `L == R`).
-- No speckle holes inside the capsule (would mean avatar pixels are landing
-  exactly on `(128, 127, 129)` — adjust palette or tweak the chroma color).
+- Capsule renders with no rectangular background — the surround is
+  truly transparent (you can see the desktop / other windows through).
+- Clicks on the transparent region land on the underlying app (taskbar,
+  browser, etc.).
+- Clicks on the capsule reach Unity (`onPointerClick` fires).
+- Capsule pops convincingly in stereo. Anti-aliased silhouette edges
+  are clean — no chroma fringe, no hard-mask jaggies.
 
 ## Mouse-wheel handling (v1.2.2+)
 
-The plugin previously resized the overlay window on scroll-wheel events as a
-quick test. That was removed in v1.2.2. To use the wheel for anything, poll
-`overlay.ConsumeWheelDelta()` each frame — the plugin still consumes the
-raw `WM_MOUSEWHEEL` (so it doesn't bubble to the underlying app when the
-overlay is foreground) and accumulates the delta for you to read. Common
-pattern: drive a `DisplayXRDisplay` rig's `virtualDisplayHeight` to get a
-zoom-in-window effect (smaller vHeight = more zoom) without changing the
-window size. See `displayxr-unity-test-transparent` for a working example.
+The plugin previously resized the overlay window on scroll-wheel events
+as a quick test. That was removed in v1.2.2. To use the wheel for
+anything, poll `overlay.ConsumeWheelDelta()` each frame — the plugin
+still consumes the raw `WM_MOUSEWHEEL` (so it doesn't bubble to the
+underlying app when the overlay is foreground) and accumulates the delta
+for you to read. Common pattern: drive a `DisplayXRDisplay` rig's
+`virtualDisplayHeight` to get a zoom-in-window effect (smaller vHeight
+= more zoom) without changing the window size. See
+`displayxr-unity-test-transparent` for a working example.
 
-## Known limitations (v1)
+## Plugin / runtime requirements
 
-- Rectangular hit-test (bounding box) only. Per-pixel alpha-mask hit-testing
-  is a future upgrade.
-- Silhouette edges may show a faint chroma halo. With the gray key it's
-  usually invisible; with a saturated key (e.g. magenta) you'd want a
-  feathered border shader or `SetWindowRgn` for a hard polygonal cutout.
-- Don't include the chroma-key color in the avatar's palette — clamp shader
-  outputs near it. With a gray key the constraint is meaningful (gray is
-  common in lit 3D scenes); with magenta it was nearly free.
-- Fullscreen-exclusive games hide topmost layered windows. Document, don't fix.
-- Windows only for v1. macOS equivalent (`NSWindow.isOpaque = NO` +
-  `CAColorMatrixFilter`) is a TODO.
+- Plugin **v1.6.0+** (`DisplayXRTransparentOverlay` no longer paints a
+  chroma color; the `RequestChromaKey` / `chromaKeyColor` API was
+  removed in v1.6.0 — `DisplayXR/displayxr-unity#103`).
+- DisplayXR runtime that advertises `XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND`
+  on the Windows D3D11/D3D12 service compositor and implements the
+  compose-under-bg + alpha-gate DP path. Older runtimes fail
+  `xrEndFrame` validation (same signature as the v1.5.6 → v1.5.12
+  regression: Player.log "is not supported for current Runtime").
+
+## Limitations
+
+- Click-through forwarding is HWND-level. Fullscreen-exclusive games
+  below the overlay hide all topmost windows — that's a Windows
+  compositor behavior, not a plugin issue.
+- On Vulkan, transparency depends on the ICD exposing a non-OPAQUE
+  `compositeAlpha`. Most Win32 ICDs only expose OPAQUE — alpha is
+  dropped at WSI present in that case. D3D11 / D3D12 / Metal work on
+  all GPUs.
+- On OpenGL Win32, transparency requires `WGL_NV_DX_interop2` (NVIDIA /
+  AMD). Intel iGPUs fall back to opaque presentation.

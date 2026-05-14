@@ -170,12 +170,12 @@ public:
 		// swapchain image as PIXEL_SHADER_RESOURCE and lets it decay to
 		// COMMON before the next acquire.
 		//
-		// In transparent sessions (XR_FB_composition_layer_alpha_blend +
-		// chroma key, DComp swapchain on D3D12), the runtime's compositor
-		// path can leave the swapchain image in a non-COMMON state
-		// between frames, breaking implicit promotion. The result was a
-		// SEGV inside CopyTextureRegion on the second xrEndFrame after
-		// the wsui swapchain was created — see issue #82.
+		// In transparent sessions (DComp swapchain on D3D12, alpha-native
+		// compose-under-bg + alpha-gate DP path), the runtime's compositor
+		// can leave the swapchain image in a non-COMMON state between
+		// frames, breaking implicit promotion. The result was a SEGV
+		// inside CopyTextureRegion on the second xrEndFrame after the
+		// wsui swapchain was created — see issue #82.
 		//
 		// Explicit transitions make the copy state-independent: the
 		// resource is forced into the copy state regardless of what the
