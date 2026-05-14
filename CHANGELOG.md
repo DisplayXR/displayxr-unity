@@ -5,6 +5,11 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.10] - 2026-05-14
+
+### Added
+- macOS: `displayxr_macos_set_window_borderless(int enabled)` primitive. Toggles Unity's configured NSWindow between borderless (no title bar / close / minimize / resize chrome — avatar/floating-window look) and the saved original style mask. App-controlled; default behavior unchanged for existing apps. Save/restore symmetric. Drag stays via the cursor-anchored API (begin/update/end_window_drag) — Cocoa's default title-bar drag is gone with the title bar. #98
+
 ## [1.5.9] - 2026-05-14
 
 ### Changed (breaking for consumers using DisplayXRInputController)
