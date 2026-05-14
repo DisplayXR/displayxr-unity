@@ -6,7 +6,7 @@ using UnityEngine;
 namespace DisplayXR.Samples
 {
     /// <summary>
-    /// Minimal starter for the chroma-key transparent overlay technique.
+    /// Minimal starter for the alpha-native transparent overlay technique.
     /// Boots a DisplayXR rig + transparent overlay on Camera.main, drops a
     /// placeholder cube, and runs above the Windows desktop with click-
     /// through outside the cube's silhouette.
@@ -17,29 +17,20 @@ namespace DisplayXR.Samples
     /// </summary>
     public static class MinimalTransparent
     {
-        // Single source of truth — every consumer of the chroma color must
-        // agree (camera clear, Win32 LWA_COLORKEY, runtime post-weave shader).
-        // Near-mid-gray makes silhouette-edge halos blend invisibly into
-        // typical desktops; trade-off is your art must avoid this RGB ±1.
-        static readonly Color s_ChromaKey = new Color(128f / 255f, 127f / 255f, 129f / 255f, 0f);
-
         // PHASE 1: BEFORE xrCreateSession.
         // SubsystemRegistration runs earlier than the OpenXR loader's session
-        // creation, so the runtime sees these flags when constructing
-        // XrWin32WindowBindingCreateInfoEXT (spec v5). OnEnable on a scene
+        // creation, so the runtime sees the transparent-background flag when
+        // constructing XrWin32WindowBindingCreateInfoEXT. OnEnable on a scene
         // component would be too late — the session is already up.
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
         static void Bootstrap()
         {
             DisplayXR.DisplayXRTransparentOverlay.RequestTransparentSession();
-            DisplayXR.DisplayXRTransparentOverlay.RequestChromaKey(s_ChromaKey);
         }
 
         // PHASE 2: AFTER scene load.
         // Attach the rig + overlay to Camera.main and ensure there's
-        // something to render. AddComponent runs OnEnable synchronously; the
-        // chromaKeyColor property setter (v1.2.1+) re-pushes camera bg +
-        // native overlay state on assignment, so this works without toggling.
+        // something to render.
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
         static void Install()
         {
@@ -60,19 +51,16 @@ namespace DisplayXR.Samples
                 cam.gameObject.AddComponent<DisplayXR.DisplayXRDisplay>();
             }
 
-            // Transparent overlay component. Camera clear flips to SolidColor
-            // in OnEnable; the property setter we call right after re-pushes
-            // the chroma color to camera bg + native overlay so all three
-            // sides agree.
+            // Transparent overlay component. The camera clear flips to
+            // SolidColor (0,0,0,0) in OnEnable; the runtime composes the
+            // desktop under each tile pre-weave so the alpha=0 regions show
+            // through to whatever's behind the window.
             var overlay = cam.gameObject.GetComponent<DisplayXR.DisplayXRTransparentOverlay>();
             if (overlay == null)
                 overlay = cam.gameObject.AddComponent<DisplayXR.DisplayXRTransparentOverlay>();
-            overlay.chromaKeyColor = s_ChromaKey;
 
             // Placeholder content if the scene is empty. Replace with your
-            // own avatar / props / etc. Remember to keep their material
-            // colors clear of (128,127,129) ±1 — the runtime's exact-match
-            // chroma pass will punch any matching pixel transparent.
+            // own avatar / props / etc.
             if (Object.FindAnyObjectByType<MeshRenderer>() == null)
             {
                 var cube = GameObject.CreatePrimitive(PrimitiveType.Cube);

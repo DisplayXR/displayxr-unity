@@ -5,6 +5,24 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed (breaking)
+- Windows transparent overlay is now **alpha-native end-to-end** — same path as macOS. Unity emits per-pixel alpha to the swapchain (`SetEnvironmentBlendMode(AlphaBlend)` is no longer gated to macOS) and the runtime DP composes the captured desktop content under each tile pre-weave + alpha-gates post-weave. Anti-aliased silhouettes get true soft alpha; the v1.3.0 "hard-mask alpha (0 or 1) on Leia hardware" known limitation is gone.
+- **Removed** the chroma-color workaround:
+  - `DisplayXRTransparentOverlay.RequestChromaKey(Color)` static method
+  - `DisplayXRTransparentOverlay.chromaKeyColor` field/property
+  - Native `displayxr_set_transparent_chroma_key()` export
+  - Internal `transparent_chroma_key_color` shared state
+  - `colorKey` argument on `displayxr_set_transparent_overlay()` (signature is now `(enabled, topmost)`)
+  - Comments / docs / sample text referring to the chroma color
+  - The Camera clear in `OnEnable` is now unconditionally `(0,0,0,0)` on both Windows and macOS.
+  - Apps that called `RequestChromaKey` will get a compile error; just delete the call — the alpha-native path is automatic. Resolves `DisplayXR/displayxr-unity#103`.
+
+### Compatibility
+- Requires a DisplayXR runtime that (a) advertises `XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND` on the Windows D3D11/D3D12 service compositor and (b) implements the compose-under-bg + alpha-gate DP path (formerly tracked as runtime#190). Older runtimes will fail `xrEndFrame` validation because they don't enumerate `ALPHA_BLEND` — same failure signature as v1.5.6 → v1.5.12. Update both plugin and runtime in lockstep.
+- macOS path unchanged.
+
 ## [1.5.13] - 2026-05-13
 
 ### Fixed

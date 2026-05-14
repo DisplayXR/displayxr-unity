@@ -22,15 +22,12 @@ displayxr_state_init(void)
 {
 	// Preserve flags that may have been set BEFORE install_hooks runs (the
 	// caller of state_init). The C# side writes transparent_background_requested
-	// and transparent_chroma_key_color at SubsystemRegistration, which fires
-	// before the OpenXR loader hooks us.
-	uint8_t  saved_transparent = s_state.transparent_background_requested;
-	uint32_t saved_chroma_key  = s_state.transparent_chroma_key_color;
+	// at SubsystemRegistration, which fires before the OpenXR loader hooks us.
+	uint8_t saved_transparent = s_state.transparent_background_requested;
 
 	memset(&s_state, 0, sizeof(s_state));
 
 	s_state.transparent_background_requested = saved_transparent;
-	s_state.transparent_chroma_key_color     = saved_chroma_key;
 
 	// Default tunables: all factors at 1.0
 	for (int i = 0; i < 2; i++) {

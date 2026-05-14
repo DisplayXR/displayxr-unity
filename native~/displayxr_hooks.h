@@ -97,20 +97,6 @@ DISPLAYXR_EXPORT void displayxr_set_editor_mode(int enabled);
 /// the end of the struct and is harmlessly ignored.
 DISPLAYXR_EXPORT void displayxr_set_transparent_background(int enabled);
 
-/// (issue runtime-pvt #191, spec v5) Set the chroma-key color for the
-/// runtime's post-weave alpha-conversion shader pass. The runtime samples
-/// the post-weave back buffer and writes alpha=0 for pixels whose RGB
-/// matches this key (alpha=1 otherwise) before Present, letting DComp/DWM
-/// blend per-pixel.
-///
-/// @param color  Win32 COLORREF (0x00BBGGRR). Set 0 to disable the pass.
-///               Plugin renders this same color as the camera clear in
-///               transparent regions; the runtime undoes it after weaving.
-///
-/// Same timing constraint as displayxr_set_transparent_background — call
-/// from C# at SubsystemRegistration before xrCreateSession.
-DISPLAYXR_EXPORT void displayxr_set_transparent_chroma_key(uint32_t color);
-
 /// (issue displayxr-unity #85) Configure Unity's main render NSWindow for
 /// transparent overlay mode on macOS. Pass enabled=1 to flip
 /// `setOpaque:NO` + `backgroundColor=clearColor` so per-pixel alpha from
@@ -213,15 +199,15 @@ DISPLAYXR_EXPORT void displayxr_stop_polling(void);
 DISPLAYXR_EXPORT void displayxr_destroy_preview_window(void);
 
 #ifdef _WIN32
-/// (issue #57) Toggle chroma-key transparent overlay mode on the parent
-/// (Unity top-level) HWND. When enabled, the window is flipped to
-/// WS_POPUP | WS_EX_LAYERED with LWA_COLORKEY so DWM punches the chroma color
-/// through to the desktop. Mutually exclusive with shell mode.
-/// @param enabled   Non-zero to enable, zero to restore the original styles.
-/// @param color_key Windows COLORREF (0x00BBGGRR). Typical: 0x00FF00FF (magenta).
-/// @param topmost   Non-zero to add WS_EX_TOPMOST while enabled.
+/// (issue #57) Toggle transparent overlay mode on the parent (Unity top-
+/// level) HWND. Strips decorations, cloaks Unity, moves it off-screen so
+/// click-through routes to desktop apps, and snaps the top-level
+/// NOREDIRECTIONBITMAP overlay HWND to Unity's former rect. Transparency
+/// itself comes from the runtime's DComp visuals + ALPHA_BLEND swapchain;
+/// no OS color key. Mutually exclusive with shell mode.
+/// @param enabled  Non-zero to enable, zero to restore the original styles.
+/// @param topmost  Non-zero to add WS_EX_TOPMOST while enabled.
 DISPLAYXR_EXPORT void displayxr_set_transparent_overlay(int enabled,
-                                                        uint32_t color_key,
                                                         int topmost);
 
 /// (issue #57) Update the rectangular hit-test region used while transparent

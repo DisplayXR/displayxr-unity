@@ -4,7 +4,6 @@
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.Events;
-using UnityEngine.Serialization;
 #if HAS_INPUT_SYSTEM
 using UnityEngine.InputSystem;
 using UnityEngine.InputSystem.LowLevel;
@@ -13,72 +12,34 @@ using UnityEngine.InputSystem.LowLevel;
 namespace DisplayXR
 {
     /// <summary>
-    /// (issue #57) Opt-in chroma-key transparent overlay mode for Windows
+    /// (issue #57) Opt-in transparent overlay mode for Windows and macOS
     /// standalone builds. Drives the avatar/desktop-overlay use case.
     ///
-    /// Background: the Leia weaver writes opaque RGB only and the DisplayXR
-    /// D3D11 compositor uses DXGI_ALPHA_MODE_IGNORE, so per-pixel alpha
-    /// doesn't survive end-to-end. Instead, this component renders a magic
-    /// color (default magenta) in transparent regions of both eye views and
-    /// asks the native plugin to flip the parent HWND to
-    /// WS_POPUP | WS_EX_LAYERED with LWA_COLORKEY so DWM punches those pixels
-    /// through to the desktop.
+    /// Mechanism: the OpenXR session is opted into
+    /// <c>XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND</c> so Unity emits per-pixel
+    /// alpha to the swapchain. The DisplayXR runtime composes the desktop
+    /// under each tile pre-weave and alpha-gates post-weave (D3D11/D3D12/
+    /// Vulkan on Windows; alpha-native Metal on macOS), so anti-aliased
+    /// silhouettes get true soft alpha. On Windows the overlay HWND is
+    /// top-level + WS_EX_NOREDIRECTIONBITMAP so DWM composites it purely
+    /// from the runtime's DComp visuals; on macOS the runtime's CAMetalLayer
+    /// + Unity's NSWindow opacity flip do the same job.
     ///
     /// Click handling: Unity's standard input system (Mouse.current.position,
-    /// OnMouseDown, EventSystem) does NOT work in transparent mode because the
-    /// cloaked Unity HWND is not OS-foreground (documented Unity limitation
-    /// — see CLAUDE.md "Known Issues"). Use the <see cref="onPointerEnter"/>,
-    /// <see cref="onPointerExit"/>, <see cref="onPointerDown"/>,
-    /// <see cref="onPointerUp"/>, <see cref="onPointerClick"/> UnityEvents
-    /// instead. They're driven by per-pixel Physics.Raycast against the
-    /// renderers' colliders, where the ray is built from the polled cursor
-    /// (Win32 GetCursorPos) by inverse-projecting through a cyclopean
-    /// (midpoint-eye) Kooima view+projection — built by averaging the
-    /// runtime's left and right eye matrices. The cyclopean ray lands on
-    /// the cube where the user perceives it after stereo fusion of the two
-    /// rendered eye images. Camera.ScreenPointToRay can't be used because
-    /// Camera.projectionMatrix is the symmetric pre-Kooima projection —
-    /// rays from it miss the collider where the cube actually appears on
-    /// screen.
-    ///
-    /// Windows only. No-op in the editor preview window and on macOS.
+    /// OnMouseDown, EventSystem) does NOT work in Windows transparent mode
+    /// because the cloaked Unity HWND is not OS-foreground (documented Unity
+    /// limitation — see CLAUDE.md "Known Issues"). Use the
+    /// <see cref="onPointerEnter"/>, <see cref="onPointerExit"/>,
+    /// <see cref="onPointerDown"/>, <see cref="onPointerUp"/>,
+    /// <see cref="onPointerClick"/> UnityEvents instead. They're driven by
+    /// per-pixel Physics.Raycast against the renderers' colliders, where the
+    /// ray is built from the polled cursor (Win32 GetCursorPos) by inverse-
+    /// projecting through a cyclopean (midpoint-eye) Kooima view+projection.
     /// </summary>
-    [AddComponentMenu("DisplayXR/Transparent Overlay (Windows)")]
+    [AddComponentMenu("DisplayXR/Transparent Overlay")]
     [RequireComponent(typeof(Camera))]
     public class DisplayXRTransparentOverlay : MonoBehaviour
     {
-        [Header("Chroma key")]
-
-        [Tooltip("Color rendered in transparent regions. Plugin clears the " +
-                 "camera to this RGB; the runtime's post-weave shader pass " +
-                 "(spec v5, runtime-pvt #191) writes alpha=0 for matching " +
-                 "pixels before Present so DComp/DWM blends per-pixel. " +
-                 "Magenta (1,0,1) is the standard pick — pure primary, no " +
-                 "sRGB round-trip drift, unlikely to appear in real content.")]
-        [SerializeField, FormerlySerializedAs("chromaKeyColor")]
-        private Color m_ChromaKeyColor = new Color(1f, 0f, 1f, 0f);
-
-        /// <summary>
-        /// Color rendered in transparent regions. Assignment at runtime is
-        /// safe: the setter immediately re-pushes the new color to both the
-        /// camera clear and the native overlay (LWA_COLORKEY + win32 binding),
-        /// so all three sides — camera clear, layered-window key, runtime
-        /// post-weave — stay in sync without toggling the component.
-        ///
-        /// If you change this from the Inspector at runtime, OnValidate
-        /// re-applies. Pre-build / authoring-time changes are picked up by
-        /// OnEnable as before.
-        /// </summary>
-        public Color chromaKeyColor
-        {
-            get => m_ChromaKeyColor;
-            set
-            {
-                m_ChromaKeyColor = value;
-                ApplyChromaKey();
-            }
-        }
-
         [Header("Window")]
 
         [Tooltip("Keep the window above all others (WS_EX_TOPMOST).")]
@@ -205,22 +166,6 @@ namespace DisplayXR
 #endif
         }
 
-        /// <summary>
-        /// Set the chroma-key color the runtime should convert to alpha=0 in
-        /// its post-weave pass (spec v5 / runtime-pvt #191). Same timing
-        /// constraint as <see cref="RequestTransparentSession"/> — must be
-        /// called BEFORE the OpenXR session is created.
-        /// </summary>
-        /// <param name="color">RGBA. Alpha is ignored (chroma key is RGB-only).
-        /// Pass the same color as the camera clear so the plugin and runtime agree
-        /// on what counts as a transparent pixel.</param>
-        public static void RequestChromaKey(Color color)
-        {
-#if UNITY_STANDALONE_WIN
-            DisplayXRNative.displayxr_set_transparent_chroma_key(ColorRefFromColor(color));
-#endif
-        }
-
         void OnEnable()
         {
             m_Camera = GetComponent<Camera>();
@@ -228,28 +173,21 @@ namespace DisplayXR
                 return;
             m_Feature = DisplayXRFeature.Instance;
 
-            // Always switch the camera to solid-color clear so transparent
-            // regions get the chroma key — even in the editor preview, where
-            // the layered-window path doesn't run. That makes the preview
-            // visually represent what the build will look like.
-            //
-            // On macOS (#85) sim_display is alpha-native — clear straight to
-            // alpha=0 instead of the chroma key. chromaKeyColor is kept on the
-            // inspector for API symmetry but is a no-op on Mac.
+            // Solid-color clear to fully transparent (alpha=0). The session
+            // is in ALPHA_BLEND mode (see DisplayXRFeature.OnInstanceCreate),
+            // so this alpha=0 reaches the swapchain unmodified; the runtime
+            // composes the desktop under each tile before weaving and alpha-
+            // gates post-weave so anti-aliased silhouettes blend cleanly.
             m_SavedClearFlags      = m_Camera.clearFlags;
             m_SavedBackgroundColor = m_Camera.backgroundColor;
             m_SavedRestore         = true;
             m_Camera.clearFlags      = CameraClearFlags.SolidColor;
-#if UNITY_STANDALONE_OSX
             m_Camera.backgroundColor = new Color(0f, 0f, 0f, 0f);
-#else
-            m_Camera.backgroundColor = chromaKeyColor;
-#endif
 
 #if UNITY_STANDALONE_WIN
-            // Layered-window mode is build-only: no top-level Unity HWND we
-            // want to mutate from the editor, and the preview window isn't
-            // the right target.
+            // Native overlay restyle (cloak Unity, top-level NOREDIRECTIONBITMAP
+            // overlay, off-screen Unity HWND for click-through) is build-only:
+            // no top-level Unity HWND we want to mutate from the editor.
             if (Application.isEditor)
                 return;
 
@@ -258,9 +196,8 @@ namespace DisplayXR
             // don't actually depend on focus, but other components might.
             Application.runInBackground = true;
 
-            uint colorRef = ColorRefFromColor(chromaKeyColor);
             DisplayXRNative.displayxr_set_transparent_overlay(
-                1, colorRef, alwaysOnTop ? 1 : 0);
+                1, alwaysOnTop ? 1 : 0);
             // Default hit rect = whole window until LateUpdate refines it.
             DisplayXRNative.displayxr_set_overlay_hit_rect(
                 0, 0, Screen.width, Screen.height);
@@ -692,7 +629,7 @@ namespace DisplayXR
 #if UNITY_STANDALONE_WIN
             if (!Application.isEditor)
             {
-                DisplayXRNative.displayxr_set_transparent_overlay(0, 0, 0);
+                DisplayXRNative.displayxr_set_transparent_overlay(0, 0);
                 DisplayXRNative.displayxr_set_overlay_hit_active(0);
             }
 #elif UNITY_STANDALONE_OSX
@@ -753,53 +690,6 @@ namespace DisplayXR
 #if UNITY_STANDALONE_OSX
         private int m_MacWheelAccum;
 #endif
-
-        // Re-apply the current chroma-key color to the camera clear and the
-        // native overlay. Idempotent — safe to call any time. Early-outs
-        // before OnEnable has run (m_SavedRestore is false): OnEnable will
-        // pick up m_ChromaKeyColor itself and the explicit re-push isn't
-        // needed.
-        private void ApplyChromaKey()
-        {
-            if (!m_SavedRestore || m_Camera == null)
-                return;
-
-#if UNITY_STANDALONE_OSX
-            m_Camera.backgroundColor = new Color(0f, 0f, 0f, 0f);
-#else
-            m_Camera.backgroundColor = m_ChromaKeyColor;
-#endif
-
-#if UNITY_STANDALONE_WIN
-            // Editor preview path skips the layered-window plumbing entirely
-            // (see OnEnable); same gate here.
-            if (Application.isEditor)
-                return;
-            if (!enabled || !gameObject.activeInHierarchy)
-                return;
-            DisplayXRNative.displayxr_set_transparent_overlay(
-                1, ColorRefFromColor(m_ChromaKeyColor),
-                alwaysOnTop ? 1 : 0);
-#endif
-        }
-
-        // Inspector-driven changes go straight to the SerializeField backing
-        // and bypass the property setter, so re-apply manually during Play.
-        // Edit-mode changes fall through to the OnEnable path on next Play.
-        void OnValidate()
-        {
-            if (Application.isPlaying)
-                ApplyChromaKey();
-        }
-
-        // Pack a Unity Color into a Windows COLORREF (0x00BBGGRR).
-        private static uint ColorRefFromColor(Color c)
-        {
-            uint r = (uint)Mathf.Clamp(Mathf.RoundToInt(c.r * 255f), 0, 255);
-            uint g = (uint)Mathf.Clamp(Mathf.RoundToInt(c.g * 255f), 0, 255);
-            uint b = (uint)Mathf.Clamp(Mathf.RoundToInt(c.b * 255f), 0, 255);
-            return (b << 16) | (g << 8) | r;
-        }
 
         // Manual ray-triangle test against the baked skinned mesh.
         // Walks all triangles transforming each through the SMR's current

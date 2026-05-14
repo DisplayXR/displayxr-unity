@@ -155,15 +155,13 @@ void win32_inject_window_binding(XrBaseOutStructure *last, DisplayXRState *state
 	     && state->window_handle != nullptr
 	     && !displayxr_is_shell_mode())
 	    ? XR_TRUE : XR_FALSE;
-	// Spec v5: post-weave chroma-key conversion. Only meaningful when
-	// transparent mode is on. Zero = pass disabled in runtime.
-	win_binding.chromaKeyColor =
-	    (win_binding.transparentBackgroundEnabled == XR_TRUE)
-	    ? state->transparent_chroma_key_color : 0;
-	displayxr_log("[DisplayXR] Injecting win32 window binding: windowHandle=%p, sharedTextureHandle=%p, transparentBackgroundEnabled=%d, chromaKeyColor=0x%08X\n",
+	// Spec v5 chromaKeyColor: post-weave chroma-key conversion is disabled
+	// (runtime uses the compose-under-bg + alpha-gate DP path instead;
+	// Unity emits per-pixel alpha via ALPHA_BLEND environment blend mode).
+	win_binding.chromaKeyColor = 0;
+	displayxr_log("[DisplayXR] Injecting win32 window binding: windowHandle=%p, sharedTextureHandle=%p, transparentBackgroundEnabled=%d, chromaKeyColor=0 (alpha-native)\n",
 	              win_binding.windowHandle, win_binding.sharedTextureHandle,
-	              (int)win_binding.transparentBackgroundEnabled,
-	              (unsigned)win_binding.chromaKeyColor);
+	              (int)win_binding.transparentBackgroundEnabled);
 	last->next = (XrBaseOutStructure *)&win_binding;
 }
 #endif
@@ -742,15 +740,14 @@ hooked_xrCreateSession(XrInstance instance, const XrSessionCreateInfo *createInf
 			     && state->window_handle != nullptr
 			     && !displayxr_is_shell_mode())
 			    ? XR_TRUE : XR_FALSE;
-			// Spec v5: post-weave chroma-key conversion.
-			win_binding.chromaKeyColor =
-			    (win_binding.transparentBackgroundEnabled == XR_TRUE)
-			    ? state->transparent_chroma_key_color : 0;
+			// Spec v5 chromaKeyColor: post-weave chroma-key conversion is
+			// disabled (runtime uses the compose-under-bg + alpha-gate DP
+			// path instead; Unity emits per-pixel alpha via ALPHA_BLEND).
+			win_binding.chromaKeyColor = 0;
 
-			displayxr_log( "[DisplayXR] Injecting win32 window binding: windowHandle=%p, sharedTextureHandle=%p, transparentBackgroundEnabled=%d, chromaKeyColor=0x%08X\n",
+			displayxr_log( "[DisplayXR] Injecting win32 window binding: windowHandle=%p, sharedTextureHandle=%p, transparentBackgroundEnabled=%d, chromaKeyColor=0 (alpha-native)\n",
 			        win_binding.windowHandle, win_binding.sharedTextureHandle,
-			        (int)win_binding.transparentBackgroundEnabled,
-			        (unsigned)win_binding.chromaKeyColor);
+			        (int)win_binding.transparentBackgroundEnabled);
 
 			((XrBaseOutStructure *)last_in_chain)->next = (XrBaseOutStructure *)&win_binding;
 #elif defined(__APPLE__)
@@ -1556,15 +1553,6 @@ displayxr_set_transparent_background(int enabled)
 	state->transparent_background_requested = (uint8_t)(enabled != 0);
 	displayxr_log("[DisplayXR] set_transparent_background: requested=%d\n",
 	              (int)state->transparent_background_requested);
-}
-
-DISPLAYXR_EXPORT void
-displayxr_set_transparent_chroma_key(uint32_t color)
-{
-	DisplayXRState *state = displayxr_get_state();
-	state->transparent_chroma_key_color = color;
-	displayxr_log("[DisplayXR] set_transparent_chroma_key: color=0x%08X\n",
-	              (unsigned)state->transparent_chroma_key_color);
 }
 
 void
