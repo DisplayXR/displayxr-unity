@@ -102,6 +102,28 @@ static int   s_drag_active        = 0;
 static POINT s_drag_anchor_screen = {0, 0};
 static POINT s_drag_anchor_window = {0, 0};
 
+// Target-window drag/resize state. When the user clicks on an underlying
+// app's title bar (HTCAPTION) or resize edge (HTLEFT/HTRIGHT/HTTOP/
+// HTBOTTOM + corners) through a transparent zone, we drive the target's
+// move/resize from our overlay rather than relying on DefWindowProc's
+// SC_MOVE/SC_SIZE modal loops on the target. Those modal loops call
+// GetKeyState(VK_LBUTTON) — which reflects the target thread's
+// queue-synchronous input state, not the live OS state — so they bail
+// immediately when our PostMessage'd WM_NCLBUTTONDOWN arrives without
+// a matching queued key-down state. Bypassing them with overlay-side
+// drag is fully reliable cross-process.
+typedef enum {
+	DXR_TGT_DRAG_NONE   = 0,
+	DXR_TGT_DRAG_MOVE   = 1,   // HTCAPTION
+	DXR_TGT_DRAG_RESIZE = 2,   // HTLEFT/HTRIGHT/HTTOP/HTBOTTOM/HTTOPLEFT/…
+} dxr_tgt_drag_mode_t;
+
+static dxr_tgt_drag_mode_t s_tgt_drag_mode   = DXR_TGT_DRAG_NONE;
+static HWND                s_tgt_drag_hwnd   = NULL;
+static LRESULT             s_tgt_drag_ht     = HTNOWHERE;
+static RECT                s_tgt_drag_rect   = {0, 0, 0, 0}; // target's window rect at DOWN
+static POINT               s_tgt_drag_anchor = {0, 0};        // cursor pos at DOWN
+
 // ============================================================================
 // Shell mode detection
 // ============================================================================
@@ -299,6 +321,146 @@ dxr_nc_button_msg(UINT msg)
 	return 0;
 }
 
+// Direct WM_SYSCOMMAND code for window-action buttons (close, min, max,
+// help). DefWindowProc would normally post these from its
+// WM_NCLBUTTONDOWN modal close-tracking loop on the target — but that
+// loop calls GetKeyState(VK_LBUTTON) which doesn't reflect our
+// PostMessage'd DOWN, so the loop bails before firing the action.
+// We post WM_SYSCOMMAND directly on UP to make the action fire
+// regardless of whether the modal loop ran. Returns 0 for HT codes
+// that don't map to a button action (HTCAPTION → SC_MOVE is handled
+// separately by our custom drag).
+static WPARAM
+dxr_sc_for_ht(LRESULT ht)
+{
+	switch (ht) {
+	case HTCLOSE:     return SC_CLOSE;
+	case HTMINBUTTON: return SC_MINIMIZE;
+	case HTMAXBUTTON: return SC_MAXIMIZE;
+	case HTHELP:      return SC_CONTEXTHELP;
+	}
+	return 0;
+}
+
+// Pick the system cursor matching a non-client hit code, so the cursor
+// adapts as the user moves over a background window's resize edges /
+// help button / sizing corners. NULL means "don't override — keep the
+// default arrow." Title-bar / caption stays arrow (HTCAPTION not
+// listed) matching standard Windows behavior.
+static HCURSOR
+dxr_cursor_for_ht(LRESULT ht)
+{
+	// The IDC_* constants in WinUser.h are unconditionally LPSTR
+	// (MAKEINTRESOURCE expands to LPCSTR in non-UNICODE mode). The W
+	// variant LoadCursorW expects LPCWSTR. The LOWORD-as-resource-id
+	// trick works for either char width, so an LPCWSTR cast is safe.
+	switch (ht) {
+	case HTLEFT:
+	case HTRIGHT:       return LoadCursorW(NULL, (LPCWSTR)IDC_SIZEWE);
+	case HTTOP:
+	case HTBOTTOM:      return LoadCursorW(NULL, (LPCWSTR)IDC_SIZENS);
+	case HTTOPLEFT:
+	case HTBOTTOMRIGHT: return LoadCursorW(NULL, (LPCWSTR)IDC_SIZENWSE);
+	case HTTOPRIGHT:
+	case HTBOTTOMLEFT:  return LoadCursorW(NULL, (LPCWSTR)IDC_SIZENESW);
+	case HTHELP:        return LoadCursorW(NULL, (LPCWSTR)IDC_HELP);
+	}
+	return NULL;
+}
+
+// True if the HT code is a resize edge we drive with custom drag.
+static int
+dxr_ht_is_resize(LRESULT ht)
+{
+	return (ht == HTLEFT  || ht == HTRIGHT  ||
+	        ht == HTTOP   || ht == HTBOTTOM ||
+	        ht == HTTOPLEFT  || ht == HTTOPRIGHT ||
+	        ht == HTBOTTOMLEFT || ht == HTBOTTOMRIGHT);
+}
+
+// Apply a delta to the target's window rect for the active resize
+// edge. Clamps to a small minimum size so the target doesn't collapse.
+static void
+dxr_apply_target_resize(int dx, int dy)
+{
+	RECT r = s_tgt_drag_rect;
+	LRESULT ht = s_tgt_drag_ht;
+
+	if (ht == HTLEFT  || ht == HTTOPLEFT  || ht == HTBOTTOMLEFT)  r.left   = s_tgt_drag_rect.left   + dx;
+	if (ht == HTRIGHT || ht == HTTOPRIGHT || ht == HTBOTTOMRIGHT) r.right  = s_tgt_drag_rect.right  + dx;
+	if (ht == HTTOP   || ht == HTTOPLEFT  || ht == HTTOPRIGHT)    r.top    = s_tgt_drag_rect.top    + dy;
+	if (ht == HTBOTTOM || ht == HTBOTTOMLEFT || ht == HTBOTTOMRIGHT) r.bottom = s_tgt_drag_rect.bottom + dy;
+
+	int w = r.right - r.left;
+	int h = r.bottom - r.top;
+	if (w < 100) {
+		// Clamp by pinning the moving edge — keep the opposite edge stable.
+		if (ht == HTLEFT || ht == HTTOPLEFT || ht == HTBOTTOMLEFT) r.left = r.right - 100;
+		else r.right = r.left + 100;
+		w = 100;
+	}
+	if (h < 50) {
+		if (ht == HTTOP || ht == HTTOPLEFT || ht == HTTOPRIGHT) r.top = r.bottom - 50;
+		else r.bottom = r.top + 50;
+		h = 50;
+	}
+
+	SetWindowPos(s_tgt_drag_hwnd, NULL, r.left, r.top, w, h,
+	             SWP_NOZORDER | SWP_NOACTIVATE);
+}
+
+// Start a target-window drag (move or resize) if the cursor is over a
+// draggable non-client zone of the underlying app. Returns 1 if drag
+// was started (caller should consume the WM_LBUTTONDOWN), 0 otherwise
+// (caller falls back to forward_click).
+static int
+dxr_try_start_target_drag(HWND overlay)
+{
+	dxr_underlying_target_t t;
+	if (!dxr_find_underlying_target(&t))
+		return 0;
+
+	int is_move   = (t.ht == HTCAPTION);
+	int is_resize = dxr_ht_is_resize(t.ht);
+	if (!is_move && !is_resize)
+		return 0;
+
+	s_tgt_drag_mode   = is_move ? DXR_TGT_DRAG_MOVE : DXR_TGT_DRAG_RESIZE;
+	s_tgt_drag_hwnd   = t.root;
+	s_tgt_drag_ht     = t.ht;
+	GetWindowRect(t.root, &s_tgt_drag_rect);
+	s_tgt_drag_anchor = t.cursor;
+	SetCapture(overlay);
+	SetForegroundWindow(t.root);
+
+	wchar_t root_cls[64] = {0};
+	GetClassNameW(t.root, root_cls, 63);
+	displayxr_log("[DisplayXR] target_drag start: mode=%s hwnd=%p[%ls] ht=%ld anchor=(%d,%d) rect=(%d,%d %dx%d)\n",
+	              is_move ? "MOVE" : "RESIZE",
+	              (void *)t.root, root_cls, (long)t.ht,
+	              (int)s_tgt_drag_anchor.x, (int)s_tgt_drag_anchor.y,
+	              (int)s_tgt_drag_rect.left, (int)s_tgt_drag_rect.top,
+	              (int)(s_tgt_drag_rect.right - s_tgt_drag_rect.left),
+	              (int)(s_tgt_drag_rect.bottom - s_tgt_drag_rect.top));
+	return 1;
+}
+
+// End the active target-window drag. Idempotent.
+static void
+dxr_end_target_drag(void)
+{
+	if (s_tgt_drag_mode == DXR_TGT_DRAG_NONE)
+		return;
+	displayxr_log("[DisplayXR] target_drag end: mode=%d hwnd=%p ht=%ld\n",
+	              (int)s_tgt_drag_mode, (void *)s_tgt_drag_hwnd,
+	              (long)s_tgt_drag_ht);
+	s_tgt_drag_mode = DXR_TGT_DRAG_NONE;
+	s_tgt_drag_hwnd = NULL;
+	s_tgt_drag_ht   = HTNOWHERE;
+	if (GetCapture() == s_overlay_hwnd)
+		ReleaseCapture();
+}
+
 // Forward a button event the overlay caught in a transparent zone
 // (Approach C, #57) to the underlying app's control under the cursor.
 //
@@ -394,6 +556,26 @@ forward_click_to_underlying_window(UINT msg, WPARAM wParam)
 
 	LPARAM screen_lp = MAKELPARAM((WORD)t.cursor.x, (WORD)t.cursor.y);
 	PostMessageW(t.root, nc_msg, (WPARAM)t.ht, screen_lp);
+
+	// On WM_LBUTTONUP over a window-action button (close / min / max /
+	// help), also post WM_SYSCOMMAND with the matching SC_* directly.
+	// DefWindowProc's WM_NCLBUTTONDOWN modal close-tracking loop
+	// polls GetKeyState(VK_LBUTTON), which reflects the target thread's
+	// queue-synchronous input state — NOT the live OS state — so our
+	// PostMessage'd DOWN doesn't make the modal loop see the held
+	// button. The loop bails before firing the action. Posting SC_*
+	// directly on UP makes the action fire regardless. The user's UP
+	// cursor position is implicitly the "did they release on the
+	// button?" check — if they dragged off, t.ht reflects the new
+	// hit-test zone and SC_* doesn't fire.
+	if (msg == WM_LBUTTONUP) {
+		WPARAM sc = dxr_sc_for_ht(t.ht);
+		if (sc != 0) {
+			PostMessageW(t.root, WM_SYSCOMMAND, sc, screen_lp);
+			displayxr_log("[DisplayXR] forward_click: posted WM_SYSCOMMAND sc=0x%04X (ht=%ld) on UP\n",
+			              (unsigned)sc, (long)t.ht);
+		}
+	}
 
 	wchar_t root_cls[64] = {0};
 	DWORD root_pid = 0;
@@ -732,11 +914,73 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		s_drag_active = 0;
 		if (was_active)
 			SendMessageW(hwnd, WM_EXITSIZEMOVE, 0, 0);
+		// Capture loss also cancels any in-progress target-drag (move
+		// or resize). Without this, a stuck s_tgt_drag_mode would
+		// hijack the next WM_MOUSEMOVE into a phantom drag.
+		if (s_tgt_drag_mode != DXR_TGT_DRAG_NONE) {
+			s_tgt_drag_mode = DXR_TGT_DRAG_NONE;
+			s_tgt_drag_hwnd = NULL;
+			s_tgt_drag_ht   = HTNOWHERE;
+		}
 		break;
 	}
 
-	// ----- mouse-move: drag overlay if active, else forward to Unity -----
+	// ----- WM_SETCURSOR: adapt cursor to underlying app's hit zone -----
+	// While target-drag is active, lock to the drag-mode cursor
+	// (SIZEALL for move, per-edge for resize). Otherwise, in
+	// transparent zones, peek at the underlying app's WM_NCHITTEST
+	// and load the matching IDC_SIZE* / IDC_HELP. Returning TRUE
+	// suppresses the overlay class's default arrow.
+	case WM_SETCURSOR: {
+		if (!s_overlay_is_toplevel)
+			break;
+		if (s_tgt_drag_mode == DXR_TGT_DRAG_MOVE) {
+			SetCursor(LoadCursorW(NULL, (LPCWSTR)IDC_SIZEALL));
+			return TRUE;
+		}
+		if (s_tgt_drag_mode == DXR_TGT_DRAG_RESIZE) {
+			HCURSOR c = dxr_cursor_for_ht(s_tgt_drag_ht);
+			if (c != NULL) {
+				SetCursor(c);
+				return TRUE;
+			}
+		}
+		if (s_hit_active)
+			break; // cube area: default cursor / Unity handles
+		dxr_underlying_target_t t;
+		if (!dxr_find_underlying_target(&t))
+			break;
+		HCURSOR c = dxr_cursor_for_ht(t.ht);
+		if (c != NULL) {
+			SetCursor(c);
+			return TRUE;
+		}
+		break;
+	}
+
+	// ----- mouse-move: drag overlay / target if active, else forward -----
 	case WM_MOUSEMOVE: {
+		// Target-window drag/resize takes precedence over everything
+		// else — we have SetCapture, so every WM_MOUSEMOVE while
+		// dragging belongs to that gesture.
+		if (s_tgt_drag_mode != DXR_TGT_DRAG_NONE && s_tgt_drag_hwnd != NULL) {
+			POINT cur;
+			GetCursorPos(&cur);
+			int dx = cur.x - s_tgt_drag_anchor.x;
+			int dy = cur.y - s_tgt_drag_anchor.y;
+			if (s_tgt_drag_mode == DXR_TGT_DRAG_MOVE) {
+				int w = s_tgt_drag_rect.right - s_tgt_drag_rect.left;
+				int h = s_tgt_drag_rect.bottom - s_tgt_drag_rect.top;
+				SetWindowPos(s_tgt_drag_hwnd, NULL,
+				             s_tgt_drag_rect.left + dx,
+				             s_tgt_drag_rect.top + dy,
+				             w, h,
+				             SWP_NOZORDER | SWP_NOACTIVATE);
+			} else {
+				dxr_apply_target_resize(dx, dy);
+			}
+			return 0;
+		}
 		if (s_drag_active) {
 			POINT cur;
 			GetCursorPos(&cur);
@@ -766,12 +1010,25 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 	case WM_LBUTTONDOWN: case WM_LBUTTONUP:
 	case WM_LBUTTONDBLCLK:
 	case WM_MBUTTONDOWN: case WM_MBUTTONUP: {
-		// Transparent zone: forward the click to the underlying app
-		// (Approach C). forward_click handles SetForegroundWindow on
-		// press messages so the target activates and takes keyboard
-		// focus — required because we are the foreground process and
-		// the OS won't auto-transfer activation otherwise.
+		// Target-drag UP closes out our captured drag gesture. The
+		// drag's own logic posted nothing to the target, so there's
+		// nothing else to do — just release capture and clear state.
+		if (msg == WM_LBUTTONUP && s_tgt_drag_mode != DXR_TGT_DRAG_NONE) {
+			dxr_end_target_drag();
+			return 0;
+		}
+		// Transparent zone: try to start a target-drag (HTCAPTION /
+		// resize edges) before forwarding. SC_MOVE / SC_SIZE modal
+		// loops on the target are unreliable cross-process because
+		// the target's GetKeyState(VK_LBUTTON) doesn't reflect our
+		// PostMessage'd DOWN. Driving the move/resize from our
+		// overlay with SetCapture is fully reliable.
 		if (!s_hit_active) {
+			if (msg == WM_LBUTTONDOWN &&
+			    s_tgt_drag_mode == DXR_TGT_DRAG_NONE &&
+			    dxr_try_start_target_drag(hwnd)) {
+				return 0;
+			}
 			forward_click_to_underlying_window(msg, wParam);
 			return 0;
 		}
