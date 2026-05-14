@@ -505,20 +505,37 @@ namespace DisplayXR
             int enabled, int topmost);
 
         /// <summary>
-        /// Set the rectangular hit-test region for transparent overlay mode.
-        /// Inside the rect → HTCLIENT; outside → HTTRANSPARENT (click-through).
-        /// Coordinates are client-space pixels (top-left origin).
+        /// Set the rectangular hit-test region of the overlay. Coords
+        /// are overlay client-space pixels (top-left origin).
+        ///
+        /// In transparent WS_POPUP + NOREDIRECTIONBITMAP mode (#57),
+        /// this also drives SetWindowRgn — outside the rect the OS
+        /// treats our window as if it didn't exist (both rendering and
+        /// hit-testing), so input is routed natively to whichever
+        /// desktop window is at the cursor with full fidelity (real
+        /// DefWindowProc modal SC_MOVE/SC_SIZE/SC_CLOSE loops, native
+        /// cursor adaptation, native menu activation, native hover).
+        /// Push the cube/avatar silhouette's screen-space AABB each
+        /// frame. w &lt;= 0 or h &lt;= 0 clears the region (overlay
+        /// catches everywhere — used as init default).
+        ///
+        /// In opaque WS_CHILD mode (legacy/Game-View overlay), this
+        /// updates the rect used by WM_NCHITTEST as a fast
+        /// HTCLIENT-vs-HTTRANSPARENT discriminator.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern void displayxr_set_overlay_hit_rect(
             int x, int y, int w, int h);
 
         /// <summary>
-        /// Per-pixel hit-test override for transparent overlay mode. AND-ed
-        /// with the rect check in WM_NCHITTEST. Set to 1 when the cursor is
-        /// over the cube silhouette (e.g. via Physics.Raycast) and 0 when
-        /// in a transparent zone — lets clicks fall through to the desktop
-        /// even inside the cube's bounding rect.
+        /// Per-pixel hit-test state from the C# raycast. Tracks "is the
+        /// cursor over a clickable renderer?" for callers that want to
+        /// know — but no longer drives the OS hit-test routing. OS
+        /// routing is owned by displayxr_set_overlay_hit_rect, which
+        /// in transparent mode calls SetWindowRgn so areas outside the
+        /// rect are treated by the OS as if our window didn't exist
+        /// (native cross-process click-through). Kept callable for
+        /// backward compat.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern void displayxr_set_overlay_hit_active(int active);

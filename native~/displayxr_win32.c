@@ -1068,6 +1068,33 @@ displayxr_set_transparent_overlay(int enabled, int topmost)
 	}
 }
 
+// Set the rectangular hit-test region of the overlay.
+//
+// In opaque WS_CHILD mode (legacy / Game View overlay): updates
+// s_hit_rect, which WM_NCHITTEST in overlay_wnd_proc / parent_subclass_
+// proc uses as a fast HTCLIENT-vs-HTTRANSPARENT discriminator.
+//
+// In transparent WS_POPUP + NOREDIRECTIONBITMAP mode (issue #57): also
+// drives SetWindowRgn on the overlay HWND. Outside the region, the OS
+// treats our window as if it didn't exist — both rendering and hit-
+// testing — so input is routed natively to whatever desktop window is
+// at the cursor (full cross-process fidelity: real DefWindowProc modal
+// SC_MOVE/SC_SIZE/SC_CLOSE loops with proper GetKeyState, native
+// cursor adaptation, native menu activation, native hover and
+// TrackMouseEvent — without any plugin forwarder gymnastics).
+//
+// Push the screen-space bounding rect of the clickable renderers
+// (cube/avatar silhouette) each frame, converted to overlay client
+// coords (top-left origin). C# already computes this rect via
+// TryGetUnionScreenRect for opaque mode; the same rect drives both
+// paths in transparent mode.
+//
+// SetWindowRgn takes ownership of the HRGN, so we must NOT
+// DeleteObject afterward on success. The previous region (if any) is
+// freed by the OS as part of SetWindowRgn.
+//
+// w<=0 / h<=0 → clear the region (overlay catches everywhere — used
+// as the init default before C# pushes per-frame).
 void
 displayxr_set_overlay_hit_rect(int x, int y, int w, int h)
 {
@@ -1075,6 +1102,38 @@ displayxr_set_overlay_hit_rect(int x, int y, int w, int h)
 	s_hit_rect.top    = y;
 	s_hit_rect.right  = x + w;
 	s_hit_rect.bottom = y + h;
+
+	if (!s_overlay_is_toplevel)
+		return; // opaque WS_CHILD: WM_NCHITTEST consumes s_hit_rect, done.
+	if (s_overlay_hwnd == NULL || !IsWindow(s_overlay_hwnd))
+		return;
+
+	HRGN rgn = NULL;
+	if (w > 0 && h > 0) {
+		rgn = CreateRectRgn(x, y, x + w, y + h);
+		if (rgn == NULL) {
+			displayxr_log("[DisplayXR] hit_region: CreateRectRgn failed (%d,%d %dx%d) err=%lu\n",
+			              x, y, w, h, (unsigned long)GetLastError());
+			return;
+		}
+	}
+	// NULL rgn = clear the region (whole window catches input).
+	if (!SetWindowRgn(s_overlay_hwnd, rgn, TRUE)) {
+		if (rgn != NULL)
+			DeleteObject(rgn);
+		displayxr_log("[DisplayXR] hit_region: SetWindowRgn failed (%d,%d %dx%d) err=%lu\n",
+		              x, y, w, h, (unsigned long)GetLastError());
+		return;
+	}
+	// Throttle the log to ~1 Hz — at 60 fps with a moving cube this
+	// fires every frame.
+	static DWORD s_last_log_tick = 0;
+	DWORD now = GetTickCount();
+	if (now - s_last_log_tick >= 1000) {
+		s_last_log_tick = now;
+		displayxr_log("[DisplayXR] hit_region: (%d,%d %dx%d) on overlay=%p (rgn=%p)\n",
+		              x, y, w, h, (void *)s_overlay_hwnd, (void *)rgn);
+	}
 }
 
 void
@@ -1109,48 +1168,20 @@ displayxr_is_our_process_foreground(void)
 void
 displayxr_set_overlay_hit_active(int active)
 {
+	// Approach B (region-based click-through): s_hit_active still tracks
+	// the C# per-pixel raycast result for callers that want to know "is
+	// the cursor over a clickable renderer?", but it no longer drives the
+	// OS hit-test routing. Routing is owned by SetWindowRgn via
+	// displayxr_set_overlay_hit_region — outside the region the OS treats
+	// our window as if it doesn't exist (native click-through); inside,
+	// the overlay catches the click and posts it to Unity, which runs its
+	// own per-pixel raycast to decide whether to act on it.
 	int new_active = active ? 1 : 0;
 	if (new_active == s_hit_active)
 		return;
 	s_hit_active = new_active;
-
-	// Transparent overlay: toggle WS_EX_TRANSPARENT on the overlay HWND
-	// so the OS hit-test routes natively past us in transparent zones.
-	//
-	//   active=1 (cursor over cube) → CLEAR WS_EX_TRANSPARENT — overlay
-	//   catches WM_LBUTTON*/WM_MOUSEMOVE/WM_MOUSEWHEEL and posts to Unity.
-	//
-	//   active=0 (transparent zone) → SET WS_EX_TRANSPARENT — OS skips us
-	//   in WindowFromPoint and dispatches the event directly to whichever
-	//   desktop window is at the cursor. Unity is moved off-screen at
-	//   (-32000,-32000) in displayxr_set_transparent_overlay so it is
-	//   NOT in the hit-test path; clicks reach the actual desktop window.
-	//
-	// Native OS routing gives us cross-process click activation, real
-	// DefWindowProc modal SC_MOVE/SC_SIZE/SC_CLOSE loops with proper
-	// GetKeyState semantics, native cursor adaptation, native menu
-	// activation, native hover and TrackMouseEvent. Replaces the
-	// PostMessage-forwarder gymnastics from earlier sessions that
-	// failed because the target's queue-synchronous input state never
-	// saw the synthetic events as a real button press.
-	//
-	// No SWP_FRAMECHANGED — the exstyle change alone updates the OS
-	// hit-test routing on the next mouse event. SWP_FRAMECHANGED was
-	// tried in earlier sessions as a defensive cache flush and reverted
-	// (broke hover; see handoff doc).
-	if (s_overlay_is_toplevel && s_overlay_hwnd != NULL && IsWindow(s_overlay_hwnd)) {
-		DWORD ex = (DWORD)GetWindowLongPtrW(s_overlay_hwnd, GWL_EXSTYLE);
-		DWORD new_ex = s_hit_active ? (ex & ~WS_EX_TRANSPARENT)
-		                            : (ex | WS_EX_TRANSPARENT);
-		if (new_ex != ex)
-			SetWindowLongPtrW(s_overlay_hwnd, GWL_EXSTYLE, (LONG_PTR)new_ex);
-		displayxr_log("[DisplayXR] hit_active=%d → WS_EX_TRANSPARENT %s (overlay=%p exstyle=0x%08X)\n",
-		              s_hit_active, s_hit_active ? "OFF (overlay catches)" : "ON  (OS routes past)",
-		              (void *)s_overlay_hwnd, (unsigned)new_ex);
-	} else {
-		displayxr_log("[DisplayXR] hit_active=%d (opaque WS_CHILD mode — toggle no-op)\n",
-		              s_hit_active);
-	}
+	// (No log line per frame — would flood at 60 Hz. The region-update
+	// path logs from displayxr_set_overlay_hit_region instead.)
 }
 
 void
