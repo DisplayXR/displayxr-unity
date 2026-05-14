@@ -141,6 +141,14 @@ DISPLAYXR_EXPORT void displayxr_macos_begin_window_drag(void);
 DISPLAYXR_EXPORT void displayxr_macos_update_window_drag(void);
 DISPLAYXR_EXPORT void displayxr_macos_end_window_drag(void);
 
+/// Toggle Unity's configured NSWindow between borderless (no title bar /
+/// close / minimize / resize chrome) and the saved original style. Apps
+/// that want an avatar / floating-window look call this with enabled=1
+/// after configure_unity_nswindow. Cocoa's title-bar drag is gone with
+/// the title bar — use the cursor-anchored drag API to move the window.
+/// Save/restore is symmetric; set(0) restores. Idempotent.
+DISPLAYXR_EXPORT void displayxr_macos_set_window_borderless(int enabled);
+
 /// Hint the typed-swapchain substitution about Unity's project color space.
 /// Must be called BEFORE Unity creates its OpenXR swapchains (i.e. from the
 /// OpenXR feature's OnInstanceCreate).

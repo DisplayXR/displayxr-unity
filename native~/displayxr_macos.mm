@@ -233,6 +233,52 @@ displayxr_macos_end_window_drag(void) {
 	s_drag_active = NO;
 }
 
+// ---- Borderless window toggle ----
+//
+// Sets / clears the configured Unity NSWindow's style mask between borderless
+// and the saved original (typically titled + closable + miniaturizable +
+// resizable). Use for avatar / overlay apps that want no chrome.
+//
+// The cursor-anchored drag API (displayxr_macos_begin/update/end_window_drag)
+// remains the way to move a borderless window — Cocoa's default title-bar
+// drag is gone with the title bar.
+//
+// Save/restore is symmetric: set(1) snapshots the current style mask;
+// set(0) restores it. Idempotent.
+
+static NSWindowStyleMask s_saved_style_mask = 0;
+static BOOL              s_style_mask_saved = NO;
+
+extern "C" DISPLAYXR_EXPORT void
+displayxr_macos_set_window_borderless(int enabled) {
+	dispatch_block_t block = ^{
+		NSWindow *w = s_configured_window;
+		if (w == nil) {
+			displayxr_log("[DisplayXR] set_window_borderless(%d): no configured NSWindow yet\n", enabled);
+			return;
+		}
+		if (enabled) {
+			if (!s_style_mask_saved) {
+				s_saved_style_mask = w.styleMask;
+				s_style_mask_saved = YES;
+			}
+			// Borderless = 0. Drop every style bit.
+			[w setStyleMask:NSWindowStyleMaskBorderless];
+			displayxr_log("[DisplayXR] set_window_borderless(1): styleMask 0x%lx → borderless\n",
+			              (unsigned long)s_saved_style_mask);
+		} else {
+			if (s_style_mask_saved) {
+				[w setStyleMask:s_saved_style_mask];
+				displayxr_log("[DisplayXR] set_window_borderless(0): restored styleMask 0x%lx\n",
+				              (unsigned long)s_saved_style_mask);
+				s_style_mask_saved = NO;
+			}
+		}
+	};
+	if ([NSThread isMainThread]) block();
+	else dispatch_async(dispatch_get_main_queue(), block);
+}
+
 extern "C" DISPLAYXR_EXPORT void
 displayxr_macos_offset_window(int dx, int dy) {
 	dispatch_block_t block = ^{

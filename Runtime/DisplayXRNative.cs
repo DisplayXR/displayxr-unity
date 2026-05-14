@@ -152,6 +152,15 @@ namespace DisplayXR
         public static extern void displayxr_macos_end_window_drag();
 
         /// <summary>
+        /// Toggle Unity's configured NSWindow between borderless (no title bar /
+        /// close / minimize / resize chrome) and the saved original style.
+        /// Save/restore is symmetric; pass enabled=0 to restore. Idempotent.
+        /// No-op on non-Apple platforms. macOS only.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void displayxr_macos_set_window_borderless(int enabled);
+
+        /// <summary>
         /// Hint the typed-swapchain substitution about the project color space.
         /// 1 = Linear (UNORM_SRGB siblings); 0 = Gamma (UNORM siblings).
         /// Must be called BEFORE Unity creates its OpenXR swapchains.
