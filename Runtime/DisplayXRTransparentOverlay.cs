@@ -565,6 +565,14 @@ namespace DisplayXR
                                | (IsRightPressed ? 2 : 0)
                                | (mouse.middleButton.isPressed ? 4 : 0);
 
+                // Accumulate wheel into Win32-unit accumulator (120 per notch)
+                // so apps can poll via ConsumeWheelDelta() with platform-
+                // identical semantics. Mac's scroll value is "ticks" with
+                // 1.0 == one notch on a standard wheel — multiply by 120.
+                float macWheelY = mouse.scroll.ReadValue().y;
+                if (Mathf.Abs(macWheelY) > 0.001f)
+                    m_MacWheelAccum += Mathf.RoundToInt(macWheelY * 120f);
+
                 // Cyclopean hit-test (per-triangle for SMRs). Identical to the
                 // Win32 path — same helpers, same hysteresis. Overlay size on
                 // Mac is just the Unity window size (no off-screen-HWND quirk
@@ -725,14 +733,26 @@ namespace DisplayXR
         /// </summary>
         public int ConsumeWheelDelta()
         {
+            if (Application.isEditor) return 0;
 #if UNITY_STANDALONE_WIN
-            if (Application.isEditor)
-                return 0;
             return DisplayXRNative.displayxr_consume_overlay_wheel_delta();
+#elif UNITY_STANDALONE_OSX
+            // Mac: no native polling needed — Mouse.current.scroll is cleanly
+            // delivered by Cocoa (no cloaked-HWND quirk). LateUpdate
+            // accumulates into m_MacWheelAccum each frame; this call reads
+            // and zeroes the accumulator, converting to Win32 raw units
+            // (120 per notch) so apps see the same value on both platforms.
+            int acc = m_MacWheelAccum;
+            m_MacWheelAccum = 0;
+            return acc;
 #else
             return 0;
 #endif
         }
+
+#if UNITY_STANDALONE_OSX
+        private int m_MacWheelAccum;
+#endif
 
         // Re-apply the current chroma-key color to the camera clear and the
         // native overlay. Idempotent — safe to call any time. Early-outs
