@@ -132,25 +132,21 @@ namespace DisplayXR
         // (including concavities like the gap between the tiger's
         // legs that an AABB swallows).
         //
-        // CRITICAL — render the mask at *tile resolution*, not window
-        // resolution. The DisplayXR runtime rasterizes eye textures at
-        // tile resolution = (overlayW * scaleX, overlayH * scaleY)
-        // where scaleX/scaleY come from the display info extension
-        // (DisplayXRFeature.DisplayInfo.recommendedViewScaleXY).
-        // Rendering the silhouette at plain window resolution rasterizes
-        // it at a different sub-pixel grid from the actual cube, so
-        // SetWindowRgn's boundary doesn't match the cube's anti-aliased
-        // edge (visible staircase / fringing). Native handles the
-        // tile→window coord rescale internally (takes mask_w,h + dst_w,h).
+        // Mask RT size = overlay client size (= window resolution).
+        // mask_w == dst_w in the native call, so the RECT-coord rescale
+        // is the identity (no rounding errors that would shrink the
+        // silhouette and clip the visible cube). Rendering at any
+        // other resolution — including window × scaleXY (tile
+        // resolution) — forces native's integer scale to truncate
+        // RECT edges and visibly clips the cube boundary.
         //
-        // scaleXY mutates on display-mode switch — recreate the RT
-        // when it changes. Capped at HIT_MASK_MAX_DIM linear for memory
-        // safety on extreme tile resolutions.
+        // Capped at HIT_MASK_MAX_DIM linear for memory safety on
+        // extreme monitor resolutions (8K+).
         //
-        // Cost: a 2K R8 readback is ~4 MB per frame (~240 MB/s at 60 Hz,
-        // trivial over PCIe). RLE produces a few thousand rects for a
-        // typical silhouette → ExtCreateRegion + SetWindowRgn is
-        // sub-millisecond.
+        // Cost: a 1920x1080 R8 readback is ~2 MB per frame (~120 MB/s
+        // at 60 Hz, trivial over PCIe). RLE produces a few thousand
+        // rects for a typical silhouette → ExtCreateRegion + SetWindowRgn
+        // is sub-millisecond.
         private const int HIT_MASK_MAX_DIM = 2048;
         private RenderTexture m_HitMaskRT;
         private int           m_HitMaskW;     // current RT width
@@ -1139,37 +1135,19 @@ namespace DisplayXR
         }
 
         // Build a one-shot CommandBuffer that renders the clickable
-        // renderers to m_HitMaskRT at *tile resolution* (= window size
-        // × scaleXY from display info) with the cyclopean view/proj.
-        // Rendering at tile resolution rather than window resolution
-        // matches the actual sub-pixel rasterization of the cube as
-        // the runtime renders it into eye textures — without this, the
-        // silhouette boundary is shifted by sub-pixel amounts from the
-        // visible cube edge and SetWindowRgn produces a stepped /
-        // fringed edge. Native scales mask coords back to window
-        // space for SetWindowRgn (takes mask_w,h + dst_w,h).
-        // Throttled to one outstanding readback at a time.
+        // renderers to m_HitMaskRT at overlay client (= window)
+        // resolution with the cyclopean view/proj. 1:1 mask→dst
+        // mapping means native's RECT-coord rescale is the identity,
+        // so the silhouette boundary lands on exact overlay pixels
+        // with no rounding. Throttled to one outstanding readback at
+        // a time.
         void RenderHitMaskAndRequestReadback(Matrix4x4 cycView, Matrix4x4 cycProj,
                                               int overlayW, int overlayH)
         {
             if (clickableRenderers == null || clickableRenderers.Length == 0)
                 return;
 
-            // Compute tile resolution from display info. scaleXY can
-            // mutate on display-mode switch — read every frame.
-            float scaleX = 1f, scaleY = 1f;
-            if (m_Feature == null) m_Feature = DisplayXRFeature.Instance;
-            if (m_Feature != null && m_Feature.DisplayInfo.isValid)
-            {
-                if (m_Feature.DisplayInfo.recommendedViewScaleX > 0f)
-                    scaleX = m_Feature.DisplayInfo.recommendedViewScaleX;
-                if (m_Feature.DisplayInfo.recommendedViewScaleY > 0f)
-                    scaleY = m_Feature.DisplayInfo.recommendedViewScaleY;
-            }
-            int tileW = Mathf.Max(1, Mathf.RoundToInt(overlayW * scaleX));
-            int tileH = Mathf.Max(1, Mathf.RoundToInt(overlayH * scaleY));
-
-            EnsureHitMaskResources(tileW, tileH);
+            EnsureHitMaskResources(overlayW, overlayH);
             if (m_SilhouetteMat == null) return;
 
             // Skip rendering if a readback is already in flight — we
