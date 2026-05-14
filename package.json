@@ -27,6 +27,11 @@
   },
   "samples": [
     {
+      "displayName": "Default Input Controller",
+      "description": "WASD + mouse-look + Tab cycle + V mode-toggle + Space reset + F11 fullscreen + I screenshot + ESC quit. Attach to your rig camera GameObject(s). Was a plugin Runtime/ component up to v1.5.8; moved here so apps can own / fork / replace input policy. See README for the `mouseLookEnabled` opt-out and other inspector fields.",
+      "path": "Samples~/DefaultInputController"
+    },
+    {
       "displayName": "Basic Scene",
       "description": "Minimal camera-centric stereo setup with a few objects for testing.",
       "path": "Samples~/BasicScene"
