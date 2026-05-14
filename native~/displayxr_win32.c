@@ -19,8 +19,10 @@
 #include <windowsx.h>
 #include <dwmapi.h>
 #include <limits.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "displayxr_hooks.h"
 #include "displayxr_shared_state.h"
 
@@ -102,6 +104,16 @@ static volatile SHORT s_vkey_state[256];
 static int   s_drag_active        = 0;
 static POINT s_drag_anchor_screen = {0, 0};
 static POINT s_drag_anchor_window = {0, 0};
+
+// True once C# has pushed at least one per-pixel silhouette mask via
+// displayxr_set_overlay_hit_mask. Acts as a one-way upgrade flag — the
+// rect-based displayxr_set_overlay_hit_rect path STOPS calling
+// SetWindowRgn after this flips so the per-pixel mask owns OS routing
+// (much tighter silhouette match, opens up the gap between the tiger's
+// legs and other concavities that an AABB swallows). C# is free to
+// keep calling _hit_rect for opaque-mode users; the rect just becomes
+// hit-test bookkeeping in transparent mode, not the routing driver.
+static int   s_hit_mask_active    = 0;
 
 // ============================================================================
 // Shell mode detection
@@ -1127,6 +1139,10 @@ displayxr_set_overlay_hit_rect(int x, int y, int w, int h)
 		return; // opaque WS_CHILD: WM_NCHITTEST consumes s_hit_rect, done.
 	if (s_overlay_hwnd == NULL || !IsWindow(s_overlay_hwnd))
 		return;
+	// Per-pixel silhouette mask path is active: stop driving the
+	// region from the AABB. Mask owns SetWindowRgn from here on.
+	if (s_hit_mask_active)
+		return;
 
 	// Cache of last applied region rect (post-padding). Sentinel value
 	// {INT_MIN,...} so the first call always goes through. Also reset
@@ -1199,6 +1215,158 @@ displayxr_set_overlay_hit_rect(int x, int y, int w, int h)
 		              padded.left, padded.top,
 		              padded.right - padded.left, padded.bottom - padded.top,
 		              (void *)s_overlay_hwnd);
+	}
+}
+
+// Per-pixel silhouette hit-test region (issue #57 Approach B+).
+//
+// C# renders each clickable Renderer to a small R8 RenderTexture with
+// the Hidden/DisplayXR/Silhouette shader (red=1 where any geometry
+// rasterizes), AsyncGPUReadbacks the result, and hands the bytes to
+// us each frame. We walk the mask row by row, RLE-encoding horizontal
+// runs of opaque pixels into RECTs scaled to overlay client coords,
+// then ExtCreateRegion + SetWindowRgn. Outside the silhouette the OS
+// treats our window as if it didn't exist — clicks/hover route
+// natively to whatever desktop window is at the cursor, including in
+// the gaps that an AABB can't express (between the tiger's legs,
+// above the hat tip, around the curling tail). Per-pixel accurate
+// cross-process click-through with no PostMessage gymnastics.
+//
+// Inputs:
+//   mask:   mask_w * mask_h bytes; non-zero = opaque (catch), zero =
+//           transparent (route past). Typically 256x144 — high enough
+//           to capture detail like leg gaps, low enough that the
+//           readback + RLE per frame is well under the budget.
+//   dst_w, dst_h: overlay client size; each mask pixel covers
+//           dst_w/mask_w by dst_h/mask_h overlay pixels (integer
+//           division — exact for power-of-two ratios, off-by-one at
+//           worst otherwise, which is invisible at 8x upsampling).
+//
+// First successful call sets s_hit_mask_active=1 — the AABB-region
+// path in displayxr_set_overlay_hit_rect stops calling SetWindowRgn
+// from that point on so the per-pixel region owns routing. This is a
+// one-way flag: once a mask has been applied, callers are committed
+// to keeping it fresh each frame (or the OS sees the last mask, which
+// may not match where the cube is now). NULL mask resets the flag
+// and restores the AABB-region path.
+//
+// HRGN ownership: SetWindowRgn takes ownership on success. We must
+// NOT DeleteObject the region we just handed it. The previous region
+// (if any) is freed by the OS as part of the call.
+//
+// Capacity: the worst case for a 256x144 mask is ~36k single-pixel
+// rects (alternating opaque/transparent every pixel of every row),
+// which would be ~580 KB of RECT data — fine but wasteful. Real
+// silhouettes RLE down to a few hundred to a few thousand rects.
+void
+displayxr_set_overlay_hit_mask(const uint8_t *mask, int mask_w, int mask_h,
+                               int dst_w, int dst_h)
+{
+	if (!s_overlay_is_toplevel)
+		return;
+	if (s_overlay_hwnd == NULL || !IsWindow(s_overlay_hwnd))
+		return;
+
+	if (mask == NULL || mask_w <= 0 || mask_h <= 0 ||
+	    dst_w <= 0 || dst_h <= 0) {
+		// NULL/empty: clear and revert to AABB-region path.
+		SetWindowRgn(s_overlay_hwnd, NULL, TRUE);
+		s_hit_mask_active = 0;
+		displayxr_log("[DisplayXR] hit_mask: cleared (reverting to AABB region)\n");
+		return;
+	}
+
+	// Build RECTs into a growable buffer. Initial capacity 1024 is
+	// usually enough for a single contiguous silhouette; we realloc if
+	// fragmentation pushes higher.
+	int  cap = 1024;
+	int  n   = 0;
+	RECT *rects = (RECT *)malloc((size_t)cap * sizeof(RECT));
+	if (rects == NULL)
+		return;
+
+	for (int my = 0; my < mask_h; my++) {
+		const uint8_t *row = mask + (size_t)my * (size_t)mask_w;
+		int top    = (int)((LONGLONG)my       * dst_h / mask_h);
+		int bottom = (int)((LONGLONG)(my + 1) * dst_h / mask_h);
+		int mx = 0;
+		while (mx < mask_w) {
+			while (mx < mask_w && row[mx] == 0) mx++;
+			if (mx >= mask_w) break;
+			int x0 = mx;
+			while (mx < mask_w && row[mx] != 0) mx++;
+			int x1 = mx;
+			if (n >= cap) {
+				int new_cap = cap * 2;
+				RECT *nr = (RECT *)realloc(rects,
+				                           (size_t)new_cap * sizeof(RECT));
+				if (nr == NULL) { free(rects); return; }
+				rects = nr;
+				cap = new_cap;
+			}
+			rects[n].left   = (LONG)((LONGLONG)x0 * dst_w / mask_w);
+			rects[n].top    = (LONG)top;
+			rects[n].right  = (LONG)((LONGLONG)x1 * dst_w / mask_w);
+			rects[n].bottom = (LONG)bottom;
+			n++;
+		}
+	}
+
+	HRGN rgn = NULL;
+	if (n == 0) {
+		// Empty silhouette: 0x0 rect = nothing-catches region.
+		rgn = CreateRectRgn(0, 0, 0, 0);
+	} else {
+		DWORD buf_size = sizeof(RGNDATAHEADER) + (DWORD)n * sizeof(RECT);
+		RGNDATA *data = (RGNDATA *)malloc(buf_size);
+		if (data == NULL) { free(rects); return; }
+
+		data->rdh.dwSize   = sizeof(RGNDATAHEADER);
+		data->rdh.iType    = RDH_RECTANGLES;
+		data->rdh.nCount   = (DWORD)n;
+		data->rdh.nRgnSize = (DWORD)n * sizeof(RECT);
+
+		LONG bl = rects[0].left,  bt = rects[0].top;
+		LONG br = rects[0].right, bb = rects[0].bottom;
+		for (int i = 1; i < n; i++) {
+			if (rects[i].left   < bl) bl = rects[i].left;
+			if (rects[i].top    < bt) bt = rects[i].top;
+			if (rects[i].right  > br) br = rects[i].right;
+			if (rects[i].bottom > bb) bb = rects[i].bottom;
+		}
+		data->rdh.rcBound.left   = bl;
+		data->rdh.rcBound.top    = bt;
+		data->rdh.rcBound.right  = br;
+		data->rdh.rcBound.bottom = bb;
+		memcpy(data->Buffer, rects, (size_t)n * sizeof(RECT));
+
+		rgn = ExtCreateRegion(NULL, buf_size, data);
+		free(data);
+
+		if (rgn == NULL) {
+			displayxr_log("[DisplayXR] hit_mask: ExtCreateRegion failed (n=%d) err=%lu\n",
+			              n, (unsigned long)GetLastError());
+			free(rects);
+			return;
+		}
+	}
+	free(rects);
+
+	if (!SetWindowRgn(s_overlay_hwnd, rgn, TRUE)) {
+		DeleteObject(rgn);
+		displayxr_log("[DisplayXR] hit_mask: SetWindowRgn failed err=%lu\n",
+		              (unsigned long)GetLastError());
+		return;
+	}
+	s_hit_mask_active = 1;
+
+	// Throttle the log to ~1 Hz — runs every frame.
+	static DWORD s_last_log_tick = 0;
+	DWORD now = GetTickCount();
+	if (now - s_last_log_tick >= 1000) {
+		s_last_log_tick = now;
+		displayxr_log("[DisplayXR] hit_mask: mask=%dx%d rects=%d dst=%dx%d\n",
+		              mask_w, mask_h, n, dst_w, dst_h);
 	}
 }
 

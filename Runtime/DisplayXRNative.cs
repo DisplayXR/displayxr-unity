@@ -531,14 +531,36 @@ namespace DisplayXR
         /// Per-pixel hit-test state from the C# raycast. Tracks "is the
         /// cursor over a clickable renderer?" for callers that want to
         /// know — but no longer drives the OS hit-test routing. OS
-        /// routing is owned by displayxr_set_overlay_hit_rect, which
-        /// in transparent mode calls SetWindowRgn so areas outside the
-        /// rect are treated by the OS as if our window didn't exist
-        /// (native cross-process click-through). Kept callable for
-        /// backward compat.
+        /// routing is owned by displayxr_set_overlay_hit_rect (AABB-
+        /// region path) or displayxr_set_overlay_hit_mask (per-pixel
+        /// silhouette path, takes over once any mask has been pushed).
+        /// Kept callable for backward compat.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern void displayxr_set_overlay_hit_active(int active);
+
+        /// <summary>
+        /// (issue #57 Approach B+) Per-pixel silhouette mask drives
+        /// SetWindowRgn for cross-process click-through. <paramref name="mask"/>
+        /// is mask_w*mask_h bytes (non-zero = opaque/overlay catches,
+        /// zero = transparent/OS routes past to whatever desktop window
+        /// is at the cursor), conceptually scaled to overlay client
+        /// size dst_w*dst_h. The native side walks the mask row-by-row,
+        /// RLE-encodes opaque runs as RECTs, ExtCreateRegion's the
+        /// union, and SetWindowRgn's it onto the overlay HWND. Outside
+        /// the silhouette the OS treats our window as if it didn't
+        /// exist — including concavities the AABB swallows (between
+        /// the tiger's legs, around the tail, etc.).
+        ///
+        /// Push from an AsyncGPUReadback callback each frame. NULL
+        /// mask reverts to the AABB-region path. Once any mask is
+        /// applied, displayxr_set_overlay_hit_rect stops driving
+        /// SetWindowRgn — callers committed to the mask path must
+        /// keep it fresh each frame.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void displayxr_set_overlay_hit_mask(
+            IntPtr mask, int mask_w, int mask_h, int dst_w, int dst_h);
 
         /// <summary>
         /// Read cursor position (overlay-client coords, top-left origin) and

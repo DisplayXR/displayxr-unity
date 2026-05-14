@@ -1,9 +1,11 @@
 // Copyright 2026, DisplayXR contributors
 // SPDX-License-Identifier: BSL-1.0
 
+using System;
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.Events;
+using UnityEngine.Rendering;
 #if HAS_INPUT_SYSTEM
 using UnityEngine.InputSystem;
 using UnityEngine.InputSystem.LowLevel;
@@ -119,6 +121,36 @@ namespace DisplayXR
         }
         private static readonly Dictionary<SkinnedMeshRenderer, BakedHit> s_BakedHits
             = new Dictionary<SkinnedMeshRenderer, BakedHit>();
+
+        // Per-pixel silhouette mask (Approach B+, #57). Each frame we
+        // render the clickable renderers to a small R8 RenderTexture
+        // with Hidden/DisplayXR/Silhouette (red=1 where any geometry
+        // rasterizes), AsyncGPUReadback the result, and hand the bytes
+        // to native — which RLEs to RECTs, ExtCreateRegion's, and
+        // SetWindowRgn's. Outside the silhouette the OS routes input
+        // natively to whatever desktop window is at the cursor
+        // (including concavities like the gap between the tiger's
+        // legs that an AABB swallows). Cheap: a 256x144 R8 readback
+        // is ~36 KB per frame.
+        //
+        // Resolution kept low intentionally — the region only needs to
+        // be silhouette-accurate, not feature-accurate. Higher values
+        // increase readback cost and region complexity (more RECTs).
+        private const int  HIT_MASK_WIDTH  = 256;
+        private const int  HIT_MASK_HEIGHT = 144;
+        private RenderTexture m_HitMaskRT;
+        private Material      m_SilhouetteMat;
+        private CommandBuffer m_HitMaskCB;
+        // Only one readback in flight at a time — Unity's
+        // AsyncGPUReadback budget is a few outstanding requests, but
+        // a single one keeps memory + GPU pressure deterministic.
+        private bool m_HitMaskReadbackPending;
+        // Captured at request time so the callback (which runs on a
+        // later main-thread tick) uses the overlay size that was
+        // current when we issued the readback, not whatever the
+        // overlay has resized to since.
+        private int  m_HitMaskPendingDstW;
+        private int  m_HitMaskPendingDstH;
 
         /// <summary>Cursor position in window-client pixels (top-left origin).
         /// Only meaningful in standalone Windows build with transparent mode
@@ -471,6 +503,16 @@ namespace DisplayXR
                 {
                     DisplayXRNative.displayxr_set_overlay_hit_rect(rx, ry, rw, rh);
                 }
+                // Approach B+: render the silhouette to a small RT with
+                // the cyclopean view/proj, AsyncGPUReadback, hand the
+                // mask bytes to native which turns it into a per-pixel
+                // SetWindowRgn. Concavities like the gap between the
+                // tiger's legs are excluded from the region — clicks
+                // there route natively to the desktop. Once the first
+                // mask lands, native ignores subsequent hit_rect calls
+                // (mask wins).
+                RenderHitMaskAndRequestReadback(cycView2, cycProj2,
+                                                overlayW, overlayH);
             }
 #elif UNITY_STANDALONE_OSX
             // (#85) Mac cursor/button polling + cyclopean hit-test mirroring
@@ -642,6 +684,7 @@ namespace DisplayXR
                 DisplayXRNative.displayxr_set_transparent_overlay(0, 0);
                 DisplayXRNative.displayxr_set_overlay_hit_active(0);
             }
+            ReleaseHitMaskResources();
 #elif UNITY_STANDALONE_OSX
             if (!Application.isEditor || Application.isPlaying)
             {
@@ -1025,6 +1068,135 @@ namespace DisplayXR
             w = unionXMax - unionXMin;
             h = unionYMax - unionYMin;
             return w > 0 && h > 0;
+        }
+
+        // -------------------------------------------------------------
+        // Per-pixel silhouette hit mask (Approach B+, issue #57)
+        // -------------------------------------------------------------
+
+        void EnsureHitMaskResources()
+        {
+            if (m_HitMaskRT == null)
+            {
+                m_HitMaskRT = new RenderTexture(HIT_MASK_WIDTH, HIT_MASK_HEIGHT,
+                                                0, RenderTextureFormat.R8)
+                {
+                    filterMode  = FilterMode.Point,
+                    useMipMap   = false,
+                    autoGenerateMips = false,
+                };
+                m_HitMaskRT.Create();
+            }
+            if (m_SilhouetteMat == null)
+            {
+                Shader s = Shader.Find("Hidden/DisplayXR/Silhouette");
+                if (s != null) m_SilhouetteMat = new Material(s) { hideFlags = HideFlags.HideAndDontSave };
+            }
+            if (m_HitMaskCB == null)
+            {
+                m_HitMaskCB = new CommandBuffer { name = "DisplayXR Hit Mask" };
+            }
+        }
+
+        // Build a one-shot CommandBuffer that renders the clickable
+        // renderers to m_HitMaskRT with the cyclopean view/proj (so
+        // the silhouette matches what the user sees on the lenticular
+        // — the stereo-fused position, not either eye's image).
+        // Issue the buffer immediately via Graphics.ExecuteCommandBuffer,
+        // then kick off an AsyncGPUReadback. Throttled to one
+        // outstanding request at a time.
+        void RenderHitMaskAndRequestReadback(Matrix4x4 cycView, Matrix4x4 cycProj,
+                                              int overlayW, int overlayH)
+        {
+            if (clickableRenderers == null || clickableRenderers.Length == 0)
+                return;
+
+            EnsureHitMaskResources();
+            if (m_SilhouetteMat == null) return;
+
+            // Skip rendering if a readback is already in flight — we
+            // don't want to queue multiple frames of GPU work waiting
+            // for the CPU side to drain.
+            if (m_HitMaskReadbackPending) return;
+
+            m_HitMaskCB.Clear();
+            m_HitMaskCB.SetRenderTarget(m_HitMaskRT);
+            m_HitMaskCB.ClearRenderTarget(true, true, Color.clear);
+            // Unity expects a GPU-conventional projection here (Y-flip
+            // and depth remap baked in if the target is an off-screen
+            // RT). GL.GetGPUProjectionMatrix handles both render-API
+            // variants.
+            m_HitMaskCB.SetViewProjectionMatrices(
+                cycView, GL.GetGPUProjectionMatrix(cycProj, true));
+
+            for (int i = 0; i < clickableRenderers.Length; i++)
+            {
+                var r = clickableRenderers[i];
+                if (r == null || !r.enabled || !r.gameObject.activeInHierarchy)
+                    continue;
+                // submesh -1 = all submeshes; CommandBuffer.DrawRenderer
+                // handles SkinnedMeshRenderer GPU skinning automatically.
+                m_HitMaskCB.DrawRenderer(r, m_SilhouetteMat, 0, 0);
+            }
+
+            Graphics.ExecuteCommandBuffer(m_HitMaskCB);
+
+            m_HitMaskPendingDstW = overlayW;
+            m_HitMaskPendingDstH = overlayH;
+            m_HitMaskReadbackPending = true;
+            AsyncGPUReadback.Request(m_HitMaskRT, 0, OnHitMaskReadback);
+        }
+
+        void OnHitMaskReadback(AsyncGPUReadbackRequest req)
+        {
+            m_HitMaskReadbackPending = false;
+            if (req.hasError) return;
+            if (m_HitMaskRT == null) return;
+
+            // Native expects a contiguous byte[] pointer. NativeArray's
+            // backing memory is contiguous; pin it for the P/Invoke
+            // call. We're allowed to read the NativeArray on the main
+            // thread until the next AsyncGPUReadback frame.
+            var data = req.GetData<byte>();
+            unsafe
+            {
+                IntPtr ptr = (IntPtr)Unity.Collections.LowLevel.Unsafe
+                    .NativeArrayUnsafeUtility.GetUnsafeReadOnlyPtr(data);
+                DisplayXRNative.displayxr_set_overlay_hit_mask(
+                    ptr,
+                    HIT_MASK_WIDTH, HIT_MASK_HEIGHT,
+                    m_HitMaskPendingDstW, m_HitMaskPendingDstH);
+            }
+        }
+
+        void ReleaseHitMaskResources()
+        {
+            // Drop the readback flag so OnHitMaskReadback (which may
+            // fire after OnDisable) silently no-ops instead of
+            // dereferencing freed resources.
+            m_HitMaskReadbackPending = false;
+            if (m_HitMaskRT != null)
+            {
+                m_HitMaskRT.Release();
+                Destroy(m_HitMaskRT);
+                m_HitMaskRT = null;
+            }
+            if (m_SilhouetteMat != null)
+            {
+                Destroy(m_SilhouetteMat);
+                m_SilhouetteMat = null;
+            }
+            if (m_HitMaskCB != null)
+            {
+                m_HitMaskCB.Release();
+                m_HitMaskCB = null;
+            }
+            // Tell native to drop the mask region (reverts to AABB-
+            // region path for the next hit_rect push).
+#if UNITY_STANDALONE_WIN
+            if (!Application.isEditor)
+                DisplayXRNative.displayxr_set_overlay_hit_mask(IntPtr.Zero, 0, 0, 0, 0);
+#endif
         }
     }
 }
