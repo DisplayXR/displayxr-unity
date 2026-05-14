@@ -18,6 +18,7 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <dwmapi.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include "displayxr_hooks.h"
@@ -1089,12 +1090,31 @@ displayxr_set_transparent_overlay(int enabled, int topmost)
 // TryGetUnionScreenRect for opaque mode; the same rect drives both
 // paths in transparent mode.
 //
+// Region stability — padding + hysteresis. Skinned-mesh idle
+// animation jitters the screen-space AABB by a few pixels per frame
+// even when the user isn't moving the cube. Without stabilization the
+// region's edge oscillates across a stationary cursor and the OS flips
+// routing every frame (visible as: hover state on the desktop app
+// underneath blinks on/off; cursor adaptation flickers). We address
+// this with two tweaks:
+//   - PADDING_PX (+16 on each side): the region is larger than the
+//     raw silhouette AABB. The cursor must be at least PADDING_PX
+//     outside the silhouette before falling into the OS-routed zone.
+//     Idle jitter can't cross a 16-pixel buffer.
+//   - HYSTERESIS_PX (4): cache the last-applied region rect; skip
+//     SetWindowRgn if the new (padded) rect is within HYSTERESIS_PX
+//     of the last on all four edges. Idle jitter never re-pushes;
+//     only real motion (cube drag, animation re-pose, zoom) does.
+//
 // SetWindowRgn takes ownership of the HRGN, so we must NOT
 // DeleteObject afterward on success. The previous region (if any) is
 // freed by the OS as part of SetWindowRgn.
 //
 // w<=0 / h<=0 → clear the region (overlay catches everywhere — used
 // as the init default before C# pushes per-frame).
+#define DXR_HIT_RECT_PADDING_PX     16
+#define DXR_HIT_RECT_HYSTERESIS_PX  4
+
 void
 displayxr_set_overlay_hit_rect(int x, int y, int w, int h)
 {
@@ -1108,31 +1128,77 @@ displayxr_set_overlay_hit_rect(int x, int y, int w, int h)
 	if (s_overlay_hwnd == NULL || !IsWindow(s_overlay_hwnd))
 		return;
 
-	HRGN rgn = NULL;
-	if (w > 0 && h > 0) {
-		rgn = CreateRectRgn(x, y, x + w, y + h);
-		if (rgn == NULL) {
-			displayxr_log("[DisplayXR] hit_region: CreateRectRgn failed (%d,%d %dx%d) err=%lu\n",
-			              x, y, w, h, (unsigned long)GetLastError());
+	// Cache of last applied region rect (post-padding). Sentinel value
+	// {INT_MIN,...} so the first call always goes through. Also reset
+	// to sentinel when we clear the region (w<=0 path below).
+	static RECT s_last_rgn_rect = { INT_MIN, INT_MIN, INT_MIN, INT_MIN };
+
+	if (w <= 0 || h <= 0) {
+		SetWindowRgn(s_overlay_hwnd, NULL, TRUE);
+		s_last_rgn_rect.left = INT_MIN;
+		displayxr_log("[DisplayXR] hit_region: cleared (overlay catches everywhere)\n");
+		return;
+	}
+
+	// Pad — gives the cursor a hysteresis margin outside the silhouette.
+	RECT padded = {
+		.left   = x - DXR_HIT_RECT_PADDING_PX,
+		.top    = y - DXR_HIT_RECT_PADDING_PX,
+		.right  = x + w + DXR_HIT_RECT_PADDING_PX,
+		.bottom = y + h + DXR_HIT_RECT_PADDING_PX,
+	};
+
+	// Hysteresis — skip the update if all four edges are within the
+	// threshold of the last applied rect. Compares against the PADDED
+	// rect so the comparison is in the same coordinate space as what
+	// we'd push.
+	if (s_last_rgn_rect.left != INT_MIN) {
+		LONG dl = padded.left   - s_last_rgn_rect.left;
+		LONG dt = padded.top    - s_last_rgn_rect.top;
+		LONG dr = padded.right  - s_last_rgn_rect.right;
+		LONG db = padded.bottom - s_last_rgn_rect.bottom;
+		if (dl < 0) dl = -dl;
+		if (dt < 0) dt = -dt;
+		if (dr < 0) dr = -dr;
+		if (db < 0) db = -db;
+		if (dl <= DXR_HIT_RECT_HYSTERESIS_PX &&
+		    dt <= DXR_HIT_RECT_HYSTERESIS_PX &&
+		    dr <= DXR_HIT_RECT_HYSTERESIS_PX &&
+		    db <= DXR_HIT_RECT_HYSTERESIS_PX) {
 			return;
 		}
 	}
-	// NULL rgn = clear the region (whole window catches input).
-	if (!SetWindowRgn(s_overlay_hwnd, rgn, TRUE)) {
-		if (rgn != NULL)
-			DeleteObject(rgn);
-		displayxr_log("[DisplayXR] hit_region: SetWindowRgn failed (%d,%d %dx%d) err=%lu\n",
-		              x, y, w, h, (unsigned long)GetLastError());
+
+	HRGN rgn = CreateRectRgn(padded.left, padded.top, padded.right, padded.bottom);
+	if (rgn == NULL) {
+		displayxr_log("[DisplayXR] hit_region: CreateRectRgn failed (%ld,%ld %ldx%ld) err=%lu\n",
+		              padded.left, padded.top,
+		              padded.right - padded.left, padded.bottom - padded.top,
+		              (unsigned long)GetLastError());
 		return;
 	}
-	// Throttle the log to ~1 Hz — at 60 fps with a moving cube this
-	// fires every frame.
+	// SetWindowRgn takes ownership of rgn on success.
+	if (!SetWindowRgn(s_overlay_hwnd, rgn, TRUE)) {
+		DeleteObject(rgn);
+		displayxr_log("[DisplayXR] hit_region: SetWindowRgn failed (%ld,%ld %ldx%ld) err=%lu\n",
+		              padded.left, padded.top,
+		              padded.right - padded.left, padded.bottom - padded.top,
+		              (unsigned long)GetLastError());
+		return;
+	}
+	s_last_rgn_rect = padded;
+
+	// Throttle the log to ~1 Hz — even with hysteresis a moving cube
+	// re-pushes regularly.
 	static DWORD s_last_log_tick = 0;
 	DWORD now = GetTickCount();
 	if (now - s_last_log_tick >= 1000) {
 		s_last_log_tick = now;
-		displayxr_log("[DisplayXR] hit_region: (%d,%d %dx%d) on overlay=%p (rgn=%p)\n",
-		              x, y, w, h, (void *)s_overlay_hwnd, (void *)rgn);
+		displayxr_log("[DisplayXR] hit_region: raw=(%d,%d %dx%d) padded=(%ld,%ld %ldx%ld) on overlay=%p\n",
+		              x, y, w, h,
+		              padded.left, padded.top,
+		              padded.right - padded.left, padded.bottom - padded.top,
+		              (void *)s_overlay_hwnd);
 	}
 }
 
