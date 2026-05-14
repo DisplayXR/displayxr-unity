@@ -34,15 +34,16 @@ int displayxr_is_shell_mode(void);
 /// @return 1 on success, 0 on failure.
 int displayxr_install_focus_hook(void *unity_hwnd);
 
-/// (issue #57) Toggle chroma-key transparent overlay mode on the parent
-/// (Unity top-level) HWND. When enabled, the window is flipped to
-/// WS_POPUP | WS_EX_LAYERED with LWA_COLORKEY so DWM punches the chroma color
-/// through to the desktop, and WM_NCHITTEST is gated by the rect set via
+/// (issue #57) Toggle transparent overlay mode on the parent (Unity top-
+/// level) HWND. Strips decorations, cloaks Unity, moves it off-screen so
+/// transparent-zone clicks route to whatever's behind, and snaps the top-
+/// level NOREDIRECTIONBITMAP overlay HWND to Unity's former rect.
+/// Transparency itself comes from the runtime's DComp visuals + ALPHA_BLEND
+/// swapchain; no OS color key. WM_NCHITTEST is gated by the rect set via
 /// displayxr_set_overlay_hit_rect(). Mutually exclusive with shell mode.
-/// @param enabled   Non-zero to enable, zero to restore the original styles.
-/// @param color_key Windows COLORREF (0x00BBGGRR). Typical: 0x00FF00FF (magenta).
-/// @param topmost   Non-zero to add WS_EX_TOPMOST while enabled.
-void displayxr_set_transparent_overlay(int enabled, uint32_t color_key, int topmost);
+/// @param enabled  Non-zero to enable, zero to restore the original styles.
+/// @param topmost  Non-zero to add WS_EX_TOPMOST while enabled.
+void displayxr_set_transparent_overlay(int enabled, int topmost);
 
 /// (issue #57) Update the rectangular hit-test region used while transparent
 /// overlay mode is enabled. Inside the rect, WM_NCHITTEST returns HTCLIENT;

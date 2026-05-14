@@ -103,8 +103,9 @@ namespace DisplayXR
         /// Set by <see cref="DisplayXRTransparentOverlay.RequestTransparentSession"/>
         /// before the OpenXR session is created. Drives the
         /// XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND opt-in inside OnInstanceCreate
-        /// so Unity's render path preserves alpha=0 in the swapchain image
-        /// — required for the macOS Cocoa per-pixel transparency path (#85).
+        /// so Unity's render path preserves alpha=0 in the swapchain image —
+        /// required for transparent-overlay mode on both Windows (DComp /
+        /// WS_EX_NOREDIRECTIONBITMAP) and macOS (Cocoa per-pixel).
         /// </summary>
         internal static bool s_TransparentBackgroundRequested;
 
@@ -192,27 +193,18 @@ namespace DisplayXR
                     field.SetValue(settings, OpenXRSettings.RenderMode.MultiPass);
             }
 
-            // (#85) When the app requested transparent background, opt the
-            // session into AlphaBlend so Unity's render path preserves alpha=0
-            // in the swapchain image. Without this Unity writes alpha=1 in
-            // transparent regions and the runtime's alpha-native sim_display
-            // path sees an opaque atlas — visual transparency never reaches
-            // the desktop. Mirror of the cocoa_window_binding bit on
-            // xrCreateSession (native side).
+            // When the app requested transparent background, opt the session
+            // into AlphaBlend so Unity's render path preserves alpha=0 in the
+            // swapchain image. The DisplayXR runtime advertises ALPHA_BLEND on
+            // both Windows (D3D11/D3D12 service, compose-under-bg + alpha-gate
+            // DP path — formerly runtime#190) and macOS (Metal alpha-native).
+            // Unity emits per-pixel alpha to the swapchain; the runtime
+            // composes the desktop under each tile pre-weave and alpha-gates
+            // post-weave so anti-aliased silhouettes get true soft alpha.
             if (s_TransparentBackgroundRequested)
             {
-#if UNITY_STANDALONE_OSX
                 SetEnvironmentBlendMode(XrEnvironmentBlendMode.AlphaBlend);
                 Debug.Log("[DisplayXR] EnvironmentBlendMode = AlphaBlend (transparent session)");
-#else
-                // Windows DisplayXR runtime (≤ v1.3.0-6) does not enumerate
-                // XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND. Calling SetEnvironmentBlendMode
-                // here causes Unity's OpenXR loader to reject it and every subsequent
-                // xrEndFrame fails with XR_ERROR_VALIDATION_FAILURE → content never
-                // reaches the swapchain. Windows transparency uses the chroma-key
-                // path instead (RequestChromaKey + runtime compositor), which works
-                // without an alpha-blend session.
-#endif
             }
 
             Debug.Log("[DisplayXR] OpenXR instance created");

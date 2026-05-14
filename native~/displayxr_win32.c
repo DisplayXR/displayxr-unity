@@ -869,28 +869,32 @@ displayxr_get_unity_main_hwnd(void)
 // ============================================================================
 // Transparent overlay mode (issue #57)
 //
-// Per-pixel-alpha transparent overlay for desktop avatar use cases. End-to-end
-// transparency is composed in two layers:
+// Per-pixel-alpha transparent overlay for desktop avatar use cases. End-to-end:
 //
-//   1) Runtime DP post-weave pass (spec v5 / runtime-pvt #191): the app paints
-//      a bridge "chroma" color in transparent regions of both eye views and
-//      passes it to the runtime via XrWin32WindowBindingCreateInfoEXT.
-//      chromaKeyColor (filled in displayxr_hooks.cpp xrCreateSession path).
-//      The runtime's DP converts matching RGB to alpha=0 IN THE SWAPCHAIN
-//      CONTENT before present. This is the only role the "chroma key" plays —
-//      it is NOT an OS color key.
+//   1) The OpenXR session is opted into XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND
+//      (see DisplayXRFeature.OnInstanceCreate), so Unity emits real per-pixel
+//      alpha into the swapchain — including alpha=0 for transparent camera
+//      clears. The plugin sets chromaKeyColor=0 in the binding extension
+//      (see displayxr_hooks.cpp), telling the runtime to skip the legacy
+//      post-weave chroma-key conversion: it isn't needed.
 //
-//   2) DComp + WS_EX_NOREDIRECTIONBITMAP overlay HWND: the overlay is created
-//      top-level with WS_EX_NOREDIRECTIONBITMAP in displayxr_get_app_main_view,
-//      so DWM has no opaque redirection surface and composites the HWND purely
-//      from the DComp visuals the runtime attached. Real per-pixel alpha then
-//      shows the desktop through alpha=0 regions natively.
+//   2) The runtime DP uses the compose-under-bg + alpha-gate path: it captures
+//      the desktop background under each tile pre-weave, blends with the
+//      atlas RGBA, then alpha-gates post-weave so silhouettes carry true
+//      anti-aliased alpha. Fully replaces the older chroma-color sentinel.
+//
+//   3) The overlay HWND is top-level WS_POPUP with WS_EX_NOREDIRECTIONBITMAP
+//      (created in displayxr_get_app_main_view), so DWM has no opaque
+//      redirection surface and composites the HWND purely from the DComp
+//      visuals the runtime attached. Real per-pixel alpha shows the desktop
+//      through alpha=0 regions natively.
 //
 // IMPORTANT: we do NOT use WS_EX_LAYERED / LWA_COLORKEY. The set_transparent_
 // overlay function below explicitly STRIPS WS_EX_LAYERED off Unity's HWND if
-// it was there. (Prior versions of this file did use LWA_COLORKEY before the
-// runtime DP chroma→alpha pass and WS_EX_NOREDIRECTIONBITMAP overlay landed —
-// any commentary or doc still describing that approach is stale.)
+// it was there. Earlier versions of this plugin DID paint a magenta/gray
+// chroma color in the camera clear and rely on the runtime DP's post-weave
+// chroma→alpha conversion — that workaround is gone now that the runtime
+// advertises ALPHA_BLEND and Unity emits true alpha.
 //
 // Click-through is independent of all of the above: WM_NCHITTEST returns
 // HTCLIENT when s_hit_active=1 (cursor over a clickable renderer), else
@@ -901,10 +905,10 @@ displayxr_get_unity_main_hwnd(void)
 // ============================================================================
 
 void
-displayxr_set_transparent_overlay(int enabled, uint32_t color_key, int topmost)
+displayxr_set_transparent_overlay(int enabled, int topmost)
 {
-	displayxr_log("[DisplayXR] transparent_overlay: called enabled=%d key=0x%08X topmost=%d shell=%d\n",
-	              enabled, (unsigned)color_key, topmost, displayxr_is_shell_mode());
+	displayxr_log("[DisplayXR] transparent_overlay: called enabled=%d topmost=%d shell=%d\n",
+	              enabled, topmost, displayxr_is_shell_mode());
 
 	if (displayxr_is_shell_mode())
 		return;
@@ -1050,10 +1054,6 @@ displayxr_set_transparent_overlay(int enabled, uint32_t color_key, int topmost)
 		// path. Idempotent — safe to call here even though the hook is
 		// also installed in the shell-mode branch of xrCreateSession.
 		displayxr_install_focus_hook(hwnd);
-
-		// color_key parameter is informational only — runtime owns the
-		// chroma key via the binding struct's chromaKeyColor field.
-		(void)color_key;
 
 		s_overlay_active = 1;
 		displayxr_log("[DisplayXR] transparent_overlay: enabled (topmost=%d, child=%p) — overlay is top-level + NOREDIRECTIONBITMAP; Unity parent cloaked; transparency owned by runtime DComp\n",

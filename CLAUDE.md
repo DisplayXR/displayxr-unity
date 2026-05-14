@@ -304,7 +304,7 @@ Three sibling Unity projects exercise the plugin against different feature areas
 | Repo | Focus | Notes |
 |------|-------|-------|
 | [`DisplayXR/displayxr-unity-test`](https://github.com/DisplayXR/displayxr-unity-test) | Baseline rendering / stereo correctness | Plain cube + camera-centric and display-centric rigs |
-| [`DisplayXR/displayxr-unity-test-transparent`](https://github.com/DisplayXR/displayxr-unity-test-transparent) | Transparent overlay + chroma key + click-through (#57 family) | Tiger FBX clickable, foreground-only render |
+| [`DisplayXR/displayxr-unity-test-transparent`](https://github.com/DisplayXR/displayxr-unity-test-transparent) | Transparent overlay + click-through (#57 family, alpha-native) | Tiger FBX clickable, foreground-only render |
 | [`DisplayXR/displayxr-unity-test-2d-ui`](https://github.com/DisplayXR/displayxr-unity-test-2d-ui) | 2D UI window-space composition layer | Tuning panel built from `DisplayXRWindowSpaceUI` |
 
 All three pin the plugin via `https://github.com/DisplayXR/displayxr-unity.git#upm` (floating; tracks latest release).

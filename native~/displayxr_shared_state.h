@@ -135,12 +135,6 @@ typedef struct DisplayXRState {
     // runtime's BitBlt (D3D11) or DComp (D3D12) swapchain path.
     uint8_t transparent_background_requested;
 
-    // Chroma-key color for the runtime's post-weave alpha conversion (spec v5).
-    // Win32 COLORREF (0x00BBGGRR). When non-zero AND transparent_background_requested
-    // is true, the runtime writes alpha=0 for swapchain pixels matching this RGB
-    // before Present, letting DComp/DWM blend per-pixel. Zero = pass disabled.
-    uint32_t transparent_chroma_key_color;
-
     // Color-space hint for typed-swapchain substitution (D3D11).
     // 1 = use DXGI_FORMAT_R8G8B8A8_UNORM_SRGB (matches Unity Linear color space).
     // 0 = use DXGI_FORMAT_R8G8B8A8_UNORM (matches Unity Gamma color space; also
