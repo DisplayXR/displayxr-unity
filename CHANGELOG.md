@@ -5,6 +5,11 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.12] - 2026-05-14
+
+### Fixed
+- macOS: `displayxr_macos_set_window_borderless` switched to true `NSWindowStyleMaskBorderless` (= 0). v1.5.11's "titled but visually empty" approach left a 1-2 px top-edge contour visible. The earlier concern that mask=0 would break keyboard input (per Cocoa's default `canBecomeKeyWindow=NO`) turned out to be a separate bug (sample's `HAS_INPUT_SYSTEM` gate, fixed in v1.5.11). Empirically Unity's `PlayerWindow` overrides `canBecomeKeyWindow` to return YES regardless of mask, so true borderless works for keyboard. Retains the defensive `makeKeyAndOrderFront:` + `activateIgnoringOtherApps:` after the styleMask change. #101
+
 ## [1.5.11] - 2026-05-14
 
 ### Fixed
