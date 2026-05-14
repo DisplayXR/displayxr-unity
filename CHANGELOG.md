@@ -5,6 +5,11 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.13] - 2026-05-13
+
+### Fixed
+- Windows transparent overlay regression from #85: `SetEnvironmentBlendMode(AlphaBlend)` is now gated to macOS. The Windows DisplayXR runtime (<= v1.3.0-6) does not enumerate `ALPHA_BLEND`, so Unity rejected the call and every `xrEndFrame` failed validation — content never reached the swapchain. Windows transparency continues to use the chroma-key path.
+
 ## [1.5.12] - 2026-05-14
 
 ### Fixed
