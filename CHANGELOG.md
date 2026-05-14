@@ -5,6 +5,12 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.11] - 2026-05-14
+
+### Fixed
+- `Samples~/DefaultInputController/DisplayXRInputController.cs` (default input sample): switched the input-system gate from `HAS_INPUT_SYSTEM` to `ENABLE_INPUT_SYSTEM`. `HAS_INPUT_SYSTEM` is the plugin's internal `versionDefines` symbol — only visible inside the plugin's asmdef. After the v1.5.9 refactor moved the sample into user `Assets/`, the symbol wasn't defined there, so the keyboard helpers fell through to legacy `Input.GetKey` (returns false in projects using New Input System only). WASD / V / Space / I / F11 silently broken in the sample since v1.5.9. `ENABLE_INPUT_SYSTEM` is Unity's official symbol set by Player Settings → Active Input Handling, visible to all assemblies. #100
+- macOS: `displayxr_macos_set_window_borderless` now defensively re-keys the window after the styleMask change (`makeKeyAndOrderFront:` + `NSApp activateIgnoringOtherApps:`). In observed runs the Cocoa default kept the window key on its own, but this guards against future quirks. Also slims diagnostic logs from three lines to one. #100
+
 ## [1.5.10] - 2026-05-14
 
 ### Added
