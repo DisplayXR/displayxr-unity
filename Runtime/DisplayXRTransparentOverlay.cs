@@ -516,15 +516,17 @@ namespace DisplayXR
                 {
                     DisplayXRNative.displayxr_set_overlay_hit_rect(rx, ry, rw, rh);
                 }
-                // Approach B+: render the silhouette to a small RT with
-                // the cyclopean view/proj, AsyncGPUReadback, hand the
-                // mask bytes to native which turns it into a per-pixel
-                // SetWindowRgn. Concavities like the gap between the
-                // tiger's legs are excluded from the region — clicks
-                // there route natively to the desktop. Once the first
-                // mask lands, native ignores subsequent hit_rect calls
-                // (mask wins).
-                RenderHitMaskAndRequestReadback(cycView2, cycProj2,
+                // Approach B+: render the silhouette to a small RT
+                // PER EYE (union of left and right view passes), then
+                // AsyncGPUReadback the union mask to native which turns
+                // it into a per-pixel SetWindowRgn. The union matters
+                // because each lenticular column shows a different
+                // view, so the screen-visible silhouette is the union
+                // of every view's projected silhouette — most divergent
+                // at high-disparity (foreground) geometry. The
+                // cyclopean projection alone lands BETWEEN the two
+                // eye silhouettes and would clip them at the edges.
+                RenderHitMaskAndRequestReadback(lv2, lp2, rv2, rp2,
                                                 overlayW, overlayH);
             }
 #elif UNITY_STANDALONE_OSX
@@ -1135,14 +1137,27 @@ namespace DisplayXR
         }
 
         // Build a one-shot CommandBuffer that renders the clickable
-        // renderers to m_HitMaskRT at overlay client (= window)
-        // resolution with the cyclopean view/proj. 1:1 mask→dst
-        // mapping means native's RECT-coord rescale is the identity,
-        // so the silhouette boundary lands on exact overlay pixels
-        // with no rounding. Throttled to one outstanding readback at
-        // a time.
-        void RenderHitMaskAndRequestReadback(Matrix4x4 cycView, Matrix4x4 cycProj,
-                                              int overlayW, int overlayH)
+        // renderers to m_HitMaskRT once per eye, at overlay client
+        // resolution. Each pass writes red=1 wherever any geometry
+        // rasterizes; the R8 RT accumulates the UNION across passes
+        // (shader writes the constant 1 with no blend, so subsequent
+        // passes leave covered pixels at 1 and only add to the set).
+        // The union is what the lenticular actually shows — each
+        // column displays a different view, so the screen-visible
+        // silhouette is the union of every view's silhouette.
+        // Per-eye union also subsumes the cyclopean projection: at
+        // any pixel either eye covers, the mask is 1. High-disparity
+        // (foreground) geometry no longer gets clipped at the edges
+        // by the SetWindowRgn boundary.
+        //
+        // 1:1 mask→dst mapping (mask_w == overlayW) means native's
+        // RECT-coord rescale is the identity — no rounding, no
+        // truncation, silhouette boundary lands on exact overlay
+        // pixels. Throttled to one outstanding readback at a time.
+        void RenderHitMaskAndRequestReadback(
+            Matrix4x4 leftView,  Matrix4x4 leftProj,
+            Matrix4x4 rightView, Matrix4x4 rightProj,
+            int overlayW, int overlayH)
         {
             if (clickableRenderers == null || clickableRenderers.Length == 0)
                 return;
@@ -1158,28 +1173,33 @@ namespace DisplayXR
             m_HitMaskCB.Clear();
             m_HitMaskCB.SetRenderTarget(m_HitMaskRT);
             m_HitMaskCB.ClearRenderTarget(true, true, Color.clear);
-            // Unity expects a GPU-conventional projection here (Y-flip
-            // and depth remap baked in if the target is an off-screen
-            // RT). GL.GetGPUProjectionMatrix handles both render-API
-            // variants.
-            m_HitMaskCB.SetViewProjectionMatrices(
-                cycView, GL.GetGPUProjectionMatrix(cycProj, true));
 
+            // Pass 1: left eye. GL.GetGPUProjectionMatrix bakes in
+            // Y-flip + depth-range conversion for off-screen RTs.
+            m_HitMaskCB.SetViewProjectionMatrices(
+                leftView, GL.GetGPUProjectionMatrix(leftProj, true));
             for (int i = 0; i < clickableRenderers.Length; i++)
             {
                 var r = clickableRenderers[i];
                 if (r == null || !r.enabled || !r.gameObject.activeInHierarchy)
                     continue;
-                // submesh -1 = all submeshes; CommandBuffer.DrawRenderer
-                // handles SkinnedMeshRenderer GPU skinning automatically.
+                m_HitMaskCB.DrawRenderer(r, m_SilhouetteMat, 0, 0);
+            }
+
+            // Pass 2: right eye. Accumulates into the same RT —
+            // pixels covered by either eye end up at 1 (union).
+            m_HitMaskCB.SetViewProjectionMatrices(
+                rightView, GL.GetGPUProjectionMatrix(rightProj, true));
+            for (int i = 0; i < clickableRenderers.Length; i++)
+            {
+                var r = clickableRenderers[i];
+                if (r == null || !r.enabled || !r.gameObject.activeInHierarchy)
+                    continue;
                 m_HitMaskCB.DrawRenderer(r, m_SilhouetteMat, 0, 0);
             }
 
             Graphics.ExecuteCommandBuffer(m_HitMaskCB);
 
-            // Capture all four sizes — the actual RT (possibly capped
-            // below tile if it exceeded HIT_MASK_MAX_DIM) and the
-            // window destination for native to rescale coords.
             m_HitMaskPendingMaskW = m_HitMaskW;
             m_HitMaskPendingMaskH = m_HitMaskH;
             m_HitMaskPendingDstW  = overlayW;
