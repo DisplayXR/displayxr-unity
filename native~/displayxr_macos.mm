@@ -233,21 +233,35 @@ displayxr_macos_end_window_drag(void) {
 	s_drag_active = NO;
 }
 
-// ---- Borderless window toggle ----
+// ---- Borderless-looking window toggle (keyboard-friendly) ----
 //
-// Sets / clears the configured Unity NSWindow's style mask between borderless
-// and the saved original (typically titled + closable + miniaturizable +
-// resizable). Use for avatar / overlay apps that want no chrome.
+// "Borderless" here means visually borderless — no title bar, no traffic-
+// light buttons. We deliberately KEEP NSWindowStyleMaskTitled in the
+// styleMask, because Cocoa's default [NSWindow canBecomeKeyWindow] returns
+// NO for true-borderless windows (mask == 0), which breaks keyboard input
+// delivery to the Unity input system (WASD, V, Tab, etc. all stop working).
 //
-// The cursor-anchored drag API (displayxr_macos_begin/update/end_window_drag)
-// remains the way to move a borderless window — Cocoa's default title-bar
-// drag is gone with the title bar.
+// To get the avatar look without losing key events:
+//   - keep NSWindowStyleMaskTitled (window remains key-acceptable)
+//   - drop Closable / Miniaturizable / Resizable so the chrome area
+//     doesn't host their hit zones
+//   - titlebarAppearsTransparent = YES → contentView extends under the
+//     title bar area (no separate vertical strip)
+//   - titleVisibility = NSWindowTitleHidden → title text suppressed
+//   - hide standardWindowButton:NSWindowCloseButton / Miniaturize / Zoom
+//     so the traffic lights don't draw
 //
-// Save/restore is symmetric: set(1) snapshots the current style mask;
-// set(0) restores it. Idempotent.
+// Drag stays via the cursor-anchored API (begin/update/end_window_drag).
+//
+// Save/restore is symmetric. Idempotent.
 
 static NSWindowStyleMask s_saved_style_mask = 0;
-static BOOL              s_style_mask_saved = NO;
+static BOOL              s_saved_titlebar_transparent = NO;
+static NSWindowTitleVisibility s_saved_title_visibility = NSWindowTitleVisible;
+static BOOL              s_saved_close_btn_hidden = NO;
+static BOOL              s_saved_min_btn_hidden = NO;
+static BOOL              s_saved_zoom_btn_hidden = NO;
+static BOOL              s_borderless_saved = NO;
 
 extern "C" DISPLAYXR_EXPORT void
 displayxr_macos_set_window_borderless(int enabled) {
@@ -257,21 +271,44 @@ displayxr_macos_set_window_borderless(int enabled) {
 			displayxr_log("[DisplayXR] set_window_borderless(%d): no configured NSWindow yet\n", enabled);
 			return;
 		}
+		NSButton *closeBtn = [w standardWindowButton:NSWindowCloseButton];
+		NSButton *minBtn   = [w standardWindowButton:NSWindowMiniaturizeButton];
+		NSButton *zoomBtn  = [w standardWindowButton:NSWindowZoomButton];
+
 		if (enabled) {
-			if (!s_style_mask_saved) {
-				s_saved_style_mask = w.styleMask;
-				s_style_mask_saved = YES;
+			if (!s_borderless_saved) {
+				s_saved_style_mask           = w.styleMask;
+				s_saved_titlebar_transparent = w.titlebarAppearsTransparent;
+				s_saved_title_visibility     = w.titleVisibility;
+				s_saved_close_btn_hidden     = closeBtn ? closeBtn.hidden : NO;
+				s_saved_min_btn_hidden       = minBtn   ? minBtn.hidden   : NO;
+				s_saved_zoom_btn_hidden      = zoomBtn  ? zoomBtn.hidden  : NO;
+				s_borderless_saved = YES;
 			}
-			// Borderless = 0. Drop every style bit.
-			[w setStyleMask:NSWindowStyleMaskBorderless];
-			displayxr_log("[DisplayXR] set_window_borderless(1): styleMask 0x%lx → borderless\n",
-			              (unsigned long)s_saved_style_mask);
+			// Keep Titled (key-capable), drop the other chrome bits so the
+			// title-bar area doesn't host hit zones for close/min/resize.
+			NSWindowStyleMask mask = s_saved_style_mask;
+			mask |= NSWindowStyleMaskTitled;
+			mask &= ~(NSWindowStyleMaskClosable
+			         | NSWindowStyleMaskMiniaturizable
+			         | NSWindowStyleMaskResizable);
+			[w setStyleMask:mask];
+			[w setTitlebarAppearsTransparent:YES];
+			[w setTitleVisibility:NSWindowTitleHidden];
+			if (closeBtn != nil) closeBtn.hidden = YES;
+			if (minBtn   != nil) minBtn.hidden   = YES;
+			if (zoomBtn  != nil) zoomBtn.hidden  = YES;
+			displayxr_log("[DisplayXR] set_window_borderless(1): titled-transparent applied (key-capable)\n");
 		} else {
-			if (s_style_mask_saved) {
+			if (s_borderless_saved) {
 				[w setStyleMask:s_saved_style_mask];
-				displayxr_log("[DisplayXR] set_window_borderless(0): restored styleMask 0x%lx\n",
-				              (unsigned long)s_saved_style_mask);
-				s_style_mask_saved = NO;
+				[w setTitlebarAppearsTransparent:s_saved_titlebar_transparent];
+				[w setTitleVisibility:s_saved_title_visibility];
+				if (closeBtn != nil) closeBtn.hidden = s_saved_close_btn_hidden;
+				if (minBtn   != nil) minBtn.hidden   = s_saved_min_btn_hidden;
+				if (zoomBtn  != nil) zoomBtn.hidden  = s_saved_zoom_btn_hidden;
+				s_borderless_saved = NO;
+				displayxr_log("[DisplayXR] set_window_borderless(0): restored chrome\n");
 			}
 		}
 	};
