@@ -123,23 +123,35 @@ namespace DisplayXR
             = new Dictionary<SkinnedMeshRenderer, BakedHit>();
 
         // Per-pixel silhouette mask (Approach B+, #57). Each frame we
-        // render the clickable renderers to a small R8 RenderTexture
-        // with Hidden/DisplayXR/Silhouette (red=1 where any geometry
-        // rasterizes), AsyncGPUReadback the result, and hand the bytes
-        // to native — which RLEs to RECTs, ExtCreateRegion's, and
-        // SetWindowRgn's. Outside the silhouette the OS routes input
-        // natively to whatever desktop window is at the cursor
-        // (including concavities like the gap between the tiger's
-        // legs that an AABB swallows). Cheap: a 256x144 R8 readback
-        // is ~36 KB per frame.
+        // render the clickable renderers' geometry once per view (left
+        // + right today; N-view-friendly via the matrices array) into
+        // an R8 RenderTexture with Hidden/DisplayXR/Silhouette (red=1
+        // wherever any view rasterizes geometry — boolean union across
+        // passes since the shader writes 1 unconditionally with no
+        // blend). The union covers the actual screen-visible silhouette
+        // on the lenticular (each column shows a different view, so
+        // pixels lit by any view appear on screen). After the union,
+        // a dilation pass (Hidden/DisplayXR/SilhouetteDilate, 5x5 max
+        // kernel) expands the silhouette by ~2 pixels on each side —
+        // softens any remaining staircase artifacts AND gives a small
+        // safety margin so AA edge pixels can't fall outside the
+        // SetWindowRgn region.
         //
-        // Resolution kept low intentionally — the region only needs to
-        // be silhouette-accurate, not feature-accurate. Higher values
-        // increase readback cost and region complexity (more RECTs).
-        private const int  HIT_MASK_WIDTH  = 256;
-        private const int  HIT_MASK_HEIGHT = 144;
+        // We use CommandBuffer.DrawMesh (NOT DrawRenderer) so the draw
+        // is just "rasterize this mesh with these matrices and this
+        // material" — no implicit stereo state from the renderer's
+        // camera context. Earlier DrawRenderer attempts silently
+        // aliased both passes to the same projection, defeating the
+        // union.
+        //
+        // Cost at 512x288 R8: ~144 KB readback per frame plus two
+        // passes + one Blit; comfortably sub-millisecond.
+        private const int  HIT_MASK_WIDTH  = 512;
+        private const int  HIT_MASK_HEIGHT = 288;
         private RenderTexture m_HitMaskRT;
+        private RenderTexture m_HitMaskDilatedRT;
         private Material      m_SilhouetteMat;
+        private Material      m_SilhouetteDilateMat;
         private CommandBuffer m_HitMaskCB;
         // Only one readback in flight at a time — Unity's
         // AsyncGPUReadback budget is a few outstanding requests, but
@@ -503,16 +515,18 @@ namespace DisplayXR
                 {
                     DisplayXRNative.displayxr_set_overlay_hit_rect(rx, ry, rw, rh);
                 }
-                // Approach B+: render the silhouette to a small RT with
-                // the cyclopean view/proj, AsyncGPUReadback, hand the
-                // mask bytes to native which turns it into a per-pixel
-                // SetWindowRgn. Concavities like the gap between the
-                // tiger's legs are excluded from the region — clicks
-                // there route natively to the desktop. Once the first
-                // mask lands, native ignores subsequent hit_rect calls
-                // (mask wins).
-                RenderHitMaskAndRequestReadback(cycView2, cycProj2,
-                                                overlayW, overlayH);
+                // Approach B+: render the silhouette PER EYE (union of
+                // left+right) to a small RT, dilate by ~2 px, then
+                // AsyncGPUReadback. Native turns the dilated mask into
+                // a per-pixel SetWindowRgn. Per-eye union covers the
+                // lenticular's actual visible silhouette (each column
+                // shows a different view); dilation absorbs any
+                // remaining sub-pixel mismatch plus smooths low-res
+                // staircase artifacts. Once the first mask lands,
+                // native ignores subsequent hit_rect calls (mask wins).
+                RenderHitMaskAndRequestReadback(
+                    lv2, lp2, rv2, rp2,
+                    overlayW, overlayH);
             }
 #elif UNITY_STANDALONE_OSX
             // (#85) Mac cursor/button polling + cyclopean hit-test mirroring
@@ -1087,10 +1101,26 @@ namespace DisplayXR
                 };
                 m_HitMaskRT.Create();
             }
+            if (m_HitMaskDilatedRT == null)
+            {
+                m_HitMaskDilatedRT = new RenderTexture(HIT_MASK_WIDTH, HIT_MASK_HEIGHT,
+                                                       0, RenderTextureFormat.R8)
+                {
+                    filterMode  = FilterMode.Point,
+                    useMipMap   = false,
+                    autoGenerateMips = false,
+                };
+                m_HitMaskDilatedRT.Create();
+            }
             if (m_SilhouetteMat == null)
             {
                 Shader s = Shader.Find("Hidden/DisplayXR/Silhouette");
                 if (s != null) m_SilhouetteMat = new Material(s) { hideFlags = HideFlags.HideAndDontSave };
+            }
+            if (m_SilhouetteDilateMat == null)
+            {
+                Shader s = Shader.Find("Hidden/DisplayXR/SilhouetteDilate");
+                if (s != null) m_SilhouetteDilateMat = new Material(s) { hideFlags = HideFlags.HideAndDontSave };
             }
             if (m_HitMaskCB == null)
             {
@@ -1098,65 +1128,116 @@ namespace DisplayXR
             }
         }
 
-        // Build a one-shot CommandBuffer that renders the clickable
-        // renderers to m_HitMaskRT with the cyclopean view/proj (so
-        // the silhouette matches what the user sees on the lenticular
-        // — the stereo-fused position, not either eye's image).
-        // Issue the buffer immediately via Graphics.ExecuteCommandBuffer,
-        // then kick off an AsyncGPUReadback. Throttled to one
-        // outstanding request at a time.
-        void RenderHitMaskAndRequestReadback(Matrix4x4 cycView, Matrix4x4 cycProj,
-                                              int overlayW, int overlayH)
+        // Build a one-shot CommandBuffer that:
+        //   1) Renders each clickable renderer's geometry into
+        //      m_HitMaskRT once per view (currently 2: left+right;
+        //      N-view extends by adding more (view, proj) pairs).
+        //      Uses DrawMesh (explicit mesh + matrix + material) NOT
+        //      DrawRenderer — DrawRenderer pulls implicit stereo
+        //      state from the renderer's camera context, which was
+        //      silently aliasing both passes to one projection.
+        //   2) Blits through the dilation shader into
+        //      m_HitMaskDilatedRT — expands the union silhouette by
+        //      ~2 pixels (5x5 max kernel) to soak up sub-pixel
+        //      mismatch and add safety margin.
+        //   3) AsyncGPUReadback's the dilated RT.
+        //
+        // SkinnedMeshRenderers use the existing s_BakedHits cache
+        // (UpdateBakedHitColliders keeps it fresh each frame).
+        // Regular renderers use their MeshFilter's sharedMesh.
+        //
+        // Throttled to one outstanding readback at a time.
+        void RenderHitMaskAndRequestReadback(
+            Matrix4x4 leftView,  Matrix4x4 leftProj,
+            Matrix4x4 rightView, Matrix4x4 rightProj,
+            int overlayW, int overlayH)
         {
             if (clickableRenderers == null || clickableRenderers.Length == 0)
                 return;
 
             EnsureHitMaskResources();
-            if (m_SilhouetteMat == null) return;
-
-            // Skip rendering if a readback is already in flight — we
-            // don't want to queue multiple frames of GPU work waiting
-            // for the CPU side to drain.
+            if (m_SilhouetteMat == null || m_SilhouetteDilateMat == null) return;
             if (m_HitMaskReadbackPending) return;
+
+            // Skinned-mesh bakes must be fresh — same cache the
+            // raycast uses, so the silhouette matches the current
+            // animated pose.
+            UpdateBakedHitColliders();
 
             m_HitMaskCB.Clear();
             m_HitMaskCB.SetRenderTarget(m_HitMaskRT);
             m_HitMaskCB.ClearRenderTarget(true, true, Color.clear);
-            // Unity expects a GPU-conventional projection here (Y-flip
-            // and depth remap baked in if the target is an off-screen
-            // RT). GL.GetGPUProjectionMatrix handles both render-API
-            // variants.
-            m_HitMaskCB.SetViewProjectionMatrices(
-                cycView, GL.GetGPUProjectionMatrix(cycProj, true));
 
-            for (int i = 0; i < clickableRenderers.Length; i++)
-            {
-                var r = clickableRenderers[i];
-                if (r == null || !r.enabled || !r.gameObject.activeInHierarchy)
-                    continue;
-                // submesh -1 = all submeshes; CommandBuffer.DrawRenderer
-                // handles SkinnedMeshRenderer GPU skinning automatically.
-                m_HitMaskCB.DrawRenderer(r, m_SilhouetteMat, 0, 0);
-            }
+            // Pass per view. Same loop body — easy to extend to N
+            // views by iterating an array of (view, proj) pairs.
+            AppendSilhouettePass(leftView,  leftProj);
+            AppendSilhouettePass(rightView, rightProj);
+
+            // Dilate the union mask through the max-kernel shader
+            // into the dilated RT. Blit reads m_HitMaskRT as _MainTex.
+            m_HitMaskCB.Blit(m_HitMaskRT, m_HitMaskDilatedRT, m_SilhouetteDilateMat);
 
             Graphics.ExecuteCommandBuffer(m_HitMaskCB);
 
             m_HitMaskPendingDstW = overlayW;
             m_HitMaskPendingDstH = overlayH;
             m_HitMaskReadbackPending = true;
-            AsyncGPUReadback.Request(m_HitMaskRT, 0, OnHitMaskReadback);
+            AsyncGPUReadback.Request(m_HitMaskDilatedRT, 0, OnHitMaskReadback);
+        }
+
+        // Append one silhouette pass with the given view + projection
+        // matrices. CommandBuffer.SetViewProjectionMatrices applies to
+        // all subsequent DrawMesh commands in the buffer; DrawMesh
+        // uses the supplied mesh + model matrix with no implicit
+        // stereo state.
+        void AppendSilhouettePass(Matrix4x4 viewMat, Matrix4x4 projMat)
+        {
+            m_HitMaskCB.SetViewProjectionMatrices(
+                viewMat, GL.GetGPUProjectionMatrix(projMat, true));
+
+            for (int i = 0; i < clickableRenderers.Length; i++)
+            {
+                var r = clickableRenderers[i];
+                if (r == null || !r.enabled || !r.gameObject.activeInHierarchy)
+                    continue;
+
+                Mesh mesh = null;
+                Matrix4x4 model = r.transform.localToWorldMatrix;
+                if (r is SkinnedMeshRenderer smr)
+                {
+                    if (s_BakedHits.TryGetValue(smr, out BakedHit baked)
+                        && baked != null && baked.mesh != null)
+                    {
+                        // BakeMesh produces vertices in the SMR's
+                        // local space; smr.transform.localToWorld
+                        // takes them to world.
+                        mesh = baked.mesh;
+                        model = smr.transform.localToWorldMatrix;
+                    }
+                }
+                else
+                {
+                    var mf = r.GetComponent<MeshFilter>();
+                    if (mf != null && mf.sharedMesh != null)
+                        mesh = mf.sharedMesh;
+                }
+                if (mesh == null) continue;
+
+                // DrawMesh: mesh + model + material + submesh + pass.
+                // submesh 0 / pass 0 — we only have one of each.
+                m_HitMaskCB.DrawMesh(mesh, model, m_SilhouetteMat, 0, 0);
+            }
         }
 
         void OnHitMaskReadback(AsyncGPUReadbackRequest req)
         {
             m_HitMaskReadbackPending = false;
             if (req.hasError) return;
-            if (m_HitMaskRT == null) return;
+            if (m_HitMaskDilatedRT == null) return;
 
             // Native expects a contiguous byte[] pointer. NativeArray's
             // backing memory is contiguous; pin it for the P/Invoke
-            // call. We're allowed to read the NativeArray on the main
-            // thread until the next AsyncGPUReadback frame.
+            // call.
             var data = req.GetData<byte>();
             unsafe
             {
@@ -1181,10 +1262,21 @@ namespace DisplayXR
                 Destroy(m_HitMaskRT);
                 m_HitMaskRT = null;
             }
+            if (m_HitMaskDilatedRT != null)
+            {
+                m_HitMaskDilatedRT.Release();
+                Destroy(m_HitMaskDilatedRT);
+                m_HitMaskDilatedRT = null;
+            }
             if (m_SilhouetteMat != null)
             {
                 Destroy(m_SilhouetteMat);
                 m_SilhouetteMat = null;
+            }
+            if (m_SilhouetteDilateMat != null)
+            {
+                Destroy(m_SilhouetteDilateMat);
+                m_SilhouetteDilateMat = null;
             }
             if (m_HitMaskCB != null)
             {
