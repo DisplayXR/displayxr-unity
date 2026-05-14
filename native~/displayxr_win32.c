@@ -175,42 +175,51 @@ find_unity_hwnd(void)
 // Standalone mode: overlay window + parent subclass
 // ============================================================================
 
-// Forward a click the overlay caught in a transparent zone (Approach C,
-// #57) to the actual deepest input-eligible control under the cursor —
-// e.g., Notepad's RichEditD2DPT child, NOT Notepad's outer frame.
-// PostMessaging to the frame doesn't move the caret; only the deepest
-// child does.
+// Resolve the underlying app's window under the cursor. Shared by the
+// click and hover forwarders below.
 //
-// Two-stage resolution:
-//   1. Iterate top-level windows in z-order (FindWindowExW). Skip our
-//      overlay, our cloaked Unity HWND, anything else in our process
-//      (the runtime's DComp visual host, class DisplayXRD3D11), and
-//      cloaked / WS_EX_TRANSPARENT windows. Pick the first whose rect
-//      contains the cursor — that's the underlying app's top-level frame.
-//      We use iteration rather than WindowFromPoint because Approach C
-//      makes our WM_NCHITTEST return HTCLIENT, and that overrides any
-//      WS_EX_TRANSPARENT toggle we'd try to hide behind for the call.
-//   2. Recursively descend with ChildWindowFromPointEx until we hit a
-//      leaf — that's the actual control (edit field, button, etc.) the
-//      user is clicking on.
+// Stage 1 — pick top-level frame by iterating top-level windows in
+// z-order (FindWindowExW). Skip our overlay, our cloaked Unity HWND,
+// anything else in our process (the runtime's DComp visual host, class
+// DisplayXRD3D11), and cloaked / WS_EX_TRANSPARENT windows. Pick the
+// first whose rect contains the cursor. We iterate rather than use
+// WindowFromPoint because Approach C makes our WM_NCHITTEST return
+// HTCLIENT, so WindowFromPoint would resolve to us.
 //
-// Activation: SetForegroundWindow on the top-level frame so the deepest
-// control takes focus. We have SFW permission because we are the
-// foreground process (we just received the click in our wndproc).
+// Stage 2 — ask the target what zone the cursor is over via WM_NCHITTEST.
+// If HTCLIENT, recursively descend with ChildWindowFromPointEx to the
+// leaf control (Notepad's RichEditD2DPT, a button HWND, etc.). Otherwise
+// the hit is on root's non-client area (title bar, close button, resize
+// edge, scroll bar, system menu) — keep deepest=root and let the caller
+// emit WM_NC*BUTTON* / WM_NCMOUSEMOVE with the HT code in wParam.
 //
-// NOT used for WM_MOUSEMOVE — would flood the underlying window per
-// frame. Hover is handled separately in overlay_wnd_proc.
-static void
-forward_click_to_underlying_window(UINT msg, WPARAM wParam)
+// The 50 ms SMTO_ABORTIFHUNG timeout on WM_NCHITTEST matches the
+// LL-mouse probe's WM_GETTEXT pattern (~line 374) — keeps us responsive
+// against unresponsive targets.
+typedef struct {
+	HWND    root;     // top-level frame of the underlying app
+	HWND    deepest;  // deepest client-area child under cursor; == root for NC hits
+	POINT   cursor;   // screen coords
+	LRESULT ht;       // WM_NCHITTEST result on root: HTCLIENT / HTCLOSE / HTCAPTION / …
+} dxr_underlying_target_t;
+
+static int
+dxr_find_underlying_target(dxr_underlying_target_t *out)
 {
+	out->root     = NULL;
+	out->deepest  = NULL;
+	out->ht       = HTNOWHERE;
+	out->cursor.x = 0;
+	out->cursor.y = 0;
+
 	POINT cursor;
 	if (!GetCursorPos(&cursor))
-		return;
+		return 0;
+	out->cursor = cursor;
 
-	HWND unity = find_unity_hwnd();
+	HWND  unity   = find_unity_hwnd();
 	DWORD our_pid = GetCurrentProcessId();
 
-	// Stage 1: pick top-level frame.
 	HWND root = NULL;
 	HWND it = NULL;
 	while ((it = FindWindowExW(NULL, it, NULL, NULL)) != NULL) {
@@ -239,57 +248,210 @@ forward_click_to_underlying_window(UINT msg, WPARAM wParam)
 		root = it;
 		break;
 	}
+	if (root == NULL)
+		return 0;
 
-	if (root == NULL) {
+	LRESULT ht = HTCLIENT;
+	DWORD_PTR got = 0;
+	if (SendMessageTimeoutW(root, WM_NCHITTEST, 0,
+	                        MAKELPARAM((WORD)cursor.x, (WORD)cursor.y),
+	                        SMTO_ABORTIFHUNG | SMTO_BLOCK, 50, &got) != 0) {
+		ht = (LRESULT)got;
+	}
+
+	HWND deepest = root;
+	if (ht == HTCLIENT) {
+		for (int i = 0; i < 16; i++) {
+			POINT cl = cursor;
+			ScreenToClient(deepest, &cl);
+			HWND child = ChildWindowFromPointEx(deepest, cl,
+			                                    CWP_SKIPINVISIBLE |
+			                                    CWP_SKIPDISABLED |
+			                                    CWP_SKIPTRANSPARENT);
+			if (child == NULL || child == deepest)
+				break;
+			deepest = child;
+		}
+	}
+
+	out->root    = root;
+	out->deepest = deepest;
+	out->ht      = ht;
+	return 1;
+}
+
+// Map a client-area button message to its WM_NC* equivalent. Returns 0
+// when the input is not a button message we know how to translate.
+static UINT
+dxr_nc_button_msg(UINT msg)
+{
+	switch (msg) {
+	case WM_LBUTTONDOWN:    return WM_NCLBUTTONDOWN;
+	case WM_LBUTTONUP:      return WM_NCLBUTTONUP;
+	case WM_LBUTTONDBLCLK:  return WM_NCLBUTTONDBLCLK;
+	case WM_RBUTTONDOWN:    return WM_NCRBUTTONDOWN;
+	case WM_RBUTTONUP:      return WM_NCRBUTTONUP;
+	case WM_RBUTTONDBLCLK:  return WM_NCRBUTTONDBLCLK;
+	case WM_MBUTTONDOWN:    return WM_NCMBUTTONDOWN;
+	case WM_MBUTTONUP:      return WM_NCMBUTTONUP;
+	case WM_MBUTTONDBLCLK:  return WM_NCMBUTTONDBLCLK;
+	}
+	return 0;
+}
+
+// Forward a button event the overlay caught in a transparent zone
+// (Approach C, #57) to the underlying app's control under the cursor.
+//
+// HTCLIENT     → PostMessage(deepest, msg, wParam, client_lp). Notepad
+//                edit field, app toolbars, button bodies, etc.
+//
+// non-HTCLIENT → PostMessage(root, WM_NC*BUTTON*, wParam=ht, screen_lp).
+//                DefWindowProc on the target then performs the standard
+//                action per HT code:
+//                  HTCAPTION                → SC_MOVE modal drag loop
+//                  HTCLOSE                  → highlight on DOWN, SC_CLOSE on UP
+//                  HTMINBUTTON              → SC_MINIMIZE on UP
+//                  HTMAXBUTTON              → SC_MAXIMIZE / restore on UP
+//                  HTLEFT/RIGHT/TOP/BOTTOM  → SC_SIZE modal resize loop
+//                  HTSYSMENU                → system menu on UP
+//
+// Activation: SetForegroundWindow(root) on press messages — we have SFW
+// permission because we received the click in our wndproc as the
+// foreground process, and the target needs focus to take keyboard input.
+//
+// NOT used for WM_MOUSEMOVE — see forward_hover_to_underlying_window.
+static void
+forward_click_to_underlying_window(UINT msg, WPARAM wParam)
+{
+	dxr_underlying_target_t t;
+	if (!dxr_find_underlying_target(&t)) {
+		POINT c = {0, 0};
+		GetCursorPos(&c);
 		displayxr_log("[DisplayXR] forward_click: no underlying top-level at (%d,%d) for msg=0x%04X\n",
-		              (int)cursor.x, (int)cursor.y, (unsigned)msg);
+		              (int)c.x, (int)c.y, (unsigned)msg);
 		return;
 	}
 
-	// Stage 2: recursively descend to the deepest non-transparent,
-	// visible, enabled child at the cursor. ChildWindowFromPointEx
-	// only goes one level — loop until we stop descending.
-	HWND deepest = root;
-	for (int i = 0; i < 16; i++) {
-		POINT cl = cursor;
-		ScreenToClient(deepest, &cl);
-		HWND child = ChildWindowFromPointEx(deepest, cl,
-		                                    CWP_SKIPINVISIBLE |
-		                                    CWP_SKIPDISABLED |
-		                                    CWP_SKIPTRANSPARENT);
-		if (child == NULL || child == deepest)
-			break;
-		deepest = child;
+	int is_press = (msg == WM_LBUTTONDOWN   || msg == WM_RBUTTONDOWN   ||
+	                msg == WM_MBUTTONDOWN   || msg == WM_LBUTTONDBLCLK ||
+	                msg == WM_RBUTTONDBLCLK || msg == WM_MBUTTONDBLCLK);
+
+	if (t.ht == HTNOWHERE || t.ht == HTERROR || t.ht == HTTRANSPARENT) {
+		// Target says "not mine" / "skip me" — don't fire phantom events.
+		displayxr_log("[DisplayXR] forward_click: msg=0x%04X cursor=(%d,%d) root=%p ht=%ld — skipped\n",
+		              (unsigned)msg, (int)t.cursor.x, (int)t.cursor.y,
+		              (void *)t.root, (long)t.ht);
+		return;
 	}
 
-	POINT client_pt = cursor;
-	ScreenToClient(deepest, &client_pt);
+	if (t.ht == HTCLIENT) {
+		POINT client_pt = t.cursor;
+		ScreenToClient(t.deepest, &client_pt);
 
-	// Activate the top-level frame on press messages so the focus
-	// transitions cleanly and the deepest control's caret/focus engages.
-	if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN) {
-		BOOL ok = SetForegroundWindow(root);
+		if (is_press) {
+			BOOL ok = SetForegroundWindow(t.root);
+			DWORD err = ok ? 0 : GetLastError();
+			displayxr_log("[DisplayXR] forward_click: SetForegroundWindow(root=%p) ok=%d err=%lu\n",
+			              (void *)t.root, ok ? 1 : 0,
+			              (unsigned long)err);
+		}
+
+		LPARAM client_lp = MAKELPARAM((WORD)client_pt.x, (WORD)client_pt.y);
+		PostMessageW(t.deepest, msg, wParam, client_lp);
+
+		wchar_t root_cls[64]    = {0};
+		wchar_t deepest_cls[64] = {0};
+		DWORD deepest_pid = 0;
+		GetClassNameW(t.root, root_cls, 63);
+		GetClassNameW(t.deepest, deepest_cls, 63);
+		GetWindowThreadProcessId(t.deepest, &deepest_pid);
+		displayxr_log("[DisplayXR] forward_click: msg=0x%04X cursor=(%d,%d) root=%p[%ls] deepest=%p[%ls] client=(%d,%d) pid=%lu ht=HTCLIENT\n",
+		              (unsigned)msg, (int)t.cursor.x, (int)t.cursor.y,
+		              (void *)t.root, root_cls,
+		              (void *)t.deepest, deepest_cls,
+		              (int)client_pt.x, (int)client_pt.y,
+		              (unsigned long)deepest_pid);
+		return;
+	}
+
+	// Non-client: PostMessage WM_NC*BUTTON* with HT in wParam and SCREEN
+	// coords in lParam. DefWindowProc dispatches the SC_* / button-press
+	// behavior keyed off wParam.
+	UINT nc_msg = dxr_nc_button_msg(msg);
+	if (nc_msg == 0) {
+		displayxr_log("[DisplayXR] forward_click: no NC analog for msg=0x%04X ht=%ld — dropped\n",
+		              (unsigned)msg, (long)t.ht);
+		return;
+	}
+
+	if (is_press) {
+		BOOL ok = SetForegroundWindow(t.root);
 		DWORD err = ok ? 0 : GetLastError();
-		displayxr_log("[DisplayXR] forward_click: SetForegroundWindow(root=%p) ok=%d err=%lu\n",
-		              (void *)root, ok ? 1 : 0,
+		displayxr_log("[DisplayXR] forward_click: SetForegroundWindow(root=%p) ok=%d err=%lu (NC)\n",
+		              (void *)t.root, ok ? 1 : 0,
 		              (unsigned long)err);
 	}
 
-	LPARAM client_lp = MAKELPARAM((WORD)client_pt.x, (WORD)client_pt.y);
-	PostMessageW(deepest, msg, wParam, client_lp);
+	LPARAM screen_lp = MAKELPARAM((WORD)t.cursor.x, (WORD)t.cursor.y);
+	PostMessageW(t.root, nc_msg, (WPARAM)t.ht, screen_lp);
 
-	wchar_t root_cls[64]    = {0};
-	wchar_t deepest_cls[64] = {0};
-	DWORD deepest_pid = 0;
-	GetClassNameW(root, root_cls, 63);
-	GetClassNameW(deepest, deepest_cls, 63);
-	GetWindowThreadProcessId(deepest, &deepest_pid);
-	displayxr_log("[DisplayXR] forward_click: msg=0x%04X cursor=(%d,%d) root=%p[%ls] deepest=%p[%ls] client=(%d,%d) pid=%lu\n",
-	              (unsigned)msg, (int)cursor.x, (int)cursor.y,
-	              (void *)root, root_cls,
-	              (void *)deepest, deepest_cls,
-	              (int)client_pt.x, (int)client_pt.y,
-	              (unsigned long)deepest_pid);
+	wchar_t root_cls[64] = {0};
+	DWORD root_pid = 0;
+	GetClassNameW(t.root, root_cls, 63);
+	GetWindowThreadProcessId(t.root, &root_pid);
+	displayxr_log("[DisplayXR] forward_click: msg=0x%04X→nc=0x%04X cursor=(%d,%d) root=%p[%ls] ht=%ld pid=%lu\n",
+	              (unsigned)msg, (unsigned)nc_msg,
+	              (int)t.cursor.x, (int)t.cursor.y,
+	              (void *)t.root, root_cls,
+	              (long)t.ht, (unsigned long)root_pid);
+}
+
+// Forward a WM_MOUSEMOVE the overlay caught in a transparent zone to
+// the underlying app so hot-track button highlights, taskbar thumbnail
+// previews, and tooltips fire on cursor hover.
+//
+// Throttled to ~60 Hz: the handoff doc's session-4 lesson — flooding
+// the target with per-pixel mouse-move messages — is the failure mode
+// to avoid. 16 ms leaves ample margin for the OS's TrackMouseEvent
+// machinery (default hover ~400 ms, tooltip ~500 ms).
+//
+// TrackMouseEvent / WM_MOUSEHOVER / WM_MOUSELEAVE need no synthesis:
+// once the target receives any WM_MOUSEMOVE, controls call
+// TrackMouseEvent themselves and the OS dispatches MOUSEHOVER /
+// MOUSELEAVE based on the real cursor position vs the tracked HWND's
+// rect — independent of which HWND received the originating
+// WM_MOUSEMOVE. DWM-themed title-bar hot-track responds to
+// WM_NCMOUSEMOVE the same way.
+//
+// No SetForegroundWindow — hover never activates a window. No
+// per-event log line — even at 60 Hz that's 60 lines/sec into
+// displayxr.log.
+static void
+forward_hover_to_underlying_window(void)
+{
+	static DWORD s_last_hover_tick = 0;
+	DWORD now = GetTickCount();
+	if (now - s_last_hover_tick < 16)
+		return;
+	s_last_hover_tick = now;
+
+	dxr_underlying_target_t t;
+	if (!dxr_find_underlying_target(&t))
+		return;
+	if (t.ht == HTNOWHERE || t.ht == HTERROR || t.ht == HTTRANSPARENT)
+		return;
+
+	if (t.ht == HTCLIENT) {
+		POINT client_pt = t.cursor;
+		ScreenToClient(t.deepest, &client_pt);
+		PostMessageW(t.deepest, WM_MOUSEMOVE, 0,
+		             MAKELPARAM((WORD)client_pt.x, (WORD)client_pt.y));
+		return;
+	}
+
+	// WM_NCMOUSEMOVE — wParam = HT code, lParam = SCREEN coords.
+	PostMessageW(t.root, WM_NCMOUSEMOVE, (WPARAM)t.ht,
+	             MAKELPARAM((WORD)t.cursor.x, (WORD)t.cursor.y));
 }
 
 // ============================================================================
@@ -584,11 +746,18 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 			             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 			return 0;
 		}
-		// Forward hover to Unity so cube hover-detection / cursor-state
-		// polling stays accurate. Do NOT call forward_click_to_underlying_window
-		// for WM_MOUSEMOVE — under Approach C the overlay catches every
-		// hover frame, and forwarding each one to the desktop app would
-		// flood it with synthetic mouse-move messages (session 4 lesson).
+		// Transparent zone: forward hover to the underlying app so its
+		// controls hot-track, tooltips arm, taskbar thumbnail previews
+		// fire. Throttled internally to ~60 Hz to address the session-4
+		// flood concern. Gated on !s_hit_active for the same reason
+		// click forwarding is — when the cursor is over the cube
+		// silhouette, the app underneath shouldn't show hover state
+		// behind the cube.
+		if (!s_hit_active)
+			forward_hover_to_underlying_window();
+
+		// Unity always sees hover for cube hover-detection / cursor
+		// polling — independent of where the cursor is on the overlay.
 		HWND unity_hover = find_unity_hwnd();
 		if (unity_hover != NULL)
 			PostMessageW(unity_hover, msg, wParam, lParam);
