@@ -102,28 +102,6 @@ static int   s_drag_active        = 0;
 static POINT s_drag_anchor_screen = {0, 0};
 static POINT s_drag_anchor_window = {0, 0};
 
-// Target-window drag/resize state. When the user clicks on an underlying
-// app's title bar (HTCAPTION) or resize edge (HTLEFT/HTRIGHT/HTTOP/
-// HTBOTTOM + corners) through a transparent zone, we drive the target's
-// move/resize from our overlay rather than relying on DefWindowProc's
-// SC_MOVE/SC_SIZE modal loops on the target. Those modal loops call
-// GetKeyState(VK_LBUTTON) — which reflects the target thread's
-// queue-synchronous input state, not the live OS state — so they bail
-// immediately when our PostMessage'd WM_NCLBUTTONDOWN arrives without
-// a matching queued key-down state. Bypassing them with overlay-side
-// drag is fully reliable cross-process.
-typedef enum {
-	DXR_TGT_DRAG_NONE   = 0,
-	DXR_TGT_DRAG_MOVE   = 1,   // HTCAPTION
-	DXR_TGT_DRAG_RESIZE = 2,   // HTLEFT/HTRIGHT/HTTOP/HTBOTTOM/HTTOPLEFT/…
-} dxr_tgt_drag_mode_t;
-
-static dxr_tgt_drag_mode_t s_tgt_drag_mode   = DXR_TGT_DRAG_NONE;
-static HWND                s_tgt_drag_hwnd   = NULL;
-static LRESULT             s_tgt_drag_ht     = HTNOWHERE;
-static RECT                s_tgt_drag_rect   = {0, 0, 0, 0}; // target's window rect at DOWN
-static POINT               s_tgt_drag_anchor = {0, 0};        // cursor pos at DOWN
-
 // ============================================================================
 // Shell mode detection
 // ============================================================================
@@ -197,467 +175,65 @@ find_unity_hwnd(void)
 // Standalone mode: overlay window + parent subclass
 // ============================================================================
 
-// Resolve the underlying app's window under the cursor. Shared by the
-// click and hover forwarders below.
+// Cross-process click-through architecture (issue #57, post-Approach-C):
 //
-// Stage 1 — pick top-level frame by iterating top-level windows in
-// z-order (FindWindowExW). Skip our overlay, our cloaked Unity HWND,
-// anything else in our process (the runtime's DComp visual host, class
-// DisplayXRD3D11), and cloaked / WS_EX_TRANSPARENT windows. Pick the
-// first whose rect contains the cursor. We iterate rather than use
-// WindowFromPoint because Approach C makes our WM_NCHITTEST return
-// HTCLIENT, so WindowFromPoint would resolve to us.
+// We toggle WS_EX_TRANSPARENT on the overlay HWND from
+// displayxr_set_overlay_hit_active() based on the C# per-frame raycast
+// at the current cursor position:
 //
-// Stage 2 — ask the target what zone the cursor is over via WM_NCHITTEST.
-// If HTCLIENT, recursively descend with ChildWindowFromPointEx to the
-// leaf control (Notepad's RichEditD2DPT, a button HWND, etc.). Otherwise
-// the hit is on root's non-client area (title bar, close button, resize
-// edge, scroll bar, system menu) — keep deepest=root and let the caller
-// emit WM_NC*BUTTON* / WM_NCMOUSEMOVE with the HT code in wParam.
+//   - cursor over a clickable renderer (cube silhouette) → s_hit_active=1
+//     → WS_EX_TRANSPARENT CLEAR → overlay catches WM_LBUTTON*/WM_MOUSEMOVE
+//     etc., posts them to Unity for normal handling.
 //
-// The 50 ms SMTO_ABORTIFHUNG timeout on WM_NCHITTEST matches the
-// LL-mouse probe's WM_GETTEXT pattern (~line 374) — keeps us responsive
-// against unresponsive targets.
-typedef struct {
-	HWND    root;     // top-level frame of the underlying app
-	HWND    deepest;  // deepest client-area child under cursor; == root for NC hits
-	POINT   cursor;   // screen coords
-	LRESULT ht;       // WM_NCHITTEST result on root: HTCLIENT / HTCLOSE / HTCAPTION / …
-} dxr_underlying_target_t;
-
-static int
-dxr_find_underlying_target(dxr_underlying_target_t *out)
-{
-	out->root     = NULL;
-	out->deepest  = NULL;
-	out->ht       = HTNOWHERE;
-	out->cursor.x = 0;
-	out->cursor.y = 0;
-
-	POINT cursor;
-	if (!GetCursorPos(&cursor))
-		return 0;
-	out->cursor = cursor;
-
-	HWND  unity   = find_unity_hwnd();
-	DWORD our_pid = GetCurrentProcessId();
-
-	HWND root = NULL;
-	HWND it = NULL;
-	while ((it = FindWindowExW(NULL, it, NULL, NULL)) != NULL) {
-		if (it == s_overlay_hwnd || it == unity)
-			continue;
-		if (!IsWindowVisible(it))
-			continue;
-		DWORD wpid = 0;
-		GetWindowThreadProcessId(it, &wpid);
-		if (wpid == our_pid)
-			continue;
-		BOOL cloaked = FALSE;
-		if (SUCCEEDED(DwmGetWindowAttribute(it, DWMWA_CLOAKED,
-		                                    &cloaked, sizeof(cloaked)))
-		    && cloaked)
-			continue;
-		DWORD ex = (DWORD)GetWindowLongPtrW(it, GWL_EXSTYLE);
-		if (ex & WS_EX_TRANSPARENT)
-			continue;
-		RECT rc;
-		if (!GetWindowRect(it, &rc))
-			continue;
-		if (cursor.x < rc.left || cursor.x >= rc.right ||
-		    cursor.y < rc.top  || cursor.y >= rc.bottom)
-			continue;
-		root = it;
-		break;
-	}
-	if (root == NULL)
-		return 0;
-
-	LRESULT ht = HTCLIENT;
-	DWORD_PTR got = 0;
-	if (SendMessageTimeoutW(root, WM_NCHITTEST, 0,
-	                        MAKELPARAM((WORD)cursor.x, (WORD)cursor.y),
-	                        SMTO_ABORTIFHUNG | SMTO_BLOCK, 50, &got) != 0) {
-		ht = (LRESULT)got;
-	}
-
-	HWND deepest = root;
-	if (ht == HTCLIENT) {
-		for (int i = 0; i < 16; i++) {
-			POINT cl = cursor;
-			ScreenToClient(deepest, &cl);
-			HWND child = ChildWindowFromPointEx(deepest, cl,
-			                                    CWP_SKIPINVISIBLE |
-			                                    CWP_SKIPDISABLED |
-			                                    CWP_SKIPTRANSPARENT);
-			if (child == NULL || child == deepest)
-				break;
-			deepest = child;
-		}
-	}
-
-	out->root    = root;
-	out->deepest = deepest;
-	out->ht      = ht;
-	return 1;
-}
-
-// Map a client-area button message to its WM_NC* equivalent. Returns 0
-// when the input is not a button message we know how to translate.
-static UINT
-dxr_nc_button_msg(UINT msg)
-{
-	switch (msg) {
-	case WM_LBUTTONDOWN:    return WM_NCLBUTTONDOWN;
-	case WM_LBUTTONUP:      return WM_NCLBUTTONUP;
-	case WM_LBUTTONDBLCLK:  return WM_NCLBUTTONDBLCLK;
-	case WM_RBUTTONDOWN:    return WM_NCRBUTTONDOWN;
-	case WM_RBUTTONUP:      return WM_NCRBUTTONUP;
-	case WM_RBUTTONDBLCLK:  return WM_NCRBUTTONDBLCLK;
-	case WM_MBUTTONDOWN:    return WM_NCMBUTTONDOWN;
-	case WM_MBUTTONUP:      return WM_NCMBUTTONUP;
-	case WM_MBUTTONDBLCLK:  return WM_NCMBUTTONDBLCLK;
-	}
-	return 0;
-}
-
-// Direct WM_SYSCOMMAND code for window-action buttons (close, min, max,
-// help). DefWindowProc would normally post these from its
-// WM_NCLBUTTONDOWN modal close-tracking loop on the target — but that
-// loop calls GetKeyState(VK_LBUTTON) which doesn't reflect our
-// PostMessage'd DOWN, so the loop bails before firing the action.
-// We post WM_SYSCOMMAND directly on UP to make the action fire
-// regardless of whether the modal loop ran. Returns 0 for HT codes
-// that don't map to a button action (HTCAPTION → SC_MOVE is handled
-// separately by our custom drag).
-static WPARAM
-dxr_sc_for_ht(LRESULT ht)
-{
-	switch (ht) {
-	case HTCLOSE:     return SC_CLOSE;
-	case HTMINBUTTON: return SC_MINIMIZE;
-	case HTMAXBUTTON: return SC_MAXIMIZE;
-	case HTHELP:      return SC_CONTEXTHELP;
-	}
-	return 0;
-}
-
-// Pick the system cursor matching a non-client hit code, so the cursor
-// adapts as the user moves over a background window's resize edges /
-// help button / sizing corners. NULL means "don't override — keep the
-// default arrow." Title-bar / caption stays arrow (HTCAPTION not
-// listed) matching standard Windows behavior.
-static HCURSOR
-dxr_cursor_for_ht(LRESULT ht)
-{
-	// The IDC_* constants in WinUser.h are unconditionally LPSTR
-	// (MAKEINTRESOURCE expands to LPCSTR in non-UNICODE mode). The W
-	// variant LoadCursorW expects LPCWSTR. The LOWORD-as-resource-id
-	// trick works for either char width, so an LPCWSTR cast is safe.
-	switch (ht) {
-	case HTLEFT:
-	case HTRIGHT:       return LoadCursorW(NULL, (LPCWSTR)IDC_SIZEWE);
-	case HTTOP:
-	case HTBOTTOM:      return LoadCursorW(NULL, (LPCWSTR)IDC_SIZENS);
-	case HTTOPLEFT:
-	case HTBOTTOMRIGHT: return LoadCursorW(NULL, (LPCWSTR)IDC_SIZENWSE);
-	case HTTOPRIGHT:
-	case HTBOTTOMLEFT:  return LoadCursorW(NULL, (LPCWSTR)IDC_SIZENESW);
-	case HTHELP:        return LoadCursorW(NULL, (LPCWSTR)IDC_HELP);
-	}
-	return NULL;
-}
-
-// True if the HT code is a resize edge we drive with custom drag.
-static int
-dxr_ht_is_resize(LRESULT ht)
-{
-	return (ht == HTLEFT  || ht == HTRIGHT  ||
-	        ht == HTTOP   || ht == HTBOTTOM ||
-	        ht == HTTOPLEFT  || ht == HTTOPRIGHT ||
-	        ht == HTBOTTOMLEFT || ht == HTBOTTOMRIGHT);
-}
-
-// Apply a delta to the target's window rect for the active resize
-// edge. Clamps to a small minimum size so the target doesn't collapse.
-static void
-dxr_apply_target_resize(int dx, int dy)
-{
-	RECT r = s_tgt_drag_rect;
-	LRESULT ht = s_tgt_drag_ht;
-
-	if (ht == HTLEFT  || ht == HTTOPLEFT  || ht == HTBOTTOMLEFT)  r.left   = s_tgt_drag_rect.left   + dx;
-	if (ht == HTRIGHT || ht == HTTOPRIGHT || ht == HTBOTTOMRIGHT) r.right  = s_tgt_drag_rect.right  + dx;
-	if (ht == HTTOP   || ht == HTTOPLEFT  || ht == HTTOPRIGHT)    r.top    = s_tgt_drag_rect.top    + dy;
-	if (ht == HTBOTTOM || ht == HTBOTTOMLEFT || ht == HTBOTTOMRIGHT) r.bottom = s_tgt_drag_rect.bottom + dy;
-
-	int w = r.right - r.left;
-	int h = r.bottom - r.top;
-	if (w < 100) {
-		// Clamp by pinning the moving edge — keep the opposite edge stable.
-		if (ht == HTLEFT || ht == HTTOPLEFT || ht == HTBOTTOMLEFT) r.left = r.right - 100;
-		else r.right = r.left + 100;
-		w = 100;
-	}
-	if (h < 50) {
-		if (ht == HTTOP || ht == HTTOPLEFT || ht == HTTOPRIGHT) r.top = r.bottom - 50;
-		else r.bottom = r.top + 50;
-		h = 50;
-	}
-
-	SetWindowPos(s_tgt_drag_hwnd, NULL, r.left, r.top, w, h,
-	             SWP_NOZORDER | SWP_NOACTIVATE);
-}
-
-// Start a target-window drag (move or resize) if the cursor is over a
-// draggable non-client zone of the underlying app. Returns 1 if drag
-// was started (caller should consume the WM_LBUTTONDOWN), 0 otherwise
-// (caller falls back to forward_click).
-static int
-dxr_try_start_target_drag(HWND overlay)
-{
-	dxr_underlying_target_t t;
-	if (!dxr_find_underlying_target(&t))
-		return 0;
-
-	int is_move   = (t.ht == HTCAPTION);
-	int is_resize = dxr_ht_is_resize(t.ht);
-	if (!is_move && !is_resize)
-		return 0;
-
-	s_tgt_drag_mode   = is_move ? DXR_TGT_DRAG_MOVE : DXR_TGT_DRAG_RESIZE;
-	s_tgt_drag_hwnd   = t.root;
-	s_tgt_drag_ht     = t.ht;
-	GetWindowRect(t.root, &s_tgt_drag_rect);
-	s_tgt_drag_anchor = t.cursor;
-	SetCapture(overlay);
-	SetForegroundWindow(t.root);
-
-	wchar_t root_cls[64] = {0};
-	GetClassNameW(t.root, root_cls, 63);
-	displayxr_log("[DisplayXR] target_drag start: mode=%s hwnd=%p[%ls] ht=%ld anchor=(%d,%d) rect=(%d,%d %dx%d)\n",
-	              is_move ? "MOVE" : "RESIZE",
-	              (void *)t.root, root_cls, (long)t.ht,
-	              (int)s_tgt_drag_anchor.x, (int)s_tgt_drag_anchor.y,
-	              (int)s_tgt_drag_rect.left, (int)s_tgt_drag_rect.top,
-	              (int)(s_tgt_drag_rect.right - s_tgt_drag_rect.left),
-	              (int)(s_tgt_drag_rect.bottom - s_tgt_drag_rect.top));
-	return 1;
-}
-
-// End the active target-window drag. Idempotent.
-static void
-dxr_end_target_drag(void)
-{
-	if (s_tgt_drag_mode == DXR_TGT_DRAG_NONE)
-		return;
-	displayxr_log("[DisplayXR] target_drag end: mode=%d hwnd=%p ht=%ld\n",
-	              (int)s_tgt_drag_mode, (void *)s_tgt_drag_hwnd,
-	              (long)s_tgt_drag_ht);
-	s_tgt_drag_mode = DXR_TGT_DRAG_NONE;
-	s_tgt_drag_hwnd = NULL;
-	s_tgt_drag_ht   = HTNOWHERE;
-	if (GetCapture() == s_overlay_hwnd)
-		ReleaseCapture();
-}
-
-// Forward a button event the overlay caught in a transparent zone
-// (Approach C, #57) to the underlying app's control under the cursor.
+//   - cursor over a transparent zone → s_hit_active=0 → WS_EX_TRANSPARENT
+//     SET → OS skips us in WindowFromPoint hit-test and routes input
+//     directly to whatever desktop app is at the cursor. Cloaked Unity
+//     is moved off-screen at (-32000,-32000) in displayxr_set_transparent_
+//     overlay so it is NOT in the hit-test path; clicks reach the actual
+//     desktop window underneath.
 //
-// HTCLIENT     → PostMessage(deepest, msg, wParam, client_lp). Notepad
-//                edit field, app toolbars, button bodies, etc.
+// Native OS routing gives us cross-process click activation, real
+// DefWindowProc modal SC_MOVE/SC_SIZE/SC_CLOSE loops with proper
+// GetKeyState (synchronously dispatched via the target's own input
+// queue), native cursor adaptation over resize edges and help buttons,
+// native menu activation, native hover and TrackMouseEvent — without
+// any cross-process PostMessage gymnastics on our side.
 //
-// non-HTCLIENT → PostMessage(root, WM_NC*BUTTON*, wParam=ht, screen_lp).
-//                DefWindowProc on the target then performs the standard
-//                action per HT code:
-//                  HTCAPTION                → SC_MOVE modal drag loop
-//                  HTCLOSE                  → highlight on DOWN, SC_CLOSE on UP
-//                  HTMINBUTTON              → SC_MINIMIZE on UP
-//                  HTMAXBUTTON              → SC_MAXIMIZE / restore on UP
-//                  HTLEFT/RIGHT/TOP/BOTTOM  → SC_SIZE modal resize loop
-//                  HTSYSMENU                → system menu on UP
+// Earlier attempts to manually forward WM_LBUTTON* / WM_NCLBUTTON* /
+// WM_MOUSEMOVE to discovered target windows via FindWindowExW +
+// PostMessage (#57 sessions 4–5, Approach C) failed because:
+//   - DefWindowProc's modal loops on the target poll GetKeyState, which
+//     reflects the target thread's queue-synchronous input state, not
+//     the live OS state — our PostMessage'd DOWN arrives without a
+//     matching key-down event in the target's queue, so the loop bails.
+//     SC_MOVE drag worked only by timing luck; SC_CLOSE never worked.
+//   - Foreground activation transfer across processes via
+//     SetForegroundWindow was unreliable for non-classic Win32 chrome
+//     (UWP/WinUI title bars, popup menus).
+//   - Per-WM_MOUSEMOVE / per-WM_SETCURSOR target discovery via
+//     FindWindowExW + SendMessageTimeoutW(WM_NCHITTEST) caused
+//     wndproc-level lag when hovering over a foreign window.
 //
-// Activation: SetForegroundWindow(root) on press messages — we have SFW
-// permission because we received the click in our wndproc as the
-// foreground process, and the target needs focus to take keyboard input.
-//
-// NOT used for WM_MOUSEMOVE — see forward_hover_to_underlying_window.
-static void
-forward_click_to_underlying_window(UINT msg, WPARAM wParam)
-{
-	dxr_underlying_target_t t;
-	if (!dxr_find_underlying_target(&t)) {
-		POINT c = {0, 0};
-		GetCursorPos(&c);
-		displayxr_log("[DisplayXR] forward_click: no underlying top-level at (%d,%d) for msg=0x%04X\n",
-		              (int)c.x, (int)c.y, (unsigned)msg);
-		return;
-	}
-
-	int is_press = (msg == WM_LBUTTONDOWN   || msg == WM_RBUTTONDOWN   ||
-	                msg == WM_MBUTTONDOWN   || msg == WM_LBUTTONDBLCLK ||
-	                msg == WM_RBUTTONDBLCLK || msg == WM_MBUTTONDBLCLK);
-
-	if (t.ht == HTNOWHERE || t.ht == HTERROR || t.ht == HTTRANSPARENT) {
-		// Target says "not mine" / "skip me" — don't fire phantom events.
-		displayxr_log("[DisplayXR] forward_click: msg=0x%04X cursor=(%d,%d) root=%p ht=%ld — skipped\n",
-		              (unsigned)msg, (int)t.cursor.x, (int)t.cursor.y,
-		              (void *)t.root, (long)t.ht);
-		return;
-	}
-
-	if (t.ht == HTCLIENT) {
-		POINT client_pt = t.cursor;
-		ScreenToClient(t.deepest, &client_pt);
-
-		if (is_press) {
-			BOOL ok = SetForegroundWindow(t.root);
-			DWORD err = ok ? 0 : GetLastError();
-			displayxr_log("[DisplayXR] forward_click: SetForegroundWindow(root=%p) ok=%d err=%lu\n",
-			              (void *)t.root, ok ? 1 : 0,
-			              (unsigned long)err);
-		}
-
-		LPARAM client_lp = MAKELPARAM((WORD)client_pt.x, (WORD)client_pt.y);
-		PostMessageW(t.deepest, msg, wParam, client_lp);
-
-		wchar_t root_cls[64]    = {0};
-		wchar_t deepest_cls[64] = {0};
-		DWORD deepest_pid = 0;
-		GetClassNameW(t.root, root_cls, 63);
-		GetClassNameW(t.deepest, deepest_cls, 63);
-		GetWindowThreadProcessId(t.deepest, &deepest_pid);
-		displayxr_log("[DisplayXR] forward_click: msg=0x%04X cursor=(%d,%d) root=%p[%ls] deepest=%p[%ls] client=(%d,%d) pid=%lu ht=HTCLIENT\n",
-		              (unsigned)msg, (int)t.cursor.x, (int)t.cursor.y,
-		              (void *)t.root, root_cls,
-		              (void *)t.deepest, deepest_cls,
-		              (int)client_pt.x, (int)client_pt.y,
-		              (unsigned long)deepest_pid);
-		return;
-	}
-
-	// Non-client: PostMessage WM_NC*BUTTON* with HT in wParam and SCREEN
-	// coords in lParam. DefWindowProc dispatches the SC_* / button-press
-	// behavior keyed off wParam.
-	UINT nc_msg = dxr_nc_button_msg(msg);
-	if (nc_msg == 0) {
-		displayxr_log("[DisplayXR] forward_click: no NC analog for msg=0x%04X ht=%ld — dropped\n",
-		              (unsigned)msg, (long)t.ht);
-		return;
-	}
-
-	if (is_press) {
-		BOOL ok = SetForegroundWindow(t.root);
-		DWORD err = ok ? 0 : GetLastError();
-		displayxr_log("[DisplayXR] forward_click: SetForegroundWindow(root=%p) ok=%d err=%lu (NC)\n",
-		              (void *)t.root, ok ? 1 : 0,
-		              (unsigned long)err);
-	}
-
-	LPARAM screen_lp = MAKELPARAM((WORD)t.cursor.x, (WORD)t.cursor.y);
-	PostMessageW(t.root, nc_msg, (WPARAM)t.ht, screen_lp);
-
-	// On WM_LBUTTONUP over a window-action button (close / min / max /
-	// help), also post WM_SYSCOMMAND with the matching SC_* directly.
-	// DefWindowProc's WM_NCLBUTTONDOWN modal close-tracking loop
-	// polls GetKeyState(VK_LBUTTON), which reflects the target thread's
-	// queue-synchronous input state — NOT the live OS state — so our
-	// PostMessage'd DOWN doesn't make the modal loop see the held
-	// button. The loop bails before firing the action. Posting SC_*
-	// directly on UP makes the action fire regardless. The user's UP
-	// cursor position is implicitly the "did they release on the
-	// button?" check — if they dragged off, t.ht reflects the new
-	// hit-test zone and SC_* doesn't fire.
-	if (msg == WM_LBUTTONUP) {
-		WPARAM sc = dxr_sc_for_ht(t.ht);
-		if (sc != 0) {
-			PostMessageW(t.root, WM_SYSCOMMAND, sc, screen_lp);
-			displayxr_log("[DisplayXR] forward_click: posted WM_SYSCOMMAND sc=0x%04X (ht=%ld) on UP\n",
-			              (unsigned)sc, (long)t.ht);
-		}
-	}
-
-	wchar_t root_cls[64] = {0};
-	DWORD root_pid = 0;
-	GetClassNameW(t.root, root_cls, 63);
-	GetWindowThreadProcessId(t.root, &root_pid);
-	displayxr_log("[DisplayXR] forward_click: msg=0x%04X→nc=0x%04X cursor=(%d,%d) root=%p[%ls] ht=%ld pid=%lu\n",
-	              (unsigned)msg, (unsigned)nc_msg,
-	              (int)t.cursor.x, (int)t.cursor.y,
-	              (void *)t.root, root_cls,
-	              (long)t.ht, (unsigned long)root_pid);
-}
-
-// Forward a WM_MOUSEMOVE the overlay caught in a transparent zone to
-// the underlying app so hot-track button highlights, taskbar thumbnail
-// previews, and tooltips fire on cursor hover.
-//
-// Throttled to ~60 Hz: the handoff doc's session-4 lesson — flooding
-// the target with per-pixel mouse-move messages — is the failure mode
-// to avoid. 16 ms leaves ample margin for the OS's TrackMouseEvent
-// machinery (default hover ~400 ms, tooltip ~500 ms).
-//
-// TrackMouseEvent / WM_MOUSEHOVER / WM_MOUSELEAVE need no synthesis:
-// once the target receives any WM_MOUSEMOVE, controls call
-// TrackMouseEvent themselves and the OS dispatches MOUSEHOVER /
-// MOUSELEAVE based on the real cursor position vs the tracked HWND's
-// rect — independent of which HWND received the originating
-// WM_MOUSEMOVE. DWM-themed title-bar hot-track responds to
-// WM_NCMOUSEMOVE the same way.
-//
-// No SetForegroundWindow — hover never activates a window. No
-// per-event log line — even at 60 Hz that's 60 lines/sec into
-// displayxr.log.
-static void
-forward_hover_to_underlying_window(void)
-{
-	static DWORD s_last_hover_tick = 0;
-	DWORD now = GetTickCount();
-	if (now - s_last_hover_tick < 16)
-		return;
-	s_last_hover_tick = now;
-
-	dxr_underlying_target_t t;
-	if (!dxr_find_underlying_target(&t))
-		return;
-	if (t.ht == HTNOWHERE || t.ht == HTERROR || t.ht == HTTRANSPARENT)
-		return;
-
-	if (t.ht == HTCLIENT) {
-		POINT client_pt = t.cursor;
-		ScreenToClient(t.deepest, &client_pt);
-		PostMessageW(t.deepest, WM_MOUSEMOVE, 0,
-		             MAKELPARAM((WORD)client_pt.x, (WORD)client_pt.y));
-		return;
-	}
-
-	// WM_NCMOUSEMOVE — wParam = HT code, lParam = SCREEN coords.
-	PostMessageW(t.root, WM_NCMOUSEMOVE, (WPARAM)t.ht,
-	             MAKELPARAM((WORD)t.cursor.x, (WORD)t.cursor.y));
-}
-
+// WS_EX_LAYERED is the canonical companion for WS_EX_TRANSPARENT hit-
+// test pass-through (per MSDN) but conflicts with our WS_EX_NOREDIRECTION
+// BITMAP per-pixel alpha. On Windows 10/11 with NOREDIRECTIONBITMAP +
+// DComp compositing, the OS appears to honor WS_EX_TRANSPARENT for
+// hit-test routing without requiring WS_EX_LAYERED.
 // ============================================================================
-// Click-through diagnostic instrumentation (issue #57 session 5)
+// Click-through diagnostic instrumentation (issue #57)
 //
-// Cross-process click-through is currently broken: WS_EX_TRANSPARENT is
-// toggled correctly on the overlay HWND, Unity is parked off-screen, yet
-// clicks in transparent zones don't reach the underlying app and the
-// forward_click_to_underlying_window fallback never fires either. The
-// click is going *somewhere* and we need to find out where before
-// changing any behavior. The two probes below report:
+// Two probes for correlating overlay input behavior with the OS hit-test:
 //
 //   1. WH_MOUSE_LL (global low-level mouse hook): fires before any
 //      window's wndproc, so we can log WindowFromPoint(cursor) — the
-//      OS's actual hit-test result — for every button event.
-//   2. Entry log at the top of overlay_wnd_proc's button handlers (in the
-//      function below): fires iff the OS dispatched the message to us,
-//      with a live re-read of WS_EX_TRANSPARENT (proves whether the OS
-//      honored the bit at this exact dispatch).
+//      OS's actual hit-test result — for every button event. Confirms
+//      whether the OS routed the click to us or past us in real time.
 //
-// Both write to displayxr_log with [LLMouse] / [OvlWnd] prefixes for
-// easy grep. See docs~/roadmap/transparent-overlay-handoff.md
-// "Click-through investigation playbook" and the session-5 plan in
-// .claude/plans/.
+//   2. Entry log at the top of overlay_wnd_proc's button handlers: fires
+//      iff the OS dispatched the message to us (so WS_EX_TRANSPARENT
+//      was OFF at the dispatch), with a live re-read of the exstyle.
+//
+// Both write to displayxr_log with [LLMouse] / [OvlWnd] prefixes.
 // ============================================================================
 
 static HHOOK         s_ll_mouse_hook    = NULL;
@@ -816,20 +392,12 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 	switch (msg) {
 	case WM_NCHITTEST: {
 		if (s_overlay_is_toplevel) {
-			// Approach C (#57 session 5): catch every click in the
-			// overlay rect and forward to the underlying app via
-			// SetForegroundWindow + PostMessage from our wndproc. This
-			// is the only way to get cross-process activation while we
-			// are the foreground process — letting the OS route past
-			// us via WS_EX_TRANSPARENT delivers the click but the OS
-			// won't transfer foreground to the target (verified with
-			// WH_MOUSE_LL: WindowFromPoint correctly resolved to
-			// Notepad's RichEditD2DPT, but Notepad never activated).
-			// We catch, we SFW(target), then we PostMessage — and the
-			// "foreground process / received last input" rule grants
-			// us SFW permission. Tradeoff: hover doesn't pass through
-			// to the underlying app's hover-states, only to Unity for
-			// cube interaction. Acceptable for the avatar use case.
+			// Transparent overlay: WS_EX_TRANSPARENT toggling in
+			// displayxr_set_overlay_hit_active drives the OS hit-
+			// test routing. When WS_EX_TRANSPARENT is ON, the OS
+			// skips us in WindowFromPoint and never calls our
+			// WM_NCHITTEST. When it's OFF (cursor over the cube),
+			// the OS calls us — return HTCLIENT to claim the click.
 			return HTCLIENT;
 		}
 		// Opaque WS_CHILD path: rect-based click-through is correct
@@ -864,19 +432,17 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 	// requirements (WS_EX_NOREDIRECTIONBITMAP for per-pixel alpha,
 	// WS_EX_NOACTIVATE) block that. Tracked in displayxr-runtime#193.
 	case WM_RBUTTONDOWN: {
-		// Transparent zone (cursor off cube): forward click to the
-		// desktop window under the cursor. WS_EX_TRANSPARENT routes
-		// hover past us correctly but clicks may still land here on
-		// non-layered windows; this is the Approach C fallback.
-		if (!s_hit_active) {
-			forward_click_to_underlying_window(msg, wParam);
-			return 0;
-		}
+		// Reaching this case means the OS routed the click to us, so
+		// WS_EX_TRANSPARENT is currently OFF (s_hit_active=1 — cursor
+		// over the cube). When the cursor is in a transparent zone,
+		// WS_EX_TRANSPARENT is set and the OS routes past us natively
+		// to the desktop window underneath.
+		//
 		// Cube area: claim OS foreground so subsequent keyboard goes
-		// to us (Unity via INPUTSINK), not to whichever app we last
-		// forwarded to. WS_EX_NOACTIVATE blocks click-driven
-		// activation, but programmatic SFW from "received last input
-		// event" is allowed. See displayxr_is_our_process_foreground.
+		// to us (Unity via INPUTSINK). WS_EX_NOACTIVATE blocks
+		// click-driven activation, but programmatic SFW from "received
+		// last input event" is allowed. See
+		// displayxr_is_our_process_foreground.
 		SetForegroundWindow(hwnd);
 		GetCursorPos(&s_drag_anchor_screen);
 		RECT wr;
@@ -902,85 +468,22 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 			ReleaseCapture();
 			return 0;
 		}
-		// Pair with the transparent-zone WM_RBUTTONDOWN we forwarded
-		// (drag wasn't active because we returned early there).
-		if (!s_hit_active) {
-			forward_click_to_underlying_window(msg, wParam);
-			return 0;
-		}
 		break;
 	case WM_CAPTURECHANGED: {
 		int was_active = s_drag_active;
 		s_drag_active = 0;
 		if (was_active)
 			SendMessageW(hwnd, WM_EXITSIZEMOVE, 0, 0);
-		// Capture loss also cancels any in-progress target-drag (move
-		// or resize). Without this, a stuck s_tgt_drag_mode would
-		// hijack the next WM_MOUSEMOVE into a phantom drag.
-		if (s_tgt_drag_mode != DXR_TGT_DRAG_NONE) {
-			s_tgt_drag_mode = DXR_TGT_DRAG_NONE;
-			s_tgt_drag_hwnd = NULL;
-			s_tgt_drag_ht   = HTNOWHERE;
-		}
 		break;
 	}
 
-	// ----- WM_SETCURSOR: adapt cursor to underlying app's hit zone -----
-	// While target-drag is active, lock to the drag-mode cursor
-	// (SIZEALL for move, per-edge for resize). Otherwise, in
-	// transparent zones, peek at the underlying app's WM_NCHITTEST
-	// and load the matching IDC_SIZE* / IDC_HELP. Returning TRUE
-	// suppresses the overlay class's default arrow.
-	case WM_SETCURSOR: {
-		if (!s_overlay_is_toplevel)
-			break;
-		if (s_tgt_drag_mode == DXR_TGT_DRAG_MOVE) {
-			SetCursor(LoadCursorW(NULL, (LPCWSTR)IDC_SIZEALL));
-			return TRUE;
-		}
-		if (s_tgt_drag_mode == DXR_TGT_DRAG_RESIZE) {
-			HCURSOR c = dxr_cursor_for_ht(s_tgt_drag_ht);
-			if (c != NULL) {
-				SetCursor(c);
-				return TRUE;
-			}
-		}
-		if (s_hit_active)
-			break; // cube area: default cursor / Unity handles
-		dxr_underlying_target_t t;
-		if (!dxr_find_underlying_target(&t))
-			break;
-		HCURSOR c = dxr_cursor_for_ht(t.ht);
-		if (c != NULL) {
-			SetCursor(c);
-			return TRUE;
-		}
-		break;
-	}
-
-	// ----- mouse-move: drag overlay / target if active, else forward -----
+	// ----- mouse-move: drag overlay if active, else forward to Unity -----
+	// When WS_EX_TRANSPARENT is OFF (cube area), the overlay receives
+	// these. When it's ON (transparent zone), the OS routes WM_MOUSEMOVE
+	// to the desktop app at the cursor natively — we never see them, so
+	// hover / TrackMouseEvent / tooltips / taskbar previews / cursor
+	// adaptation all fire on the real recipient without our help.
 	case WM_MOUSEMOVE: {
-		// Target-window drag/resize takes precedence over everything
-		// else — we have SetCapture, so every WM_MOUSEMOVE while
-		// dragging belongs to that gesture.
-		if (s_tgt_drag_mode != DXR_TGT_DRAG_NONE && s_tgt_drag_hwnd != NULL) {
-			POINT cur;
-			GetCursorPos(&cur);
-			int dx = cur.x - s_tgt_drag_anchor.x;
-			int dy = cur.y - s_tgt_drag_anchor.y;
-			if (s_tgt_drag_mode == DXR_TGT_DRAG_MOVE) {
-				int w = s_tgt_drag_rect.right - s_tgt_drag_rect.left;
-				int h = s_tgt_drag_rect.bottom - s_tgt_drag_rect.top;
-				SetWindowPos(s_tgt_drag_hwnd, NULL,
-				             s_tgt_drag_rect.left + dx,
-				             s_tgt_drag_rect.top + dy,
-				             w, h,
-				             SWP_NOZORDER | SWP_NOACTIVATE);
-			} else {
-				dxr_apply_target_resize(dx, dy);
-			}
-			return 0;
-		}
 		if (s_drag_active) {
 			POINT cur;
 			GetCursorPos(&cur);
@@ -990,18 +493,8 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 			             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 			return 0;
 		}
-		// Transparent zone: forward hover to the underlying app so its
-		// controls hot-track, tooltips arm, taskbar thumbnail previews
-		// fire. Throttled internally to ~60 Hz to address the session-4
-		// flood concern. Gated on !s_hit_active for the same reason
-		// click forwarding is — when the cursor is over the cube
-		// silhouette, the app underneath shouldn't show hover state
-		// behind the cube.
-		if (!s_hit_active)
-			forward_hover_to_underlying_window();
-
-		// Unity always sees hover for cube hover-detection / cursor
-		// polling — independent of where the cursor is on the overlay.
+		// Cube area: forward hover to Unity for cube hover-detection /
+		// cursor-state polling.
 		HWND unity_hover = find_unity_hwnd();
 		if (unity_hover != NULL)
 			PostMessageW(unity_hover, msg, wParam, lParam);
@@ -1010,32 +503,12 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 	case WM_LBUTTONDOWN: case WM_LBUTTONUP:
 	case WM_LBUTTONDBLCLK:
 	case WM_MBUTTONDOWN: case WM_MBUTTONUP: {
-		// Target-drag UP closes out our captured drag gesture. The
-		// drag's own logic posted nothing to the target, so there's
-		// nothing else to do — just release capture and clear state.
-		if (msg == WM_LBUTTONUP && s_tgt_drag_mode != DXR_TGT_DRAG_NONE) {
-			dxr_end_target_drag();
-			return 0;
-		}
-		// Transparent zone: try to start a target-drag (HTCAPTION /
-		// resize edges) before forwarding. SC_MOVE / SC_SIZE modal
-		// loops on the target are unreliable cross-process because
-		// the target's GetKeyState(VK_LBUTTON) doesn't reflect our
-		// PostMessage'd DOWN. Driving the move/resize from our
-		// overlay with SetCapture is fully reliable.
-		if (!s_hit_active) {
-			if (msg == WM_LBUTTONDOWN &&
-			    s_tgt_drag_mode == DXR_TGT_DRAG_NONE &&
-			    dxr_try_start_target_drag(hwnd)) {
-				return 0;
-			}
-			forward_click_to_underlying_window(msg, wParam);
-			return 0;
-		}
-		// Cube area: on press, claim OS foreground so keyboard goes to
-		// our process (Unity via INPUTSINK) instead of whichever app
-		// we last forwarded a click to. Skip on UP messages — UP after
-		// the press would be redundant.
+		// Same gating as above: reaching this case means we're in the
+		// cube area (WS_EX_TRANSPARENT OFF). Transparent-zone clicks
+		// are routed to the desktop natively and never arrive here.
+		//
+		// On press, claim OS foreground so keyboard goes to our
+		// process (Unity via INPUTSINK).
 		if (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONDBLCLK ||
 		    msg == WM_MBUTTONDOWN) {
 			SetForegroundWindow(hwnd);
@@ -1226,18 +699,19 @@ displayxr_get_app_main_view(void)
 	DWORD style    = transparent_mode
 	    ? (DWORD)(WS_POPUP | WS_VISIBLE)
 	    : (DWORD)(WS_CHILD | WS_VISIBLE);
-	// Transparent path: NO WS_EX_TRANSPARENT — that bypasses WM_NCHITTEST so
-	// click-through becomes all-or-nothing. We instead gate per-pixel
-	// click-through via overlay_wnd_proc's WM_NCHITTEST + s_hit_rect.
+	// Transparent path: WS_EX_TRANSPARENT is NOT in the creation exstyle —
+	// it's toggled per-frame by displayxr_set_overlay_hit_active() driven
+	// by the C# raycast at the current cursor position. When the cursor
+	// is over a clickable renderer (cube silhouette), WS_EX_TRANSPARENT
+	// is cleared so the overlay catches clicks for Unity. When the cursor
+	// is in a transparent zone, WS_EX_TRANSPARENT is set and the OS
+	// routes hit-tests natively past us to whatever desktop window is
+	// underneath — full cross-process click/hover/cursor fidelity without
+	// any in-plugin forwarder gymnastics.
 	// WS_EX_NOACTIVATE keeps activation/foreground on Unity's (cloaked) HWND
-	// when the user clicks the overlay — otherwise Application.isFocused
+	// when the user clicks the cube — otherwise Application.isFocused
 	// flips false and Unity stops processing input.
-	// WS_EX_TOPMOST keeps the avatar visually above the underlying app
-	// while we forward clicks/keyboard to that app via Approach C
-	// (#57 session 5). WS_EX_NOACTIVATE prevents click-on-cube from
-	// stealing focus from the underlying app — the C# side computes the
-	// raycast in screen space, and we PostMessage to Unity directly, so
-	// we never need foreground.
+	// WS_EX_TOPMOST keeps the avatar visually above the underlying app.
 	DWORD ex_style = transparent_mode
 	    ? (DWORD)(WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)
 	    : (DWORD)(WS_EX_TRANSPARENT);
@@ -1325,10 +799,12 @@ displayxr_get_unity_main_hwnd(void)
 // chroma→alpha conversion — that workaround is gone now that the runtime
 // advertises ALPHA_BLEND and Unity emits true alpha.
 //
-// Click-through is independent of all of the above: WM_NCHITTEST returns
-// HTCLIENT when s_hit_active=1 (cursor over a clickable renderer), else
-// HTTRANSPARENT; button events in non-hit regions are forwarded to the
-// underlying window via forward_click_to_underlying_window (Approach C).
+// Click-through is independent of all of the above: the overlay's
+// WS_EX_TRANSPARENT bit is toggled per-frame by
+// displayxr_set_overlay_hit_active() based on the C# raycast at the
+// current cursor position. When set (transparent zone), the OS hit-test
+// routes natively past us to the desktop app underneath. When clear
+// (cube silhouette), the overlay catches clicks for Unity.
 //
 // Mutually exclusive with shell mode (early-out below).
 // ============================================================================
@@ -1638,18 +1114,43 @@ displayxr_set_overlay_hit_active(int active)
 		return;
 	s_hit_active = new_active;
 
-	// Approach C (#57 session 5): the overlay always catches clicks
-	// (WM_NCHITTEST returns HTCLIENT), and overlay_wnd_proc dispatches
-	// based on s_hit_active — cube path PostMessages to Unity, transparent
-	// zone path calls forward_click_to_underlying_window which does
-	// SetForegroundWindow + PostMessage on the target. We no longer
-	// toggle WS_EX_TRANSPARENT: that path delivered messages to the
-	// underlying window but couldn't transfer foreground from us, so
-	// Notepad-style apps received the click without activating (no caret,
-	// no keyboard). Logging the hit_active transition is kept for log
-	// correlation with the [LLMouse] / [OvlWnd] probes.
-	displayxr_log("[DisplayXR] hit_active=%d (Approach C — overlay always catches)\n",
-	              s_hit_active);
+	// Transparent overlay: toggle WS_EX_TRANSPARENT on the overlay HWND
+	// so the OS hit-test routes natively past us in transparent zones.
+	//
+	//   active=1 (cursor over cube) → CLEAR WS_EX_TRANSPARENT — overlay
+	//   catches WM_LBUTTON*/WM_MOUSEMOVE/WM_MOUSEWHEEL and posts to Unity.
+	//
+	//   active=0 (transparent zone) → SET WS_EX_TRANSPARENT — OS skips us
+	//   in WindowFromPoint and dispatches the event directly to whichever
+	//   desktop window is at the cursor. Unity is moved off-screen at
+	//   (-32000,-32000) in displayxr_set_transparent_overlay so it is
+	//   NOT in the hit-test path; clicks reach the actual desktop window.
+	//
+	// Native OS routing gives us cross-process click activation, real
+	// DefWindowProc modal SC_MOVE/SC_SIZE/SC_CLOSE loops with proper
+	// GetKeyState semantics, native cursor adaptation, native menu
+	// activation, native hover and TrackMouseEvent. Replaces the
+	// PostMessage-forwarder gymnastics from earlier sessions that
+	// failed because the target's queue-synchronous input state never
+	// saw the synthetic events as a real button press.
+	//
+	// No SWP_FRAMECHANGED — the exstyle change alone updates the OS
+	// hit-test routing on the next mouse event. SWP_FRAMECHANGED was
+	// tried in earlier sessions as a defensive cache flush and reverted
+	// (broke hover; see handoff doc).
+	if (s_overlay_is_toplevel && s_overlay_hwnd != NULL && IsWindow(s_overlay_hwnd)) {
+		DWORD ex = (DWORD)GetWindowLongPtrW(s_overlay_hwnd, GWL_EXSTYLE);
+		DWORD new_ex = s_hit_active ? (ex & ~WS_EX_TRANSPARENT)
+		                            : (ex | WS_EX_TRANSPARENT);
+		if (new_ex != ex)
+			SetWindowLongPtrW(s_overlay_hwnd, GWL_EXSTYLE, (LONG_PTR)new_ex);
+		displayxr_log("[DisplayXR] hit_active=%d → WS_EX_TRANSPARENT %s (overlay=%p exstyle=0x%08X)\n",
+		              s_hit_active, s_hit_active ? "OFF (overlay catches)" : "ON  (OS routes past)",
+		              (void *)s_overlay_hwnd, (unsigned)new_ex);
+	} else {
+		displayxr_log("[DisplayXR] hit_active=%d (opaque WS_CHILD mode — toggle no-op)\n",
+		              s_hit_active);
+	}
 }
 
 void
