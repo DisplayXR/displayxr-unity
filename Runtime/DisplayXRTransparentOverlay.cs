@@ -505,16 +505,16 @@ namespace DisplayXR
                 {
                     DisplayXRNative.displayxr_set_overlay_hit_rect(rx, ry, rw, rh);
                 }
-                // Approach B+: render the silhouette to a small RT with
-                // the cyclopean view/proj, AsyncGPUReadback, hand the
-                // mask bytes to native which turns it into a per-pixel
-                // SetWindowRgn. Concavities like the gap between the
-                // tiger's legs are excluded from the region — clicks
-                // there route natively to the desktop. Once the first
-                // mask lands, native ignores subsequent hit_rect calls
-                // (mask wins).
-                RenderHitMaskAndRequestReadback(cycView2, cycProj2,
-                                                overlayW, overlayH);
+                // Approach B+: render the silhouette PER EYE (union of
+                // left+right) to a small RT, dilate, then
+                // AsyncGPUReadback. Per-eye union covers what the
+                // lenticular actually displays column-by-column; the
+                // cyclopean midpoint by itself is narrower than the
+                // visible silhouette on high-disparity foreground
+                // geometry (e.g. hands), causing clipping.
+                RenderHitMaskAndRequestReadback(
+                    lv2, lp2, rv2, rp2,
+                    overlayW, overlayH);
             }
 #elif UNITY_STANDALONE_OSX
             // (#85) Mac cursor/button polling + cyclopean hit-test mirroring
@@ -1116,31 +1116,56 @@ namespace DisplayXR
             }
         }
 
-        // Build a one-shot CommandBuffer that renders the clickable
-        // renderers to m_HitMaskRT with the cyclopean view/proj (so
-        // the silhouette matches what the user sees on the lenticular
-        // — the stereo-fused position, not either eye's image), then
-        // Blits through a 5x5 max-kernel dilation shader into
-        // m_HitMaskDilatedRT to soak up AA edge pixels and smooth
-        // the staircase. AsyncGPUReadback's the dilated mask.
-        // Throttled to one outstanding request at a time.
-        void RenderHitMaskAndRequestReadback(Matrix4x4 cycView, Matrix4x4 cycProj,
-                                              int overlayW, int overlayH)
+        // Build a one-shot CommandBuffer that:
+        //   1) Renders each clickable renderer ONCE PER EYE into
+        //      m_HitMaskRT, using CommandBuffer.SetGlobalMatrix to
+        //      push the per-eye view-projection as a custom property
+        //      (_DXRViewProj) the silhouette shader consumes. Two
+        //      passes accumulate into the same RT (no clear between);
+        //      shader writes (1,0,0,1) unconditionally with no blend,
+        //      so the result is the boolean union of the two
+        //      silhouettes — what the lenticular actually displays.
+        //   2) Blits through the 5x5 max-kernel dilation shader into
+        //      m_HitMaskDilatedRT so AA-edge pixels and any sub-pixel
+        //      mismatch fall inside the SetWindowRgn region.
+        //   3) AsyncGPUReadback's the dilated RT.
+        //
+        // The custom _DXRViewProj uniform is critical: Unity's XR
+        // render pipeline overrides UNITY_MATRIX_VP per stereo eye,
+        // so CommandBuffer.SetViewProjectionMatrices is ineffective
+        // here and DrawRenderer ends up rasterizing both passes with
+        // the same matrices. _DXRViewProj is a property Unity doesn't
+        // know about, so SetGlobalMatrix sticks across the draws.
+        //
+        // For N-view extension: add more (view, proj) pairs and call
+        // SetGlobalMatrix + DrawRenderer for each. Architecture-friendly.
+        //
+        // Throttled to one outstanding readback at a time.
+        void RenderHitMaskAndRequestReadback(
+            Matrix4x4 leftView,  Matrix4x4 leftProj,
+            Matrix4x4 rightView, Matrix4x4 rightProj,
+            int overlayW, int overlayH)
         {
             if (clickableRenderers == null || clickableRenderers.Length == 0)
                 return;
 
             EnsureHitMaskResources();
             if (m_SilhouetteMat == null) return;
-
             if (m_HitMaskReadbackPending) return;
+
+            // Bake GL-convention projection (Y-flip + depth-range
+            // baked in for off-screen RTs) × view into a single
+            // view-projection matrix that the shader applies in one
+            // mul against world-space vertices.
+            Matrix4x4 leftVP  = GL.GetGPUProjectionMatrix(leftProj,  true) * leftView;
+            Matrix4x4 rightVP = GL.GetGPUProjectionMatrix(rightProj, true) * rightView;
 
             m_HitMaskCB.Clear();
             m_HitMaskCB.SetRenderTarget(m_HitMaskRT);
             m_HitMaskCB.ClearRenderTarget(true, true, Color.clear);
-            m_HitMaskCB.SetViewProjectionMatrices(
-                cycView, GL.GetGPUProjectionMatrix(cycProj, true));
 
+            // Pass 1: left eye.
+            m_HitMaskCB.SetGlobalMatrix("_DXRViewProj", leftVP);
             for (int i = 0; i < clickableRenderers.Length; i++)
             {
                 var r = clickableRenderers[i];
@@ -1149,11 +1174,21 @@ namespace DisplayXR
                 m_HitMaskCB.DrawRenderer(r, m_SilhouetteMat, 0, 0);
             }
 
-            // Dilate the silhouette (expand by ~2 mask pixels in
-            // every direction) so the SetWindowRgn boundary includes
-            // sub-pixel AA edges. If the dilation material isn't
-            // available for any reason, fall back to a raw Blit
-            // (identity) so we still get a working mask.
+            // Pass 2: right eye. Accumulates into the same RT — pixels
+            // covered by either eye end up at 1 (boolean union).
+            m_HitMaskCB.SetGlobalMatrix("_DXRViewProj", rightVP);
+            for (int i = 0; i < clickableRenderers.Length; i++)
+            {
+                var r = clickableRenderers[i];
+                if (r == null || !r.enabled || !r.gameObject.activeInHierarchy)
+                    continue;
+                m_HitMaskCB.DrawRenderer(r, m_SilhouetteMat, 0, 0);
+            }
+
+            // Dilate the union by ~2 mask pixels to absorb AA-edge
+            // pixels at the silhouette boundary. Falls back to a
+            // direct readback of m_HitMaskRT if the dilation shader
+            // is unavailable.
             RenderTexture readbackRT;
             if (m_SilhouetteDilateMat != null && m_HitMaskDilatedRT != null)
             {
