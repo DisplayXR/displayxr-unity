@@ -201,8 +201,18 @@ namespace DisplayXR
             // xrCreateSession (native side).
             if (s_TransparentBackgroundRequested)
             {
+#if UNITY_STANDALONE_OSX
                 SetEnvironmentBlendMode(XrEnvironmentBlendMode.AlphaBlend);
                 Debug.Log("[DisplayXR] EnvironmentBlendMode = AlphaBlend (transparent session)");
+#else
+                // Windows DisplayXR runtime (≤ v1.3.0-6) does not enumerate
+                // XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND. Calling SetEnvironmentBlendMode
+                // here causes Unity's OpenXR loader to reject it and every subsequent
+                // xrEndFrame fails with XR_ERROR_VALIDATION_FAILURE → content never
+                // reaches the swapchain. Windows transparency uses the chroma-key
+                // path instead (RequestChromaKey + runtime compositor), which works
+                // without an alpha-blend session.
+#endif
             }
 
             Debug.Log("[DisplayXR] OpenXR instance created");
