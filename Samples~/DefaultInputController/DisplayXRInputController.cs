@@ -36,6 +36,13 @@ namespace DisplayXR
         [Tooltip("Scroll wheel zoom speed (scale factor per scroll tick).")]
         public float zoomSpeed = 0.1f;
 
+        [Tooltip("When false, scroll wheel does NOT zoom the camera. Useful " +
+                 "when the app drives its own scroll-based zoom (e.g. " +
+                 "WheelZoomVHeight driving DisplayXRDisplay.virtualDisplayHeight " +
+                 "for an avatar-style zoom-in-window). Mouse-look and WASD " +
+                 "are unaffected.")]
+        public bool scrollZoomEnabled = true;
+
         private float m_Yaw;
         private float m_Pitch;
         private bool m_Dragging;
@@ -339,6 +346,7 @@ namespace DisplayXR
 
         private void HandleScrollZoom()
         {
+            if (!scrollZoomEnabled) return;
             if (ShouldIgnoreInput()) return;
             float scroll = GetScrollDelta();
             if (Mathf.Abs(scroll) < 0.001f) return;

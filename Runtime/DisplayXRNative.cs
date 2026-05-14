@@ -8,8 +8,18 @@ namespace DisplayXR
 {
     /// <summary>
     /// P/Invoke bindings to the displayxr_unity native plugin.
+    ///
+    /// Promoted to public in v1.5.9 so user code (notably the Samples~/
+    /// DefaultInputController sample that moved out of Runtime) can call
+    /// the same native bindings the plugin uses internally. Method
+    /// signatures track the underlying native exports — a native change
+    /// is a binding change. Keep that contract in mind if you call these
+    /// from app code: prefer the high-level wrappers (DisplayXRFeature,
+    /// DisplayXRTransparentOverlay, DisplayXRRigManager) where they
+    /// exist; reach for DisplayXRNative only when nothing higher-level
+    /// is available.
     /// </summary>
-    internal static class DisplayXRNative
+    public static class DisplayXRNative
     {
         private const string LibName = "displayxr_unity";
 
@@ -18,13 +28,13 @@ namespace DisplayXR
         /// Returns our hook function pointer.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern IntPtr displayxr_install_hooks(IntPtr nextGetInstanceProcAddr);
+        public static extern IntPtr displayxr_install_hooks(IntPtr nextGetInstanceProcAddr);
 
         /// <summary>
         /// Set stereo rig tunables from game thread.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_set_tunables(
+        public static extern void displayxr_set_tunables(
             float ipdFactor,
             float parallaxFactor,
             float perspectiveFactor,
@@ -40,7 +50,7 @@ namespace DisplayXR
         /// Get display info queried from runtime via XR_EXT_display_info.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_get_display_info(
+        public static extern void displayxr_get_display_info(
             out float displayWidthM,
             out float displayHeightM,
             out uint pixelWidth,
@@ -56,7 +66,7 @@ namespace DisplayXR
         /// Get raw eye positions from last xrLocateViews call.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_get_eye_positions(
+        public static extern void displayxr_get_eye_positions(
             out float lx, out float ly, out float lz,
             out float rx, out float ry, out float rz,
             out int isTracked);
@@ -66,7 +76,7 @@ namespace DisplayXR
         /// Chain: raw eyes → scene transform → tunables → Kooima.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_set_scene_transform(
+        public static extern void displayxr_set_scene_transform(
             float posX, float posY, float posZ,
             float oriX, float oriY, float oriZ, float oriW,
             float scaleX, float scaleY, float scaleZ,
@@ -76,14 +86,14 @@ namespace DisplayXR
         /// Set the window handle for session creation (HWND on Win32, NSView* on macOS).
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_set_window_handle(IntPtr handle);
+        public static extern void displayxr_set_window_handle(IntPtr handle);
 
         /// <summary>
         /// Set editor mode flag. When enabled, native code creates its own preview
         /// window instead of auto-detecting the app's window.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_set_editor_mode(int enabled);
+        public static extern void displayxr_set_editor_mode(int enabled);
 
         /// <summary>
         /// (runtime-pvt #191 / displayxr-unity #57) Request the runtime's
@@ -97,7 +107,7 @@ namespace DisplayXR
         /// [RuntimeInitializeOnLoadMethod(SubsystemRegistration)].
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_set_transparent_background(int enabled);
+        public static extern void displayxr_set_transparent_background(int enabled);
 
         /// <summary>
         /// (runtime-pvt #191 spec v5) Set the chroma-key color for the
@@ -105,7 +115,7 @@ namespace DisplayXR
         /// COLORREF (0x00BBGGRR). 0 = pass disabled.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_set_transparent_chroma_key(uint color);
+        public static extern void displayxr_set_transparent_chroma_key(uint color);
 
         /// <summary>
         /// (displayxr-unity #85) Configure Unity's main render NSWindow for
@@ -114,7 +124,7 @@ namespace DisplayXR
         /// No-op on non-Apple platforms.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_macos_configure_unity_nswindow(int enabled);
+        public static extern void displayxr_macos_configure_unity_nswindow(int enabled);
 
         /// <summary>
         /// Move Unity's configured NSWindow by (dx, dy) screen points. Used by
@@ -147,14 +157,14 @@ namespace DisplayXR
         /// Must be called BEFORE Unity creates its OpenXR swapchains.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_set_use_srgb_swapchain(int enabled);
+        public static extern void displayxr_set_use_srgb_swapchain(int enabled);
 
         /// <summary>
         /// Check whether the plugin is running in shell/IPC mode.
         /// Detected via DISPLAYXR_SHELL_SESSION=1 environment variable.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int displayxr_is_shell_mode();
+        public static extern int displayxr_is_shell_mode();
 
         /// <summary>
         /// (issue #57) Returns 1 if the OS foreground window belongs to our
@@ -166,7 +176,7 @@ namespace DisplayXR
         /// while the user is typing in Notepad.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int displayxr_is_our_process_foreground();
+        public static extern int displayxr_is_our_process_foreground();
 
         /// <summary>
         /// (issue #57) Overlay's current client size in pixels. After scroll-
@@ -176,14 +186,14 @@ namespace DisplayXR
         /// overlay HWND.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_get_overlay_size(out int width, out int height);
+        public static extern void displayxr_get_overlay_size(out int width, out int height);
 
         /// <summary>
         /// Get shell-mode mouse button state from native WM_INPUT tracking.
         /// Buttons: bit 0 = left, bit 1 = right, bit 2 = middle.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_get_shell_mouse_state(
+        public static extern void displayxr_get_shell_mouse_state(
             out int buttons, out int mouseX, out int mouseY);
 
         /// <summary>
@@ -192,7 +202,7 @@ namespace DisplayXR
         /// eye offset on the physical display.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_set_viewport_size(uint width, uint height,
+        public static extern void displayxr_set_viewport_size(uint width, uint height,
             int screenX, int screenY);
 
         /// <summary>
@@ -201,7 +211,7 @@ namespace DisplayXR
         /// <param name="mode3d">1 for 3D mode, 0 for 2D mode.</param>
         /// <returns>1 on success, 0 on failure or not supported.</returns>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int displayxr_request_display_mode(int mode3d);
+        public static extern int displayxr_request_display_mode(int mode3d);
 
         /// <summary>
         /// Get the Kooima stereo view and projection matrices computed by the native library.
@@ -210,7 +220,7 @@ namespace DisplayXR
         /// Matrices are column-major, OpenXR/OpenGL convention.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_get_stereo_matrices(
+        public static extern void displayxr_get_stereo_matrices(
             [MarshalAs(UnmanagedType.LPArray, SizeConst = 16)] float[] leftView,
             [MarshalAs(UnmanagedType.LPArray, SizeConst = 16)] float[] leftProj,
             [MarshalAs(UnmanagedType.LPArray, SizeConst = 16)] float[] rightView,
@@ -221,7 +231,7 @@ namespace DisplayXR
         /// Get readback pixel data from offscreen rendering.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_get_readback(
+        public static extern void displayxr_get_readback(
             out IntPtr pixels,
             out uint width,
             out uint height,
@@ -231,14 +241,14 @@ namespace DisplayXR
         /// Kill xrPollEvent forwarding. Call before session/instance teardown.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_stop_polling();
+        public static extern void displayxr_stop_polling();
 
         /// <summary>
         /// Destroy the editor preview window. Call before XR teardown to
         /// prevent the compositor from blocking on a stale window.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_destroy_preview_window();
+        public static extern void displayxr_destroy_preview_window();
 
         // ====================================================================
         // Window-space UI overlay (issue #67)
@@ -254,7 +264,7 @@ namespace DisplayXR
         /// swapchain should mirror each frame. Pass IntPtr.Zero to deregister.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_window_space_ui_set_texture(
+        public static extern void displayxr_window_space_ui_set_texture(
             IntPtr nativeTex, int width, int height);
 
         /// <summary>
@@ -262,34 +272,34 @@ namespace DisplayXR
         /// horizontal disparity). Cheap; safe to call every frame.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_window_space_ui_set_layer(
+        public static extern void displayxr_window_space_ui_set_layer(
             float x, float y, float width, float height, float disparity);
 
         /// <summary>
         /// Clear the registered texture and mark the layer inactive.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_window_space_ui_clear();
+        public static extern void displayxr_window_space_ui_clear();
 
         // ====================================================================
         // Native log callback (routes native messages to Debug.Log)
         // ====================================================================
 
         [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-        internal delegate void LogCallback([MarshalAs(UnmanagedType.LPStr)] string message);
+        public delegate void LogCallback([MarshalAs(UnmanagedType.LPStr)] string message);
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_standalone_set_log_callback(LogCallback callback);
+        public static extern void displayxr_standalone_set_log_callback(LogCallback callback);
 
         // ====================================================================
         // Standalone preview session (bypasses Unity's OpenXR loader)
         // ====================================================================
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int displayxr_standalone_window_was_closed();
+        public static extern int displayxr_standalone_window_was_closed();
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_standalone_get_preview_mouse_state(
+        public static extern void displayxr_standalone_get_preview_mouse_state(
             out int buttons, out int wheelDelta);
 
         /// <summary>
@@ -301,25 +311,25 @@ namespace DisplayXR
         /// Editor-preview only — built apps use Input.mousePosition.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int displayxr_standalone_get_preview_mouse_position(
+        public static extern int displayxr_standalone_get_preview_mouse_position(
             out float fx, out float fy);
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int displayxr_standalone_window_is_interacting();
+        public static extern int displayxr_standalone_window_is_interacting();
 
         /// <summary>
         /// (Windows only) Set Unity's D3D12 device for atlas bridge texture.
         /// Must be called BEFORE displayxr_standalone_start().
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_standalone_set_unity_device(IntPtr unityNativeTex);
+        public static extern void displayxr_standalone_set_unity_device(IntPtr unityNativeTex);
 
         /// <summary>
         /// (Windows D3D12 only) Get the atlas bridge texture opened on Unity's device.
         /// C# uses Graphics.CopyTexture to copy the atlas RT into this each frame.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_standalone_get_atlas_bridge_texture(
+        public static extern void displayxr_standalone_get_atlas_bridge_texture(
             out IntPtr nativePtr, out uint width, out uint height);
 
         /// <summary>
@@ -334,25 +344,25 @@ namespace DisplayXR
         /// the SA-side bridge into the composition layer's swapchain image.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_standalone_get_wsui_bridge_texture(
+        public static extern void displayxr_standalone_get_wsui_bridge_texture(
             uint width, uint height,
             out IntPtr nativePtr, out uint outWidth, out uint outHeight);
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int displayxr_standalone_start(
+        public static extern int displayxr_standalone_start(
             [MarshalAs(UnmanagedType.LPStr)] string runtimeJsonPath);
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_standalone_stop();
+        public static extern void displayxr_standalone_stop();
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int displayxr_standalone_is_running();
+        public static extern int displayxr_standalone_is_running();
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_standalone_poll();
+        public static extern void displayxr_standalone_poll();
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_standalone_get_display_info(
+        public static extern void displayxr_standalone_get_display_info(
             out float displayWidthM, out float displayHeightM,
             out uint pixelWidth, out uint pixelHeight,
             out float nominalX, out float nominalY, out float nominalZ,
@@ -360,7 +370,7 @@ namespace DisplayXR
             out int isValid);
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_standalone_get_eye_positions(
+        public static extern void displayxr_standalone_get_eye_positions(
             out float lx, out float ly, out float lz,
             out float rx, out float ry, out float rz,
             out int isTracked);
@@ -370,33 +380,33 @@ namespace DisplayXR
         /// Returns 2.0 on macOS Retina, 1.0 on non-Retina or non-macOS.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern float displayxr_get_backing_scale_factor();
+        public static extern float displayxr_get_backing_scale_factor();
 
         // ====================================================================
         // Standalone frame loop (split: poll → begin → render → submit)
         // ====================================================================
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_standalone_poll_events();
+        public static extern void displayxr_standalone_poll_events();
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int displayxr_standalone_begin_frame(out int shouldRender);
+        public static extern int displayxr_standalone_begin_frame(out int shouldRender);
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int displayxr_standalone_submit_frame_atlas(IntPtr atlasTex);
+        public static extern int displayxr_standalone_submit_frame_atlas(IntPtr atlasTex);
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int displayxr_standalone_submit_frame(IntPtr leftTex, IntPtr rightTex);
+        public static extern int displayxr_standalone_submit_frame(IntPtr leftTex, IntPtr rightTex);
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_standalone_end_frame_empty();
+        public static extern void displayxr_standalone_end_frame_empty();
 
         // ====================================================================
         // Standalone stereo views (Kooima projection via display3d library)
         // ====================================================================
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_standalone_compute_views(
+        public static extern void displayxr_standalone_compute_views(
             uint viewCount,
             float nearZ, float farZ,
             [MarshalAs(UnmanagedType.LPArray)] float[] viewMatrices,
@@ -404,11 +414,11 @@ namespace DisplayXR
             out int valid);
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_standalone_get_swapchain_size(
+        public static extern void displayxr_standalone_get_swapchain_size(
             out uint width, out uint height);
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_standalone_get_current_mode_info(
+        public static extern void displayxr_standalone_get_current_mode_info(
             out uint viewCount,
             out uint tileColumns, out uint tileRows,
             out uint viewWidthPixels, out uint viewHeightPixels,
@@ -420,13 +430,13 @@ namespace DisplayXR
         // ====================================================================
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_standalone_set_tunables(
+        public static extern void displayxr_standalone_set_tunables(
             float ipdFactor, float parallaxFactor, float perspectiveFactor,
             float virtualDisplayHeight, float invConvergenceDistance, float fovOverride,
             float nearZ, float farZ, int cameraCentric);
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_standalone_set_display_pose(
+        public static extern void displayxr_standalone_set_display_pose(
             float posX, float posY, float posZ,
             float oriX, float oriY, float oriZ, float oriW,
             float scaleX, float scaleY, float scaleZ,
@@ -437,26 +447,26 @@ namespace DisplayXR
         // ====================================================================
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int displayxr_standalone_request_display_mode(int mode3d);
+        public static extern int displayxr_standalone_request_display_mode(int mode3d);
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int displayxr_standalone_request_rendering_mode(uint modeIndex);
+        public static extern int displayxr_standalone_request_rendering_mode(uint modeIndex);
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int displayxr_standalone_get_rendering_mode_name(
+        public static extern int displayxr_standalone_get_rendering_mode_name(
             uint arraySlot,
             [MarshalAs(UnmanagedType.LPArray)] byte[] buffer,
             uint bufferSize);
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int displayxr_standalone_get_preview_window_size(
+        public static extern int displayxr_standalone_get_preview_window_size(
             out uint width, out uint height);
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int displayxr_standalone_is_key_pressed(int ascii);
+        public static extern int displayxr_standalone_is_key_pressed(int ascii);
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int displayxr_standalone_enumerate_rendering_modes(
+        public static extern int displayxr_standalone_enumerate_rendering_modes(
             uint capacity, out uint count,
             [MarshalAs(UnmanagedType.LPArray)] uint[] modeIndices,
             IntPtr modeNames,
@@ -489,7 +499,7 @@ namespace DisplayXR
         /// <param name="colorKey">Windows COLORREF (0x00BBGGRR). Typical: 0x00FF00FF (magenta).</param>
         /// <param name="topmost">1 to add WS_EX_TOPMOST while enabled.</param>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_set_transparent_overlay(
+        public static extern void displayxr_set_transparent_overlay(
             int enabled, uint colorKey, int topmost);
 
         /// <summary>
@@ -498,7 +508,7 @@ namespace DisplayXR
         /// Coordinates are client-space pixels (top-left origin).
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_set_overlay_hit_rect(
+        public static extern void displayxr_set_overlay_hit_rect(
             int x, int y, int w, int h);
 
         /// <summary>
@@ -509,7 +519,7 @@ namespace DisplayXR
         /// even inside the cube's bounding rect.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_set_overlay_hit_active(int active);
+        public static extern void displayxr_set_overlay_hit_active(int active);
 
         /// <summary>
         /// Read cursor position (overlay-client coords, top-left origin) and
@@ -520,7 +530,7 @@ namespace DisplayXR
         /// Buttons: bit 0 = left, 1 = right, 2 = middle.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern void displayxr_get_overlay_pointer(
+        public static extern void displayxr_get_overlay_pointer(
             out int clientX, out int clientY, out int buttons);
 
         /// <summary>
@@ -531,7 +541,7 @@ namespace DisplayXR
         /// apps consume this value and decide what to do with it.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        internal static extern int displayxr_consume_overlay_wheel_delta();
+        public static extern int displayxr_consume_overlay_wheel_delta();
 #endif
 
     }
