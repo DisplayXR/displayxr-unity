@@ -1,7 +1,7 @@
 {
   "name": "com.displayxr.unity",
   "displayName": "DisplayXR",
-  "version": "1.5.13",
+  "version": "1.6.0",
   "unity": "2022.3",
   "description": "Unity plugin for DisplayXR OpenXR runtime enabling stereo rendering on 3D light field displays. Provides display-centric and camera-centric stereo rig authoring, Kooima asymmetric frustum projection, 2D UI overlay support, and in-editor preview.",
   "keywords": [
@@ -47,13 +47,13 @@
       "path": "Samples~/DisplayScene"
     },
     {
-      "displayName": "Transparent Avatar (Windows)",
-      "description": "Chroma-key transparent overlay mode (issue #57) — capsule avatar floats above the desktop with click-through. Windows standalone only.",
+      "displayName": "Transparent Avatar",
+      "description": "Alpha-native transparent overlay (issue #57) — capsule avatar floats above the desktop with click-through. Windows + macOS standalone.",
       "path": "Samples~/TransparentAvatar"
     },
     {
-      "displayName": "Minimal Transparent (Windows)",
-      "description": "Smallest working chroma-key transparent overlay scene (~70 lines). Teaching sample — README walks through the four-mechanism pipeline, the OpenXR extensions in use, and the layer ownership map. Windows standalone only.",
+      "displayName": "Minimal Transparent",
+      "description": "Smallest working alpha-native transparent overlay scene (~60 lines). Teaching sample — README walks through the three-mechanism pipeline, the OpenXR extensions in use, and the layer ownership map. Windows + macOS standalone.",
       "path": "Samples~/MinimalTransparent"
     }
   ]

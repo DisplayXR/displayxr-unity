@@ -5,7 +5,7 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.6.0] - 2026-05-13
 
 ### Changed (breaking)
 - Windows transparent overlay is now **alpha-native end-to-end** — same path as macOS. Unity emits per-pixel alpha to the swapchain (`SetEnvironmentBlendMode(AlphaBlend)` is no longer gated to macOS) and the runtime DP composes the captured desktop content under each tile pre-weave + alpha-gates post-weave. Anti-aliased silhouettes get true soft alpha; the v1.3.0 "hard-mask alpha (0 or 1) on Leia hardware" known limitation is gone.
