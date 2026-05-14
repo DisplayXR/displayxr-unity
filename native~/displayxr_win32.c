@@ -869,21 +869,33 @@ displayxr_get_unity_main_hwnd(void)
 // ============================================================================
 // Transparent overlay mode (issue #57)
 //
-// Chroma-key transparent overlay for desktop avatar use cases. The Leia weaver
-// drops alpha and the D3D11 compositor uses DXGI_ALPHA_MODE_IGNORE, so true
-// per-pixel alpha doesn't survive end-to-end. Workaround: app renders a magic
-// color (default magenta) in transparent regions of both eye views; we flip
-// the parent HWND to WS_POPUP | WS_EX_LAYERED with LWA_COLORKEY so DWM punches
-// those pixels through to the desktop. Click-through outside a rectangular hit
-// region is handled by returning HTTRANSPARENT from WM_NCHITTEST.
+// Per-pixel-alpha transparent overlay for desktop avatar use cases. End-to-end
+// transparency is composed in two layers:
 //
-// In standalone mode the DisplayXR runtime presents into a child overlay HWND
-// (created in displayxr_get_app_main_view) — not into Unity's top-level
-// window. DXGI flip-model swap chains in a child window are composed by DWM
-// independently, so a colorkey on the parent doesn't punch through the
-// child's pixels. We mirror WS_EX_LAYERED + LWA_COLORKEY onto the child too;
-// since Win 8, layered child windows are supported and DWM applies the
-// colorkey to the child's composed swapchain content directly.
+//   1) Runtime DP post-weave pass (spec v5 / runtime-pvt #191): the app paints
+//      a bridge "chroma" color in transparent regions of both eye views and
+//      passes it to the runtime via XrWin32WindowBindingCreateInfoEXT.
+//      chromaKeyColor (filled in displayxr_hooks.cpp xrCreateSession path).
+//      The runtime's DP converts matching RGB to alpha=0 IN THE SWAPCHAIN
+//      CONTENT before present. This is the only role the "chroma key" plays —
+//      it is NOT an OS color key.
+//
+//   2) DComp + WS_EX_NOREDIRECTIONBITMAP overlay HWND: the overlay is created
+//      top-level with WS_EX_NOREDIRECTIONBITMAP in displayxr_get_app_main_view,
+//      so DWM has no opaque redirection surface and composites the HWND purely
+//      from the DComp visuals the runtime attached. Real per-pixel alpha then
+//      shows the desktop through alpha=0 regions natively.
+//
+// IMPORTANT: we do NOT use WS_EX_LAYERED / LWA_COLORKEY. The set_transparent_
+// overlay function below explicitly STRIPS WS_EX_LAYERED off Unity's HWND if
+// it was there. (Prior versions of this file did use LWA_COLORKEY before the
+// runtime DP chroma→alpha pass and WS_EX_NOREDIRECTIONBITMAP overlay landed —
+// any commentary or doc still describing that approach is stale.)
+//
+// Click-through is independent of all of the above: WM_NCHITTEST returns
+// HTCLIENT when s_hit_active=1 (cursor over a clickable renderer), else
+// HTTRANSPARENT; button events in non-hit regions are forwarded to the
+// underlying window via forward_click_to_underlying_window (Approach C).
 //
 // Mutually exclusive with shell mode (early-out below).
 // ============================================================================
