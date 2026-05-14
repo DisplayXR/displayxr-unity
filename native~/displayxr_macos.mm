@@ -298,7 +298,18 @@ displayxr_macos_set_window_borderless(int enabled) {
 			if (closeBtn != nil) closeBtn.hidden = YES;
 			if (minBtn   != nil) minBtn.hidden   = YES;
 			if (zoomBtn  != nil) zoomBtn.hidden  = YES;
-			displayxr_log("[DisplayXR] set_window_borderless(1): titled-transparent applied (key-capable)\n");
+
+			// macOS can drop key status when styleMask changes; re-key
+			// explicitly so Unity's NSResponder chain keeps receiving
+			// keyboard events. Belt-and-braces: in observed runs the window
+			// stayed key on its own, but this guards against future quirks.
+			[w makeKeyAndOrderFront:nil];
+			[NSApp activateIgnoringOtherApps:YES];
+
+			displayxr_log("[DisplayXR] borderless(1): styleMask 0x%lx → 0x%lx, isKey=%d\n",
+			              (unsigned long)s_saved_style_mask,
+			              (unsigned long)w.styleMask,
+			              (int)w.isKeyWindow);
 		} else {
 			if (s_borderless_saved) {
 				[w setStyleMask:s_saved_style_mask];

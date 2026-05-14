@@ -2,7 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 
 using UnityEngine;
-#if HAS_INPUT_SYSTEM
+#if ENABLE_INPUT_SYSTEM
 using UnityEngine.InputSystem;
 #endif
 
@@ -60,7 +60,7 @@ namespace DisplayXR
         void Start()
         {
             Application.runInBackground = true;
-#if HAS_INPUT_SYSTEM
+#if ENABLE_INPUT_SYSTEM
             InputSystem.settings.backgroundBehavior = InputSettings.BackgroundBehavior.IgnoreFocus;
 #if UNITY_EDITOR
             InputSystem.settings.editorInputBehaviorInPlayMode =
@@ -485,7 +485,7 @@ namespace DisplayXR
 
         // --- Input abstraction (keyboard + mouse) ---
 
-#if HAS_INPUT_SYSTEM
+#if ENABLE_INPUT_SYSTEM
         private static bool GetKey(KeyCode k) =>
             Keyboard.current != null && Keyboard.current[ToKey(k)].isPressed;
         private static bool GetKeyDown(KeyCode k) =>
