@@ -446,19 +446,21 @@ namespace DisplayXR
             DispatchButton(buttons, 1, ref m_LeftWasDown, hitRenderer);
             DispatchButton(buttons, 2, ref m_RightWasDown, hitRenderer);
 
-            // Coarse AABB hit rect — drives WM_NCHITTEST in the opaque
-            // WS_CHILD path as a fast HTCLIENT-vs-HTTRANSPARENT
-            // discriminator. In transparent WS_POPUP +
-            // NOREDIRECTIONBITMAP mode (#57), routing is owned by
-            // WM_NCHITTEST per-pixel based on s_hit_active (set just
-            // above from the cyclopean raycast) — HTCLIENT over tiger
-            // silhouette, HTTRANSPARENT elsewhere. The OS handles
-            // native click-through at HTTRANSPARENT pixels with full
-            // fidelity (real DefWindowProc modal loops, native cursor
-            // adaptation, native menu activation, native hover,
-            // taskbar previews, tooltips). The rect push is kept here
-            // for opaque-mode compatibility; transparent mode ignores
-            // it.
+            // Cube/avatar screen-space AABB. Drives the OS hit-test region
+            // on the overlay HWND via displayxr_set_overlay_hit_rect:
+            //  - Transparent mode (Approach B): native side calls
+            //    SetWindowRgn(overlay, rect, TRUE). Outside the rect the
+            //    OS treats our window as if it didn't exist, so input is
+            //    routed natively to whatever desktop window is underneath
+            //    (full cross-process fidelity: real DefWindowProc modal
+            //    loops with proper GetKeyState, native cursor adaptation
+            //    over resize edges, native menu activation, native hover
+            //    highlights, taskbar previews, tooltips). Inside the rect
+            //    the overlay catches the click and posts it to Unity,
+            //    which runs its own per-pixel raycast (s_hit_active /
+            //    onPointerClick) to decide whether to act.
+            //  - Opaque WS_CHILD mode: WM_NCHITTEST uses the rect as a
+            //    fast HTCLIENT-vs-HTTRANSPARENT discriminator.
             if (TryGetStereoMatrices(out Matrix4x4 lv2, out Matrix4x4 lp2,
                                      out Matrix4x4 rv2, out Matrix4x4 rp2))
             {

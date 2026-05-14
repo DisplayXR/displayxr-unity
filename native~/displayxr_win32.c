@@ -102,16 +102,6 @@ static int   s_drag_active        = 0;
 static POINT s_drag_anchor_screen = {0, 0};
 static POINT s_drag_anchor_window = {0, 0};
 
-// Left-click capture state. When WM_NCHITTEST returns HTCLIENT (cursor
-// over tiger silhouette per s_hit_active) and the user presses LMB, we
-// SetCapture(overlay) so subsequent WM_MOUSEMOVE / WM_LBUTTONUP keep
-// flowing to us even if the cursor leaves the silhouette mid-drag.
-// Without capture, the per-pixel WM_NCHITTEST routing would silently
-// reroute mid-gesture to whatever desktop window is at the new cursor
-// position, breaking the drag. ReleaseCapture happens on WM_LBUTTONUP
-// (or WM_CAPTURECHANGED for safety).
-static int   s_left_capture_active = 0;
-
 // ============================================================================
 // Shell mode detection
 // ============================================================================
@@ -402,40 +392,13 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 	switch (msg) {
 	case WM_NCHITTEST: {
 		if (s_overlay_is_toplevel) {
-			// Transparent overlay: per-pixel native routing via
-			// WM_NCHITTEST.
-			//
-			//   s_hit_active=1 (cursor on tiger silhouette, per C#
-			//   per-pixel raycast each LateUpdate) → HTCLIENT.
-			//   Overlay catches WM_LBUTTON*/WM_MOUSEMOVE/WM_MOUSEWHEEL
-			//   and posts to Unity.
-			//
-			//   s_hit_active=0 (transparent zone) → HTTRANSPARENT.
-			//   OS recurses to find the next window beneath us at
-			//   this exact pixel and dispatches input there with
-			//   full native fidelity: real DefWindowProc modal
-			//   SC_MOVE/SC_SIZE/SC_CLOSE loops (proper GetKeyState
-			//   semantics), native click-to-activate, native cursor
-			//   adaptation over resize edges, native menu activation,
-			//   native hover and TrackMouseEvent, native taskbar
-			//   thumbnail previews and tooltips. Unity is moved off-
-			//   screen at (-32000,-32000) in displayxr_set_transparent_
-			//   overlay so it is NOT in the z-order beneath us;
-			//   input reaches the actual desktop window underneath.
-			//
-			// Per-pixel HTTRANSPARENT does NOT affect rendering — it
-			// only routes hit-testing. The cube continues to render
-			// via DComp + NOREDIRECTIONBITMAP per-pixel alpha. Unlike
-			// the whole-window WS_EX_TRANSPARENT flag (which requires
-			// WS_EX_LAYERED and conflicts with NOREDIRECTIONBITMAP),
-			// WM_NCHITTEST per-pixel routing is mechanism-independent
-			// of the window's compositing config.
-			//
-			// During an active left-drag (SetCapture by overlay on
-			// WM_LBUTTONDOWN), WM_NCHITTEST is NOT called by the OS —
-			// captured input bypasses hit-testing. So drag continues
-			// reliably even when cursor leaves the tiger silhouette.
-			return s_hit_active ? HTCLIENT : HTTRANSPARENT;
+			// Transparent overlay: WS_EX_TRANSPARENT toggling in
+			// displayxr_set_overlay_hit_active drives the OS hit-
+			// test routing. When WS_EX_TRANSPARENT is ON, the OS
+			// skips us in WindowFromPoint and never calls our
+			// WM_NCHITTEST. When it's OFF (cursor over the cube),
+			// the OS calls us — return HTCLIENT to claim the click.
+			return HTCLIENT;
 		}
 		// Opaque WS_CHILD path: rect-based click-through is correct
 		// (the runtime composites into the child and its parent stays
@@ -511,21 +474,15 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		s_drag_active = 0;
 		if (was_active)
 			SendMessageW(hwnd, WM_EXITSIZEMOVE, 0, 0);
-		// Also clear left-click capture if some other window stole it,
-		// so the next WM_LBUTTONDOWN re-captures cleanly.
-		s_left_capture_active = 0;
 		break;
 	}
 
-	// ----- mouse-move: drag overlay if right-drag, else forward to Unity -----
-	// In transparent mode (s_overlay_is_toplevel), we only receive
-	// WM_MOUSEMOVE when (a) WM_NCHITTEST returned HTCLIENT — cursor over
-	// tiger silhouette — OR (b) we have SetCapture (left-drag in
-	// progress; OS bypasses hit-testing for captured input). Hover in
-	// transparent zones (HTTRANSPARENT) is routed natively by the OS to
-	// the desktop app underneath, so we never see those — desktop
-	// hover effects / tooltips / cursor adaptation / taskbar previews
-	// all fire on the real recipient without plugin involvement.
+	// ----- mouse-move: drag overlay if active, else forward to Unity -----
+	// When WS_EX_TRANSPARENT is OFF (cube area), the overlay receives
+	// these. When it's ON (transparent zone), the OS routes WM_MOUSEMOVE
+	// to the desktop app at the cursor natively — we never see them, so
+	// hover / TrackMouseEvent / tooltips / taskbar previews / cursor
+	// adaptation all fire on the real recipient without our help.
 	case WM_MOUSEMOVE: {
 		if (s_drag_active) {
 			POINT cur;
@@ -536,51 +493,26 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 			             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 			return 0;
 		}
-		// Forward hover to Unity for cube hover-detection / cursor-state
-		// polling. During an active left-drag (s_left_capture_active),
-		// this also delivers the drag motion to Unity even when the
-		// cursor leaves the tiger silhouette — SetCapture keeps events
-		// flowing to us regardless of HTCLIENT/HTTRANSPARENT result.
+		// Cube area: forward hover to Unity for cube hover-detection /
+		// cursor-state polling.
 		HWND unity_hover = find_unity_hwnd();
 		if (unity_hover != NULL)
 			PostMessageW(unity_hover, msg, wParam, lParam);
 		return 0;
 	}
-	case WM_LBUTTONDOWN: case WM_LBUTTONDBLCLK: {
-		// We received this because WM_NCHITTEST returned HTCLIENT —
-		// cursor was over tiger silhouette at click time. Take capture
-		// so subsequent mouse events (move, up) keep flowing to us
-		// even if the cursor leaves the silhouette mid-drag. Without
-		// capture, WM_NCHITTEST would re-route past us as soon as the
-		// cursor crosses out of the per-pixel hit zone, and the drag
-		// would be lost. ReleaseCapture happens on WM_LBUTTONUP /
-		// WM_CAPTURECHANGED.
-		if (!s_drag_active && !s_left_capture_active) {
-			s_left_capture_active = 1;
-			SetCapture(hwnd);
-		}
-		// Claim OS foreground so keyboard goes to our process (Unity
-		// via INPUTSINK).
-		SetForegroundWindow(hwnd);
-		HWND unity = find_unity_hwnd();
-		if (unity != NULL)
-			PostMessageW(unity, msg, wParam, lParam);
-		return 0;
-	}
-	case WM_LBUTTONUP: {
-		if (s_left_capture_active) {
-			s_left_capture_active = 0;
-			ReleaseCapture();
-		}
-		HWND unity = find_unity_hwnd();
-		if (unity != NULL)
-			PostMessageW(unity, msg, wParam, lParam);
-		return 0;
-	}
+	case WM_LBUTTONDOWN: case WM_LBUTTONUP:
+	case WM_LBUTTONDBLCLK:
 	case WM_MBUTTONDOWN: case WM_MBUTTONUP: {
-		// Middle button: forward to Unity, no capture (no drag use case yet).
-		if (msg == WM_MBUTTONDOWN)
+		// Same gating as above: reaching this case means we're in the
+		// cube area (WS_EX_TRANSPARENT OFF). Transparent-zone clicks
+		// are routed to the desktop natively and never arrive here.
+		//
+		// On press, claim OS foreground so keyboard goes to our
+		// process (Unity via INPUTSINK).
+		if (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONDBLCLK ||
+		    msg == WM_MBUTTONDOWN) {
 			SetForegroundWindow(hwnd);
+		}
 		HWND unity = find_unity_hwnd();
 		if (unity != NULL)
 			PostMessageW(unity, msg, wParam, lParam);
@@ -1136,18 +1068,33 @@ displayxr_set_transparent_overlay(int enabled, int topmost)
 	}
 }
 
-// Set the rectangular hit-test region of the overlay (opaque WS_CHILD
-// mode only). WM_NCHITTEST in overlay_wnd_proc / parent_subclass_proc
-// uses s_hit_rect as a fast HTCLIENT-vs-HTTRANSPARENT discriminator.
+// Set the rectangular hit-test region of the overlay.
 //
-// In transparent WS_POPUP + NOREDIRECTIONBITMAP mode (#57), routing is
-// owned entirely by WM_NCHITTEST per-pixel: HTCLIENT when s_hit_active
-// (cursor on tiger silhouette, per the C# per-pixel raycast each
-// LateUpdate), HTTRANSPARENT elsewhere. The OS handles native click-
-// through with full fidelity in HTTRANSPARENT zones (real
-// DefWindowProc modal loops, native cursor adaptation, native menu
-// activation, native hover, taskbar previews, tooltips). No
-// SetWindowRgn needed — s_hit_rect is unused in transparent mode.
+// In opaque WS_CHILD mode (legacy / Game View overlay): updates
+// s_hit_rect, which WM_NCHITTEST in overlay_wnd_proc / parent_subclass_
+// proc uses as a fast HTCLIENT-vs-HTTRANSPARENT discriminator.
+//
+// In transparent WS_POPUP + NOREDIRECTIONBITMAP mode (issue #57): also
+// drives SetWindowRgn on the overlay HWND. Outside the region, the OS
+// treats our window as if it didn't exist — both rendering and hit-
+// testing — so input is routed natively to whatever desktop window is
+// at the cursor (full cross-process fidelity: real DefWindowProc modal
+// SC_MOVE/SC_SIZE/SC_CLOSE loops with proper GetKeyState, native
+// cursor adaptation, native menu activation, native hover and
+// TrackMouseEvent — without any plugin forwarder gymnastics).
+//
+// Push the screen-space bounding rect of the clickable renderers
+// (cube/avatar silhouette) each frame, converted to overlay client
+// coords (top-left origin). C# already computes this rect via
+// TryGetUnionScreenRect for opaque mode; the same rect drives both
+// paths in transparent mode.
+//
+// SetWindowRgn takes ownership of the HRGN, so we must NOT
+// DeleteObject afterward on success. The previous region (if any) is
+// freed by the OS as part of SetWindowRgn.
+//
+// w<=0 / h<=0 → clear the region (overlay catches everywhere — used
+// as the init default before C# pushes per-frame).
 void
 displayxr_set_overlay_hit_rect(int x, int y, int w, int h)
 {
@@ -1155,6 +1102,38 @@ displayxr_set_overlay_hit_rect(int x, int y, int w, int h)
 	s_hit_rect.top    = y;
 	s_hit_rect.right  = x + w;
 	s_hit_rect.bottom = y + h;
+
+	if (!s_overlay_is_toplevel)
+		return; // opaque WS_CHILD: WM_NCHITTEST consumes s_hit_rect, done.
+	if (s_overlay_hwnd == NULL || !IsWindow(s_overlay_hwnd))
+		return;
+
+	HRGN rgn = NULL;
+	if (w > 0 && h > 0) {
+		rgn = CreateRectRgn(x, y, x + w, y + h);
+		if (rgn == NULL) {
+			displayxr_log("[DisplayXR] hit_region: CreateRectRgn failed (%d,%d %dx%d) err=%lu\n",
+			              x, y, w, h, (unsigned long)GetLastError());
+			return;
+		}
+	}
+	// NULL rgn = clear the region (whole window catches input).
+	if (!SetWindowRgn(s_overlay_hwnd, rgn, TRUE)) {
+		if (rgn != NULL)
+			DeleteObject(rgn);
+		displayxr_log("[DisplayXR] hit_region: SetWindowRgn failed (%d,%d %dx%d) err=%lu\n",
+		              x, y, w, h, (unsigned long)GetLastError());
+		return;
+	}
+	// Throttle the log to ~1 Hz — at 60 fps with a moving cube this
+	// fires every frame.
+	static DWORD s_last_log_tick = 0;
+	DWORD now = GetTickCount();
+	if (now - s_last_log_tick >= 1000) {
+		s_last_log_tick = now;
+		displayxr_log("[DisplayXR] hit_region: (%d,%d %dx%d) on overlay=%p (rgn=%p)\n",
+		              x, y, w, h, (void *)s_overlay_hwnd, (void *)rgn);
+	}
 }
 
 void

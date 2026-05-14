@@ -505,32 +505,37 @@ namespace DisplayXR
             int enabled, int topmost);
 
         /// <summary>
-        /// Set the rectangular hit-test region of the overlay (opaque
-        /// WS_CHILD mode only). Coords are client-space pixels (top-
-        /// left origin). Used by WM_NCHITTEST as a fast HTCLIENT-vs-
-        /// HTTRANSPARENT discriminator. In transparent WS_POPUP +
-        /// NOREDIRECTIONBITMAP mode (#57), routing is owned by
-        /// WM_NCHITTEST per-pixel based on
-        /// displayxr_set_overlay_hit_active, and this rect is ignored
-        /// — kept for opaque-mode callers and forward compat.
+        /// Set the rectangular hit-test region of the overlay. Coords
+        /// are overlay client-space pixels (top-left origin).
+        ///
+        /// In transparent WS_POPUP + NOREDIRECTIONBITMAP mode (#57),
+        /// this also drives SetWindowRgn — outside the rect the OS
+        /// treats our window as if it didn't exist (both rendering and
+        /// hit-testing), so input is routed natively to whichever
+        /// desktop window is at the cursor with full fidelity (real
+        /// DefWindowProc modal SC_MOVE/SC_SIZE/SC_CLOSE loops, native
+        /// cursor adaptation, native menu activation, native hover).
+        /// Push the cube/avatar silhouette's screen-space AABB each
+        /// frame. w &lt;= 0 or h &lt;= 0 clears the region (overlay
+        /// catches everywhere — used as init default).
+        ///
+        /// In opaque WS_CHILD mode (legacy/Game-View overlay), this
+        /// updates the rect used by WM_NCHITTEST as a fast
+        /// HTCLIENT-vs-HTTRANSPARENT discriminator.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern void displayxr_set_overlay_hit_rect(
             int x, int y, int w, int h);
 
         /// <summary>
-        /// Per-pixel hit-test state from the C# raycast. Drives
-        /// WM_NCHITTEST routing in transparent WS_POPUP +
-        /// NOREDIRECTIONBITMAP mode (#57) — HTCLIENT when set
-        /// (cursor over tiger silhouette, overlay catches the click),
-        /// HTTRANSPARENT when clear (OS recurses to find the next
-        /// window beneath us at that pixel and dispatches input there
-        /// with full native fidelity: real DefWindowProc modal loops,
-        /// native cursor adaptation, native menu activation, native
-        /// hover, taskbar previews, tooltips). During an active
-        /// left-drag (overlay holds SetCapture from WM_LBUTTONDOWN
-        /// onward), the OS bypasses hit-testing so the drag completes
-        /// even when the cursor leaves the silhouette.
+        /// Per-pixel hit-test state from the C# raycast. Tracks "is the
+        /// cursor over a clickable renderer?" for callers that want to
+        /// know — but no longer drives the OS hit-test routing. OS
+        /// routing is owned by displayxr_set_overlay_hit_rect, which
+        /// in transparent mode calls SetWindowRgn so areas outside the
+        /// rect are treated by the OS as if our window didn't exist
+        /// (native cross-process click-through). Kept callable for
+        /// backward compat.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern void displayxr_set_overlay_hit_active(int active);
