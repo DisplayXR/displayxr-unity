@@ -285,24 +285,16 @@ displayxr_macos_set_window_borderless(int enabled) {
 				s_saved_zoom_btn_hidden      = zoomBtn  ? zoomBtn.hidden  : NO;
 				s_borderless_saved = YES;
 			}
-			// Keep Titled (key-capable), drop the other chrome bits so the
-			// title-bar area doesn't host hit zones for close/min/resize.
-			NSWindowStyleMask mask = s_saved_style_mask;
-			mask |= NSWindowStyleMaskTitled;
-			mask &= ~(NSWindowStyleMaskClosable
-			         | NSWindowStyleMaskMiniaturizable
-			         | NSWindowStyleMaskResizable);
-			[w setStyleMask:mask];
-			[w setTitlebarAppearsTransparent:YES];
-			[w setTitleVisibility:NSWindowTitleHidden];
-			if (closeBtn != nil) closeBtn.hidden = YES;
-			if (minBtn   != nil) minBtn.hidden   = YES;
-			if (zoomBtn  != nil) zoomBtn.hidden  = YES;
+			// True borderless — no title bar, no chrome, no top-edge contour.
+			// Cocoa default [NSWindow canBecomeKeyWindow] returns NO for
+			// mask=0, BUT Unity's PlayerWindow subclass overrides this so
+			// the window stays key-capable. Verified empirically: keyboard
+			// input continues working with mask=0. The keyboard breakage
+			// observed earlier was a separate bug (sample's HAS_INPUT_SYSTEM
+			// vs ENABLE_INPUT_SYSTEM gate), fixed in v1.5.11.
+			[w setStyleMask:NSWindowStyleMaskBorderless];
 
-			// macOS can drop key status when styleMask changes; re-key
-			// explicitly so Unity's NSResponder chain keeps receiving
-			// keyboard events. Belt-and-braces: in observed runs the window
-			// stayed key on its own, but this guards against future quirks.
+			// Re-key explicitly — defensive after any styleMask transition.
 			[w makeKeyAndOrderFront:nil];
 			[NSApp activateIgnoringOtherApps:YES];
 
