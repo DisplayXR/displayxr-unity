@@ -5,6 +5,19 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.9] - 2026-05-14
+
+### Changed (breaking for consumers using DisplayXRInputController)
+- `DisplayXRInputController` moved out of plugin `Runtime/` into `Samples~/DefaultInputController/`. Plugin Runtime now contains only mechanisms (cursor polling, rig manager, mode setter); input policy lives in app code. Consumers import via Package Manager → DisplayXR → Samples → "Default Input Controller". Same class name, same `DisplayXR` namespace, same fields — just sourced from the project's `Assets/` folder. Scenes referencing the old Runtime type will fail to deserialize until the sample is imported. No deprecation shim — a shim sharing the namespace would collide with the imported sample. #97
+- `DisplayXRNative` promoted from `internal` to `public` (class + all P/Invoke methods + `LogCallback` delegate). Enables the sample (now in user Assets/) to call the same bindings the plugin uses. Stability contract: method signatures track underlying native exports; prefer high-level wrappers (`DisplayXRFeature`, `DisplayXRTransparentOverlay`, `DisplayXRRigManager`) where they exist.
+
+### Added
+- `DisplayXRInputController.scrollZoomEnabled` field (sample) — parallel to `mouseLookEnabled`. Apps that drive their own scroll-based zoom can set false to opt out of the controller's built-in scroll → camera transform / FOV change.
+- macOS `ConsumeWheelDelta` now returns real values (was Win32-only / 0 on Mac). `DisplayXRTransparentOverlay`'s Mac LateUpdate branch accumulates `Mouse.current.scroll.y × 120` per frame; same Win32-unit semantics as the Win32 path. Unblocks `WheelZoomVHeight`-style app wheel handlers on Mac.
+
+### Migration
+- Existing apps with `DisplayXRInputController` in scenes need to import the sample. After import, the project-owned copy in `Assets/Samples/com.displayxr.unity/.../Default Input Controller/` resolves scene references via the preserved meta GUID — no scene edits required.
+
 ## [1.5.8] - 2026-05-14
 
 ### Added
