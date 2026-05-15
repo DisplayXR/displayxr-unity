@@ -1179,29 +1179,36 @@ namespace DisplayXR
             if (m_HitMaskReadbackPending) return;
 
             // Convert OpenXR-convention view matrices (right-handed,
-            // -Z forward in world) to Unity-convention (left-handed,
-            // +Z forward). The shader's input world-space points come
-            // from unity_ObjectToWorld which is Unity-world; the raw
-            // view matrices from displayxr_get_stereo_matrices expect
+            // -Z forward in world space) to Unity-convention (left-
+            // handed, +Z forward) by negating the third COLUMN. The
+            // shader's input world-space points come from
+            // unity_ObjectToWorld (Unity-world), but the raw view
+            // matrices from displayxr_get_stereo_matrices expect
             // OpenXR-world input. Without this conversion a Unity-world
             // point at +Z is interpreted as OpenXR's +Z (= behind the
-            // camera) and clips out of frustum — worst at high-Z
-            // foreground geometry. Same negation ProjectThroughEye
-            // does for the C# raycast.
+            // camera), projects out of clip range, and gets clipped —
+            // worst at high-Z foreground geometry like the tiger's
+            // hands. This is the same conversion ProjectThroughEye
+            // applies for the C# raycast (negating m02/m12/m22/m32 of
+            // the view matrix).
+            //
+            // GL.GetGPUProjectionMatrix(proj, renderIntoTexture=FALSE)
+            // does depth-range remap (OpenGL [-1,1] → D3D [0,1]) but
+            // NO Y-flip. We don't want the Y-flip — we read the RT
+            // back as CPU bytes and ship them to SetWindowRgn, where
+            // row 0 = top of overlay (Win32 client coords). The Y-flip
+            // would put row 0 at the bottom of the intended image.
             Matrix4x4 leftViewUnity  = ConvertOpenXRViewToUnity(leftView);
             Matrix4x4 rightViewUnity = ConvertOpenXRViewToUnity(rightView);
+            Matrix4x4 leftVP  = GL.GetGPUProjectionMatrix(leftProj,  false) * leftViewUnity;
+            Matrix4x4 rightVP = GL.GetGPUProjectionMatrix(rightProj, false) * rightViewUnity;
 
             m_HitMaskCB.Clear();
             m_HitMaskCB.SetRenderTarget(m_HitMaskRT);
             m_HitMaskCB.ClearRenderTarget(true, true, Color.clear);
 
-            // Pass 1: left eye. CommandBuffer.SetViewProjectionMatrices
-            // applies to all subsequent draws in the buffer until the
-            // next call (the union-not-working issue we hit earlier
-            // turned out to be the Z-flip bug, not Unity overriding
-            // our matrices — with the convention conversion above the
-            // standard SetViewProjectionMatrices path is sufficient).
-            m_HitMaskCB.SetViewProjectionMatrices(leftViewUnity, leftProj);
+            // Pass 1: left eye.
+            m_HitMaskCB.SetGlobalMatrix("_DXRViewProj", leftVP);
             for (int i = 0; i < clickableRenderers.Length; i++)
             {
                 var r = clickableRenderers[i];
@@ -1212,7 +1219,7 @@ namespace DisplayXR
 
             // Pass 2: right eye. Accumulates into the same RT — pixels
             // covered by either eye end up at 1 (boolean union).
-            m_HitMaskCB.SetViewProjectionMatrices(rightViewUnity, rightProj);
+            m_HitMaskCB.SetGlobalMatrix("_DXRViewProj", rightVP);
             for (int i = 0; i < clickableRenderers.Length; i++)
             {
                 var r = clickableRenderers[i];
