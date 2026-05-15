@@ -955,7 +955,19 @@ hooked_xrEndFrame(XrSession session, const XrFrameEndInfo *frameEndInfo)
 
 		ws_layers[i].type = XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT;
 		ws_layers[i].next = nullptr;
-		ws_layers[i].layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+		// BLEND_TEXTURE_SOURCE_ALPHA_BIT: blend this layer over what's
+		// below using the texture's source alpha.
+		// UNPREMULTIPLIED_ALPHA_BIT: Unity Canvas (which renders into
+		// the window-space layer's swapchain via DisplayXRWindowSpaceUI)
+		// outputs non-premultiplied alpha — (color, alpha) where color
+		// is the un-scaled value. Without this flag the runtime treats
+		// the texture as premultiplied and the color math goes wrong
+		// (panel too bright) AND alpha math can end up < 1 even where
+		// the HUD panel covers the opaque tiger, letting captured
+		// desktop bleed through the semi-transparent panel area.
+		ws_layers[i].layerFlags =
+			XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT |
+			XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
 		ws_layers[i].subImage.swapchain = wl->swapchain;
 		ws_layers[i].subImage.imageRect.offset = {0, 0};
 		ws_layers[i].subImage.imageRect.extent = {(int32_t)wl->swapchain_width,
