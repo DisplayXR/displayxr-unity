@@ -5,6 +5,14 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0] - 2026-05-14
+
+### Added
+- Transparent overlay: per-pixel silhouette click-through region (#57). Plugin computes a per-eye silhouette mask, unions both eyes, and applies it cross-process via `SetWindowRgn` so the OS-level hit-testing matches the rendered avatar shape — clicks land on the avatar; non-silhouette pixels pass through to the desktop. Replaces the prior coarse rect-based click-through. #105
+
+### Fixed
+- 2D UI window-space composition layer: set `XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT` on the layer flags so the runtime compositor blends UI textures with the documented unpremultiplied-alpha convention. Eliminates dark fringing around anti-aliased UI edges on transparent backgrounds. #105
+
 ## [1.6.0] - 2026-05-13
 
 ### Changed (breaking)
