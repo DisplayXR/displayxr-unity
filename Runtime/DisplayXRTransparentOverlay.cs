@@ -971,6 +971,31 @@ namespace DisplayXR
             return true;
         }
 
+        // Convert an OpenXR-convention view matrix (right-handed
+        // world, -Z forward) to a Unity-convention view matrix that
+        // accepts Unity-world points (left-handed, +Z forward).
+        //
+        // Negating the third column flips the Z basis vector — when
+        // the matrix is applied to (x_u, y_u, z_u, 1) it gives the
+        // same eye-space result as applying the original to
+        // (x_u, y_u, -z_u, 1), i.e. as if we first converted Unity
+        // world coords to OpenXR world coords by negating Z.
+        //
+        // This is the same conversion the C# raycast helper
+        // ProjectThroughEye performs. Used here for the silhouette
+        // mask projection — the shader's input world-space points
+        // come from unity_ObjectToWorld (Unity-world), so the view
+        // matrix in our _DXRViewProj uniform has to accept Unity-
+        // world input.
+        private static Matrix4x4 ConvertOpenXRViewToUnity(Matrix4x4 v)
+        {
+            v.m02 = -v.m02;
+            v.m12 = -v.m12;
+            v.m22 = -v.m22;
+            v.m32 = -v.m32;
+            return v;
+        }
+
         // Build cyclopean (midpoint-eye) view + projection from the left and
         // right eye matrices. The two eyes' view matrices share the same
         // rotation (both face the display) but have different translations
@@ -1153,23 +1178,30 @@ namespace DisplayXR
             if (m_SilhouetteMat == null) return;
             if (m_HitMaskReadbackPending) return;
 
-            // Bake API-correct projection (depth-range remap, but NO
-            // Y-flip) × view into a single view-projection matrix the
-            // shader applies in one mul against world-space vertices.
+            // Convert OpenXR-convention view matrices (right-handed,
+            // -Z forward in world space) to Unity-convention (left-
+            // handed, +Z forward) by negating the third COLUMN. The
+            // shader's input world-space points come from
+            // unity_ObjectToWorld (Unity-world), but the raw view
+            // matrices from displayxr_get_stereo_matrices expect
+            // OpenXR-world input. Without this conversion a Unity-world
+            // point at +Z is interpreted as OpenXR's +Z (= behind the
+            // camera), projects out of clip range, and gets clipped —
+            // worst at high-Z foreground geometry like the tiger's
+            // hands. This is the same conversion ProjectThroughEye
+            // applies for the C# raycast (negating m02/m12/m22/m32 of
+            // the view matrix).
             //
-            // renderIntoTexture=FALSE here is critical. With `true`,
-            // Unity adds a Y-flip on D3D to make the RT correctly
-            // oriented when SAMPLED later. We don't sample — we read
-            // the RT back as CPU bytes and ship them to SetWindowRgn,
-            // which expects row 0 = top of the overlay (Win32 client
-            // coords). With the Y-flip, the silhouette ends up
-            // upside-down in the byte buffer: hands rendered at the
-            // top of NDC land in the bottom rows of the mask, and
-            // SetWindowRgn places them at the bottom of the overlay.
-            // Visible hands at the top of the screen then fall
-            // outside the region and get clipped.
-            Matrix4x4 leftVP  = GL.GetGPUProjectionMatrix(leftProj,  false) * leftView;
-            Matrix4x4 rightVP = GL.GetGPUProjectionMatrix(rightProj, false) * rightView;
+            // GL.GetGPUProjectionMatrix(proj, renderIntoTexture=FALSE)
+            // does depth-range remap (OpenGL [-1,1] → D3D [0,1]) but
+            // NO Y-flip. We don't want the Y-flip — we read the RT
+            // back as CPU bytes and ship them to SetWindowRgn, where
+            // row 0 = top of overlay (Win32 client coords). The Y-flip
+            // would put row 0 at the bottom of the intended image.
+            Matrix4x4 leftViewUnity  = ConvertOpenXRViewToUnity(leftView);
+            Matrix4x4 rightViewUnity = ConvertOpenXRViewToUnity(rightView);
+            Matrix4x4 leftVP  = GL.GetGPUProjectionMatrix(leftProj,  false) * leftViewUnity;
+            Matrix4x4 rightVP = GL.GetGPUProjectionMatrix(rightProj, false) * rightViewUnity;
 
             m_HitMaskCB.Clear();
             m_HitMaskCB.SetRenderTarget(m_HitMaskRT);
