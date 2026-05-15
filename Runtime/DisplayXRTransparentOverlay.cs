@@ -1153,12 +1153,23 @@ namespace DisplayXR
             if (m_SilhouetteMat == null) return;
             if (m_HitMaskReadbackPending) return;
 
-            // Bake GL-convention projection (Y-flip + depth-range
-            // baked in for off-screen RTs) × view into a single
-            // view-projection matrix that the shader applies in one
-            // mul against world-space vertices.
-            Matrix4x4 leftVP  = GL.GetGPUProjectionMatrix(leftProj,  true) * leftView;
-            Matrix4x4 rightVP = GL.GetGPUProjectionMatrix(rightProj, true) * rightView;
+            // Bake API-correct projection (depth-range remap, but NO
+            // Y-flip) × view into a single view-projection matrix the
+            // shader applies in one mul against world-space vertices.
+            //
+            // renderIntoTexture=FALSE here is critical. With `true`,
+            // Unity adds a Y-flip on D3D to make the RT correctly
+            // oriented when SAMPLED later. We don't sample — we read
+            // the RT back as CPU bytes and ship them to SetWindowRgn,
+            // which expects row 0 = top of the overlay (Win32 client
+            // coords). With the Y-flip, the silhouette ends up
+            // upside-down in the byte buffer: hands rendered at the
+            // top of NDC land in the bottom rows of the mask, and
+            // SetWindowRgn places them at the bottom of the overlay.
+            // Visible hands at the top of the screen then fall
+            // outside the region and get clipped.
+            Matrix4x4 leftVP  = GL.GetGPUProjectionMatrix(leftProj,  false) * leftView;
+            Matrix4x4 rightVP = GL.GetGPUProjectionMatrix(rightProj, false) * rightView;
 
             m_HitMaskCB.Clear();
             m_HitMaskCB.SetRenderTarget(m_HitMaskRT);
