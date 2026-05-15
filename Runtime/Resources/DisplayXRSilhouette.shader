@@ -16,14 +16,12 @@
 // care "did anything draw here?" — the answer drives whether the OS
 // hit-tests this pixel as ours or as the desktop's.
 //
-// We use a CUSTOM _DXRViewProj uniform instead of UNITY_MATRIX_VP.
-// With an active XR session, Unity's render pipeline overrides the
-// view+projection matrices that DrawRenderer normally consumes
-// (CommandBuffer.SetViewProjectionMatrices gets ignored). _DXRViewProj
-// is a property Unity doesn't know about, so SetGlobalMatrix sticks —
-// and two render passes with different matrices produce a real
-// boolean union, not an aliased single pass. unity_ObjectToWorld is
-// still per-renderer and not affected by stereo state.
+// Standard UnityObjectToClipPos vertex path. The caller
+// (DisplayXRTransparentOverlay) sets UNITY_MATRIX_VP per pass via
+// CommandBuffer.SetViewProjectionMatrices, applying the OpenXR→Unity
+// Z-column conversion to the view matrix so Unity-world inputs project
+// correctly. Two passes (one per eye) accumulate into the same R8 RT
+// for the boolean union of view silhouettes.
 
 Shader "Hidden/DisplayXR/Silhouette"
 {
@@ -42,16 +40,13 @@ Shader "Hidden/DisplayXR/Silhouette"
             #pragma fragment frag
             #include "UnityCG.cginc"
 
-            float4x4 _DXRViewProj;
-
             struct appdata { float4 vertex : POSITION; };
             struct v2f { float4 pos : SV_POSITION; };
 
             v2f vert(appdata v)
             {
                 v2f o;
-                float4 worldPos = mul(unity_ObjectToWorld, v.vertex);
-                o.pos = mul(_DXRViewProj, worldPos);
+                o.pos = UnityObjectToClipPos(v.vertex);
                 return o;
             }
 
