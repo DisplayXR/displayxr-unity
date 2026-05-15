@@ -5,6 +5,7 @@
 
 #pragma once
 
+#include <stdint.h>
 #include <openxr/openxr.h>
 
 #ifdef __cplusplus
@@ -221,6 +222,16 @@ DISPLAYXR_EXPORT void displayxr_set_overlay_hit_rect(int x, int y, int w, int h)
 /// based on a Physics.Raycast at the polled cursor — lets clicks fall
 /// through inside the AABB but outside the cube silhouette.
 DISPLAYXR_EXPORT void displayxr_set_overlay_hit_active(int active);
+
+/// (issue #57 Approach B+) Per-pixel silhouette mask drives SetWindowRgn
+/// for cross-process click-through. mask is mask_w*mask_h bytes (non-zero
+/// = opaque/catch, zero = transparent/route-past), upsampled to overlay
+/// client size dst_w*dst_h. NULL/empty mask reverts to AABB-region path.
+/// Once a mask is applied, displayxr_set_overlay_hit_rect stops driving
+/// SetWindowRgn for the lifetime of the overlay (mask wins).
+DISPLAYXR_EXPORT void displayxr_set_overlay_hit_mask(const uint8_t *mask,
+                                                     int mask_w, int mask_h,
+                                                     int dst_w, int dst_h);
 
 /// (issue #57) Returns 1 if the OS foreground window belongs to our process,
 /// 0 otherwise. Use to gate input handlers (WASD etc.) that should be

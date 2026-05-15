@@ -18,8 +18,11 @@
 #include <windows.h>
 #include <windowsx.h>
 #include <dwmapi.h>
+#include <limits.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 #include "displayxr_hooks.h"
 #include "displayxr_shared_state.h"
 
@@ -102,6 +105,16 @@ static int   s_drag_active        = 0;
 static POINT s_drag_anchor_screen = {0, 0};
 static POINT s_drag_anchor_window = {0, 0};
 
+// True once C# has pushed at least one per-pixel silhouette mask via
+// displayxr_set_overlay_hit_mask. Acts as a one-way upgrade flag — the
+// rect-based displayxr_set_overlay_hit_rect path STOPS calling
+// SetWindowRgn after this flips so the per-pixel mask owns OS routing
+// (much tighter silhouette match, opens up the gap between the tiger's
+// legs and other concavities that an AABB swallows). C# is free to
+// keep calling _hit_rect for opaque-mode users; the rect just becomes
+// hit-test bookkeeping in transparent mode, not the routing driver.
+static int   s_hit_mask_active    = 0;
+
 // ============================================================================
 // Shell mode detection
 // ============================================================================
@@ -175,145 +188,65 @@ find_unity_hwnd(void)
 // Standalone mode: overlay window + parent subclass
 // ============================================================================
 
-// Forward a click the overlay caught in a transparent zone (Approach C,
-// #57) to the actual deepest input-eligible control under the cursor —
-// e.g., Notepad's RichEditD2DPT child, NOT Notepad's outer frame.
-// PostMessaging to the frame doesn't move the caret; only the deepest
-// child does.
+// Cross-process click-through architecture (issue #57, post-Approach-C):
 //
-// Two-stage resolution:
-//   1. Iterate top-level windows in z-order (FindWindowExW). Skip our
-//      overlay, our cloaked Unity HWND, anything else in our process
-//      (the runtime's DComp visual host, class DisplayXRD3D11), and
-//      cloaked / WS_EX_TRANSPARENT windows. Pick the first whose rect
-//      contains the cursor — that's the underlying app's top-level frame.
-//      We use iteration rather than WindowFromPoint because Approach C
-//      makes our WM_NCHITTEST return HTCLIENT, and that overrides any
-//      WS_EX_TRANSPARENT toggle we'd try to hide behind for the call.
-//   2. Recursively descend with ChildWindowFromPointEx until we hit a
-//      leaf — that's the actual control (edit field, button, etc.) the
-//      user is clicking on.
+// We toggle WS_EX_TRANSPARENT on the overlay HWND from
+// displayxr_set_overlay_hit_active() based on the C# per-frame raycast
+// at the current cursor position:
 //
-// Activation: SetForegroundWindow on the top-level frame so the deepest
-// control takes focus. We have SFW permission because we are the
-// foreground process (we just received the click in our wndproc).
+//   - cursor over a clickable renderer (cube silhouette) → s_hit_active=1
+//     → WS_EX_TRANSPARENT CLEAR → overlay catches WM_LBUTTON*/WM_MOUSEMOVE
+//     etc., posts them to Unity for normal handling.
 //
-// NOT used for WM_MOUSEMOVE — would flood the underlying window per
-// frame. Hover is handled separately in overlay_wnd_proc.
-static void
-forward_click_to_underlying_window(UINT msg, WPARAM wParam)
-{
-	POINT cursor;
-	if (!GetCursorPos(&cursor))
-		return;
-
-	HWND unity = find_unity_hwnd();
-	DWORD our_pid = GetCurrentProcessId();
-
-	// Stage 1: pick top-level frame.
-	HWND root = NULL;
-	HWND it = NULL;
-	while ((it = FindWindowExW(NULL, it, NULL, NULL)) != NULL) {
-		if (it == s_overlay_hwnd || it == unity)
-			continue;
-		if (!IsWindowVisible(it))
-			continue;
-		DWORD wpid = 0;
-		GetWindowThreadProcessId(it, &wpid);
-		if (wpid == our_pid)
-			continue;
-		BOOL cloaked = FALSE;
-		if (SUCCEEDED(DwmGetWindowAttribute(it, DWMWA_CLOAKED,
-		                                    &cloaked, sizeof(cloaked)))
-		    && cloaked)
-			continue;
-		DWORD ex = (DWORD)GetWindowLongPtrW(it, GWL_EXSTYLE);
-		if (ex & WS_EX_TRANSPARENT)
-			continue;
-		RECT rc;
-		if (!GetWindowRect(it, &rc))
-			continue;
-		if (cursor.x < rc.left || cursor.x >= rc.right ||
-		    cursor.y < rc.top  || cursor.y >= rc.bottom)
-			continue;
-		root = it;
-		break;
-	}
-
-	if (root == NULL) {
-		displayxr_log("[DisplayXR] forward_click: no underlying top-level at (%d,%d) for msg=0x%04X\n",
-		              (int)cursor.x, (int)cursor.y, (unsigned)msg);
-		return;
-	}
-
-	// Stage 2: recursively descend to the deepest non-transparent,
-	// visible, enabled child at the cursor. ChildWindowFromPointEx
-	// only goes one level — loop until we stop descending.
-	HWND deepest = root;
-	for (int i = 0; i < 16; i++) {
-		POINT cl = cursor;
-		ScreenToClient(deepest, &cl);
-		HWND child = ChildWindowFromPointEx(deepest, cl,
-		                                    CWP_SKIPINVISIBLE |
-		                                    CWP_SKIPDISABLED |
-		                                    CWP_SKIPTRANSPARENT);
-		if (child == NULL || child == deepest)
-			break;
-		deepest = child;
-	}
-
-	POINT client_pt = cursor;
-	ScreenToClient(deepest, &client_pt);
-
-	// Activate the top-level frame on press messages so the focus
-	// transitions cleanly and the deepest control's caret/focus engages.
-	if (msg == WM_LBUTTONDOWN || msg == WM_RBUTTONDOWN || msg == WM_MBUTTONDOWN) {
-		BOOL ok = SetForegroundWindow(root);
-		DWORD err = ok ? 0 : GetLastError();
-		displayxr_log("[DisplayXR] forward_click: SetForegroundWindow(root=%p) ok=%d err=%lu\n",
-		              (void *)root, ok ? 1 : 0,
-		              (unsigned long)err);
-	}
-
-	LPARAM client_lp = MAKELPARAM((WORD)client_pt.x, (WORD)client_pt.y);
-	PostMessageW(deepest, msg, wParam, client_lp);
-
-	wchar_t root_cls[64]    = {0};
-	wchar_t deepest_cls[64] = {0};
-	DWORD deepest_pid = 0;
-	GetClassNameW(root, root_cls, 63);
-	GetClassNameW(deepest, deepest_cls, 63);
-	GetWindowThreadProcessId(deepest, &deepest_pid);
-	displayxr_log("[DisplayXR] forward_click: msg=0x%04X cursor=(%d,%d) root=%p[%ls] deepest=%p[%ls] client=(%d,%d) pid=%lu\n",
-	              (unsigned)msg, (int)cursor.x, (int)cursor.y,
-	              (void *)root, root_cls,
-	              (void *)deepest, deepest_cls,
-	              (int)client_pt.x, (int)client_pt.y,
-	              (unsigned long)deepest_pid);
-}
-
+//   - cursor over a transparent zone → s_hit_active=0 → WS_EX_TRANSPARENT
+//     SET → OS skips us in WindowFromPoint hit-test and routes input
+//     directly to whatever desktop app is at the cursor. Cloaked Unity
+//     is moved off-screen at (-32000,-32000) in displayxr_set_transparent_
+//     overlay so it is NOT in the hit-test path; clicks reach the actual
+//     desktop window underneath.
+//
+// Native OS routing gives us cross-process click activation, real
+// DefWindowProc modal SC_MOVE/SC_SIZE/SC_CLOSE loops with proper
+// GetKeyState (synchronously dispatched via the target's own input
+// queue), native cursor adaptation over resize edges and help buttons,
+// native menu activation, native hover and TrackMouseEvent — without
+// any cross-process PostMessage gymnastics on our side.
+//
+// Earlier attempts to manually forward WM_LBUTTON* / WM_NCLBUTTON* /
+// WM_MOUSEMOVE to discovered target windows via FindWindowExW +
+// PostMessage (#57 sessions 4–5, Approach C) failed because:
+//   - DefWindowProc's modal loops on the target poll GetKeyState, which
+//     reflects the target thread's queue-synchronous input state, not
+//     the live OS state — our PostMessage'd DOWN arrives without a
+//     matching key-down event in the target's queue, so the loop bails.
+//     SC_MOVE drag worked only by timing luck; SC_CLOSE never worked.
+//   - Foreground activation transfer across processes via
+//     SetForegroundWindow was unreliable for non-classic Win32 chrome
+//     (UWP/WinUI title bars, popup menus).
+//   - Per-WM_MOUSEMOVE / per-WM_SETCURSOR target discovery via
+//     FindWindowExW + SendMessageTimeoutW(WM_NCHITTEST) caused
+//     wndproc-level lag when hovering over a foreign window.
+//
+// WS_EX_LAYERED is the canonical companion for WS_EX_TRANSPARENT hit-
+// test pass-through (per MSDN) but conflicts with our WS_EX_NOREDIRECTION
+// BITMAP per-pixel alpha. On Windows 10/11 with NOREDIRECTIONBITMAP +
+// DComp compositing, the OS appears to honor WS_EX_TRANSPARENT for
+// hit-test routing without requiring WS_EX_LAYERED.
 // ============================================================================
-// Click-through diagnostic instrumentation (issue #57 session 5)
+// Click-through diagnostic instrumentation (issue #57)
 //
-// Cross-process click-through is currently broken: WS_EX_TRANSPARENT is
-// toggled correctly on the overlay HWND, Unity is parked off-screen, yet
-// clicks in transparent zones don't reach the underlying app and the
-// forward_click_to_underlying_window fallback never fires either. The
-// click is going *somewhere* and we need to find out where before
-// changing any behavior. The two probes below report:
+// Two probes for correlating overlay input behavior with the OS hit-test:
 //
 //   1. WH_MOUSE_LL (global low-level mouse hook): fires before any
 //      window's wndproc, so we can log WindowFromPoint(cursor) — the
-//      OS's actual hit-test result — for every button event.
-//   2. Entry log at the top of overlay_wnd_proc's button handlers (in the
-//      function below): fires iff the OS dispatched the message to us,
-//      with a live re-read of WS_EX_TRANSPARENT (proves whether the OS
-//      honored the bit at this exact dispatch).
+//      OS's actual hit-test result — for every button event. Confirms
+//      whether the OS routed the click to us or past us in real time.
 //
-// Both write to displayxr_log with [LLMouse] / [OvlWnd] prefixes for
-// easy grep. See docs~/roadmap/transparent-overlay-handoff.md
-// "Click-through investigation playbook" and the session-5 plan in
-// .claude/plans/.
+//   2. Entry log at the top of overlay_wnd_proc's button handlers: fires
+//      iff the OS dispatched the message to us (so WS_EX_TRANSPARENT
+//      was OFF at the dispatch), with a live re-read of the exstyle.
+//
+// Both write to displayxr_log with [LLMouse] / [OvlWnd] prefixes.
 // ============================================================================
 
 static HHOOK         s_ll_mouse_hook    = NULL;
@@ -472,20 +405,12 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 	switch (msg) {
 	case WM_NCHITTEST: {
 		if (s_overlay_is_toplevel) {
-			// Approach C (#57 session 5): catch every click in the
-			// overlay rect and forward to the underlying app via
-			// SetForegroundWindow + PostMessage from our wndproc. This
-			// is the only way to get cross-process activation while we
-			// are the foreground process — letting the OS route past
-			// us via WS_EX_TRANSPARENT delivers the click but the OS
-			// won't transfer foreground to the target (verified with
-			// WH_MOUSE_LL: WindowFromPoint correctly resolved to
-			// Notepad's RichEditD2DPT, but Notepad never activated).
-			// We catch, we SFW(target), then we PostMessage — and the
-			// "foreground process / received last input" rule grants
-			// us SFW permission. Tradeoff: hover doesn't pass through
-			// to the underlying app's hover-states, only to Unity for
-			// cube interaction. Acceptable for the avatar use case.
+			// Transparent overlay: WS_EX_TRANSPARENT toggling in
+			// displayxr_set_overlay_hit_active drives the OS hit-
+			// test routing. When WS_EX_TRANSPARENT is ON, the OS
+			// skips us in WindowFromPoint and never calls our
+			// WM_NCHITTEST. When it's OFF (cursor over the cube),
+			// the OS calls us — return HTCLIENT to claim the click.
 			return HTCLIENT;
 		}
 		// Opaque WS_CHILD path: rect-based click-through is correct
@@ -520,19 +445,17 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 	// requirements (WS_EX_NOREDIRECTIONBITMAP for per-pixel alpha,
 	// WS_EX_NOACTIVATE) block that. Tracked in displayxr-runtime#193.
 	case WM_RBUTTONDOWN: {
-		// Transparent zone (cursor off cube): forward click to the
-		// desktop window under the cursor. WS_EX_TRANSPARENT routes
-		// hover past us correctly but clicks may still land here on
-		// non-layered windows; this is the Approach C fallback.
-		if (!s_hit_active) {
-			forward_click_to_underlying_window(msg, wParam);
-			return 0;
-		}
+		// Reaching this case means the OS routed the click to us, so
+		// WS_EX_TRANSPARENT is currently OFF (s_hit_active=1 — cursor
+		// over the cube). When the cursor is in a transparent zone,
+		// WS_EX_TRANSPARENT is set and the OS routes past us natively
+		// to the desktop window underneath.
+		//
 		// Cube area: claim OS foreground so subsequent keyboard goes
-		// to us (Unity via INPUTSINK), not to whichever app we last
-		// forwarded to. WS_EX_NOACTIVATE blocks click-driven
-		// activation, but programmatic SFW from "received last input
-		// event" is allowed. See displayxr_is_our_process_foreground.
+		// to us (Unity via INPUTSINK). WS_EX_NOACTIVATE blocks
+		// click-driven activation, but programmatic SFW from "received
+		// last input event" is allowed. See
+		// displayxr_is_our_process_foreground.
 		SetForegroundWindow(hwnd);
 		GetCursorPos(&s_drag_anchor_screen);
 		RECT wr;
@@ -558,12 +481,6 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 			ReleaseCapture();
 			return 0;
 		}
-		// Pair with the transparent-zone WM_RBUTTONDOWN we forwarded
-		// (drag wasn't active because we returned early there).
-		if (!s_hit_active) {
-			forward_click_to_underlying_window(msg, wParam);
-			return 0;
-		}
 		break;
 	case WM_CAPTURECHANGED: {
 		int was_active = s_drag_active;
@@ -574,6 +491,11 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 	}
 
 	// ----- mouse-move: drag overlay if active, else forward to Unity -----
+	// When WS_EX_TRANSPARENT is OFF (cube area), the overlay receives
+	// these. When it's ON (transparent zone), the OS routes WM_MOUSEMOVE
+	// to the desktop app at the cursor natively — we never see them, so
+	// hover / TrackMouseEvent / tooltips / taskbar previews / cursor
+	// adaptation all fire on the real recipient without our help.
 	case WM_MOUSEMOVE: {
 		if (s_drag_active) {
 			POINT cur;
@@ -584,11 +506,8 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 			             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 			return 0;
 		}
-		// Forward hover to Unity so cube hover-detection / cursor-state
-		// polling stays accurate. Do NOT call forward_click_to_underlying_window
-		// for WM_MOUSEMOVE — under Approach C the overlay catches every
-		// hover frame, and forwarding each one to the desktop app would
-		// flood it with synthetic mouse-move messages (session 4 lesson).
+		// Cube area: forward hover to Unity for cube hover-detection /
+		// cursor-state polling.
 		HWND unity_hover = find_unity_hwnd();
 		if (unity_hover != NULL)
 			PostMessageW(unity_hover, msg, wParam, lParam);
@@ -597,19 +516,12 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 	case WM_LBUTTONDOWN: case WM_LBUTTONUP:
 	case WM_LBUTTONDBLCLK:
 	case WM_MBUTTONDOWN: case WM_MBUTTONUP: {
-		// Transparent zone: forward the click to the underlying app
-		// (Approach C). forward_click handles SetForegroundWindow on
-		// press messages so the target activates and takes keyboard
-		// focus — required because we are the foreground process and
-		// the OS won't auto-transfer activation otherwise.
-		if (!s_hit_active) {
-			forward_click_to_underlying_window(msg, wParam);
-			return 0;
-		}
-		// Cube area: on press, claim OS foreground so keyboard goes to
-		// our process (Unity via INPUTSINK) instead of whichever app
-		// we last forwarded a click to. Skip on UP messages — UP after
-		// the press would be redundant.
+		// Same gating as above: reaching this case means we're in the
+		// cube area (WS_EX_TRANSPARENT OFF). Transparent-zone clicks
+		// are routed to the desktop natively and never arrive here.
+		//
+		// On press, claim OS foreground so keyboard goes to our
+		// process (Unity via INPUTSINK).
 		if (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONDBLCLK ||
 		    msg == WM_MBUTTONDOWN) {
 			SetForegroundWindow(hwnd);
@@ -800,18 +712,19 @@ displayxr_get_app_main_view(void)
 	DWORD style    = transparent_mode
 	    ? (DWORD)(WS_POPUP | WS_VISIBLE)
 	    : (DWORD)(WS_CHILD | WS_VISIBLE);
-	// Transparent path: NO WS_EX_TRANSPARENT — that bypasses WM_NCHITTEST so
-	// click-through becomes all-or-nothing. We instead gate per-pixel
-	// click-through via overlay_wnd_proc's WM_NCHITTEST + s_hit_rect.
+	// Transparent path: WS_EX_TRANSPARENT is NOT in the creation exstyle —
+	// it's toggled per-frame by displayxr_set_overlay_hit_active() driven
+	// by the C# raycast at the current cursor position. When the cursor
+	// is over a clickable renderer (cube silhouette), WS_EX_TRANSPARENT
+	// is cleared so the overlay catches clicks for Unity. When the cursor
+	// is in a transparent zone, WS_EX_TRANSPARENT is set and the OS
+	// routes hit-tests natively past us to whatever desktop window is
+	// underneath — full cross-process click/hover/cursor fidelity without
+	// any in-plugin forwarder gymnastics.
 	// WS_EX_NOACTIVATE keeps activation/foreground on Unity's (cloaked) HWND
-	// when the user clicks the overlay — otherwise Application.isFocused
+	// when the user clicks the cube — otherwise Application.isFocused
 	// flips false and Unity stops processing input.
-	// WS_EX_TOPMOST keeps the avatar visually above the underlying app
-	// while we forward clicks/keyboard to that app via Approach C
-	// (#57 session 5). WS_EX_NOACTIVATE prevents click-on-cube from
-	// stealing focus from the underlying app — the C# side computes the
-	// raycast in screen space, and we PostMessage to Unity directly, so
-	// we never need foreground.
+	// WS_EX_TOPMOST keeps the avatar visually above the underlying app.
 	DWORD ex_style = transparent_mode
 	    ? (DWORD)(WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)
 	    : (DWORD)(WS_EX_TRANSPARENT);
@@ -899,10 +812,12 @@ displayxr_get_unity_main_hwnd(void)
 // chroma→alpha conversion — that workaround is gone now that the runtime
 // advertises ALPHA_BLEND and Unity emits true alpha.
 //
-// Click-through is independent of all of the above: WM_NCHITTEST returns
-// HTCLIENT when s_hit_active=1 (cursor over a clickable renderer), else
-// HTTRANSPARENT; button events in non-hit regions are forwarded to the
-// underlying window via forward_click_to_underlying_window (Approach C).
+// Click-through is independent of all of the above: the overlay's
+// WS_EX_TRANSPARENT bit is toggled per-frame by
+// displayxr_set_overlay_hit_active() based on the C# raycast at the
+// current cursor position. When set (transparent zone), the OS hit-test
+// routes natively past us to the desktop app underneath. When clear
+// (cube silhouette), the overlay catches clicks for Unity.
 //
 // Mutually exclusive with shell mode (early-out below).
 // ============================================================================
@@ -1166,6 +1081,52 @@ displayxr_set_transparent_overlay(int enabled, int topmost)
 	}
 }
 
+// Set the rectangular hit-test region of the overlay.
+//
+// In opaque WS_CHILD mode (legacy / Game View overlay): updates
+// s_hit_rect, which WM_NCHITTEST in overlay_wnd_proc / parent_subclass_
+// proc uses as a fast HTCLIENT-vs-HTTRANSPARENT discriminator.
+//
+// In transparent WS_POPUP + NOREDIRECTIONBITMAP mode (issue #57): also
+// drives SetWindowRgn on the overlay HWND. Outside the region, the OS
+// treats our window as if it didn't exist — both rendering and hit-
+// testing — so input is routed natively to whatever desktop window is
+// at the cursor (full cross-process fidelity: real DefWindowProc modal
+// SC_MOVE/SC_SIZE/SC_CLOSE loops with proper GetKeyState, native
+// cursor adaptation, native menu activation, native hover and
+// TrackMouseEvent — without any plugin forwarder gymnastics).
+//
+// Push the screen-space bounding rect of the clickable renderers
+// (cube/avatar silhouette) each frame, converted to overlay client
+// coords (top-left origin). C# already computes this rect via
+// TryGetUnionScreenRect for opaque mode; the same rect drives both
+// paths in transparent mode.
+//
+// Region stability — padding + hysteresis. Skinned-mesh idle
+// animation jitters the screen-space AABB by a few pixels per frame
+// even when the user isn't moving the cube. Without stabilization the
+// region's edge oscillates across a stationary cursor and the OS flips
+// routing every frame (visible as: hover state on the desktop app
+// underneath blinks on/off; cursor adaptation flickers). We address
+// this with two tweaks:
+//   - PADDING_PX (+16 on each side): the region is larger than the
+//     raw silhouette AABB. The cursor must be at least PADDING_PX
+//     outside the silhouette before falling into the OS-routed zone.
+//     Idle jitter can't cross a 16-pixel buffer.
+//   - HYSTERESIS_PX (4): cache the last-applied region rect; skip
+//     SetWindowRgn if the new (padded) rect is within HYSTERESIS_PX
+//     of the last on all four edges. Idle jitter never re-pushes;
+//     only real motion (cube drag, animation re-pose, zoom) does.
+//
+// SetWindowRgn takes ownership of the HRGN, so we must NOT
+// DeleteObject afterward on success. The previous region (if any) is
+// freed by the OS as part of SetWindowRgn.
+//
+// w<=0 / h<=0 → clear the region (overlay catches everywhere — used
+// as the init default before C# pushes per-frame).
+#define DXR_HIT_RECT_PADDING_PX     16
+#define DXR_HIT_RECT_HYSTERESIS_PX  4
+
 void
 displayxr_set_overlay_hit_rect(int x, int y, int w, int h)
 {
@@ -1173,6 +1134,240 @@ displayxr_set_overlay_hit_rect(int x, int y, int w, int h)
 	s_hit_rect.top    = y;
 	s_hit_rect.right  = x + w;
 	s_hit_rect.bottom = y + h;
+
+	if (!s_overlay_is_toplevel)
+		return; // opaque WS_CHILD: WM_NCHITTEST consumes s_hit_rect, done.
+	if (s_overlay_hwnd == NULL || !IsWindow(s_overlay_hwnd))
+		return;
+	// Per-pixel silhouette mask path is active: stop driving the
+	// region from the AABB. Mask owns SetWindowRgn from here on.
+	if (s_hit_mask_active)
+		return;
+
+	// Cache of last applied region rect (post-padding). Sentinel value
+	// {INT_MIN,...} so the first call always goes through. Also reset
+	// to sentinel when we clear the region (w<=0 path below).
+	static RECT s_last_rgn_rect = { INT_MIN, INT_MIN, INT_MIN, INT_MIN };
+
+	if (w <= 0 || h <= 0) {
+		SetWindowRgn(s_overlay_hwnd, NULL, TRUE);
+		s_last_rgn_rect.left = INT_MIN;
+		displayxr_log("[DisplayXR] hit_region: cleared (overlay catches everywhere)\n");
+		return;
+	}
+
+	// Pad — gives the cursor a hysteresis margin outside the silhouette.
+	RECT padded = {
+		.left   = x - DXR_HIT_RECT_PADDING_PX,
+		.top    = y - DXR_HIT_RECT_PADDING_PX,
+		.right  = x + w + DXR_HIT_RECT_PADDING_PX,
+		.bottom = y + h + DXR_HIT_RECT_PADDING_PX,
+	};
+
+	// Hysteresis — skip the update if all four edges are within the
+	// threshold of the last applied rect. Compares against the PADDED
+	// rect so the comparison is in the same coordinate space as what
+	// we'd push.
+	if (s_last_rgn_rect.left != INT_MIN) {
+		LONG dl = padded.left   - s_last_rgn_rect.left;
+		LONG dt = padded.top    - s_last_rgn_rect.top;
+		LONG dr = padded.right  - s_last_rgn_rect.right;
+		LONG db = padded.bottom - s_last_rgn_rect.bottom;
+		if (dl < 0) dl = -dl;
+		if (dt < 0) dt = -dt;
+		if (dr < 0) dr = -dr;
+		if (db < 0) db = -db;
+		if (dl <= DXR_HIT_RECT_HYSTERESIS_PX &&
+		    dt <= DXR_HIT_RECT_HYSTERESIS_PX &&
+		    dr <= DXR_HIT_RECT_HYSTERESIS_PX &&
+		    db <= DXR_HIT_RECT_HYSTERESIS_PX) {
+			return;
+		}
+	}
+
+	HRGN rgn = CreateRectRgn(padded.left, padded.top, padded.right, padded.bottom);
+	if (rgn == NULL) {
+		displayxr_log("[DisplayXR] hit_region: CreateRectRgn failed (%ld,%ld %ldx%ld) err=%lu\n",
+		              padded.left, padded.top,
+		              padded.right - padded.left, padded.bottom - padded.top,
+		              (unsigned long)GetLastError());
+		return;
+	}
+	// SetWindowRgn takes ownership of rgn on success.
+	if (!SetWindowRgn(s_overlay_hwnd, rgn, TRUE)) {
+		DeleteObject(rgn);
+		displayxr_log("[DisplayXR] hit_region: SetWindowRgn failed (%ld,%ld %ldx%ld) err=%lu\n",
+		              padded.left, padded.top,
+		              padded.right - padded.left, padded.bottom - padded.top,
+		              (unsigned long)GetLastError());
+		return;
+	}
+	s_last_rgn_rect = padded;
+
+	// Throttle the log to ~1 Hz — even with hysteresis a moving cube
+	// re-pushes regularly.
+	static DWORD s_last_log_tick = 0;
+	DWORD now = GetTickCount();
+	if (now - s_last_log_tick >= 1000) {
+		s_last_log_tick = now;
+		displayxr_log("[DisplayXR] hit_region: raw=(%d,%d %dx%d) padded=(%ld,%ld %ldx%ld) on overlay=%p\n",
+		              x, y, w, h,
+		              padded.left, padded.top,
+		              padded.right - padded.left, padded.bottom - padded.top,
+		              (void *)s_overlay_hwnd);
+	}
+}
+
+// Per-pixel silhouette hit-test region (issue #57 Approach B+).
+//
+// C# renders each clickable Renderer to a small R8 RenderTexture with
+// the Hidden/DisplayXR/Silhouette shader (red=1 where any geometry
+// rasterizes), AsyncGPUReadbacks the result, and hands the bytes to
+// us each frame. We walk the mask row by row, RLE-encoding horizontal
+// runs of opaque pixels into RECTs scaled to overlay client coords,
+// then ExtCreateRegion + SetWindowRgn. Outside the silhouette the OS
+// treats our window as if it didn't exist — clicks/hover route
+// natively to whatever desktop window is at the cursor, including in
+// the gaps that an AABB can't express (between the tiger's legs,
+// above the hat tip, around the curling tail). Per-pixel accurate
+// cross-process click-through with no PostMessage gymnastics.
+//
+// Inputs:
+//   mask:   mask_w * mask_h bytes; non-zero = opaque (catch), zero =
+//           transparent (route past). Typically 256x144 — high enough
+//           to capture detail like leg gaps, low enough that the
+//           readback + RLE per frame is well under the budget.
+//   dst_w, dst_h: overlay client size; each mask pixel covers
+//           dst_w/mask_w by dst_h/mask_h overlay pixels (integer
+//           division — exact for power-of-two ratios, off-by-one at
+//           worst otherwise, which is invisible at 8x upsampling).
+//
+// First successful call sets s_hit_mask_active=1 — the AABB-region
+// path in displayxr_set_overlay_hit_rect stops calling SetWindowRgn
+// from that point on so the per-pixel region owns routing. This is a
+// one-way flag: once a mask has been applied, callers are committed
+// to keeping it fresh each frame (or the OS sees the last mask, which
+// may not match where the cube is now). NULL mask resets the flag
+// and restores the AABB-region path.
+//
+// HRGN ownership: SetWindowRgn takes ownership on success. We must
+// NOT DeleteObject the region we just handed it. The previous region
+// (if any) is freed by the OS as part of the call.
+//
+// Capacity: the worst case for a 256x144 mask is ~36k single-pixel
+// rects (alternating opaque/transparent every pixel of every row),
+// which would be ~580 KB of RECT data — fine but wasteful. Real
+// silhouettes RLE down to a few hundred to a few thousand rects.
+void
+displayxr_set_overlay_hit_mask(const uint8_t *mask, int mask_w, int mask_h,
+                               int dst_w, int dst_h)
+{
+	if (!s_overlay_is_toplevel)
+		return;
+	if (s_overlay_hwnd == NULL || !IsWindow(s_overlay_hwnd))
+		return;
+
+	if (mask == NULL || mask_w <= 0 || mask_h <= 0 ||
+	    dst_w <= 0 || dst_h <= 0) {
+		// NULL/empty: clear and revert to AABB-region path.
+		SetWindowRgn(s_overlay_hwnd, NULL, TRUE);
+		s_hit_mask_active = 0;
+		displayxr_log("[DisplayXR] hit_mask: cleared (reverting to AABB region)\n");
+		return;
+	}
+
+	// Build RECTs into a growable buffer. Initial capacity 1024 is
+	// usually enough for a single contiguous silhouette; we realloc if
+	// fragmentation pushes higher.
+	int  cap = 1024;
+	int  n   = 0;
+	RECT *rects = (RECT *)malloc((size_t)cap * sizeof(RECT));
+	if (rects == NULL)
+		return;
+
+	for (int my = 0; my < mask_h; my++) {
+		const uint8_t *row = mask + (size_t)my * (size_t)mask_w;
+		int top    = (int)((LONGLONG)my       * dst_h / mask_h);
+		int bottom = (int)((LONGLONG)(my + 1) * dst_h / mask_h);
+		int mx = 0;
+		while (mx < mask_w) {
+			while (mx < mask_w && row[mx] == 0) mx++;
+			if (mx >= mask_w) break;
+			int x0 = mx;
+			while (mx < mask_w && row[mx] != 0) mx++;
+			int x1 = mx;
+			if (n >= cap) {
+				int new_cap = cap * 2;
+				RECT *nr = (RECT *)realloc(rects,
+				                           (size_t)new_cap * sizeof(RECT));
+				if (nr == NULL) { free(rects); return; }
+				rects = nr;
+				cap = new_cap;
+			}
+			rects[n].left   = (LONG)((LONGLONG)x0 * dst_w / mask_w);
+			rects[n].top    = (LONG)top;
+			rects[n].right  = (LONG)((LONGLONG)x1 * dst_w / mask_w);
+			rects[n].bottom = (LONG)bottom;
+			n++;
+		}
+	}
+
+	HRGN rgn = NULL;
+	if (n == 0) {
+		// Empty silhouette: 0x0 rect = nothing-catches region.
+		rgn = CreateRectRgn(0, 0, 0, 0);
+	} else {
+		DWORD buf_size = sizeof(RGNDATAHEADER) + (DWORD)n * sizeof(RECT);
+		RGNDATA *data = (RGNDATA *)malloc(buf_size);
+		if (data == NULL) { free(rects); return; }
+
+		data->rdh.dwSize   = sizeof(RGNDATAHEADER);
+		data->rdh.iType    = RDH_RECTANGLES;
+		data->rdh.nCount   = (DWORD)n;
+		data->rdh.nRgnSize = (DWORD)n * sizeof(RECT);
+
+		LONG bl = rects[0].left,  bt = rects[0].top;
+		LONG br = rects[0].right, bb = rects[0].bottom;
+		for (int i = 1; i < n; i++) {
+			if (rects[i].left   < bl) bl = rects[i].left;
+			if (rects[i].top    < bt) bt = rects[i].top;
+			if (rects[i].right  > br) br = rects[i].right;
+			if (rects[i].bottom > bb) bb = rects[i].bottom;
+		}
+		data->rdh.rcBound.left   = bl;
+		data->rdh.rcBound.top    = bt;
+		data->rdh.rcBound.right  = br;
+		data->rdh.rcBound.bottom = bb;
+		memcpy(data->Buffer, rects, (size_t)n * sizeof(RECT));
+
+		rgn = ExtCreateRegion(NULL, buf_size, data);
+		free(data);
+
+		if (rgn == NULL) {
+			displayxr_log("[DisplayXR] hit_mask: ExtCreateRegion failed (n=%d) err=%lu\n",
+			              n, (unsigned long)GetLastError());
+			free(rects);
+			return;
+		}
+	}
+	free(rects);
+
+	if (!SetWindowRgn(s_overlay_hwnd, rgn, TRUE)) {
+		DeleteObject(rgn);
+		displayxr_log("[DisplayXR] hit_mask: SetWindowRgn failed err=%lu\n",
+		              (unsigned long)GetLastError());
+		return;
+	}
+	s_hit_mask_active = 1;
+
+	// Throttle the log to ~1 Hz — runs every frame.
+	static DWORD s_last_log_tick = 0;
+	DWORD now = GetTickCount();
+	if (now - s_last_log_tick >= 1000) {
+		s_last_log_tick = now;
+		displayxr_log("[DisplayXR] hit_mask: mask=%dx%d rects=%d dst=%dx%d\n",
+		              mask_w, mask_h, n, dst_w, dst_h);
+	}
 }
 
 void
@@ -1207,23 +1402,20 @@ displayxr_is_our_process_foreground(void)
 void
 displayxr_set_overlay_hit_active(int active)
 {
+	// Approach B (region-based click-through): s_hit_active still tracks
+	// the C# per-pixel raycast result for callers that want to know "is
+	// the cursor over a clickable renderer?", but it no longer drives the
+	// OS hit-test routing. Routing is owned by SetWindowRgn via
+	// displayxr_set_overlay_hit_region — outside the region the OS treats
+	// our window as if it doesn't exist (native click-through); inside,
+	// the overlay catches the click and posts it to Unity, which runs its
+	// own per-pixel raycast to decide whether to act on it.
 	int new_active = active ? 1 : 0;
 	if (new_active == s_hit_active)
 		return;
 	s_hit_active = new_active;
-
-	// Approach C (#57 session 5): the overlay always catches clicks
-	// (WM_NCHITTEST returns HTCLIENT), and overlay_wnd_proc dispatches
-	// based on s_hit_active — cube path PostMessages to Unity, transparent
-	// zone path calls forward_click_to_underlying_window which does
-	// SetForegroundWindow + PostMessage on the target. We no longer
-	// toggle WS_EX_TRANSPARENT: that path delivered messages to the
-	// underlying window but couldn't transfer foreground from us, so
-	// Notepad-style apps received the click without activating (no caret,
-	// no keyboard). Logging the hit_active transition is kept for log
-	// correlation with the [LLMouse] / [OvlWnd] probes.
-	displayxr_log("[DisplayXR] hit_active=%d (Approach C — overlay always catches)\n",
-	              s_hit_active);
+	// (No log line per frame — would flood at 60 Hz. The region-update
+	// path logs from displayxr_set_overlay_hit_region instead.)
 }
 
 void

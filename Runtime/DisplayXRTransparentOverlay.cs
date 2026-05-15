@@ -1,9 +1,11 @@
 // Copyright 2026, DisplayXR contributors
 // SPDX-License-Identifier: BSL-1.0
 
+using System;
 using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.Events;
+using UnityEngine.Rendering;
 #if HAS_INPUT_SYSTEM
 using UnityEngine.InputSystem;
 using UnityEngine.InputSystem.LowLevel;
@@ -119,6 +121,38 @@ namespace DisplayXR
         }
         private static readonly Dictionary<SkinnedMeshRenderer, BakedHit> s_BakedHits
             = new Dictionary<SkinnedMeshRenderer, BakedHit>();
+
+        // Per-pixel silhouette mask (Approach B+, #57). Each frame we
+        // render the clickable renderers to a small R8 RenderTexture
+        // with Hidden/DisplayXR/Silhouette (red=1 where any geometry
+        // rasterizes), AsyncGPUReadback the result, and hand the bytes
+        // to native — which RLEs to RECTs, ExtCreateRegion's, and
+        // SetWindowRgn's. Outside the silhouette the OS routes input
+        // natively to whatever desktop window is at the cursor
+        // (including concavities like the gap between the tiger's
+        // legs that an AABB swallows). Cheap: a 256x144 R8 readback
+        // is ~36 KB per frame.
+        //
+        // Resolution kept low intentionally — the region only needs to
+        // be silhouette-accurate, not feature-accurate. Higher values
+        // increase readback cost and region complexity (more RECTs).
+        private const int  HIT_MASK_WIDTH  = 256;
+        private const int  HIT_MASK_HEIGHT = 144;
+        private RenderTexture m_HitMaskRT;
+        private RenderTexture m_HitMaskDilatedRT;
+        private Material      m_SilhouetteMat;
+        private Material      m_SilhouetteDilateMat;
+        private CommandBuffer m_HitMaskCB;
+        // Only one readback in flight at a time — Unity's
+        // AsyncGPUReadback budget is a few outstanding requests, but
+        // a single one keeps memory + GPU pressure deterministic.
+        private bool m_HitMaskReadbackPending;
+        // Captured at request time so the callback (which runs on a
+        // later main-thread tick) uses the overlay size that was
+        // current when we issued the readback, not whatever the
+        // overlay has resized to since.
+        private int  m_HitMaskPendingDstW;
+        private int  m_HitMaskPendingDstH;
 
         /// <summary>Cursor position in window-client pixels (top-left origin).
         /// Only meaningful in standalone Windows build with transparent mode
@@ -446,11 +480,21 @@ namespace DisplayXR
             DispatchButton(buttons, 1, ref m_LeftWasDown, hitRenderer);
             DispatchButton(buttons, 2, ref m_RightWasDown, hitRenderer);
 
-            // Coarse AABB hit rect — used by WM_NCHITTEST in the OPAQUE
-            // WS_CHILD path as a fast reject before the per-pixel hit_active
-            // check kicks in. (In transparent-overlay top-level mode the
-            // native side returns HTCLIENT unconditionally, so this rect
-            // is informational; we set it anyway for opaque-mode users.)
+            // Cube/avatar screen-space AABB. Drives the OS hit-test region
+            // on the overlay HWND via displayxr_set_overlay_hit_rect:
+            //  - Transparent mode (Approach B): native side calls
+            //    SetWindowRgn(overlay, rect, TRUE). Outside the rect the
+            //    OS treats our window as if it didn't exist, so input is
+            //    routed natively to whatever desktop window is underneath
+            //    (full cross-process fidelity: real DefWindowProc modal
+            //    loops with proper GetKeyState, native cursor adaptation
+            //    over resize edges, native menu activation, native hover
+            //    highlights, taskbar previews, tooltips). Inside the rect
+            //    the overlay catches the click and posts it to Unity,
+            //    which runs its own per-pixel raycast (s_hit_active /
+            //    onPointerClick) to decide whether to act.
+            //  - Opaque WS_CHILD mode: WM_NCHITTEST uses the rect as a
+            //    fast HTCLIENT-vs-HTTRANSPARENT discriminator.
             if (TryGetStereoMatrices(out Matrix4x4 lv2, out Matrix4x4 lp2,
                                      out Matrix4x4 rv2, out Matrix4x4 rp2))
             {
@@ -461,6 +505,16 @@ namespace DisplayXR
                 {
                     DisplayXRNative.displayxr_set_overlay_hit_rect(rx, ry, rw, rh);
                 }
+                // Approach B+: render the silhouette PER EYE (union of
+                // left+right) to a small RT, dilate, then
+                // AsyncGPUReadback. Per-eye union covers what the
+                // lenticular actually displays column-by-column; the
+                // cyclopean midpoint by itself is narrower than the
+                // visible silhouette on high-disparity foreground
+                // geometry (e.g. hands), causing clipping.
+                RenderHitMaskAndRequestReadback(
+                    lv2, lp2, rv2, rp2,
+                    overlayW, overlayH);
             }
 #elif UNITY_STANDALONE_OSX
             // (#85) Mac cursor/button polling + cyclopean hit-test mirroring
@@ -632,6 +686,7 @@ namespace DisplayXR
                 DisplayXRNative.displayxr_set_transparent_overlay(0, 0);
                 DisplayXRNative.displayxr_set_overlay_hit_active(0);
             }
+            ReleaseHitMaskResources();
 #elif UNITY_STANDALONE_OSX
             if (!Application.isEditor || Application.isPlaying)
             {
@@ -916,6 +971,31 @@ namespace DisplayXR
             return true;
         }
 
+        // Convert an OpenXR-convention view matrix (right-handed
+        // world, -Z forward) to a Unity-convention view matrix that
+        // accepts Unity-world points (left-handed, +Z forward).
+        //
+        // Negating the third column flips the Z basis vector — when
+        // the matrix is applied to (x_u, y_u, z_u, 1) it gives the
+        // same eye-space result as applying the original to
+        // (x_u, y_u, -z_u, 1), i.e. as if we first converted Unity
+        // world coords to OpenXR world coords by negating Z.
+        //
+        // This is the same conversion the C# raycast helper
+        // ProjectThroughEye performs. Used here for the silhouette
+        // mask projection — the shader's input world-space points
+        // come from unity_ObjectToWorld (Unity-world), so the view
+        // matrix in our _DXRViewProj uniform has to accept Unity-
+        // world input.
+        private static Matrix4x4 ConvertOpenXRViewToUnity(Matrix4x4 v)
+        {
+            v.m02 = -v.m02;
+            v.m12 = -v.m12;
+            v.m22 = -v.m22;
+            v.m32 = -v.m32;
+            return v;
+        }
+
         // Build cyclopean (midpoint-eye) view + projection from the left and
         // right eye matrices. The two eyes' view matrices share the same
         // rotation (both face the display) but have different translations
@@ -1015,6 +1095,219 @@ namespace DisplayXR
             w = unionXMax - unionXMin;
             h = unionYMax - unionYMin;
             return w > 0 && h > 0;
+        }
+
+        // -------------------------------------------------------------
+        // Per-pixel silhouette hit mask (Approach B+, issue #57)
+        // -------------------------------------------------------------
+
+        void EnsureHitMaskResources()
+        {
+            if (m_HitMaskRT == null)
+            {
+                m_HitMaskRT = new RenderTexture(HIT_MASK_WIDTH, HIT_MASK_HEIGHT,
+                                                0, RenderTextureFormat.R8)
+                {
+                    filterMode  = FilterMode.Point,
+                    useMipMap   = false,
+                    autoGenerateMips = false,
+                };
+                m_HitMaskRT.Create();
+            }
+            if (m_HitMaskDilatedRT == null)
+            {
+                m_HitMaskDilatedRT = new RenderTexture(HIT_MASK_WIDTH, HIT_MASK_HEIGHT,
+                                                       0, RenderTextureFormat.R8)
+                {
+                    filterMode  = FilterMode.Point,
+                    useMipMap   = false,
+                    autoGenerateMips = false,
+                };
+                m_HitMaskDilatedRT.Create();
+            }
+            if (m_SilhouetteMat == null)
+            {
+                Shader s = Shader.Find("Hidden/DisplayXR/Silhouette");
+                if (s != null) m_SilhouetteMat = new Material(s) { hideFlags = HideFlags.HideAndDontSave };
+            }
+            if (m_SilhouetteDilateMat == null)
+            {
+                Shader s = Shader.Find("Hidden/DisplayXR/SilhouetteDilate");
+                if (s != null) m_SilhouetteDilateMat = new Material(s) { hideFlags = HideFlags.HideAndDontSave };
+            }
+            if (m_HitMaskCB == null)
+            {
+                m_HitMaskCB = new CommandBuffer { name = "DisplayXR Hit Mask" };
+            }
+        }
+
+        // Build a one-shot CommandBuffer that:
+        //   1) Renders each clickable renderer ONCE PER EYE into
+        //      m_HitMaskRT, using CommandBuffer.SetGlobalMatrix to
+        //      push the per-eye view-projection as a custom property
+        //      (_DXRViewProj) the silhouette shader consumes. Two
+        //      passes accumulate into the same RT (no clear between);
+        //      shader writes (1,0,0,1) unconditionally with no blend,
+        //      so the result is the boolean union of the two
+        //      silhouettes — what the lenticular actually displays.
+        //   2) Blits through the 5x5 max-kernel dilation shader into
+        //      m_HitMaskDilatedRT so AA-edge pixels and any sub-pixel
+        //      mismatch fall inside the SetWindowRgn region.
+        //   3) AsyncGPUReadback's the dilated RT.
+        //
+        // The custom _DXRViewProj uniform is critical: Unity's XR
+        // render pipeline overrides UNITY_MATRIX_VP per stereo eye,
+        // so CommandBuffer.SetViewProjectionMatrices is ineffective
+        // here and DrawRenderer ends up rasterizing both passes with
+        // the same matrices. _DXRViewProj is a property Unity doesn't
+        // know about, so SetGlobalMatrix sticks across the draws.
+        //
+        // For N-view extension: add more (view, proj) pairs and call
+        // SetGlobalMatrix + DrawRenderer for each. Architecture-friendly.
+        //
+        // Throttled to one outstanding readback at a time.
+        void RenderHitMaskAndRequestReadback(
+            Matrix4x4 leftView,  Matrix4x4 leftProj,
+            Matrix4x4 rightView, Matrix4x4 rightProj,
+            int overlayW, int overlayH)
+        {
+            if (clickableRenderers == null || clickableRenderers.Length == 0)
+                return;
+
+            EnsureHitMaskResources();
+            if (m_SilhouetteMat == null) return;
+            if (m_HitMaskReadbackPending) return;
+
+            // Convert OpenXR-convention view matrices (right-handed,
+            // -Z forward in world space) to Unity-convention (left-
+            // handed, +Z forward) by negating the third COLUMN. The
+            // shader's input world-space points come from
+            // unity_ObjectToWorld (Unity-world), but the raw view
+            // matrices from displayxr_get_stereo_matrices expect
+            // OpenXR-world input. Without this conversion a Unity-world
+            // point at +Z is interpreted as OpenXR's +Z (= behind the
+            // camera), projects out of clip range, and gets clipped —
+            // worst at high-Z foreground geometry like the tiger's
+            // hands. This is the same conversion ProjectThroughEye
+            // applies for the C# raycast (negating m02/m12/m22/m32 of
+            // the view matrix).
+            //
+            // GL.GetGPUProjectionMatrix(proj, renderIntoTexture=FALSE)
+            // does depth-range remap (OpenGL [-1,1] → D3D [0,1]) but
+            // NO Y-flip. We don't want the Y-flip — we read the RT
+            // back as CPU bytes and ship them to SetWindowRgn, where
+            // row 0 = top of overlay (Win32 client coords). The Y-flip
+            // would put row 0 at the bottom of the intended image.
+            Matrix4x4 leftViewUnity  = ConvertOpenXRViewToUnity(leftView);
+            Matrix4x4 rightViewUnity = ConvertOpenXRViewToUnity(rightView);
+            Matrix4x4 leftVP  = GL.GetGPUProjectionMatrix(leftProj,  false) * leftViewUnity;
+            Matrix4x4 rightVP = GL.GetGPUProjectionMatrix(rightProj, false) * rightViewUnity;
+
+            m_HitMaskCB.Clear();
+            m_HitMaskCB.SetRenderTarget(m_HitMaskRT);
+            m_HitMaskCB.ClearRenderTarget(true, true, Color.clear);
+
+            // Pass 1: left eye.
+            m_HitMaskCB.SetGlobalMatrix("_DXRViewProj", leftVP);
+            for (int i = 0; i < clickableRenderers.Length; i++)
+            {
+                var r = clickableRenderers[i];
+                if (r == null || !r.enabled || !r.gameObject.activeInHierarchy)
+                    continue;
+                m_HitMaskCB.DrawRenderer(r, m_SilhouetteMat, 0, 0);
+            }
+
+            // Pass 2: right eye. Accumulates into the same RT — pixels
+            // covered by either eye end up at 1 (boolean union).
+            m_HitMaskCB.SetGlobalMatrix("_DXRViewProj", rightVP);
+            for (int i = 0; i < clickableRenderers.Length; i++)
+            {
+                var r = clickableRenderers[i];
+                if (r == null || !r.enabled || !r.gameObject.activeInHierarchy)
+                    continue;
+                m_HitMaskCB.DrawRenderer(r, m_SilhouetteMat, 0, 0);
+            }
+
+            // Dilate the union by ~2 mask pixels to absorb AA-edge
+            // pixels at the silhouette boundary. Falls back to a
+            // direct readback of m_HitMaskRT if the dilation shader
+            // is unavailable.
+            RenderTexture readbackRT;
+            if (m_SilhouetteDilateMat != null && m_HitMaskDilatedRT != null)
+            {
+                m_HitMaskCB.Blit(m_HitMaskRT, m_HitMaskDilatedRT, m_SilhouetteDilateMat);
+                readbackRT = m_HitMaskDilatedRT;
+            }
+            else
+            {
+                readbackRT = m_HitMaskRT;
+            }
+
+            Graphics.ExecuteCommandBuffer(m_HitMaskCB);
+
+            m_HitMaskPendingDstW = overlayW;
+            m_HitMaskPendingDstH = overlayH;
+            m_HitMaskReadbackPending = true;
+            AsyncGPUReadback.Request(readbackRT, 0, OnHitMaskReadback);
+        }
+
+        void OnHitMaskReadback(AsyncGPUReadbackRequest req)
+        {
+            m_HitMaskReadbackPending = false;
+            if (req.hasError) return;
+            if (m_HitMaskRT == null) return;
+
+            var data = req.GetData<byte>();
+            unsafe
+            {
+                IntPtr ptr = (IntPtr)Unity.Collections.LowLevel.Unsafe
+                    .NativeArrayUnsafeUtility.GetUnsafeReadOnlyPtr(data);
+                DisplayXRNative.displayxr_set_overlay_hit_mask(
+                    ptr,
+                    HIT_MASK_WIDTH, HIT_MASK_HEIGHT,
+                    m_HitMaskPendingDstW, m_HitMaskPendingDstH);
+            }
+        }
+
+        void ReleaseHitMaskResources()
+        {
+            // Drop the readback flag so OnHitMaskReadback (which may
+            // fire after OnDisable) silently no-ops instead of
+            // dereferencing freed resources.
+            m_HitMaskReadbackPending = false;
+            if (m_HitMaskRT != null)
+            {
+                m_HitMaskRT.Release();
+                Destroy(m_HitMaskRT);
+                m_HitMaskRT = null;
+            }
+            if (m_HitMaskDilatedRT != null)
+            {
+                m_HitMaskDilatedRT.Release();
+                Destroy(m_HitMaskDilatedRT);
+                m_HitMaskDilatedRT = null;
+            }
+            if (m_SilhouetteMat != null)
+            {
+                Destroy(m_SilhouetteMat);
+                m_SilhouetteMat = null;
+            }
+            if (m_SilhouetteDilateMat != null)
+            {
+                Destroy(m_SilhouetteDilateMat);
+                m_SilhouetteDilateMat = null;
+            }
+            if (m_HitMaskCB != null)
+            {
+                m_HitMaskCB.Release();
+                m_HitMaskCB = null;
+            }
+            // Tell native to drop the mask region (reverts to AABB-
+            // region path for the next hit_rect push).
+#if UNITY_STANDALONE_WIN
+            if (!Application.isEditor)
+                DisplayXRNative.displayxr_set_overlay_hit_mask(IntPtr.Zero, 0, 0, 0, 0);
+#endif
         }
     }
 }
