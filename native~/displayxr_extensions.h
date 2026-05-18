@@ -55,6 +55,14 @@ typedef struct XrDisplayRenderingModeInfoEXT {
     uint32_t tileRows;
     uint32_t viewWidthPixels;
     uint32_t viewHeightPixels;
+    // v13 (DisplayXR runtime v1.4.0+): isActive marks the current mode for
+    // this session; isRequestable is false for non-controller workspace
+    // clients (runtime drops xrRequestDisplayRenderingModeEXT). Plugin
+    // doesn't currently consume them, but the struct sizeof must match
+    // the runtime's so xrEnumerateDisplayRenderingModesEXT writes modes[i]
+    // at the right stride. See DisplayXR/displayxr-runtime#234.
+    XrBool32 isActive;
+    XrBool32 isRequestable;
 } XrDisplayRenderingModeInfoEXT;
 
 typedef XrResult(XRAPI_PTR *PFN_xrEnumerateDisplayRenderingModesEXT)(
