@@ -5,6 +5,11 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.2] - 2026-05-18
+
+### Fixed
+- Editor compile on Unity 6.0.x: reverted three Unity 6.1+ APIs in `Editor/DisplayXRPreviewSession.cs` back to cross-version-safe equivalents — `Camera.GetEntityId` → `GetInstanceID`, `EditorUtility.EntityIdToObject` → `EditorUtility.InstanceIDToObject`, and single-arg `FindObjectsByType<T>(FindObjectsInactive)` → two-arg `FindObjectsByType<T>(FindObjectsInactive, FindObjectsSortMode)`. Partners on Unity 6000.0.x were hitting 5 compile errors when importing the package; this restores Unity 6.0+ compatibility without affecting Unity 6.1 behavior. #109 (#110)
+
 ## [1.7.0] - 2026-05-14
 
 ### Added
