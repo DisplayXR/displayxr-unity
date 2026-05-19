@@ -186,9 +186,23 @@ namespace DisplayXR
         }
 
 #if UNITY_EDITOR
-        // OnDrawGizmos (not OnDrawGizmosSelected) so multi-rig scenes show
-        // every rig at once with the active rig highlighted and others dimmed.
+        // Selection-driven in plain Edit Mode; active-rig-only when a
+        // DisplayXR session is alive (preview window, or Play Mode XR loader).
         void OnDrawGizmos()
+        {
+            if (!DisplayXRGizmoHelpers.IsSessionActive()) return;
+            var cam = m_Camera != null ? m_Camera : GetComponent<Camera>();
+            if (cam == null || DisplayXRRigManager.ActiveCamera != cam) return;
+            DrawGizmosImpl();
+        }
+
+        void OnDrawGizmosSelected()
+        {
+            if (DisplayXRGizmoHelpers.IsSessionActive()) return;
+            DrawGizmosImpl();
+        }
+
+        void DrawGizmosImpl()
         {
             DisplayXRDisplayInfo info = DisplayXRFeature.Instance != null
                 ? DisplayXRFeature.Instance.DisplayInfo
@@ -198,15 +212,13 @@ namespace DisplayXR
                 ? info.displayWidthMeters / info.displayHeightMeters
                 : 16f / 9f;
 
-            // FOV: prefer cached (set in OnEnable); fall back to Camera.fov for
-            // Edit Mode where OnEnable may not have run yet.
             var cam = m_Camera != null ? m_Camera : GetComponent<Camera>();
             float fovDeg = m_CachedCameraFov > 0f ? m_CachedCameraFov
                          : (cam != null ? cam.fieldOfView : 60f);
 
-            // Virtual display rect: at convergence distance when finite, else
-            // a 2 m preview plane (with a distinct hue) so the gizmo is still
-            // useful in parallel-projection mode.
+            // Convergence plane: at 1/invd when finite, else a 2 m preview
+            // plane so the parallel-projection case still gives the user
+            // something to anchor on.
             bool parallel = invConvergenceDistance < 0.001f;
             float convergenceDist = parallel ? 2f : (1f / invConvergenceDistance);
             float halfH = convergenceDist * Mathf.Tan(fovDeg * 0.5f * Mathf.Deg2Rad);
@@ -214,6 +226,24 @@ namespace DisplayXR
             float w = h * aspect;
             float hw = w * 0.5f;
             float hh = h * 0.5f;
+
+            // Orange convergence volume (preserves the pre-#111 visual; the
+            // parallel-projection case shifts hue so the user can tell it
+            // apart from the finite-convergence case).
+            Color volFill = parallel
+                ? new Color(0.7f, 0.4f, 1f, 0.25f)
+                : new Color(1f, 0.6f, 0.2f, 0.3f);
+            Color volWire = parallel
+                ? new Color(0.7f, 0.4f, 1f, 0.8f)
+                : new Color(1f, 0.6f, 0.2f, 0.8f);
+            Vector3 center = new Vector3(0, 0, convergenceDist);
+            Vector3 size = new Vector3(w, h, 0.002f);
+            Gizmos.matrix = transform.localToWorldMatrix;
+            Gizmos.color = volFill;
+            Gizmos.DrawCube(center, size);
+            Gizmos.color = volWire;
+            Gizmos.DrawWireCube(center, size);
+            Gizmos.matrix = Matrix4x4.identity;
 
             Vector3 cBL = transform.TransformPoint(new Vector3(-hw, -hh, convergenceDist));
             Vector3 cBR = transform.TransformPoint(new Vector3(+hw, -hh, convergenceDist));
@@ -226,28 +256,15 @@ namespace DisplayXR
                 cameraCentric: true,
                 out Vector3 leftEye, out Vector3 rightEye, out bool isLive);
 
-            bool isActive = cam != null && DisplayXRRigManager.ActiveCamera == cam;
-            float alpha = isActive ? 1f : 0.3f;
-
-            Color rectBase = parallel
-                ? DisplayXRGizmoHelpers.DisplayRectParallel
-                : DisplayXRGizmoHelpers.DisplayRectActive;
-            Color rectColor = DisplayXRGizmoHelpers.Dimmed(rectBase, alpha);
-            Color leftColor = DisplayXRGizmoHelpers.Dimmed(
-                DisplayXRGizmoHelpers.FrustumLeftActive, alpha);
-            Color rightColor = DisplayXRGizmoHelpers.Dimmed(
-                DisplayXRGizmoHelpers.FrustumRightActive, alpha);
-            Color eyeColor = DisplayXRGizmoHelpers.Dimmed(
-                isLive ? DisplayXRGizmoHelpers.EyeGlyphLive
-                       : DisplayXRGizmoHelpers.EyeGlyphNominal,
-                alpha);
+            Color frustumColor = Color.magenta;
+            Color eyeColor = isLive ? DisplayXRGizmoHelpers.EyeGlyphLive
+                                    : DisplayXRGizmoHelpers.EyeGlyphNominal;
 
             float farDist = 5f * Mathf.Max(w, h);
             if (cam != null) farDist = Mathf.Min(farDist, cam.farClipPlane);
 
-            DisplayXRGizmoHelpers.DrawDisplayRect(cBL, cBR, cTR, cTL, rectColor);
-            DisplayXRGizmoHelpers.DrawAsymmetricFrustum(leftEye, cBL, cBR, cTR, cTL, farDist, leftColor);
-            DisplayXRGizmoHelpers.DrawAsymmetricFrustum(rightEye, cBL, cBR, cTR, cTL, farDist, rightColor);
+            DisplayXRGizmoHelpers.DrawAsymmetricFrustum(leftEye, cBL, cBR, cTR, cTL, farDist, frustumColor);
+            DisplayXRGizmoHelpers.DrawAsymmetricFrustum(rightEye, cBL, cBR, cTR, cTL, farDist, frustumColor);
             DisplayXRGizmoHelpers.DrawEyeGlyph(leftEye, transform.rotation, 0.015f, eyeColor);
             DisplayXRGizmoHelpers.DrawEyeGlyph(rightEye, transform.rotation, 0.015f, eyeColor);
         }

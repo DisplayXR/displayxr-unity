@@ -18,6 +18,48 @@ namespace DisplayXR
         public const float NOMINAL_VIEWER_Z_FALLBACK = 0.5f;
 
         // -----------------------------------------------------------------
+        // Session detection (selection-driven in Edit Mode; active-rig-only
+        // when a DisplayXR session is alive)
+        // -----------------------------------------------------------------
+
+        static System.Reflection.PropertyInfo s_PreviewIsRunningProp;
+        static bool s_PreviewLookupDone;
+
+        public static bool IsSessionActive()
+        {
+            if (Application.isPlaying) return true;
+            return IsPreviewSessionRunning();
+        }
+
+        static bool IsPreviewSessionRunning()
+        {
+            if (!s_PreviewLookupDone)
+            {
+                s_PreviewLookupDone = true;
+                // Editor asmdef references Runtime, not the other way around,
+                // so DisplayXRPreviewSession (DisplayXR.Editor namespace) is
+                // not visible at compile time. Reflect through loaded
+                // assemblies — cached after first hit.
+                try
+                {
+                    foreach (var asm in System.AppDomain.CurrentDomain.GetAssemblies())
+                    {
+                        var t = asm.GetType("DisplayXR.Editor.DisplayXRPreviewSession", false);
+                        if (t == null) continue;
+                        s_PreviewIsRunningProp = t.GetProperty("IsRunning",
+                            System.Reflection.BindingFlags.Public |
+                            System.Reflection.BindingFlags.Static);
+                        break;
+                    }
+                }
+                catch { /* swallow — fall back to "no session" */ }
+            }
+            if (s_PreviewIsRunningProp == null) return false;
+            try { return (bool)s_PreviewIsRunningProp.GetValue(null); }
+            catch { return false; }
+        }
+
+        // -----------------------------------------------------------------
         // Data source
         // -----------------------------------------------------------------
 
@@ -171,20 +213,6 @@ namespace DisplayXR
         // -----------------------------------------------------------------
 
         /// <summary>
-        /// Draw a quadrilateral as 4 line segments. Corner order matters for
-        /// matching frustum edges; see DrawAsymmetricFrustum.
-        /// </summary>
-        public static void DrawDisplayRect(
-            Vector3 cBL, Vector3 cBR, Vector3 cTR, Vector3 cTL, Color color)
-        {
-            Gizmos.color = color;
-            Gizmos.DrawLine(cBL, cBR);
-            Gizmos.DrawLine(cBR, cTR);
-            Gizmos.DrawLine(cTR, cTL);
-            Gizmos.DrawLine(cTL, cBL);
-        }
-
-        /// <summary>
         /// Draw an asymmetric (Kooima) frustum: eye → 4 display corners,
         /// plus a far-plane quad along each eye→corner ray. Distance is
         /// measured from the eye to the corresponding corner; the far
@@ -239,22 +267,11 @@ namespace DisplayXR
         }
 
         // -----------------------------------------------------------------
-        // Color helpers
+        // Eye-glyph colors
         // -----------------------------------------------------------------
 
-        public static readonly Color DisplayRectActive = Color.magenta;
-        public static readonly Color FrustumLeftActive = new Color(0.4f, 0.9f, 1f, 1f);
-        public static readonly Color FrustumRightActive = new Color(1f, 0.6f, 0.4f, 1f);
         public static readonly Color EyeGlyphLive = new Color(1f, 1f, 0.2f, 1f);
         public static readonly Color EyeGlyphNominal = new Color(0.9f, 0.85f, 0.3f, 0.7f);
-
-        // Parallel-projection fallback rect (camera-centric, invd ≈ 0).
-        public static readonly Color DisplayRectParallel = new Color(0.7f, 0.4f, 1f, 1f);
-
-        public static Color Dimmed(Color c, float alpha = 0.3f)
-        {
-            return new Color(c.r, c.g, c.b, c.a * alpha);
-        }
     }
 }
 #endif
