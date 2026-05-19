@@ -1258,6 +1258,7 @@ namespace DisplayXR
             if (m_HitMaskRT == null) return;
 
             var data = req.GetData<byte>();
+#if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
             unsafe
             {
                 IntPtr ptr = (IntPtr)Unity.Collections.LowLevel.Unsafe
@@ -1267,6 +1268,7 @@ namespace DisplayXR
                     HIT_MASK_WIDTH, HIT_MASK_HEIGHT,
                     m_HitMaskPendingDstW, m_HitMaskPendingDstH);
             }
+#endif
         }
 
         void ReleaseHitMaskResources()
