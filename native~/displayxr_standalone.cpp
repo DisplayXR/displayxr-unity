@@ -1762,6 +1762,25 @@ displayxr_standalone_get_eye_positions(float *lx, float *ly, float *lz,
 	*is_tracked = s_sa.is_tracked;
 }
 
+void
+displayxr_standalone_get_n_eye_positions(float *out_xyz_array,
+                                          uint32_t capacity,
+                                          uint32_t *out_count,
+                                          int32_t *out_tracked)
+{
+	uint32_t n = s_sa.located_view_count;
+	if (n > capacity) n = capacity;
+	if (out_count) *out_count = n;
+	if (out_tracked) *out_tracked = s_sa.is_tracked;
+	if (out_xyz_array && n > 0) {
+		for (uint32_t i = 0; i < n; i++) {
+			out_xyz_array[i * 3 + 0] = s_sa.eye_positions[i][0];
+			out_xyz_array[i * 3 + 1] = s_sa.eye_positions[i][1];
+			out_xyz_array[i * 3 + 2] = s_sa.eye_positions[i][2];
+		}
+	}
+}
+
 
 void
 displayxr_standalone_set_unity_device(void *unity_native_tex)

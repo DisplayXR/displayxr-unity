@@ -8,12 +8,17 @@ namespace DisplayXR
 {
     /// <summary>
     /// Shared Scene-view gizmo primitives for DisplayXRDisplay / DisplayXRCamera.
-    /// Re-implements the canonical <c>display3d_apply_eye_factors</c> math
-    /// (native~/display3d_view.c:119-160) in C# so the drawn frustum origins
-    /// match what the runtime actually consumes in xrLocateViews.
+    /// Re-implements the canonical Kooima eye-factor math
+    /// (native~/display3d_view.c, display3d_apply_eye_factors_n) in C# so the
+    /// drawn frustum origins match what the runtime actually consumes in
+    /// xrLocateViews. Supports N views (Standard 3D = 2, quad = 4,
+    /// lenticular = 8, …) by reading the standalone preview's per-view
+    /// state through displayxr_standalone_get_n_eye_positions and the
+    /// active mode's viewCount through displayxr_standalone_get_current_mode_info.
     /// </summary>
     internal static class DisplayXRGizmoHelpers
     {
+        public const int MAX_VIEWS = 16;
         public const float NOMINAL_IPD_METERS = 0.063f;
         public const float NOMINAL_VIEWER_Z_FALLBACK = 0.5f;
 
@@ -89,117 +94,184 @@ namespace DisplayXR
         }
 
         /// <summary>
-        /// Read the last per-eye pose pushed through xrLocateViews. Positions
-        /// are in OpenXR display-relative space (right-hand, -Z forward).
-        /// Returns true only if the runtime reported tracked AND non-zero
-        /// positions (untracked sessions can return zeros).
+        /// View count for the currently active rendering mode (Standard 3D = 2,
+        /// quad = 4, lenticular = 8, …). Falls back to 2 when no preview
+        /// session is running or the mode info is unavailable. Clamped to
+        /// [1, MAX_VIEWS].
         /// </summary>
-        public static bool TryGetLiveEyesOpenXR(out Vector3 rawLeft, out Vector3 rawRight)
+        public static int QueryActiveViewCount()
         {
-            rawLeft = rawRight = Vector3.zero;
-            int tracked = 0;
+            uint vc = 0;
             try
             {
-                DisplayXRNative.displayxr_get_eye_positions(
-                    out float lx, out float ly, out float lz,
-                    out float rx, out float ry, out float rz,
-                    out tracked);
-                rawLeft = new Vector3(lx, ly, lz);
-                rawRight = new Vector3(rx, ry, rz);
+                DisplayXRNative.displayxr_standalone_get_current_mode_info(
+                    out vc, out _, out _, out _, out _, out _, out _, out _);
             }
-            catch (System.DllNotFoundException)
+            catch (System.DllNotFoundException) { }
+            int n = vc > 0 ? (int)vc : 2;
+            if (n < 1) n = 1;
+            if (n > MAX_VIEWS) n = MAX_VIEWS;
+            return n;
+        }
+
+        // Reusable scratch buffer for the N-eye native marshalling. Editor-
+        // only, single-threaded gizmo callbacks, so a static instance is fine.
+        static float[] s_NEyeBuf;
+
+        /// <summary>
+        /// Try to fill <paramref name="eyesOut"/> with the runtime's last
+        /// per-view eye positions (OpenXR display-relative, right-hand,
+        /// −Z forward). Standalone preview path returns up to N; Unity
+        /// hook chain (Play Mode) returns 2. Returns the number written;
+        /// 0 if no live data is available or the data is degenerate
+        /// (all-zero, or L==R with N==2 — head-center-only sessions).
+        /// </summary>
+        public static int TryGetLiveRawEyes(Vector3[] eyesOut)
+        {
+            if (eyesOut == null || eyesOut.Length == 0) return 0;
+            int cap = eyesOut.Length;
+
+            // 1) Standalone preview (N-view): preferred when running.
+            if (s_NEyeBuf == null || s_NEyeBuf.Length < cap * 3)
+                s_NEyeBuf = new float[cap * 3];
+            try
             {
-                return false;
+                DisplayXRNative.displayxr_standalone_get_n_eye_positions(
+                    s_NEyeBuf, (uint)cap, out uint outCount, out int outTracked);
+                if (outTracked != 0 && outCount > 0)
+                {
+                    int n = (int)outCount;
+                    for (int i = 0; i < n; i++)
+                    {
+                        eyesOut[i] = new Vector3(
+                            s_NEyeBuf[i * 3 + 0],
+                            s_NEyeBuf[i * 3 + 1],
+                            s_NEyeBuf[i * 3 + 2]);
+                    }
+                    if (!IsDegenerateEyeSet(eyesOut, n)) return n;
+                }
             }
-            if (tracked == 0) return false;
-            // Some runtimes return tracked=1 with zero positions before the
-            // first frame — guard against that to avoid drawing eyes at the
-            // display origin.
-            if (rawLeft == Vector3.zero && rawRight == Vector3.zero) return false;
-            // Some runtimes report a single head-center pose for both eyes
-            // before per-eye tracking kicks in. Treat that as "no live IPD
-            // separation" and fall back to the nominal pair so the user can
-            // still see two distinct ray origins.
-            if ((rawLeft - rawRight).sqrMagnitude < 1e-8f) return false;
+            catch (System.DllNotFoundException) { }
+
+            // 2) Unity hook chain (Play Mode XR loader): 2 eyes only.
+            if (cap >= 2)
+            {
+                int tracked = 0;
+                try
+                {
+                    DisplayXRNative.displayxr_get_eye_positions(
+                        out float lx, out float ly, out float lz,
+                        out float rx, out float ry, out float rz,
+                        out tracked);
+                    if (tracked != 0)
+                    {
+                        eyesOut[0] = new Vector3(lx, ly, lz);
+                        eyesOut[1] = new Vector3(rx, ry, rz);
+                        if (!IsDegenerateEyeSet(eyesOut, 2)) return 2;
+                    }
+                }
+                catch (System.DllNotFoundException) { }
+            }
+            return 0;
+        }
+
+        // All-zero or all-equal positions mean the runtime hasn't actually
+        // tracked the viewer yet — fall back to nominal so the user still
+        // sees a sensible IPD separation.
+        static bool IsDegenerateEyeSet(Vector3[] eyes, int count)
+        {
+            if (count == 0) return true;
+            if (eyes[0] != Vector3.zero) return AllSame(eyes, count);
+            // First eye is zero — check the rest.
+            for (int i = 1; i < count; i++)
+                if (eyes[i] != Vector3.zero) return AllSame(eyes, count);
+            return true; // all zero
+        }
+
+        static bool AllSame(Vector3[] eyes, int count)
+        {
+            for (int i = 1; i < count; i++)
+                if ((eyes[i] - eyes[0]).sqrMagnitude > 1e-8f) return false;
             return true;
         }
 
         /// <summary>
-        /// Nominal eye pair around the runtime's nominal viewer (or constant
-        /// fallback when display info is invalid). Same conventions as
-        /// TryGetLiveEyesOpenXR (OpenXR display-relative space).
+        /// Two-eye nominal pair around the runtime's nominal viewer (or a
+        /// constant fallback when display info is invalid). Used when no
+        /// live data is available.
         /// </summary>
-        public static void NominalEyesOpenXR(
-            DisplayXRDisplayInfo info,
-            out Vector3 nominalLeft, out Vector3 nominalRight)
+        public static int FillNominalEyes(DisplayXRDisplayInfo info, Vector3[] eyesOut)
         {
+            if (eyesOut == null || eyesOut.Length < 2) return 0;
             float nx = info.isValid ? info.nominalViewerX : 0f;
             float ny = info.isValid ? info.nominalViewerY : 0f;
             float nz = info.isValid ? info.nominalViewerZ : NOMINAL_VIEWER_Z_FALLBACK;
             float halfIpd = NOMINAL_IPD_METERS * 0.5f;
-            nominalLeft = new Vector3(nx - halfIpd, ny, nz);
-            nominalRight = new Vector3(nx + halfIpd, ny, nz);
+            eyesOut[0] = new Vector3(nx - halfIpd, ny, nz);
+            eyesOut[1] = new Vector3(nx + halfIpd, ny, nz);
+            return 2;
         }
 
         // -----------------------------------------------------------------
-        // Kooima eye-factor math (mirror display3d_apply_eye_factors)
+        // Kooima eye-factor math, N-view variant
+        // (mirror display3d_apply_eye_factors_n at display3d_view.c:220-260)
         // -----------------------------------------------------------------
 
-        public static void ApplyKooimaEyeFactors(
-            Vector3 rawLeft, Vector3 rawRight,
+        public static void ApplyKooimaEyeFactorsN(
+            Vector3[] rawEyes, int count,
             float nominalZ,
             float ipdFactor, float parallaxFactor, float perspectiveFactor,
-            out Vector3 outLeft, out Vector3 outRight)
+            Vector3[] outEyes)
         {
-            // Step 1: IPD factor scales eye-to-center vector, center fixed.
-            Vector3 center = (rawLeft + rawRight) * 0.5f;
-            Vector3 leftVec = (rawLeft - center) * ipdFactor;
-            Vector3 rightVec = (rawRight - center) * ipdFactor;
+            if (count <= 0) return;
 
-            // Step 2: parallax factor lerps center toward (0, 0, nominal_z).
+            // Centroid of all eyes
+            Vector3 center = Vector3.zero;
+            for (int i = 0; i < count; i++) center += rawEyes[i];
+            center /= count;
+
+            // Parallax: lerp centroid toward (0, 0, nominalZ)
             Vector3 centerNew = new Vector3(
                 parallaxFactor * center.x,
                 parallaxFactor * center.y,
                 nominalZ + parallaxFactor * (center.z - nominalZ));
 
-            outLeft = (centerNew + leftVec) * perspectiveFactor;
-            outRight = (centerNew + rightVec) * perspectiveFactor;
+            // IPD: scale each eye's offset from centroid
+            for (int i = 0; i < count; i++)
+            {
+                Vector3 e = centerNew + (rawEyes[i] - center) * ipdFactor;
+                outEyes[i] = e * perspectiveFactor;
+            }
         }
 
         // -----------------------------------------------------------------
-        // World-space eye placement per rig type
+        // World-space placement per rig type
         // -----------------------------------------------------------------
 
         /// <summary>
-        /// Display-centric world placement. Mirrors the native
-        /// display3d_compute_view pipeline (display3d_view.c:280-298):
-        /// applies anisotropic eye corrections (ax = sy/sx, az = sy/sz),
-        /// then m2v_effective = vdh / (sy * display_height_m) so eyes
-        /// scale to virtual-display space. Uses rig.position + rig.rotation
-        /// (NOT TransformPoint) because the runtime folds lossyScale into
-        /// m2v via /sy — using TransformPoint would multiply by sy on top
-        /// of that, producing sy^2 scaling.
+        /// Display-centric: mirrors native display3d_compute_view
+        /// (display3d_view.c:280-298). Applies anisotropic eye corrections
+        /// (ax = sy/sx, az = sy/sz) and m2v_effective = vdh/(sy*display_h),
+        /// then rig.position + rig.rotation only (no TransformPoint —
+        /// lossyScale is already folded into m2v via /sy).
         /// </summary>
-        public static void GetDisplayCentricEyes(
+        public static int GetDisplayCentricEyesWorld(
             Transform rig,
             DisplayXRDisplayInfo info,
             float ipdFactor, float parallaxFactor, float perspectiveFactor,
             float virtualDisplayHeight,
-            out Vector3 leftWorld, out Vector3 rightWorld, out bool isLive)
+            Vector3[] worldEyesOut, out bool isLive)
         {
-            isLive = TryGetLiveEyesOpenXR(out Vector3 rawL, out Vector3 rawR);
-            if (!isLive)
-                NominalEyesOpenXR(info, out rawL, out rawR);
+            int count = TryGetLiveRawEyes(worldEyesOut);
+            isLive = count > 0;
+            if (!isLive) count = FillNominalEyes(info, worldEyesOut);
 
             float nominalZ = info.isValid ? info.nominalViewerZ : NOMINAL_VIEWER_Z_FALLBACK;
-            ApplyKooimaEyeFactors(
-                rawL, rawR, nominalZ,
+            ApplyKooimaEyeFactorsN(
+                worldEyesOut, count, nominalZ,
                 ipdFactor, parallaxFactor, perspectiveFactor,
-                out Vector3 kooimaL, out Vector3 kooimaR);
+                worldEyesOut);
 
-            // Scale-as-zoom: vdh /= sy (matches displayxr_hooks.cpp:447).
-            // Anisotropic per-axis corrections so non-uniform rig scale still
-            // produces consistent geometry (matches lines 451-470).
             float sx = SafeAbs(rig.lossyScale.x);
             float sy = SafeAbs(rig.lossyScale.y);
             float sz = SafeAbs(rig.lossyScale.z);
@@ -211,44 +283,50 @@ namespace DisplayXR
             float az = sy / sz;
             float m2v = (vdh / sy) / ph;
 
-            Vector3 placeL = ApplyAnisoAndM2v(kooimaL, ax, az, m2v);
-            Vector3 placeR = ApplyAnisoAndM2v(kooimaR, ax, az, m2v);
-
-            // OpenXR (right-hand, -Z forward) → Unity local (left-hand, +Z fwd).
-            // Apply rotation and position ONLY — scale is already folded in
-            // via m2v above. TransformPoint would re-multiply by lossyScale.
-            leftWorld = rig.position + rig.rotation * new Vector3(placeL.x, placeL.y, -placeL.z);
-            rightWorld = rig.position + rig.rotation * new Vector3(placeR.x, placeR.y, -placeR.z);
+            for (int i = 0; i < count; i++)
+            {
+                Vector3 e = worldEyesOut[i];
+                Vector3 local = new Vector3(e.x * ax * m2v, e.y * m2v, e.z * az * m2v);
+                worldEyesOut[i] = rig.position + rig.rotation * new Vector3(local.x, local.y, -local.z);
+            }
+            return count;
         }
 
         /// <summary>
-        /// Camera-centric world placement. Eyes are at the rig (camera)
-        /// position plus the Kooima-vs-nominal displacement, mapped through
-        /// rig pose. TransformPoint here matches camera3d_view.c which
-        /// multiplies eye_raw by scene scale before the rotation.
+        /// Camera-centric: each eye is placed as the displacement from
+        /// nominal head-center (0, 0, nominalZ), z-flipped, then
+        /// TransformPoint via the rig (which is the camera). Mirrors
+        /// camera3d_view.c which multiplies raw eye by scene scale before
+        /// rotation — TransformPoint reproduces that on top of the IPD /
+        /// parallax adjustments already applied by ApplyKooimaEyeFactorsN.
         /// </summary>
-        public static void GetCameraCentricEyes(
+        public static int GetCameraCentricEyesWorld(
             Transform rig,
             DisplayXRDisplayInfo info,
             float ipdFactor, float parallaxFactor,
-            out Vector3 leftWorld, out Vector3 rightWorld, out bool isLive)
+            Vector3[] worldEyesOut, out bool isLive)
         {
-            isLive = TryGetLiveEyesOpenXR(out Vector3 rawL, out Vector3 rawR);
-            if (!isLive)
-                NominalEyesOpenXR(info, out rawL, out rawR);
+            int count = TryGetLiveRawEyes(worldEyesOut);
+            isLive = count > 0;
+            if (!isLive) count = FillNominalEyes(info, worldEyesOut);
 
             float nominalZ = info.isValid ? info.nominalViewerZ : NOMINAL_VIEWER_Z_FALLBACK;
-            ApplyKooimaEyeFactors(
-                rawL, rawR, nominalZ,
+            ApplyKooimaEyeFactorsN(
+                worldEyesOut, count, nominalZ,
                 ipdFactor, parallaxFactor, perspectiveFactor: 1f,
-                out Vector3 kooimaL, out Vector3 kooimaR);
+                worldEyesOut);
 
-            NominalEyesOpenXR(info, out Vector3 nomL, out Vector3 nomR);
-            Vector3 dL = kooimaL - nomL;
-            Vector3 dR = kooimaR - nomR;
+            Vector3 headCenter = new Vector3(
+                info.isValid ? info.nominalViewerX : 0f,
+                info.isValid ? info.nominalViewerY : 0f,
+                nominalZ);
 
-            leftWorld = rig.TransformPoint(new Vector3(dL.x, dL.y, -dL.z));
-            rightWorld = rig.TransformPoint(new Vector3(dR.x, dR.y, -dR.z));
+            for (int i = 0; i < count; i++)
+            {
+                Vector3 d = worldEyesOut[i] - headCenter;
+                worldEyesOut[i] = rig.TransformPoint(new Vector3(d.x, d.y, -d.z));
+            }
+            return count;
         }
 
         static float SafeAbs(float v)
@@ -257,24 +335,14 @@ namespace DisplayXR
             return a < 0.001f ? 1f : a;
         }
 
-        static Vector3 ApplyAnisoAndM2v(Vector3 eye, float ax, float az, float m2v)
-        {
-            return new Vector3(
-                eye.x * ax * m2v,
-                eye.y * m2v,
-                eye.z * az * m2v);
-        }
-
         // -----------------------------------------------------------------
         // Drawing primitives
         // -----------------------------------------------------------------
 
         /// <summary>
-        /// Draw an asymmetric (Kooima) frustum: eye → 4 display corners,
-        /// plus a far-plane quad along each eye→corner ray. Distance is
-        /// measured from the eye to the corresponding corner; the far
-        /// corner sits at <c>farDistanceFromEye</c> meters along the same
-        /// ray (extrapolated past the display plane).
+        /// Asymmetric (Kooima) frustum: eye → 4 display corners, plus a far
+        /// quad along each eye→corner ray (extrapolated past the display
+        /// plane). farDistanceFromEye is measured from the eye.
         /// </summary>
         public static void DrawAsymmetricFrustum(
             Vector3 eye,
@@ -282,13 +350,11 @@ namespace DisplayXR
             float farDistanceFromEye, Color color)
         {
             Gizmos.color = color;
-            // 4 edges eye → corner
             Gizmos.DrawLine(eye, cBL);
             Gizmos.DrawLine(eye, cBR);
             Gizmos.DrawLine(eye, cTR);
             Gizmos.DrawLine(eye, cTL);
 
-            // Far quad along each ray (extrapolated past the display plane).
             Vector3 fBL = ExtrapolateRay(eye, cBL, farDistanceFromEye);
             Vector3 fBR = ExtrapolateRay(eye, cBR, farDistanceFromEye);
             Vector3 fTR = ExtrapolateRay(eye, cTR, farDistanceFromEye);
@@ -301,17 +367,12 @@ namespace DisplayXR
 
         static Vector3 ExtrapolateRay(Vector3 origin, Vector3 through, float distance)
         {
-            Vector3 dir = (through - origin);
+            Vector3 dir = through - origin;
             float len = dir.magnitude;
             if (len < 1e-5f) return through;
             return origin + dir * (distance / len);
         }
 
-        /// <summary>
-        /// Small camera glyph at the eye: a wire cube plus a short forward
-        /// stub indicating orientation. <paramref name="orient"/> follows
-        /// Unity's +Z-forward convention.
-        /// </summary>
         public static void DrawEyeGlyph(
             Vector3 pos, Quaternion orient, float size, Color color)
         {
