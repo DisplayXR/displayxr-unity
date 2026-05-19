@@ -233,10 +233,10 @@ namespace DisplayXR
             Vector3 cTR = transform.TransformPoint(new Vector3(+hw, +hh, 0f));
             Vector3 cTL = transform.TransformPoint(new Vector3(-hw, +hh, 0f));
 
-            DisplayXRGizmoHelpers.GetEyeWorldPositions(
+            DisplayXRGizmoHelpers.GetDisplayCentricEyes(
                 transform, info,
                 ipdFactor, parallaxFactor, perspectiveFactor,
-                cameraCentric: false,
+                virtualDisplayHeight,
                 out Vector3 leftEye, out Vector3 rightEye, out bool isLive);
 
             var cam = m_Camera != null ? m_Camera : GetComponent<Camera>();

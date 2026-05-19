@@ -250,10 +250,9 @@ namespace DisplayXR
             Vector3 cTR = transform.TransformPoint(new Vector3(+hw, +hh, convergenceDist));
             Vector3 cTL = transform.TransformPoint(new Vector3(-hw, +hh, convergenceDist));
 
-            DisplayXRGizmoHelpers.GetEyeWorldPositions(
+            DisplayXRGizmoHelpers.GetCameraCentricEyes(
                 transform, info,
-                ipdFactor, parallaxFactor, perspectiveFactor: 1f,
-                cameraCentric: true,
+                ipdFactor, parallaxFactor,
                 out Vector3 leftEye, out Vector3 rightEye, out bool isLive);
 
             Color frustumColor = Color.magenta;
