@@ -116,6 +116,11 @@ namespace DisplayXR
             // first frame — guard against that to avoid drawing eyes at the
             // display origin.
             if (rawLeft == Vector3.zero && rawRight == Vector3.zero) return false;
+            // Some runtimes report a single head-center pose for both eyes
+            // before per-eye tracking kicks in. Treat that as "no live IPD
+            // separation" and fall back to the nominal pair so the user can
+            // still see two distinct ray origins.
+            if ((rawLeft - rawRight).sqrMagnitude < 1e-8f) return false;
             return true;
         }
 
@@ -166,17 +171,20 @@ namespace DisplayXR
         // -----------------------------------------------------------------
 
         /// <summary>
-        /// Resolve world-space eye positions for the rig.
-        /// cameraCentric=false → DisplayXRDisplay: absolute Kooima eye in
-        /// display space, transformed by rig (which is the display).
-        /// cameraCentric=true → DisplayXRCamera: displacement of Kooima eye
-        /// from nominal eye, applied as a rig-local offset around the camera.
+        /// Display-centric world placement. Mirrors the native
+        /// display3d_compute_view pipeline (display3d_view.c:280-298):
+        /// applies anisotropic eye corrections (ax = sy/sx, az = sy/sz),
+        /// then m2v_effective = vdh / (sy * display_height_m) so eyes
+        /// scale to virtual-display space. Uses rig.position + rig.rotation
+        /// (NOT TransformPoint) because the runtime folds lossyScale into
+        /// m2v via /sy — using TransformPoint would multiply by sy on top
+        /// of that, producing sy^2 scaling.
         /// </summary>
-        public static void GetEyeWorldPositions(
+        public static void GetDisplayCentricEyes(
             Transform rig,
             DisplayXRDisplayInfo info,
             float ipdFactor, float parallaxFactor, float perspectiveFactor,
-            bool cameraCentric,
+            float virtualDisplayHeight,
             out Vector3 leftWorld, out Vector3 rightWorld, out bool isLive)
         {
             isLive = TryGetLiveEyesOpenXR(out Vector3 rawL, out Vector3 rawR);
@@ -189,23 +197,72 @@ namespace DisplayXR
                 ipdFactor, parallaxFactor, perspectiveFactor,
                 out Vector3 kooimaL, out Vector3 kooimaR);
 
-            Vector3 placeL, placeR;
-            if (cameraCentric)
-            {
-                NominalEyesOpenXR(info, out Vector3 nomL, out Vector3 nomR);
-                placeL = kooimaL - nomL;
-                placeR = kooimaR - nomR;
-            }
-            else
-            {
-                placeL = kooimaL;
-                placeR = kooimaR;
-            }
+            // Scale-as-zoom: vdh /= sy (matches displayxr_hooks.cpp:447).
+            // Anisotropic per-axis corrections so non-uniform rig scale still
+            // produces consistent geometry (matches lines 451-470).
+            float sx = SafeAbs(rig.lossyScale.x);
+            float sy = SafeAbs(rig.lossyScale.y);
+            float sz = SafeAbs(rig.lossyScale.z);
+            float vdh = virtualDisplayHeight > 0f
+                ? virtualDisplayHeight
+                : (info.isValid ? info.displayHeightMeters : 0.2f);
+            float ph = info.isValid ? info.displayHeightMeters : 0.2f;
+            float ax = sy / sx;
+            float az = sy / sz;
+            float m2v = (vdh / sy) / ph;
 
-            // OpenXR (right-hand, -Z forward) → Unity local (left-hand, +Z fwd):
-            // flip Z. Then TransformPoint to pick up rig pose + lossyScale.
-            leftWorld = rig.TransformPoint(new Vector3(placeL.x, placeL.y, -placeL.z));
-            rightWorld = rig.TransformPoint(new Vector3(placeR.x, placeR.y, -placeR.z));
+            Vector3 placeL = ApplyAnisoAndM2v(kooimaL, ax, az, m2v);
+            Vector3 placeR = ApplyAnisoAndM2v(kooimaR, ax, az, m2v);
+
+            // OpenXR (right-hand, -Z forward) → Unity local (left-hand, +Z fwd).
+            // Apply rotation and position ONLY — scale is already folded in
+            // via m2v above. TransformPoint would re-multiply by lossyScale.
+            leftWorld = rig.position + rig.rotation * new Vector3(placeL.x, placeL.y, -placeL.z);
+            rightWorld = rig.position + rig.rotation * new Vector3(placeR.x, placeR.y, -placeR.z);
+        }
+
+        /// <summary>
+        /// Camera-centric world placement. Eyes are at the rig (camera)
+        /// position plus the Kooima-vs-nominal displacement, mapped through
+        /// rig pose. TransformPoint here matches camera3d_view.c which
+        /// multiplies eye_raw by scene scale before the rotation.
+        /// </summary>
+        public static void GetCameraCentricEyes(
+            Transform rig,
+            DisplayXRDisplayInfo info,
+            float ipdFactor, float parallaxFactor,
+            out Vector3 leftWorld, out Vector3 rightWorld, out bool isLive)
+        {
+            isLive = TryGetLiveEyesOpenXR(out Vector3 rawL, out Vector3 rawR);
+            if (!isLive)
+                NominalEyesOpenXR(info, out rawL, out rawR);
+
+            float nominalZ = info.isValid ? info.nominalViewerZ : NOMINAL_VIEWER_Z_FALLBACK;
+            ApplyKooimaEyeFactors(
+                rawL, rawR, nominalZ,
+                ipdFactor, parallaxFactor, perspectiveFactor: 1f,
+                out Vector3 kooimaL, out Vector3 kooimaR);
+
+            NominalEyesOpenXR(info, out Vector3 nomL, out Vector3 nomR);
+            Vector3 dL = kooimaL - nomL;
+            Vector3 dR = kooimaR - nomR;
+
+            leftWorld = rig.TransformPoint(new Vector3(dL.x, dL.y, -dL.z));
+            rightWorld = rig.TransformPoint(new Vector3(dR.x, dR.y, -dR.z));
+        }
+
+        static float SafeAbs(float v)
+        {
+            float a = Mathf.Abs(v);
+            return a < 0.001f ? 1f : a;
+        }
+
+        static Vector3 ApplyAnisoAndM2v(Vector3 eye, float ax, float az, float m2v)
+        {
+            return new Vector3(
+                eye.x * ax * m2v,
+                eye.y * m2v,
+                eye.z * az * m2v);
         }
 
         // -----------------------------------------------------------------
