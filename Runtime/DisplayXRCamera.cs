@@ -202,6 +202,9 @@ namespace DisplayXR
             DrawGizmosImpl();
         }
 
+        // Cached per-rig scratch buffer for N-view eye positions.
+        Vector3[] m_GizmoEyes;
+
         void DrawGizmosImpl()
         {
             DisplayXRDisplayInfo info = DisplayXRFeature.Instance != null
@@ -250,10 +253,13 @@ namespace DisplayXR
             Vector3 cTR = transform.TransformPoint(new Vector3(+hw, +hh, convergenceDist));
             Vector3 cTL = transform.TransformPoint(new Vector3(-hw, +hh, convergenceDist));
 
-            DisplayXRGizmoHelpers.GetCameraCentricEyes(
+            if (m_GizmoEyes == null)
+                m_GizmoEyes = new Vector3[DisplayXRGizmoHelpers.MAX_VIEWS];
+
+            int count = DisplayXRGizmoHelpers.GetCameraCentricEyesWorld(
                 transform, info,
                 ipdFactor, parallaxFactor,
-                out Vector3 leftEye, out Vector3 rightEye, out bool isLive);
+                m_GizmoEyes, out bool isLive);
 
             Color frustumColor = Color.magenta;
             Color eyeColor = isLive ? DisplayXRGizmoHelpers.EyeGlyphLive
@@ -262,10 +268,14 @@ namespace DisplayXR
             float farDist = 5f * Mathf.Max(w, h);
             if (cam != null) farDist = Mathf.Min(farDist, cam.farClipPlane);
 
-            DisplayXRGizmoHelpers.DrawAsymmetricFrustum(leftEye, cBL, cBR, cTR, cTL, farDist, frustumColor);
-            DisplayXRGizmoHelpers.DrawAsymmetricFrustum(rightEye, cBL, cBR, cTR, cTL, farDist, frustumColor);
-            DisplayXRGizmoHelpers.DrawEyeGlyph(leftEye, transform.rotation, 0.015f, eyeColor);
-            DisplayXRGizmoHelpers.DrawEyeGlyph(rightEye, transform.rotation, 0.015f, eyeColor);
+            for (int i = 0; i < count; i++)
+            {
+                Vector3 eye = m_GizmoEyes[i];
+                DisplayXRGizmoHelpers.DrawAsymmetricFrustum(
+                    eye, cBL, cBR, cTR, cTL, farDist, frustumColor);
+                DisplayXRGizmoHelpers.DrawEyeGlyph(
+                    eye, transform.rotation, 0.015f, eyeColor);
+            }
         }
 #endif
     }

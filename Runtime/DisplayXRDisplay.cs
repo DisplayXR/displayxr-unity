@@ -200,12 +200,12 @@ namespace DisplayXR
             DrawGizmosImpl();
         }
 
+        // Cached per-rig scratch buffer for N-view eye positions; reused
+        // each gizmo callback to avoid per-frame allocations.
+        Vector3[] m_GizmoEyes;
+
         void DrawGizmosImpl()
         {
-            // Prefer the runtime's pushed display info; fall back to a direct
-            // native read so the gizmo works in Edit Mode preview where
-            // DisplayXRFeature.Instance is null but the preview session has
-            // still written into the native ring.
             DisplayXRDisplayInfo info = DisplayXRFeature.Instance != null
                 ? DisplayXRFeature.Instance.DisplayInfo
                 : DisplayXRGizmoHelpers.ReadDisplayInfoFromNative();
@@ -217,8 +217,8 @@ namespace DisplayXR
                 ? info.displayWidthMeters * (h / info.displayHeightMeters)
                 : h * 1.5f;
 
-            // Light-blue virtual display volume (restored to match the
-            // pre-#111 OnDrawGizmosSelected aesthetic).
+            // Light-blue virtual display volume (preserves the pre-#111
+            // OnDrawGizmosSelected aesthetic).
             Gizmos.matrix = transform.localToWorldMatrix;
             Gizmos.color = new Color(0.2f, 0.8f, 1.0f, 0.3f);
             Gizmos.DrawCube(Vector3.zero, new Vector3(w, h, 0.002f));
@@ -233,11 +233,14 @@ namespace DisplayXR
             Vector3 cTR = transform.TransformPoint(new Vector3(+hw, +hh, 0f));
             Vector3 cTL = transform.TransformPoint(new Vector3(-hw, +hh, 0f));
 
-            DisplayXRGizmoHelpers.GetDisplayCentricEyes(
+            if (m_GizmoEyes == null)
+                m_GizmoEyes = new Vector3[DisplayXRGizmoHelpers.MAX_VIEWS];
+
+            int count = DisplayXRGizmoHelpers.GetDisplayCentricEyesWorld(
                 transform, info,
                 ipdFactor, parallaxFactor, perspectiveFactor,
                 virtualDisplayHeight,
-                out Vector3 leftEye, out Vector3 rightEye, out bool isLive);
+                m_GizmoEyes, out bool isLive);
 
             var cam = m_Camera != null ? m_Camera : GetComponent<Camera>();
             Color frustumColor = Color.magenta;
@@ -250,10 +253,14 @@ namespace DisplayXR
             float farDist = 5f * Mathf.Max(w, h);
             if (cam != null) farDist = Mathf.Min(farDist, cam.farClipPlane);
 
-            DisplayXRGizmoHelpers.DrawAsymmetricFrustum(leftEye, cBL, cBR, cTR, cTL, farDist, frustumColor);
-            DisplayXRGizmoHelpers.DrawAsymmetricFrustum(rightEye, cBL, cBR, cTR, cTL, farDist, frustumColor);
-            DisplayXRGizmoHelpers.DrawEyeGlyph(leftEye, transform.rotation, 0.015f, eyeColor);
-            DisplayXRGizmoHelpers.DrawEyeGlyph(rightEye, transform.rotation, 0.015f, eyeColor);
+            for (int i = 0; i < count; i++)
+            {
+                Vector3 eye = m_GizmoEyes[i];
+                DisplayXRGizmoHelpers.DrawAsymmetricFrustum(
+                    eye, cBL, cBR, cTR, cTL, farDist, frustumColor);
+                DisplayXRGizmoHelpers.DrawEyeGlyph(
+                    eye, transform.rotation, 0.015f, eyeColor);
+            }
         }
 #endif
     }

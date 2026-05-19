@@ -199,6 +199,27 @@ DISPLAYXR_EXPORT void displayxr_standalone_get_current_mode_info(
     float *view_scale_x, float *view_scale_y,
     int *hardware_display_3d);
 
+/// Get per-view eye positions from the standalone preview's last
+/// xrLocateViews call. Unlike displayxr_standalone_get_eye_positions
+/// (2-eye L/R helper, kept for back-compat with existing C# bindings),
+/// this surfaces all N view positions the preview session received
+/// from xrLocateViews — viewCount = 2 for standard 3D, 4 for quad,
+/// 8 for lenticular, etc.
+///
+/// Positions are in LOCAL space (display-relative, OpenXR right-hand
+/// −Z forward), packed as float[capacity*3] = (x0,y0,z0, x1,y1,z1, …).
+/// Output count is min(located_view_count, capacity).
+///
+/// @param out_xyz_array   Output buffer, capacity*3 floats.
+/// @param capacity        Max views the caller can hold.
+/// @param out_count       Actual view count written (may be 0).
+/// @param out_tracked     1 if the last locateViews tracked, 0 otherwise.
+DISPLAYXR_EXPORT void displayxr_standalone_get_n_eye_positions(
+    float *out_xyz_array,
+    uint32_t capacity,
+    uint32_t *out_count,
+    int32_t *out_tracked);
+
 // ============================================================================
 // Display mode switching
 // ============================================================================

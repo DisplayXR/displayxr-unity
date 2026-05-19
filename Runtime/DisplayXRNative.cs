@@ -426,6 +426,23 @@ namespace DisplayXR
             out float viewScaleX, out float viewScaleY,
             out int hardwareDisplay3D);
 
+        /// <summary>
+        /// Per-view eye positions from the standalone preview's last
+        /// xrLocateViews call. Surfaces all N positions (2 for standard 3D,
+        /// 4 for quad / sim-display quad mode, 8 for lenticular, etc.) —
+        /// the 2-eye displayxr_standalone_get_eye_positions only returns
+        /// the first two.
+        ///
+        /// Positions packed as float[capacity*3] = (x0,y0,z0, x1,y1,z1, …)
+        /// in OpenXR display-relative space (right-hand, −Z forward).
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void displayxr_standalone_get_n_eye_positions(
+            [MarshalAs(UnmanagedType.LPArray)] float[] outXyzArray,
+            uint capacity,
+            out uint outCount,
+            out int outTracked);
+
         // ====================================================================
         // Standalone tunables + display pose
         // ====================================================================
