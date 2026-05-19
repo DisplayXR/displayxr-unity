@@ -182,10 +182,25 @@ namespace DisplayXR
         }
 
 #if UNITY_EDITOR
-        // OnDrawGizmos (not OnDrawGizmosSelected) so multi-rig scenes show
-        // every rig at once with the active rig highlighted and others dimmed.
-        // Toggle off per-component via Unity's Scene-view Gizmos dropdown.
+        // Gating: selection-driven in plain Edit Mode; active-rig-only when
+        // a DisplayXR session is alive (preview window running, or Play Mode
+        // with the XR loader). The two are mutually exclusive — exactly one
+        // entry point draws per frame.
         void OnDrawGizmos()
+        {
+            if (!DisplayXRGizmoHelpers.IsSessionActive()) return;
+            var cam = m_Camera != null ? m_Camera : GetComponent<Camera>();
+            if (cam == null || DisplayXRRigManager.ActiveCamera != cam) return;
+            DrawGizmosImpl();
+        }
+
+        void OnDrawGizmosSelected()
+        {
+            if (DisplayXRGizmoHelpers.IsSessionActive()) return;
+            DrawGizmosImpl();
+        }
+
+        void DrawGizmosImpl()
         {
             // Prefer the runtime's pushed display info; fall back to a direct
             // native read so the gizmo works in Edit Mode preview where
@@ -202,6 +217,15 @@ namespace DisplayXR
                 ? info.displayWidthMeters * (h / info.displayHeightMeters)
                 : h * 1.5f;
 
+            // Light-blue virtual display volume (restored to match the
+            // pre-#111 OnDrawGizmosSelected aesthetic).
+            Gizmos.matrix = transform.localToWorldMatrix;
+            Gizmos.color = new Color(0.2f, 0.8f, 1.0f, 0.3f);
+            Gizmos.DrawCube(Vector3.zero, new Vector3(w, h, 0.002f));
+            Gizmos.color = new Color(0.2f, 0.8f, 1.0f, 0.8f);
+            Gizmos.DrawWireCube(Vector3.zero, new Vector3(w, h, 0.002f));
+            Gizmos.matrix = Matrix4x4.identity;
+
             float hw = w * 0.5f;
             float hh = h * 0.5f;
             Vector3 cBL = transform.TransformPoint(new Vector3(-hw, -hh, 0f));
@@ -216,29 +240,18 @@ namespace DisplayXR
                 out Vector3 leftEye, out Vector3 rightEye, out bool isLive);
 
             var cam = m_Camera != null ? m_Camera : GetComponent<Camera>();
-            bool isActive = cam != null && DisplayXRRigManager.ActiveCamera == cam;
-            float alpha = isActive ? 1f : 0.3f;
-
-            Color rectColor = DisplayXRGizmoHelpers.Dimmed(
-                DisplayXRGizmoHelpers.DisplayRectActive, alpha);
-            Color leftColor = DisplayXRGizmoHelpers.Dimmed(
-                DisplayXRGizmoHelpers.FrustumLeftActive, alpha);
-            Color rightColor = DisplayXRGizmoHelpers.Dimmed(
-                DisplayXRGizmoHelpers.FrustumRightActive, alpha);
-            Color eyeColor = DisplayXRGizmoHelpers.Dimmed(
-                isLive ? DisplayXRGizmoHelpers.EyeGlyphLive
-                       : DisplayXRGizmoHelpers.EyeGlyphNominal,
-                alpha);
+            Color frustumColor = Color.magenta;
+            Color eyeColor = isLive ? DisplayXRGizmoHelpers.EyeGlyphLive
+                                    : DisplayXRGizmoHelpers.EyeGlyphNominal;
 
             // Far distance for the truncated pyramid. Camera.farClipPlane
-            // defaults to 1000m which fills the entire scene — clamp to a
+            // defaults to 1000 m which fills the entire scene — clamp to a
             // few display-widths so the gizmo stays legible.
             float farDist = 5f * Mathf.Max(w, h);
             if (cam != null) farDist = Mathf.Min(farDist, cam.farClipPlane);
 
-            DisplayXRGizmoHelpers.DrawDisplayRect(cBL, cBR, cTR, cTL, rectColor);
-            DisplayXRGizmoHelpers.DrawAsymmetricFrustum(leftEye, cBL, cBR, cTR, cTL, farDist, leftColor);
-            DisplayXRGizmoHelpers.DrawAsymmetricFrustum(rightEye, cBL, cBR, cTR, cTL, farDist, rightColor);
+            DisplayXRGizmoHelpers.DrawAsymmetricFrustum(leftEye, cBL, cBR, cTR, cTL, farDist, frustumColor);
+            DisplayXRGizmoHelpers.DrawAsymmetricFrustum(rightEye, cBL, cBR, cTR, cTL, farDist, frustumColor);
             DisplayXRGizmoHelpers.DrawEyeGlyph(leftEye, transform.rotation, 0.015f, eyeColor);
             DisplayXRGizmoHelpers.DrawEyeGlyph(rightEye, transform.rotation, 0.015f, eyeColor);
         }
