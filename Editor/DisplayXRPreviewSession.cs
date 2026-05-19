@@ -669,7 +669,7 @@ namespace DisplayXR.Editor
 
         public static CameraEntry[] DiscoverCameras()
         {
-            var cameras = UnityEngine.Object.FindObjectsByType<Camera>(FindObjectsInactive.Exclude);
+            var cameras = UnityEngine.Object.FindObjectsByType<Camera>(FindObjectsInactive.Exclude, FindObjectsSortMode.None);
             var entries = new List<CameraEntry>();
 
             foreach (var cam in cameras)
@@ -716,7 +716,7 @@ namespace DisplayXR.Editor
             s_SelectedSourceCamera = cam;
             if (cam != null)
             {
-                SessionState.SetString(kSelectedCameraIDKey, cam.GetEntityId().ToString());
+                SessionState.SetString(kSelectedCameraIDKey, cam.GetInstanceID().ToString());
                 SessionState.SetString(kSelectedCameraNameKey, cam.gameObject.name);
             }
             else
@@ -734,13 +734,11 @@ namespace DisplayXR.Editor
 
         public static void RestoreSelection()
         {
-            // 1. Try EntityId (precise, survives assembly reload in Edit Mode)
+            // 1. Try InstanceID (precise, survives assembly reload in Edit Mode)
             string savedID = SessionState.GetString(kSelectedCameraIDKey, "");
             if (!string.IsNullOrEmpty(savedID) && int.TryParse(savedID, out int id) && id != 0)
             {
-#pragma warning disable CS0618 // EntityId int cast — no non-deprecated constructor available yet
-                var obj = EditorUtility.EntityIdToObject((EntityId)id) as Camera;
-#pragma warning restore CS0618
+                var obj = EditorUtility.InstanceIDToObject(id) as Camera;
                 if (obj != null)
                 {
                     s_SelectedSourceCamera = obj;
@@ -749,7 +747,7 @@ namespace DisplayXR.Editor
                 }
             }
 
-            // 2. Try camera name (survives Play Mode domain reload where EntityId is invalidated)
+            // 2. Try camera name (survives Play Mode domain reload where InstanceID is invalidated)
             string savedName = SessionState.GetString(kSelectedCameraNameKey, "");
             if (!string.IsNullOrEmpty(savedName))
             {
@@ -785,7 +783,7 @@ namespace DisplayXR.Editor
 
             if (s_SelectedSourceCamera != null)
             {
-                SessionState.SetString(kSelectedCameraIDKey, s_SelectedSourceCamera.GetEntityId().ToString());
+                SessionState.SetString(kSelectedCameraIDKey, s_SelectedSourceCamera.GetInstanceID().ToString());
                 SessionState.SetString(kSelectedCameraNameKey, s_SelectedSourceCamera.gameObject.name);
                 ApplyCameraSelection();
             }

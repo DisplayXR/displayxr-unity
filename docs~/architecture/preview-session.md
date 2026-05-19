@@ -46,7 +46,7 @@ When the user presses Play with the preview running:
 1. **ExitingEditMode:** Disable Unity's XR loader (`TryRemoveLoader`), save `PlayModeStartedKey = IsRunning`
 2. **Domain reload:** `OnBeforeAssemblyReload` → `Stop()` (statics wiped, native session stopped)
 3. **EnteredPlayMode:** Read `PlayModeStartedKey` from SessionState → `Start()` → `RestoreSelection()`
-4. **Camera restore:** Try EntityId (fails after domain reload) → try camera name → fallback to first rig
+4. **Camera restore:** Try InstanceID (fails after domain reload) → try camera name → fallback to first rig
 5. **ExitingPlayMode:** `Stop()`, clear flag
 6. **EnteredEditMode:** Re-enable XR loader (`TryAddLoader`), focus Scene View
 
