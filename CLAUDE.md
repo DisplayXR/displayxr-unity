@@ -311,6 +311,8 @@ All three pin the plugin via `https://github.com/DisplayXR/displayxr-unity.git#u
 
 Each test repo also has its own `CLAUDE.md` describing its scene, scripts, and which plugin features it exercises — designed so an agent can work in the test repo without loading the plugin's context.
 
+**Releases ship as NSIS installers, not zips** (per issue #108). Each test repo has an `installer/` dir with a `.nsi` + `build-installer.bat` that mirrors the [`displayxr-demo-gaussiansplat`](https://github.com/DisplayXR/displayxr-demo-gaussiansplat) pattern: hard-prereqs the runtime, installs the Unity Player under `Program Files\DisplayXR\Unity\<Variant>\`, and drops a registered-mode `.displayxr.json` manifest + icons under `%ProgramData%\DisplayXR\apps\` so the DisplayXR Shell launcher discovers the app as a tile. Build flow is manual today: build the Unity Player from the editor, run `installer\build-installer.bat`, attach the resulting `.exe` to a GitHub Release via `gh release create`. CI automation is a follow-up (blocked on Unity license activation in CI). The transparent installer pins `MIN_RUNTIME_VERSION=1.7.0` (needs `XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND` on D3D11); the other two pin `1.5.0`.
+
 #### Where to launch Claude Code when working on the test repos
 
 - **Test-only work** (tweak a scene, polish a test-repo script, fix a test-repo bug) → launch from the test repo directly. Its `CLAUDE.md` auto-loads with focused context, git ops target the right repo by default, smaller context is cheaper and faster. The plugin's installed source is still readable at `Library/PackageCache/com.displayxr.unity@<hash>/` if a grep into plugin internals is needed.
