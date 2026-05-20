@@ -149,17 +149,41 @@ public:
 		er = real_enumerate_rendering_modes(session, total, &total, rendering_modes);
 		if (XR_FAILED(er)) return;
 		rendering_mode_count = total;
-		// Pick first hardware_display_3d mode as default; fall back to mode 0.
-		bool picked = false;
+
+		// Find currently-active mode (v13 `isActive` field) and the first
+		// hardware_display_3d candidate.
+		uint32_t active_idx = 0;
+		bool active_is_3d = false;
+		uint32_t first_3d_idx = 0;
+		bool found_3d = false;
 		for (uint32_t i = 0; i < total; i++) {
-			if (rendering_modes[i].hardwareDisplay3D) {
-				current_rendering_mode_index = rendering_modes[i].modeIndex;
-				picked = true;
-				break;
+			if (rendering_modes[i].isActive) {
+				active_idx = rendering_modes[i].modeIndex;
+				active_is_3d = rendering_modes[i].hardwareDisplay3D;
+			}
+			if (!found_3d && rendering_modes[i].hardwareDisplay3D &&
+			    rendering_modes[i].isRequestable) {
+				first_3d_idx = rendering_modes[i].modeIndex;
+				found_3d = true;
 			}
 		}
-		if (!picked && total > 0)
-			current_rendering_mode_index = rendering_modes[0].modeIndex;
+
+		// If the runtime started us in 2D (mode 0 is the default since
+		// DisplayXR/displayxr-runtime#112), switch to the first 3D mode so
+		// the DP weaves instead of force-passing-through. Matches what the
+		// standalone preview does when a rig camera is selected. Respect
+		// any 3D mode the user pre-selected (e.g. SIM_DISPLAY_OUTPUT env
+		// var, workspace override) — only intervene when active is 2D.
+		if (!active_is_3d && found_3d && real_request_rendering_mode != nullptr) {
+			XrResult r = real_request_rendering_mode(session, first_3d_idx);
+			if (XR_SUCCEEDED(r)) {
+				current_rendering_mode_index = first_3d_idx;
+			} else {
+				current_rendering_mode_index = active_idx;
+			}
+		} else {
+			current_rendering_mode_index = active_idx;
+		}
 	}
 	virtual XrResult request_rendering_mode(XrSession session, uint32_t modeIndex)
 	{

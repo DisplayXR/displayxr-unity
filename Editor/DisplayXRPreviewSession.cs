@@ -264,6 +264,15 @@ namespace DisplayXR.Editor
                 CreateRenderRig();
                 CreateAtlasBridge();
                 DisplayXRGameViewOverlay.AtlasTexture = s_AtlasRT;
+                // Runtime defaults to mode 0 (2D, see DisplayXR/displayxr-runtime
+                // #112). When a rig camera is the active selection, bump to the
+                // first 3D mode so the runtime preview window shows woven output
+                // instead of single-tile passthrough. Mirrors the dropdown
+                // auto-switch in DisplayXRPreviewWindow.cs.
+                if (GetSelectedCameraCategory() != CameraCategory.RegularCamera)
+                {
+                    DisplayXRNative.displayxr_standalone_request_rendering_mode(1);
+                }
                 return true;
             }
 

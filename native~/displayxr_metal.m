@@ -202,3 +202,32 @@ displayxr_get_app_main_view(void)
 		return NULL;
 	}
 }
+
+int
+displayxr_metal_get_app_window_rect(int32_t *out_x, int32_t *out_y,
+                                     uint32_t *out_w, uint32_t *out_h)
+{
+	if (s_overlay_view == nil) {
+		if (out_x) *out_x = 0;
+		if (out_y) *out_y = 0;
+		if (out_w) *out_w = 0;
+		if (out_h) *out_h = 0;
+		return 0;
+	}
+	NSWindow *window = [s_overlay_view window];
+	if (window == nil) {
+		if (out_x) *out_x = 0;
+		if (out_y) *out_y = 0;
+		if (out_w) *out_w = 0;
+		if (out_h) *out_h = 0;
+		return 0;
+	}
+	NSRect frame = [window frame];
+	NSRect content = [window contentRectForFrameRect:frame];
+	CGFloat scale = [window backingScaleFactor];
+	if (out_x) *out_x = (int32_t)(content.origin.x * scale);
+	if (out_y) *out_y = (int32_t)(content.origin.y * scale);
+	if (out_w) *out_w = (uint32_t)(content.size.width * scale);
+	if (out_h) *out_h = (uint32_t)(content.size.height * scale);
+	return 1;
+}
