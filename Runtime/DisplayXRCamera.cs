@@ -265,16 +265,16 @@ namespace DisplayXR
             Color eyeColor = isLive ? DisplayXRGizmoHelpers.EyeGlyphLive
                                     : DisplayXRGizmoHelpers.EyeGlyphNominal;
 
-            float farDist = 5f * Mathf.Max(w, h);
-            if (cam != null) farDist = Mathf.Min(farDist, cam.farClipPlane);
+            float nearDist = cam != null ? cam.nearClipPlane : 0.3f;
+            float farDist = cam != null ? cam.farClipPlane : 1000f;
 
             for (int i = 0; i < count; i++)
             {
                 Vector3 eye = m_GizmoEyes[i];
                 DisplayXRGizmoHelpers.DrawAsymmetricFrustum(
-                    eye, cBL, cBR, cTR, cTL, farDist, frustumColor);
+                    eye, cBL, cBR, cTR, cTL, nearDist, farDist, frustumColor);
                 DisplayXRGizmoHelpers.DrawEyeGlyph(
-                    eye, transform.rotation, 0.03f, eyeColor);
+                    eye, transform.rotation, 0.05f, eyeColor);
             }
         }
 #endif

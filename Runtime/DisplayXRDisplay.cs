@@ -247,19 +247,19 @@ namespace DisplayXR
             Color eyeColor = isLive ? DisplayXRGizmoHelpers.EyeGlyphLive
                                     : DisplayXRGizmoHelpers.EyeGlyphNominal;
 
-            // Far distance for the truncated pyramid. Camera.farClipPlane
-            // defaults to 1000 m which fills the entire scene — clamp to a
-            // few display-widths so the gizmo stays legible.
-            float farDist = 5f * Mathf.Max(w, h);
-            if (cam != null) farDist = Mathf.Min(farDist, cam.farClipPlane);
+            // Near + far come straight from the camera. The frustum helper
+            // clamps far internally so we don't fill the whole scene at
+            // farClipPlane = 1000 m.
+            float nearDist = cam != null ? cam.nearClipPlane : 0.3f;
+            float farDist = cam != null ? cam.farClipPlane : 1000f;
 
             for (int i = 0; i < count; i++)
             {
                 Vector3 eye = m_GizmoEyes[i];
                 DisplayXRGizmoHelpers.DrawAsymmetricFrustum(
-                    eye, cBL, cBR, cTR, cTL, farDist, frustumColor);
+                    eye, cBL, cBR, cTR, cTL, nearDist, farDist, frustumColor);
                 DisplayXRGizmoHelpers.DrawEyeGlyph(
-                    eye, transform.rotation, 0.03f, eyeColor);
+                    eye, transform.rotation, 0.05f, eyeColor);
             }
         }
 #endif

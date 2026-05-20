@@ -351,37 +351,81 @@ namespace DisplayXR
         // -----------------------------------------------------------------
 
         /// <summary>
-        /// Asymmetric (Kooima) frustum: eye → 4 display corners, plus a far
-        /// quad along each eye→corner ray (extrapolated past the display
-        /// plane). farDistanceFromEye is measured from the eye.
+        /// Asymmetric (Kooima) frustum: per-eye truncated pyramid bounded by
+        /// the near, display, and far planes. The near and far planes are
+        /// parallel to the display plane (i.e. perpendicular to the display
+        /// normal) — NOT perpendicular to each eye-corner ray. Drawing them
+        /// along the rays would tilt them, which is incorrect for off-axis
+        /// projection.
+        ///
+        /// nearDist and farDist are perpendicular distances from the eye to
+        /// the near/far planes, in display-normal direction (i.e. world
+        /// meters along the display's forward axis). farDist is clamped to
+        /// keep the gizmo legible — the actual rendered far plane may sit
+        /// further out.
         /// </summary>
         public static void DrawAsymmetricFrustum(
             Vector3 eye,
             Vector3 cBL, Vector3 cBR, Vector3 cTR, Vector3 cTL,
-            float farDistanceFromEye, Color color)
+            float nearDist, float farDist,
+            Color color)
         {
-            Gizmos.color = color;
-            Gizmos.DrawLine(eye, cBL);
-            Gizmos.DrawLine(eye, cBR);
-            Gizmos.DrawLine(eye, cTR);
-            Gizmos.DrawLine(eye, cTL);
+            // Display plane center + normal. Normal flipped to point toward
+            // the eye if needed, so signedDist is positive.
+            Vector3 planeCenter = (cBL + cBR + cTR + cTL) * 0.25f;
+            Vector3 planeNormal = Vector3.Cross(cBR - cBL, cTL - cBL).normalized;
+            float signedDist = Vector3.Dot(eye - planeCenter, planeNormal);
+            if (signedDist < 0f)
+            {
+                planeNormal = -planeNormal;
+                signedDist = -signedDist;
+            }
+            float dDisp = signedDist;
+            if (dDisp < 1e-4f) return; // eye coplanar with display, degenerate
 
-            Vector3 fBL = ExtrapolateRay(eye, cBL, farDistanceFromEye);
-            Vector3 fBR = ExtrapolateRay(eye, cBR, farDistanceFromEye);
-            Vector3 fTR = ExtrapolateRay(eye, cTR, farDistanceFromEye);
-            Vector3 fTL = ExtrapolateRay(eye, cTL, farDistanceFromEye);
+            // Clamp so the frustum stays inside a reasonable visual envelope.
+            // Near stays in front of the display (between eye and display);
+            // far sits 1.5-3× display distance past the display.
+            float nSafe = Mathf.Clamp(nearDist, 0.001f, dDisp * 0.5f);
+            float fSafe = Mathf.Clamp(farDist, dDisp * 1.5f, dDisp * 3f);
+
+            float tN = nSafe / dDisp;
+            float tF = fSafe / dDisp;
+
+            Vector3 nBL = eye + tN * (cBL - eye);
+            Vector3 nBR = eye + tN * (cBR - eye);
+            Vector3 nTR = eye + tN * (cTR - eye);
+            Vector3 nTL = eye + tN * (cTL - eye);
+            Vector3 fBL = eye + tF * (cBL - eye);
+            Vector3 fBR = eye + tF * (cBR - eye);
+            Vector3 fTR = eye + tF * (cTR - eye);
+            Vector3 fTL = eye + tF * (cTL - eye);
+
+            Gizmos.color = color;
+
+            // Apex edges: eye → 4 near corners.
+            Gizmos.DrawLine(eye, nBL);
+            Gizmos.DrawLine(eye, nBR);
+            Gizmos.DrawLine(eye, nTR);
+            Gizmos.DrawLine(eye, nTL);
+
+            // Near plane rectangle.
+            Gizmos.DrawLine(nBL, nBR);
+            Gizmos.DrawLine(nBR, nTR);
+            Gizmos.DrawLine(nTR, nTL);
+            Gizmos.DrawLine(nTL, nBL);
+
+            // Connecting edges near → far (pass through the display plane).
+            Gizmos.DrawLine(nBL, fBL);
+            Gizmos.DrawLine(nBR, fBR);
+            Gizmos.DrawLine(nTR, fTR);
+            Gizmos.DrawLine(nTL, fTL);
+
+            // Far plane rectangle.
             Gizmos.DrawLine(fBL, fBR);
             Gizmos.DrawLine(fBR, fTR);
             Gizmos.DrawLine(fTR, fTL);
             Gizmos.DrawLine(fTL, fBL);
-        }
-
-        static Vector3 ExtrapolateRay(Vector3 origin, Vector3 through, float distance)
-        {
-            Vector3 dir = through - origin;
-            float len = dir.magnitude;
-            if (len < 1e-5f) return through;
-            return origin + dir * (distance / len);
         }
 
         public static void DrawEyeGlyph(
