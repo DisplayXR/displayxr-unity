@@ -108,6 +108,7 @@ namespace DisplayXR
                     out vc, out _, out _, out _, out _, out _, out _, out _);
             }
             catch (System.DllNotFoundException) { }
+            catch (System.EntryPointNotFoundException) { }
             int n = vc > 0 ? (int)vc : 2;
             if (n < 1) n = 1;
             if (n > MAX_VIEWS) n = MAX_VIEWS;
@@ -152,6 +153,7 @@ namespace DisplayXR
                 }
             }
             catch (System.DllNotFoundException) { }
+            catch (System.EntryPointNotFoundException) { }
 
             // 2) Unity hook chain (Play Mode XR loader): 2 eyes only.
             if (cap >= 2)
@@ -171,6 +173,7 @@ namespace DisplayXR
                     }
                 }
                 catch (System.DllNotFoundException) { }
+                catch (System.EntryPointNotFoundException) { }
             }
             return 0;
         }
