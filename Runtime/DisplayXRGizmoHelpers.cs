@@ -125,7 +125,13 @@ namespace DisplayXR
         /// −Z forward). Standalone preview path returns up to N; Unity
         /// hook chain (Play Mode) returns 2. Returns the number written;
         /// 0 if no live data is available or the data is degenerate
-        /// (all-zero, or L==R with N==2 — head-center-only sessions).
+        /// (all-zero, or L==R / all-same — head-center-only sessions).
+        ///
+        /// Does NOT gate on the tracked bit. sim_display is marked as
+        /// non-tracking but returns valid eye poses (runtime commit
+        /// e0cefdce0); gating on tracked would discard every gizmo update
+        /// in editor preview against sim_display. The degenerate-eye-set
+        /// check below catches all-zero / all-same fallbacks instead.
         /// </summary>
         public static int TryGetLiveRawEyes(Vector3[] eyesOut)
         {
@@ -138,8 +144,8 @@ namespace DisplayXR
             try
             {
                 DisplayXRNative.displayxr_standalone_get_n_eye_positions(
-                    s_NEyeBuf, (uint)cap, out uint outCount, out int outTracked);
-                if (outTracked != 0 && outCount > 0)
+                    s_NEyeBuf, (uint)cap, out uint outCount, out int _);
+                if (outCount > 0)
                 {
                     int n = (int)outCount;
                     for (int i = 0; i < n; i++)
@@ -156,6 +162,8 @@ namespace DisplayXR
             catch (System.EntryPointNotFoundException) { }
 
             // 2) Unity hook chain (Play Mode XR loader): 2 eyes only.
+            // Keep the tracked gate here — XR sessions can legitimately
+            // be in pre-tracked state and we don't want to draw stale data.
             if (cap >= 2)
             {
                 int tracked = 0;
