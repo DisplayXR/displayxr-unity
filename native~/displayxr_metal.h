@@ -24,6 +24,14 @@ void displayxr_metal_destroy_preview_window(void);
 /// @return NSView* cast to void*, or NULL if no window found.
 void *displayxr_get_app_main_view(void);
 
+/// Get the app's main window content rect in screen-coord backing pixels.
+/// Uses the same NSWindow as displayxr_get_app_main_view. Cocoa convention:
+/// origin is bottom-left of the primary screen, Y-up. Output is suitable for
+/// feeding into displayxr_set_viewport_size_native for window-relative Kooima.
+/// @return 1 if the rect is valid, 0 if no window is available.
+int displayxr_metal_get_app_window_rect(int32_t *out_x, int32_t *out_y,
+                                         uint32_t *out_w, uint32_t *out_h);
+
 /// Hooked-path Metal blit helper (issue #67).
 /// Same-format blit src → dst using a caller-provided MTLCommandQueue.
 /// Returns 1 on success. Differs from displayxr_sa_metal_blit by accepting

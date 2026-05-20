@@ -160,12 +160,17 @@ namespace DisplayXR.Editor
                 }
             }
 
-            // Camera selector dropdown
+            // Camera selector dropdown. EditorGUI.BeginChangeCheck/EndChangeCheck
+            // is the only correct way to detect a user-initiated change: comparing
+            // `newIdx != m_SelectedCameraIndex` fires spuriously when SyncCameraIndex
+            // or RefreshCameraList resets m_SelectedCameraIndex between OnGUI passes,
+            // which would then auto-toggle the rendering mode each frame.
             if (m_CameraNames != null && m_CameraNames.Length > 0)
             {
+                EditorGUI.BeginChangeCheck();
                 int newIdx = EditorGUILayout.Popup(m_SelectedCameraIndex, m_CameraNames,
                     EditorStyles.toolbarPopup, GUILayout.Width(150));
-                if (newIdx != m_SelectedCameraIndex && newIdx >= 0 && newIdx < m_CameraList.Length)
+                if (EditorGUI.EndChangeCheck() && newIdx >= 0 && newIdx < m_CameraList.Length)
                 {
                     m_SelectedCameraIndex = newIdx;
                     var entry = m_CameraList[newIdx];

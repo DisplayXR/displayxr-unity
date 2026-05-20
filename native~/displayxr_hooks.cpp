@@ -231,6 +231,20 @@ hooked_xrLocateViews(XrSession session,
 
 		}
 	}
+#elif defined(__APPLE__)
+	// macOS built apps: poll the overlay window's screen rect each frame so
+	// the window-relative Kooima math below sees the actual screen position.
+	// C# DisplayXRDisplay/DisplayXRCamera only know Screen.width/height and
+	// hard-code (0, 0) for the screen position; native is the only place
+	// that has the NSWindow handle. Mirror the Windows shell-mode pattern.
+	{
+		int32_t wx, wy;
+		uint32_t ww, wh;
+		if (displayxr_metal_get_app_window_rect(&wx, &wy, &ww, &wh) &&
+		    ww > 0 && wh > 0) {
+			displayxr_set_viewport_size_native(ww, wh, wx, wy);
+		}
+	}
 #endif
 
 	// Use our LOCAL space if available, otherwise pass through the original space.
