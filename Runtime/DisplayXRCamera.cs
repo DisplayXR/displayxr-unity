@@ -274,7 +274,7 @@ namespace DisplayXR
                 DisplayXRGizmoHelpers.DrawAsymmetricFrustum(
                     eye, cBL, cBR, cTR, cTL, farDist, frustumColor);
                 DisplayXRGizmoHelpers.DrawEyeGlyph(
-                    eye, transform.rotation, 0.015f, eyeColor);
+                    eye, transform.rotation, 0.03f, eyeColor);
             }
         }
 #endif

@@ -390,7 +390,11 @@ namespace DisplayXR
             Gizmos.color = color;
             var saved = Gizmos.matrix;
             Gizmos.matrix = Matrix4x4.TRS(pos, orient, Vector3.one);
-            Gizmos.DrawWireCube(Vector3.zero, Vector3.one * size);
+            // Filled sphere — the most readable marker at typical Scene-view
+            // zoom levels. The earlier wire-cube + forward-line combo at 1.5 cm
+            // was effectively invisible inside the converging frustum lines.
+            Gizmos.DrawSphere(Vector3.zero, size * 0.5f);
+            // Forward stub keeps orientation visible.
             Gizmos.DrawLine(Vector3.zero, new Vector3(0, 0, size * 2.0f));
             Gizmos.matrix = saved;
         }
