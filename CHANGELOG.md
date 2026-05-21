@@ -5,6 +5,21 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.3] - 2026-05-21
+
+### Added
+- Scene-view per-eye Kooima frustum gizmos for visualizing stereo projection in the editor. Extended to N views via standalone preview state, with display-centric m2v + scale-as-zoom applied and gating reworked so selection drives Edit Mode while the active rig drives preview. Includes filled-sphere eye glyphs (bumped to 3 cm) for visibility and accepts untracked-but-valid sim_display poses. (#111)
+
+### Fixed
+- macOS URP centering: N-view Kooima path now includes URP head-pose compensation so URP scenes render centered. (#115)
+- Play Mode default-to-2D + macOS window-relative Kooima in built apps.
+- Kooima frustum: near + far planes are now parallel to the display. (#111)
+- Stale native bundle: catch `EntryPointNotFoundException` so older binaries fail gracefully. (#111)
+- Guard hit-mask push for macOS compile. (#111)
+
+### Changed
+- Ship CI-built macOS bundle with N-view accessor. (#111)
+
 ## [1.7.2] - 2026-05-18
 
 ### Fixed
