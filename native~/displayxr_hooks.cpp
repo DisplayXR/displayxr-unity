@@ -99,6 +99,7 @@ PFN_xrCreateSession s_real_create_session = nullptr;
 PFN_xrDestroySession s_real_destroy_session = nullptr;
 PFN_xrEndFrame s_real_end_frame = nullptr;
 PFN_xrCreateReferenceSpace s_real_create_reference_space = nullptr;
+PFN_xrLocateSpace s_real_locate_space = nullptr; // URP head-pose comp (#115)
 volatile PFN_xrPollEvent s_real_poll_event = nullptr;
 PFN_xrDestroyInstance s_real_destroy_instance = nullptr;
 
@@ -170,6 +171,12 @@ static XrInstance s_instance = XR_NULL_HANDLE;
 static XrSession s_session = XR_NULL_HANDLE;
 XrSession displayxr_get_hooked_session() { return s_session; }
 static XrSpace s_local_space = XR_NULL_HANDLE;
+// Private VIEW reference space used solely for Unity URP head-pose compensation
+// in hooked_xrLocateViews. The runtime returns xrLocateSpace(s_view_space,
+// s_local_space) = the current head pose in LOCAL coords, which we add to
+// views[i].pose.position so Unity's URP "eye_world = pose - head_pose" math
+// resolves back to Kooima eye_world. See issue #115.
+static XrSpace s_view_space = XR_NULL_HANDLE;
 static volatile int s_session_alive = 0; // Guard for teardown
 static volatile int s_instance_alive = 0; // Guard for post-destroy polling
 
@@ -187,6 +194,12 @@ static volatile int s_stop_polling = 0; // Stop forwarding xrPollEvent after EXI
 static PFN_xrSetSharedTextureOutputRectEXT s_pfn_set_output_rect = nullptr;
 static int s_native_viewport_active = 0; // WM_SIZE (native) is authoritative source
 
+// Max view count handled by hooked_xrLocateViews. The DisplayXR runtime
+// advertises max-view-count across all render modes for the active display
+// (e.g. sim_display = 4 because of its quad mode; lenticular displays could
+// be 8+). Bump if a higher-N display ships. Matches DisplayXRGizmoHelpers
+// .MAX_VIEWS on the C# side so gizmo + native agree on the cap.
+#define DISPLAYXR_HOOKS_MAX_VIEWS 16
 
 // ============================================================================
 // Intercepted OpenXR functions
@@ -265,8 +278,25 @@ hooked_xrLocateViews(XrSession session,
 	if (count < 2) {
 		return result;
 	}
+	// Sim_display advertises max-view-count over all render modes (quad => 4),
+	// even in 2D / anaglyph where it replicates view 0 into the extras. We
+	// compute Kooima for all `count` views: replica raw eyes propagate to
+	// replica projections through the math automatically. URP reads each
+	// XRPass.GetProjMatrix from views[i].fov, so all of them must be set.
+	if (count > DISPLAYXR_HOOKS_MAX_VIEWS) {
+		static int s_clamp_warned = 0;
+		if (!s_clamp_warned) {
+			s_clamp_warned = 1;
+			displayxr_log("[DisplayXR] xrLocateViews: viewCount=%u exceeds "
+			              "DISPLAYXR_HOOKS_MAX_VIEWS=%d, clamping (extra views "
+			              "will keep runtime defaults)\n",
+			              count, DISPLAYXR_HOOKS_MAX_VIEWS);
+		}
+		count = DISPLAYXR_HOOKS_MAX_VIEWS;
+	}
 
-	// Cache raw eye positions for C# access (before any transforms)
+	// Cache L/R eye positions for C# eye-tracking queries (gizmo, debug UI).
+	// N-view tooling uses standalone preview state separately.
 	uint8_t tracked = (viewState->viewStateFlags & XR_VIEW_STATE_POSITION_TRACKED_BIT) != 0;
 	displayxr_state_set_eye_positions(&views[0].pose.position, &views[1].pose.position, tracked);
 
@@ -291,8 +321,10 @@ hooked_xrLocateViews(XrSession session,
 	// Delegate to canonical view libraries for IPD/parallax/Kooima.
 	// Raw eye positions and scene transform (camera/display pose) are passed
 	// to the libraries, matching the native test app's pipeline exactly.
-	XrVector3f raw_left = views[0].pose.position;
-	XrVector3f raw_right = views[1].pose.position;
+	XrVector3f raw_eyes[DISPLAYXR_HOOKS_MAX_VIEWS];
+	for (uint32_t i = 0; i < count; i++) {
+		raw_eyes[i] = views[i].pose.position;
+	}
 	XrVector3f nominal = {di->nominal_viewer_x, di->nominal_viewer_y, di->nominal_viewer_z};
 
 	// Window-relative Kooima (ADR-012): screen = actual window physical size,
@@ -316,10 +348,10 @@ hooked_xrLocateViews(XrSession session,
 #ifdef _WIN32
 		eyeOffY_h = -eyeOffY_h; // Win32 Y is top-down, eye coords are Y-up
 #endif
-		raw_left.x -= eyeOffX_h;
-		raw_left.y -= eyeOffY_h;
-		raw_right.x -= eyeOffX_h;
-		raw_right.y -= eyeOffY_h;
+		for (uint32_t i = 0; i < count; i++) {
+			raw_eyes[i].x -= eyeOffX_h;
+			raw_eyes[i].y -= eyeOffY_h;
+		}
 		nominal.x -= eyeOffX_h;
 		nominal.y -= eyeOffY_h;
 	}
@@ -371,12 +403,13 @@ hooked_xrLocateViews(XrSession session,
 		static int s_cam_log = 0;
 		if (s_cam_log++ % 60 == 0) {
 			displayxr_log( "[DisplayXR] CAM-CENTRIC: scene_pose=(%.3f,%.3f,%.3f) "
-			        "raw_L=(%.3f,%.3f,%.3f) raw_R=(%.3f,%.3f,%.3f) "
+			        "n=%u raw_L=(%.3f,%.3f,%.3f) raw_R=(%.3f,%.3f,%.3f) "
 			        "nominal=(%.3f,%.3f,%.3f) invd=%.4f half_tan_vfov=%.4f "
 			        "scale=(%.3f,%.3f,%.3f)\n",
 			        scene_pose.position.x, scene_pose.position.y, scene_pose.position.z,
-			        raw_left.x, raw_left.y, raw_left.z,
-			        raw_right.x, raw_right.y, raw_right.z,
+			        count,
+			        raw_eyes[0].x, raw_eyes[0].y, raw_eyes[0].z,
+			        raw_eyes[1].x, raw_eyes[1].y, raw_eyes[1].z,
 			        nominal.x, nominal.y, nominal.z,
 			        tunables.inv_convergence_distance,
 			        tunables.fov_override,
@@ -396,8 +429,7 @@ hooked_xrLocateViews(XrSession session,
 
 		cam_tunables.inv_convergence_distance = tunables.inv_convergence_distance / sz;
 
-		XrVector3f raw_eyes[2] = {raw_left, raw_right};
-		for (int i = 0; i < 2; i++) {
+		for (uint32_t i = 0; i < count; i++) {
 			raw_eyes[i].x *= sx;
 			raw_eyes[i].y *= sy;
 			raw_eyes[i].z *= sz;
@@ -407,23 +439,23 @@ hooked_xrLocateViews(XrSession session,
 		nominal.y *= sy;
 		nominal.z *= sz;
 
-		Camera3DView cam_views[2];
+		Camera3DView cam_views[DISPLAYXR_HOOKS_MAX_VIEWS];
 		camera3d_compute_views(
-			raw_eyes, 2,
+			raw_eyes, count,
 			&nominal, &screen, &cam_tunables,
 			&scene_pose,
 			tunables.near_z, tunables.far_z,
 			cam_views);
 
-		views[0].fov = cam_views[0].fov;
-		views[1].fov = cam_views[1].fov;
+		for (uint32_t i = 0; i < count; i++) {
+			views[i].fov = cam_views[i].fov;
+			views[i].pose.position = cam_views[i].eye_world;
+			views[i].pose.orientation = scene_pose.orientation;
+		}
 
-		views[0].pose.position = cam_views[0].eye_world;
-		views[1].pose.position = cam_views[1].eye_world;
-		views[0].pose.orientation = scene_pose.orientation;
-		views[1].pose.orientation = scene_pose.orientation;
-
-		// Store Kooima matrices for C# stereo override
+		// Store L/R Kooima matrices for the C# stereo override path used by
+		// BiRP (Camera.SetStereoProjectionMatrix). URP doesn't consume these —
+		// it reads each XRPass.GetProjMatrix from views[i].fov above.
 		DisplayXRStereoMatrices mats = {};
 		memcpy(mats.left_view, cam_views[0].view_matrix, sizeof(float) * 16);
 		memcpy(mats.left_projection, cam_views[0].projection_matrix, sizeof(float) * 16);
@@ -445,12 +477,13 @@ hooked_xrLocateViews(XrSession session,
 		if (s_disp_log++ % 60 == 0) {
 			displayxr_log("[DisplayXR] DISP-CENTRIC: scene_pose=(%.3f,%.3f,%.3f) "
 				"scale=(%.3f,%.3f,%.3f) vdh=%.3f cam_centric=%d "
-				"raw_L=(%.3f,%.3f,%.3f) raw_R=(%.3f,%.3f,%.3f)\n",
+				"n=%u raw_L=(%.3f,%.3f,%.3f) raw_R=(%.3f,%.3f,%.3f)\n",
 				scene_pose.position.x, scene_pose.position.y, scene_pose.position.z,
 				scene_xform.scale[0], scene_xform.scale[1], scene_xform.scale[2],
 				tunables.virtual_display_height, tunables.camera_centric,
-				raw_left.x, raw_left.y, raw_left.z,
-				raw_right.x, raw_right.y, raw_right.z);
+				count,
+				raw_eyes[0].x, raw_eyes[0].y, raw_eyes[0].z,
+				raw_eyes[1].x, raw_eyes[1].y, raw_eyes[1].z);
 		}
 
 		float sx = (scene_xform.scale[0] > 0.001f) ? scene_xform.scale[0] : 1.0f;
@@ -475,32 +508,33 @@ hooked_xrLocateViews(XrSession session,
 		disp_tunables.virtual_display_height = vdh;
 		disp_tunables.clip_at_display_plane = tunables.clip_at_display_plane;
 
-		XrVector3f raw_eyes[2] = {raw_left, raw_right};
-
-		// Anisotropic eye position corrections
-		for (int i = 0; i < 2; i++) {
+		// Anisotropic eye position corrections — apply to all N views.
+		// Replica raw eyes (views 2..N-1 in lower-N modes) stay replicas after
+		// scaling, so their computed projections also replicate view 0.
+		for (uint32_t i = 0; i < count; i++) {
 			raw_eyes[i].x *= ax;
 			raw_eyes[i].z *= az;
 		}
 
 		// Scale nominal viewer depth for consistency
 		nominal.z *= az;
-		Display3DView disp_views[2];
+		Display3DView disp_views[DISPLAYXR_HOOKS_MAX_VIEWS];
 		display3d_compute_views(
-			raw_eyes, 2,
+			raw_eyes, count,
 			&nominal, &screen, &disp_tunables,
 			scene_xform.enabled ? &scene_pose : NULL,
 			tunables.near_z, tunables.far_z,
 			disp_views);
 
-		views[0].fov = disp_views[0].fov;
-		views[1].fov = disp_views[1].fov;
-		views[0].pose.position = disp_views[0].eye_world;
-		views[1].pose.position = disp_views[1].eye_world;
-		views[0].pose.orientation = scene_pose.orientation;
-		views[1].pose.orientation = scene_pose.orientation;
+		for (uint32_t i = 0; i < count; i++) {
+			views[i].fov = disp_views[i].fov;
+			views[i].pose.position = disp_views[i].eye_world;
+			views[i].pose.orientation = scene_pose.orientation;
+		}
 
-		// Store Kooima matrices for C# stereo override
+		// Store L/R Kooima matrices for the C# stereo override path used by
+		// BiRP (Camera.SetStereoProjectionMatrix). URP doesn't consume these —
+		// it reads each XRPass.GetProjMatrix from views[i].fov above.
 		DisplayXRStereoMatrices mats = {};
 		memcpy(mats.left_view, disp_views[0].view_matrix, sizeof(float) * 16);
 		memcpy(mats.left_projection, disp_views[0].projection_matrix, sizeof(float) * 16);
@@ -508,6 +542,50 @@ hooked_xrLocateViews(XrSession session,
 		memcpy(mats.right_projection, disp_views[1].projection_matrix, sizeof(float) * 16);
 		mats.valid = 1;
 		displayxr_state_set_stereo_matrices(&mats);
+	}
+
+	// Unity URP head-pose compensation (issue #115).
+	// URP builds its per-eye view matrix as:
+	//     eye_world_in_unity = views[i].pose.position - xrLocateSpace(VIEW, LOCAL).pose.position
+	// because it follows the OpenXR XR-Rig convention where xrLocateViews
+	// returns "head + eye offset" and Unity subtracts the current head pose
+	// to get the eye relative to the XR Rig camera. For sim_display this
+	// composition shifts the rendered eye by the runtime's head pose
+	// (typically (0, 0.1, 0.6) in world, equivalently (0, -1.5, 0.6) in LOCAL
+	// because LOCAL anchors at the qwerty session-start head (0, 1.6, 0)) —
+	// landing the cube below center on macOS URP.
+	//
+	// BiRP and the native test apps bypass this by writing the view matrix
+	// directly (Camera.SetStereoViewMatrix / eyeParams.viewMat = kooima),
+	// so the same Kooima eye_world we just wrote works for them as-is.
+	// To make URP land on the same eye_world we add head_pose here, so URP's
+	// "pose - head_pose" subtraction cancels back to Kooima eye_world.
+	//
+	// The runtime weaver does NOT consume the submitted views[].pose for
+	// sim_display (it uses its own internal eye positions), so the modified
+	// pose flowing into xrEndFrame composition is harmless.
+	if (s_view_space != XR_NULL_HANDLE && s_local_space != XR_NULL_HANDLE) {
+		XrSpaceLocation head_loc = {XR_TYPE_SPACE_LOCATION};
+		XrResult hl = s_real_locate_space(s_view_space, s_local_space,
+		                                  viewLocateInfo->displayTime, &head_loc);
+		if (XR_SUCCEEDED(hl) &&
+		    (head_loc.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)) {
+			for (uint32_t i = 0; i < count; i++) {
+				views[i].pose.position.x += head_loc.pose.position.x;
+				views[i].pose.position.y += head_loc.pose.position.y;
+				views[i].pose.position.z += head_loc.pose.position.z;
+			}
+			static int s_hp_log = 0;
+			if (s_hp_log++ % 600 == 0) {
+				// Rare confirmation that the URP head-pose compensation is
+				// firing with the expected runtime head pose. Bump throttle
+				// to ~10s — once tuned it's not a per-frame concern.
+				displayxr_log("[DisplayXR] URP head-pose comp: added "
+				              "head_pos=(%.3f,%.3f,%.3f) to %u views (#115)\n",
+				              head_loc.pose.position.x, head_loc.pose.position.y,
+				              head_loc.pose.position.z, count);
+			}
+		}
 	}
 
 	// Debug: log every 60 frames (AFTER writeback so we see final values)
@@ -812,6 +890,25 @@ hooked_xrCreateSession(XrInstance instance, const XrSessionCreateInfo *createInf
 			} else {
 				displayxr_log( "[DisplayXR] LOCAL reference space created successfully\n");
 			}
+
+			// Also create our own VIEW space so hooked_xrLocateViews can query
+			// the current head pose without depending on the app having created
+			// one. Used for Unity URP head-pose compensation (issue #115) —
+			// xrLocateSpace(s_view_space, s_local_space) returns the current
+			// head pose in LOCAL coords, which we add to views[i].pose.position.
+			XrReferenceSpaceCreateInfo view_info = {XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
+			view_info.referenceSpaceType = XR_REFERENCE_SPACE_TYPE_VIEW;
+			view_info.poseInReferenceSpace.orientation = {0, 0, 0, 1};
+			view_info.poseInReferenceSpace.position = {0, 0, 0};
+			XrResult view_result = s_real_create_reference_space(s_session, &view_info, &s_view_space);
+			if (XR_FAILED(view_result)) {
+				s_view_space = XR_NULL_HANDLE;
+				displayxr_log("[DisplayXR] VIEW reference space FAILED (result=%d) — "
+				              "Unity URP head-pose compensation will be skipped\n",
+				              view_result);
+			} else {
+				displayxr_log("[DisplayXR] VIEW reference space created successfully\n");
+			}
 		}
 
 		// Wire the rendering-mode extension function pointers and enumerate
@@ -848,6 +945,7 @@ hooked_xrDestroySession(XrSession session)
 	displayxr_log( "[DisplayXR] xrDestroySession BEGIN session=%p (DEFERRED)\n", (void *)(uintptr_t)session);
 	s_session_alive = 0;
 	s_local_space = XR_NULL_HANDLE;
+	s_view_space = XR_NULL_HANDLE;
 	wsui_hooked_on_session_destroyed();
 	if (s_backend) { s_backend->on_session_destroyed(); }
 
@@ -1255,6 +1353,7 @@ hooked_xrDestroyInstance(XrInstance instance)
 	s_real_destroy_session = nullptr;
 	s_real_end_frame = nullptr;
 	s_real_create_reference_space = nullptr;
+	s_real_locate_space = nullptr;
 	s_real_poll_event = nullptr;
 	s_real_destroy_instance = nullptr;
 	s_real_enumerate_swapchain_formats = nullptr;
@@ -1274,6 +1373,7 @@ hooked_xrDestroyInstance(XrInstance instance)
 	s_instance = XR_NULL_HANDLE;
 	s_session = XR_NULL_HANDLE;
 	s_local_space = XR_NULL_HANDLE;
+	s_view_space = XR_NULL_HANDLE;
 	return XR_SUCCESS;
 }
 
@@ -1376,7 +1476,12 @@ displayxr_hook_xrGetInstanceProcAddr(XrInstance instance, const char *name, PFN_
 		*function = (PFN_xrVoidFunction)hooked_xrEndFrame;
 	} else if (strcmp(name, "xrCreateReferenceSpace") == 0) {
 		s_real_create_reference_space = (PFN_xrCreateReferenceSpace)*function;
-		// Don't intercept — just cache the function pointer
+		// Cache only — we call this ourselves to create our LOCAL + VIEW
+		// reference spaces (s_local_space, s_view_space) in hooked_xrCreateSession.
+	} else if (strcmp(name, "xrLocateSpace") == 0) {
+		s_real_locate_space = (PFN_xrLocateSpace)*function;
+		// Cache only — we call this ourselves for Unity URP head-pose
+		// compensation in hooked_xrLocateViews (issue #115).
 	} else if (strcmp(name, "xrPollEvent") == 0) {
 		s_real_poll_event = (PFN_xrPollEvent)*function;
 		*function = (PFN_xrVoidFunction)hooked_xrPollEvent;
@@ -1452,11 +1557,13 @@ displayxr_install_hooks(PFN_xrGetInstanceProcAddr next_gipa)
 	s_real_destroy_session = nullptr;
 	s_real_end_frame = nullptr;
 	s_real_create_reference_space = nullptr;
+	s_real_locate_space = nullptr;
 	s_real_poll_event = nullptr;
 	s_real_destroy_instance = nullptr;
 	s_instance = XR_NULL_HANDLE;
 	s_session = XR_NULL_HANDLE;
 	s_local_space = XR_NULL_HANDLE;
+	s_view_space = XR_NULL_HANDLE;
 	s_session_alive = 0;
 	s_instance_alive = 0;
 	s_stop_polling = 0;
