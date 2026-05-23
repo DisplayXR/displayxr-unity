@@ -443,6 +443,18 @@ namespace DisplayXR
             out uint outCount,
             out int outTracked);
 
+        /// <summary>
+        /// Canvas rect last pushed to the standalone preview session.
+        /// Used by Scene-view gizmos to mirror the window-relative Kooima
+        /// shift the SA session applies (ADR-006). Returns isValid=0 until
+        /// the canvas has been polled at least once.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void displayxr_standalone_get_canvas_rect(
+            out int outX, out int outY,
+            out uint outW, out uint outH,
+            out int outIsValid);
+
         // ====================================================================
         // Standalone tunables + display pose
         // ====================================================================

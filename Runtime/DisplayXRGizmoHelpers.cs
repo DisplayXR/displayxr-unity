@@ -27,50 +27,128 @@ namespace DisplayXR
         // when a DisplayXR session is alive)
         // -----------------------------------------------------------------
 
-        static System.Reflection.PropertyInfo s_PreviewIsRunningProp;
-        static bool s_PreviewLookupDone;
-
         public static bool IsSessionActive()
         {
             if (Application.isPlaying) return true;
-            return IsPreviewSessionRunning();
+            return IsStandaloneRunning();
         }
 
-        static bool IsPreviewSessionRunning()
+        // Direct native check. Previously this used reflection on
+        // DisplayXR.Editor.DisplayXRPreviewSession.IsRunning to avoid a
+        // Runtime→Editor compile-time dependency, but that path returned
+        // false in some Editor sessions even with the SA session running
+        // (assembly enumeration / domain reload timing). s_sa.running is
+        // the authoritative flag — it's true between session-start and
+        // session-stop regardless of who started it.
+        static bool IsStandaloneRunning()
         {
-            if (!s_PreviewLookupDone)
-            {
-                s_PreviewLookupDone = true;
-                // Editor asmdef references Runtime, not the other way around,
-                // so DisplayXRPreviewSession (DisplayXR.Editor namespace) is
-                // not visible at compile time. Reflect through loaded
-                // assemblies — cached after first hit.
-                try
-                {
-                    foreach (var asm in System.AppDomain.CurrentDomain.GetAssemblies())
-                    {
-                        var t = asm.GetType("DisplayXR.Editor.DisplayXRPreviewSession", false);
-                        if (t == null) continue;
-                        s_PreviewIsRunningProp = t.GetProperty("IsRunning",
-                            System.Reflection.BindingFlags.Public |
-                            System.Reflection.BindingFlags.Static);
-                        break;
-                    }
-                }
-                catch { /* swallow — fall back to "no session" */ }
-            }
-            if (s_PreviewIsRunningProp == null) return false;
-            try { return (bool)s_PreviewIsRunningProp.GetValue(null); }
-            catch { return false; }
+            try { return DisplayXRNative.displayxr_standalone_is_running() != 0; }
+            catch (System.DllNotFoundException) { return false; }
+            catch (System.EntryPointNotFoundException) { return false; }
         }
 
         // -----------------------------------------------------------------
         // Data source
         // -----------------------------------------------------------------
 
+        public struct CanvasRect
+        {
+            public int x, y;
+            public uint w, h;
+            public bool isValid;
+        }
+
+        /// <summary>
+        /// Canvas rect last pushed to the standalone preview session, in
+        /// physical-display pixel coords. isValid=false when no preview is
+        /// running or before the canvas has been polled. Used to mirror
+        /// the window-relative Kooima shift the SA session applies in
+        /// compute_views (ADR-006).
+        /// </summary>
+        public static CanvasRect TryGetCanvasRect()
+        {
+            var r = new CanvasRect();
+            try
+            {
+                DisplayXRNative.displayxr_standalone_get_canvas_rect(
+                    out r.x, out r.y, out r.w, out r.h, out int isValid);
+                r.isValid = isValid != 0;
+            }
+            catch (System.DllNotFoundException) { r.isValid = false; }
+            catch (System.EntryPointNotFoundException) { r.isValid = false; }
+            return r;
+        }
+
+        /// <summary>
+        /// Mirrors the window-relative Kooima shift the runtime applies in
+        /// xrLocateViews (native: hooks.cpp:300-325, standalone.cpp:1545-1559).
+        /// Returns the virtual-display dims (meters) for sizing the gizmo
+        /// rect, and the eye-offset (meters) to subtract from raw eye
+        /// positions. When the canvas isn't valid or display info is missing,
+        /// returns physical-display dims and zero offset (pass-through).
+        /// </summary>
+        public static void ComputeWindowRelativeShift(
+            DisplayXRDisplayInfo info, CanvasRect canvas,
+            out float windowWidthMeters, out float windowHeightMeters,
+            out float eyeOffsetXMeters, out float eyeOffsetYMeters)
+        {
+            // Default = pass-through (physical-display dims, no shift).
+            windowWidthMeters = info.isValid ? info.displayWidthMeters : 0f;
+            windowHeightMeters = info.isValid ? info.displayHeightMeters : 0f;
+            eyeOffsetXMeters = 0f;
+            eyeOffsetYMeters = 0f;
+
+            if (!canvas.isValid || !info.isValid) return;
+            if (info.displayPixelWidth == 0 || info.displayPixelHeight == 0) return;
+            if (canvas.w == 0 || canvas.h == 0) return;
+
+            float pxSizeX = info.displayWidthMeters / (float)info.displayPixelWidth;
+            float pxSizeY = info.displayHeightMeters / (float)info.displayPixelHeight;
+            windowWidthMeters = canvas.w * pxSizeX;
+            windowHeightMeters = canvas.h * pxSizeY;
+
+            float winCenterX = canvas.x + canvas.w * 0.5f;
+            float winCenterY = canvas.y + canvas.h * 0.5f;
+            float dispCenterX = info.displayPixelWidth * 0.5f;
+            float dispCenterY = info.displayPixelHeight * 0.5f;
+            eyeOffsetXMeters = (winCenterX - dispCenterX) * pxSizeX;
+            eyeOffsetYMeters = (winCenterY - dispCenterY) * pxSizeY;
+#if UNITY_EDITOR_WIN
+            // Win32 canvas Y is top-down; OpenXR eye coords are Y-up.
+            // Matches the #ifdef _WIN32 in hooks.cpp:317 / standalone.cpp:1558.
+            eyeOffsetYMeters = -eyeOffsetYMeters;
+#endif
+        }
+
         public static DisplayXRDisplayInfo ReadDisplayInfoFromNative()
         {
             var info = new DisplayXRDisplayInfo();
+            // Try the standalone preview session first — in Edit Mode the
+            // hook chain isn't initialized, but the SA session has its own
+            // display info populated from the runtime.
+            try
+            {
+                DisplayXRNative.displayxr_standalone_get_display_info(
+                    out info.displayWidthMeters,
+                    out info.displayHeightMeters,
+                    out info.displayPixelWidth,
+                    out info.displayPixelHeight,
+                    out info.nominalViewerX,
+                    out info.nominalViewerY,
+                    out info.nominalViewerZ,
+                    out info.recommendedViewScaleX,
+                    out info.recommendedViewScaleY,
+                    out int saValid);
+                if (saValid != 0)
+                {
+                    info.isValid = true;
+                    return info;
+                }
+            }
+            catch (System.DllNotFoundException) { return info; }
+            catch (System.EntryPointNotFoundException) { /* fall through */ }
+
+            // Fall back to the hook chain (Play Mode XR loader path).
             try
             {
                 DisplayXRNative.displayxr_get_display_info(
@@ -86,10 +164,7 @@ namespace DisplayXR
                     out int isValid);
                 info.isValid = isValid != 0;
             }
-            catch (System.DllNotFoundException)
-            {
-                info.isValid = false;
-            }
+            catch (System.DllNotFoundException) { info.isValid = false; }
             return info;
         }
 
@@ -277,6 +352,21 @@ namespace DisplayXR
             isLive = count > 0;
             if (!isLive) count = FillNominalEyes(info, worldEyesOut);
 
+            // Mirror native: shift raw eyes from display-relative to
+            // window-relative coords before Kooima factors, and use the
+            // WINDOW height as the Kooima "screen" height for m2v scaling
+            // (display3d_view.c:280 — m2v = vdh / screen->height_m).
+            // When canvas isn't valid, winH_m falls back to physical
+            // display height (pass-through), matching old behavior.
+            ComputeWindowRelativeShift(info, TryGetCanvasRect(),
+                out float _winW_m, out float winH_m,
+                out float offX_m, out float offY_m);
+            if (offX_m != 0f || offY_m != 0f)
+            {
+                Vector3 shift = new Vector3(offX_m, offY_m, 0f);
+                for (int i = 0; i < count; i++) worldEyesOut[i] -= shift;
+            }
+
             float nominalZ = info.isValid ? info.nominalViewerZ : NOMINAL_VIEWER_Z_FALLBACK;
             ApplyKooimaEyeFactorsN(
                 worldEyesOut, count, nominalZ,
@@ -289,10 +379,11 @@ namespace DisplayXR
             float vdh = virtualDisplayHeight > 0f
                 ? virtualDisplayHeight
                 : (info.isValid ? info.displayHeightMeters : 0.2f);
-            float ph = info.isValid ? info.displayHeightMeters : 0.2f;
+            float screenH = winH_m > 0f ? winH_m
+                : (info.isValid ? info.displayHeightMeters : 0.2f);
             float ax = sy / sx;
             float az = sy / sz;
-            float m2v = (vdh / sy) / ph;
+            float m2v = (vdh / sy) / screenH;
 
             for (int i = 0; i < count; i++)
             {
@@ -449,6 +540,32 @@ namespace DisplayXR
 
         public static readonly Color EyeGlyphLive = new Color(1f, 1f, 0.2f, 1f);
         public static readonly Color EyeGlyphNominal = new Color(0.9f, 0.85f, 0.3f, 0.7f);
+    }
+
+    // Forces Scene-view repaints when the SA preview window's canvas rect
+    // changes, so the gizmo (virtual display rect + frustum + eye glyphs)
+    // tracks window drag/resize in real time. Without this, Scene view
+    // only repaints on user interaction → gizmo lags behind window edits.
+    // Cheap: polls a single native getter, no repaint when canvas is stable.
+    [UnityEditor.InitializeOnLoad]
+    internal static class DisplayXRGizmoRepainter
+    {
+        static DisplayXRGizmoHelpers.CanvasRect s_LastCanvas;
+
+        static DisplayXRGizmoRepainter()
+        {
+            UnityEditor.EditorApplication.update += Tick;
+        }
+
+        static void Tick()
+        {
+            var c = DisplayXRGizmoHelpers.TryGetCanvasRect();
+            if (!c.isValid) return;
+            if (c.x == s_LastCanvas.x && c.y == s_LastCanvas.y &&
+                c.w == s_LastCanvas.w && c.h == s_LastCanvas.h) return;
+            s_LastCanvas = c;
+            UnityEditor.SceneView.RepaintAll();
+        }
     }
 }
 #endif

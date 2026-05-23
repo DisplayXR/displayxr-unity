@@ -220,6 +220,20 @@ DISPLAYXR_EXPORT void displayxr_standalone_get_n_eye_positions(
     uint32_t *out_count,
     int32_t *out_tracked);
 
+/// Canvas rect last pushed to the standalone session (preview window).
+/// Used by Scene-view gizmos to mirror the window-relative Kooima shift
+/// the SA session applies in compute_views (ADR-006). Returns is_valid=0
+/// until canvas_width/height have been set (e.g. before the preview
+/// window has been polled the first time).
+///
+/// Coordinates are screen-space pixels: (x, y) is the top-left of the
+/// canvas on the physical display; (w, h) is the canvas size in
+/// content-area backing pixels.
+DISPLAYXR_EXPORT void displayxr_standalone_get_canvas_rect(
+    int32_t *out_x, int32_t *out_y,
+    uint32_t *out_w, uint32_t *out_h,
+    int *out_is_valid);
+
 // ============================================================================
 // Display mode switching
 // ============================================================================
