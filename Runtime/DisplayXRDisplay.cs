@@ -210,12 +210,20 @@ namespace DisplayXR
                 ? DisplayXRFeature.Instance.DisplayInfo
                 : DisplayXRGizmoHelpers.ReadDisplayInfoFromNative();
 
+            // Window-relative Kooima: when the SA preview is rendering into
+            // a sub-rect of the panel, the virtual display gizmo should
+            // match the WINDOW dims, not the physical panel dims.
+            DisplayXRGizmoHelpers.ComputeWindowRelativeShift(
+                info, DisplayXRGizmoHelpers.TryGetCanvasRect(),
+                out float winW_m, out float winH_m, out _, out _);
+            bool windowMode = winW_m > 0f && winH_m > 0f;
+
             float h = virtualDisplayHeight > 0f
                 ? virtualDisplayHeight
-                : (info.isValid ? info.displayHeightMeters : 0.2f);
-            float w = info.isValid
-                ? info.displayWidthMeters * (h / info.displayHeightMeters)
-                : h * 1.5f;
+                : (windowMode ? winH_m : (info.isValid ? info.displayHeightMeters : 0.2f));
+            float w = windowMode
+                ? h * (winW_m / winH_m)
+                : (info.isValid ? info.displayWidthMeters * (h / info.displayHeightMeters) : h * 1.5f);
 
             // Light-blue virtual display volume (preserves the pre-#111
             // OnDrawGizmosSelected aesthetic).

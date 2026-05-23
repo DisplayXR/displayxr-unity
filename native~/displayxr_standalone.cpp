@@ -160,6 +160,7 @@ typedef struct StandaloneState {
 	volatile int preview_mouse_y;
 	volatile int preview_mouse_in_content; // 1 = cursor inside content area
 	int dragging;       // Non-zero while custom (non-modal) window move is active
+	int sizing_edge;    // WMSZ_* (1-8) while custom non-modal resize is active, 0 otherwise
 	POINT drag_start_cursor;
 	RECT drag_start_rect;
 #endif
@@ -688,15 +689,15 @@ sa_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 	case WM_DESTROY:
 		s_sa.preview_hwnd = NULL;
 		return 0;
-	// #61: capture-based SC_MOVE intercept with synchronous
+	// #61: capture-based SC_MOVE / SC_SIZE intercept with synchronous
 	// WM_ENTERSIZEMOVE/EXITSIZEMOVE bracketing. Bypassing DefWindowProc's
-	// modal drag loop keeps Unity's main thread running so FrameTick fires
-	// during the move (real-time Kooima). The bracketing messages drive the
-	// SR SDK weaver's WndProc subclass into its phase-snap state so the
-	// window lands on lenticular-aligned pixels. Order matters: ENTERSIZEMOVE
-	// before the first SetWindowPos, EXITSIZEMOVE after the flag is cleared
-	// so the recursive WM_CAPTURECHANGED from ReleaseCapture() can't re-send
-	// it.
+	// modal drag/resize loop keeps Unity's main thread running so FrameTick
+	// fires during the operation (real-time Kooima + real-time Scene-view
+	// gizmo). The bracketing messages drive the SR SDK weaver's WndProc
+	// subclass into its phase-snap state so the window lands on
+	// lenticular-aligned pixels. Order matters: ENTERSIZEMOVE before the
+	// first SetWindowPos, EXITSIZEMOVE after the flag is cleared so the
+	// recursive WM_CAPTURECHANGED from ReleaseCapture() can't re-send it.
 	case WM_SYSCOMMAND:
 		if ((wParam & 0xFFF0) == SC_MOVE) {
 			SetCapture(hwnd);
@@ -705,6 +706,35 @@ sa_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 			s_sa.dragging = 1;
 			SendMessageW(hwnd, WM_ENTERSIZEMOVE, 0, 0);
 			return 0;
+		}
+		if ((wParam & 0xFFF0) == SC_SIZE) {
+			// Low nibble of wParam = WMSZ_* edge code (1..8).
+			UINT edge = (UINT)(wParam & 0xF);
+			if (edge >= WMSZ_LEFT && edge <= WMSZ_BOTTOMRIGHT) {
+				SetCapture(hwnd);
+				GetCursorPos(&s_sa.drag_start_cursor);
+				GetWindowRect(hwnd, &s_sa.drag_start_rect);
+				s_sa.sizing_edge = (int)edge;
+				SendMessageW(hwnd, WM_ENTERSIZEMOVE, 0, 0);
+				return 0;
+			}
+		}
+		break;
+	case WM_SETCURSOR:
+		// During custom resize, force the appropriate sizing cursor —
+		// otherwise it reverts to the arrow because we own capture.
+		if (s_sa.sizing_edge) {
+			LPCSTR shape = NULL;
+			switch (s_sa.sizing_edge) {
+				case WMSZ_LEFT: case WMSZ_RIGHT:           shape = IDC_SIZEWE; break;
+				case WMSZ_TOP: case WMSZ_BOTTOM:           shape = IDC_SIZENS; break;
+				case WMSZ_TOPLEFT: case WMSZ_BOTTOMRIGHT:  shape = IDC_SIZENWSE; break;
+				case WMSZ_TOPRIGHT: case WMSZ_BOTTOMLEFT:  shape = IDC_SIZENESW; break;
+			}
+			if (shape) {
+				SetCursor(LoadCursorA(NULL, shape));
+				return TRUE;
+			}
 		}
 		break;
 	case WM_MOUSEMOVE:
@@ -718,6 +748,46 @@ sa_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 			             s_sa.drag_start_rect.top + dy,
 			             0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 		}
+		if (s_sa.sizing_edge) {
+			POINT cur;
+			GetCursorPos(&cur);
+			int dx = cur.x - s_sa.drag_start_cursor.x;
+			int dy = cur.y - s_sa.drag_start_cursor.y;
+			RECT r = s_sa.drag_start_rect;
+			switch (s_sa.sizing_edge) {
+				case WMSZ_LEFT:        r.left  += dx; break;
+				case WMSZ_RIGHT:       r.right += dx; break;
+				case WMSZ_TOP:         r.top   += dy; break;
+				case WMSZ_TOPLEFT:     r.top   += dy; r.left  += dx; break;
+				case WMSZ_TOPRIGHT:    r.top   += dy; r.right += dx; break;
+				case WMSZ_BOTTOM:      r.bottom += dy; break;
+				case WMSZ_BOTTOMLEFT:  r.bottom += dy; r.left  += dx; break;
+				case WMSZ_BOTTOMRIGHT: r.bottom += dy; r.right += dx; break;
+			}
+			// Enforce minimum tracking size (matches DefWindowProc default).
+			int minW = GetSystemMetrics(SM_CXMINTRACK);
+			int minH = GetSystemMetrics(SM_CYMINTRACK);
+			if (r.right - r.left < minW) {
+				if (s_sa.sizing_edge == WMSZ_LEFT ||
+				    s_sa.sizing_edge == WMSZ_TOPLEFT ||
+				    s_sa.sizing_edge == WMSZ_BOTTOMLEFT)
+					r.left = r.right - minW;
+				else
+					r.right = r.left + minW;
+			}
+			if (r.bottom - r.top < minH) {
+				if (s_sa.sizing_edge == WMSZ_TOP ||
+				    s_sa.sizing_edge == WMSZ_TOPLEFT ||
+				    s_sa.sizing_edge == WMSZ_TOPRIGHT)
+					r.top = r.bottom - minH;
+				else
+					r.bottom = r.top + minH;
+			}
+			SetWindowPos(hwnd, NULL,
+			             r.left, r.top,
+			             r.right - r.left, r.bottom - r.top,
+			             SWP_NOZORDER | SWP_NOACTIVATE);
+		}
 		break;
 	case WM_LBUTTONUP:
 		if (s_sa.dragging) {
@@ -726,11 +796,18 @@ sa_wndproc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 			ReleaseCapture();
 			return 0;
 		}
+		if (s_sa.sizing_edge) {
+			s_sa.sizing_edge = 0;
+			SendMessageW(hwnd, WM_EXITSIZEMOVE, 0, 0);
+			ReleaseCapture();
+			return 0;
+		}
 		break;
 	case WM_CAPTURECHANGED: {
-		int was_dragging = s_sa.dragging;
+		int was_active = s_sa.dragging || s_sa.sizing_edge;
 		s_sa.dragging = 0;
-		if (was_dragging)
+		s_sa.sizing_edge = 0;
+		if (was_active)
 			SendMessageW(hwnd, WM_EXITSIZEMOVE, 0, 0);
 		break;
 	}
@@ -1779,6 +1856,19 @@ displayxr_standalone_get_n_eye_positions(float *out_xyz_array,
 			out_xyz_array[i * 3 + 2] = s_sa.eye_positions[i][2];
 		}
 	}
+}
+
+void
+displayxr_standalone_get_canvas_rect(int32_t *out_x, int32_t *out_y,
+                                      uint32_t *out_w, uint32_t *out_h,
+                                      int *out_is_valid)
+{
+	if (out_x) *out_x = s_sa.canvas_x;
+	if (out_y) *out_y = s_sa.canvas_y;
+	if (out_w) *out_w = s_sa.canvas_width;
+	if (out_h) *out_h = s_sa.canvas_height;
+	if (out_is_valid)
+		*out_is_valid = (s_sa.canvas_width > 0 && s_sa.canvas_height > 0) ? 1 : 0;
 }
 
 

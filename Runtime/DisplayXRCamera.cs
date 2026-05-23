@@ -211,9 +211,15 @@ namespace DisplayXR
                 ? DisplayXRFeature.Instance.DisplayInfo
                 : DisplayXRGizmoHelpers.ReadDisplayInfoFromNative();
 
-            float aspect = info.isValid
-                ? info.displayWidthMeters / info.displayHeightMeters
-                : 16f / 9f;
+            // Window-relative Kooima: convergence volume aspect should
+            // match the WINDOW the runtime is rasterizing into, not the
+            // physical panel.
+            DisplayXRGizmoHelpers.ComputeWindowRelativeShift(
+                info, DisplayXRGizmoHelpers.TryGetCanvasRect(),
+                out float winW_m, out float winH_m, out _, out _);
+            float aspect = (winW_m > 0f && winH_m > 0f)
+                ? winW_m / winH_m
+                : (info.isValid ? info.displayWidthMeters / info.displayHeightMeters : 16f / 9f);
 
             var cam = m_Camera != null ? m_Camera : GetComponent<Camera>();
             float fovDeg = m_CachedCameraFov > 0f ? m_CachedCameraFov
