@@ -5,6 +5,14 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.0] - 2026-05-23
+
+### Added
+- Window-relative gizmo + real-time resize intercept: per-eye Kooima frustum gizmos now track the standalone preview window during resize/move, with the resize intercept pushing canvas updates so visualization stays in sync with the live render canvas. (#111, #118)
+
+### Changed
+- Documentation: updated deployment notes for the post-#263 plug-in architecture. (#117)
+
 ## [1.7.3] - 2026-05-21
 
 ### Added
