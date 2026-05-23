@@ -52,7 +52,8 @@ The plugin works by hooking `xrLocateViews` before Unity sees the results, repla
 | **Unity** | 2022.3 LTS or later (including Unity 6) |
 | **OpenXR Plugin** | `com.unity.xr.openxr` 1.9.1+ (installed via Package Manager) |
 | **XR Plugin Management** | `com.unity.xr.management` 4.4.0+ (auto-installed with OpenXR) |
-| **DisplayXR Runtime** | Pre-built from [displayxr-runtime](https://github.com/DisplayXR/displayxr-runtime) CI — see [Deploying to End Users](#deploying-to-end-users) |
+| **DisplayXR Runtime** | [`DisplayXRSetup-*.exe`](https://github.com/DisplayXR/displayxr-runtime/releases/latest) (v1.4.0+) — required on every target machine. See [Deploying to End Users](#deploying-to-end-users). |
+| **Vendor display plug-in** (Leia hardware only) | [`DisplayXRLeiaSRSetup-*.exe`](https://github.com/DisplayXR/displayxr-leia-plugin/releases/latest) — required for Leia SR hardware. Not needed for sim_display testing or non-Leia displays. Install **after** the runtime. |
 
 ### Platform Support
 
@@ -338,9 +339,25 @@ Your built app is a standard OpenXR application. It needs an OpenXR runtime on t
 
 ### Windows Deployment
 
-Install the DisplayXR runtime via the `SRDisplayXRInstaller.exe` from the [displayxr-runtime](https://github.com/DisplayXR/displayxr-runtime) CI build artifact (registers the runtime JSON and copies DLLs system-wide).
+Two installers, in order:
 
-Or, for development/testing, set the environment variable:
+**1. DisplayXR Runtime** (always required):
+
+Install [`DisplayXRSetup-*.exe`](https://github.com/DisplayXR/displayxr-runtime/releases/latest) from the [displayxr-runtime](https://github.com/DisplayXR/displayxr-runtime/releases) releases. Registers the OpenXR runtime JSON, drops the runtime DLLs at `C:\Program Files\DisplayXR\Runtime\`, sets `HKLM\Software\Khronos\OpenXR\1\ActiveRuntime` to the DisplayXR manifest, and auto-starts `displayxr-service.exe` at user logon.
+
+The runtime ships with the `sim_display` plug-in (vendor-neutral SBS/anaglyph/blend fallback for any GPU). For real 3D hardware you also need the matching vendor plug-in below.
+
+**2. Leia SR plug-in** (required for Leia SR hardware only):
+
+Install [`DisplayXRLeiaSRSetup-*.exe`](https://github.com/DisplayXR/displayxr-leia-plugin/releases/latest) from the [displayxr-leia-plugin](https://github.com/DisplayXR/displayxr-leia-plugin/releases) releases. Drops `DisplayXR-LeiaSR.dll` at `C:\Program Files\DisplayXR\Plugins\LeiaSR\` and registers it at `HKLM\Software\DisplayXR\DisplayProcessors\leia-sr` (`ProbeOrder=50`). The runtime's registry-driven discovery picks it up at `xrCreateInstance` time; on Leia hardware it wins the probe and renders through the SR weaver, on non-Leia hardware it declines and the runtime falls back to `sim_display`.
+
+**Install order matters** — the Leia plug-in installer hard-prereqs `HKLM\Software\DisplayXR\Runtime\InstallPath` and refuses install if the runtime isn't already present.
+
+The plug-in cascade-uninstalls with the runtime: uninstalling the runtime via `Add/Remove Programs` automatically uninstalls all registered vendor plug-ins (#286 fixed cleanup in runtime v1.4.1+).
+
+> **Why two installers?** Pre-v1.4.0 the runtime installer bundled the Leia plug-in. As of v1.4.0 (`ADR-019` / [#263](https://github.com/DisplayXR/displayxr-runtime/issues/263)), vendor display drivers ship as separate plug-in installers from their own repos so the runtime stays vendor-source-clean and additional vendors don't bloat the runtime install set.
+
+Or, for development/testing without installation, set the environment variable to your dev runtime JSON:
 ```cmd
 set XR_RUNTIME_JSON=C:\path\to\openxr_displayxr-dev.json
 ```
@@ -423,6 +440,7 @@ This lets you develop and test the full stereo pipeline on any machine.
 |---------|-------|-----|
 | "No OpenXR runtime found" | `XR_RUNTIME_JSON` not set or points to missing file | Set the env var to the DisplayXR runtime JSON path |
 | Black screen | DisplayXR feature not enabled | Check Project Settings > XR Plug-in Management > OpenXR > Features |
+| Scene renders 2D side-by-side on Leia hardware (no depth) | Leia plug-in not installed/registered | Install `DisplayXRLeiaSRSetup-*.exe` from [displayxr-leia-plugin](https://github.com/DisplayXR/displayxr-leia-plugin/releases). Verify `HKLM\Software\DisplayXR\DisplayProcessors\leia-sr` exists. Without the plug-in, the runtime falls back to `sim_display` (SBS output) on any hardware. |
 | No stereo (flat image) | Eye tracking not running | Verify the DisplayXR runtime is configured with a display that supports eye tracking, or use sim_display for testing |
 | Stereo looks wrong | Tunables misconfigured | Reset to defaults (IPD=1, Parallax=1, Scale=1) |
 | UPM "cannot add package from git URL" (Windows) | Git not installed or not in PATH | Install [Git for Windows](https://gitforwindows.org/), restart Unity. Verify with `git --version` in a terminal. |

@@ -157,7 +157,7 @@ $env:SIM_DISPLAY_OUTPUT = "sbs"
 & "C:\Program Files\Unity Hub\Unity Hub.exe"
 ```
 
-> **Tip:** On Windows, if the DisplayXR runtime was installed system-wide via `SRDisplayXRInstaller.exe`, you don't need to set `XR_RUNTIME_JSON` — it's already registered.
+> **Tip:** On Windows, if the DisplayXR runtime was installed system-wide via `DisplayXRSetup-*.exe`, you don't need to set `XR_RUNTIME_JSON` — it's already registered. (For Leia hardware also install `DisplayXRLeiaSRSetup-*.exe` from the [Leia plug-in releases](https://github.com/DisplayXR/displayxr-leia-plugin/releases).)
 
 ---
 
@@ -389,7 +389,7 @@ YourApp.exe
 
 **With the installed runtime:**
 
-If the DisplayXR runtime was installed system-wide (`SRDisplayXRInstaller.exe`), just double-click `YourApp.exe` — no environment variables needed.
+If the DisplayXR runtime was installed system-wide (`DisplayXRSetup-*.exe`), just double-click `YourApp.exe` — no environment variables needed. For Leia hardware, also install `DisplayXRLeiaSRSetup-*.exe` from the [Leia plug-in releases](https://github.com/DisplayXR/displayxr-leia-plugin/releases) (in addition to, not instead of, the runtime).
 
 **With runtime in a custom path:**
 ```cmd
