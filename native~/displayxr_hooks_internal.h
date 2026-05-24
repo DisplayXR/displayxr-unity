@@ -40,6 +40,9 @@ void displayxr_log(const char *fmt, ...);
 #define XR_TYPE_GRAPHICS_BINDING_D3D12_KHR      ((XrStructureType)1000028000)
 #endif
 #endif
+#ifndef XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR
+#define XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR     ((XrStructureType)1000025000)
+#endif
 
 // --- D3D11 swapchain image struct (from openxr_platform.h) ---
 // Defined inline to avoid requiring XR_USE_GRAPHICS_API_D3D11 globally.
