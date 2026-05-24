@@ -878,6 +878,9 @@ hooked_xrCreateSession(XrInstance instance, const XrSessionCreateInfo *createInf
 	}
 
 	XrResult result = s_real_create_session(instance, createInfo, session);
+	if (XR_FAILED(result)) {
+		displayxr_log("[DisplayXR] xrCreateSession FAILED, result=%d (runtime may not support the supplied graphics binding)\n", (int)result);
+	}
 	if (XR_SUCCEEDED(result)) {
 		s_session = *session;
 		s_session_alive = 1;
