@@ -944,6 +944,114 @@ hooked_xrCreateSession(XrInstance instance, const XrSessionCreateInfo *createInf
 	return result;
 }
 
+#if defined(ENABLE_VULKAN)
+// --- xrCreateVulkanDeviceKHR interception (displayxr-runtime#314) ---
+//
+// Unity (XR_KHR_vulkan_enable2) routes its logical-device creation through the
+// runtime's xrCreateVulkanDeviceKHR. Unity's own VkDeviceCreateInfo enables
+// VK_KHR_external_memory / _semaphore but NOT the _win32 variants. The SR SDK
+// Vulkan weaver (CreateVulkanWeaver) builds a D3D-interop compose-under bridge,
+// which is the kind of work that needs the _win32 external-memory/semaphore
+// extensions. We intercept device creation and append them so the device Unity
+// hands the runtime is interop-capable — the correct contract for an
+// interop-fed device regardless of who consumes it.
+//
+// NOTE: injecting these alone does NOT resolve the LeiaSR weaver AV during
+// xrCreateSession on Vulkan (displayxr-runtime#314). Verified: the bound device
+// is this exact device handle and vkCreateDevice accepted the extensions, yet
+// the weaver still faults — so the root cause is elsewhere in the weaver's
+// handling of Unity's device. This hook is kept as a correct prerequisite, not
+// as the fix.
+//
+// Minimal stable-ABI struct definitions (avoids a Vulkan SDK dependency — same
+// opaque-handle philosophy as XrGraphicsBindingVulkanKHR in
+// displayxr_vulkan_backend.cpp). Layout matches Vulkan 1.x / OpenXR 1.x on x64.
+typedef void  *DxrVkPhysicalDevice;
+typedef void  *DxrVkDevice;
+typedef void (*DxrPFN_vkVoidFunction)(void);
+typedef DxrPFN_vkVoidFunction (XRAPI_PTR *DxrPFN_vkGetInstanceProcAddr)(void *instance, const char *name);
+
+typedef struct DxrVkDeviceCreateInfo {
+	int32_t            sType;
+	const void        *pNext;
+	uint32_t           flags;
+	uint32_t           queueCreateInfoCount;
+	const void        *pQueueCreateInfos;
+	uint32_t           enabledLayerCount;
+	const char *const *ppEnabledLayerNames;
+	uint32_t           enabledExtensionCount;
+	const char *const *ppEnabledExtensionNames;
+	const void        *pEnabledFeatures;
+} DxrVkDeviceCreateInfo;
+
+typedef struct DxrXrVulkanDeviceCreateInfoKHR {
+	XrStructureType               type;
+	const void                   *next;
+	XrSystemId                    systemId;
+	uint64_t                      createFlags;
+	DxrPFN_vkGetInstanceProcAddr  pfnGetInstanceProcAddr;
+	DxrVkPhysicalDevice           vulkanPhysicalDevice;
+	const DxrVkDeviceCreateInfo  *vulkanCreateInfo;
+	const void                   *vulkanAllocator;
+} DxrXrVulkanDeviceCreateInfoKHR;
+
+typedef XrResult (XRAPI_PTR *DxrPFN_xrCreateVulkanDeviceKHR)(
+    XrInstance instance, const DxrXrVulkanDeviceCreateInfoKHR *createInfo,
+    DxrVkDevice *vulkanDevice, int32_t *vulkanResult);
+
+static DxrPFN_xrCreateVulkanDeviceKHR s_real_create_vulkan_device = nullptr;
+
+static XrResult XRAPI_CALL
+hooked_xrCreateVulkanDeviceKHR(XrInstance instance,
+                               const DxrXrVulkanDeviceCreateInfoKHR *createInfo,
+                               DxrVkDevice *vulkanDevice, int32_t *vulkanResult)
+{
+	static const char *kRequired[] = {
+		"VK_KHR_external_memory",
+		"VK_KHR_external_memory_win32",
+		"VK_KHR_external_semaphore",
+		"VK_KHR_external_semaphore_win32",
+	};
+	const uint32_t kRequiredCount = (uint32_t)(sizeof(kRequired) / sizeof(kRequired[0]));
+
+	if (s_real_create_vulkan_device == nullptr) return XR_ERROR_FUNCTION_UNSUPPORTED;
+	if (createInfo == nullptr || createInfo->vulkanCreateInfo == nullptr) {
+		return s_real_create_vulkan_device(instance, createInfo, vulkanDevice, vulkanResult);
+	}
+
+	const DxrVkDeviceCreateInfo *src = createInfo->vulkanCreateInfo;
+	const uint32_t orig = src->enabledExtensionCount;
+
+	const char *merged[256];
+	if (orig + kRequiredCount > 256) {
+		// Implausibly long list — pass through rather than risk a stack overrun.
+		displayxr_log("[DisplayXR] Vulkan: device extension list too long (%u), not injecting\n", orig);
+		return s_real_create_vulkan_device(instance, createInfo, vulkanDevice, vulkanResult);
+	}
+
+	uint32_t n = 0;
+	for (uint32_t i = 0; i < orig; i++) merged[n++] = src->ppEnabledExtensionNames[i];
+	for (uint32_t r = 0; r < kRequiredCount; r++) {
+		bool present = false;
+		for (uint32_t i = 0; i < orig; i++) {
+			if (src->ppEnabledExtensionNames[i] &&
+			    strcmp(src->ppEnabledExtensionNames[i], kRequired[r]) == 0) { present = true; break; }
+		}
+		if (!present) merged[n++] = kRequired[r];
+	}
+
+	DxrVkDeviceCreateInfo dci = *src;
+	dci.enabledExtensionCount   = n;
+	dci.ppEnabledExtensionNames = merged;
+
+	DxrXrVulkanDeviceCreateInfoKHR ci = *createInfo;
+	ci.vulkanCreateInfo = &dci;
+
+	displayxr_log("[DisplayXR] xrCreateVulkanDeviceKHR: enabled %u device extensions (%u app + win32 external-memory/semaphore interop for SR weaver)\n", n, orig);
+	return s_real_create_vulkan_device(instance, &ci, vulkanDevice, vulkanResult);
+}
+#endif // ENABLE_VULKAN
+
 static XrResult XRAPI_CALL
 hooked_xrRequestDisplayRenderingModeEXT(XrSession session, uint32_t modeIndex)
 {
@@ -1515,6 +1623,12 @@ displayxr_hook_xrGetInstanceProcAddr(XrInstance instance, const char *name, PFN_
 	else if (strcmp(name, "xrRequestDisplayRenderingModeEXT") == 0) {
 		*function = (PFN_xrVoidFunction)hooked_xrRequestDisplayRenderingModeEXT;
 	}
+#if defined(ENABLE_VULKAN)
+	else if (strcmp(name, "xrCreateVulkanDeviceKHR") == 0) {
+		s_real_create_vulkan_device = (DxrPFN_xrCreateVulkanDeviceKHR)*function;
+		*function = (PFN_xrVoidFunction)hooked_xrCreateVulkanDeviceKHR;
+	}
+#endif
 	else if (strcmp(name, "xrCreateSwapchain") == 0) {
 		s_real_create_swapchain = (PFN_xrCreateSwapchain)*function;
 		*function = (PFN_xrVoidFunction)hooked_xrCreateSwapchain;
