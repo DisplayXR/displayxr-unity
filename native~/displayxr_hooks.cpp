@@ -134,7 +134,7 @@ XrResult displayxr_hooked_request_rendering_mode(GraphicsBackend *b, XrSession s
 {
 	return b ? b->request_rendering_mode(s, mode_index) : XR_ERROR_FUNCTION_UNSUPPORTED;
 }
-enum BackendType { kBackendNone, kBackendD3D11, kBackendD3D12, kBackendMetal };
+enum BackendType { kBackendNone, kBackendD3D11, kBackendD3D12, kBackendMetal, kBackendVulkan };
 static BackendType s_backend_type = kBackendNone;
 
 // Win32 window binding helper (shared with D3D11Backend / D3D12Backend)
@@ -707,7 +707,11 @@ hooked_xrCreateSession(XrInstance instance, const XrSessionCreateInfo *createInf
 		const XrBaseInStructure *item = (const XrBaseInStructure *)createInfo->next;
 		while (item != nullptr) {
 			if (item->type == XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR) {
+#if defined(__APPLE__)
 				displayxr_log( "[DisplayXR] Graphics binding: VULKAN (via MoltenVK on macOS)\n");
+#else
+				displayxr_log( "[DisplayXR] Graphics binding: VULKAN\n");
+#endif
 			} else if (item->type == XR_TYPE_GRAPHICS_BINDING_D3D11_KHR) {
 				displayxr_log( "[DisplayXR] Graphics binding: D3D11\n");
 			} else if (item->type == XR_TYPE_GRAPHICS_BINDING_D3D12_KHR) {
@@ -731,6 +735,11 @@ hooked_xrCreateSession(XrInstance instance, const XrSessionCreateInfo *createInf
 			} else if (item->type == XR_TYPE_GRAPHICS_BINDING_D3D11_KHR) {
 				s_backend = create_d3d11_backend(); s_backend_type = kBackendD3D11; break;
 			}
+#if defined(ENABLE_VULKAN)
+			else if (item->type == XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR) {
+				s_backend = create_vulkan_backend(); s_backend_type = kBackendVulkan; break;
+			}
+#endif
 #elif defined(__APPLE__)
 			if (item->type == (XrStructureType)1000029000) { // XR_TYPE_GRAPHICS_BINDING_METAL_KHR
 				s_backend = create_metal_backend(); s_backend_type = kBackendMetal; break;

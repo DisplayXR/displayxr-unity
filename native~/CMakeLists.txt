@@ -110,6 +110,15 @@ else()
     target_compile_options(displayxr_unity PRIVATE -fvisibility=hidden)
 endif()
 
+# Enable Vulkan backend on Windows. The stub in displayxr_vulkan_backend.cpp
+# is auto-active on Android/Linux but gated behind ENABLE_VULKAN on Windows
+# so opt-in is explicit. Needed for #122 (test whether Vulkan unlocks MSAA
+# on the XR eye RT). Excludes Apple — Vulkan on macOS is out of scope for
+# this plugin.
+if(WIN32)
+    target_compile_definitions(displayxr_unity PRIVATE ENABLE_VULKAN)
+endif()
+
 # --- Apple framework linking ---
 if(APPLE)
     find_library(IOSURFACE_FRAMEWORK IOSurface REQUIRED)
