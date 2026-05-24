@@ -60,6 +60,15 @@ namespace DisplayXR.Editor
 
         // Rendering rig
         private static RenderTexture s_AtlasRT;
+        // MSAA intermediate: eye cameras render here, then Blit-resolves into
+        // s_AtlasRT so all downstream consumers (bridge copy, screenshot,
+        // GameView overlay, native swapchain submit) keep the single-sampled
+        // contract. Null when QualitySettings.antiAliasing == 0; in that case
+        // cameras render directly to s_AtlasRT with no MSAA.
+        // Without this, silhouette edges land in s_AtlasRT with binary alpha
+        // (alpha=0 outside, alpha=1 inside, no fractional coverage), which
+        // shows up as visible aliasing in alpha-native transparent overlays.
+        private static RenderTexture s_AtlasMsaaRT;
         private static Texture2D s_AtlasBridgeTex; // Windows D3D12: cross-device bridge
         private static Camera[] s_EyeCams;
         private static GameObject s_RigRoot;
@@ -418,7 +427,10 @@ namespace DisplayXR.Editor
             {
                 s_FrameCount++;
 
-                // Render each eye into its tile within the atlas
+                // Render each eye into its tile within the atlas. Target the
+                // MSAA intermediate when available so silhouette edges get
+                // fractional alpha; resolved into s_AtlasRT below.
+                RenderTexture renderTarget = s_AtlasMsaaRT != null ? s_AtlasMsaaRT : s_AtlasRT;
                 for (int eye = 0; eye < nViews && eye < s_EyeCams.Length; eye++)
                 {
                     if (s_EyeCams[eye] == null) continue;
@@ -430,10 +442,16 @@ namespace DisplayXR.Editor
                     System.Array.Copy(viewMats, eye * 16, eyeView, 0, 16);
                     System.Array.Copy(projMats, eye * 16, eyeProj, 0, 16);
 
-                    RenderEyeToAtlas(s_EyeCams[eye], s_AtlasRT, eyeView, eyeProj,
+                    RenderEyeToAtlas(s_EyeCams[eye], renderTarget, eyeView, eyeProj,
                         (int)(tileX * s_ViewWidth), (int)(tileY * s_ViewHeight),
                         (int)s_ViewWidth, (int)s_ViewHeight);
                 }
+
+                // Resolve MSAA → single-sampled atlas. Graphics.Blit on an
+                // MSAA source performs the hardware resolve (averages all
+                // channels including alpha) before copying.
+                if (s_AtlasMsaaRT != null)
+                    Graphics.Blit(s_AtlasMsaaRT, s_AtlasRT);
 
                 // Atlas is fully rendered. Service screenshot capture / flash
                 // overlay before the bridge copy so any flash is visible on the
@@ -484,10 +502,26 @@ namespace DisplayXR.Editor
             Debug.Log($"[DisplayXR-SA] Creating atlas render rig: {s_AtlasWidth}x{s_AtlasHeight} " +
                 $"({s_ViewCount} views, {s_TileColumns}x{s_TileRows} tiles, {s_ViewWidth}x{s_ViewHeight} per view)");
 
-            // Create single atlas RenderTexture
+            // Create single atlas RenderTexture (single-sampled — submission target).
             s_AtlasRT = new RenderTexture((int)s_AtlasWidth, (int)s_AtlasHeight, 24, RenderTextureFormat.ARGB32);
             s_AtlasRT.name = "DisplayXR_SA_Atlas";
             s_AtlasRT.Create();
+
+            // MSAA intermediate for camera rasterization. Cameras rendering
+            // into a RenderTexture inherit its MSAA setting, NOT
+            // QualitySettings.antiAliasing or Camera.allowMSAA. Without an
+            // MSAA target here, silhouettes carry binary alpha — visible as
+            // aliasing in alpha-native transparent overlays.
+            int msaa = QualitySettings.antiAliasing > 0 ? QualitySettings.antiAliasing : 1;
+            if (msaa > 1)
+            {
+                var msaaDesc = new RenderTextureDescriptor(
+                    (int)s_AtlasWidth, (int)s_AtlasHeight, RenderTextureFormat.ARGB32, 24);
+                msaaDesc.msaaSamples = msaa;
+                s_AtlasMsaaRT = new RenderTexture(msaaDesc);
+                s_AtlasMsaaRT.name = "DisplayXR_SA_AtlasMSAA";
+                s_AtlasMsaaRT.Create();
+            }
 
             // Create hidden camera rig with N eye cameras
             s_RigRoot = new GameObject("DisplayXR_SA_Rig");
@@ -521,6 +555,8 @@ namespace DisplayXR.Editor
 
             if (s_AtlasRT != null) { s_AtlasRT.Release(); UnityEngine.Object.DestroyImmediate(s_AtlasRT); }
             s_AtlasRT = null;
+            if (s_AtlasMsaaRT != null) { s_AtlasMsaaRT.Release(); UnityEngine.Object.DestroyImmediate(s_AtlasMsaaRT); }
+            s_AtlasMsaaRT = null;
         }
 
         private static void CreateAtlasBridge()
