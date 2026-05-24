@@ -542,16 +542,24 @@ namespace DisplayXR
         public static readonly Color EyeGlyphNominal = new Color(0.9f, 0.85f, 0.3f, 0.7f);
     }
 
-    // Forces Scene-view repaints when the SA preview window's canvas rect
-    // changes, so the gizmo (virtual display rect + frustum + eye glyphs)
-    // tracks window drag/resize in real time. Without this, Scene view
-    // only repaints on user interaction → gizmo lags behind window edits.
-    // Cheap: polls a single native getter, no repaint when canvas is stable.
+    // Forces Scene View to repaint each editor frame while the SA preview
+    // is running in Edit Mode, so the gizmo (virtual display rect + frustum
+    // + eye glyphs) tracks window drag/resize in real time.
+    //
+    // Why: without this, Scene View only repaints on explicit invalidation
+    // or user interaction. During an SA preview drag/resize, the WndProc's
+    // capture-based SC_MOVE/SC_SIZE intercept floods Unity's main thread
+    // with WM_MOUSEMOVE messages, starving Scene View's repaint cycle —
+    // gizmo only catches up when the drag releases.
+    //
+    // Play Mode is intentionally excluded: Unity's play frame loop already
+    // drives continuous Scene View repaints, so the gizmo updates real-time
+    // there for free. Adding our own RepaintAll on top of that just adds
+    // contention with the teardown path (avoids re-entrant OnDrawGizmos
+    // triggering native reads while the SA session is mid-destroy).
     [UnityEditor.InitializeOnLoad]
     internal static class DisplayXRGizmoRepainter
     {
-        static DisplayXRGizmoHelpers.CanvasRect s_LastCanvas;
-
         static DisplayXRGizmoRepainter()
         {
             UnityEditor.EditorApplication.update += Tick;
@@ -559,11 +567,8 @@ namespace DisplayXR
 
         static void Tick()
         {
-            var c = DisplayXRGizmoHelpers.TryGetCanvasRect();
-            if (!c.isValid) return;
-            if (c.x == s_LastCanvas.x && c.y == s_LastCanvas.y &&
-                c.w == s_LastCanvas.w && c.h == s_LastCanvas.h) return;
-            s_LastCanvas = c;
+            if (Application.isPlaying) return;
+            if (!DisplayXRGizmoHelpers.IsSessionActive()) return;
             UnityEditor.SceneView.RepaintAll();
         }
     }
