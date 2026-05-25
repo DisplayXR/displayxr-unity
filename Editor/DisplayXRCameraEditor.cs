@@ -13,6 +13,7 @@ namespace DisplayXR.Editor
         private SerializedProperty m_IpdFactor;
         private SerializedProperty m_ParallaxFactor;
         private SerializedProperty m_InvConvergenceDistance;
+        private SerializedProperty m_PostProcessAntiAliasing;
         private SerializedProperty m_LogEyeTracking;
 
         void OnEnable()
@@ -21,6 +22,7 @@ namespace DisplayXR.Editor
             m_IpdFactor = serializedObject.FindProperty("ipdFactor");
             m_ParallaxFactor = serializedObject.FindProperty("parallaxFactor");
             m_InvConvergenceDistance = serializedObject.FindProperty("invConvergenceDistance");
+            m_PostProcessAntiAliasing = serializedObject.FindProperty("postProcessAntiAliasing");
             m_LogEyeTracking = serializedObject.FindProperty("logEyeTracking");
         }
 
@@ -64,6 +66,13 @@ namespace DisplayXR.Editor
                 EditorGUILayout.LabelField(" ", "(\u221E)");
             }
             EditorGUI.indentLevel--;
+
+            EditorGUILayout.Space();
+            EditorGUILayout.LabelField("Rendering", EditorStyles.boldLabel);
+            EditorGUILayout.PropertyField(m_PostProcessAntiAliasing,
+                new GUIContent("Post-Process AA (FXAA)",
+                    "Unity drops MSAA on the XR eye RT, so silhouettes alias. " +
+                    "FXAA restores soft edges post-resolve. Disable if not needed."));
 
             EditorGUILayout.Space();
             EditorGUILayout.PropertyField(m_LogEyeTracking);

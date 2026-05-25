@@ -41,6 +41,15 @@ namespace DisplayXR
                  "ignored when this is enabled.")]
         public bool foregroundOnlyClip = false;
 
+        [Header("Rendering")]
+
+        [Tooltip("Post-process FXAA on the eye render target. Unity drops MSAA on the XR " +
+                 "eye RT (submits sampleCount=1 and its resolve loses fractional alpha), so " +
+                 "silhouettes alias — most visibly in alpha-native transparent overlays. " +
+                 "FXAA restores soft edges post-resolve where MSAA/supersampling can't. " +
+                 "Disable if you don't need it.")]
+        public bool postProcessAntiAliasing = true;
+
         [Header("Debug")]
 
         [Tooltip("Show eye tracking status in the console.")]
@@ -48,6 +57,7 @@ namespace DisplayXR
 
         private DisplayXRFeature m_Feature;
         private Camera m_Camera;
+        private DisplayXRPostAA m_PostAA;
         // True when running under URP/HDRP. BiRP fires Camera.onPreRender; SRP doesn't,
         // so we route through RenderPipelineManager.beginCameraRendering instead.
         private bool m_UsingSRP;
@@ -62,6 +72,11 @@ namespace DisplayXR
             else
                 Camera.onPreRender += OnCameraPreRender;
             DisplayXRRigManager.Register(m_Camera);
+
+            // Post-process AA: Unity drops MSAA on the XR eye RT, so attach a
+            // (hidden, rig-managed) FXAA pass and mirror the toggle onto it.
+            m_PostAA = DisplayXRPostAA.Ensure(gameObject);
+            m_PostAA.enabled = postProcessAntiAliasing;
 #if !UNITY_EDITOR
             if (m_Feature == null)
             {
@@ -122,6 +137,10 @@ namespace DisplayXR
 
         void LateUpdate()
         {
+            // Keep the post-process AA pass tracking the toggle (inspector or
+            // runtime). Before the active-rig gate so every rig tracks its own flag.
+            if (m_PostAA != null) m_PostAA.enabled = postProcessAntiAliasing;
+
             // Only the active rig pushes tunables (prevents multi-rig conflicts)
             var active = DisplayXRRigManager.ActiveCamera;
             if (active != null && active != m_Camera) return;
