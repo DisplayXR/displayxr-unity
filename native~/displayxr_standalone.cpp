@@ -998,13 +998,24 @@ displayxr_standalone_start(const char *runtime_json_path)
 #endif
 
 	// --- Step 3: Create OpenXR instance ---
+#if defined(_WIN32)
+	// Enable the graphics extension matching the editor's API so the runtime
+	// accepts our session's graphics binding at xrCreateSession. Vulkan editor →
+	// XR_KHR_vulkan_enable; otherwise XR_KHR_D3D12_enable (which also serves a
+	// D3D11 editor via the atlas bridge). Without the right one here,
+	// xrGetVulkanGraphics*KHR don't resolve and xrCreateSession returns -7.
+	const char *win_gfx_enable = "XR_KHR_D3D12_enable";
+#if defined(ENABLE_VULKAN)
+	if (s_unity_gfx_api == 21 /* Vulkan */) win_gfx_enable = "XR_KHR_vulkan_enable";
+#endif
+#endif
 	const char *extensions[] = {
 		XR_EXT_DISPLAY_INFO_EXTENSION_NAME,
 #if defined(__APPLE__)
 		XR_KHR_METAL_ENABLE_EXTENSION_NAME,
 		XR_EXT_COCOA_WINDOW_BINDING_EXTENSION_NAME,
 #elif defined(_WIN32)
-		"XR_KHR_D3D12_enable",
+		win_gfx_enable,
 		XR_EXT_WIN32_WINDOW_BINDING_EXTENSION_NAME,
 #endif
 	};
