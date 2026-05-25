@@ -1280,14 +1280,28 @@ hooked_xrCreateSwapchain(XrSession session,
 	// the GPU to apply sRGB encoding a second time (double-gamma → on-display
 	// content is too dark). Downgrade sRGB color formats to their UNORM
 	// equivalents so the values land unchanged. Linear projects keep sRGB.
-	// This works for any graphics backend (D3D11, D3D12, Vulkan, Metal).
+	// The format numbering is graphics-API-specific: D3D uses DXGI_FORMAT,
+	// Vulkan uses VkFormat, so the sRGB→UNORM map must match the active
+	// backend (displayxr-unity#122 — Vulkan was previously missed, leaving
+	// Gamma projects dark on Vulkan).
 	XrSwapchainCreateInfo info = *createInfo;
 	DisplayXRState *st = displayxr_get_state();
 	if (!st->use_srgb_swapchain &&
 	    (info.usageFlags & XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT)) {
 		int64_t orig = info.format;
-		if      (info.format == 29) info.format = 28; // RGBA8 SRGB → UNORM
-		else if (info.format == 91) info.format = 87; // BGRA8 SRGB → UNORM
+#if defined(ENABLE_VULKAN)
+		if (s_backend_type == kBackendVulkan) {
+			// VkFormat sRGB → UNORM. Unity-on-Vulkan requests an sRGB
+			// swapchain (e.g. VK_FORMAT_B8G8R8A8_SRGB=50) even in Gamma mode.
+			if      (info.format == 43) info.format = 37; // R8G8B8A8_SRGB → R8G8B8A8_UNORM
+			else if (info.format == 50) info.format = 44; // B8G8R8A8_SRGB → B8G8R8A8_UNORM
+			else if (info.format == 58) info.format = 51; // A8B8G8R8_SRGB_PACK32 → _UNORM_PACK32
+		} else
+#endif
+		{
+			if      (info.format == 29) info.format = 28; // DXGI RGBA8 SRGB → UNORM
+			else if (info.format == 91) info.format = 87; // DXGI BGRA8 SRGB → UNORM
+		}
 		if (info.format != orig) {
 			displayxr_log("[DisplayXR] xrCreateSwapchain: Gamma-space override %lld → %lld\n",
 			    (long long)orig, (long long)info.format);
