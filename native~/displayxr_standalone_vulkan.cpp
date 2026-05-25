@@ -483,7 +483,13 @@ public:
 	void *get_atlas_bridge_unity_ptr() override
 	{
 #if defined(_WIN32)
-		return (void *)unity_bridge_image;
+		// Unity's Texture2D.CreateExternalTexture on Vulkan expects a POINTER to
+		// the VkImage handle — NOT the handle value (the way D3D passes the
+		// resource pointer). Passing the value makes Unity dereference the handle
+		// as an address inside RegisterNativeTextureWithParams → garbage VkImage →
+		// vkCreateImageView crashes in the driver. Return the address of the
+		// stable member (valid for the backend's lifetime).
+		return (void *)&unity_bridge_image;
 #else
 		return nullptr;
 #endif
