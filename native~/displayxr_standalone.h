@@ -45,6 +45,16 @@ DISPLAYXR_EXPORT void displayxr_standalone_set_log_callback(DisplayXRLogCallback
 /// @param unity_native_tex A native texture pointer from Unity.
 DISPLAYXR_EXPORT void displayxr_standalone_set_unity_device(void *unity_native_tex);
 
+/// (Windows only) Tell the standalone session which graphics API the Unity
+/// editor is running, so it can pick the matching backend. Values mirror
+/// UnityEngine.Rendering.GraphicsDeviceType / UnityGfxRenderer
+/// (Direct3D11 = 2, Direct3D12 = 18, Vulkan = 21). Vulkan selects the Vulkan
+/// standalone backend; anything else uses the D3D12 backend (which also bridges
+/// to a D3D11 editor). Must be called BEFORE displayxr_standalone_set_unity_device
+/// and displayxr_standalone_start(). No-op on non-Windows.
+/// @param api UnityGfxRenderer id of the editor's active graphics device.
+DISPLAYXR_EXPORT void displayxr_standalone_set_unity_graphics_api(int api);
+
 /// Get the atlas bridge texture opened on Unity's device (Windows only).
 /// Returns ID3D11Texture2D* if Unity is on D3D11, ID3D12Resource* if on D3D12.
 /// C# passes this to Texture2D.CreateExternalTexture and uses Graphics.CopyTexture

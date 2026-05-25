@@ -252,7 +252,25 @@ namespace DisplayXR.Editor
             DisplayXRNative.displayxr_standalone_set_log_callback(s_LogCallback);
 
 #if UNITY_EDITOR_WIN
-            // Pass Unity's D3D12 device to native for atlas bridge texture
+            // Tell native which editor graphics API we're on so it selects the
+            // matching standalone backend (Vulkan vs D3D12). Map Unity's
+            // GraphicsDeviceType to the UnityGfxRenderer ids the native side uses.
+            {
+                int gfxApi;
+                switch (SystemInfo.graphicsDeviceType)
+                {
+                    case UnityEngine.Rendering.GraphicsDeviceType.Vulkan:     gfxApi = 21; break;
+                    case UnityEngine.Rendering.GraphicsDeviceType.Direct3D12: gfxApi = 18; break;
+                    case UnityEngine.Rendering.GraphicsDeviceType.Direct3D11: gfxApi = 2;  break;
+                    default:                                                  gfxApi = -1; break;
+                }
+                try { DisplayXRNative.displayxr_standalone_set_unity_graphics_api(gfxApi); }
+                catch (System.EntryPointNotFoundException) { /* older cached DLL */ }
+            }
+
+            // Pass Unity's D3D11/D3D12 device to native for the atlas bridge.
+            // (No-op for the Vulkan backend, which obtains Unity's VkDevice via
+            // IUnityGraphicsVulkan in UnityPluginLoad; harmless to call here.)
             {
                 var tempRT = new RenderTexture(4, 4, 0, RenderTextureFormat.ARGB32);
                 tempRT.Create();

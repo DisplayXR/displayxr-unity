@@ -326,6 +326,15 @@ namespace DisplayXR
         public static extern void displayxr_standalone_set_unity_device(IntPtr unityNativeTex);
 
         /// <summary>
+        /// (Windows only) Tell native which graphics API the editor runs so it
+        /// picks the matching standalone backend (Vulkan vs D3D12). Values are
+        /// UnityGfxRenderer ids (D3D11=2, D3D12=18, Vulkan=21). Call BEFORE
+        /// displayxr_standalone_set_unity_device and displayxr_standalone_start().
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void displayxr_standalone_set_unity_graphics_api(int api);
+
+        /// <summary>
         /// (Windows D3D12 only) Get the atlas bridge texture opened on Unity's device.
         /// C# uses Graphics.CopyTexture to copy the atlas RT into this each frame.
         /// </summary>
