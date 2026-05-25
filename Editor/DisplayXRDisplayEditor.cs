@@ -14,6 +14,7 @@ namespace DisplayXR.Editor
         private SerializedProperty m_ParallaxFactor;
         private SerializedProperty m_PerspectiveFactor;
         private SerializedProperty m_VirtualDisplayHeight;
+        private SerializedProperty m_PostProcessAntiAliasing;
         private SerializedProperty m_LogEyeTracking;
 
         void OnEnable()
@@ -23,6 +24,7 @@ namespace DisplayXR.Editor
             m_ParallaxFactor = serializedObject.FindProperty("parallaxFactor");
             m_PerspectiveFactor = serializedObject.FindProperty("perspectiveFactor");
             m_VirtualDisplayHeight = serializedObject.FindProperty("virtualDisplayHeight");
+            m_PostProcessAntiAliasing = serializedObject.FindProperty("postProcessAntiAliasing");
             m_LogEyeTracking = serializedObject.FindProperty("logEyeTracking");
         }
 
@@ -71,6 +73,13 @@ namespace DisplayXR.Editor
                     EditorGUI.indentLevel--;
                 }
             }
+
+            EditorGUILayout.Space();
+            EditorGUILayout.LabelField("Rendering", EditorStyles.boldLabel);
+            EditorGUILayout.PropertyField(m_PostProcessAntiAliasing,
+                new GUIContent("Post-Process AA (FXAA)",
+                    "Unity drops MSAA on the XR eye RT, so silhouettes alias. " +
+                    "FXAA restores soft edges post-resolve. Disable if not needed."));
 
             EditorGUILayout.Space();
             EditorGUILayout.PropertyField(m_LogEyeTracking);
