@@ -5,6 +5,17 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.0] - 2026-05-25
+
+### Added
+- Rig-level post-process FXAA anti-aliasing pass (`DisplayXRPostAA`) with a `postProcessAntiAliasing` toggle on DisplayXRCamera/DisplayXRDisplay. (#121)
+
+### Fixed
+- Preview-path silhouette aliasing via MSAA intermediate atlas RT. (#120)
+
+### Changed
+- **Post-process anti-aliasing now defaults to ON on DisplayXR rigs.** Unity drops MSAA on the XR eye render target (submits sampleCount=1 on D3D12 and Vulkan), so the plugin applies an FXAA pass to restore soft edges. This is a behavior change for existing projects (an extra per-eye blit, negligible cost). Built-in Render Pipeline only — under URP/HDRP `OnRenderImage` does not fire and the pass is a no-op; disable per-rig via the inspector toggle if not wanted. (#121)
+
 ## [1.8.1] - 2026-05-23
 
 ### Fixed
