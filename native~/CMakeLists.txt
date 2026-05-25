@@ -37,6 +37,31 @@ else()
     get_target_property(OPENXR_INCLUDE_DIR OpenXR::Headers INTERFACE_INCLUDE_DIRECTORIES)
 endif()
 
+# --- Vulkan headers (Windows standalone backend, issue #124) ---
+# Header-only. We compile against these with VK_NO_PROTOTYPES and resolve every
+# entry point from vulkan-1.dll at runtime (displayxr_vk_loader.cpp), so there
+# is NO find_package(Vulkan), NO vulkan-1.lib link, and NO Vulkan SDK needed in
+# CI — and the shipped DLL keeps no hard dependency on vulkan-1.dll.
+if(WIN32)
+    find_package(VulkanHeaders QUIET)
+    if(VulkanHeaders_FOUND)
+        get_target_property(VULKAN_INCLUDE_DIR Vulkan::Headers INTERFACE_INCLUDE_DIRECTORIES)
+    else()
+        include(FetchContent)
+        FetchContent_Declare(
+            vulkan_headers
+            GIT_REPOSITORY https://github.com/KhronosGroup/Vulkan-Headers.git
+            GIT_TAG v1.3.280
+            GIT_SHALLOW TRUE
+        )
+        FetchContent_GetProperties(vulkan_headers)
+        if(NOT vulkan_headers_POPULATED)
+            FetchContent_Populate(vulkan_headers)
+        endif()
+        set(VULKAN_INCLUDE_DIR "${vulkan_headers_SOURCE_DIR}/include")
+    endif()
+endif()
+
 # --- Plugin sources ---
 set(SOURCES
     displayxr_hooks.cpp
@@ -56,6 +81,7 @@ set(SOURCES
     displayxr_standalone_vulkan.cpp
     displayxr_standalone_opengl.cpp
     displayxr_standalone_opengles.cpp
+    displayxr_vk_loader.cpp
     displayxr_window_space_ui.cpp
     display3d_view.c
     camera3d_view.c
@@ -85,8 +111,8 @@ endif()
 # user32 is required for SetLayeredWindowAttributes / WS_EX_LAYERED
 # (transparent overlay mode, issue #57).
 if(WIN32)
-    list(APPEND SOURCES displayxr_win32.c displayxr_gpu_preference.cpp)
-    list(APPEND HEADERS displayxr_win32.h)
+    list(APPEND SOURCES displayxr_win32.c displayxr_gpu_preference.cpp displayxr_unity_plugin.cpp)
+    list(APPEND HEADERS displayxr_win32.h displayxr_vk_loader.h)
     link_libraries(user32 d3d11 d3d12 dxgi)
 endif()
 
@@ -102,6 +128,15 @@ target_include_directories(displayxr_unity PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${OPENXR_INCLUDE_DIR}
 )
+
+# Vulkan headers + vendored Unity native-plugin interface headers (Windows
+# standalone Vulkan backend, issue #124).
+if(WIN32)
+    target_include_directories(displayxr_unity PRIVATE
+        ${VULKAN_INCLUDE_DIR}
+        ${CMAKE_CURRENT_SOURCE_DIR}/unity_pluginapi
+    )
+endif()
 
 # Symbol visibility
 if(MSVC)

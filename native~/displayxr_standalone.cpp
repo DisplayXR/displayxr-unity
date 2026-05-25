@@ -170,6 +170,34 @@ static StandaloneState s_sa = {};
 
 static StandaloneGraphicsBackend *s_sa_backend = nullptr;
 
+// Unity editor graphics API (UnityGfxRenderer: 2=D3D11, 18=D3D12, 21=Vulkan),
+// pushed from C# via displayxr_standalone_set_unity_graphics_api() before start.
+// -1 = unknown → default to the D3D12 backend on Windows (back-compat).
+static int s_unity_gfx_api = -1;
+
+// Pick + create the standalone graphics backend for this platform / editor
+// graphics API. Idempotent (no-op once created). A Vulkan editor selects the
+// Vulkan backend; otherwise the D3D12 backend, which also bridges to a D3D11
+// editor (so D3D11/D3D12 behavior is unchanged).
+static void
+ensure_sa_backend(void)
+{
+#if defined(__APPLE__)
+	if (!s_sa_backend)
+		s_sa_backend = create_standalone_metal_backend();
+#elif defined(_WIN32)
+	if (!s_sa_backend) {
+#if defined(ENABLE_VULKAN)
+		if (s_unity_gfx_api == 21 /* kUnityGfxRendererVulkan */) {
+			s_sa_backend = create_standalone_vulkan_backend();
+			fprintf(stderr, "[DisplayXR-SA] Using Vulkan standalone backend (editor on Vulkan)\n");
+		} else
+#endif
+			s_sa_backend = create_standalone_d3d12_backend();
+	}
+#endif
+}
+
 // ============================================================================
 // Log callback — routes native messages to Unity's Debug.Log
 // ============================================================================
@@ -504,8 +532,21 @@ create_atlas_swapchain(void)
 		if (formats[i] == 80) { format = 80; break; } // MTLPixelFormatBGRA8Unorm
 		if (formats[i] == 70) { format = 70; }         // MTLPixelFormatRGBA8Unorm
 #elif defined(_WIN32)
-		if (formats[i] == 28) { format = 28; break; }  // DXGI_FORMAT_R8G8B8A8_UNORM
-		if (formats[i] == 87) { format = 87; }          // DXGI_FORMAT_B8G8R8A8_UNORM
+#if defined(ENABLE_VULKAN)
+		if (s_unity_gfx_api == 21 /* Vulkan */) {
+			// Vulkan enumerates VkFormat, not DXGI codes. Prefer
+			// VK_FORMAT_R8G8B8A8_UNORM (37) (matches the atlas bridge image and
+			// C# RGBA32), then B8G8R8A8_UNORM (44). Avoid *_SRGB (43/50): the
+			// runtime weaves linearly, so an sRGB swapchain double-applies gamma
+			// (same downgrade the in-session hook does, #122).
+			if (formats[i] == 37) { format = 37; break; }
+			if (formats[i] == 44) { format = 44; }
+		} else
+#endif
+		{
+			if (formats[i] == 28) { format = 28; break; }  // DXGI_FORMAT_R8G8B8A8_UNORM
+			if (formats[i] == 87) { format = 87; }          // DXGI_FORMAT_B8G8R8A8_UNORM
+		}
 #endif
 	}
 	sa_log("[DisplayXR-SA] Selected swapchain format: %lld\n", format);
@@ -1013,13 +1054,7 @@ displayxr_standalone_start(const char *runtime_json_path)
 	sa_log("[DisplayXR-SA] System acquired\n");
 
 	// --- Step 5b: Create graphics device via backend ---
-#if defined(__APPLE__)
-	if (!s_sa_backend)
-		s_sa_backend = create_standalone_metal_backend();
-#elif defined(_WIN32)
-	if (!s_sa_backend)
-		s_sa_backend = create_standalone_d3d12_backend();
-#endif
+	ensure_sa_backend();
 	if (s_sa_backend) {
 		if (!s_sa_backend->create_device(s_sa.instance, s_sa.system_id, s_sa.gipa)) {
 			sa_log("[DisplayXR-SA] Backend create_device failed\n");
@@ -1143,26 +1178,42 @@ displayxr_standalone_start(const char *runtime_json_path)
 	metal_binding.next = &mac_binding;
 	session_ci.next = &metal_binding;
 #elif defined(_WIN32)
-	// D3D12 graphics binding (device + queue from backend)
-	XrGraphicsBindingD3D12KHR d3d12_binding = {};
-	d3d12_binding.type = XR_TYPE_GRAPHICS_BINDING_D3D12_KHR;
-	d3d12_binding.device = (ID3D12Device *)s_sa_backend->get_graphics_device();
-	d3d12_binding.queue = (ID3D12CommandQueue *)s_sa_backend->get_graphics_queue();
-
-	// Win32 window binding — pass the plugin-owned preview HWND.
-	// The runtime composites directly into this window.
+	// Win32 window binding — identical for both graphics APIs. The runtime
+	// composites the woven output directly into this plugin-owned HWND.
+	// Declared at function scope so it outlives the xrCreateSession call below.
 	XrWin32WindowBindingCreateInfoEXT win_binding = {};
 	win_binding.type = XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT;
 	win_binding.windowHandle = (void *)s_sa.preview_hwnd;
 	win_binding.readbackCallback = NULL;
 	win_binding.readbackUserdata = NULL;
 	win_binding.sharedTextureHandle = NULL;
-
 	sa_log("[DisplayXR-SA] Win32 binding: preview HWND=%p\n", (void *)s_sa.preview_hwnd);
 
-	// Chain: session_ci → d3d12_binding → win_binding
-	d3d12_binding.next = &win_binding;
-	session_ci.next = &d3d12_binding;
+	XrGraphicsBindingD3D12KHR d3d12_binding = {}; // kept in scope for create_session
+#if defined(ENABLE_VULKAN)
+	if (s_unity_gfx_api == 21 /* Vulkan */) {
+		// Vulkan graphics binding (XrGraphicsBindingVulkanKHR) is built by the
+		// backend; chain the window binding after it. All XR graphics bindings
+		// share the {type, next, ...} header, so we set .next via the base
+		// struct (same technique as win32_inject_window_binding).
+		const void *vk_binding = s_sa_backend->build_session_binding(nullptr, nullptr);
+		if (vk_binding) {
+			((XrBaseOutStructure *)const_cast<void *>(vk_binding))->next =
+			    (XrBaseOutStructure *)&win_binding;
+			session_ci.next = vk_binding;
+		} else {
+			sa_log("[DisplayXR-SA] Vulkan build_session_binding returned null\n");
+		}
+	} else
+#endif
+	{
+		// D3D12 graphics binding (device + queue from backend)
+		d3d12_binding.type = XR_TYPE_GRAPHICS_BINDING_D3D12_KHR;
+		d3d12_binding.device = (ID3D12Device *)s_sa_backend->get_graphics_device();
+		d3d12_binding.queue = (ID3D12CommandQueue *)s_sa_backend->get_graphics_queue();
+		d3d12_binding.next = &win_binding;
+		session_ci.next = &d3d12_binding;
+	}
 #endif
 
 	result = s_sa.pfn_create_session(s_sa.instance, &session_ci, &s_sa.session);
@@ -1873,12 +1924,19 @@ displayxr_standalone_get_canvas_rect(int32_t *out_x, int32_t *out_y,
 
 
 void
+displayxr_standalone_set_unity_graphics_api(int api)
+{
+	s_unity_gfx_api = api;
+	ensure_sa_backend(); // create the matching backend up front
+}
+
+void
 displayxr_standalone_set_unity_device(void *unity_native_tex)
 {
 #if defined(_WIN32)
-	if (!s_sa_backend)
-		s_sa_backend = create_standalone_d3d12_backend();
-	s_sa_backend->set_unity_device(unity_native_tex);
+	ensure_sa_backend();
+	if (s_sa_backend)
+		s_sa_backend->set_unity_device(unity_native_tex);
 #else
 	(void)unity_native_tex;
 #endif
