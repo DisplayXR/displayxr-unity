@@ -5,6 +5,16 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.10.0] - 2026-05-26
+
+### Added
+- Vulkan rendering backend for Windows, including a Vulkan editor standalone-preview backend. (#122, #124)
+
+### Fixed
+- Vulkan: correct dark-image/gamma via VkFormat sRGB→UNORM downgrade. (#122)
+- Vulkan: standalone-session binding + CreateExternalTexture handle on the Vulkan editor path. (#124)
+- Build post-process tolerates a locked app-icon file (DisplayXR Shell holds icons open) instead of failing.
+
 ## [1.9.0] - 2026-05-25
 
 ### Added
