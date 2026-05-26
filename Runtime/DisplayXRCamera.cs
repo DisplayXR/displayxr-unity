@@ -62,9 +62,6 @@ namespace DisplayXR
         // so we route through RenderPipelineManager.beginCameraRendering instead.
         private bool m_UsingSRP;
 
-        static readonly int k_ClipPointId = Shader.PropertyToID("_DXRClipPoint");
-        const string k_ClipKeyword = "_DXR_FOREGROUND_CLIP";
-
 #if UNITY_EDITOR
         void OnValidate()
         {
@@ -127,11 +124,6 @@ namespace DisplayXR
             cam.SetStereoViewMatrix(Camera.StereoscopicEye.Right, rightView);
             cam.SetStereoProjectionMatrix(Camera.StereoscopicEye.Left, leftProj);
             cam.SetStereoProjectionMatrix(Camera.StereoscopicEye.Right, rightProj);
-
-            // Push the foreground clip point from the SAME fresh matrices this
-            // frame's render uses (not LateUpdate — that lagged a frame and
-            // mis-clipped while moving). See PushForegroundClipFar.
-            PushForegroundClipFar(leftView, leftProj, rightView, rightProj);
         }
 
         /// <summary>Negate column 2 (Z) of a view matrix to convert OpenXR → Unity world handedness.</summary>
@@ -203,9 +195,6 @@ namespace DisplayXR
 
             m_Feature.RefreshEyePositions();
 
-            // (Foreground clip is pushed from OnCameraPreRender with fresh
-            // per-frame matrices — see PushForegroundClipFar.)
-
             if (logEyeTracking)
             {
                 Debug.Log($"[DisplayXR] Eyes: L={m_Feature.LeftEyePosition}, " +
@@ -213,41 +202,6 @@ namespace DisplayXR
                           $" camPos={transform.position} fov={m_CachedCameraFov:F1}" +
                           $" invd={invConvergenceDistance:F4}");
             }
-        }
-
-        // Push a world point on the convergence plane for clip-capable materials
-        // (DisplayXR/ForegroundClip), from the per-eye view matrices + fars of
-        // THIS frame's render (passed in from OnCameraPreRender — Unity
-        // convention, already FlipViewZ'd). A point on it is fL/fR in front of
-        // each eye along its view forward; both lie on the same plane (shared
-        // orientation), so the shader's per-eye view-depth comparison cuts
-        // identically for every eye — coincident, no averaging, no eye index.
-        // URP-only — under BiRP the native far clips.
-        void PushForegroundClipFar(Matrix4x4 leftViewUnity, Matrix4x4 leftProj,
-                                   Matrix4x4 rightViewUnity, Matrix4x4 rightProj)
-        {
-            if (m_UsingSRP && foregroundOnlyClip)
-            {
-                float fL = FarOf(leftProj), fR = FarOf(rightProj);
-                if (fL > 0f && fR > 0f)
-                {
-                    Vector3 pL = leftViewUnity.inverse.MultiplyPoint3x4(new Vector3(0f, 0f, -fL));
-                    Vector3 pR = rightViewUnity.inverse.MultiplyPoint3x4(new Vector3(0f, 0f, -fR));
-                    Vector3 p = 0.5f * (pL + pR);
-                    Shader.SetGlobalVector(k_ClipPointId, new Vector4(p.x, p.y, p.z, 0f));
-                    Shader.EnableKeyword(k_ClipKeyword);
-                    return;
-                }
-            }
-            Shader.DisableKeyword(k_ClipKeyword);
-        }
-
-        // Far plane (view-space distance) of the native OpenGL-convention
-        // projection: f = m23 / (m22 + 1).
-        static float FarOf(Matrix4x4 p)
-        {
-            float d = p.m22 + 1f;
-            return Mathf.Abs(d) < 1e-6f ? -1f : p.m23 / d;
         }
 
 #if UNITY_EDITOR
