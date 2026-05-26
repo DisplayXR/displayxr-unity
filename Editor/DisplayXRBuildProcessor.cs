@@ -281,9 +281,9 @@ namespace DisplayXR.Editor
         /// </summary>
         private static bool ExportTexture(Texture2D source, string destPath)
         {
+            byte[] png;
             try
             {
-                byte[] png;
                 if (source.isReadable)
                 {
                     png = source.EncodeToPNG();
@@ -303,18 +303,90 @@ namespace DisplayXR.Editor
                     png = readable.EncodeToPNG();
                     UnityEngine.Object.DestroyImmediate(readable);
                 }
-
-                if (png == null || png.Length == 0)
-                    return false;
-
-                File.WriteAllBytes(destPath, png);
-                return true;
             }
             catch (System.Exception e)
             {
-                Debug.LogWarning($"DisplayXR: Failed to export icon to {destPath}: {e.Message}");
+                Debug.LogWarning($"DisplayXR: Failed to encode icon for {destPath}: {e.Message}");
                 return false;
             }
+
+            if (png == null || png.Length == 0)
+                return false;
+
+            return WriteBytesTolerant(destPath, png);
+        }
+
+        /// <summary>
+        /// Write bytes to a path, tolerating the file being held open by another
+        /// process. The DisplayXR Shell keeps registered app icons open to draw
+        /// its launcher tiles, so rebuilding while the Shell is running hits a
+        /// sharing violation on the icon. Skip the write when the content is
+        /// unchanged (the common rebuild case) so we never touch the locked
+        /// file; otherwise retry briefly to ride out a transient lock.
+        /// </summary>
+        private static bool WriteBytesTolerant(string destPath, byte[] bytes)
+        {
+            // Unchanged content → nothing to do. Read with shared access so a
+            // viewer that has the file open for reading doesn't block us.
+            try
+            {
+                if (File.Exists(destPath))
+                {
+                    byte[] existing;
+                    using (var fs = new FileStream(destPath, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                    {
+                        existing = new byte[fs.Length];
+                        int read = 0;
+                        while (read < existing.Length)
+                        {
+                            int n = fs.Read(existing, read, existing.Length - read);
+                            if (n <= 0) break;
+                            read += n;
+                        }
+                    }
+                    if (existing.Length == bytes.Length && ByteArraysEqual(existing, bytes))
+                        return true;
+                }
+            }
+            catch
+            {
+                // Couldn't compare (e.g. locked for read too) — fall through and
+                // attempt the write/retry path below.
+            }
+
+            const int maxAttempts = 5;
+            for (int attempt = 1; attempt <= maxAttempts; attempt++)
+            {
+                try
+                {
+                    File.WriteAllBytes(destPath, bytes);
+                    return true;
+                }
+                catch (IOException e)
+                {
+                    if (attempt == maxAttempts)
+                    {
+                        Debug.LogWarning($"DisplayXR: Could not write icon to {destPath} after {maxAttempts} attempts " +
+                                         $"(likely held open by the running DisplayXR Shell): {e.Message}. " +
+                                         "Keeping the existing icon; close the Shell and rebuild to refresh it.");
+                        return false;
+                    }
+                    System.Threading.Thread.Sleep(120);
+                }
+                catch (System.Exception e)
+                {
+                    Debug.LogWarning($"DisplayXR: Failed to write icon to {destPath}: {e.Message}");
+                    return false;
+                }
+            }
+            return false;
+        }
+
+        private static bool ByteArraysEqual(byte[] a, byte[] b)
+        {
+            for (int i = 0; i < a.Length; i++)
+                if (a[i] != b[i]) return false;
+            return true;
         }
 
         /// <summary>JSON-escape a string value with surrounding quotes.</summary>
