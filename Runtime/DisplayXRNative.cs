@@ -335,6 +335,16 @@ namespace DisplayXR
         public static extern void displayxr_standalone_set_unity_graphics_api(int api);
 
         /// <summary>
+        /// (Windows only) Opt into shared-texture mode (issue #131): the plugin
+        /// allocates a panel-size shared output texture, binds it at session
+        /// create so the runtime weaves into it, and presents it each frame.
+        /// Required for 2D surround. Default off (handle mode — runtime presents).
+        /// Call BEFORE displayxr_standalone_start(); effective at next start.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void displayxr_standalone_set_shared_texture_mode(int enable);
+
+        /// <summary>
         /// (Windows D3D12 only) Get the atlas bridge texture opened on Unity's device.
         /// C# uses Graphics.CopyTexture to copy the atlas RT into this each frame.
         /// </summary>

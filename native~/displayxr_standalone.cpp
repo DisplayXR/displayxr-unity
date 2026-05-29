@@ -148,7 +148,17 @@ typedef struct StandaloneState {
 	int32_t canvas_x;
 	int32_t canvas_y;
 	int has_display_mode_ext;
+
+	// Shared-texture mode (issue #131): resolved runtime state, set during
+	// start. 1 only if the mode was requested (s_shared_texture_mode_requested,
+	// a static that survives the start-time memset of s_sa) AND the backend
+	// produced a shared handle (non-D3D12 backends return null → handle-mode
+	// fallback). When active, the runtime weaves into our shared output texture
+	// and we present it via the backend's fw_* swapchain; default off = handle
+	// mode (runtime presents), preserved bit-for-bit.
+	int shared_texture_active;
 #if defined(_WIN32)
+	int fw_created;     // 1 once the plugin-side present swapchain is created
 	int window_closed;  // Set to 1 when user closes the preview window
 	// Mouse button state tracked by sa_wndproc for the C# input controller
 	// (Unity's new Input System doesn't see our preview window's clicks).
@@ -174,6 +184,11 @@ static StandaloneGraphicsBackend *s_sa_backend = nullptr;
 // pushed from C# via displayxr_standalone_set_unity_graphics_api() before start.
 // -1 = unknown → default to the D3D12 backend on Windows (back-compat).
 static int s_unity_gfx_api = -1;
+
+// Shared-texture mode request (issue #131), pushed from C# before start. Kept
+// outside s_sa so it survives the memset(&s_sa, ...) at the top of start. Read
+// at session create to decide whether to allocate + bind the shared texture.
+static int s_shared_texture_mode_requested = 0;
 
 // Pick + create the standalone graphics backend for this platform / editor
 // graphics API. Idempotent (no-op once created). A Vulkan editor selects the
@@ -1192,13 +1207,39 @@ displayxr_standalone_start(const char *runtime_json_path)
 	// Win32 window binding — identical for both graphics APIs. The runtime
 	// composites the woven output directly into this plugin-owned HWND.
 	// Declared at function scope so it outlives the xrCreateSession call below.
+	// Shared-texture mode (issue #131): allocate a panel-size shared output
+	// texture and hand its NT handle to the runtime so it weaves into the
+	// texture instead of presenting to the HWND. We then present it ourselves
+	// (fw_* swapchain) after each xrEndFrame. get_shared_handle() returns null
+	// on backends that don't implement it (D3D11/Metal/Vulkan today) → we fall
+	// back to handle mode so the flag is a safe no-op there.
+	void *shared_handle = NULL;
+	s_sa.shared_texture_active = 0;
+	if (s_shared_texture_mode_requested && s_sa_backend) {
+		if (s_sa_backend->create_shared_texture(
+		        s_sa.display_info.display_pixel_width,
+		        s_sa.display_info.display_pixel_height)) {
+			shared_handle = s_sa_backend->get_shared_handle();
+		}
+		if (shared_handle) {
+			s_sa.shared_texture_active = 1;
+			sa_log("[DisplayXR-SA] Shared-texture mode ACTIVE: %ux%u handle=%p\n",
+			    s_sa.display_info.display_pixel_width,
+			    s_sa.display_info.display_pixel_height, shared_handle);
+		} else {
+			sa_log("[DisplayXR-SA] Shared-texture mode requested but backend "
+			    "produced no shared handle — falling back to handle mode\n");
+		}
+	}
+
 	XrWin32WindowBindingCreateInfoEXT win_binding = {};
 	win_binding.type = XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT;
 	win_binding.windowHandle = (void *)s_sa.preview_hwnd;
 	win_binding.readbackCallback = NULL;
 	win_binding.readbackUserdata = NULL;
-	win_binding.sharedTextureHandle = NULL;
-	sa_log("[DisplayXR-SA] Win32 binding: preview HWND=%p\n", (void *)s_sa.preview_hwnd);
+	win_binding.sharedTextureHandle = shared_handle; // NULL = handle mode (runtime presents)
+	sa_log("[DisplayXR-SA] Win32 binding: preview HWND=%p sharedTex=%p\n",
+	    (void *)s_sa.preview_hwnd, shared_handle);
 
 	XrGraphicsBindingD3D12KHR d3d12_binding = {}; // kept in scope for create_session
 #if defined(ENABLE_VULKAN)
@@ -1276,6 +1317,16 @@ displayxr_standalone_stop(void)
 
 	wsui_standalone_on_session_destroyed(s_sa.pfn_destroy_swapchain);
 	destroy_atlas_swapchain();
+
+#if defined(_WIN32)
+	// Tear down the shared-texture-mode present swapchain (must happen before
+	// the backend releases its device in destroy()). No-op if never created.
+	if (s_sa.fw_created && s_sa_backend) {
+		s_sa_backend->fw_destroy_swapchain();
+	}
+	s_sa.fw_created = 0;
+	s_sa.shared_texture_active = 0;
+#endif
 
 	if (s_sa.local_space != XR_NULL_HANDLE && s_sa.pfn_destroy_space) {
 		s_sa.pfn_destroy_space(s_sa.local_space);
@@ -1623,6 +1674,26 @@ displayxr_standalone_submit_frame_atlas(void *atlas_tex)
 	end_info.layers = layers;
 
 	s_sa.pfn_end_frame(s_sa.session, &end_info);
+
+#if defined(_WIN32)
+	// Shared-texture mode (issue #131): the runtime wove into our shared output
+	// texture during xrEndFrame above (rather than presenting to the HWND), so
+	// present it to the preview window ourselves. Lazily create the present
+	// swapchain at panel dims — DXGI stretches it to the window client area, so
+	// no WM_SIZE reallocation is needed. Skipped in handle mode (runtime presents).
+	if (s_sa.shared_texture_active && s_sa_backend) {
+		uint32_t pw = s_sa.display_info.display_pixel_width;
+		uint32_t ph = s_sa.display_info.display_pixel_height;
+		if (!s_sa.fw_created && s_sa.preview_hwnd && pw > 0 && ph > 0) {
+			if (s_sa_backend->fw_create_swapchain((void *)s_sa.preview_hwnd, pw, ph)) {
+				s_sa.fw_created = 1;
+				sa_log("[DisplayXR-SA] Present swapchain created %ux%u\n", pw, ph);
+			}
+		}
+		if (s_sa.fw_created)
+			s_sa_backend->fw_present(pw, ph);
+	}
+#endif
 	return 1;
 }
 
@@ -1939,6 +2010,17 @@ displayxr_standalone_set_unity_graphics_api(int api)
 {
 	s_unity_gfx_api = api;
 	ensure_sa_backend(); // create the matching backend up front
+}
+
+void
+displayxr_standalone_set_shared_texture_mode(int enable)
+{
+	// Must be called BEFORE displayxr_standalone_start — the flag is read at
+	// session create to decide whether to allocate + bind the shared output
+	// texture. Changing it mid-session has no effect until the next start.
+	s_shared_texture_mode_requested = enable ? 1 : 0;
+	sa_log("[DisplayXR-SA] shared_texture_mode = %d (effective at next start)\n",
+	    s_shared_texture_mode_requested);
 }
 
 void

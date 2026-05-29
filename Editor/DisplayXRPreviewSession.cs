@@ -96,6 +96,12 @@ namespace DisplayXR.Editor
         private static Camera s_SelectedSourceCamera;
         public static Camera SelectedCamera => s_SelectedSourceCamera;
 
+        /// <summary>
+        /// EditorPrefs key for the shared-texture-mode toggle (issue #131).
+        /// Read before start; the Preview Window exposes the toggle. Default off.
+        /// </summary>
+        public const string SharedTextureModePrefKey = "DisplayXR_SA_SharedTextureMode";
+
         // SessionState survives domain reload (unlike static fields)
         private const string kPlayModeStartedKey = "DisplayXR_SA_StartedByPlayMode";
         private const string kXRWasEnabledKey = "DisplayXR_SA_XRWasEnabled";
@@ -277,6 +283,16 @@ namespace DisplayXR.Editor
                 DisplayXRNative.displayxr_standalone_set_unity_device(tempRT.GetNativeTexturePtr());
                 tempRT.Release();
                 UnityEngine.Object.DestroyImmediate(tempRT);
+            }
+
+            // Shared-texture mode (issue #131) — opt-in, default off. When on,
+            // the runtime weaves into a plugin-allocated shared texture and the
+            // plugin presents it; required for 2D surround. Read from EditorPrefs
+            // so the Preview Window toggle controls it; pushed before start.
+            {
+                bool sharedTex = UnityEditor.EditorPrefs.GetBool(SharedTextureModePrefKey, false);
+                try { DisplayXRNative.displayxr_standalone_set_shared_texture_mode(sharedTex ? 1 : 0); }
+                catch (System.EntryPointNotFoundException) { /* older cached DLL */ }
             }
 #endif
 

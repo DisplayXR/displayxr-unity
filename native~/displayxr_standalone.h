@@ -55,6 +55,13 @@ DISPLAYXR_EXPORT void displayxr_standalone_set_unity_device(void *unity_native_t
 /// @param api UnityGfxRenderer id of the editor's active graphics device.
 DISPLAYXR_EXPORT void displayxr_standalone_set_unity_graphics_api(int api);
 
+/// Opt into shared-texture mode (issue #131). When enabled, the plugin
+/// allocates a panel-size shared output texture and binds it at session create
+/// so the runtime weaves into it; the plugin then presents it each frame.
+/// Required for 2D surround. Default off (handle mode — runtime presents).
+/// Must be called BEFORE displayxr_standalone_start(); effective at next start.
+DISPLAYXR_EXPORT void displayxr_standalone_set_shared_texture_mode(int enable);
+
 /// Get the atlas bridge texture opened on Unity's device (Windows only).
 /// Returns ID3D11Texture2D* if Unity is on D3D11, ID3D12Resource* if on D3D12.
 /// C# passes this to Texture2D.CreateExternalTexture and uses Graphics.CopyTexture

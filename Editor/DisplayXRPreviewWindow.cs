@@ -197,6 +197,25 @@ namespace DisplayXR.Editor
 
             m_AutoRefresh = GUILayout.Toggle(m_AutoRefresh, "Auto Refresh",
                 EditorStyles.toolbarButton, GUILayout.Width(100));
+
+            // Shared-texture mode (issue #131). Opt-in; takes effect at next
+            // Start (handle vs shared-texture is decided at session create), so
+            // toggling while running just stages the change. Required for 2D
+            // surround. Default off → current handle-mode behavior.
+            {
+                bool cur = EditorPrefs.GetBool(
+                    DisplayXRPreviewSession.SharedTextureModePrefKey, false);
+                bool next = GUILayout.Toggle(cur,
+                    new GUIContent("Shared Tex (#131)",
+                        "Shared-texture mode: runtime weaves into a plugin-allocated " +
+                        "texture and the plugin presents it. Required for 2D surround. " +
+                        "Applies at next Start."),
+                    EditorStyles.toolbarButton, GUILayout.Width(120));
+                if (next != cur)
+                    EditorPrefs.SetBool(
+                        DisplayXRPreviewSession.SharedTextureModePrefKey, next);
+            }
+
             GUILayout.FlexibleSpace();
 
             // Status indicator
