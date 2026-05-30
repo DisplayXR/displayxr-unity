@@ -389,6 +389,19 @@ public:
 
 		// Clamp the copy box to both resources' actual dimensions.
 		D3D12_RESOURCE_DESC src_desc = src->GetDesc();
+		// One-shot diagnostic: the Unity RT format/size we're copying from vs the
+		// surround texture (#131 no-bubble debugging). A format that isn't
+		// copy-compatible with R8G8B8A8_UNORM, or a smaller-than-expected size,
+		// would leave the surround texture (and thus the bubble) blank.
+		static int s_surr_copy_diag = 0;
+		if (!s_surr_copy_diag) {
+			s_surr_copy_diag = 1;
+			displayxr_log("[DisplayXR] surround COPY DIAG: unity_rt fmt=%u %llux%u -> "
+			    "surround fmt=%u %ux%u\n",
+			    (unsigned)src_desc.Format, (unsigned long long)src_desc.Width,
+			    (unsigned)src_desc.Height,
+			    (unsigned)DXGI_FORMAT_R8G8B8A8_UNORM, surround_w, surround_h);
+		}
 		uint32_t copy_w = w, copy_h = h;
 		if ((uint32_t)src_desc.Width  < copy_w) copy_w = (uint32_t)src_desc.Width;
 		if (surround_w < copy_w) copy_w = surround_w;

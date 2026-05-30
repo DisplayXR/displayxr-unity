@@ -1145,8 +1145,23 @@ hooked_xrEndFrame(XrSession session, const XrFrameEndInfo *frameEndInfo)
 		if (s_backend->surround_update(s_surround_unity_tex,
 		        s_surround_w, s_surround_h, &tex_h, &fence_h, &await_val) &&
 		    tex_h && fence_h) {
-			s_pfn_set_surround_fence(session, tex_h, s_surround_w, s_surround_h,
-			                         fence_h, await_val);
+			XrResult sr = s_pfn_set_surround_fence(session, tex_h, s_surround_w,
+			                  s_surround_h, fence_h, await_val);
+			// One-shot diagnostic: the runtime SKIPS the surround blit unless the
+			// surround dims exactly match the weave target (the HWND client area).
+			// Log both so we can see a mismatch (#131 no-bubble debugging).
+			static int s_surround_diag = 0;
+			if (!s_surround_diag) {
+				s_surround_diag = 1;
+				DisplayXRState *st = displayxr_get_state();
+				RECT rc = {0, 0, 0, 0};
+				if (st && st->window_handle)
+					GetClientRect((HWND)st->window_handle, &rc);
+				displayxr_log("[DisplayXR] surround DIAG: registered=%ux%u "
+				    "set_surround_fence=%d HWND=%p client=%ldx%ld\n",
+				    s_surround_w, s_surround_h, (int)sr, st ? st->window_handle : nullptr,
+				    (long)(rc.right - rc.left), (long)(rc.bottom - rc.top));
+			}
 		}
 	}
 
@@ -2047,4 +2062,26 @@ displayxr_set_canvas_rect(int32_t x, int32_t y, uint32_t w, uint32_t h)
 	if (s_pfn_set_output_rect && s_session != XR_NULL_HANDLE)
 		s_pfn_set_output_rect(s_session, x, y, w, h);
 	displayxr_log("[DisplayXR] set_canvas_rect: (%d,%d) %ux%u\n", x, y, w, h);
+}
+
+DISPLAYXR_EXPORT void
+displayxr_get_render_target_size(uint32_t *out_w, uint32_t *out_h)
+{
+	// The runtime weaves into the bound HWND's client area, which on Leia SR is
+	// NOT the display panel size (the SR weaver oversizes/crops the window for
+	// lenticular phase alignment). 2D surround + canvas sub-rect must be sized in
+	// THESE pixels, not the display panel dims (#131). Returns 0x0 if no window.
+	uint32_t w = 0, h = 0;
+#if defined(_WIN32)
+	DisplayXRState *state = displayxr_get_state();
+	if (state && state->window_handle) {
+		RECT rc = {0, 0, 0, 0};
+		if (GetClientRect((HWND)state->window_handle, &rc)) {
+			w = (uint32_t)(rc.right - rc.left);
+			h = (uint32_t)(rc.bottom - rc.top);
+		}
+	}
+#endif
+	if (out_w) *out_w = w;
+	if (out_h) *out_h = h;
 }
