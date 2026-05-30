@@ -52,6 +52,17 @@ Shader "Hidden/DisplayXR/Silhouette"
                 v2f o;
                 float4 worldPos = mul(unity_ObjectToWorld, v.vertex);
                 o.pos = mul(_DXRViewProj, worldPos);
+                // Pin clip-space z to mid-frustum (z = 0.5w → z_ndc = 0.5,
+                // inside both D3D [0,1] and GL [-1,1] ranges) so the
+                // projection's near/far planes never clip foreground/back
+                // geometry out of the mask. _DXRViewProj bakes in near=0.05/
+                // far=100 (the cached Kooima matrices), which are TIGHTER than
+                // the camera's actual render clip — without this, the tiger's
+                // closest parts (cheek, arm) get sliced into wedge-shaped
+                // click-through holes that the woven render doesn't have. The
+                // mask only needs x/y coverage; depth is irrelevant here
+                // (ZTest Always, no depth buffer), so overriding z is safe.
+                o.pos.z = o.pos.w * 0.5;
                 return o;
             }
 
