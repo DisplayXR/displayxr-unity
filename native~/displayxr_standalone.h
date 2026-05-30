@@ -75,6 +75,24 @@ DISPLAYXR_EXPORT void displayxr_standalone_get_wsui_bridge_texture(
     uint32_t width, uint32_t height,
     void **native_ptr, uint32_t *out_width, uint32_t *out_height);
 
+/// (#131) Get the 2D surround bridge texture for the standalone session.
+/// Native lazily creates a SHARED RGBA8 surround texture + SHARED fence on the
+/// SA device and opens the texture on Unity's device; returns the Unity-side
+/// pointer. C# wraps it (CreateExternalTexture) and Graphics.CopyTexture's its
+/// 2D RT into it each frame; the submit path signals + registers it.
+DISPLAYXR_EXPORT void displayxr_standalone_get_surround_bridge_texture(
+    uint32_t width, uint32_t height,
+    void **native_ptr, uint32_t *out_width, uint32_t *out_height);
+
+/// (#131) Enable/disable the 2D surround for the standalone session and set the
+/// 3D canvas sub-rect (window-client pixels) it surrounds.
+DISPLAYXR_EXPORT void displayxr_standalone_surround_set_active(
+    int active, int32_t subrect_x, int32_t subrect_y,
+    uint32_t subrect_w, uint32_t subrect_h);
+
+/// (#131) Clear the 2D surround: unregister, drop the sub-rect, release bridge.
+DISPLAYXR_EXPORT void displayxr_standalone_surround_clear(void);
+
 /// Start a standalone OpenXR session for editor preview.
 /// Loads the runtime from the JSON manifest, creates instance/session,
 /// and opens a native preview window for compositor output.

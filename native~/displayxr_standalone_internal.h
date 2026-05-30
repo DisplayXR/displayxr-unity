@@ -216,6 +216,18 @@ public:
 	virtual void wsui_create_bridge(uint32_t /*w*/, uint32_t /*h*/) {}
 	virtual void wsui_destroy_bridge() {}
 	virtual void *wsui_get_bridge_unity_ptr() { return nullptr; }
+
+	// 2D surround (issue #131) — like the wsui bridge but registered with the
+	// runtime via xrSetSharedTextureSurround2DFenceEXT (not copied to a
+	// swapchain). Allocates a SHARED RGBA8 surround texture on the SA device,
+	// opens it on Unity's device (C# renders the 2D content into it), and a
+	// SHARED ID3D12Fence. surround_signal() bumps + signals the fence on the SA
+	// queue and returns the NT handles + value for registration.
+	virtual void surround_create_bridge(uint32_t /*w*/, uint32_t /*h*/) {}
+	virtual void surround_destroy_bridge() {}
+	virtual void *surround_get_bridge_unity_ptr() { return nullptr; }
+	virtual bool surround_signal(void ** /*out_tex_handle*/,
+	    void ** /*out_fence_handle*/, uint64_t * /*out_value*/) { return false; }
 };
 
 // Factory functions (defined in the backend .cpp files)

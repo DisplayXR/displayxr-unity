@@ -382,6 +382,31 @@ namespace DisplayXR
             uint width, uint height,
             out IntPtr nativePtr, out uint outWidth, out uint outHeight);
 
+        /// <summary>
+        /// (#131, Windows D3D12) Get the 2D surround bridge texture for the
+        /// standalone session (Editor Preview / Play Mode). Native creates a
+        /// SHARED RGBA8 surround texture + fence on the SA device and opens the
+        /// texture on Unity's device. C# wraps it (CreateExternalTexture) and
+        /// Graphics.CopyTexture's its 2D RT into it each frame; the submit path
+        /// signals + registers it. IntPtr.Zero if no SA session / not D3D12.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void displayxr_standalone_get_surround_bridge_texture(
+            uint width, uint height,
+            out IntPtr nativePtr, out uint outWidth, out uint outHeight);
+
+        /// <summary>
+        /// (#131) Enable/disable the 2D surround for the standalone session and
+        /// set the 3D canvas sub-rect (window-client pixels) it surrounds.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void displayxr_standalone_surround_set_active(
+            int active, int subrectX, int subrectY, uint subrectW, uint subrectH);
+
+        /// <summary>(#131) Clear the standalone 2D surround.</summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void displayxr_standalone_surround_clear();
+
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern int displayxr_standalone_start(
             [MarshalAs(UnmanagedType.LPStr)] string runtimeJsonPath);
