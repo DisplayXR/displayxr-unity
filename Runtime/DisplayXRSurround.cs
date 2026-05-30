@@ -76,14 +76,19 @@ namespace DisplayXR
         {
             m_Canvas = GetComponent<Canvas>();
             m_CanvasRect = m_Canvas.GetComponent<RectTransform>();
+            TrySetup();
+        }
+
+        // Build the RT + camera once a valid resolution is known. Retried from
+        // LateUpdate if display info isn't available yet at OnEnable.
+        private void TrySetup()
+        {
+            if (SurroundTexture != null) return; // already set up
+            if (m_Canvas == null) return;
 
             ResolveResolution();
             if (m_Width <= 0 || m_Height <= 0)
-            {
-                Debug.LogWarning("[DisplayXR] Surround: no valid resolution yet " +
-                    "(display info unavailable). Will retry on enable.");
-                return;
-            }
+                return; // no valid dims yet — retry next LateUpdate
 
             // Save canvas state for restoration.
             m_OrigRenderMode = m_Canvas.renderMode;
@@ -193,7 +198,12 @@ namespace DisplayXR
 
         void LateUpdate()
         {
-            if (m_Camera == null || SurroundTexture == null) return;
+            if (SurroundTexture == null)
+            {
+                TrySetup(); // display info may have become available
+                return;
+            }
+            if (m_Camera == null) return;
             m_Camera.Render();
 
             // The native side re-reads the registered pointer each xrEndFrame, so
