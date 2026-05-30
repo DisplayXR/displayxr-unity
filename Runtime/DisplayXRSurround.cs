@@ -102,6 +102,7 @@ namespace DisplayXR
             if (SurroundTexture != null) return; // already set up
             if (m_Canvas == null) return;
 
+            m_Editor = Application.isEditor;
             ResolveResolution();
             if (m_Width <= 0 || m_Height <= 0)
                 return; // no valid dims yet — retry next LateUpdate
@@ -161,7 +162,6 @@ namespace DisplayXR
 
             m_Canvas.worldCamera = m_Camera;
 
-            m_Editor = Application.isEditor;
             RegisterSurround();
             Debug.Log($"[DisplayXR] Surround enabled: {m_Width}x{m_Height} " +
                       $"(RGBA8, {(m_Editor ? "standalone/bridge" : "hooked")})");
@@ -306,21 +306,44 @@ namespace DisplayXR
                 m_Height = resolution.y;
                 return;
             }
-            // Use the runtime's display pixel dimensions.
+            // The surround texture MUST match the runtime's weave target (the
+            // bound HWND client area), which on Leia SR differs from the display
+            // panel dims — so use the render-target size, not display info.
+            if (TryGetTargetSize(m_Editor, out int w, out int h))
+            {
+                m_Width = w;
+                m_Height = h;
+                return;
+            }
+            m_Width = m_Height = 0;
+        }
+
+        /// <summary>
+        /// The runtime's weave-target size (= bound HWND client area), which the
+        /// surround texture + canvas sub-rect must match. Editor (standalone) uses
+        /// the preview window; built apps (hooked) use the bound overlay HWND.
+        /// </summary>
+        public static bool TryGetTargetSize(bool editor, out int w, out int h)
+        {
+            w = h = 0;
             try
             {
-                DisplayXRNative.displayxr_get_display_info(
-                    out _, out _, out uint pw, out uint ph,
-                    out _, out _, out _, out _, out _, out int isValid);
-                if (isValid != 0 && pw > 0 && ph > 0)
+                if (editor)
                 {
-                    m_Width = (int)pw;
-                    m_Height = (int)ph;
-                    return;
+                    if (DisplayXRNative.displayxr_standalone_get_preview_window_size(
+                            out uint pw, out uint ph) != 0 && pw > 0 && ph > 0)
+                    {
+                        w = (int)pw; h = (int)ph; return true;
+                    }
+                }
+                else
+                {
+                    DisplayXRNative.displayxr_get_render_target_size(out uint rw, out uint rh);
+                    if (rw > 0 && rh > 0) { w = (int)rw; h = (int)rh; return true; }
                 }
             }
             catch (System.EntryPointNotFoundException) { }
-            m_Width = m_Height = 0;
+            return false;
         }
 
         private static void SetLayerRecursive(GameObject go, int layer)

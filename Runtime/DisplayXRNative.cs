@@ -134,6 +134,15 @@ namespace DisplayXR
         public static extern void displayxr_surround_clear();
 
         /// <summary>
+        /// (#131) Get the runtime's weave-target size = the bound HWND client
+        /// area, in physical pixels. On Leia SR this differs from the display
+        /// panel dims. The 2D surround texture + canvas sub-rect must use THESE
+        /// pixels. Returns 0x0 until a window is bound. Hooked path (built apps).
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void displayxr_get_render_target_size(out uint width, out uint height);
+
+        /// <summary>
         /// (displayxr-unity #85) Configure Unity's main render NSWindow for
         /// transparent overlay mode on macOS. enabled=1 flips setOpaque:NO +
         /// backgroundColor=clearColor; enabled=0 restores the saved values.

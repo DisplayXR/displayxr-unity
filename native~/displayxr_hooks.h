@@ -111,6 +111,12 @@ DISPLAYXR_EXPORT void displayxr_surround_set_texture(void *unity_native_tex,
 /// runtime. Releases the SHARED surround texture + fence.
 DISPLAYXR_EXPORT void displayxr_surround_clear(void);
 
+/// (#131) Get the runtime's weave-target size = the bound HWND client area, in
+/// physical pixels. On Leia SR this differs from the display panel dims (the SR
+/// weaver oversizes/crops the window). The 2D surround texture + canvas sub-rect
+/// must be sized in THESE pixels. Returns 0x0 if no window is bound yet.
+DISPLAYXR_EXPORT void displayxr_get_render_target_size(uint32_t *out_w, uint32_t *out_h);
+
 /// (issue displayxr-unity #85) Configure Unity's main render NSWindow for
 /// transparent overlay mode on macOS. Pass enabled=1 to flip
 /// `setOpaque:NO` + `backgroundColor=clearColor` so per-pixel alpha from
