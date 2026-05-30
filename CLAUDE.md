@@ -294,6 +294,25 @@ For detailed architecture and design decisions, see `docs~/`:
 
 - Runtime repo: [DisplayXR/displayxr-runtime](https://github.com/DisplayXR/displayxr-runtime)
 - Use `DisplayXR/displayxr-runtime#N` syntax to reference runtime issues
+
+### Independent of the runtime's `versions.json` auto-bump matrix
+
+The DisplayXR runtime maintains a `versions.json` at its root that
+pins the **bundled stack** (runtime, shell, leia-plugin, mcp, demos)
+for the dev orchestrator and the meta-installer. **This Unity plugin
+is intentionally NOT in that matrix** — it's a downstream consumer
+of the runtime's OpenXR wire protocol, not part of the
+co-released bundle. The bundle ships installers; Unity ships a UPM
+package on its own cadence. The two systems stay decoupled.
+
+If a future product decision puts Unity in the bundle (single-installer
+distribution), the integration shape would be: add a `unity` field
+to runtime's `versions.json`, add a `DispatchVersionsBump` job to
+this repo's `.github/workflows/build-native.yml` on tag push, and
+the meta-installer bundles the UPM tarball alongside the other
+installers. None of that exists today. See
+[`displayxr-runtime/docs/specs/runtime/versions-json-autobump.md`](https://github.com/DisplayXR/displayxr-runtime/blob/main/docs/specs/runtime/versions-json-autobump.md)
+for the spec.
 - The runtime provides the OpenXR compositor, display drivers, and eye tracking
 - The plugin provides the Unity-side stereo rendering pipeline
 
