@@ -194,6 +194,14 @@ static volatile int s_stop_polling = 0; // Stop forwarding xrPollEvent after EXI
 static PFN_xrSetSharedTextureOutputRectEXT s_pfn_set_output_rect = nullptr;
 static int s_native_viewport_active = 0; // WM_SIZE (native) is authoritative source
 
+// Canvas sub-rect (#34 / #131): when an app opts in (via displayxr_set_canvas_rect),
+// the 3D content weaves into this HWND-client sub-rect instead of the full window,
+// leaving the rest as the 2D surround region. Re-applied each xrEndFrame (matches
+// the cube_texture reference). Default invalid → full-window canvas (no change).
+static int s_canvas_rect_valid = 0;
+static int32_t s_canvas_rect_x = 0, s_canvas_rect_y = 0;
+static uint32_t s_canvas_rect_w = 0, s_canvas_rect_h = 0;
+
 // Max view count handled by hooked_xrLocateViews. The DisplayXR runtime
 // advertises max-view-count across all render modes for the active display
 // (e.g. sim_display = 4 because of its quad mode; lenticular displays could
@@ -1101,6 +1109,15 @@ hooked_xrEndFrame(XrSession session, const XrFrameEndInfo *frameEndInfo)
 		return s_real_end_frame(session, frameEndInfo);
 	}
 
+	// Canvas sub-rect (#34/#131): re-apply each frame so the runtime weaves the
+	// 3D content into the app-chosen sub-rect (the rest becomes the 2D surround
+	// region). No-op unless an app called displayxr_set_canvas_rect. Per-frame
+	// matches the cube_texture reference and survives runtime state resets.
+	if (s_canvas_rect_valid && s_pfn_set_output_rect) {
+		s_pfn_set_output_rect(session, s_canvas_rect_x, s_canvas_rect_y,
+		                      s_canvas_rect_w, s_canvas_rect_h);
+	}
+
 	// Diagnostic: log what Unity submits (every 120 frames, skip first 2)
 	static int s_ef_count = 0;
 	if (s_ef_count >= 2 && s_ef_count % 120 == 0 &&
@@ -1956,6 +1973,20 @@ displayxr_get_shared_texture(void **native_ptr, uint32_t *width, uint32_t *heigh
 void
 displayxr_set_canvas_rect(int32_t x, int32_t y, uint32_t w, uint32_t h)
 {
+	// Cache the rect so hooked_xrEndFrame re-applies it each frame (#34/#131):
+	// the 3D weaves into this sub-rect, the rest becomes the 2D surround region.
+	// w==0 || h==0 clears (full-window canvas). Also apply immediately if live.
+	if (w == 0 || h == 0) {
+		s_canvas_rect_valid = 0;
+		displayxr_log("[DisplayXR] set_canvas_rect: cleared (full-window canvas)\n");
+		return;
+	}
+	s_canvas_rect_x = x;
+	s_canvas_rect_y = y;
+	s_canvas_rect_w = w;
+	s_canvas_rect_h = h;
+	s_canvas_rect_valid = 1;
 	if (s_pfn_set_output_rect && s_session != XR_NULL_HANDLE)
 		s_pfn_set_output_rect(s_session, x, y, w, h);
+	displayxr_log("[DisplayXR] set_canvas_rect: (%d,%d) %ux%u\n", x, y, w, h);
 }

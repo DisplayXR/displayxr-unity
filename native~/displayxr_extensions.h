@@ -75,18 +75,40 @@ typedef XrResult(XRAPI_PTR *PFN_xrEnumerateDisplayRenderingModesEXT)(
 typedef XrResult (XRAPI_PTR *PFN_xrSetSharedTextureOutputRectEXT)(
     XrSession session, int32_t x, int32_t y, uint32_t width, uint32_t height);
 
+// --- 2D surround texture (post-weave fill of the non-canvas region) ---
+// XR_EXT_win32_window_binding spec v6 (D3D11 keyed-mutex) / v7 (D3D12 fence).
+// The runtime blits the non-canvas pixels of the output (HWND back buffer or
+// app shared texture) from this app-supplied full-window 2D texture each frame,
+// AFTER the weave — so the surround is always at full native panel resolution.
+// Works in handle mode (runtime presents) as well as shared-texture mode;
+// requires xrSetSharedTextureOutputRectEXT to define the canvas sub-rect.
+// v6: D3D11 path, IDXGIKeyedMutex sync (key 0). Pass NULL handle to clear.
+typedef XrResult (XRAPI_PTR *PFN_xrSetSharedTextureSurround2DEXT)(
+    XrSession session, void *sharedTextureHandle, uint32_t width, uint32_t height);
+// v7: D3D12 path. D3D12-native shared resources don't expose IDXGIKeyedMutex,
+// so sync is via a shared ID3D12Fence. App signals (fence, awaitFenceValue) on
+// its queue after recording surround content; the runtime waits on that value
+// before the strip blit. awaitFenceValue must increase monotonically. Pass
+// NULL sharedTextureHandle to clear (fence handle ignored in that case).
+typedef XrResult (XRAPI_PTR *PFN_xrSetSharedTextureSurround2DFenceEXT)(
+    XrSession session, void *sharedTextureHandle, uint32_t width, uint32_t height,
+    void *sharedFenceHandle, uint64_t awaitFenceValue);
+
 // --- Readback callback (shared by macOS and Win32 bindings) ---
 typedef void (*PFN_xrReadbackCallback)(const uint8_t *pixels, uint32_t width, uint32_t height, void *userdata);
 
 // --- XR_EXT_win32_window_binding ---
 #define XR_EXT_WIN32_WINDOW_BINDING_EXTENSION_NAME "XR_EXT_win32_window_binding"
+// SPEC_VERSION 7 adds xrSetSharedTextureSurround2DFenceEXT (D3D12 fence-synced
+// 2D surround); v6 added xrSetSharedTextureSurround2DEXT (D3D11 keyed-mutex).
 // SPEC_VERSION 5 adds chromaKeyColor — runtime-side post-weave chroma-key
 // conversion that writes alpha=0 for matching pixels before the DComp
 // (D3D12) or BitBlt (D3D11) present (runtime-pvt #191).
 // SPEC_VERSION 4 added transparentBackgroundEnabled.
-// SPEC_VERSION 3 added sharedTextureHandle. We embed v5; older runtimes
-// ignore trailing fields (struct grows at the end, ABI-safe both ways).
-#define XR_EXT_WIN32_WINDOW_BINDING_SPEC_VERSION 5
+// SPEC_VERSION 3 added sharedTextureHandle. The CreateInfo struct is unchanged
+// since v5 (surround is a separate entry-point family, not new struct fields);
+// older runtimes ignore trailing fields (struct grows at the end, ABI-safe).
+#define XR_EXT_WIN32_WINDOW_BINDING_SPEC_VERSION 7
 
 #define XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT ((XrStructureType)1000999001)
 #define XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT ((XrStructureType)1000999002)
