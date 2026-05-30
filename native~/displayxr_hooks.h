@@ -210,6 +210,13 @@ DISPLAYXR_EXPORT void displayxr_get_shared_texture(void **native_ptr,
 DISPLAYXR_EXPORT void displayxr_set_canvas_rect(
     int32_t x, int32_t y, uint32_t w, uint32_t h);
 
+/// (#131) Report the active canvas sub-rect in HWND-client pixels. Returns 1 and
+/// fills the out params when a sub-rect is set (via displayxr_set_canvas_rect),
+/// 0 otherwise. Used by the Win32 overlay to map the click-through silhouette
+/// into the same sub-rect the runtime weaves the 3D into. Out params may be NULL.
+DISPLAYXR_EXPORT int displayxr_get_canvas_rect_px(
+    int32_t *x, int32_t *y, uint32_t *w, uint32_t *h);
+
 /// Kill xrPollEvent forwarding immediately. Call from C# before session/instance
 /// teardown to prevent use-after-free when the runtime is unloaded.
 DISPLAYXR_EXPORT void displayxr_stop_polling(void);
@@ -251,6 +258,16 @@ DISPLAYXR_EXPORT void displayxr_set_overlay_hit_active(int active);
 DISPLAYXR_EXPORT void displayxr_set_overlay_hit_mask(const uint8_t *mask,
                                                      int mask_w, int mask_h,
                                                      int dst_w, int dst_h);
+
+/// (#131) Register an opaque rect (overlay client pixels, top-left origin) that
+/// must catch clicks even though it lives in the 2D surround region outside the
+/// 3D silhouette — e.g. a high-res text bubble drawn into the surround. It is
+/// UNION-ed into the SetWindowRgn region built by displayxr_set_overlay_hit_mask
+/// each frame, so the bubble catches clicks while the empty surround still routes
+/// past to the desktop. Pass w<=0 or h<=0 to clear. Takes effect on the next
+/// hit-mask update.
+DISPLAYXR_EXPORT void displayxr_set_overlay_surround_rect(int x, int y,
+                                                          int w, int h);
 
 /// (issue #57) Returns 1 if the OS foreground window belongs to our process,
 /// 0 otherwise. Use to gate input handlers (WASD etc.) that should be
