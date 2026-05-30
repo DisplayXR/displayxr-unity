@@ -1145,23 +1145,8 @@ hooked_xrEndFrame(XrSession session, const XrFrameEndInfo *frameEndInfo)
 		if (s_backend->surround_update(s_surround_unity_tex,
 		        s_surround_w, s_surround_h, &tex_h, &fence_h, &await_val) &&
 		    tex_h && fence_h) {
-			XrResult sr = s_pfn_set_surround_fence(session, tex_h, s_surround_w,
-			                  s_surround_h, fence_h, await_val);
-			// One-shot diagnostic: the runtime SKIPS the surround blit unless the
-			// surround dims exactly match the weave target (the HWND client area).
-			// Log both so we can see a mismatch (#131 no-bubble debugging).
-			static int s_surround_diag = 0;
-			if (!s_surround_diag) {
-				s_surround_diag = 1;
-				DisplayXRState *st = displayxr_get_state();
-				RECT rc = {0, 0, 0, 0};
-				if (st && st->window_handle)
-					GetClientRect((HWND)st->window_handle, &rc);
-				displayxr_log("[DisplayXR] surround DIAG: registered=%ux%u "
-				    "set_surround_fence=%d HWND=%p client=%ldx%ld\n",
-				    s_surround_w, s_surround_h, (int)sr, st ? st->window_handle : nullptr,
-				    (long)(rc.right - rc.left), (long)(rc.bottom - rc.top));
-			}
+			s_pfn_set_surround_fence(session, tex_h, s_surround_w,
+			                         s_surround_h, fence_h, await_val);
 		}
 	}
 
@@ -2062,6 +2047,22 @@ displayxr_set_canvas_rect(int32_t x, int32_t y, uint32_t w, uint32_t h)
 	if (s_pfn_set_output_rect && s_session != XR_NULL_HANDLE)
 		s_pfn_set_output_rect(s_session, x, y, w, h);
 	displayxr_log("[DisplayXR] set_canvas_rect: (%d,%d) %ux%u\n", x, y, w, h);
+}
+
+DISPLAYXR_EXPORT int
+displayxr_get_canvas_rect_px(int32_t *x, int32_t *y, uint32_t *w, uint32_t *h)
+{
+	// Report the active canvas sub-rect (#34/#131) in HWND-client pixels so the
+	// Win32 overlay can scale+offset the click-through silhouette into the same
+	// sub-rect the runtime weaves the 3D into. Returns 0 when no sub-rect is set
+	// (full-window canvas → overlay maps the silhouette to the whole client).
+	if (!s_canvas_rect_valid)
+		return 0;
+	if (x) *x = s_canvas_rect_x;
+	if (y) *y = s_canvas_rect_y;
+	if (w) *w = s_canvas_rect_w;
+	if (h) *h = s_canvas_rect_h;
+	return 1;
 }
 
 DISPLAYXR_EXPORT void

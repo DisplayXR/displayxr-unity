@@ -1101,6 +1101,24 @@ namespace DisplayXR
         // Per-pixel silhouette hit mask (Approach B+, issue #57)
         // -------------------------------------------------------------
 
+        // Draw EVERY submesh of a renderer into the silhouette mask. The old
+        // single DrawRenderer(r, mat, 0, 0) only rasterized submesh 0, so a mesh
+        // with multiple material slots (e.g. body / face / limbs on separate
+        // submeshes — common for character FBX imports) left the other submeshes
+        // out of the mask → interior click-through holes over those parts (#131).
+        // The silhouette shader writes solid 1 for any rasterized triangle, so
+        // covering all submeshes makes the silhouette truly solid.
+        void DrawSilhouetteAllSubmeshes(Renderer r)
+        {
+            Mesh mesh = null;
+            if (r is SkinnedMeshRenderer smr) mesh = smr.sharedMesh;
+            else { var mf = r.GetComponent<MeshFilter>(); if (mf != null) mesh = mf.sharedMesh; }
+
+            int subCount = (mesh != null) ? Mathf.Max(1, mesh.subMeshCount) : 1;
+            for (int s = 0; s < subCount; s++)
+                m_HitMaskCB.DrawRenderer(r, m_SilhouetteMat, s, 0);
+        }
+
         void EnsureHitMaskResources()
         {
             if (m_HitMaskRT == null)
@@ -1214,7 +1232,7 @@ namespace DisplayXR
                 var r = clickableRenderers[i];
                 if (r == null || !r.enabled || !r.gameObject.activeInHierarchy)
                     continue;
-                m_HitMaskCB.DrawRenderer(r, m_SilhouetteMat, 0, 0);
+                DrawSilhouetteAllSubmeshes(r);
             }
 
             // Pass 2: right eye. Accumulates into the same RT — pixels
@@ -1225,7 +1243,7 @@ namespace DisplayXR
                 var r = clickableRenderers[i];
                 if (r == null || !r.enabled || !r.gameObject.activeInHierarchy)
                     continue;
-                m_HitMaskCB.DrawRenderer(r, m_SilhouetteMat, 0, 0);
+                DrawSilhouetteAllSubmeshes(r);
             }
 
             // Dilate the union by ~2 mask pixels to absorb AA-edge

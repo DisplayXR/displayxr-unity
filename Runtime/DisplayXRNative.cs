@@ -659,6 +659,20 @@ namespace DisplayXR
             IntPtr mask, int mask_w, int mask_h, int dst_w, int dst_h);
 
         /// <summary>
+        /// (#131) Register an opaque rect (overlay client pixels, top-left
+        /// origin) that must catch clicks even though it lives in the 2D
+        /// surround region outside the 3D silhouette — e.g. a high-res text
+        /// bubble. It is UNION-ed into the SetWindowRgn region built by
+        /// displayxr_set_overlay_hit_mask each frame, so the bubble catches
+        /// clicks while the empty surround keeps routing past to the desktop.
+        /// Pass w&lt;=0 || h&lt;=0 to clear. Takes effect on the next hit-mask
+        /// update. Transparent overlay (hooked) path only.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void displayxr_set_overlay_surround_rect(
+            int x, int y, int w, int h);
+
+        /// <summary>
         /// Read cursor position (overlay-client coords, top-left origin) and
         /// mouse button state. Designed for transparent overlay mode where
         /// Unity's New Input System Mouse.current.position is frozen because

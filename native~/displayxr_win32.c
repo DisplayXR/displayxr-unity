@@ -115,6 +115,14 @@ static POINT s_drag_anchor_window = {0, 0};
 // hit-test bookkeeping in transparent mode, not the routing driver.
 static int   s_hit_mask_active    = 0;
 
+// (#131) Opaque surround rect (overlay client pixels, top-left origin) for a 2D
+// element drawn in the surround region — e.g. a high-res text bubble — that must
+// catch clicks even though it sits outside the 3D silhouette. UNION-ed into the
+// SetWindowRgn region built by displayxr_set_overlay_hit_mask each frame. Invalid
+// by default (no bubble) so empty surround keeps routing clicks to the desktop.
+static int   s_surround_rect_valid = 0;
+static RECT  s_surround_rect       = {0, 0, 0, 0};
+
 // ============================================================================
 // Shell mode detection
 // ============================================================================
@@ -1285,10 +1293,26 @@ displayxr_set_overlay_hit_mask(const uint8_t *mask, int mask_w, int mask_h,
 	if (rects == NULL)
 		return;
 
+	// (#131) When a canvas sub-rect is active, the runtime shrinks the 3D weave
+	// into that sub-rect, so the displayed silhouette lives there too. Map the
+	// full-window mask into the sub-rect (same scale+offset the weave applies)
+	// instead of the full overlay client, so the click-through region matches the
+	// shrunk tiger. No sub-rect → leaves origin (0,0)/extent (dst_w,dst_h), i.e.
+	// the legacy whole-client mapping.
+	int32_t  cvx = 0, cvy = 0;
+	uint32_t cvw = (uint32_t)dst_w, cvh = (uint32_t)dst_h;
+	displayxr_get_canvas_rect_px(&cvx, &cvy, &cvw, &cvh);
+
+	// Round each rect's edges OUTWARD when mapping mask cells → target pixels:
+	// leading edges (left/top) floor, trailing edges (right/bottom) ceil. A mask
+	// cell covers cvw/mask_w (cvh/mask_h) target px; with the canvas sub-rect this
+	// can be several px per cell, and plain truncation on the trailing edges would
+	// shrink the catch-region inside the silhouette and clip the tiger's edges.
+	// Outward rounding dilates by <1 cell so the region fully covers the silhouette.
 	for (int my = 0; my < mask_h; my++) {
 		const uint8_t *row = mask + (size_t)my * (size_t)mask_w;
-		int top    = (int)((LONGLONG)my       * dst_h / mask_h);
-		int bottom = (int)((LONGLONG)(my + 1) * dst_h / mask_h);
+		int top    = (int)(cvy + (LONGLONG)my * cvh / mask_h);
+		int bottom = (int)(cvy + ((LONGLONG)(my + 1) * cvh + mask_h - 1) / mask_h);
 		int mx = 0;
 		while (mx < mask_w) {
 			while (mx < mask_w && row[mx] == 0) mx++;
@@ -1304,12 +1328,28 @@ displayxr_set_overlay_hit_mask(const uint8_t *mask, int mask_w, int mask_h,
 				rects = nr;
 				cap = new_cap;
 			}
-			rects[n].left   = (LONG)((LONGLONG)x0 * dst_w / mask_w);
+			rects[n].left   = (LONG)(cvx + (LONGLONG)x0 * cvw / mask_w);
 			rects[n].top    = (LONG)top;
-			rects[n].right  = (LONG)((LONGLONG)x1 * dst_w / mask_w);
+			rects[n].right  = (LONG)(cvx + ((LONGLONG)x1 * cvw + mask_w - 1) / mask_w);
 			rects[n].bottom = (LONG)bottom;
 			n++;
 		}
+	}
+
+	// (#131) Union the opaque surround rect (e.g. a high-res text bubble drawn in
+	// the surround region) so it catches clicks even though it's outside the 3D
+	// silhouette. Appended as one more RECT before ExtCreateRegion; the empty
+	// surround around it stays click-through.
+	if (s_surround_rect_valid) {
+		if (n >= cap) {
+			int new_cap = cap + 1;
+			RECT *nr = (RECT *)realloc(rects,
+			                           (size_t)new_cap * sizeof(RECT));
+			if (nr == NULL) { free(rects); return; }
+			rects = nr;
+			cap = new_cap;
+		}
+		rects[n++] = s_surround_rect;
 	}
 
 	HRGN rgn = NULL;
@@ -1368,6 +1408,26 @@ displayxr_set_overlay_hit_mask(const uint8_t *mask, int mask_w, int mask_h,
 		displayxr_log("[DisplayXR] hit_mask: mask=%dx%d rects=%d dst=%dx%d\n",
 		              mask_w, mask_h, n, dst_w, dst_h);
 	}
+}
+
+void
+displayxr_set_overlay_surround_rect(int x, int y, int w, int h)
+{
+	// (#131) Store the opaque surround rect (overlay client pixels, top-left
+	// origin); displayxr_set_overlay_hit_mask unions it into the window region on
+	// the next frame so the bubble catches clicks. w<=0 || h<=0 clears it.
+	if (w <= 0 || h <= 0) {
+		if (s_surround_rect_valid)
+			displayxr_log("[DisplayXR] surround_rect: cleared\n");
+		s_surround_rect_valid = 0;
+		return;
+	}
+	s_surround_rect.left   = x;
+	s_surround_rect.top    = y;
+	s_surround_rect.right  = x + w;
+	s_surround_rect.bottom = y + h;
+	s_surround_rect_valid  = 1;
+	displayxr_log("[DisplayXR] surround_rect: (%d,%d) %dx%d\n", x, y, w, h);
 }
 
 void
