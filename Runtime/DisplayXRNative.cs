@@ -110,6 +110,16 @@ namespace DisplayXR
         public static extern void displayxr_set_transparent_background(int enabled);
 
         /// <summary>
+        /// (#34 / #131) Define the 3D canvas sub-rect within the window client
+        /// area, in pixels. The runtime weaves the 3D into this rect; the rest
+        /// of the window is the 2D surround region. Pass width==0 || height==0
+        /// to clear (full-window canvas). Re-applied each frame; safe any time.
+        /// Hooked path (built apps) only.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void displayxr_set_canvas_rect(int x, int y, uint width, uint height);
+
+        /// <summary>
         /// (displayxr-unity #85) Configure Unity's main render NSWindow for
         /// transparent overlay mode on macOS. enabled=1 flips setOpaque:NO +
         /// backgroundColor=clearColor; enabled=0 restores the saved values.
