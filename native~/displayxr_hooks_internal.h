@@ -220,6 +220,22 @@ public:
 	// opaque flip-model swapchains silently tolerate the byte permutation).
 	// See displayxr-unity#82 / displayxr-runtime#216.
 	virtual int64_t wsui_get_native_texture_format(void * /*unity_tex*/) { return -1; }
+
+	// --- 2D surround (issue #131, hooked path) ---
+	// Update the app-supplied 2D surround texture from a Unity RenderTexture and
+	// prepare it for registration via xrSetSharedTextureSurround2DFenceEXT.
+	// On first call (or when w/h change) allocates a SHARED RGBA8 surround
+	// texture + a SHARED ID3D12Fence on the runtime/Unity device; each call
+	// copies unity_rt into the surround texture on the runtime queue and signals
+	// the fence (monotonic). Returns the NT handles + the just-signaled fence
+	// value via out_* so the caller can register. Runs on the xrEndFrame render
+	// thread (same context as wsui_copy_to_swapchain_image). Returns true if
+	// out_* are filled. Default: unsupported (non-D3D12 backends).
+	virtual bool surround_update(void * /*unity_rt*/, uint32_t /*w*/, uint32_t /*h*/,
+	    void ** /*out_tex_handle*/, void ** /*out_fence_handle*/,
+	    uint64_t * /*out_value*/) { return false; }
+	// Release surround texture/fence/handles. Safe to call repeatedly.
+	virtual void surround_release() {}
 };
 
 // Internal accessor for the currently-active hooked backend. Returns nullptr

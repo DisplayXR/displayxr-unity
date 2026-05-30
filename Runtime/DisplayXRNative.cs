@@ -120,6 +120,20 @@ namespace DisplayXR
         public static extern void displayxr_set_canvas_rect(int x, int y, uint width, uint height);
 
         /// <summary>
+        /// (#131) Register a Unity RenderTexture (R8G8B8A8_UNORM) as the 2D
+        /// surround source. The runtime fills the non-canvas region (outside the
+        /// canvas sub-rect) from it each frame, post-weave, at full native panel
+        /// resolution. Pair with displayxr_set_canvas_rect. Pass IntPtr.Zero to
+        /// clear. D3D12 hooked path (built apps).
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void displayxr_surround_set_texture(IntPtr unityNativeTex, uint width, uint height);
+
+        /// <summary>(#131) Clear the registered 2D surround texture.</summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void displayxr_surround_clear();
+
+        /// <summary>
         /// (displayxr-unity #85) Configure Unity's main render NSWindow for
         /// transparent overlay mode on macOS. enabled=1 flips setOpaque:NO +
         /// backgroundColor=clearColor; enabled=0 restores the saved values.
