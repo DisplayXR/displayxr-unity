@@ -202,6 +202,15 @@ static int s_canvas_rect_valid = 0;
 static int32_t s_canvas_rect_x = 0, s_canvas_rect_y = 0;
 static uint32_t s_canvas_rect_w = 0, s_canvas_rect_h = 0;
 
+// 2D surround (#131): the runtime fills the non-canvas region post-weave from an
+// app-supplied full-window 2D texture (xrSetSharedTextureSurround2DFenceEXT, v7).
+// C# registers a Unity RenderTexture pointer; hooked_xrEndFrame copies it into a
+// SHARED surround texture (via the backend), signals a SHARED fence, and registers
+// the handles + value each frame. Default null → no surround (no change).
+static PFN_xrSetSharedTextureSurround2DFenceEXT s_pfn_set_surround_fence = nullptr;
+static void * volatile s_surround_unity_tex = nullptr;
+static volatile uint32_t s_surround_w = 0, s_surround_h = 0;
+
 // Max view count handled by hooked_xrLocateViews. The DisplayXR runtime
 // advertises max-view-count across all render modes for the active display
 // (e.g. sim_display = 4 because of its quad mode; lenticular displays could
@@ -686,6 +695,11 @@ hooked_xrGetSystemProperties(XrInstance instance, XrSystemId systemId, XrSystemP
 					s_pfn_set_output_rect = (PFN_xrSetSharedTextureOutputRectEXT)fn;
 					displayxr_log( "[DisplayXR] Resolved xrSetSharedTextureOutputRectEXT\n");
 				}
+				fn = nullptr;
+				if (XR_SUCCEEDED(s_next_gipa(s_instance, "xrSetSharedTextureSurround2DFenceEXT", &fn)) && fn) {
+					s_pfn_set_surround_fence = (PFN_xrSetSharedTextureSurround2DFenceEXT)fn;
+					displayxr_log( "[DisplayXR] Resolved xrSetSharedTextureSurround2DFenceEXT\n");
+				}
 			}
 			break;
 		}
@@ -1116,6 +1130,24 @@ hooked_xrEndFrame(XrSession session, const XrFrameEndInfo *frameEndInfo)
 	if (s_canvas_rect_valid && s_pfn_set_output_rect) {
 		s_pfn_set_output_rect(session, s_canvas_rect_x, s_canvas_rect_y,
 		                      s_canvas_rect_w, s_canvas_rect_h);
+	}
+
+	// 2D surround (#131): copy the registered Unity RT into the SHARED surround
+	// texture, signal the SHARED fence, and (re)register with the runtime so it
+	// blits the non-canvas region post-weave. Runs here on the render thread
+	// (same context as wsui below) so queue submission is safe. No-op unless
+	// C# registered a texture AND the backend supports it (D3D12). The register
+	// happens BEFORE s_real_end_frame so the runtime sees the await value for
+	// this frame's strip blit.
+	if (s_surround_unity_tex && s_backend && s_pfn_set_surround_fence) {
+		void *tex_h = nullptr, *fence_h = nullptr;
+		uint64_t await_val = 0;
+		if (s_backend->surround_update(s_surround_unity_tex,
+		        s_surround_w, s_surround_h, &tex_h, &fence_h, &await_val) &&
+		    tex_h && fence_h) {
+			s_pfn_set_surround_fence(session, tex_h, s_surround_w, s_surround_h,
+			                         fence_h, await_val);
+		}
 	}
 
 	// Diagnostic: log what Unity submits (every 120 frames, skip first 2)
@@ -1843,6 +1875,32 @@ displayxr_set_transparent_background(int enabled)
 	state->transparent_background_requested = (uint8_t)(enabled != 0);
 	displayxr_log("[DisplayXR] set_transparent_background: requested=%d\n",
 	              (int)state->transparent_background_requested);
+}
+
+DISPLAYXR_EXPORT void
+displayxr_surround_set_texture(void *unity_native_tex, uint32_t width, uint32_t height)
+{
+	// Register a Unity RenderTexture (R8G8B8A8_UNORM) as the 2D surround source
+	// (#131). hooked_xrEndFrame copies it into the SHARED surround texture each
+	// frame, signals the SHARED fence, and registers via
+	// xrSetSharedTextureSurround2DFenceEXT so the runtime fills the non-canvas
+	// region post-weave (always full native panel resolution). Pair with
+	// displayxr_set_canvas_rect to define where the 3D lives. Pass NULL to clear.
+	s_surround_w = width;
+	s_surround_h = height;
+	s_surround_unity_tex = unity_native_tex;
+	displayxr_log("[DisplayXR] surround_set_texture: tex=%p %ux%u\n",
+	              unity_native_tex, width, height);
+}
+
+DISPLAYXR_EXPORT void
+displayxr_surround_clear(void)
+{
+	s_surround_unity_tex = nullptr;
+	if (s_pfn_set_surround_fence && s_session != XR_NULL_HANDLE)
+		s_pfn_set_surround_fence(s_session, nullptr, 0, 0, nullptr, 0);
+	if (s_backend) s_backend->surround_release();
+	displayxr_log("[DisplayXR] surround_clear\n");
 }
 
 void

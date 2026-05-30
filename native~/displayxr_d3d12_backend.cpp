@@ -43,6 +43,93 @@ public:
 	HANDLE                     fence_event = nullptr;
 	UINT64                     fence_value = 0;
 
+	// 2D surround (issue #131): a SHARED RGBA8 texture + SHARED ID3D12Fence on
+	// the runtime/Unity device, registered with the runtime via
+	// xrSetSharedTextureSurround2DFenceEXT (spec v7). Unity renders the 2D
+	// content into its own RT; we copy it here and signal the fence; the
+	// runtime waits on the fence before the post-weave strip blit.
+	ID3D12Resource            *surround_tex          = nullptr;
+	HANDLE                     surround_tex_handle    = nullptr;
+	ID3D12Fence               *surround_fence         = nullptr;
+	HANDLE                     surround_fence_handle  = nullptr;
+	UINT64                     surround_value         = 0;
+	ID3D12CommandAllocator    *surround_cmd_alloc     = nullptr;
+	ID3D12GraphicsCommandList *surround_cmd_list      = nullptr;
+	uint32_t                   surround_w = 0, surround_h = 0;
+
+	bool ensure_surround_resources(uint32_t w, uint32_t h)
+	{
+		if (surround_tex && surround_w == w && surround_h == h) return true;
+		if (surround_tex) release_surround(); // dims changed → recreate
+		if (!device || w == 0 || h == 0) return false;
+
+		D3D12_HEAP_PROPERTIES heap = {};
+		heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+		// Runtime requires the surround source to be R8G8B8A8_UNORM(_SRGB).
+		D3D12_RESOURCE_DESC td = {};
+		td.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+		td.Width = w;
+		td.Height = h;
+		td.DepthOrArraySize = 1;
+		td.MipLevels = 1;
+		td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		td.SampleDesc.Count = 1;
+		td.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+		td.Flags = D3D12_RESOURCE_FLAG_NONE;
+
+		if (FAILED(device->CreateCommittedResource(
+			&heap, D3D12_HEAP_FLAG_SHARED, &td,
+			D3D12_RESOURCE_STATE_COMMON, nullptr,
+			__uuidof(ID3D12Resource), (void **)&surround_tex))) {
+			displayxr_log("[DisplayXR] surround D3D12: CreateCommittedResource failed\n");
+			return false;
+		}
+		if (FAILED(device->CreateSharedHandle(
+			surround_tex, nullptr, GENERIC_ALL, nullptr, &surround_tex_handle))) {
+			displayxr_log("[DisplayXR] surround D3D12: CreateSharedHandle (tex) failed\n");
+			release_surround();
+			return false;
+		}
+		if (FAILED(device->CreateFence(0, D3D12_FENCE_FLAG_SHARED,
+			__uuidof(ID3D12Fence), (void **)&surround_fence))) {
+			displayxr_log("[DisplayXR] surround D3D12: CreateFence (shared) failed\n");
+			release_surround();
+			return false;
+		}
+		if (FAILED(device->CreateSharedHandle(
+			surround_fence, nullptr, GENERIC_ALL, nullptr, &surround_fence_handle))) {
+			displayxr_log("[DisplayXR] surround D3D12: CreateSharedHandle (fence) failed\n");
+			release_surround();
+			return false;
+		}
+		device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+			__uuidof(ID3D12CommandAllocator), (void **)&surround_cmd_alloc);
+		device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+			surround_cmd_alloc, nullptr,
+			__uuidof(ID3D12GraphicsCommandList), (void **)&surround_cmd_list);
+		surround_cmd_list->Close();
+
+		surround_w = w;
+		surround_h = h;
+		surround_value = 0;
+		displayxr_log("[DisplayXR] surround D3D12: %ux%u shared texture + fence ready (texH=%p fenceH=%p)\n",
+			w, h, surround_tex_handle, surround_fence_handle);
+		return true;
+	}
+
+	void release_surround()
+	{
+		if (surround_cmd_list)     { surround_cmd_list->Release();      surround_cmd_list     = nullptr; }
+		if (surround_cmd_alloc)    { surround_cmd_alloc->Release();     surround_cmd_alloc    = nullptr; }
+		if (surround_fence_handle) { CloseHandle(surround_fence_handle); surround_fence_handle = nullptr; }
+		if (surround_fence)        { surround_fence->Release();         surround_fence        = nullptr; }
+		if (surround_tex_handle)   { CloseHandle(surround_tex_handle);  surround_tex_handle   = nullptr; }
+		if (surround_tex)          { surround_tex->Release();           surround_tex          = nullptr; }
+		surround_w = surround_h = 0;
+		surround_value = 0;
+	}
+
 	bool ensure_copy_resources()
 	{
 		if (cmd_list) return true;
@@ -100,6 +187,7 @@ public:
 
 	void on_session_destroyed() override
 	{
+		release_surround();
 		release_copy_resources();
 		if (queue)  { queue->Release();  queue  = nullptr; }
 		if (device) { device->Release(); device = nullptr; }
@@ -258,6 +346,88 @@ public:
 		}
 		return true;
 	}
+
+	// --- 2D surround (issue #131) ---
+
+	bool surround_update(void *unity_rt, uint32_t w, uint32_t h,
+	                     void **out_tex_handle, void **out_fence_handle,
+	                     uint64_t *out_value) override
+	{
+		ID3D12Resource *src = (ID3D12Resource *)unity_rt;
+		if (!src || !queue || !ensure_surround_resources(w, h)) return false;
+
+		surround_cmd_alloc->Reset();
+		surround_cmd_list->Reset(surround_cmd_alloc, nullptr);
+
+		// Explicit transitions around the copy (same convention as the wsui
+		// copy above). Both resources are COMMON between frames: src (Unity's
+		// RT) per OpenXR convention; surround_tex is a SHARED resource we always
+		// leave in COMMON so the runtime's queue can transition it on its side
+		// (D3D12 requires shared resources to be COMMON at cross-queue handoff).
+		D3D12_RESOURCE_BARRIER pre[2] = {};
+		pre[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		pre[0].Transition.pResource   = src;
+		pre[0].Transition.Subresource = 0;
+		pre[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+		pre[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+		pre[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		pre[1].Transition.pResource   = surround_tex;
+		pre[1].Transition.Subresource = 0;
+		pre[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+		pre[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
+		surround_cmd_list->ResourceBarrier(2, pre);
+
+		D3D12_TEXTURE_COPY_LOCATION dst_loc = {};
+		dst_loc.pResource = surround_tex;
+		dst_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+		dst_loc.SubresourceIndex = 0;
+
+		D3D12_TEXTURE_COPY_LOCATION src_loc = {};
+		src_loc.pResource = src;
+		src_loc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+		src_loc.SubresourceIndex = 0;
+
+		// Clamp the copy box to both resources' actual dimensions.
+		D3D12_RESOURCE_DESC src_desc = src->GetDesc();
+		uint32_t copy_w = w, copy_h = h;
+		if ((uint32_t)src_desc.Width  < copy_w) copy_w = (uint32_t)src_desc.Width;
+		if (surround_w < copy_w) copy_w = surround_w;
+		if (src_desc.Height < copy_h) copy_h = src_desc.Height;
+		if (surround_h < copy_h) copy_h = surround_h;
+		D3D12_BOX box = { 0, 0, 0, copy_w, copy_h, 1 };
+
+		surround_cmd_list->CopyTextureRegion(&dst_loc, 0, 0, 0, &src_loc, &box);
+
+		D3D12_RESOURCE_BARRIER post[2] = {};
+		post[0].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		post[0].Transition.pResource   = src;
+		post[0].Transition.Subresource = 0;
+		post[0].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+		post[0].Transition.StateAfter  = D3D12_RESOURCE_STATE_COMMON;
+		post[1].Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		post[1].Transition.pResource   = surround_tex;
+		post[1].Transition.Subresource = 0;
+		post[1].Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+		post[1].Transition.StateAfter  = D3D12_RESOURCE_STATE_COMMON;
+		surround_cmd_list->ResourceBarrier(2, post);
+
+		surround_cmd_list->Close();
+		ID3D12CommandList *lists[] = { surround_cmd_list };
+		queue->ExecuteCommandLists(1, lists);
+
+		// Signal the SHARED fence AFTER the copy (same queue → ordered). The
+		// runtime waits on this value before its strip blit reads the texture.
+		// No CPU wait here — the GPU fence handshake handles producer→consumer.
+		surround_value++;
+		queue->Signal(surround_fence, surround_value);
+
+		*out_tex_handle   = surround_tex_handle;
+		*out_fence_handle = surround_fence_handle;
+		*out_value        = surround_value;
+		return true;
+	}
+
+	void surround_release() override { release_surround(); }
 };
 
 GraphicsBackend *create_d3d12_backend() { return new D3D12Backend(); }
