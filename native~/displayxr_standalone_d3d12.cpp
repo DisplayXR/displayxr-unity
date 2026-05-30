@@ -44,6 +44,20 @@ public:
 	uint32_t                      wsui_bridge_w             = 0;
 	uint32_t                      wsui_bridge_h             = 0;
 
+	// 2D surround bridge (issue #131): SHARED RGBA8 texture on the SA device
+	// opened on Unity's device (C# renders the 2D content into it) + a SHARED
+	// ID3D12Fence. Registered with the runtime via the fence EXT, which reads
+	// the SA-side texture directly (same device as the SA session).
+	ID3D12Resource               *d3d12_surround_bridge        = nullptr;
+	HANDLE                        d3d12_surround_bridge_handle  = nullptr;
+	ID3D12Resource               *d3d12_unity_surround_bridge  = nullptr;
+	ID3D11Texture2D              *d3d11_unity_surround_bridge  = nullptr;
+	ID3D12Fence                  *d3d12_surround_fence          = nullptr;
+	HANDLE                        d3d12_surround_fence_handle   = nullptr;
+	UINT64                        d3d12_surround_value          = 0;
+	uint32_t                      surround_bridge_w             = 0;
+	uint32_t                      surround_bridge_h             = 0;
+
 	// Fullscreen window resources (D3D12)
 	IDXGISwapChain3              *fw_swapchain   = nullptr;
 	ID3D12Resource               *fw_bb[2]       = { nullptr, nullptr };
@@ -502,6 +516,7 @@ public:
 	{
 		destroy_atlas_bridge();
 		wsui_destroy_bridge();
+		surround_destroy_bridge();
 		if (unity_d3d11_device)  { unity_d3d11_device->Release();  unity_d3d11_device = nullptr; }
 		if (unity_device)        { unity_device->Release();        unity_device       = nullptr; }
 		destroy_shared_texture();
@@ -733,6 +748,132 @@ public:
 		if (d3d11_unity_wsui_bridge) return (void *)d3d11_unity_wsui_bridge;
 		if (d3d12_unity_wsui_bridge) return (void *)d3d12_unity_wsui_bridge;
 		return nullptr;
+	}
+
+	// --- 2D surround bridge (issue #131) ---
+
+	void surround_create_bridge(uint32_t w, uint32_t h) override
+	{
+		if (d3d12_surround_bridge != nullptr) {
+			if (surround_bridge_w == w && surround_bridge_h == h) return;
+			surround_destroy_bridge();
+		}
+		if ((!unity_device && !unity_d3d11_device) || !d3d12_device) return;
+		if (w == 0 || h == 0) return;
+
+		D3D12_HEAP_PROPERTIES heap = {};
+		heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+
+		D3D12_RESOURCE_DESC bd = {};
+		bd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+		bd.Width = w;
+		bd.Height = h;
+		bd.DepthOrArraySize = 1;
+		bd.MipLevels = 1;
+		// Runtime requires the surround source to be R8G8B8A8_UNORM(_SRGB).
+		bd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+		bd.SampleDesc.Count = 1;
+		bd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+		bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+		HRESULT hr = d3d12_device->CreateCommittedResource(
+			&heap, D3D12_HEAP_FLAG_SHARED, &bd,
+			D3D12_RESOURCE_STATE_COMMON, NULL,
+			__uuidof(ID3D12Resource), (void **)&d3d12_surround_bridge);
+		if (FAILED(hr)) {
+			fprintf(stderr, "[DisplayXR-SA] surround bridge CreateCommittedResource failed: 0x%08lx\n", hr);
+			return;
+		}
+		hr = d3d12_device->CreateSharedHandle(
+			d3d12_surround_bridge, NULL, GENERIC_ALL, NULL, &d3d12_surround_bridge_handle);
+		if (FAILED(hr) || !d3d12_surround_bridge_handle) {
+			fprintf(stderr, "[DisplayXR-SA] surround bridge CreateSharedHandle failed: 0x%08lx\n", hr);
+			surround_destroy_bridge();
+			return;
+		}
+		// SHARED fence for the producer→consumer handshake with the runtime.
+		hr = d3d12_device->CreateFence(0, D3D12_FENCE_FLAG_SHARED,
+			__uuidof(ID3D12Fence), (void **)&d3d12_surround_fence);
+		if (FAILED(hr)) {
+			fprintf(stderr, "[DisplayXR-SA] surround fence CreateFence failed: 0x%08lx\n", hr);
+			surround_destroy_bridge();
+			return;
+		}
+		hr = d3d12_device->CreateSharedHandle(
+			d3d12_surround_fence, NULL, GENERIC_ALL, NULL, &d3d12_surround_fence_handle);
+		if (FAILED(hr) || !d3d12_surround_fence_handle) {
+			fprintf(stderr, "[DisplayXR-SA] surround fence CreateSharedHandle failed: 0x%08lx\n", hr);
+			surround_destroy_bridge();
+			return;
+		}
+
+		if (unity_device) {
+			hr = unity_device->OpenSharedHandle(
+				d3d12_surround_bridge_handle,
+				__uuidof(ID3D12Resource), (void **)&d3d12_unity_surround_bridge);
+			if (FAILED(hr) || !d3d12_unity_surround_bridge) {
+				fprintf(stderr, "[DisplayXR-SA] surround bridge OpenSharedHandle (D3D12) failed: 0x%08lx\n", hr);
+				surround_destroy_bridge();
+				return;
+			}
+		} else if (unity_d3d11_device) {
+			ID3D11Device1 *dev1 = NULL;
+			hr = unity_d3d11_device->QueryInterface(__uuidof(ID3D11Device1), (void **)&dev1);
+			if (SUCCEEDED(hr) && dev1) {
+				hr = dev1->OpenSharedResource1(
+					d3d12_surround_bridge_handle,
+					__uuidof(ID3D11Texture2D), (void **)&d3d11_unity_surround_bridge);
+				dev1->Release();
+			}
+			if (FAILED(hr) || !d3d11_unity_surround_bridge) {
+				fprintf(stderr, "[DisplayXR-SA] surround bridge OpenSharedResource1 (D3D11) failed: 0x%08lx\n", hr);
+				surround_destroy_bridge();
+				return;
+			}
+		}
+
+		surround_bridge_w = w;
+		surround_bridge_h = h;
+		d3d12_surround_value = 0;
+		fprintf(stderr, "[DisplayXR-SA] surround bridge: %ux%u texH=%p fenceH=%p\n",
+			w, h, d3d12_surround_bridge_handle, d3d12_surround_fence_handle);
+	}
+
+	void surround_destroy_bridge() override
+	{
+		if (d3d11_unity_surround_bridge)  { d3d11_unity_surround_bridge->Release();  d3d11_unity_surround_bridge  = nullptr; }
+		if (d3d12_unity_surround_bridge)  { d3d12_unity_surround_bridge->Release();  d3d12_unity_surround_bridge  = nullptr; }
+		if (d3d12_surround_fence_handle)  { CloseHandle(d3d12_surround_fence_handle); d3d12_surround_fence_handle  = nullptr; }
+		if (d3d12_surround_fence)         { d3d12_surround_fence->Release();         d3d12_surround_fence         = nullptr; }
+		if (d3d12_surround_bridge_handle) { CloseHandle(d3d12_surround_bridge_handle); d3d12_surround_bridge_handle = nullptr; }
+		if (d3d12_surround_bridge)        { d3d12_surround_bridge->Release();        d3d12_surround_bridge        = nullptr; }
+		surround_bridge_w = surround_bridge_h = 0;
+		d3d12_surround_value = 0;
+	}
+
+	void *surround_get_bridge_unity_ptr() override
+	{
+		if (d3d11_unity_surround_bridge) return (void *)d3d11_unity_surround_bridge;
+		if (d3d12_unity_surround_bridge) return (void *)d3d12_unity_surround_bridge;
+		return nullptr;
+	}
+
+	bool surround_signal(void **out_tex_handle, void **out_fence_handle,
+	                     uint64_t *out_value) override
+	{
+		if (!d3d12_surround_bridge_handle || !d3d12_surround_fence_handle ||
+		    !d3d12_surround_fence || !d3d12_queue)
+			return false;
+		// Bump + signal the SHARED fence on the SA queue. Unity's copy into the
+		// bridge happened earlier on Unity's device (coarse cross-device sync,
+		// same as the wsui/atlas bridges); the runtime waits on this value on
+		// the SA queue before its strip blit reads the SA-side texture.
+		d3d12_surround_value++;
+		d3d12_queue->Signal(d3d12_surround_fence, d3d12_surround_value);
+		*out_tex_handle   = (void *)d3d12_surround_bridge_handle;
+		*out_fence_handle = (void *)d3d12_surround_fence_handle;
+		*out_value        = d3d12_surround_value;
+		return true;
 	}
 };
 

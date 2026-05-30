@@ -143,11 +143,22 @@ typedef struct StandaloneState {
 	PFN_xrRequestDisplayRenderingModeEXT pfn_request_rendering_mode;
 	PFN_xrEnumerateDisplayRenderingModesEXT pfn_enumerate_rendering_modes;
 	PFN_xrSetSharedTextureOutputRectEXT pfn_set_output_rect;
+	PFN_xrSetSharedTextureSurround2DFenceEXT pfn_set_surround_fence;
 	uint32_t canvas_width;
 	uint32_t canvas_height;
 	int32_t canvas_x;
 	int32_t canvas_y;
 	int has_display_mode_ext;
+
+	// 2D surround (issue #131). When active, the runtime fills the non-canvas
+	// region from an app texture; the canvas weaves into surround_subrect
+	// instead of the full window. surround_w/h = the surround texture (= window
+	// client) dims; surround_subrect_* = the 3D canvas sub-rect in window pixels.
+	int surround_active;
+	uint32_t surround_w, surround_h;
+	int surround_subrect_valid;
+	int32_t surround_subrect_x, surround_subrect_y;
+	uint32_t surround_subrect_w, surround_subrect_h;
 #if defined(_WIN32)
 	int window_closed;  // Set to 1 when user closes the preview window
 	// Mouse button state tracked by sa_wndproc for the C# input controller
@@ -352,6 +363,11 @@ resolve_functions(void)
 		if (XR_SUCCEEDED(s_sa.gipa(s_sa.instance, "xrSetSharedTextureOutputRectEXT", &fn)) && fn) {
 			s_sa.pfn_set_output_rect = (PFN_xrSetSharedTextureOutputRectEXT)fn;
 			sa_log("[DisplayXR-SA] Resolved xrSetSharedTextureOutputRectEXT\n");
+		}
+		fn = nullptr;
+		if (XR_SUCCEEDED(s_sa.gipa(s_sa.instance, "xrSetSharedTextureSurround2DFenceEXT", &fn)) && fn) {
+			s_sa.pfn_set_surround_fence = (PFN_xrSetSharedTextureSurround2DFenceEXT)fn;
+			sa_log("[DisplayXR-SA] Resolved xrSetSharedTextureSurround2DFenceEXT\n");
 		}
 	}
 
@@ -625,8 +641,18 @@ destroy_atlas_swapchain(void)
 static void
 sa_push_canvas_rect_to_runtime(void)
 {
-	if (s_sa.pfn_set_output_rect && s_sa.session != XR_NULL_HANDLE &&
-	    s_sa.canvas_width > 0 && s_sa.canvas_height > 0) {
+	if (!s_sa.pfn_set_output_rect || s_sa.session == XR_NULL_HANDLE)
+		return;
+	// 2D surround (#131): when a sub-rect is registered, the 3D weaves into it
+	// (window-relative pixels) and the rest becomes the surround region.
+	if (s_sa.surround_subrect_valid &&
+	    s_sa.surround_subrect_w > 0 && s_sa.surround_subrect_h > 0) {
+		s_sa.pfn_set_output_rect(s_sa.session,
+		                          s_sa.surround_subrect_x, s_sa.surround_subrect_y,
+		                          s_sa.surround_subrect_w, s_sa.surround_subrect_h);
+		return;
+	}
+	if (s_sa.canvas_width > 0 && s_sa.canvas_height > 0) {
 		s_sa.pfn_set_output_rect(s_sa.session,
 		                          0, 0,
 		                          s_sa.canvas_width, s_sa.canvas_height);
@@ -1623,6 +1649,21 @@ displayxr_standalone_submit_frame_atlas(void *atlas_tex)
 		(const XrCompositionLayerBaseHeader *)&hud_layer,
 	};
 
+	// 2D surround (#131): the runtime fills the non-canvas region post-weave
+	// from the SHARED surround bridge (Unity copied its 2D content in earlier).
+	// Push the canvas sub-rect + signal the fence + (re)register before
+	// xrEndFrame so the runtime's strip blit reads this frame's content.
+	if (s_sa.surround_active && s_sa.pfn_set_surround_fence && s_sa_backend) {
+		sa_push_canvas_rect_to_runtime();
+		void *tex_h = nullptr, *fence_h = nullptr;
+		uint64_t await_val = 0;
+		if (s_sa_backend->surround_signal(&tex_h, &fence_h, &await_val) &&
+		    tex_h && fence_h) {
+			s_sa.pfn_set_surround_fence(s_sa.session, tex_h,
+			    s_sa.surround_w, s_sa.surround_h, fence_h, await_val);
+		}
+	}
+
 	XrFrameEndInfo end_info = {XR_TYPE_FRAME_END_INFO};
 	end_info.displayTime = s_sa.predicted_display_time;
 	end_info.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
@@ -2005,6 +2046,66 @@ displayxr_standalone_get_wsui_bridge_texture(uint32_t width, uint32_t height,
 	}
 	*out_width = width;
 	*out_height = height;
+}
+
+// 2D surround (#131) bridge for the standalone session. Mirrors the wsui
+// bridge: native lazily creates a SHARED RGBA8 surround texture on the SA
+// device + a SHARED fence, opens the texture on Unity's device, and returns
+// the Unity-side pointer. C# wraps it via Texture2D.CreateExternalTexture and
+// Graphics.CopyTexture's its 2D RT into it each frame; the SA submit path then
+// signals the fence + registers the texture with the runtime.
+void
+displayxr_standalone_get_surround_bridge_texture(uint32_t width, uint32_t height,
+                                                  void **native_ptr,
+                                                  uint32_t *out_width,
+                                                  uint32_t *out_height)
+{
+	if (s_sa_backend && width > 0 && height > 0) {
+		s_sa_backend->surround_create_bridge(width, height);
+		*native_ptr = s_sa_backend->surround_get_bridge_unity_ptr();
+		s_sa.surround_w = width;
+		s_sa.surround_h = height;
+	} else {
+		*native_ptr = NULL;
+	}
+	*out_width = width;
+	*out_height = height;
+}
+
+// Enable/disable the 2D surround for the standalone session and set the 3D
+// canvas sub-rect (window-client pixels) that the surround surrounds. The
+// submit path signals + registers each frame while active.
+void
+displayxr_standalone_surround_set_active(int active, int32_t subrect_x, int32_t subrect_y,
+                                         uint32_t subrect_w, uint32_t subrect_h)
+{
+	s_sa.surround_active = active ? 1 : 0;
+	if (active && subrect_w > 0 && subrect_h > 0) {
+		s_sa.surround_subrect_valid = 1;
+		s_sa.surround_subrect_x = subrect_x;
+		s_sa.surround_subrect_y = subrect_y;
+		s_sa.surround_subrect_w = subrect_w;
+		s_sa.surround_subrect_h = subrect_h;
+	} else {
+		s_sa.surround_subrect_valid = 0;
+	}
+	sa_log("[DisplayXR-SA] surround_set_active: active=%d subrect=(%d,%d) %ux%u\n",
+	    s_sa.surround_active, subrect_x, subrect_y, subrect_w, subrect_h);
+}
+
+// Clear the 2D surround: unregister from the runtime, drop the sub-rect (back
+// to full-window canvas), and release the bridge.
+void
+displayxr_standalone_surround_clear(void)
+{
+	s_sa.surround_active = 0;
+	s_sa.surround_subrect_valid = 0;
+	if (s_sa.pfn_set_surround_fence && s_sa.session != XR_NULL_HANDLE)
+		s_sa.pfn_set_surround_fence(s_sa.session, NULL, 0, 0, NULL, 0);
+	if (s_sa_backend) s_sa_backend->surround_destroy_bridge();
+	// Restore the full-window canvas.
+	sa_push_canvas_rect_to_runtime();
+	sa_log("[DisplayXR-SA] surround_clear\n");
 }
 
 
