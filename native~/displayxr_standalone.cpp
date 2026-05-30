@@ -907,7 +907,14 @@ displayxr_standalone_start(const char *runtime_json_path)
 	XrResult result;
 
 #if defined(_WIN32)
-	HMODULE hmod = LoadLibraryA(lib_abs);
+	// LOAD_WITH_ALTERED_SEARCH_PATH makes Windows resolve the runtime DLL's own
+	// dependencies (e.g. pthreadVCE3.dll, cjson.dll, which ship beside it in the
+	// runtime folder) from that DLL's directory rather than from Unity.exe's
+	// search path. Plain LoadLibrary searches the *host process* dir + System32
+	// + PATH, none of which contain those runtime-local deps, so it fails with
+	// ERROR_MOD_NOT_FOUND (126) whenever the runtime has a folder-local
+	// dependency. Requires an absolute path, which resolve_library_path gives us.
+	HMODULE hmod = LoadLibraryExA(lib_abs, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
 	if (!hmod) {
 		sa_log("[DisplayXR-SA] LoadLibrary failed: %lu\n", GetLastError());
 		free(lib_abs);
