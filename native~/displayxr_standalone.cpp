@@ -1654,7 +1654,12 @@ displayxr_standalone_submit_frame_atlas(void *atlas_tex)
 	// Push the canvas sub-rect + signal the fence + (re)register before
 	// xrEndFrame so the runtime's strip blit reads this frame's content.
 	if (s_sa.surround_active && s_sa.pfn_set_surround_fence && s_sa_backend) {
+#if defined(_WIN32)
+		// Canvas sub-rect push is Win32-only (sa_push_canvas_rect_to_runtime
+		// lives in the _WIN32 block). Standalone surround is Windows-D3D12-only,
+		// so on other platforms surround_active never sets and this is moot.
 		sa_push_canvas_rect_to_runtime();
+#endif
 		void *tex_h = nullptr, *fence_h = nullptr;
 		uint64_t await_val = 0;
 		if (s_sa_backend->surround_signal(&tex_h, &fence_h, &await_val) &&
@@ -2103,8 +2108,11 @@ displayxr_standalone_surround_clear(void)
 	if (s_sa.pfn_set_surround_fence && s_sa.session != XR_NULL_HANDLE)
 		s_sa.pfn_set_surround_fence(s_sa.session, NULL, 0, 0, NULL, 0);
 	if (s_sa_backend) s_sa_backend->surround_destroy_bridge();
-	// Restore the full-window canvas.
+	// Restore the full-window canvas. (Win32-only — see note above; macOS/other
+	// standalone backends don't support surround so there's nothing to restore.)
+#if defined(_WIN32)
 	sa_push_canvas_rect_to_runtime();
+#endif
 	sa_log("[DisplayXR-SA] surround_clear\n");
 }
 
