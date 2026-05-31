@@ -269,6 +269,23 @@ DISPLAYXR_EXPORT void displayxr_set_overlay_hit_mask(const uint8_t *mask,
 DISPLAYXR_EXPORT void displayxr_set_overlay_surround_rect(int x, int y,
                                                           int w, int h);
 
+/// (#131) Per-pixel variant of displayxr_set_overlay_surround_rect: register the
+/// EXACT shape of a 2D surround element (e.g. a comic bubble with a triangular
+/// tail) as an alpha mask (mask_w*mask_h bytes, non-zero = opaque/catch), mapped
+/// over the dst rect (overlay client px, top-left). It is RLE'd and UNION-ed into
+/// the SetWindowRgn region built by displayxr_set_overlay_hit_mask each frame, so
+/// the element catches clicks while the empty area beside/around it (including the
+/// corners next to a triangular tail) keeps routing past to the desktop — which a
+/// single bounding rect cannot express. The surround is flat post-weave 2D, so
+/// the caller rasterizes the mask directly (no disparity / per-view math). The
+/// plugin copies the bytes. Pass mask=NULL or any dim <=0 to clear. Coexists with
+/// the rect API (both are unioned in); callers using the mask should clear the
+/// rect. Takes effect on the next hit-mask update.
+DISPLAYXR_EXPORT void displayxr_set_overlay_surround_mask(const uint8_t *mask,
+                                                          int mask_w, int mask_h,
+                                                          int dst_x, int dst_y,
+                                                          int dst_w, int dst_h);
+
 /// (issue #57) Returns 1 if the OS foreground window belongs to our process,
 /// 0 otherwise. Use to gate input handlers (WASD etc.) that should be
 /// inactive when the user has clicked through the overlay to another app.
