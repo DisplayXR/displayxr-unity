@@ -346,18 +346,38 @@ hooked_xrLocateViews(XrSession session,
 
 	// Window-relative Kooima (ADR-012): screen = actual window physical size,
 	// eye positions shifted by window-center offset on monitor.
+	//
+	// 2D-surround sub-rect (#131): when a canvas sub-rect is active the 3D weaves
+	// into THAT sub-rect (a smaller physical area of the panel), not the full
+	// window. The Kooima frustum + convergence must be computed for the region the
+	// content actually occupies, or the depth/parallax is sized for the window and
+	// the downscaled-into-the-sub-rect 3D is geometrically wrong (too strong). So
+	// the "effective output region" is the canvas sub-rect when set, else the full
+	// window. s_canvas_rect_* is window-client-relative; add the window's screen
+	// origin to get its position on the panel. No sub-rect → full window (unchanged).
+	int32_t  ov_x = state->viewport_x;
+	int32_t  ov_y = state->viewport_y;
+	uint32_t ov_w = state->viewport_width;
+	uint32_t ov_h = state->viewport_height;
+	if (s_canvas_rect_valid && s_canvas_rect_w > 0 && s_canvas_rect_h > 0) {
+		ov_x = state->viewport_x + s_canvas_rect_x;
+		ov_y = state->viewport_y + s_canvas_rect_y;
+		ov_w = s_canvas_rect_w;
+		ov_h = s_canvas_rect_h;
+	}
+
 	Display3DScreen screen = {di->display_width_meters, di->display_height_meters};
 	float eyeOffX_h = 0, eyeOffY_h = 0;
-	if (state->viewport_width > 0 && state->viewport_height > 0 &&
+	if (ov_w > 0 && ov_h > 0 &&
 	    di->display_pixel_width > 0 && di->display_pixel_height > 0) {
 		float px_size_x = di->display_width_meters / (float)di->display_pixel_width;
 		float px_size_y = di->display_height_meters / (float)di->display_pixel_height;
-		screen.width_m = (float)state->viewport_width * px_size_x;
-		screen.height_m = (float)state->viewport_height * px_size_y;
+		screen.width_m = (float)ov_w * px_size_x;
+		screen.height_m = (float)ov_h * px_size_y;
 
-		// Shift eyes from display-center to window-center coordinates
-		float winCenterX = (float)state->viewport_x + (float)state->viewport_width * 0.5f;
-		float winCenterY = (float)state->viewport_y + (float)state->viewport_height * 0.5f;
+		// Shift eyes from display-center to the output region's center on the panel.
+		float winCenterX = (float)ov_x + (float)ov_w * 0.5f;
+		float winCenterY = (float)ov_y + (float)ov_h * 0.5f;
 		float dispCenterX = (float)di->display_pixel_width * 0.5f;
 		float dispCenterY = (float)di->display_pixel_height * 0.5f;
 		eyeOffX_h = (winCenterX - dispCenterX) * px_size_x;
@@ -373,21 +393,23 @@ hooked_xrLocateViews(XrSession session,
 		nominal.y -= eyeOffY_h;
 	}
 
-	// Log Kooima params on viewport resize/move
+	// Log Kooima params when the effective output region (window OR canvas
+	// sub-rect) resizes/moves.
 	{
-		static uint32_t s_prev_vp_w = 0, s_prev_vp_h = 0;
-		static int32_t s_prev_vp_x = 0, s_prev_vp_y = 0;
-		if (state->viewport_width != s_prev_vp_w || state->viewport_height != s_prev_vp_h ||
-		    state->viewport_x != s_prev_vp_x || state->viewport_y != s_prev_vp_y) {
-			s_prev_vp_w = state->viewport_width;
-			s_prev_vp_h = state->viewport_height;
-			s_prev_vp_x = state->viewport_x;
-			s_prev_vp_y = state->viewport_y;
-			displayxr_log("[DisplayXR] Kooima hooks: vp=%ux%u@(%d,%d) disp=%ux%u "
+		static uint32_t s_prev_ov_w = 0, s_prev_ov_h = 0;
+		static int32_t s_prev_ov_x = 0, s_prev_ov_y = 0;
+		if (ov_w != s_prev_ov_w || ov_h != s_prev_ov_h ||
+		    ov_x != s_prev_ov_x || ov_y != s_prev_ov_y) {
+			s_prev_ov_w = ov_w;
+			s_prev_ov_h = ov_h;
+			s_prev_ov_x = ov_x;
+			s_prev_ov_y = ov_y;
+			displayxr_log("[DisplayXR] Kooima hooks: out=%ux%u@(%d,%d)%s win=%ux%u disp=%ux%u "
 			              "screen=%.4fx%.4fm eyeOff=(%.4f,%.4f) "
 			              "nom=(%.4f,%.4f,%.4f)\n",
+			              ov_w, ov_h, ov_x, ov_y,
+			              s_canvas_rect_valid ? " [canvas]" : "",
 			              state->viewport_width, state->viewport_height,
-			              state->viewport_x, state->viewport_y,
 			              di->display_pixel_width, di->display_pixel_height,
 			              screen.width_m, screen.height_m,
 			              eyeOffX_h, eyeOffY_h,
