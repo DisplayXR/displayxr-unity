@@ -27,38 +27,15 @@ displayxr-unity/               # repo root = UPM package root
 
 ## Building the Native Plugin
 
-```bash
-cd native~
-mkdir build && cd build
-cmake .. -DCMAKE_BUILD_TYPE=Release
-cmake --build . --config Release
-```
+Use the platform build scripts (they wrap CMake and place the shipping binary):
 
-Output: `displayxr_unity.dll` (Windows) or `libdisplayxr_unity.dylib` (macOS).
+- **macOS (shipping binary):** `native~/build-mac.sh` → Universal (x86_64 + arm64) `Runtime/Plugins/macOS/displayxr_unity.bundle`.
+- **Windows (shipping binary, MSVC):** `native~\build-win.bat` → `Runtime/Plugins/Windows/x64/displayxr_unity.dll`. Needs VS 2022 (or Build Tools) + "Desktop development with C++"; run from a Developer Command Prompt or any shell with MSVC on PATH.
+- **Windows (MinGW, compile-check only):** `native~/build-win.sh` → leaves the DLL in `build-win/` (MinGW ABI, not shipped). Run on macOS as a cross-compile check.
 
-Copy built binary to `Runtime/Plugins/Windows/x64/` or `Runtime/Plugins/macOS/`.
+Raw CMake (`cd native~ && mkdir build && cd build && cmake .. -DCMAKE_BUILD_TYPE=Release && cmake --build . --config Release`) works too, but the scripts handle output placement.
 
-### Local builds
-
-**macOS (native, produces shipping binary):**
-```bash
-native~/build-mac.sh
-```
-Builds Universal binary (x86_64 + arm64) → `Runtime/Plugins/macOS/displayxr_unity.bundle`.
-
-**Windows (native MSVC, produces shipping binary):**
-```bat
-native~\build-win.bat
-```
-Builds x64 DLL with MSVC → `Runtime/Plugins/Windows/x64/displayxr_unity.dll`. Requires Visual Studio 2022 (or Build Tools) with the "Desktop development with C++" workload. Run from a Developer Command Prompt or any shell with MSVC on PATH.
-
-**Windows (MinGW cross-compile, compile check only):**
-```bash
-native~/build-win.sh
-```
-Verifies the code compiles for Windows but the DLL stays in `build-win/` (MinGW ABI, not shipped). For native Windows builds, use `build-win.bat` instead.
-
-**Claude Code: After modifying any file in `native~/`, always run the local build script for the current platform — `native~/build-mac.sh` on macOS or `native~\build-win.bat` on Windows — to update the shipping binary. On macOS, also run `native~/build-win.sh` as a cross-compile check. Then commit (source + your platform's binary), push to a feature branch, and open a PR — CI builds both platforms automatically and reports back on the PR.**
+**Claude Code: after modifying any file in `native~/`, run the build script for the current platform (`native~/build-mac.sh` on macOS, `native~\build-win.bat` on Windows; also `native~/build-win.sh` as a cross-compile check on macOS) to refresh the shipping binary. Then commit source + your platform's binary, push to a feature branch, and open a PR — CI builds both platforms.**
 
 ## Key Architecture
 
@@ -155,22 +132,11 @@ Extension struct definitions in `native~/displayxr_extensions.h` must match the 
 
 ### Known Issues
 
-**Windows preview window: stutter vs. real-time Kooima during drag (parked).**
-The standalone preview window on Windows has two mutually-exclusive behaviors during a window move:
+Both open issues below share one root cause: **the SR SDK only phase-snaps to lenticular-aligned positions when it owns the OS modal drag loop.** A proper fix needs a runtime "external drag" API where the app proposes a position and the runtime returns the snapped one — tracked in `DisplayXR/displayxr-runtime#193`.
 
-1. **DefWindowProc modal drag** (current default): the SR SDK weaver phase-snaps the window to lenticular-aligned positions (no stutter), but Unity's main thread is blocked, so FrameTick can't run and Kooima only updates on drag release.
-2. **SC_MOVE intercept** (capture-based custom move): FrameTick keeps running so Kooima updates in real time, but the SR weaver doesn't get a chance to phase-snap, producing visible stutter.
+**Windows preview-window stutter during drag (parked).** Two mutually-exclusive behaviors during a window move: `DefWindowProc` modal drag lets the weaver phase-snap (no stutter) but blocks Unity's main thread so Kooima only updates on release; an SC_MOVE intercept keeps Kooima live but the weaver can't phase-snap (visible stutter). Calling `xrSetSharedTextureOutputRectEXT` from `WM_MOVE` is required for windowed interlacing at all but doesn't trigger phase-snap. SC_MOVE handling stays parked in `displayxr_standalone.cpp` (`sa_wndproc` `WM_SYSCOMMAND` case).
 
-We tried calling `xrSetSharedTextureOutputRectEXT` from `WM_MOVE` to push canvas updates to the runtime — this is required for the weaver to interlace at all in windowed mode (without it, weaving only works in fullscreen) — but it doesn't trigger phase-snapping. The SR SDK only phase-snaps when it owns the modal drag loop.
-
-A proper fix likely needs runtime API support: an "external drag" mode where the app proposes a position (e.g. via `xrSetSharedTextureOutputRectEXT` extended) and the runtime returns the snapped position. Tracked in `DisplayXR/displayxr-runtime#193`. Until then, the WndProc in `displayxr_standalone.cpp` keeps SC_MOVE handling commented out / parked. See the long comment in `sa_wndproc`'s `WM_SYSCOMMAND` case for context.
-
-**Transparent overlay (#57) right-drag — same SR phase-snap blocker as the standalone preview, no workaround possible from the plugin side.** Regular opaque DisplayXR built apps don't stutter when dragged because Unity has a real title bar — drag the title, `DefWindowProc` enters the OS modal drag loop, the SR weaver phase-snaps inside that loop. In transparent overlay mode Unity is `WS_POPUP` + cloaked with no title bar, so the user drags via right-click on the cube body. Two attempts to inherit opaque-mode behavior both failed:
-
-1. `SendMessage(unity_hwnd, WM_NCLBUTTONDOWN, HTCAPTION, 0)` from the overlay's `WM_RBUTTONDOWN` — silently ignored by `DefWindowProc` on cloaked `WS_POPUP` Unity. No `WM_ENTERSIZEMOVE`, no drag.
-2. `SendMessage(overlay, WM_SYSCOMMAND, SC_MOVE | HTCAPTION, 0)` — also silently ignored. The overlay has `WS_EX_NOREDIRECTIONBITMAP` (mandatory for per-pixel transparency) + `WS_EX_NOACTIVATE`, and `DefWindowProc`'s modal drag needs a DWM redirection surface to render the drag preview, so it bails. Adding `WS_CAPTION` to the overlay would change the client-area math and break the C#-supplied hit-rect coordinates.
-
-Current implementation is back to capture-based custom drag (`SetCapture` + manual `SetWindowPos(unity)` per `WM_MOUSEMOVE`) in `overlay_wnd_proc`. Cube/Kooima keep animating during drag, but no SR weaver phase-snap → 3D stutter visible during motion. Same fundamental blocker as the standalone preview — the SR SDK only phase-snaps when it owns the modal drag loop, and we can't induce one on a window with our style requirements. Resolution tracked in `DisplayXR/displayxr-runtime#193` (external drag API).
+**Transparent overlay (#57) right-drag — same blocker.** Opaque apps don't stutter because dragging the real title bar enters `DefWindowProc`'s modal loop. The overlay is `WS_POPUP` + cloaked + `WS_EX_NOREDIRECTIONBITMAP`/`WS_EX_NOACTIVATE`, so synthesized `WM_NCLBUTTONDOWN`/`SC_MOVE` drags are silently ignored (the modal loop needs a DWM redirection surface). Current impl is capture-based custom drag in `overlay_wnd_proc` — Kooima animates but no phase-snap.
 
 ### Code Style
 
@@ -266,16 +232,10 @@ The `upm` branch and release tarball only exist after the first `v*` tag is push
 
 ## Claude Code Skills
 
-### /release - Tagged Release
-Bumps the version, tags, pushes, monitors CI, and verifies the GitHub Release
-+ `upm` branch were created. See the "Creating a release" section above for
-usage. Skill at `.claude/skills/release/SKILL.md`.
+### /release — Tagged Release
+Bumps the version, tags, pushes, monitors CI, and verifies the GitHub Release + `upm` branch. See "Creating a release" above. Skill at `.claude/skills/release/SKILL.md`.
 
-> **Note:** A `/ci-monitor` skill previously automated direct-push-to-main +
-> watch-the-build. It was retired when the CI policy moved to PR-driven
-> builds — open a PR and let CI report on the PR head. Always include the
-> related GitHub issue number in commit messages (e.g. `Fix linker error
-> (#93)`).
+Always include the related GitHub issue number in commit messages (e.g. `Fix linker error (#93)`).
 
 ## Documentation Index
 
@@ -292,29 +252,9 @@ For detailed architecture and design decisions, see `docs~/`:
 
 ## Cross-Repo References
 
-- Runtime repo: [DisplayXR/displayxr-runtime](https://github.com/DisplayXR/displayxr-runtime)
-- Use `DisplayXR/displayxr-runtime#N` syntax to reference runtime issues
-
-### Independent of the runtime's `versions.json` auto-bump matrix
-
-The DisplayXR runtime maintains a `versions.json` at its root that
-pins the **bundled stack** (runtime, shell, leia-plugin, mcp, demos)
-for the dev orchestrator and the meta-installer. **This Unity plugin
-is intentionally NOT in that matrix** — it's a downstream consumer
-of the runtime's OpenXR wire protocol, not part of the
-co-released bundle. The bundle ships installers; Unity ships a UPM
-package on its own cadence. The two systems stay decoupled.
-
-If a future product decision puts Unity in the bundle (single-installer
-distribution), the integration shape would be: add a `unity` field
-to runtime's `versions.json`, add a `DispatchVersionsBump` job to
-this repo's `.github/workflows/build-native.yml` on tag push, and
-the meta-installer bundles the UPM tarball alongside the other
-installers. None of that exists today. See
-[`displayxr-runtime/docs/specs/runtime/versions-json-autobump.md`](https://github.com/DisplayXR/displayxr-runtime/blob/main/docs/specs/runtime/versions-json-autobump.md)
-for the spec.
-- The runtime provides the OpenXR compositor, display drivers, and eye tracking
-- The plugin provides the Unity-side stereo rendering pipeline
+- Runtime repo: [DisplayXR/displayxr-runtime](https://github.com/DisplayXR/displayxr-runtime). Use `DisplayXR/displayxr-runtime#N` to reference runtime issues.
+- The runtime provides the OpenXR compositor, display drivers, and eye tracking; this plugin provides the Unity-side stereo rendering pipeline.
+- **Decoupled from the runtime's `versions.json` bundle matrix** — this UPM package is a downstream consumer of the runtime's OpenXR wire protocol, not part of the co-released installer bundle (runtime/shell/leia-plugin/mcp/demos). The two ship on independent cadences. Spec: [`versions-json-autobump.md`](https://github.com/DisplayXR/displayxr-runtime/blob/main/docs/specs/runtime/versions-json-autobump.md).
 
 ### Test repos
 
@@ -330,7 +270,7 @@ All three pin the plugin via `https://github.com/DisplayXR/displayxr-unity.git#u
 
 Each test repo also has its own `CLAUDE.md` describing its scene, scripts, and which plugin features it exercises — designed so an agent can work in the test repo without loading the plugin's context.
 
-**Releases ship as NSIS installers, not zips** (per issue #108). Each test repo has an `installer/` dir with a `.nsi` + `build-installer.bat` that mirrors the [`displayxr-demo-gaussiansplat`](https://github.com/DisplayXR/displayxr-demo-gaussiansplat) pattern: hard-prereqs the runtime, installs the Unity Player under `Program Files\DisplayXR\Unity\<Variant>\`, and drops a registered-mode `.displayxr.json` manifest under `%ProgramData%\DisplayXR\apps\` (with renamed `icon_unity_test*.png` so variants don't collide) so the DisplayXR Shell launcher discovers the app as a tile. Icons are sourced from the Unity build output (`${BIN_DIR}\icon.png`) — Unity bundles per-app art next to the exe, no duplication in the repo. All three installers pin `MIN_RUNTIME_VERSION=1.3.0` (the gaussiansplat reference floor; runtime versioning is independent of plugin versioning). Build flow is manual today: build the Unity Player from the editor to `Builds/Win64/DisplayXR-test/`, run `installer\build-installer.bat`, attach the resulting `.exe` to a GitHub Release via `gh release create`. CI automation is a follow-up (blocked on Unity license activation in CI).
+**Test-repo releases ship as NSIS installers, not zips** (#108). Each test repo's `installer/` dir (`.nsi` + `build-installer.bat`) mirrors the [`displayxr-demo-gaussiansplat`](https://github.com/DisplayXR/displayxr-demo-gaussiansplat) pattern: hard-prereqs the runtime, installs the Unity Player under `Program Files\DisplayXR\Unity\<Variant>\`, and drops a registered-mode `.displayxr.json` manifest under `%ProgramData%\DisplayXR\apps\` (renamed `icon_unity_test*.png` per variant) so the Shell launcher discovers it as a tile. Build flow is manual today (build Player → `installer\build-installer.bat` → `gh release create`); CI automation is blocked on Unity license activation.
 
 #### Where to launch Claude Code when working on the test repos
 
