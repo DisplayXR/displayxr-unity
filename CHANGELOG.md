@@ -5,22 +5,6 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.11.0] - 2026-05-30
-
-### Added
-- **2D surround on the hooked path (#131):** high-resolution 2D content composited post-weave over the woven 3D scene. The surround fills a canvas sub-rect of the display, with a D3D12 fence-synced surround manager and a `DisplayXRSurround` component. Also runs on the standalone session (Editor Preview / Play Mode).
-- Surround foundation: v7 extension typedefs + hooked canvas-rect re-apply. (#131)
-
-### Fixed
-- Surround: size to the HWND weave target rather than panel dims so the bubble renders. (#131)
-- Surround: sub-rect-aware transparent-overlay click-through + solid silhouette mask. (#131)
-- Silhouette mask: pin clip-space z so near/far planes don't carve wedges out of the mask. (#131)
-- `DisplayXRSurround`: retry setup until display dimensions are valid. (#131)
-- Standalone runtime load failing with `ERROR_MOD_NOT_FOUND` (126) — rebuilt DLL with the SA altered-search-path fix. (#131)
-
-### Changed
-- Documentation: streamlined CLAUDE.md (deduped build steps, pruned runtime cruft) and documented independence from the runtime versions.json matrix.
-
 ## [1.10.0] - 2026-05-26
 
 ### Added
