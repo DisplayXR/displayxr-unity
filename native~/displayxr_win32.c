@@ -120,8 +120,27 @@ static int   s_hit_mask_active    = 0;
 // catch clicks even though it sits outside the 3D silhouette. UNION-ed into the
 // SetWindowRgn region built by displayxr_set_overlay_hit_mask each frame. Invalid
 // by default (no bubble) so empty surround keeps routing clicks to the desktop.
+//
+// The rect is a coarse bounding box; for a non-rectangular surround element (a
+// comic bubble with a triangular tail) it would catch clicks in the empty corners
+// beside the shape. The surround MASK below supersedes it: a per-pixel alpha of
+// the actual shape, RLE'd into the region exactly like the tiger silhouette — but
+// flat 2D (no disparity / no per-view union), so the caller can rasterize it on
+// the CPU. When a mask is set the caller should clear the rect (both are unioned
+// in if both are valid). The rect path stays for older callers / compat.
 static int   s_surround_rect_valid = 0;
 static RECT  s_surround_rect       = {0, 0, 0, 0};
+
+// (#131) Per-pixel surround shape mask (non-zero = opaque/catch). Owned copy,
+// mapped over s_surround_mask_dst (overlay client px, top-left) when the region is
+// rebuilt. NULL/invalid by default. Unlike the tiger hit-mask (which maps into the
+// canvas sub-rect and is owned by the silhouette each frame), this maps wherever
+// the caller places its 2D element in the full surround and is unioned in.
+static uint8_t *s_surround_mask       = NULL;
+static int      s_surround_mask_w     = 0;
+static int      s_surround_mask_h     = 0;
+static RECT     s_surround_mask_dst   = {0, 0, 0, 0};
+static int      s_surround_mask_valid = 0;
 
 // ============================================================================
 // Shell mode detection
@@ -1352,6 +1371,46 @@ displayxr_set_overlay_hit_mask(const uint8_t *mask, int mask_w, int mask_h,
 		rects[n++] = s_surround_rect;
 	}
 
+	// (#131) Union the per-pixel surround mask (e.g. the exact rounded-bubble +
+	// triangular-tail shape), RLE'd into rects over its dst rect with the same
+	// outward edge rounding as the tiger silhouette above. This is what makes the
+	// empty area BESIDE a non-rectangular tail route clicks through — a single
+	// bounding rect can't express that. Flat 2D: the caller hands us the shape
+	// directly (no view/disparity math, since the surround is post-weave).
+	if (s_surround_mask_valid && s_surround_mask != NULL) {
+		LONG sdx = s_surround_mask_dst.left;
+		LONG sdy = s_surround_mask_dst.top;
+		LONG sdw = s_surround_mask_dst.right  - s_surround_mask_dst.left;
+		LONG sdh = s_surround_mask_dst.bottom - s_surround_mask_dst.top;
+		int  smw = s_surround_mask_w, smh = s_surround_mask_h;
+		for (int my = 0; my < smh; my++) {
+			const uint8_t *row = s_surround_mask + (size_t)my * (size_t)smw;
+			int top    = (int)(sdy + (LONGLONG)my * sdh / smh);
+			int bottom = (int)(sdy + ((LONGLONG)(my + 1) * sdh + smh - 1) / smh);
+			int mx = 0;
+			while (mx < smw) {
+				while (mx < smw && row[mx] == 0) mx++;
+				if (mx >= smw) break;
+				int x0 = mx;
+				while (mx < smw && row[mx] != 0) mx++;
+				int x1 = mx;
+				if (n >= cap) {
+					int new_cap = cap * 2;
+					RECT *nr = (RECT *)realloc(rects,
+					                           (size_t)new_cap * sizeof(RECT));
+					if (nr == NULL) { free(rects); return; }
+					rects = nr;
+					cap = new_cap;
+				}
+				rects[n].left   = (LONG)(sdx + (LONGLONG)x0 * sdw / smw);
+				rects[n].top    = (LONG)top;
+				rects[n].right  = (LONG)(sdx + ((LONGLONG)x1 * sdw + smw - 1) / smw);
+				rects[n].bottom = (LONG)bottom;
+				n++;
+			}
+		}
+	}
+
 	HRGN rgn = NULL;
 	if (n == 0) {
 		// Empty silhouette: 0x0 rect = nothing-catches region.
@@ -1428,6 +1487,47 @@ displayxr_set_overlay_surround_rect(int x, int y, int w, int h)
 	s_surround_rect.bottom = y + h;
 	s_surround_rect_valid  = 1;
 	displayxr_log("[DisplayXR] surround_rect: (%d,%d) %dx%d\n", x, y, w, h);
+}
+
+void
+displayxr_set_overlay_surround_mask(const uint8_t *mask, int mask_w, int mask_h,
+                                    int dst_x, int dst_y, int dst_w, int dst_h)
+{
+	// (#131) Store a per-pixel surround shape mask (non-zero = opaque/catch),
+	// mapped over [dst_x,dst_y,dst_w,dst_h] in overlay client px when the window
+	// region is rebuilt by displayxr_set_overlay_hit_mask. Owned copy so the
+	// caller's buffer need not outlive the call. NULL/empty clears it.
+	if (mask == NULL || mask_w <= 0 || mask_h <= 0 || dst_w <= 0 || dst_h <= 0) {
+		if (s_surround_mask_valid)
+			displayxr_log("[DisplayXR] surround_mask: cleared\n");
+		free(s_surround_mask);
+		s_surround_mask       = NULL;
+		s_surround_mask_w     = 0;
+		s_surround_mask_h     = 0;
+		s_surround_mask_valid = 0;
+		return;
+	}
+
+	size_t bytes = (size_t)mask_w * (size_t)mask_h;
+	uint8_t *copy = (uint8_t *)malloc(bytes);
+	if (copy == NULL) {
+		displayxr_log("[DisplayXR] surround_mask: alloc failed (%dx%d)\n",
+		              mask_w, mask_h);
+		return;
+	}
+	memcpy(copy, mask, bytes);
+
+	free(s_surround_mask);
+	s_surround_mask        = copy;
+	s_surround_mask_w      = mask_w;
+	s_surround_mask_h      = mask_h;
+	s_surround_mask_dst.left   = dst_x;
+	s_surround_mask_dst.top    = dst_y;
+	s_surround_mask_dst.right  = dst_x + dst_w;
+	s_surround_mask_dst.bottom = dst_y + dst_h;
+	s_surround_mask_valid  = 1;
+	displayxr_log("[DisplayXR] surround_mask: %dx%d -> dst (%d,%d) %dx%d\n",
+	              mask_w, mask_h, dst_x, dst_y, dst_w, dst_h);
 }
 
 void

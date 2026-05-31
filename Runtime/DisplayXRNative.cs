@@ -673,6 +673,25 @@ namespace DisplayXR
             int x, int y, int w, int h);
 
         /// <summary>
+        /// (#131) Per-pixel variant of displayxr_set_overlay_surround_rect:
+        /// register the EXACT shape of a 2D surround element (e.g. a comic
+        /// bubble with a triangular tail) as an alpha mask (mask_w*mask_h
+        /// bytes, non-zero = opaque/catch) mapped over the dst rect (overlay
+        /// client px, top-left). RLE-unioned into the SetWindowRgn region each
+        /// frame, so the element catches clicks while the empty area beside it
+        /// (e.g. the corners next to the tail) keeps routing to the desktop —
+        /// which a single bounding rect can't express. The surround is flat
+        /// post-weave 2D, so the caller rasterizes the mask directly (no
+        /// disparity / per-view math). The plugin copies the bytes. Pass
+        /// mask = IntPtr.Zero or any dim &lt;= 0 to clear. Transparent overlay
+        /// (hooked) path only.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void displayxr_set_overlay_surround_mask(
+            IntPtr mask, int mask_w, int mask_h,
+            int dst_x, int dst_y, int dst_w, int dst_h);
+
+        /// <summary>
         /// Read cursor position (overlay-client coords, top-left origin) and
         /// mouse button state. Designed for transparent overlay mode where
         /// Unity's New Input System Mouse.current.position is frozen because
