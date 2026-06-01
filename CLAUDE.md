@@ -130,13 +130,9 @@ Extension struct definitions in `native~/displayxr_extensions.h` must match the 
 
 **You MUST use `com.unity.xr.openxr` version 1.16.1 or later.** The minimum version in `package.json` is 1.9.1 for broad compatibility, but versions before 1.16.1 ignore the `XR_RUNTIME_JSON` environment variable and the system `active_runtime.json` in editor play mode — they silently fall back to Unity's built-in Mock Runtime. This causes `0x0` display resolution, no IOSurface/shared texture, and no display info from the runtime. The failure is silent (no error logged, just mock runtime loaded). Always pin `1.16.1+` in your test project's `Packages/manifest.json`.
 
-### Known Issues
+### Resolved: window-drag phase-snap (#61)
 
-Both open issues below share one root cause: **the SR SDK only phase-snaps to lenticular-aligned positions when it owns the OS modal drag loop.** A proper fix needs a runtime "external drag" API where the app proposes a position and the runtime returns the snapped one — tracked in `DisplayXR/displayxr-runtime#193`.
-
-**Windows preview-window stutter during drag (parked).** Two mutually-exclusive behaviors during a window move: `DefWindowProc` modal drag lets the weaver phase-snap (no stutter) but blocks Unity's main thread so Kooima only updates on release; an SC_MOVE intercept keeps Kooima live but the weaver can't phase-snap (visible stutter). Calling `xrSetSharedTextureOutputRectEXT` from `WM_MOVE` is required for windowed interlacing at all but doesn't trigger phase-snap. SC_MOVE handling stays parked in `displayxr_standalone.cpp` (`sa_wndproc` `WM_SYSCOMMAND` case).
-
-**Transparent overlay (#57) right-drag — same blocker.** Opaque apps don't stutter because dragging the real title bar enters `DefWindowProc`'s modal loop. The overlay is `WS_POPUP` + cloaked + `WS_EX_NOREDIRECTIONBITMAP`/`WS_EX_NOACTIVATE`, so synthesized `WM_NCLBUTTONDOWN`/`SC_MOVE` drags are silently ignored (the modal loop needs a DWM redirection surface). Current impl is capture-based custom drag in `overlay_wnd_proc` — Kooima animates but no phase-snap.
+**Window-drag phase-snap is solved** (issue #61, closed 2026-05-09, hardware-verified on both paths). The SR SDK weaver only phase-snaps to lenticular-aligned positions when its WndProc subclass sees the OS in-drag flag. Rather than hand the OS the modal drag loop (which our `WS_POPUP` + cloaked + `WS_EX_NOREDIRECTIONBITMAP`/`WS_EX_NOACTIVATE` overlay can't do — synthesized `WM_NCLBUTTONDOWN`/`SC_MOVE` need a DWM redirection surface), we keep the capture-based custom drag and **bracket it** by synthesizing `WM_ENTERSIZEMOVE`/`WM_EXITSIZEMOVE` via `SendMessageW` around the drag. The weaver's subclass sees the bracket and phase-snaps; Kooima stays live throughout (no stutter, no update-only-on-release). Implemented in both `displayxr_win32.c` `overlay_wnd_proc` (transparent overlay right-drag, #57) and `displayxr_standalone.cpp` `sa_wndproc` (preview window). The runtime "external drag" API (`DisplayXR/displayxr-runtime#193`) is no longer needed for this.
 
 ### Code Style
 
