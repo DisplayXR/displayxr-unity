@@ -5,6 +5,18 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.14.0] - 2026-06-01
+
+### Added
+- Fullscreen 2D-surround region-editor support for the transparent overlay (#131): opt-in `displayxr_set_fullscreen_overlay_pref` births the overlay covering the monitor minus 1px (DWM-composited, covers the taskbar); new `displayxr_set_overlay_cursor` for app-driven overlay cursor shapes.
+- `displayxr_get_canvas_rect_px` binding + sub-rect-aware cyclopean raycast in `DisplayXRTransparentOverlay` so LMB-rotate works with an active canvas sub-rect (#131).
+
+### Fixed
+- Startup white flashes + hang with a fullscreen transparent overlay: an exact-monitor window tripped Windows fullscreen-optimization / independent-flip (DWM-alpha bypass); the overlay is now born 1px short of the monitor to stay DWM-composited (#131).
+
+### Changed
+- Coarse `[+ms]` relative timestamps on every native log line.
+
 ## [1.13.0] - 2026-05-31
 
 ### Added
