@@ -120,6 +120,18 @@ namespace DisplayXR
         public static extern void displayxr_set_canvas_rect(int x, int y, uint width, uint height);
 
         /// <summary>
+        /// (#34 / #131) Read back the active 3D canvas sub-rect (HWND-client
+        /// pixels, top-left origin). Returns 1 and fills the out params when a
+        /// sub-rect is set; returns 0 (full-window canvas) and leaves them
+        /// untouched otherwise. Used by the overlay raycast so cursor→NDC maps
+        /// into the sub-rect the 3D actually weaves into (the stereo projection
+        /// is computed for that sub-rect), not the full window.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int displayxr_get_canvas_rect_px(
+            out int x, out int y, out uint width, out uint height);
+
+        /// <summary>
         /// (#131) Register a Unity RenderTexture (R8G8B8A8_UNORM) as the 2D
         /// surround source. The runtime fills the non-canvas region (outside the
         /// canvas sub-rect) from it each frame, post-weave, at full native panel
@@ -690,6 +702,42 @@ namespace DisplayXR
         public static extern void displayxr_set_overlay_surround_mask(
             IntPtr mask, int mask_w, int mask_h,
             int dst_x, int dst_y, int dst_w, int dst_h);
+
+        /// <summary>
+        /// (#131) Put the transparent overlay into fixed full-screen,
+        /// app-managed window mode. enabled=1 sizes the overlay HWND to its
+        /// monitor at the aligned origin and DISABLES the native right-drag
+        /// move so the app owns all window interaction via virtual rects (3D
+        /// canvas sub-rect via displayxr_set_canvas_rect + 2D surround). This
+        /// turns move/resize into pure rectangle math (no OS resize, no
+        /// phase-snap, no mid-resize content drop). enabled=0 restores native
+        /// move. Windows transparent overlay only; no-op elsewhere.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void displayxr_set_overlay_fullscreen(int enabled);
+
+        /// <summary>
+        /// (#131) Opt in to a born-fullscreen transparent overlay. Must be called
+        /// BEFORE the overlay is created — call as early as possible, e.g. from a
+        /// RuntimeInitializeOnLoadMethod(BeforeSplashScreen). The overlay is then
+        /// created already covering its monitor, so the app needs no post-creation
+        /// resize (which recreates the swapchain = a startup flash) and Unity can
+        /// stay WINDOWED (avoiding fullscreen independent-flip, which bypasses DWM
+        /// alpha compositing and washes the content out). No-op once the overlay
+        /// exists. Windows transparent overlay only.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void displayxr_set_fullscreen_overlay_pref(int enabled);
+
+        /// <summary>
+        /// (#131) Set the transparent overlay's mouse cursor shape (applied each
+        /// mouse move over the overlay client area). Shapes: 0=arrow, 1=size-WE,
+        /// 2=size-NS, 3=size-NWSE, 4=size-NESW, 5=size-all (move). The region
+        /// editor uses it for resize affordances on window edges/corners and
+        /// region lines. Windows transparent overlay only; no-op elsewhere.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void displayxr_set_overlay_cursor(int shape);
 
         /// <summary>
         /// Read cursor position (overlay-client coords, top-left origin) and

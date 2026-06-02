@@ -105,6 +105,42 @@ static int   s_drag_active        = 0;
 static POINT s_drag_anchor_screen = {0, 0};
 static POINT s_drag_anchor_window = {0, 0};
 
+// (#131) App-managed fixed full-screen window mode. When set via
+// displayxr_set_overlay_fullscreen(1), the native right-drag MOVE in
+// overlay_wnd_proc is disabled — the app owns all window interaction by placing
+// content in virtual rects inside the fixed full-screen overlay. The overlay
+// still records button state (so displayxr_get_overlay_pointer reports the
+// right button to the app for app-driven translate).
+static int   s_app_managed_window = 0;
+
+// (#131) When set before the overlay is created (displayxr_set_fullscreen_
+// overlay_pref, from a fullscreen 2D-surround app's earliest init), birth the
+// overlay covering NEARLY the whole monitor — the monitor rect minus 1px on the
+// right and bottom — instead of Unity's (small, windowed) client rect.
+//
+// Two reasons for "minus 1px" rather than the exact monitor rect:
+//  - A top-level window sized to the EXACT monitor rect trips Windows
+//    fullscreen-optimization / independent-flip (DirectFlip), which bypasses DWM
+//    alpha compositing — the same path behind the documented 5s white
+//    overexposure (and the startup flashes/hang seen with an exact-fullscreen
+//    overlay). One pixel short keeps the window DWM-composited. A clean-era log
+//    (2026-05-11) confirmed a near-full 3517x2160 window-sized overlay was
+//    perfectly smooth, so coverage was never the problem — exact-monitor was.
+//  - The 1px lives at the bottom-right; the overlay still covers the taskbar
+//    (tiger feet render over it) for all but that last row/column.
+//
+// Born at this size up front so the overlay never needs a post-creation resize
+// (a resize recreates the runtime's presentation swapchain = a flash). Read at
+// creation time; setting it later has no effect on birth size.
+static int   s_fullscreen_overlay_pref = 0;
+
+// (#131) App-requested overlay cursor shape, applied in WM_SETCURSOR. The
+// overlay window class has no hCursor, so we must SetCursor explicitly (incl.
+// the arrow for shape 0) or a resize cursor would stick. 0=arrow, 1=size-WE,
+// 2=size-NS, 3=size-NWSE, 4=size-NESW, 5=size-all (move). Used by the region
+// editor to show resize affordances on window edges/corners and region lines.
+static volatile LONG s_overlay_cursor = 0;
+
 // True once C# has pushed at least one per-pixel silhouette mask via
 // displayxr_set_overlay_hit_mask. Acts as a one-way upgrade flag — the
 // rect-based displayxr_set_overlay_hit_rect path STOPS calling
@@ -456,6 +492,30 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		// click so foreground stays on Unity (cloaked but active).
 		return MA_NOACTIVATE;
 
+	case WM_SETCURSOR:
+		// (#131) App-driven cursor for the region editor's resize
+		// affordances. WM_NCHITTEST returns HTCLIENT for the toplevel
+		// overlay, so the low word is HTCLIENT whenever the cursor is in
+		// our (region-clipped) client area. The class has no hCursor, so
+		// we always SetCursor explicitly — incl. the arrow for shape 0 —
+		// otherwise a previously-set resize cursor would persist.
+		if (s_overlay_is_toplevel && LOWORD(lParam) == HTCLIENT) {
+			// IDC_* are integer resource atoms shared by the A/W APIs;
+			// cast to LPCWSTR so LoadCursorW takes them without a
+			// LPSTR→LPCWSTR type warning (the value is unchanged).
+			LPCWSTR id = (LPCWSTR)IDC_ARROW;
+			switch ((int)s_overlay_cursor) {
+			case 1: id = (LPCWSTR)IDC_SIZEWE;   break;
+			case 2: id = (LPCWSTR)IDC_SIZENS;   break;
+			case 3: id = (LPCWSTR)IDC_SIZENWSE; break;
+			case 4: id = (LPCWSTR)IDC_SIZENESW; break;
+			case 5: id = (LPCWSTR)IDC_SIZEALL;  break;
+			}
+			SetCursor(LoadCursorW(NULL, id));
+			return TRUE;
+		}
+		break;
+
 	// ----- right-button: capture-based drag of the OVERLAY window -----
 	//
 	// In transparent mode (Approach A from #57 session 4), Unity's HWND
@@ -484,18 +544,26 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		// last input event" is allowed. See
 		// displayxr_is_our_process_foreground.
 		SetForegroundWindow(hwnd);
-		GetCursorPos(&s_drag_anchor_screen);
-		RECT wr;
-		GetWindowRect(hwnd, &wr);
-		s_drag_anchor_window.x = wr.left;
-		s_drag_anchor_window.y = wr.top;
-		s_drag_active = 1;
-		SetCapture(hwnd);
-		// #61: synchronous bracketing so the SR SDK weaver's WndProc
-		// subclass sees the in-drag flag and phase-snaps the window
-		// to lenticular-aligned pixels. Must precede the first
-		// SetWindowPos in WM_MOUSEMOVE.
-		SendMessageW(hwnd, WM_ENTERSIZEMOVE, 0, 0);
+		// (#131) In app-managed fixed full-screen mode the app owns
+		// window translation (it moves a virtual rect, not the HWND),
+		// so skip the native capture-based MOVE. We still claimed
+		// foreground above (keyboard focus) and recorded the right
+		// button earlier, so displayxr_get_overlay_pointer reports it
+		// to the app's translate logic.
+		if (!s_app_managed_window) {
+			GetCursorPos(&s_drag_anchor_screen);
+			RECT wr;
+			GetWindowRect(hwnd, &wr);
+			s_drag_anchor_window.x = wr.left;
+			s_drag_anchor_window.y = wr.top;
+			s_drag_active = 1;
+			SetCapture(hwnd);
+			// #61: synchronous bracketing so the SR SDK weaver's
+			// WndProc subclass sees the in-drag flag and phase-snaps
+			// the window to lenticular-aligned pixels. Must precede
+			// the first SetWindowPos in WM_MOUSEMOVE.
+			SendMessageW(hwnd, WM_ENTERSIZEMOVE, 0, 0);
+		}
 		return 0;
 	}
 	case WM_RBUTTONUP:
@@ -758,6 +826,35 @@ displayxr_get_app_main_view(void)
 	int x = transparent_mode ? client_origin.x : 0;
 	int y = transparent_mode ? client_origin.y : 0;
 
+	// (#131) Fullscreen-overlay preference: when the app opted in BEFORE the
+	// overlay was created (displayxr_set_fullscreen_overlay_pref, from a
+	// fullscreen 2D-surround app's earliest init), BIRTH the overlay covering
+	// nearly the whole monitor — at the monitor origin, sized to the monitor
+	// MINUS 1px on the right and bottom. The "minus 1px" keeps the window from
+	// being the exact monitor rect, which would trip Windows fullscreen-
+	// optimization / independent-flip (DWM-alpha bypass = the white flash); 1px
+	// short stays DWM-composited. The overlay still covers the taskbar (tiger
+	// feet render over it) save the last row/column. Born at this size so it is
+	// never resized later (a resize recreates the swapchain = a flash). If the
+	// pref lands too late, the overlay is born at Unity's window size and
+	// set_overlay_fullscreen sizes it (one flash) as a graceful fallback.
+	if (transparent_mode && s_fullscreen_overlay_pref) {
+		HMONITOR mon = MonitorFromWindow(unity_hwnd, MONITOR_DEFAULTTONEAREST);
+		MONITORINFO mi;
+		mi.cbSize = sizeof(mi);
+		if (GetMonitorInfo(mon, &mi)) {
+			x = mi.rcMonitor.left;
+			y = mi.rcMonitor.top;
+			w = (mi.rcMonitor.right - mi.rcMonitor.left) - 1;
+			h = (mi.rcMonitor.bottom - mi.rcMonitor.top) - 1;
+			displayxr_log("[DisplayXR] overlay born near-fullscreen: "
+			              "(%d,%d) %dx%d (monitor %dx%d, minus 1px to stay "
+			              "DWM-composited)\n", x, y, w, h,
+			              (int)(mi.rcMonitor.right - mi.rcMonitor.left),
+			              (int)(mi.rcMonitor.bottom - mi.rcMonitor.top));
+		}
+	}
+
 	// Owner field:
 	// - WS_CHILD path: parent is unity_hwnd. The overlay is automatically
 	//   clipped, z-ordered, and destroyed with Unity. Standard.
@@ -941,7 +1038,17 @@ displayxr_set_transparent_overlay(int enabled, int topmost)
 			// boundaries — line the overlay up there. After this snap,
 			// parent_subclass_proc no longer follows Unity (Unity will
 			// be off-screen) and the overlay owns its on-screen position.
-			if (s_overlay_hwnd != NULL && IsWindow(s_overlay_hwnd)) {
+			//
+			// (#131) EXCEPT in near-fullscreen mode: the overlay was
+			// already born covering nearly the whole monitor (monitor
+			// minus 1px), and snapping it down to Unity's small WINDOWED
+			// rect here would shrink it — then set_overlay_fullscreen would
+			// grow it back, two resizes each recreating the presentation
+			// swapchain (= flash). The fullscreen overlay is meant to cover
+			// the monitor, not Unity's window, and all downstream C# works
+			// in full-monitor coords, so leave it where it was born.
+			if (s_overlay_hwnd != NULL && IsWindow(s_overlay_hwnd)
+			    && !s_fullscreen_overlay_pref) {
 				SetWindowPos(s_overlay_hwnd, HWND_TOPMOST,
 				             s_unity_saved_rect.left,
 				             s_unity_saved_rect.top, w, h,
@@ -1528,6 +1635,98 @@ displayxr_set_overlay_surround_mask(const uint8_t *mask, int mask_w, int mask_h,
 	s_surround_mask_valid  = 1;
 	displayxr_log("[DisplayXR] surround_mask: %dx%d -> dst (%d,%d) %dx%d\n",
 	              mask_w, mask_h, dst_x, dst_y, dst_w, dst_h);
+}
+
+void
+displayxr_set_fullscreen_overlay_pref(int enabled)
+{
+	// (#131) Opt in to a born-fullscreen overlay. Call as EARLY as possible
+	// (e.g. C# RuntimeInitializeOnLoadMethod(BeforeSplashScreen)) so it is set
+	// before the runtime creates the overlay in displayxr_get_app_main_view;
+	// then the overlay is born covering the monitor and the later
+	// displayxr_set_overlay_fullscreen() does not resize → no startup flash.
+	s_fullscreen_overlay_pref = enabled ? 1 : 0;
+	displayxr_log("[DisplayXR] fullscreen_overlay_pref = %d\n",
+	              s_fullscreen_overlay_pref);
+}
+
+void
+displayxr_set_overlay_fullscreen(int enabled)
+{
+	// (#131) Fixed full-screen, app-managed window mode. Resizing the OS HWND
+	// per interaction caused the three region-editor quirks (outline only in the
+	// 2D area, shift-then-snap on resize, content vanishing mid-resize) plus the
+	// #61 phase-snap. Instead we pin the overlay to its monitor ONCE at the
+	// aligned origin and let the app place its 3D canvas sub-rect + 2D surround
+	// in virtual rects inside it — pure rectangle math, no OS move/resize, no
+	// snap. The app drives translate/resize via displayxr_set_canvas_rect and
+	// the surround mask; this fn only disables the native right-drag MOVE and
+	// sizes the surface.
+	s_app_managed_window = enabled ? 1 : 0;
+
+	if (s_overlay_hwnd == NULL) {
+		displayxr_log("[DisplayXR] fullscreen: %s (no overlay HWND yet)\n",
+		              enabled ? "enabled" : "disabled");
+		return;
+	}
+
+	if (enabled) {
+		HMONITOR mon = MonitorFromWindow(s_overlay_hwnd,
+		                                 MONITOR_DEFAULTTONEAREST);
+		MONITORINFO mi;
+		mi.cbSize = sizeof(mi);
+		if (GetMonitorInfo(mon, &mi)) {
+			// Near-fullscreen target = monitor origin, sized to monitor MINUS
+			// 1px (right + bottom). Exactly the birth geometry in
+			// displayxr_get_app_main_view, so for a born-near-fullscreen overlay
+			// this is already satisfied and we skip the SetWindowPos. The 1px
+			// short keeps the window DWM-composited (an exact-monitor window
+			// trips fullscreen-optimization / independent-flip = the white
+			// flash). HWND_TOPMOST keeps it above the taskbar.
+			int x = mi.rcMonitor.left;
+			int y = mi.rcMonitor.top;
+			int w = (mi.rcMonitor.right - mi.rcMonitor.left) - 1;
+			int h = (mi.rcMonitor.bottom - mi.rcMonitor.top) - 1;
+
+			// If already at the target rect (born near-fullscreen), skip the
+			// SetWindowPos entirely — a same-size SetWindowPos still fires
+			// WM_WINDOWPOSCHANGED / a z-order change that DWM can hitch on, and
+			// any genuine resize recreates the presentation swapchain (flash).
+			// The resize path here is only a fallback for when the pref landed
+			// too late and the overlay was born at Unity's window size.
+			RECT cur;
+			GetWindowRect(s_overlay_hwnd, &cur);
+			if (cur.left == x && cur.top == y &&
+			    cur.right == x + w && cur.bottom == y + h) {
+				displayxr_log("[DisplayXR] fullscreen: enabled -> "
+				              "(%d,%d) %dx%d already near-fullscreen, "
+				              "no resize (app-managed)\n", x, y, w, h);
+				return;
+			}
+
+			SetWindowPos(s_overlay_hwnd, HWND_TOPMOST, x, y, w, h,
+			             SWP_NOACTIVATE);
+			displayxr_log("[DisplayXR] fullscreen: enabled -> "
+			              "(%d,%d) %dx%d topmost (resized)\n", x, y, w, h);
+		} else {
+			displayxr_log("[DisplayXR] fullscreen: GetMonitorInfo "
+			              "failed\n");
+		}
+	} else {
+		displayxr_log("[DisplayXR] fullscreen: disabled\n");
+	}
+}
+
+void
+displayxr_set_overlay_cursor(int shape)
+{
+	// (#131) Store the desired overlay cursor; WM_SETCURSOR applies it on every
+	// mouse move within the client area. Only an int write here (no SetCursor)
+	// so it is safe to call from C# on Unity's main thread regardless of which
+	// thread pumps the overlay's messages. Out-of-range falls back to arrow.
+	if (shape < 0 || shape > 5)
+		shape = 0;
+	InterlockedExchange(&s_overlay_cursor, (LONG)shape);
 }
 
 void
