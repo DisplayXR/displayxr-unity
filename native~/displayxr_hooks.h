@@ -286,6 +286,34 @@ DISPLAYXR_EXPORT void displayxr_set_overlay_surround_mask(const uint8_t *mask,
                                                           int dst_x, int dst_y,
                                                           int dst_w, int dst_h);
 
+/// (#131) Put the transparent overlay into "fixed full-screen, app-managed
+/// window" mode. enabled=1: resize the overlay HWND to its monitor bounds at
+/// the monitor origin (so the weaver interlaces the whole screen once, at the
+/// lenticular-aligned origin) and set an app-managed flag that DISABLES the
+/// native right-drag MOVE — the app now owns ALL window interaction by placing
+/// its content in virtual rects (3D canvas sub-rect + 2D surround) inside the
+/// fixed full-screen surface. enabled=0: clear the flag (restore native move).
+/// Windows transparent overlay only; no-op when there is no overlay HWND.
+DISPLAYXR_EXPORT void displayxr_set_overlay_fullscreen(int enabled);
+
+/// (#131) Opt in to a born-fullscreen transparent overlay. Must be called BEFORE
+/// the overlay is created (call as early as possible — e.g. a Unity
+/// RuntimeInitializeOnLoadMethod(BeforeSplashScreen)). The overlay is then
+/// created already covering its monitor, so a fullscreen 2D-surround app never
+/// needs a post-creation resize (which recreates the swapchain = a startup
+/// flash) and Unity itself can stay WINDOWED (avoiding fullscreen-optimization /
+/// independent-flip, which bypasses DWM alpha compositing). Setting it after the
+/// overlay exists has no effect on birth size. Windows transparent overlay only.
+DISPLAYXR_EXPORT void displayxr_set_fullscreen_overlay_pref(int enabled);
+
+/// (#131) Set the transparent overlay's mouse cursor shape, applied on every
+/// mouse move within the overlay's client area (the region editor uses it to
+/// show resize affordances on window edges/corners and region lines). Shapes:
+/// 0=arrow, 1=size-WE (horizontal), 2=size-NS (vertical), 3=size-NWSE,
+/// 4=size-NESW, 5=size-all (move). Out-of-range falls back to arrow. Windows
+/// transparent overlay only; no-op elsewhere.
+DISPLAYXR_EXPORT void displayxr_set_overlay_cursor(int shape);
+
 /// (issue #57) Returns 1 if the OS foreground window belongs to our process,
 /// 0 otherwise. Use to gate input handlers (WASD etc.) that should be
 /// inactive when the user has clicked through the overlay to another app.

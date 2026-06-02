@@ -74,7 +74,20 @@ void displayxr_log(const char *fmt, ...)
 			fflush(s_logfile);
 		}
 	}
+	// (#131) Coarse relative timestamp on every line so startup hitches can be
+	// localized in the log (e.g. the gap between "xrCreateSession succeeded"
+	// and the first "xrEndFrame" quantifies any first-frame weaver warmup).
+	// Captured once on the first call; GetTickCount64 (~15ms granularity) is
+	// plenty for spotting multi-frame freezes.
+	static unsigned long long s_log_t0 = 0;
+	if (s_log_t0 == 0)
+		s_log_t0 = GetTickCount64();
+	char ts[24];
+	snprintf(ts, sizeof(ts), "[+%llums] ",
+	         (unsigned long long)(GetTickCount64() - s_log_t0));
+
 	if (s_logfile) {
+		fputs(ts, s_logfile);
 		va_list args2;
 		va_copy(args2, args);
 		vfprintf(s_logfile, fmt, args2);
@@ -83,7 +96,9 @@ void displayxr_log(const char *fmt, ...)
 	}
 	// Also OutputDebugString for Visual Studio / DbgView
 	char buf[2048];
-	vsnprintf(buf, sizeof(buf), fmt, args);
+	int tn = snprintf(buf, sizeof(buf), "%s", ts);
+	if (tn < 0) tn = 0;
+	vsnprintf(buf + tn, sizeof(buf) - (size_t)tn, fmt, args);
 	OutputDebugStringA(buf);
 #else
 	vfprintf(stderr, fmt, args);

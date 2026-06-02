@@ -200,6 +200,26 @@ namespace DisplayXR
 #endif
         }
 
+        /// <summary>
+        /// (#131) Ask for the transparent overlay to be BORN covering its
+        /// monitor (instead of inheriting Unity's window size and being resized
+        /// later). MUST be called BEFORE the OpenXR session is created — from
+        /// the SAME [RuntimeInitializeOnLoadMethod(SubsystemRegistration)]
+        /// bootstrap as RequestTransparentSession. The overlay is then created
+        /// full-size, so a fullscreen 2D-surround app needs no post-creation
+        /// resize (which recreates the swapchain = a startup flash/freeze) and
+        /// Unity itself can stay WINDOWED (avoiding fullscreen independent-flip,
+        /// which bypasses DWM alpha compositing). Called from OnEnable it is too
+        /// late — the overlay already exists, and the app falls back to the
+        /// resize. Windows only.
+        /// </summary>
+        public static void RequestFullscreenOverlay()
+        {
+#if UNITY_STANDALONE_WIN || UNITY_STANDALONE_OSX
+            DisplayXRNative.displayxr_set_fullscreen_overlay_pref(1);
+#endif
+        }
+
         void OnEnable()
         {
             m_Camera = GetComponent<Camera>();
@@ -324,7 +344,9 @@ namespace DisplayXR
             {
                 BuildCyclopean(leftView, leftProj, rightView, rightProj,
                                 out Matrix4x4 cycView, out Matrix4x4 cycProj);
-                if (TryBuildEyeRay(clientX, clientY, overlayW, overlayH, cycView, cycProj, out Ray ray))
+                GetStereoViewport(overlayW, overlayH,
+                                  out int vpX, out int vpY, out int vpW, out int vpH);
+                if (TryBuildEyeRay(clientX, clientY, vpX, vpY, vpW, vpH, cycView, cycProj, out Ray ray))
                 {
                     float bestT = m_Camera.farClipPlane;
                     for (int i = 0; i < clickableRenderers.Length; i++)
@@ -581,7 +603,9 @@ namespace DisplayXR
                     {
                         BuildCyclopean(lvM, lpM, rvM, rpM,
                                        out Matrix4x4 cvM, out Matrix4x4 cpM);
-                        if (TryBuildEyeRay(clientXMac, clientYMac, overlayWMac, overlayHMac, cvM, cpM, out Ray rayM))
+                        GetStereoViewport(overlayWMac, overlayHMac,
+                                          out int vpXM, out int vpYM, out int vpWM, out int vpHM);
+                        if (TryBuildEyeRay(clientXMac, clientYMac, vpXM, vpYM, vpWM, vpHM, cvM, cpM, out Ray rayM))
                         {
                             float bestTM = m_Camera.farClipPlane;
                             for (int i = 0; i < clickableRenderers.Length; i++)
@@ -883,26 +907,51 @@ namespace DisplayXR
                                                 out rightView, out rightProj);
         }
 
+        // The stereo viewport (overlay client px) the Kooima projection from
+        // displayxr_get_stereo_matrices is computed for. Defaults to the full
+        // overlay; when a 3D canvas sub-rect is active (#131) the projection is
+        // built for that sub-rect, so the raycast must map the cursor into it.
+        private static void GetStereoViewport(int overlayW, int overlayH,
+                                              out int vpX, out int vpY,
+                                              out int vpW, out int vpH)
+        {
+            vpX = 0; vpY = 0; vpW = overlayW; vpH = overlayH;
+            try
+            {
+                if (DisplayXRNative.displayxr_get_canvas_rect_px(
+                        out int cx, out int cy, out uint cw, out uint ch) != 0
+                    && cw > 0 && ch > 0)
+                {
+                    vpX = cx; vpY = cy; vpW = (int)cw; vpH = (int)ch;
+                }
+            }
+            catch (System.EntryPointNotFoundException) { }
+        }
+
         // Unproject a window-pixel cursor through one eye's view + projection
         // into a Unity-world-space Ray. Inverse path of ProjectThroughEye:
-        // window px → NDC → inverse projection (eye-space, OpenXR convention)
+        // viewport px → NDC → inverse projection (eye-space, OpenXR convention)
         // → inverse view (Unity world). Origin = ray's near-plane point;
         // direction = far-near. Returns false if the projection is degenerate.
         private static bool TryBuildEyeRay(int clientX, int clientY,
-                                            int overlayW, int overlayH,
+                                            int vpX, int vpY, int vpW, int vpH,
                                             Matrix4x4 viewOpenXR, Matrix4x4 projOpenXR,
                                             out Ray ray)
         {
             ray = new Ray(Vector3.zero, Vector3.forward);
-            // Use the overlay's actual client size (not Screen.*, which
-            // reflects Unity's frozen off-screen HWND). The overlay rect
-            // can change at runtime — without this, cursor → NDC drifts
-            // and the ray misses the cube collider.
-            float sw = Mathf.Max(1, overlayW);
-            float sh = Mathf.Max(1, overlayH);
-            // Window pixel (top-left origin) → NDC ([-1,1] with +Y up)
-            float ndcX = 2f * clientX / sw - 1f;
-            float ndcY = 1f - 2f * clientY / sh;
+            // Map the cursor to NDC over the stereo VIEWPORT — the region the
+            // Kooima projection is computed for. Normally that's the full
+            // overlay client area, but when a 3D canvas sub-rect is active
+            // (#131) the projection is built for that (smaller, offset)
+            // sub-rect, so cursor → NDC must use it too; otherwise the ray
+            // lands at the content's full-window position and misses the
+            // shrunk-into-the-sub-rect collider. (overlayW/H is passed as the
+            // viewport when no sub-rect is set.)
+            float sw = Mathf.Max(1, vpW);
+            float sh = Mathf.Max(1, vpH);
+            // Viewport pixel (top-left origin) → NDC ([-1,1] with +Y up)
+            float ndcX = 2f * (clientX - vpX) / sw - 1f;
+            float ndcY = 1f - 2f * (clientY - vpY) / sh;
 
             Matrix4x4 projInv = projOpenXR.inverse;
             Vector4 nearClip = new Vector4(ndcX, ndcY, -1f, 1f);
