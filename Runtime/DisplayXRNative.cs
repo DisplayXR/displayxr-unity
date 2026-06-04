@@ -260,6 +260,21 @@ namespace DisplayXR
         public static extern int displayxr_request_display_mode(int mode3d);
 
         /// <summary>
+        /// (#140 / #396 W6) Capture the runtime's composed multi-view atlas to a
+        /// PNG via xrCaptureAtlasEXT (XR_EXT_atlas_capture). The runtime does the
+        /// readback with the compositor's own atlas image and writes
+        /// "&lt;pathPrefix&gt;_atlas.png" — no app-side AsyncGPUReadback or
+        /// hidden-camera re-render. Non-blocking (latches; PNG lands next composed
+        /// frame).
+        /// </summary>
+        /// <param name="pathPrefix">Output path prefix (runtime appends "_atlas.png").</param>
+        /// <param name="stage">1 = projection-only, 0 = post-compose (includes chrome).</param>
+        /// <returns>1 on XR_SUCCEEDED, 0 if unresolved / no session / failed.</returns>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int displayxr_capture_atlas(
+            [MarshalAs(UnmanagedType.LPStr)] string pathPrefix, int stage);
+
+        /// <summary>
         /// Get the Kooima stereo view and projection matrices computed by the native library.
         /// These are the matched matrix pairs that should be applied directly, bypassing
         /// Unity's matrix reconstruction from (fov, position, orientation).

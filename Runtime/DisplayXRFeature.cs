@@ -41,7 +41,8 @@ namespace DisplayXR
         private const string ExtensionStrings =
             "XR_EXT_display_info " +
             "XR_EXT_win32_window_binding " +
-            "XR_EXT_cocoa_window_binding";
+            "XR_EXT_cocoa_window_binding " +
+            "XR_EXT_atlas_capture";
 
         /// <summary>Singleton instance, set during OnInstanceCreate.</summary>
         public static DisplayXRFeature Instance { get; private set; }
@@ -559,6 +560,25 @@ namespace DisplayXR
         {
             if (!m_HooksInstalled) return false;
             return DisplayXRNative.displayxr_request_display_mode(mode3d ? 1 : 0) != 0;
+        }
+
+        /// <summary>
+        /// (#140 / #396 W6) Capture the runtime's composed multi-view atlas to a
+        /// PNG via xrCaptureAtlasEXT (XR_EXT_atlas_capture). The runtime reads back
+        /// the compositor's own atlas and writes "&lt;pathPrefix&gt;_atlas.png" —
+        /// the app no longer does an AsyncGPUReadback or hidden-camera re-render.
+        /// Non-blocking: the call latches the request and the PNG lands on the next
+        /// composed frame, so true means accepted, not on-disk.
+        /// </summary>
+        /// <param name="pathPrefix">Output path prefix (runtime appends "_atlas.png").</param>
+        /// <param name="projectionOnly">true = projection-only stage (default,
+        /// matches the native apps); false = post-compose (includes chrome / quad
+        /// layers).</param>
+        /// <returns>true if the capture was accepted.</returns>
+        public bool CaptureAtlas(string pathPrefix, bool projectionOnly = true)
+        {
+            if (!m_HooksInstalled) return false;
+            return DisplayXRNative.displayxr_capture_atlas(pathPrefix, projectionOnly ? 1 : 0) != 0;
         }
 
     }

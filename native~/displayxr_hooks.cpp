@@ -226,6 +226,12 @@ static PFN_xrSetSharedTextureSurround2DFenceEXT s_pfn_set_surround_fence = nullp
 static void * volatile s_surround_unity_tex = nullptr;
 static volatile uint32_t s_surround_w = 0, s_surround_h = 0;
 
+// XR_EXT_atlas_capture (#140 / #396 W6): runtime-owned atlas screenshot. Resolved
+// alongside the other extension entry points in hooked_xrGetSystemProperties; the
+// 'I'-key screenshot (DisplayXRScreenshot.cs → DisplayXRFeature.CaptureAtlas →
+// displayxr_capture_atlas) routes through this instead of an app-side GPU readback.
+static PFN_xrCaptureAtlasEXT s_pfn_capture_atlas = nullptr;
+
 // Max view count handled by hooked_xrLocateViews. The DisplayXR runtime
 // advertises max-view-count across all render modes for the active display
 // (e.g. sim_display = 4 because of its quad mode; lenticular displays could
@@ -736,6 +742,11 @@ hooked_xrGetSystemProperties(XrInstance instance, XrSystemId systemId, XrSystemP
 				if (XR_SUCCEEDED(s_next_gipa(s_instance, "xrSetSharedTextureSurround2DFenceEXT", &fn)) && fn) {
 					s_pfn_set_surround_fence = (PFN_xrSetSharedTextureSurround2DFenceEXT)fn;
 					displayxr_log( "[DisplayXR] Resolved xrSetSharedTextureSurround2DFenceEXT\n");
+				}
+				fn = nullptr;
+				if (XR_SUCCEEDED(s_next_gipa(s_instance, "xrCaptureAtlasEXT", &fn)) && fn) {
+					s_pfn_capture_atlas = (PFN_xrCaptureAtlasEXT)fn;
+					displayxr_log( "[DisplayXR] Resolved xrCaptureAtlasEXT (#140)\n");
 				}
 			}
 			break;
@@ -1988,6 +1999,35 @@ displayxr_request_display_mode(int mode_3d)
 
 	XrDisplayModeEXT mode = mode_3d ? XR_DISPLAY_MODE_3D_EXT : XR_DISPLAY_MODE_2D_EXT;
 	XrResult result = state->pfn_request_display_mode(s_session, mode);
+	return XR_SUCCEEDED(result) ? 1 : 0;
+}
+
+DISPLAYXR_EXPORT int
+displayxr_capture_atlas(const char *path_prefix, int stage)
+{
+	// XR_EXT_atlas_capture (#140 / #396 W6): hand the runtime a path prefix and a
+	// capture stage; the runtime reads back its own compositor atlas and writes
+	// "<prefix>_atlas.png". Non-blocking — the PNG lands on the next composed
+	// frame, so XR_SUCCESS means accepted, not on-disk (matches the native apps).
+	if (s_pfn_capture_atlas == nullptr || s_session == XR_NULL_HANDLE) {
+		displayxr_log("[DisplayXR] capture_atlas: unavailable (pfn=%p session=%p)\n",
+		              (void *)s_pfn_capture_atlas, (void *)(uintptr_t)s_session);
+		return 0; // Extension not resolved or no live session
+	}
+
+	XrAtlasCaptureInfoEXT info = {};
+	info.type = XR_TYPE_ATLAS_CAPTURE_INFO_EXT;
+	info.next = nullptr;
+	info.stage = (stage != 0) ? XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_EXT
+	                          : XR_ATLAS_CAPTURE_STAGE_POST_COMPOSE_EXT;
+	if (path_prefix != nullptr) {
+		strncpy(info.pathPrefix, path_prefix, XR_ATLAS_CAPTURE_PATH_MAX_EXT - 1);
+		info.pathPrefix[XR_ATLAS_CAPTURE_PATH_MAX_EXT - 1] = '\0';
+	}
+
+	XrResult result = s_pfn_capture_atlas(s_session, &info, nullptr);
+	displayxr_log("[DisplayXR] capture_atlas: stage=%d prefix='%s' result=%d\n",
+	              (int)info.stage, info.pathPrefix, (int)result);
 	return XR_SUCCEEDED(result) ? 1 : 0;
 }
 
