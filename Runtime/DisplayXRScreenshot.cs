@@ -4,28 +4,31 @@
 using System;
 using System.Collections.Concurrent;
 using System.IO;
-using System.Threading.Tasks;
 using UnityEngine;
 using UnityEngine.Rendering;
 
 namespace DisplayXR
 {
     /// <summary>
-    /// Saves the multi-view atlas the app wrote to the swapchain as a PNG.
+    /// Saves the multi-view atlas the runtime composes for this session as a PNG.
     /// Mirrors the C++ test app and Unreal plugin convention:
-    ///   <Pictures>/DisplayXR/<appname>-N_<cols>x<rows>.png
+    ///   <Pictures>/DisplayXR/<appname>-N_<cols>x<rows>_atlas.png
     /// where N auto-increments and cols x rows comes from the active rendering
-    /// mode (e.g. 2x1 for Leia 3D or SBS anaglyph). A short white flash gives
-    /// the user visual feedback that the capture happened.
+    /// mode. A short white flash gives the user visual feedback.
+    ///
+    /// As of #140 (W6 of #396) the capture is runtime-owned: a live session calls
+    /// <c>xrCaptureAtlasEXT</c> (XR_EXT_atlas_capture) via
+    /// <see cref="DisplayXRFeature.CaptureAtlas"/>, the runtime reads back the
+    /// compositor's own atlas image and writes the PNG. The plugin no longer does
+    /// an app-side <c>AsyncGPUReadback</c> or a hidden-camera Kooima re-render.
     ///
     /// Two capture paths:
-    ///   - Editor with the standalone preview session running: reads the
-    ///     existing atlas RT before swapchain submit. Flash is drawn into
-    ///     the atlas, visible on the 3D display, preview window, and Game View.
-    ///   - Standalone built app (or editor without the SA session): re-renders
-    ///     the active rig camera's left/right Kooima views into a temporary
-    ///     atlas via a hidden capture camera. Flash is rendered as a full-screen
-    ///     IMGUI overlay.
+    ///   - Editor with the standalone preview session running
+    ///     (<c>displayxr_standalone_is_running()</c>): reads the existing atlas RT
+    ///     before swapchain submit and encodes it app-side (there is no runtime
+    ///     OpenXR session in pure-editor preview, so xrCaptureAtlasEXT is N/A).
+    ///   - Live OpenXR session (built app, or editor running an OpenXR session):
+    ///     supplies a path prefix to xrCaptureAtlasEXT; the runtime writes the PNG.
     ///
     /// Bind <see cref="Capture"/> to any developer-chosen event (key, button,
     /// gamepad). The included sample <c>DisplayXRInputController</c> binds it
@@ -58,27 +61,24 @@ namespace DisplayXR
         private static volatile bool s_CapturePending;
         private static int s_FlashFramesRemaining;
 
-        // Background-thread results dispatched back to the main thread.
+        // Background-thread results dispatched back to the main thread (editor-
+        // preview PNG-write path only; the live path's PNG is written by the runtime).
         private static readonly ConcurrentQueue<Action> s_MainQueue = new ConcurrentQueue<Action>();
 
         // Cached material for the flash overlay (HideAndDontSave; reused across captures).
         private static Material s_FlashMat;
-
-        // Built-app on-demand capture: hidden camera that re-renders the rig.
-        private static GameObject s_CaptureRig;
-        private static Camera s_CaptureCam;
-        private static GameObject s_FlashOverlayGO;
 
         // ================================================================
         // Public API
         // ================================================================
 
         /// <summary>
-        /// Request a screenshot. In editor with the SA session running, the
-        /// capture runs at the next frame's submit point (multiple calls in
-        /// one frame are coalesced). In a built app or editor without the SA
-        /// session, the capture is performed synchronously by re-rendering
-        /// the active rig camera's left/right views.
+        /// Request a screenshot. In editor with the SA preview session running, the
+        /// capture runs at the next frame's submit point (multiple calls in one
+        /// frame are coalesced). In a live OpenXR session (built app, or editor with
+        /// an OpenXR session) the capture is requested from the runtime via
+        /// xrCaptureAtlasEXT — the runtime reads back its own composited atlas and
+        /// writes the PNG on the next composed frame.
         /// </summary>
         public static void Capture()
         {
@@ -86,16 +86,82 @@ namespace DisplayXR
 
             if (IsSessionRunning())
             {
+                // Editor preview session: app-side readback path (unchanged).
                 s_CapturePending = true;
                 return;
             }
 
-            CaptureOnDemand();
+            CaptureLive();
         }
 
         // ================================================================
-        // Internal hook (called from DisplayXRPreviewSession after eye render
-        // loop, before swapchain submit)
+        // Live OpenXR session: runtime-owned capture via xrCaptureAtlasEXT
+        // ================================================================
+
+        private static void CaptureLive()
+        {
+            var feature = DisplayXRFeature.Instance;
+            if (feature == null)
+            {
+                Fail("DisplayXRFeature not active (enable DisplayXR in OpenXR settings)");
+                return;
+            }
+
+            // Built-app stereo is two-view (Unity SetStereoViewMatrix L/R); this
+            // matches the cols x rows the runtime composes for a standard 3D mode.
+            // cols/rows feed only the PNG filename — the runtime appends "_atlas.png"
+            // and is the authoritative source of the actual atlas dimensions.
+            const int cols = 2;
+            const int rows = 1;
+
+            // Skip mono (no multi-view atlas to capture).
+            if (cols <= 1 && rows <= 1)
+            {
+                Fail("Mono mode — no multi-view atlas to capture");
+                return;
+            }
+
+            // Build the numbered output PREFIX (no extension): the runtime appends
+            // "_atlas.png". Mirrors the demos' dxr_capture::MakeCaptureAtlasPrefix —
+            // number against "<stem>-<N>_<cols>x<rows>_atlas.png" so repeats
+            // accumulate rather than overwrite.
+            string outDir = OutputDirectory;
+            string stem = SanitizeStem(Application.productName);
+            string prefix;
+            try
+            {
+                Directory.CreateDirectory(outDir);
+                int n = NextSequenceNumber(outDir, stem, cols, rows);
+                prefix = Path.Combine(outDir, $"{stem}-{n}_{cols}x{rows}");
+            }
+            catch (Exception ex)
+            {
+                Fail($"Could not prepare output directory: {ex.Message}");
+                return;
+            }
+
+            // projectionOnly: true matches the native test apps / demos default.
+            if (!feature.CaptureAtlas(prefix, projectionOnly: true))
+            {
+                Fail("xrCaptureAtlasEXT unavailable or rejected the request "
+                     + "(runtime missing XR_EXT_atlas_capture or no live session)");
+                return;
+            }
+
+            // The runtime writes "<prefix>_atlas.png" on its next composed frame.
+            // Optimistic success (the call is non-blocking; matches the native apps).
+            Succeed(prefix + "_atlas.png");
+
+            // Keep the flash overlay for visual feedback.
+            s_FlashFramesRemaining = kFlashFrames;
+            EnsureFlashOverlay();
+        }
+
+        // ================================================================
+        // Editor preview session hook (called from DisplayXRPreviewSession after
+        // the eye render loop, before swapchain submit). Out of scope for #140 —
+        // there is no runtime OpenXR session in pure-editor preview, so this path
+        // still encodes the atlas app-side.
         // ================================================================
 
         internal static void _OnAtlasReady(RenderTexture atlas, uint tileCols, uint tileRows,
@@ -133,7 +199,8 @@ namespace DisplayXR
         }
 
         // ================================================================
-        // Capture pipeline
+        // Editor-preview capture pipeline (app-side readback). LIVE sessions use
+        // the runtime path above and never reach here.
         // ================================================================
 
         private static void BeginCapture(RenderTexture atlas, int contentW, int contentH,
@@ -190,7 +257,7 @@ namespace DisplayXR
                 {
                     Directory.CreateDirectory(outDir);
                     int n = NextSequenceNumber(outDir, stem, cols, rows);
-                    fullPath = Path.Combine(outDir, $"{stem}-{n}_{cols}x{rows}.png");
+                    fullPath = Path.Combine(outDir, $"{stem}-{n}_{cols}x{rows}_atlas.png");
                 }
                 catch (Exception ex)
                 {
@@ -198,7 +265,7 @@ namespace DisplayXR
                     return;
                 }
 
-                Task.Run(() =>
+                System.Threading.Tasks.Task.Run(() =>
                 {
                     try
                     {
@@ -214,120 +281,8 @@ namespace DisplayXR
         }
 
         // ================================================================
-        // On-demand capture (built app / editor without SA session)
+        // Flash overlay (shared by both paths)
         // ================================================================
-
-        private static void CaptureOnDemand()
-        {
-            var rigCam = DisplayXRRigManager.ActiveCamera;
-            if (rigCam == null)
-            {
-                Fail("No active DisplayXR rig camera");
-                return;
-            }
-
-            var feature = DisplayXRFeature.Instance;
-            if (feature == null)
-            {
-                Fail("DisplayXRFeature not active (enable DisplayXR in OpenXR settings)");
-                return;
-            }
-
-            if (!feature.GetStereoMatrices(out Matrix4x4 lv, out Matrix4x4 lp,
-                                            out Matrix4x4 rv, out Matrix4x4 rp))
-            {
-                Fail("Stereo matrices unavailable (no frame computed yet)");
-                return;
-            }
-
-            var info = feature.DisplayInfo;
-
-            // Built-app stereo is two-view (Unity SetStereoViewMatrix L/R).
-            const int cols = 2;
-            const int rows = 1;
-
-            int tileW = info.recommendedViewScaleX > 0
-                ? Mathf.Max(1, Mathf.RoundToInt(Screen.width * info.recommendedViewScaleX))
-                : Mathf.Max(1, Screen.width);
-            int tileH = info.recommendedViewScaleY > 0
-                ? Mathf.Max(1, Mathf.RoundToInt(Screen.height * info.recommendedViewScaleY))
-                : Mathf.Max(1, Screen.height);
-
-            int atlasW = cols * tileW;
-            int atlasH = rows * tileH;
-
-            var atlas = RenderTexture.GetTemporary(atlasW, atlasH, 24, RenderTextureFormat.ARGB32);
-            atlas.name = "DisplayXR_OnDemandAtlas";
-
-            EnsureCaptureCamera();
-
-            // Configure the capture camera from the live rig camera. CopyFrom
-            // brings clear flags, near/far, culling mask, etc.; we override
-            // anything that affects render placement.
-            s_CaptureCam.CopyFrom(rigCam);
-            s_CaptureCam.enabled = false;
-            s_CaptureCam.stereoTargetEye = StereoTargetEyeMask.None;
-            s_CaptureCam.allowHDR = false;
-            s_CaptureCam.allowMSAA = false;
-            s_CaptureCam.targetTexture = atlas;
-
-            s_CaptureRig.transform.SetPositionAndRotation(
-                rigCam.transform.position, rigCam.transform.rotation);
-            s_CaptureRig.transform.localScale = rigCam.transform.lossyScale;
-
-            // OpenXR view matrices use right-hand / -Z forward; Unity world is
-            // left-hand / +Z forward. Negate column 2 (matches DisplayXRDisplay).
-            Matrix4x4 lvU = FlipViewZ(lv);
-            Matrix4x4 rvU = FlipViewZ(rv);
-
-            float xFrac = (float)tileW / atlasW;
-            float yFrac = (float)tileH / atlasH;
-
-            // Left eye → tile (0, 0)
-            s_CaptureCam.worldToCameraMatrix = lvU;
-            s_CaptureCam.projectionMatrix = lp;
-            s_CaptureCam.rect = new Rect(0f, 0f, xFrac, yFrac);
-            s_CaptureCam.Render();
-
-            // Right eye → tile (1, 0)
-            s_CaptureCam.worldToCameraMatrix = rvU;
-            s_CaptureCam.projectionMatrix = rp;
-            s_CaptureCam.rect = new Rect(xFrac, 0f, xFrac, yFrac);
-            s_CaptureCam.Render();
-
-            // Restore so the camera doesn't keep a reference to a temp RT.
-            s_CaptureCam.targetTexture = null;
-            s_CaptureCam.ResetWorldToCameraMatrix();
-            s_CaptureCam.ResetProjectionMatrix();
-            s_CaptureCam.rect = new Rect(0f, 0f, 1f, 1f);
-
-            // Atlas is already exactly content-sized so the crop is a no-op.
-            // Unlike the SA path we don't apply a proj-Y flip during render,
-            // so the atlas is in natural orientation and Y-flip is not needed.
-            BeginCapture(atlas, atlasW, atlasH, cols, rows, yFlip: false);
-
-            // BeginCapture's Graphics.Blit reads `atlas` synchronously; releasing
-            // here is safe.
-            RenderTexture.ReleaseTemporary(atlas);
-
-            s_FlashFramesRemaining = kFlashFrames;
-            EnsureFlashOverlay();
-        }
-
-        private static void EnsureCaptureCamera()
-        {
-            if (s_CaptureCam != null) return;
-            s_CaptureRig = new GameObject("DisplayXR_CaptureCam") { hideFlags = HideFlags.HideAndDontSave };
-            UnityEngine.Object.DontDestroyOnLoad(s_CaptureRig);
-            s_CaptureCam = s_CaptureRig.AddComponent<Camera>();
-            s_CaptureCam.enabled = false;
-        }
-
-        private static Matrix4x4 FlipViewZ(Matrix4x4 m)
-        {
-            m.m02 = -m.m02; m.m12 = -m.m12; m.m22 = -m.m22; m.m32 = -m.m32;
-            return m;
-        }
 
         private static void EnsureFlashOverlay()
         {
@@ -368,7 +323,7 @@ namespace DisplayXR
             RenderTexture.active = prev;
         }
 
-        // Used by the on-demand path's DisplayXRFlashOverlay (Camera.onPostRender)
+        // Used by the live path's DisplayXRFlashOverlay (Camera.onPostRender)
         // to draw into whatever RT the rig camera just wrote to (the OpenXR
         // swapchain image). Don't change RenderTexture.active here.
         internal static void _DrawFlashGL(int framesRemaining)
@@ -427,11 +382,15 @@ namespace DisplayXR
             return new string(chars);
         }
 
+        // Number against the final "<stem>-<N>_<cols>x<rows>_atlas.png" name (the
+        // runtime-owned suffix) so the live and editor-preview paths share one
+        // counter and repeats accumulate rather than overwrite. Mirrors the demos'
+        // dxr_capture::NextCaptureNumSuffix.
         private static int NextSequenceNumber(string dir, string stem, int cols, int rows)
         {
             if (!Directory.Exists(dir)) return 1;
             string prefix = stem + "-";
-            string suffix = $"_{cols}x{rows}.png";
+            string suffix = $"_{cols}x{rows}_atlas.png";
             int max = 0;
             foreach (string path in Directory.GetFiles(dir, $"{stem}-*{suffix}"))
             {
@@ -477,14 +436,14 @@ namespace DisplayXR
             }
         }
 
-        // Exposed so the on-demand path's per-frame overlay can drain the queue
+        // Exposed so the live path's per-frame overlay can drain the queue
         // even when the SA session isn't running (no _OnAtlasReady tick).
         internal static void _DrainMainQueue() => DrainMainQueue();
     }
 
     // Component attached to the active rig camera that draws the white flash
-    // into the camera's render target via a CommandBuffer. Built-app / no-SA
-    // path. CommandBuffer is required because Camera.OnPostRender (the legacy
+    // into the camera's render target via a CommandBuffer. Live (non-SA) path.
+    // CommandBuffer is required because Camera.OnPostRender (the legacy
     // event/instance message) fires after Unity releases the OpenXR swapchain
     // image, so any draws there land in nothing. CameraEvent.AfterEverything
     // runs as part of Unity's render queue, before swapchain release.

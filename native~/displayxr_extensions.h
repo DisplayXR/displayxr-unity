@@ -157,6 +157,61 @@ typedef struct XrCocoaWindowBindingCreateInfoEXT {
     XrBool32 transparentBackgroundEnabled; // SPEC_VERSION 5
 } XrCocoaWindowBindingCreateInfoEXT;
 
+// --- XR_EXT_atlas_capture ---
+// Vendor-neutral "snapshot the runtime's composed multi-view atlas to a PNG"
+// entry point. Replaces the app-side GPU readback (AsyncGPUReadback + hidden
+// camera re-render) the plugin used to do for the screenshot ('I') key — the
+// runtime now does the readback with the compositor's own atlas image at a
+// caller-selected stage and writes the PNG (appending "_atlas.png" to the
+// supplied path prefix). Source of truth:
+// displayxr-runtime/src/external/openxr_includes/openxr/XR_EXT_atlas_capture.h
+#define XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME "XR_EXT_atlas_capture"
+#define XR_EXT_ATLAS_CAPTURE_SPEC_VERSION 1
+
+#define XR_TYPE_ATLAS_CAPTURE_INFO_EXT ((XrStructureType)1000999120)
+#define XR_TYPE_ATLAS_CAPTURE_RESULT_EXT ((XrStructureType)1000999121)
+
+#define XR_ATLAS_CAPTURE_PATH_MAX_EXT 256
+
+// Values match enum mcp_capture_mode in the runtime (no translation layer):
+//   POST_COMPOSE    — atlas handed to the display processor (projection +
+//                     window-space + quad layers), end of frame.
+//   PROJECTION_ONLY — atlas with only projection-class layers, captured at the
+//                     projection-done boundary.
+typedef enum XrAtlasCaptureStageEXT {
+    XR_ATLAS_CAPTURE_STAGE_POST_COMPOSE_EXT = 0,
+    XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_EXT = 1,
+    XR_ATLAS_CAPTURE_STAGE_MAX_ENUM_EXT = 0x7FFFFFFF
+} XrAtlasCaptureStageEXT;
+
+typedef struct XrAtlasCaptureInfoEXT {
+    XrStructureType type; // Must be XR_TYPE_ATLAS_CAPTURE_INFO_EXT
+    const void *next;
+    XrAtlasCaptureStageEXT stage; // Capture stage (post-compose / projection-only)
+    char pathPrefix[XR_ATLAS_CAPTURE_PATH_MAX_EXT];
+} XrAtlasCaptureInfoEXT;
+
+typedef struct XrAtlasCaptureResultEXT {
+    XrStructureType type; // Must be XR_TYPE_ATLAS_CAPTURE_RESULT_EXT
+    void *next;
+    uint64_t timestampNs;
+    uint32_t atlasWidth;
+    uint32_t atlasHeight;
+    uint32_t eyeWidth;
+    uint32_t eyeHeight;
+    uint32_t tileColumns;
+    uint32_t tileRows;
+    float displayWidthM;
+    float displayHeightM;
+    float eyeLeftM[3];
+    float eyeRightM[3];
+} XrAtlasCaptureResultEXT;
+
+typedef XrResult(XRAPI_PTR *PFN_xrCaptureAtlasEXT)(
+    XrSession session,
+    const XrAtlasCaptureInfoEXT *info,
+    XrAtlasCaptureResultEXT *result);
+
 #ifdef __cplusplus
 }
 #endif
