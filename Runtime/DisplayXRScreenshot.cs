@@ -114,13 +114,6 @@ namespace DisplayXR
             const int cols = 2;
             const int rows = 1;
 
-            // Skip mono (no multi-view atlas to capture).
-            if (cols <= 1 && rows <= 1)
-            {
-                Fail("Mono mode — no multi-view atlas to capture");
-                return;
-            }
-
             // Build the numbered output PREFIX (no extension): the runtime appends
             // "_atlas.png". Mirrors the demos' dxr_capture::MakeCaptureAtlasPrefix —
             // number against "<stem>-<N>_<cols>x<rows>_atlas.png" so repeats
