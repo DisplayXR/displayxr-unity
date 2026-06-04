@@ -147,6 +147,18 @@ jobs:
           # Create branch from the tag contents + binaries
           git checkout -B upm
 
+          # Patch package.json to the tag version on the upm branch. The
+          # earlier "Verify package.json version matches tag" step only edits
+          # the working tree and never stages it, so without this the commit
+          # below would carry HEAD's (possibly stale) version — the .tgz would
+          # be correct but the #upm branch would ship the old version string.
+          # jq-patch here and stage it so the committed package.json matches
+          # the tag.
+          TAG_VERSION="${{ steps.version.outputs.version }}"
+          jq --arg v "$TAG_VERSION" '.version = $v' package.json > package.json.tmp
+          mv package.json.tmp package.json
+          git add package.json
+
           # Strip dev-only files that don't belong in a published Unity
           # package. Unity Package Manager strips *.md.meta files at the
           # package root, then warns about every .md file there that isn't
