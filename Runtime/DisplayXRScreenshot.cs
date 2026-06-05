@@ -57,9 +57,19 @@ namespace DisplayXR
 
         private const int kFlashFrames = 8;
 
+        // Frames to wait after issuing a live (runtime-owned) capture before
+        // starting the feedback flash. The flash draws into the same eye buffers
+        // the runtime composites for xrCaptureAtlasEXT, and the runtime grabs its
+        // next composed frame — so starting the flash immediately whites out the
+        // saved atlas. Delaying it a few frames lets the clean atlas be captured
+        // first. (The editor-preview path has no such race: it captures the atlas
+        // RT before drawing the flash in _OnAtlasReady.)
+        private const int kFlashStartDelayFrames = 3;
+
         private static string s_OutputDirectory;
         private static volatile bool s_CapturePending;
         private static int s_FlashFramesRemaining;
+        private static int s_FlashStartDelay;
 
         // Background-thread results dispatched back to the main thread (editor-
         // preview PNG-write path only; the live path's PNG is written by the runtime).
@@ -145,8 +155,12 @@ namespace DisplayXR
             // Optimistic success (the call is non-blocking; matches the native apps).
             Succeed(prefix + "_atlas.png");
 
-            // Keep the flash overlay for visual feedback.
-            s_FlashFramesRemaining = kFlashFrames;
+            // Defer the feedback flash: it draws into the same eye buffers the
+            // runtime composites for the capture, so arming it now whites out the
+            // saved atlas. Wait a few frames (the overlay ticks the delay down and
+            // arms s_FlashFramesRemaining) so the clean atlas is captured first.
+            s_FlashStartDelay = kFlashStartDelayFrames;
+            s_FlashFramesRemaining = 0;
             EnsureFlashOverlay();
         }
 
@@ -301,6 +315,17 @@ namespace DisplayXR
         internal static void _ConsumeFlashFrame()
         {
             if (s_FlashFramesRemaining > 0) s_FlashFramesRemaining--;
+        }
+
+        // Live-path pre-flash delay: ticked once per frame by the overlay. While
+        // counting down, the flash stays disarmed so the runtime's atlas capture
+        // (which grabs its next composed frame) isn't whited out by the flash.
+        // When the delay elapses, the flash is armed for kFlashFrames frames.
+        internal static void _TickFlashStartDelay()
+        {
+            if (s_FlashStartDelay <= 0) return;
+            s_FlashStartDelay--;
+            if (s_FlashStartDelay == 0) s_FlashFramesRemaining = kFlashFrames;
         }
 
         // ================================================================
@@ -491,8 +516,6 @@ namespace DisplayXR
             // fire and the success log appears, even when the SA session isn't running.
             DisplayXRScreenshot._DrainMainQueue();
 
-            int frames = DisplayXRScreenshot._GetFlashFramesRemaining();
-
             // SA session owns the flash via the atlas RT.
             bool saRunning = false;
             try { saRunning = DisplayXRNative.displayxr_standalone_is_running() != 0; }
@@ -500,6 +523,14 @@ namespace DisplayXR
 
             bool decrementThisFrame = Time.frameCount != s_LastTickFrame;
             if (decrementThisFrame) s_LastTickFrame = Time.frameCount;
+
+            // Live path: count down the pre-flash delay once per frame so the
+            // runtime captures a clean atlas before the flash draws into the eye
+            // buffers. This arms s_FlashFramesRemaining when the delay elapses, so
+            // read the count AFTER ticking.
+            if (decrementThisFrame) DisplayXRScreenshot._TickFlashStartDelay();
+
+            int frames = DisplayXRScreenshot._GetFlashFramesRemaining();
 
             if (frames <= 0 || saRunning || m_Cam == null)
             {

@@ -5,6 +5,14 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.15.0] - 2026-06-04
+
+### Changed
+- **The 'I'-key atlas screenshot is now runtime-owned via `xrCaptureAtlasEXT`** (XR_EXT_atlas_capture, spec v1) for live OpenXR sessions (#140, #396 W6). A live session hands the runtime a path prefix; the runtime reads back its own composited atlas and writes `<prefix>_atlas.png`. The plugin no longer does an app-side `AsyncGPUReadback` or a hidden-camera Kooima re-render on the live path. New public API `DisplayXRFeature.CaptureAtlas(pathPrefix, projectionOnly)`. **Requires a DisplayXR runtime that advertises `XR_EXT_atlas_capture`** — against older runtimes the capture logs `…unavailable` and is a no-op (no crash). The editor-preview (standalone-session) path is unchanged: it still encodes the atlas RT app-side, since there is no runtime OpenXR session in pure-editor preview.
+
+### Fixed
+- Live-path screenshot no longer captures the white feedback flash. The flash draws into the same eye buffers the runtime composites for the capture, so arming it immediately whited out the saved atlas; the flash is now deferred a few frames so the runtime grabs the clean atlas first (#140).
+
 ## [1.14.0] - 2026-06-01
 
 ### Added
