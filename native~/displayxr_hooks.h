@@ -187,8 +187,10 @@ DISPLAYXR_EXPORT int displayxr_request_display_mode(int mode_3d);
 
 /// (#140 / #396 W6) Capture the runtime's composed multi-view atlas to a PNG via
 /// xrCaptureAtlasEXT (XR_EXT_atlas_capture). The runtime does the readback with
-/// the compositor's own atlas image and writes "<path_prefix>_atlas.png" — the
-/// app no longer needs an AsyncGPUReadback or hidden-camera re-render. Non-blocking
+/// the compositor's own atlas image and writes
+/// "<path_prefix>_atlas_<viewCount>_<cols>x<rows>.png" (it owns the suffix —
+/// DisplayXR/displayxr-runtime#425) — the app passes a bare prefix and no longer
+/// needs an AsyncGPUReadback or hidden-camera re-render. Non-blocking
 /// (latches; PNG lands next composed frame). @param stage 1 = projection-only,
 /// 0 = post-compose (includes chrome/quad layers). Returns 1 on XR_SUCCEEDED, 0
 /// if the extension is unresolved, there is no live session, or the call failed.

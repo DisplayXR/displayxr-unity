@@ -565,12 +565,15 @@ namespace DisplayXR
         /// <summary>
         /// (#140 / #396 W6) Capture the runtime's composed multi-view atlas to a
         /// PNG via xrCaptureAtlasEXT (XR_EXT_atlas_capture). The runtime reads back
-        /// the compositor's own atlas and writes "&lt;pathPrefix&gt;_atlas.png" —
-        /// the app no longer does an AsyncGPUReadback or hidden-camera re-render.
+        /// the compositor's own atlas and writes
+        /// "&lt;pathPrefix&gt;_atlas_&lt;viewCount&gt;_&lt;cols&gt;x&lt;rows&gt;.png"
+        /// (the runtime owns the suffix; see DisplayXR/displayxr-runtime#425) — the
+        /// app no longer does an AsyncGPUReadback or hidden-camera re-render.
         /// Non-blocking: the call latches the request and the PNG lands on the next
         /// composed frame, so true means accepted, not on-disk.
         /// </summary>
-        /// <param name="pathPrefix">Output path prefix (runtime appends "_atlas.png").</param>
+        /// <param name="pathPrefix">Bare output path prefix (no layout tokens); the
+        /// runtime appends "_atlas_&lt;viewCount&gt;_&lt;cols&gt;x&lt;rows&gt;.png".</param>
         /// <param name="projectionOnly">true = projection-only stage (default,
         /// matches the native apps); false = post-compose (includes chrome / quad
         /// layers).</param>

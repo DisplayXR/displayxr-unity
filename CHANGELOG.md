@@ -5,6 +5,11 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- Atlas screenshot filenames adopt the runtime-owned suffix `<stem>-<N>_atlas_<viewCount>_<cols>x<rows>.png` (XR_EXT_atlas_capture spec v2, `DisplayXR/displayxr-runtime#425`). The live `xrCaptureAtlasEXT` path now passes a bare `<stem>-<N>` prefix (no pre-baked `_<cols>x<rows>`) and lets the runtime own the `_atlas_…` tokens, so the final name no longer duplicates the layout (`..._2x1_atlas_2_2x1.png`). The editor-preview (app-side) path writes the same name so both share one sequence counter.
+
 ## [1.15.0] - 2026-06-04
 
 ### Changed

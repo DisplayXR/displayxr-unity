@@ -12,9 +12,11 @@ namespace DisplayXR
     /// <summary>
     /// Saves the multi-view atlas the runtime composes for this session as a PNG.
     /// Mirrors the C++ test app and Unreal plugin convention:
-    ///   <Pictures>/DisplayXR/<appname>-N_<cols>x<rows>_atlas.png
-    /// where N auto-increments and cols x rows comes from the active rendering
-    /// mode. A short white flash gives the user visual feedback.
+    ///   <Pictures>/DisplayXR/<appname>-N_atlas_<viewCount>_<cols>x<rows>.png
+    /// where N auto-increments and viewCount/cols/rows come from the active
+    /// rendering mode (the runtime owns the "_atlas_..." suffix; see
+    /// DisplayXR/displayxr-runtime#425). A short white flash gives the user
+    /// visual feedback.
     ///
     /// As of #140 (W6 of #396) the capture is runtime-owned: a live session calls
     /// <c>xrCaptureAtlasEXT</c> (XR_EXT_atlas_capture) via
@@ -119,15 +121,19 @@ namespace DisplayXR
 
             // Built-app stereo is two-view (Unity SetStereoViewMatrix L/R); this
             // matches the cols x rows the runtime composes for a standard 3D mode.
-            // cols/rows feed only the PNG filename — the runtime appends "_atlas.png"
-            // and is the authoritative source of the actual atlas dimensions.
+            // cols/rows feed only the PNG filename — the runtime owns the
+            // "_atlas_<viewCount>_<cols>x<rows>.png" suffix and is the
+            // authoritative source of the actual atlas dimensions.
             const int cols = 2;
             const int rows = 1;
 
-            // Build the numbered output PREFIX (no extension): the runtime appends
-            // "_atlas.png". Mirrors the demos' dxr_capture::MakeCaptureAtlasPrefix —
-            // number against "<stem>-<N>_<cols>x<rows>_atlas.png" so repeats
-            // accumulate rather than overwrite.
+            // Build the numbered output PREFIX (bare — no layout tokens, no
+            // extension): the runtime appends "_atlas_<viewCount>_<cols>x<rows>.png"
+            // (DisplayXR/displayxr-runtime#425), so the prefix must NOT pre-bake the
+            // layout or the final name duplicates it (..._2x1_atlas_2_2x1.png).
+            // Mirrors the demos' dxr_capture::MakeCaptureAtlasPrefix — number
+            // against "<stem>-<N>_atlas_*.png" so repeats accumulate rather than
+            // overwrite.
             string outDir = OutputDirectory;
             string stem = SanitizeStem(Application.productName);
             string prefix;
@@ -135,7 +141,7 @@ namespace DisplayXR
             {
                 Directory.CreateDirectory(outDir);
                 int n = NextSequenceNumber(outDir, stem, cols, rows);
-                prefix = Path.Combine(outDir, $"{stem}-{n}_{cols}x{rows}");
+                prefix = Path.Combine(outDir, $"{stem}-{n}");
             }
             catch (Exception ex)
             {
@@ -151,9 +157,10 @@ namespace DisplayXR
                 return;
             }
 
-            // The runtime writes "<prefix>_atlas.png" on its next composed frame.
-            // Optimistic success (the call is non-blocking; matches the native apps).
-            Succeed(prefix + "_atlas.png");
+            // The runtime writes "<prefix>_atlas_<viewCount>_<cols>x<rows>.png" on its
+            // next composed frame. Optimistic success (the call is non-blocking;
+            // matches the native apps).
+            Succeed(prefix + $"_atlas_{cols * rows}_{cols}x{rows}.png");
 
             // Defer the feedback flash: it draws into the same eye buffers the
             // runtime composites for the capture, so arming it now whites out the
@@ -264,7 +271,9 @@ namespace DisplayXR
                 {
                     Directory.CreateDirectory(outDir);
                     int n = NextSequenceNumber(outDir, stem, cols, rows);
-                    fullPath = Path.Combine(outDir, $"{stem}-{n}_{cols}x{rows}_atlas.png");
+                    // Editor-preview writes app-side, but match the runtime-owned
+                    // name so both paths share one numbering space (#425).
+                    fullPath = Path.Combine(outDir, $"{stem}-{n}_atlas_{cols * rows}_{cols}x{rows}.png");
                 }
                 catch (Exception ex)
                 {
@@ -400,15 +409,15 @@ namespace DisplayXR
             return new string(chars);
         }
 
-        // Number against the final "<stem>-<N>_<cols>x<rows>_atlas.png" name (the
-        // runtime-owned suffix) so the live and editor-preview paths share one
-        // counter and repeats accumulate rather than overwrite. Mirrors the demos'
-        // dxr_capture::NextCaptureNumSuffix.
+        // Number against the final "<stem>-<N>_atlas_<viewCount>_<cols>x<rows>.png"
+        // name (the runtime-owned suffix, #425) so the live and editor-preview paths
+        // share one counter and repeats accumulate rather than overwrite. Mirrors the
+        // demos' dxr_capture::NextCaptureNumSuffix.
         private static int NextSequenceNumber(string dir, string stem, int cols, int rows)
         {
             if (!Directory.Exists(dir)) return 1;
             string prefix = stem + "-";
-            string suffix = $"_{cols}x{rows}_atlas.png";
+            string suffix = $"_atlas_{cols * rows}_{cols}x{rows}.png";
             int max = 0;
             foreach (string path in Directory.GetFiles(dir, $"{stem}-*{suffix}"))
             {

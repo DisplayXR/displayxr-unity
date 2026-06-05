@@ -162,11 +162,12 @@ typedef struct XrCocoaWindowBindingCreateInfoEXT {
 // entry point. Replaces the app-side GPU readback (AsyncGPUReadback + hidden
 // camera re-render) the plugin used to do for the screenshot ('I') key — the
 // runtime now does the readback with the compositor's own atlas image at a
-// caller-selected stage and writes the PNG (appending "_atlas.png" to the
-// supplied path prefix). Source of truth:
+// caller-selected stage and writes the PNG (appending
+// "_atlas_<viewCount>_<cols>x<rows>.png" to the supplied path prefix, opaque
+// alpha — DisplayXR/displayxr-runtime#425). Source of truth:
 // displayxr-runtime/src/external/openxr_includes/openxr/XR_EXT_atlas_capture.h
 #define XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME "XR_EXT_atlas_capture"
-#define XR_EXT_ATLAS_CAPTURE_SPEC_VERSION 1
+#define XR_EXT_ATLAS_CAPTURE_SPEC_VERSION 2
 
 #define XR_TYPE_ATLAS_CAPTURE_INFO_EXT ((XrStructureType)1000999120)
 #define XR_TYPE_ATLAS_CAPTURE_RESULT_EXT ((XrStructureType)1000999121)
