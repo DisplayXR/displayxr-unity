@@ -37,6 +37,26 @@ else()
     get_target_property(OPENXR_INCLUDE_DIR OpenXR::Headers INTERFACE_INCLUDE_DIRECTORIES)
 endif()
 
+# --- displayxr::math (shared Kooima math, displayxr-runtime#396) ---
+# The display3d/camera3d view math is the org-shared displayxr-common library,
+# consumed by tag like every other consumer (runtime test apps, demos, Unreal).
+# displayxr-common reuses an existing OpenXR::headers / OpenXR::openxr_loader
+# target when the consumer provides one; expose the headers we just resolved
+# above so it doesn't fetch a second OpenXR-SDK copy (version skew + CI time).
+if(NOT TARGET OpenXR::headers AND NOT TARGET OpenXR::openxr_loader)
+    add_library(displayxr_unity_openxr_headers INTERFACE)
+    target_include_directories(displayxr_unity_openxr_headers INTERFACE "${OPENXR_INCLUDE_DIR}")
+    add_library(OpenXR::headers ALIAS displayxr_unity_openxr_headers)
+endif()
+include(FetchContent)
+set(DISPLAYXR_COMMON_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(
+    displayxr_common
+    GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
+    GIT_TAG v0.2.0
+)
+FetchContent_MakeAvailable(displayxr_common)
+
 # --- Vulkan headers (Windows standalone backend, issue #124) ---
 # Header-only. We compile against these with VK_NO_PROTOTYPES and resolve every
 # entry point from vulkan-1.dll at runtime (displayxr_vk_loader.cpp), so there
@@ -83,8 +103,6 @@ set(SOURCES
     displayxr_standalone_opengles.cpp
     displayxr_vk_loader.cpp
     displayxr_window_space_ui.cpp
-    display3d_view.c
-    camera3d_view.c
 )
 
 set(HEADERS
@@ -97,8 +115,6 @@ set(HEADERS
     displayxr_standalone.h
     displayxr_standalone_internal.h
     displayxr_window_space_ui.h
-    display3d_view.h
-    camera3d_view.h
 )
 
 # Apple-only: IOSurface helpers (Objective-C) + transparent-overlay NSWindow config
@@ -128,6 +144,10 @@ target_include_directories(displayxr_unity PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${OPENXR_INCLUDE_DIR}
 )
+
+# Shared Kooima math (display3d_view.h / camera3d_view.h / projection_depth.h
+# resolve from this target's interface include dir).
+target_link_libraries(displayxr_unity PRIVATE displayxr::math)
 
 # Vulkan headers + vendored Unity native-plugin interface headers (Windows
 # standalone Vulkan backend, issue #124).

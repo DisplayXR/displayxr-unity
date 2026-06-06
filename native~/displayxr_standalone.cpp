@@ -1728,32 +1728,6 @@ displayxr_standalone_compute_views(
 	s_sa.last_near_z = near_z;
 	s_sa.last_far_z = far_z;
 
-	// Window-relative Kooima (ADR-012): screen = actual window physical size,
-	// eye positions shifted by window-center offset on monitor.
-	Display3DScreen screen;
-	float eyeOffsetX_mv = 0.0f, eyeOffsetY_mv = 0.0f;
-	if (s_sa.canvas_width > 0 && s_sa.canvas_height > 0 &&
-	    s_sa.display_info.display_pixel_width > 0 && s_sa.display_info.display_pixel_height > 0) {
-		float pxSizeX = s_sa.display_info.display_width_meters / (float)s_sa.display_info.display_pixel_width;
-		float pxSizeY = s_sa.display_info.display_height_meters / (float)s_sa.display_info.display_pixel_height;
-		screen.width_m = (float)s_sa.canvas_width * pxSizeX;
-		screen.height_m = (float)s_sa.canvas_height * pxSizeY;
-
-		// Shift eyes from display-center to window-center coordinates
-		float winCenterX = (float)s_sa.canvas_x + (float)s_sa.canvas_width * 0.5f;
-		float winCenterY = (float)s_sa.canvas_y + (float)s_sa.canvas_height * 0.5f;
-		float dispCenterX = (float)s_sa.display_info.display_pixel_width * 0.5f;
-		float dispCenterY = (float)s_sa.display_info.display_pixel_height * 0.5f;
-		eyeOffsetX_mv = (winCenterX - dispCenterX) * pxSizeX;
-		eyeOffsetY_mv = (winCenterY - dispCenterY) * pxSizeY;
-#ifdef _WIN32
-		eyeOffsetY_mv = -eyeOffsetY_mv; // Win32 Y is top-down, eye coords are Y-up
-#endif
-	} else {
-		screen.width_m = s_sa.display_info.display_width_meters;
-		screen.height_m = s_sa.display_info.display_height_meters;
-	}
-
 	Display3DTunables tunables = s_sa.tunables_set
 		? s_sa.tunables
 		: display3d_default_tunables();
@@ -1761,24 +1735,55 @@ displayxr_standalone_compute_views(
 	XrPosef *pose_ptr = s_sa.display_pose_set ? &s_sa.display_pose : NULL;
 
 	XrVector3f nominal = {
-		s_sa.display_info.nominal_viewer_x - eyeOffsetX_mv,
-		s_sa.display_info.nominal_viewer_y - eyeOffsetY_mv,
+		s_sa.display_info.nominal_viewer_x,
+		s_sa.display_info.nominal_viewer_y,
 		s_sa.display_info.nominal_viewer_z
 	};
 
 	// Build raw eye positions for all requested views.
 	// If mode needs more views than xrLocateViews returned (e.g. quad=4
 	// but PRIMARY_STEREO=2), duplicate views[0] for extras — matches the
-	// reference test app.
-	XrVector3f raw_eyes[SA_MAX_VIEWS];
+	// reference test app. (+1 slot: the nominal viewer rides through the
+	// window-rect resolve below so it gets the same shift as the eyes.)
+	XrVector3f raw_eyes[SA_MAX_VIEWS + 1];
 	uint32_t n = view_count;
 	if (n > SA_MAX_VIEWS) n = SA_MAX_VIEWS;
 
 	for (uint32_t i = 0; i < n; i++) {
 		uint32_t src = (i < s_sa.located_view_count) ? i : 0;
-		raw_eyes[i].x = s_sa.eye_positions[src][0] - eyeOffsetX_mv;
-		raw_eyes[i].y = s_sa.eye_positions[src][1] - eyeOffsetY_mv;
+		raw_eyes[i].x = s_sa.eye_positions[src][0];
+		raw_eyes[i].y = s_sa.eye_positions[src][1];
 		raw_eyes[i].z = s_sa.eye_positions[src][2];
+	}
+
+	// Window-relative Kooima (ADR-012), via Layer 1 (displayxr::math):
+	// screen = actual window physical size, eyes + nominal shifted to the
+	// window-center on the monitor (including the Y-down -> Y-up flip).
+	Display3DScreen screen = {
+		s_sa.display_info.display_width_meters,
+		s_sa.display_info.display_height_meters,
+	};
+	if (s_sa.canvas_width > 0 && s_sa.canvas_height > 0 &&
+	    s_sa.display_info.display_pixel_width > 0 && s_sa.display_info.display_pixel_height > 0) {
+		Display3DWindowPlacement placement = {};
+		placement.display_width_m = s_sa.display_info.display_width_meters;
+		placement.display_height_m = s_sa.display_info.display_height_meters;
+		placement.display_width_px = (float)s_sa.display_info.display_pixel_width;
+		placement.display_height_px = (float)s_sa.display_info.display_pixel_height;
+		placement.rect_width_px = (float)s_sa.canvas_width;
+		placement.rect_height_px = (float)s_sa.canvas_height;
+		placement.rect_center_x_px = (float)s_sa.canvas_x + (float)s_sa.canvas_width * 0.5f;
+		float rect_center_y = (float)s_sa.canvas_y + (float)s_sa.canvas_height * 0.5f;
+#if !defined(_WIN32)
+		// NSWindow rects are bottom-left-origin Y-up; the placement expects
+		// top-left Y-down pixels (Layer 1 owns the Y-down -> Y-up eye flip).
+		rect_center_y = (float)s_sa.display_info.display_pixel_height - rect_center_y;
+#endif
+		placement.rect_center_y_px = rect_center_y;
+
+		raw_eyes[n] = nominal;
+		display3d_resolve_window_rect(&placement, raw_eyes, n + 1, &screen, raw_eyes);
+		nominal = raw_eyes[n];
 	}
 
 	if (s_sa.camera_centric) {
@@ -1809,11 +1814,31 @@ displayxr_standalone_compute_views(
 		}
 		s_sa.computed_view_count = n;
 	} else {
-		// Display-centric: use display3d library
+		// Display-centric: use display3d library.
+		// Clip-plane policy (call-site): the C# caller passes ABSOLUTE
+		// near/far view-space distances; displayxr::math resolves
+		// ZDP-anchored offsets instead, so compute the views with nominal
+		// offsets and rebuild each per-view projection with the lib's
+		// absolute-clip primitive (FOV / view matrix / eye outputs are
+		// clip-plane independent).
+		float vdh = tunables.virtual_display_height;
 		Display3DView out_views[SA_MAX_VIEWS];
 		display3d_compute_views(
 			raw_eyes, n, &nominal, &screen, &tunables,
-			pose_ptr, near_z, far_z, out_views);
+			pose_ptr,
+			/*near_offset=*/vdh, /*far_offset=*/1000.0f * vdh,
+			/*vulkan_flip_y=*/0,
+			out_views);
+
+		const float m2v = (screen.height_m > 0.0001f) ? vdh / screen.height_m : 0.0f;
+		const float kScreenW = screen.width_m * m2v;
+		const float kScreenH = screen.height_m * m2v;
+		for (uint32_t i = 0; i < n; i++) {
+			display3d_compute_projection(out_views[i].eye_display,
+			                             kScreenW, kScreenH,
+			                             near_z, far_z,
+			                             out_views[i].projection_matrix);
+		}
 
 		for (uint32_t i = 0; i < n; i++) {
 			memcpy(&view_matrices[i * 16], out_views[i].view_matrix, 16 * sizeof(float));

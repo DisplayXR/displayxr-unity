@@ -388,30 +388,36 @@ hooked_xrLocateViews(XrSession session,
 	}
 
 	Display3DScreen screen = {di->display_width_meters, di->display_height_meters};
-	float eyeOffX_h = 0, eyeOffY_h = 0;
 	if (ov_w > 0 && ov_h > 0 &&
 	    di->display_pixel_width > 0 && di->display_pixel_height > 0) {
-		float px_size_x = di->display_width_meters / (float)di->display_pixel_width;
-		float px_size_y = di->display_height_meters / (float)di->display_pixel_height;
-		screen.width_m = (float)ov_w * px_size_x;
-		screen.height_m = (float)ov_h * px_size_y;
-
-		// Shift eyes from display-center to the output region's center on the panel.
-		float winCenterX = (float)ov_x + (float)ov_w * 0.5f;
-		float winCenterY = (float)ov_y + (float)ov_h * 0.5f;
-		float dispCenterX = (float)di->display_pixel_width * 0.5f;
-		float dispCenterY = (float)di->display_pixel_height * 0.5f;
-		eyeOffX_h = (winCenterX - dispCenterX) * px_size_x;
-		eyeOffY_h = (winCenterY - dispCenterY) * px_size_y;
-#ifdef _WIN32
-		eyeOffY_h = -eyeOffY_h; // Win32 Y is top-down, eye coords are Y-up
+		// Layer 1 (displayxr::math): rect -> Kooima screen dims + rect-center-
+		// relative eye shift, including the screen-Y-down -> eye-Y-up flip.
+		// Only the platform rect fetch stays here.
+		Display3DWindowPlacement placement = {};
+		placement.display_width_m = di->display_width_meters;
+		placement.display_height_m = di->display_height_meters;
+		placement.display_width_px = (float)di->display_pixel_width;
+		placement.display_height_px = (float)di->display_pixel_height;
+		placement.rect_width_px = (float)ov_w;
+		placement.rect_height_px = (float)ov_h;
+		placement.rect_center_x_px = (float)ov_x + (float)ov_w * 0.5f;
+		float rect_center_y = (float)ov_y + (float)ov_h * 0.5f;
+#if !defined(_WIN32)
+		// NSWindow rects are bottom-left-origin Y-up; the placement expects
+		// top-left Y-down pixels (Layer 1 owns the Y-down -> Y-up eye flip).
+		rect_center_y = (float)di->display_pixel_height - rect_center_y;
 #endif
-		for (uint32_t i = 0; i < count; i++) {
-			raw_eyes[i].x -= eyeOffX_h;
-			raw_eyes[i].y -= eyeOffY_h;
-		}
-		nominal.x -= eyeOffX_h;
-		nominal.y -= eyeOffY_h;
+		placement.rect_center_y_px = rect_center_y;
+
+		// Nominal viewer rides through the resolve as an extra point so it
+		// gets the same rect-center shift as the eyes (it must stay in the
+		// eyes' frame).
+		XrVector3f pts[DISPLAYXR_HOOKS_MAX_VIEWS + 1];
+		memcpy(pts, raw_eyes, count * sizeof(XrVector3f));
+		pts[count] = nominal;
+		display3d_resolve_window_rect(&placement, pts, count + 1, &screen, pts);
+		memcpy(raw_eyes, pts, count * sizeof(XrVector3f));
+		nominal = pts[count];
 	}
 
 	// Log Kooima params when the effective output region (window OR canvas
@@ -426,14 +432,13 @@ hooked_xrLocateViews(XrSession session,
 			s_prev_ov_x = ov_x;
 			s_prev_ov_y = ov_y;
 			displayxr_log("[DisplayXR] Kooima hooks: out=%ux%u@(%d,%d)%s win=%ux%u disp=%ux%u "
-			              "screen=%.4fx%.4fm eyeOff=(%.4f,%.4f) "
+			              "screen=%.4fx%.4fm "
 			              "nom=(%.4f,%.4f,%.4f)\n",
 			              ov_w, ov_h, ov_x, ov_y,
 			              s_canvas_rect_valid ? " [canvas]" : "",
 			              state->viewport_width, state->viewport_height,
 			              di->display_pixel_width, di->display_pixel_height,
 			              screen.width_m, screen.height_m,
-			              eyeOffX_h, eyeOffY_h,
 			              nominal.x, nominal.y, nominal.z);
 		}
 	}
@@ -479,7 +484,6 @@ hooked_xrLocateViews(XrSession session,
 		cam_tunables.ipd_factor = tunables.ipd_factor;
 		cam_tunables.parallax_factor = tunables.parallax_factor;
 		cam_tunables.half_tan_vfov = tunables.fov_override;
-		cam_tunables.clip_at_display_plane = tunables.clip_at_display_plane;
 
 		// Parent camera scale: multiply eye positions and nominal viewer,
 		// divide inv_convergence_distance by sz.
@@ -499,12 +503,24 @@ hooked_xrLocateViews(XrSession session,
 		nominal.y *= sy;
 		nominal.z *= sz;
 
+		// Foreground-only mode (camera-centric): clip at the convergence
+		// distance — the analogue of the display plane. Call-site policy
+		// (Unity-specific) on top of the shared camera3d math; invd == 0
+		// means parallel projection (convergence at infinity) — no-op.
+		float cam_far = tunables.far_z;
+		if (tunables.clip_at_display_plane &&
+		    cam_tunables.inv_convergence_distance > 0.0001f) {
+			float conv = 1.0f / cam_tunables.inv_convergence_distance;
+			float min_far = tunables.near_z + 0.001f;
+			cam_far = (conv > min_far) ? conv : min_far;
+		}
+
 		Camera3DView cam_views[DISPLAYXR_HOOKS_MAX_VIEWS];
 		camera3d_compute_views(
 			raw_eyes, count,
 			&nominal, &screen, &cam_tunables,
 			&scene_pose,
-			tunables.near_z, tunables.far_z,
+			tunables.near_z, cam_far,
 			cam_views);
 
 		for (uint32_t i = 0; i < count; i++) {
@@ -566,7 +582,6 @@ hooked_xrLocateViews(XrSession session,
 		disp_tunables.parallax_factor = tunables.parallax_factor;
 		disp_tunables.perspective_factor = tunables.perspective_factor;
 		disp_tunables.virtual_display_height = vdh;
-		disp_tunables.clip_at_display_plane = tunables.clip_at_display_plane;
 
 		// Anisotropic eye position corrections — apply to all N views.
 		// Replica raw eyes (views 2..N-1 in lower-N modes) stay replicas after
@@ -578,13 +593,44 @@ hooked_xrLocateViews(XrSession session,
 
 		// Scale nominal viewer depth for consistency
 		nominal.z *= az;
+		// Clip-plane policy (Unity-specific, call-site): Unity's documented
+		// contract is that Camera.nearClipPlane/farClipPlane are honored as
+		// ABSOLUTE view-space distances (DisplayXRTunables.nearZ/farZ), and
+		// foreground-only mode clips each view at its own eye->display-plane
+		// distance. displayxr::math resolves ZDP-anchored offsets instead, so
+		// compute the views with nominal offsets, then rebuild each per-view
+		// projection below with the lib's absolute-clip primitive. The FOV /
+		// view-matrix / eye outputs the rest of this function consumes are
+		// clip-plane independent.
 		Display3DView disp_views[DISPLAYXR_HOOKS_MAX_VIEWS];
 		display3d_compute_views(
 			raw_eyes, count,
 			&nominal, &screen, &disp_tunables,
 			scene_xform.enabled ? &scene_pose : NULL,
-			tunables.near_z, tunables.far_z,
+			/*near_offset=*/vdh, /*far_offset=*/1000.0f * vdh,
+			/*vulkan_flip_y=*/0,
 			disp_views);
+
+		// Kooima-scaled screen dims (what the lib uses internally):
+		// m2v = vdh / screen.height_m, so kScreenH == vdh.
+		const float m2v = (screen.height_m > 0.0001f) ? vdh / screen.height_m : 0.0f;
+		const float kScreenW = screen.width_m * m2v;
+		const float kScreenH = screen.height_m * m2v;
+		for (uint32_t i = 0; i < count; i++) {
+			float far_eff = tunables.far_z;
+			if (tunables.clip_at_display_plane) {
+				// Foreground-only: far at this view's own optical-axis
+				// intersection with the display plane (eye_display is the
+				// m2v-scaled eye, so |z| is in projection units).
+				float ez_abs = fabsf(disp_views[i].eye_display.z);
+				float min_far = tunables.near_z + 0.001f;
+				far_eff = (ez_abs > min_far) ? ez_abs : min_far;
+			}
+			display3d_compute_projection(disp_views[i].eye_display,
+			                             kScreenW, kScreenH,
+			                             tunables.near_z, far_eff,
+			                             disp_views[i].projection_matrix);
+		}
 
 		for (uint32_t i = 0; i < count; i++) {
 			views[i].fov = disp_views[i].fov;

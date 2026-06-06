@@ -38,8 +38,8 @@ typedef struct DisplayXRTunables {
     uint8_t camera_centric;     // Use camera-centric parameters
     uint8_t clip_at_display_plane; // Per-view far override: clip each view at its own
                                 // |eye.z|*m2v (display-centric) or 1/invd (camera-centric).
-                                // Foreground-only render — see Display3DTunables /
-                                // Camera3DTunables for per-view semantics.
+                                // Foreground-only render — Unity call-site policy applied
+                                // in displayxr_hooks.cpp on top of displayxr::math.
 } DisplayXRTunables;
 
 // --- Display info (set from render thread, read from game thread) ---
