@@ -5,6 +5,14 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.17.0] - 2026-06-05
+
+### Changed
+- **Kooima math now comes from the shared `displayxr::math` library** ([DisplayXR/displayxr-common](https://github.com/DisplayXR/displayxr-common) @ v0.2.0, pinned via CMake FetchContent) instead of vendored copies of `display3d_view.{c,h}` / `camera3d_view.{c,h}` (`DisplayXR/displayxr-runtime#396` W3 — last consumer; net −994 lines). Behavior-preserving: the projection convention is unchanged (GL `[-1,1]`, Unity converts via `GL.GetGPUProjectionMatrix`), `Camera.nearClipPlane`/`farClipPlane` are still honored as absolute view-space distances, and the foreground-only mode keeps its exact per-view semantics. The window-relative / canvas sub-rect Kooima input-prep (rect → screen meters + eye shift + Y-flip) in both the hooks path and the standalone editor-preview path is now the library's `display3d_resolve_window_rect()` (Layer 1). P/Invoke surface and C# API unchanged.
+
+### Fixed
+- The standalone (editor-preview) camera-centric path read an uninitialized foreground-only flag; the field is gone with the shared-library migration.
+
 ## [1.16.0] - 2026-06-05
 
 ### Changed
