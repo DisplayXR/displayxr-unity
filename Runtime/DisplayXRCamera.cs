@@ -142,6 +142,9 @@ namespace DisplayXR
             // runtime). Before the active-rig gate so every rig tracks its own flag.
             if (m_PostAA != null) m_PostAA.enabled = postProcessAntiAliasing;
 
+            // The boot splash owns the projection while it plays.
+            if (DisplayXRRigManager.SplashActive) return;
+
             // Only the active rig pushes tunables (prevents multi-rig conflicts)
             var active = DisplayXRRigManager.ActiveCamera;
             if (active != null && active != m_Camera) return;

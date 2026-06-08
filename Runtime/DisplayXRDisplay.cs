@@ -62,6 +62,14 @@ namespace DisplayXR
         // so we route through RenderPipelineManager.beginCameraRendering instead.
         private bool m_UsingSRP;
 
+        // Set by DisplayXRSplash on the boot-splash rig. Such a rig does NOT join
+        // the rig registry — so app scripts that bind to DisplayXRRigManager
+        // .ActiveCamera latch onto the app's real rig, not this transient one —
+        // but it still owns the projection: it pushes unconditionally and raises
+        // DisplayXRRigManager.SplashActive so the app's rigs suspend their push
+        // while the splash plays.
+        internal bool bootSplashOverlay;
+
         void OnEnable()
         {
             m_Camera = GetComponent<Camera>();
@@ -71,7 +79,10 @@ namespace DisplayXR
                 RenderPipelineManager.beginCameraRendering += OnSRPBeginCamera;
             else
                 Camera.onPreRender += OnCameraPreRender;
-            DisplayXRRigManager.Register(m_Camera);
+            if (bootSplashOverlay)
+                DisplayXRRigManager.SplashActive = true;
+            else
+                DisplayXRRigManager.Register(m_Camera);
 
             // Post-process AA: Unity drops MSAA on the XR eye RT, so attach a
             // (hidden, rig-managed) FXAA pass and mirror the toggle onto it.
@@ -92,7 +103,10 @@ namespace DisplayXR
                 RenderPipelineManager.beginCameraRendering -= OnSRPBeginCamera;
             else
                 Camera.onPreRender -= OnCameraPreRender;
-            DisplayXRRigManager.Unregister(m_Camera);
+            if (bootSplashOverlay)
+                DisplayXRRigManager.SplashActive = false;
+            else
+                DisplayXRRigManager.Unregister(m_Camera);
         }
 
         void OnSRPBeginCamera(ScriptableRenderContext ctx, Camera cam) => OnCameraPreRender(cam);
@@ -141,9 +155,18 @@ namespace DisplayXR
             // runtime). Before the active-rig gate so every rig tracks its own flag.
             if (m_PostAA != null) m_PostAA.enabled = postProcessAntiAliasing;
 
-            // Only the active rig pushes tunables (prevents multi-rig conflicts)
-            var active = DisplayXRRigManager.ActiveCamera;
-            if (active != null && active != m_Camera) return;
+            if (bootSplashOverlay)
+            {
+                // Splash rig: sole pusher while it plays — bypass the gate.
+            }
+            else
+            {
+                // The boot splash owns the projection while it plays.
+                if (DisplayXRRigManager.SplashActive) return;
+                // Only the active rig pushes tunables (prevents multi-rig conflicts)
+                var active = DisplayXRRigManager.ActiveCamera;
+                if (active != null && active != m_Camera) return;
+            }
 
             if (m_Feature == null)
             {
