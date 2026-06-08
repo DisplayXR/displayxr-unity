@@ -1,7 +1,9 @@
 // Copyright 2024-2026, DisplayXR contributors
 // SPDX-License-Identifier: BSL-1.0
 
+using System.Collections.Generic;
 using UnityEditor;
+using UnityEditor.Build;
 using UnityEngine;
 
 namespace DisplayXR.Editor
@@ -9,6 +11,10 @@ namespace DisplayXR.Editor
     [CustomEditor(typeof(DisplayXRManifestSettings))]
     public class DisplayXRManifestSettingsEditor : UnityEditor.Editor
     {
+        // Opt-out scripting define. The boot splash is ON by default; this
+        // define compiles out the spawner (DisplayXRSplashBootstrap) and tells
+        // the build processor to leave Unity's stock splash alone.
+        const string NoSplashDefine = "DISPLAYXR_NO_SPLASH";
         // Direct shortcut so users don't have to hunt through Project Settings
         // (which can be empty if the OpenXR feature isn't checked) or guess
         // where the asset lives in Assets/.
@@ -29,6 +35,7 @@ namespace DisplayXR.Editor
         private SerializedProperty icon3D;
         private SerializedProperty icon3DLayout;
         private SerializedProperty registerWithDisplayXR;
+        private SerializedProperty disableBootSplash;
 
         private void OnEnable()
         {
@@ -40,6 +47,7 @@ namespace DisplayXR.Editor
             icon3D = serializedObject.FindProperty("icon3D");
             icon3DLayout = serializedObject.FindProperty("icon3DLayout");
             registerWithDisplayXR = serializedObject.FindProperty("registerWithDisplayXR");
+            disableBootSplash = serializedObject.FindProperty("disableBootSplash");
         }
 
         public override void OnInspectorGUI()
@@ -112,7 +120,47 @@ namespace DisplayXR.Editor
                 "Also write a registered manifest to %LOCALAPPDATA%\\DisplayXR\\apps\\ so DisplayXR-compatible " +
                 "workspace controllers (including the DisplayXR Shell) discover this build without needing it under Program Files."));
 
+            EditorGUILayout.Space();
+
+            // --- Boot Splash ---
+            EditorGUILayout.LabelField("Boot Splash", EditorStyles.boldLabel);
+            EditorGUILayout.HelpBox(
+                "DisplayXR shows a branded boot splash on the zero-disparity plane by " +
+                "default, and disables Unity's stock splash in standalone builds. " +
+                "Unity 6 permits disabling the stock splash on all license tiers.",
+                MessageType.Info);
+            EditorGUI.BeginChangeCheck();
+            EditorGUILayout.PropertyField(disableBootSplash, new GUIContent("Disable DisplayXR Splash",
+                "Opt out: keep Unity's stock splash and skip the DisplayXR splash " +
+                "(sets the DISPLAYXR_NO_SPLASH define)."));
+            bool toggleChanged = EditorGUI.EndChangeCheck();
+
             serializedObject.ApplyModifiedProperties();
+
+            if (toggleChanged)
+                ApplyOptOutState(disableBootSplash.boolValue);
+        }
+
+        /// <summary>
+        /// Apply the opt-out choice: add/remove the DISPLAYXR_NO_SPLASH define,
+        /// which compiles the boot-splash spawner out and tells the build
+        /// processor to leave Unity's stock splash alone. (When opted in — the
+        /// default — the build processor disables the stock splash per build, so
+        /// we never persistently mutate the user's PlayerSettings here.)
+        /// </summary>
+        private static void ApplyOptOutState(bool optedOut)
+        {
+            var nbt = NamedBuildTarget.Standalone;
+            var defines = new List<string>(
+                PlayerSettings.GetScriptingDefineSymbols(nbt)
+                    .Split(new[] { ';' }, System.StringSplitOptions.RemoveEmptyEntries));
+            bool has = defines.Contains(NoSplashDefine);
+            if (optedOut && !has) defines.Add(NoSplashDefine);
+            else if (!optedOut && has) defines.Remove(NoSplashDefine);
+            PlayerSettings.SetScriptingDefineSymbols(nbt, string.Join(";", defines));
+
+            Debug.Log($"[DisplayXR] Boot splash {(optedOut ? "DISABLED (opt-out)" : "enabled (default)")} " +
+                      $"— define {(optedOut ? "added" : "removed")}.");
         }
     }
 }

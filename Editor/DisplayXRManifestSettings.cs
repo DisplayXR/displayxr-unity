@@ -46,6 +46,12 @@ namespace DisplayXR.Editor
                  "discover this build without needing it under Program Files.")]
         public bool registerWithDisplayXR = false;
 
+        [Tooltip("DisplayXR shows a branded boot splash (logo on the zero-disparity " +
+                 "plane) by default, replacing Unity's stock splash in standalone " +
+                 "builds. Tick to OPT OUT — keep Unity's splash and skip the DisplayXR " +
+                 "one (sets the DISPLAYXR_NO_SPLASH define).")]
+        public bool disableBootSplash = false;
+
         /// <summary>Effective app name: explicit setting or fallback to product name.</summary>
         public string EffectiveName =>
             string.IsNullOrWhiteSpace(appName) ? Application.productName : appName;

@@ -47,6 +47,11 @@
       "path": "Samples~/DisplayScene"
     },
     {
+      "displayName": "Splash Screen",
+      "description": "DisplayXR-branded boot splash (logo + 'for Unity') rendered on the zero-disparity plane, then loads your first scene. The splash is on by default (no wiring needed); use this sample only to customize it as an explicit scene. Opt out via Manifest Settings > Boot Splash > Disable DisplayXR Splash. See the sample README.",
+      "path": "Samples~/SplashScreen"
+    },
+    {
       "displayName": "Transparent Avatar",
       "description": "Alpha-native transparent overlay (issue #57) — capsule avatar floats above the desktop with click-through. Windows + macOS standalone.",
       "path": "Samples~/TransparentAvatar"

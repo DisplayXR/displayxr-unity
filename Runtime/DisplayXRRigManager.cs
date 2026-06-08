@@ -17,6 +17,15 @@ namespace DisplayXR
         private static string s_ActiveCameraName;
         private static readonly List<Camera> s_RegisteredCameras = new List<Camera>();
 
+        /// <summary>
+        /// True while the boot splash owns the projection. The splash rig is NOT
+        /// registered (so app scripts that read <see cref="ActiveCamera"/> bind to
+        /// the app's real rig, not the transient splash), so to keep the splash
+        /// the sole tunables-pusher the registered rigs suspend their push while
+        /// this is set. Cleared when the splash hands off.
+        /// </summary>
+        public static bool SplashActive { get; set; }
+
         /// <summary>Currently active camera for rig gating and input.</summary>
         public static Camera ActiveCamera
         {
