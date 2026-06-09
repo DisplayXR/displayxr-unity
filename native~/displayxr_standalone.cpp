@@ -107,6 +107,16 @@ typedef struct StandaloneState {
 	float eye_positions[SA_MAX_VIEWS][3];
 	uint32_t located_view_count;
 
+	// XR_EXT_view_rig (#396): when the runtime advertises the extension, the
+	// frame locate chains a rig descriptor and the runtime returns render-ready
+	// per-view pose+fov (Kooima done runtime-side). compute_views then builds
+	// matrices from these instead of running display3d/camera3d locally.
+	int has_view_rig;                    // runtime advertises XR_EXT_view_rig
+	int rig_views_valid;                 // begin_frame filled rig_view_* this frame
+	XrPosef rig_view_pose[SA_MAX_VIEWS]; // render-ready per-view pose
+	XrFovf rig_view_fov[SA_MAX_VIEWS];   // render-ready per-view fov
+	XrPosef rig_pose_used;               // the rig pose chained this frame (RigLocalEyeZ)
+
 	// Last computed Kooima views (from compute_views, used by submit_frame_atlas)
 	Display3DView computed_views[SA_MAX_VIEWS];
 	uint32_t computed_view_count;
@@ -1042,17 +1052,53 @@ displayxr_standalone_start(const char *runtime_json_path)
 	if (s_unity_gfx_api == 21 /* Vulkan */) win_gfx_enable = "XR_KHR_vulkan_enable";
 #endif
 #endif
-	const char *extensions[] = {
-		XR_EXT_DISPLAY_INFO_EXTENSION_NAME,
+	// XR_EXT_view_rig (#396): probe availability BEFORE requesting it — older
+	// runtimes reject an unknown extension at xrCreateInstance. Only enable it
+	// when advertised; otherwise the SA path falls back to the legacy local
+	// Kooima compute in compute_views (see the has_view_rig gate there).
+	s_sa.has_view_rig = 0;
+	{
+		PFN_xrVoidFunction fn_enum = NULL;
+		s_sa.gipa(XR_NULL_HANDLE, "xrEnumerateInstanceExtensionProperties", &fn_enum);
+		if (fn_enum) {
+			PFN_xrEnumerateInstanceExtensionProperties enum_ext =
+				(PFN_xrEnumerateInstanceExtensionProperties)fn_enum;
+			uint32_t avail = 0;
+			enum_ext(NULL, 0, &avail, NULL);
+			if (avail > 0) {
+				XrExtensionProperties *props = (XrExtensionProperties *)
+					calloc(avail, sizeof(XrExtensionProperties));
+				for (uint32_t i = 0; i < avail; i++)
+					props[i].type = XR_TYPE_EXTENSION_PROPERTIES;
+				if (XR_SUCCEEDED(enum_ext(NULL, avail, &avail, props))) {
+					for (uint32_t i = 0; i < avail; i++) {
+						if (strcmp(props[i].extensionName,
+						           XR_EXT_VIEW_RIG_EXTENSION_NAME) == 0) {
+							s_sa.has_view_rig = 1;
+							break;
+						}
+					}
+				}
+				free(props);
+			}
+		}
+		sa_log("[DisplayXR-SA] XR_EXT_view_rig: %s\n",
+		       s_sa.has_view_rig ? "AVAILABLE (runtime owns Kooima)"
+		                         : "not found (legacy local Kooima path)");
+	}
+
+	const char *extensions[8];
+	uint32_t ext_count = 0;
+	extensions[ext_count++] = XR_EXT_DISPLAY_INFO_EXTENSION_NAME;
 #if defined(__APPLE__)
-		XR_KHR_METAL_ENABLE_EXTENSION_NAME,
-		XR_EXT_COCOA_WINDOW_BINDING_EXTENSION_NAME,
+	extensions[ext_count++] = XR_KHR_METAL_ENABLE_EXTENSION_NAME;
+	extensions[ext_count++] = XR_EXT_COCOA_WINDOW_BINDING_EXTENSION_NAME;
 #elif defined(_WIN32)
-		win_gfx_enable,
-		XR_EXT_WIN32_WINDOW_BINDING_EXTENSION_NAME,
+	extensions[ext_count++] = win_gfx_enable;
+	extensions[ext_count++] = XR_EXT_WIN32_WINDOW_BINDING_EXTENSION_NAME;
 #endif
-	};
-	uint32_t ext_count = sizeof(extensions) / sizeof(extensions[0]);
+	if (s_sa.has_view_rig)
+		extensions[ext_count++] = XR_EXT_VIEW_RIG_EXTENSION_NAME;
 
 	PFN_xrVoidFunction fn_create = NULL;
 	s_sa.gipa(XR_NULL_HANDLE, "xrCreateInstance", &fn_create);
@@ -1486,34 +1532,94 @@ displayxr_standalone_begin_frame(int *should_render)
 		XrViewState view_state = {XR_TYPE_VIEW_STATE};
 		uint32_t view_count = 0;
 
+		// XR_EXT_view_rig (#396): chain a rig descriptor so the runtime returns
+		// render-ready XrView{pose,fov}, and chain the raw channel to recover the
+		// raw display-space eyes (for the gizmo / eye cache). The runtime owns the
+		// window/canvas resolve (we pushed it via xrSetSharedTextureOutputRectEXT).
+		XrDisplayRigEXT display_rig = {XR_TYPE_DISPLAY_RIG_EXT};
+		XrCameraRigEXT camera_rig = {XR_TYPE_CAMERA_RIG_EXT};
+		XrViewDisplayRawEXT raw_probe = {XR_TYPE_VIEW_DISPLAY_RAW_EXT};
+		XrPosef rig_pose = s_sa.display_pose_set
+			? s_sa.display_pose
+			: XrPosef{{0, 0, 0, 1}, {0, 0, 0}};
+		if (s_sa.has_view_rig) {
+			Display3DTunables t = s_sa.tunables_set ? s_sa.tunables
+			                                        : display3d_default_tunables();
+			if (s_sa.camera_centric) {
+				camera_rig.pose = rig_pose;
+				camera_rig.ipdFactor = t.ipd_factor;
+				camera_rig.parallaxFactor = t.parallax_factor;
+				camera_rig.convergenceDiopters = s_sa.inv_convergence_distance;
+				camera_rig.verticalFov = 2.0f * atanf(s_sa.fov_override);
+				locate_info.next = &camera_rig;
+			} else {
+				display_rig.pose = rig_pose;
+				display_rig.virtualDisplayHeight = t.virtual_display_height;
+				display_rig.ipdFactor = t.ipd_factor;
+				display_rig.parallaxFactor = t.parallax_factor;
+				display_rig.perspectiveFactor = t.perspective_factor;
+				locate_info.next = &display_rig;
+			}
+			view_state.next = &raw_probe;
+		}
+
 		result = s_sa.pfn_locate_views(s_sa.session, &locate_info,
 		                               &view_state, SA_MAX_VIEWS, &view_count, views);
 		if (XR_SUCCEEDED(result) && view_count >= 1) {
 			if (view_count > SA_MAX_VIEWS) view_count = SA_MAX_VIEWS;
 			s_sa.located_view_count = view_count;
+			s_sa.rig_views_valid = 0;
 
-			for (uint32_t i = 0; i < view_count; i++) {
-				s_sa.eye_positions[i][0] = views[i].pose.position.x;
-				s_sa.eye_positions[i][1] = views[i].pose.position.y;
-				s_sa.eye_positions[i][2] = views[i].pose.position.z;
-			}
+			if (s_sa.has_view_rig) {
+				// views[i] are render-ready (Kooima done runtime-side). Cache pose
+				// + fov for compute_views; cache the RAW eyes (from the raw channel)
+				// into eye_positions for the gizmo, matching the legacy contract
+				// where eye_positions held raw display-space eyes.
+				s_sa.rig_pose_used = rig_pose;
+				for (uint32_t i = 0; i < view_count; i++) {
+					s_sa.rig_view_pose[i] = views[i].pose;
+					s_sa.rig_view_fov[i] = views[i].fov;
+				}
+				s_sa.rig_views_valid = 1;
 
-			// Backward compat: populate left/right eye from first 2 views
-			s_sa.left_eye[0] = views[0].pose.position.x;
-			s_sa.left_eye[1] = views[0].pose.position.y;
-			s_sa.left_eye[2] = views[0].pose.position.z;
-			if (view_count >= 2) {
-				s_sa.right_eye[0] = views[1].pose.position.x;
-				s_sa.right_eye[1] = views[1].pose.position.y;
-				s_sa.right_eye[2] = views[1].pose.position.z;
+				uint32_t raw_n = raw_probe.eyeCountOutput;
+				if (raw_n == 0) raw_n = view_count; // tolerate a runtime that skipped the raw fill
+				if (raw_n > SA_MAX_VIEWS) raw_n = SA_MAX_VIEWS;
+				for (uint32_t i = 0; i < raw_n; i++) {
+					s_sa.eye_positions[i][0] = raw_probe.rawEyes[i].x;
+					s_sa.eye_positions[i][1] = raw_probe.rawEyes[i].y;
+					s_sa.eye_positions[i][2] = raw_probe.rawEyes[i].z;
+				}
+				s_sa.left_eye[0] = raw_probe.rawEyes[0].x;
+				s_sa.left_eye[1] = raw_probe.rawEyes[0].y;
+				s_sa.left_eye[2] = raw_probe.rawEyes[0].z;
+				uint32_t ri = (raw_n >= 2) ? 1 : 0;
+				s_sa.right_eye[0] = raw_probe.rawEyes[ri].x;
+				s_sa.right_eye[1] = raw_probe.rawEyes[ri].y;
+				s_sa.right_eye[2] = raw_probe.rawEyes[ri].z;
+				s_sa.is_tracked = raw_probe.isTracking ? 1 : 0;
 			} else {
-				s_sa.right_eye[0] = views[0].pose.position.x;
-				s_sa.right_eye[1] = views[0].pose.position.y;
-				s_sa.right_eye[2] = views[0].pose.position.z;
+				// Legacy path: no rig chained, so views[i].pose carries raw eyes.
+				for (uint32_t i = 0; i < view_count; i++) {
+					s_sa.eye_positions[i][0] = views[i].pose.position.x;
+					s_sa.eye_positions[i][1] = views[i].pose.position.y;
+					s_sa.eye_positions[i][2] = views[i].pose.position.z;
+				}
+				s_sa.left_eye[0] = views[0].pose.position.x;
+				s_sa.left_eye[1] = views[0].pose.position.y;
+				s_sa.left_eye[2] = views[0].pose.position.z;
+				if (view_count >= 2) {
+					s_sa.right_eye[0] = views[1].pose.position.x;
+					s_sa.right_eye[1] = views[1].pose.position.y;
+					s_sa.right_eye[2] = views[1].pose.position.z;
+				} else {
+					s_sa.right_eye[0] = views[0].pose.position.x;
+					s_sa.right_eye[1] = views[0].pose.position.y;
+					s_sa.right_eye[2] = views[0].pose.position.z;
+				}
+				s_sa.is_tracked = (view_state.viewStateFlags &
+				                   XR_VIEW_STATE_POSITION_TRACKED_BIT) != 0;
 			}
-
-			s_sa.is_tracked = (view_state.viewStateFlags &
-			                   XR_VIEW_STATE_POSITION_TRACKED_BIT) != 0;
 		}
 	}
 
@@ -1710,6 +1816,56 @@ displayxr_standalone_end_frame_empty(void)
 
 
 // ============================================================================
+// XR_EXT_view_rig (#396): render-ready XrView{pose,fov} -> renderer matrices.
+// Ported verbatim from the runtime reference app
+// (test_apps/cube_handle_d3d11_win/main.cpp): same convention the displayxr::math
+// rigs emit, so RenderEyeToAtlas's existing Z-flip / proj-Y-flip stay correct.
+// ============================================================================
+
+// Column-major view matrix from a render-ready pose: R^T * translate(-position).
+static void sa_view_matrix_from_pose(const XrPosef *pose, float *out) {
+	const float qx = pose->orientation.x, qy = pose->orientation.y;
+	const float qz = pose->orientation.z, qw = pose->orientation.w;
+	float rot[16] = {};
+	rot[0] = 1.0f - 2.0f * (qy * qy + qz * qz);
+	rot[1] = 2.0f * (qx * qy + qz * qw);
+	rot[2] = 2.0f * (qx * qz - qy * qw);
+	rot[4] = 2.0f * (qx * qy - qz * qw);
+	rot[5] = 1.0f - 2.0f * (qx * qx + qz * qz);
+	rot[6] = 2.0f * (qy * qz + qx * qw);
+	rot[8] = 2.0f * (qx * qz + qy * qw);
+	rot[9] = 2.0f * (qy * qz - qx * qw);
+	rot[10] = 1.0f - 2.0f * (qx * qx + qy * qy);
+	rot[15] = 1.0f;
+	for (int i = 0; i < 16; i++) out[i] = 0.0f;
+	for (int i = 0; i < 3; i++)
+		for (int j = 0; j < 3; j++)
+			out[j * 4 + i] = rot[i * 4 + j]; // R^T
+	out[15] = 1.0f;
+	out[12] = -(out[0] * pose->position.x + out[4] * pose->position.y + out[8] * pose->position.z);
+	out[13] = -(out[1] * pose->position.x + out[5] * pose->position.y + out[9] * pose->position.z);
+	out[14] = -(out[2] * pose->position.x + out[6] * pose->position.y + out[10] * pose->position.z);
+}
+
+// Column-major GL ([-1,1] clip-z) off-axis projection from a render-ready fov +
+// app clip policy. Unity's cam.projectionMatrix is GL convention (Unity does the
+// GPU remap), so we feed this directly — no gl_to_zero_to_one conversion here.
+static void sa_projection_from_fov(const XrFovf *fov, float near_z, float far_z, float *out) {
+	const float l = tanf(fov->angleLeft) * near_z;
+	const float r = tanf(fov->angleRight) * near_z;
+	const float b = tanf(fov->angleDown) * near_z;
+	const float t = tanf(fov->angleUp) * near_z;
+	for (int i = 0; i < 16; i++) out[i] = 0.0f;
+	out[0] = 2.0f * near_z / (r - l);
+	out[5] = 2.0f * near_z / (t - b);
+	out[8] = (r + l) / (r - l);
+	out[9] = (t + b) / (t - b);
+	out[10] = -(far_z + near_z) / (far_z - near_z);
+	out[11] = -1.0f;
+	out[14] = -2.0f * far_z * near_z / (far_z - near_z);
+}
+
+// ============================================================================
 // Public API: Multiview compute (N views)
 // ============================================================================
 
@@ -1727,6 +1883,29 @@ displayxr_standalone_compute_views(
 	// Cache near/far for reuse during drag repositioning
 	s_sa.last_near_z = near_z;
 	s_sa.last_far_z = far_z;
+
+	// XR_EXT_view_rig (#396): the runtime already returned render-ready per-view
+	// pose+fov this frame (window/canvas resolve + Kooima done runtime-side).
+	// Build the renderer matrices straight from them; the legacy display3d /
+	// camera3d compute below is the fallback for runtimes without the extension.
+	// near/far are uniform (the SA C# passes Camera near/far) — same as legacy.
+	if (s_sa.has_view_rig && s_sa.rig_views_valid) {
+		uint32_t n = view_count;
+		if (n > SA_MAX_VIEWS) n = SA_MAX_VIEWS;
+		for (uint32_t i = 0; i < n; i++) {
+			uint32_t src = (i < s_sa.located_view_count) ? i : 0;
+			sa_view_matrix_from_pose(&s_sa.rig_view_pose[src], &view_matrices[i * 16]);
+			sa_projection_from_fov(&s_sa.rig_view_fov[src], near_z, far_z, &proj_matrices[i * 16]);
+			memcpy(s_sa.computed_views[i].view_matrix, &view_matrices[i * 16], 16 * sizeof(float));
+			memcpy(s_sa.computed_views[i].projection_matrix, &proj_matrices[i * 16], 16 * sizeof(float));
+			s_sa.computed_views[i].fov = s_sa.rig_view_fov[src];
+			s_sa.computed_views[i].eye_world = s_sa.rig_view_pose[src].position;
+			s_sa.computed_views[i].orientation = s_sa.rig_view_pose[src].orientation;
+		}
+		s_sa.computed_view_count = n;
+		*valid = 1;
+		return;
+	}
 
 	Display3DTunables tunables = s_sa.tunables_set
 		? s_sa.tunables
