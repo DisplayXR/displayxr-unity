@@ -84,7 +84,7 @@ typedef struct StandaloneState {
 	int is_tracked;
 
 	// Tunables + display pose (set from C#)
-	Display3DTunables tunables;
+	SaTunables tunables;
 	int tunables_set;
 	int camera_centric;
 	float inv_convergence_distance;
@@ -118,7 +118,7 @@ typedef struct StandaloneState {
 	XrPosef rig_pose_used;               // the rig pose chained this frame (RigLocalEyeZ)
 
 	// Last computed Kooima views (from compute_views, used by submit_frame_atlas)
-	Display3DView computed_views[SA_MAX_VIEWS];
+	SaView computed_views[SA_MAX_VIEWS];
 	uint32_t computed_view_count;
 
 	// Frame state (stored between begin_frame and submit/end)
@@ -1543,8 +1543,8 @@ displayxr_standalone_begin_frame(int *should_render)
 			? s_sa.display_pose
 			: XrPosef{{0, 0, 0, 1}, {0, 0, 0}};
 		if (s_sa.has_view_rig) {
-			Display3DTunables t = s_sa.tunables_set ? s_sa.tunables
-			                                        : display3d_default_tunables();
+			SaTunables t = s_sa.tunables_set ? s_sa.tunables
+			                                 : SaTunables{1.0f, 1.0f, 1.0f, 0.0f};
 			if (s_sa.camera_centric) {
 				camera_rig.pose = rig_pose;
 				camera_rig.ipdFactor = t.ipd_factor;
@@ -1907,129 +1907,16 @@ displayxr_standalone_compute_views(
 		return;
 	}
 
-	Display3DTunables tunables = s_sa.tunables_set
-		? s_sa.tunables
-		: display3d_default_tunables();
-
-	XrPosef *pose_ptr = s_sa.display_pose_set ? &s_sa.display_pose : NULL;
-
-	XrVector3f nominal = {
-		s_sa.display_info.nominal_viewer_x,
-		s_sa.display_info.nominal_viewer_y,
-		s_sa.display_info.nominal_viewer_z
-	};
-
-	// Build raw eye positions for all requested views.
-	// If mode needs more views than xrLocateViews returned (e.g. quad=4
-	// but PRIMARY_STEREO=2), duplicate views[0] for extras — matches the
-	// reference test app. (+1 slot: the nominal viewer rides through the
-	// window-rect resolve below so it gets the same shift as the eyes.)
-	XrVector3f raw_eyes[SA_MAX_VIEWS + 1];
-	uint32_t n = view_count;
-	if (n > SA_MAX_VIEWS) n = SA_MAX_VIEWS;
-
-	for (uint32_t i = 0; i < n; i++) {
-		uint32_t src = (i < s_sa.located_view_count) ? i : 0;
-		raw_eyes[i].x = s_sa.eye_positions[src][0];
-		raw_eyes[i].y = s_sa.eye_positions[src][1];
-		raw_eyes[i].z = s_sa.eye_positions[src][2];
+	// XR_EXT_view_rig (#396 W7): no rig views this frame => the runtime lacks the
+	// extension (or the locate failed). There is NO local Kooima fallback — signal
+	// "no views" so the caller skips the eye render. One-shot WARN.
+	static int s_sa_no_rig_warned = 0;
+	if (!s_sa_no_rig_warned) {
+		s_sa_no_rig_warned = 1;
+		sa_log("[DisplayXR-SA] compute_views: runtime lacks XR_EXT_view_rig — "
+		       "no stereo views produced. Update the DisplayXR runtime.\n");
 	}
-
-	// Window-relative Kooima (ADR-012), via Layer 1 (displayxr::math):
-	// screen = actual window physical size, eyes + nominal shifted to the
-	// window-center on the monitor (including the Y-down -> Y-up flip).
-	Display3DScreen screen = {
-		s_sa.display_info.display_width_meters,
-		s_sa.display_info.display_height_meters,
-	};
-	if (s_sa.canvas_width > 0 && s_sa.canvas_height > 0 &&
-	    s_sa.display_info.display_pixel_width > 0 && s_sa.display_info.display_pixel_height > 0) {
-		Display3DWindowPlacement placement = {};
-		placement.display_width_m = s_sa.display_info.display_width_meters;
-		placement.display_height_m = s_sa.display_info.display_height_meters;
-		placement.display_width_px = (float)s_sa.display_info.display_pixel_width;
-		placement.display_height_px = (float)s_sa.display_info.display_pixel_height;
-		placement.rect_width_px = (float)s_sa.canvas_width;
-		placement.rect_height_px = (float)s_sa.canvas_height;
-		placement.rect_center_x_px = (float)s_sa.canvas_x + (float)s_sa.canvas_width * 0.5f;
-		float rect_center_y = (float)s_sa.canvas_y + (float)s_sa.canvas_height * 0.5f;
-#if !defined(_WIN32)
-		// NSWindow rects are bottom-left-origin Y-up; the placement expects
-		// top-left Y-down pixels (Layer 1 owns the Y-down -> Y-up eye flip).
-		rect_center_y = (float)s_sa.display_info.display_pixel_height - rect_center_y;
-#endif
-		placement.rect_center_y_px = rect_center_y;
-
-		raw_eyes[n] = nominal;
-		display3d_resolve_window_rect(&placement, raw_eyes, n + 1, &screen, raw_eyes);
-		nominal = raw_eyes[n];
-	}
-
-	if (s_sa.camera_centric) {
-		// Camera-centric: use camera3d library (tangent-space Kooima)
-		Camera3DTunables cam_tunables;
-		cam_tunables.ipd_factor = tunables.ipd_factor;
-		cam_tunables.parallax_factor = tunables.parallax_factor;
-		cam_tunables.inv_convergence_distance = s_sa.inv_convergence_distance;
-		cam_tunables.half_tan_vfov = s_sa.fov_override;
-
-		Camera3DView cam_views[SA_MAX_VIEWS];
-		camera3d_compute_views(
-			raw_eyes, n, &nominal, &screen, &cam_tunables,
-			pose_ptr, near_z, far_z, cam_views);
-
-		for (uint32_t i = 0; i < n; i++) {
-			memcpy(&view_matrices[i * 16], cam_views[i].view_matrix, 16 * sizeof(float));
-			memcpy(&proj_matrices[i * 16], cam_views[i].projection_matrix, 16 * sizeof(float));
-		}
-
-		// Cache as Display3DView for submit_frame_atlas (layout-compatible fields)
-		for (uint32_t i = 0; i < n; i++) {
-			memcpy(s_sa.computed_views[i].view_matrix, cam_views[i].view_matrix, 16 * sizeof(float));
-			memcpy(s_sa.computed_views[i].projection_matrix, cam_views[i].projection_matrix, 16 * sizeof(float));
-			s_sa.computed_views[i].fov = cam_views[i].fov;
-			s_sa.computed_views[i].eye_world = cam_views[i].eye_world;
-			s_sa.computed_views[i].orientation = cam_views[i].orientation;
-		}
-		s_sa.computed_view_count = n;
-	} else {
-		// Display-centric: use display3d library.
-		// Clip-plane policy (call-site): the C# caller passes ABSOLUTE
-		// near/far view-space distances; displayxr::math resolves
-		// ZDP-anchored offsets instead, so compute the views with nominal
-		// offsets and rebuild each per-view projection with the lib's
-		// absolute-clip primitive (FOV / view matrix / eye outputs are
-		// clip-plane independent).
-		float vdh = tunables.virtual_display_height;
-		Display3DView out_views[SA_MAX_VIEWS];
-		display3d_compute_views(
-			raw_eyes, n, &nominal, &screen, &tunables,
-			pose_ptr,
-			/*near_offset=*/vdh, /*far_offset=*/1000.0f * vdh,
-			/*vulkan_flip_y=*/0,
-			out_views);
-
-		const float m2v = (screen.height_m > 0.0001f) ? vdh / screen.height_m : 0.0f;
-		const float kScreenW = screen.width_m * m2v;
-		const float kScreenH = screen.height_m * m2v;
-		for (uint32_t i = 0; i < n; i++) {
-			display3d_compute_projection(out_views[i].eye_display,
-			                             kScreenW, kScreenH,
-			                             near_z, far_z,
-			                             out_views[i].projection_matrix);
-		}
-
-		for (uint32_t i = 0; i < n; i++) {
-			memcpy(&view_matrices[i * 16], out_views[i].view_matrix, 16 * sizeof(float));
-			memcpy(&proj_matrices[i * 16], out_views[i].projection_matrix, 16 * sizeof(float));
-		}
-
-		// Cache computed views for submit_frame_atlas (FOV + eye_world)
-		memcpy(s_sa.computed_views, out_views, n * sizeof(Display3DView));
-		s_sa.computed_view_count = n;
-	}
-
-	*valid = 1;
+	*valid = 0;
 }
 
 
