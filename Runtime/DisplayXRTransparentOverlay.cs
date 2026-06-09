@@ -215,7 +215,7 @@ namespace DisplayXR
         /// </summary>
         public static void RequestFullscreenOverlay()
         {
-#if UNITY_STANDALONE_WIN || UNITY_STANDALONE_OSX
+#if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
             DisplayXRNative.displayxr_set_fullscreen_overlay_pref(1);
 #endif
         }
