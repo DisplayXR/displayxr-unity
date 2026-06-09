@@ -5,6 +5,17 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.18.0] - 2026-06-09
+
+### Added
+- **DisplayXR boot splash on the zero-disparity plane** (#147): a DisplayXR logo + "for Unity" splash now renders on the zero-disparity plane as an on-by-default overlay. Opt out via the `DISPLAYXR_NO_SPLASH` environment variable. Ships with an accompanying UPM sample.
+
+### Fixed
+- Splash teardown now flushes the eye buffers on overlay teardown, avoiding a frozen atlas tile after the splash dismisses (#147).
+
+### Changed
+- CI: drift-guard fails the build if `displayxr::math` is re-vendored (`DisplayXR/displayxr-runtime#396` W5).
+
 ## [1.17.0] - 2026-06-05
 
 ### Changed
