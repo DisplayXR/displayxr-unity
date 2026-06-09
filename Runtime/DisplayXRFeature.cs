@@ -42,7 +42,8 @@ namespace DisplayXR
             "XR_EXT_display_info " +
             "XR_EXT_win32_window_binding " +
             "XR_EXT_cocoa_window_binding " +
-            "XR_EXT_atlas_capture";
+            "XR_EXT_atlas_capture " +
+            "XR_EXT_view_rig";
 
         /// <summary>Singleton instance, set during OnInstanceCreate.</summary>
         public static DisplayXRFeature Instance { get; private set; }

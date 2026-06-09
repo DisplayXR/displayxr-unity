@@ -239,6 +239,54 @@ static PFN_xrCaptureAtlasEXT s_pfn_capture_atlas = nullptr;
 // .MAX_VIEWS on the C# side so gizmo + native agree on the cap.
 #define DISPLAYXR_HOOKS_MAX_VIEWS 16
 
+// XR_EXT_view_rig (#396): set in the xrGetSystemProperties hook when the runtime
+// advertises the extension. When set, hooked_xrLocateViews chains a rig descriptor
+// and consumes the runtime's render-ready XrView{pose,fov} instead of computing
+// Kooima locally (the legacy display3d/camera3d path is the fallback).
+static int s_has_view_rig = 0;
+
+// XR_EXT_view_rig: render-ready XrView{pose,fov} -> renderer matrices. Same
+// convention the displayxr::math rigs emit (OpenXR view matrix = R^T*translate(-p);
+// GL [-1,1] off-axis projection), so the BiRP C# shim's FlipViewZ stays correct.
+static void dxr_view_matrix_from_pose(const XrPosef *pose, float *out) {
+	const float qx = pose->orientation.x, qy = pose->orientation.y;
+	const float qz = pose->orientation.z, qw = pose->orientation.w;
+	float rot[16] = {};
+	rot[0] = 1.0f - 2.0f * (qy * qy + qz * qz);
+	rot[1] = 2.0f * (qx * qy + qz * qw);
+	rot[2] = 2.0f * (qx * qz - qy * qw);
+	rot[4] = 2.0f * (qx * qy - qz * qw);
+	rot[5] = 1.0f - 2.0f * (qx * qx + qz * qz);
+	rot[6] = 2.0f * (qy * qz + qx * qw);
+	rot[8] = 2.0f * (qx * qz + qy * qw);
+	rot[9] = 2.0f * (qy * qz - qx * qw);
+	rot[10] = 1.0f - 2.0f * (qx * qx + qy * qy);
+	rot[15] = 1.0f;
+	for (int i = 0; i < 16; i++) out[i] = 0.0f;
+	for (int i = 0; i < 3; i++)
+		for (int j = 0; j < 3; j++)
+			out[j * 4 + i] = rot[i * 4 + j]; // R^T
+	out[15] = 1.0f;
+	out[12] = -(out[0] * pose->position.x + out[4] * pose->position.y + out[8] * pose->position.z);
+	out[13] = -(out[1] * pose->position.x + out[5] * pose->position.y + out[9] * pose->position.z);
+	out[14] = -(out[2] * pose->position.x + out[6] * pose->position.y + out[10] * pose->position.z);
+}
+
+static void dxr_projection_from_fov(const XrFovf *fov, float near_z, float far_z, float *out) {
+	const float l = tanf(fov->angleLeft) * near_z;
+	const float r = tanf(fov->angleRight) * near_z;
+	const float b = tanf(fov->angleDown) * near_z;
+	const float t = tanf(fov->angleUp) * near_z;
+	for (int i = 0; i < 16; i++) out[i] = 0.0f;
+	out[0] = 2.0f * near_z / (r - l);
+	out[5] = 2.0f * near_z / (t - b);
+	out[8] = (r + l) / (r - l);
+	out[9] = (t + b) / (t - b);
+	out[10] = -(far_z + near_z) / (far_z - near_z);
+	out[11] = -1.0f;
+	out[14] = -2.0f * far_z * near_z / (far_z - near_z);
+}
+
 // ============================================================================
 // Intercepted OpenXR functions
 // ============================================================================
@@ -305,6 +353,52 @@ hooked_xrLocateViews(XrSession session,
 		modified_info.space = s_local_space;
 	}
 
+	// XR_EXT_view_rig (#396): when the runtime owns the Kooima math, chain a rig
+	// descriptor so the real locate returns render-ready XrView{pose,fov}, plus the
+	// raw-eyes channel for the gizmo/eye cache. Built from the same tunables + scene
+	// pose the legacy compute uses (below). Anisotropic scene scale (non-uniform
+	// lossyScale) is NOT expressible via the rig API — uniform scale is exact; this
+	// is a known #396 limitation. The post-process + early-return is after the locate.
+	XrDisplayRigEXT rig_display = {XR_TYPE_DISPLAY_RIG_EXT};
+	XrCameraRigEXT rig_camera = {XR_TYPE_CAMERA_RIG_EXT};
+	XrViewDisplayRawEXT rig_raw = {XR_TYPE_VIEW_DISPLAY_RAW_EXT};
+	bool rig_chained = false;
+	if (s_has_view_rig) {
+		DisplayXRTunables rt = displayxr_state_get_tunables();
+		DisplayXRSceneTransform rx = displayxr_state_get_scene_transform();
+		DisplayXRState *rs = displayxr_get_state();
+		if (rs->display_info.is_valid) {
+			XrPosef rp = {};
+			if (rx.enabled) {
+				rp.position = XrVector3f{rx.position[0], rx.position[1], -rx.position[2]};
+				rp.orientation = XrQuaternionf{-rx.orientation[0], -rx.orientation[1],
+				                               rx.orientation[2], rx.orientation[3]};
+			} else {
+				rp.orientation = XrQuaternionf{0, 0, 0, 1};
+			}
+			float ssy = (rx.enabled && rx.scale[1] > 0.001f) ? rx.scale[1] : 1.0f;
+			float ssz = (rx.enabled && rx.scale[2] > 0.001f) ? rx.scale[2] : 1.0f;
+			if (rt.camera_centric) {
+				rig_camera.pose = rp;
+				rig_camera.ipdFactor = rt.ipd_factor;
+				rig_camera.parallaxFactor = rt.parallax_factor;
+				rig_camera.convergenceDiopters = rt.inv_convergence_distance / ssz;
+				rig_camera.verticalFov = 2.0f * atanf(rt.fov_override);
+				modified_info.next = &rig_camera;
+			} else {
+				rig_display.pose = rp;
+				rig_display.virtualDisplayHeight = rt.virtual_display_height / ssy;
+				rig_display.ipdFactor = rt.ipd_factor;
+				rig_display.parallaxFactor = rt.parallax_factor;
+				rig_display.perspectiveFactor = rt.perspective_factor;
+				modified_info.next = &rig_display;
+			}
+			rig_raw.next = (void *)viewState->next;
+			viewState->next = &rig_raw;
+			rig_chained = true;
+		}
+	}
+
 	// Call the real xrLocateViews
 	XrResult result = s_real_locate_views(session, &modified_info, viewState, viewCapacityInput, viewCountOutput,
 	                                      views);
@@ -331,6 +425,48 @@ hooked_xrLocateViews(XrSession session,
 			              count, DISPLAYXR_HOOKS_MAX_VIEWS);
 		}
 		count = DISPLAYXR_HOOKS_MAX_VIEWS;
+	}
+
+	// XR_EXT_view_rig (#396): the runtime already returned render-ready views[i]
+	// (Kooima + window/canvas resolve done runtime-side). Cache raw eyes from the
+	// raw channel for the gizmo, build the BiRP view-shim matrices (view from the
+	// render-ready pose; proj from fov — BiRP itself reads views[i].fov directly,
+	// Probe A), apply the #115 URP head-pose comp, and pass the views through. The
+	// legacy display3d/camera3d compute below is skipped (it's the no-EXT fallback).
+	if (rig_chained) {
+		DisplayXRTunables rt = displayxr_state_get_tunables();
+		uint8_t rtracked = rig_raw.isTracking ? 1 : 0;
+		if (rig_raw.eyeCountOutput >= 2)
+			displayxr_state_set_eye_positions(&rig_raw.rawEyes[0], &rig_raw.rawEyes[1], rtracked);
+		else
+			displayxr_state_set_eye_positions(&views[0].pose.position, &views[1].pose.position, rtracked);
+
+		// BiRP view-matrix shim (handedness): built from the render-ready pose
+		// BEFORE the #115 comp below, so BiRP gets the eye_world view and URP gets
+		// the comp'd pose. proj is filled from fov but unused by the C# shim now.
+		DisplayXRStereoMatrices mats = {};
+		dxr_view_matrix_from_pose(&views[0].pose, mats.left_view);
+		dxr_view_matrix_from_pose(&views[1].pose, mats.right_view);
+		dxr_projection_from_fov(&views[0].fov, rt.near_z, rt.far_z, mats.left_projection);
+		dxr_projection_from_fov(&views[1].fov, rt.near_z, rt.far_z, mats.right_projection);
+		mats.valid = 1;
+		displayxr_state_set_stereo_matrices(&mats);
+
+		// #115 URP head-pose comp: add the runtime head pose so URP's
+		// (pose - head_pose) subtraction lands back on the render-ready eye.
+		if (s_view_space != XR_NULL_HANDLE && s_local_space != XR_NULL_HANDLE) {
+			XrSpaceLocation hl = {XR_TYPE_SPACE_LOCATION};
+			if (XR_SUCCEEDED(s_real_locate_space(s_view_space, s_local_space,
+			                                     viewLocateInfo->displayTime, &hl)) &&
+			    (hl.locationFlags & XR_SPACE_LOCATION_POSITION_VALID_BIT)) {
+				for (uint32_t i = 0; i < count; i++) {
+					views[i].pose.position.x += hl.pose.position.x;
+					views[i].pose.position.y += hl.pose.position.y;
+					views[i].pose.position.z += hl.pose.position.z;
+				}
+			}
+		}
+		return result;
 	}
 
 	// Cache L/R eye positions for C# eye-tracking queries (gizmo, debug UI).
@@ -793,6 +929,37 @@ hooked_xrGetSystemProperties(XrInstance instance, XrSystemId systemId, XrSystemP
 				if (XR_SUCCEEDED(s_next_gipa(s_instance, "xrCaptureAtlasEXT", &fn)) && fn) {
 					s_pfn_capture_atlas = (PFN_xrCaptureAtlasEXT)fn;
 					displayxr_log( "[DisplayXR] Resolved xrCaptureAtlasEXT (#140)\n");
+				}
+
+				// XR_EXT_view_rig (#396): no entry point to resolve (rig is chained
+				// on xrLocateViews), so detect by enumerating available instance
+				// extensions. We requested it in OpenxrExtensionStrings, so available
+				// == enabled here. When present, the locate hook delegates Kooima to
+				// the runtime; otherwise it falls back to the local display3d/camera3d.
+				fn = nullptr;
+				if (XR_SUCCEEDED(s_next_gipa(s_instance, "xrEnumerateInstanceExtensionProperties", &fn)) && fn) {
+					PFN_xrEnumerateInstanceExtensionProperties enum_ext =
+						(PFN_xrEnumerateInstanceExtensionProperties)fn;
+					uint32_t avail = 0;
+					enum_ext(nullptr, 0, &avail, nullptr);
+					if (avail > 0) {
+						XrExtensionProperties *props = (XrExtensionProperties *)
+							calloc(avail, sizeof(XrExtensionProperties));
+						for (uint32_t i = 0; i < avail; i++)
+							props[i].type = XR_TYPE_EXTENSION_PROPERTIES;
+						if (XR_SUCCEEDED(enum_ext(nullptr, avail, &avail, props))) {
+							for (uint32_t i = 0; i < avail; i++) {
+								if (strcmp(props[i].extensionName, XR_EXT_VIEW_RIG_EXTENSION_NAME) == 0) {
+									s_has_view_rig = 1;
+									break;
+								}
+							}
+						}
+						free(props);
+					}
+					displayxr_log("[DisplayXR] XR_EXT_view_rig: %s\n",
+					              s_has_view_rig ? "AVAILABLE (runtime owns Kooima)"
+					                             : "not found (legacy local Kooima path)");
 				}
 			}
 			break;
