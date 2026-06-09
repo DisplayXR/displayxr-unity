@@ -9,10 +9,26 @@
 #include "displayxr_standalone.h"
 #include "displayxr_extensions.h"
 #include "displayxr_shared_state.h"
-#include "display3d_view.h"
-#include "camera3d_view.h"
 
 #include <openxr/openxr.h>
+
+// XR_EXT_view_rig (#396 W7): the SA session delegates Kooima to the runtime, so it
+// no longer links displayxr::math. These local containers replace the former
+// Display3DTunables / Display3DView (data only — no math).
+typedef struct SaTunables {
+	float ipd_factor;
+	float parallax_factor;
+	float perspective_factor;
+	float virtual_display_height;
+} SaTunables;
+
+typedef struct SaView {
+	float view_matrix[16];       // column-major 4x4
+	float projection_matrix[16]; // column-major 4x4
+	XrFovf fov;
+	XrVector3f eye_world;
+	XrQuaternionf orientation;
+} SaView;
 
 #if defined(__APPLE__)
 #include "displayxr_standalone_metal.h"

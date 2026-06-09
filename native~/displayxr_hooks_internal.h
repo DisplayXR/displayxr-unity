@@ -8,10 +8,8 @@
 
 #include "displayxr_hooks.h"
 #include "displayxr_extensions.h"
-#include "displayxr_kooima.h"
 #include "displayxr_shared_state.h"
 #include "displayxr_readback.h"
-#include "camera3d_view.h"
 #include <math.h>
 
 #if defined(__APPLE__)

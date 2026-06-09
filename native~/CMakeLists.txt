@@ -37,25 +37,11 @@ else()
     get_target_property(OPENXR_INCLUDE_DIR OpenXR::Headers INTERFACE_INCLUDE_DIRECTORIES)
 endif()
 
-# --- displayxr::math (shared Kooima math, displayxr-runtime#396) ---
-# The display3d/camera3d view math is the org-shared displayxr-common library,
-# consumed by tag like every other consumer (runtime test apps, demos, Unreal).
-# displayxr-common reuses an existing OpenXR::headers / OpenXR::openxr_loader
-# target when the consumer provides one; expose the headers we just resolved
-# above so it doesn't fetch a second OpenXR-SDK copy (version skew + CI time).
-if(NOT TARGET OpenXR::headers AND NOT TARGET OpenXR::openxr_loader)
-    add_library(displayxr_unity_openxr_headers INTERFACE)
-    target_include_directories(displayxr_unity_openxr_headers INTERFACE "${OPENXR_INCLUDE_DIR}")
-    add_library(OpenXR::headers ALIAS displayxr_unity_openxr_headers)
-endif()
-include(FetchContent)
-set(DISPLAYXR_COMMON_BUILD_TESTS OFF CACHE BOOL "" FORCE)
-FetchContent_Declare(
-    displayxr_common
-    GIT_REPOSITORY https://github.com/DisplayXR/displayxr-common.git
-    GIT_TAG v0.2.0
-)
-FetchContent_MakeAvailable(displayxr_common)
+# --- displayxr::math removed (#396 W7) ---
+# The plugin no longer computes Kooima locally — the DisplayXR runtime owns the
+# view-rig math via XR_EXT_view_rig, and the plugin consumes render-ready
+# XrView{pose,fov}. The former displayxr-common (display3d/camera3d) dependency
+# is gone; do NOT re-add it (see the no-vendored-math drift guard).
 
 # --- Vulkan headers (Windows standalone backend, issue #124) ---
 # Header-only. We compile against these with VK_NO_PROTOTYPES and resolve every
@@ -91,7 +77,6 @@ set(SOURCES
     displayxr_vulkan_backend.cpp
     displayxr_opengl_backend.cpp
     displayxr_opengles_backend.cpp
-    displayxr_kooima.cpp
     displayxr_shared_state.cpp
     displayxr_readback.cpp
     displayxr_standalone.cpp
@@ -108,7 +93,6 @@ set(SOURCES
 set(HEADERS
     displayxr_hooks.h
     displayxr_hooks_internal.h
-    displayxr_kooima.h
     displayxr_shared_state.h
     displayxr_readback.h
     displayxr_extensions.h
@@ -144,10 +128,6 @@ target_include_directories(displayxr_unity PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}
     ${OPENXR_INCLUDE_DIR}
 )
-
-# Shared Kooima math (display3d_view.h / camera3d_view.h / projection_depth.h
-# resolve from this target's interface include dir).
-target_link_libraries(displayxr_unity PRIVATE displayxr::math)
 
 # Vulkan headers + vendored Unity native-plugin interface headers (Windows
 # standalone Vulkan backend, issue #124).
