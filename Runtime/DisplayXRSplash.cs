@@ -129,7 +129,7 @@ namespace DisplayXR
             {
                 // Reveal the scene loaded underneath. Destroying our rig clears
                 // DisplayXRRigManager.SplashActive, so the app's rig resumes.
-                Destroy(gameObject);
+                StartCoroutine(FlushAndDestroy());
                 return;
             }
             if (!string.IsNullOrEmpty(nextScene))
@@ -140,6 +140,29 @@ namespace DisplayXR
             int next = gameObject.scene.buildIndex + 1;
             if (next > 0 && next < SceneManager.sceneCountInBuildSettings)
                 SceneManager.LoadScene(next);
+        }
+
+        // Overlay teardown: before destroying the splash rig, hold it a few extra
+        // frames rendering ONLY a full-eye black clear (cullingMask=0, depth on
+        // top). The boot splash is a transient 2nd projection rig; if it vanishes
+        // in one frame it can orphan a stale atlas region (frozen content the main
+        // rig never reclaims). Overwriting the full eye buffer to black across all
+        // buffered swapchain images first means no foreign content is left frozen.
+        IEnumerator FlushAndDestroy()
+        {
+            var cam = GetComponent<Camera>();
+            if (cam != null)
+            {
+                cam.cullingMask = 0;                            // draw nothing but the clear
+                cam.clearFlags = CameraClearFlags.SolidColor;
+                cam.backgroundColor = Color.black;
+                cam.depth = 100;                                // on top of the app cameras
+            }
+            // Hold longer than any plausible swapchain image count (2-3) so every
+            // buffered eye image is overwritten before the rig goes away.
+            for (int i = 0; i < 6; i++)
+                yield return new WaitForEndOfFrame();
+            Destroy(gameObject);
         }
 
         void BuildArtwork(float displayH)
