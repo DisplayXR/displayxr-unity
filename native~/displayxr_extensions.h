@@ -213,6 +213,69 @@ typedef XrResult(XRAPI_PTR *PFN_xrCaptureAtlasEXT)(
     const XrAtlasCaptureInfoEXT *info,
     XrAtlasCaptureResultEXT *result);
 
+// --- XR_EXT_view_rig ---
+// App-facing control of the runtime's view-rig (Kooima) math: chain ONE rig
+// descriptor on XrViewLocateInfo::next and consume render-ready XrView{pose,fov}
+// instead of computing the projection from raw eyes ourselves. Chain
+// XrViewDisplayRawEXT on XrViewState::next to recover the raw display-space eyes
+// (for the gizmo / eye-position cache). Descriptors carry NO clip params (near/far
+// stay app-side) and NO placement params (the runtime owns the window/canvas).
+// Per-locate: chain every frame you want it to drive; a locate chaining nothing
+// keeps the default raw-eye transport. Out-of-range values clamp (one-shot runtime
+// WARN), never reject; if both rigs are chained the camera rig wins. Source of
+// truth: displayxr-runtime/src/external/openxr_includes/openxr/XR_EXT_view_rig.h
+// (SPEC_VERSION 2 — reconcile with the Khronos registry before spec freeze).
+#define XR_EXT_VIEW_RIG_EXTENSION_NAME "XR_EXT_view_rig"
+#define XR_EXT_view_rig_SPEC_VERSION 2
+
+#define XR_TYPE_DISPLAY_RIG_EXT ((XrStructureType)1000999140)
+#define XR_TYPE_CAMERA_RIG_EXT ((XrStructureType)1000999141)
+#define XR_TYPE_VIEW_DISPLAY_RAW_EXT ((XrStructureType)1000999142)
+
+// Capacity of XrViewDisplayRawEXT::rawEyes (matches the runtime's max views).
+#define XR_VIEW_RIG_MAX_RAW_EYES_EXT 8
+
+// Display-centric rig (window/canvas as a portal). Chain on XrViewLocateInfo::next.
+typedef struct XrDisplayRigEXT {
+    XrStructureType type; // Must be XR_TYPE_DISPLAY_RIG_EXT
+    const void *next;
+    XrPosef pose;               // virtual display plane pose in the locate space
+    float virtualDisplayHeight; // app units; m2v = this / physical canvas height
+    float ipdFactor;            // [0,1] multiplies view-pose spread about center
+    float parallaxFactor;       // [0,1] lerps eye centroid toward nominal viewer
+    float perspectiveFactor;    // [0.1,10] scales eye XYZ (object perspective)
+} XrDisplayRigEXT;
+
+// Camera-centric rig (app camera perturbed by eye tracking). Chain on next.
+typedef struct XrCameraRigEXT {
+    XrStructureType type; // Must be XR_TYPE_CAMERA_RIG_EXT
+    const void *next;
+    XrPosef pose;             // camera pose in the locate space
+    float ipdFactor;          // [0,1] multiplies view-pose spread about center
+    float parallaxFactor;     // [0,1] lerps eye centroid toward nominal viewer
+    float convergenceDiopters; // 1/m to the convergence plane; 0 = infinity
+    float verticalFov;        // radians, full vertical angle
+} XrCameraRigEXT;
+
+// Raw rig inputs for the locate, filled by the runtime. Chain on XrViewState::next.
+// rawEyes are verbatim physical-display-space eye positions (meters, display-center
+// origin, +X right +Y up +Z toward viewer), one per active view; NOT canvas-rebased.
+typedef struct XrViewDisplayRawEXT {
+    XrStructureType type; // Must be XR_TYPE_VIEW_DISPLAY_RAW_EXT
+    void *next;
+    XrVector3f rawEyes[XR_VIEW_RIG_MAX_RAW_EYES_EXT];
+    uint32_t eyeCountOutput;      // eyes written = the DP's per-view count
+    XrPosef displayPlanePose;     // physical display plane in the locate space
+    XrRect2Di canvasRectPx;       // effective canvas on the panel (client/sub-rect)
+    XrExtent2Df canvasSizeMeters; // physical size of that canvas
+    int64_t sampleTimeNs;         // when the eyes were sampled (monotonic)
+    XrBool32 isTracking;          // physical tracker lock (vs nominal fallback)
+} XrViewDisplayRawEXT;
+
+// Workspace-controller-only entry point — the plugin never calls this (Unity is
+// never the workspace controller); typedef kept for header completeness.
+typedef XrResult(XRAPI_PTR *PFN_xrSetWorkspaceViewRigEXT)(XrSession session, const void *rig);
+
 #ifdef __cplusplus
 }
 #endif
