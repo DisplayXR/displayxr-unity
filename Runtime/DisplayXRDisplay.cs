@@ -61,6 +61,8 @@ namespace DisplayXR
         // True when running under URP/HDRP. BiRP fires Camera.onPreRender; SRP doesn't,
         // so we route through RenderPipelineManager.beginCameraRendering instead.
         private bool m_UsingSRP;
+        // URP foreground-clip: cached Camera.farClipPlane while overridden (-1 = not overriding).
+        private float m_UrpSavedFar = -1f;
 
         // Set by DisplayXRSplash on the boot-splash rig. Such a rig does NOT join
         // the rig registry — so app scripts that bind to DisplayXRRigManager
@@ -130,15 +132,33 @@ namespace DisplayXR
             cam.SetStereoViewMatrix(Camera.StereoscopicEye.Left, leftView);
             cam.SetStereoViewMatrix(Camera.StereoscopicEye.Right, rightView);
 
-            // Projection is normally NOT overridden — BiRP consumes the runtime's
-            // render-ready views[i].fov directly (#396 Probe A). The exception is
-            // foreground-only clip (#57 family): the rig fov is clip-independent, so
-            // the per-view far at the display plane is applied app-side via the
-            // native foreground projection (leftProj/rightProj carry it).
+            // Projection is normally NOT overridden — BiRP and URP both consume the
+            // runtime's render-ready views[i].fov directly (#396 Probe A). The
+            // exception is foreground-only clip (#57 family): the rig fov is
+            // clip-independent, so the per-view far at the display plane is applied
+            // app-side. BiRP honors SetStereoProjectionMatrix; URP does NOT (verified)
+            // — but URP honors Camera.farClipPlane, so feed it the recovered far.
             if (foregroundOnlyClip)
             {
-                cam.SetStereoProjectionMatrix(Camera.StereoscopicEye.Left, leftProj);
-                cam.SetStereoProjectionMatrix(Camera.StereoscopicEye.Right, rightProj);
+                if (m_UsingSRP)
+                {
+                    // Recover the foreground far from the GL projection: far = m23/(m22+1).
+                    // Native still computes it per-view from the eye→display-plane distance,
+                    // so the far_z feedback through LateUpdate doesn't drift it.
+                    float fgFar = leftProj.m23 / (leftProj.m22 + 1f);
+                    if (m_UrpSavedFar < 0f) m_UrpSavedFar = cam.farClipPlane;
+                    if (fgFar > cam.nearClipPlane) cam.farClipPlane = fgFar;
+                }
+                else
+                {
+                    cam.SetStereoProjectionMatrix(Camera.StereoscopicEye.Left, leftProj);
+                    cam.SetStereoProjectionMatrix(Camera.StereoscopicEye.Right, rightProj);
+                }
+            }
+            else if (m_UsingSRP && m_UrpSavedFar >= 0f)
+            {
+                cam.farClipPlane = m_UrpSavedFar; // restore when foreground clip turns off
+                m_UrpSavedFar = -1f;
             }
         }
 
