@@ -127,28 +127,29 @@ namespace DisplayXR
             cam.SetStereoViewMatrix(Camera.StereoscopicEye.Left, leftView);
             cam.SetStereoViewMatrix(Camera.StereoscopicEye.Right, rightView);
 
-            // Projection is normally NOT overridden — BiRP and URP both consume the
-            // runtime's render-ready views[i].fov directly (#396 Probe A). The
-            // exception is foreground-only clip (#57 family): the rig fov is
-            // clip-independent, so the per-view far (camera rig = the convergence
-            // distance) is applied app-side. BiRP honors SetStereoProjectionMatrix;
-            // URP does NOT (verified) — but URP honors Camera.farClipPlane.
-            if (foregroundOnlyClip)
+            // BiRP: always override the projection with the runtime's render-ready fov,
+            // built explicitly (native dxr_projection_from_fov). Unity's XR builds a
+            // correct projection from views[i].fov only for a CENTERED frustum; for
+            // window-relative off-center the frustum shears and Unity mishandles it,
+            // over-separating the eyes (#396 — the native cube app works off-center,
+            // Unity didn't until this override). Centered is unchanged (explicit ==
+            // Unity's fov projection there, Probe A). The native projection also carries
+            // the foreground-clip per-view far (camera rig = the convergence distance, #57).
+            if (!m_UsingSRP)
             {
-                if (m_UsingSRP)
-                {
-                    // Recover the foreground far from the GL projection: far = m23/(m22+1).
-                    float fgFar = leftProj.m23 / (leftProj.m22 + 1f);
-                    if (m_UrpSavedFar < 0f) m_UrpSavedFar = cam.farClipPlane;
-                    if (fgFar > cam.nearClipPlane) cam.farClipPlane = fgFar;
-                }
-                else
-                {
-                    cam.SetStereoProjectionMatrix(Camera.StereoscopicEye.Left, leftProj);
-                    cam.SetStereoProjectionMatrix(Camera.StereoscopicEye.Right, rightProj);
-                }
+                cam.SetStereoProjectionMatrix(Camera.StereoscopicEye.Left, leftProj);
+                cam.SetStereoProjectionMatrix(Camera.StereoscopicEye.Right, rightProj);
             }
-            else if (m_UsingSRP && m_UrpSavedFar >= 0f)
+            // URP ignores SetStereoProjectionMatrix; feed the foreground-clip far via
+            // Camera.farClipPlane. The off-center frustum shear can't be injected into
+            // URP this way → off-center window-relative Kooima is a URP-only limitation.
+            else if (foregroundOnlyClip)
+            {
+                float fgFar = leftProj.m23 / (leftProj.m22 + 1f);
+                if (m_UrpSavedFar < 0f) m_UrpSavedFar = cam.farClipPlane;
+                if (fgFar > cam.nearClipPlane) cam.farClipPlane = fgFar;
+            }
+            else if (m_UrpSavedFar >= 0f)
             {
                 cam.farClipPlane = m_UrpSavedFar; // restore when foreground clip turns off
                 m_UrpSavedFar = -1f;
