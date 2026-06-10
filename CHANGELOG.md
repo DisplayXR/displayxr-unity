@@ -5,6 +5,22 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.19.0] - 2026-06-09
+
+### Changed
+- **Kooima projection is now owned by the DisplayXR runtime via `XR_EXT_view_rig`** (`DisplayXR/displayxr-runtime#396` W7, ADR-024). The plugin no longer computes Kooima: it chains an `XrDisplayRigEXT`/`XrCameraRigEXT` descriptor (scene transform + the handful of tunables) onto `xrLocateViews` and consumes render-ready `XrView{pose, fov}` — on **both** the built-app hook path and the standalone editor-preview session. The former vendored/`displayxr::math` display3d/camera3d Kooima math is removed (~500 lines, plus `displayxr_kooima.{cpp,h}`; the `displayxr::math` link is dropped). The P/Invoke surface and C# API are unchanged.
+  - **⚠️ Requires a DisplayXR runtime that advertises `XR_EXT_view_rig` (SPEC_VERSION 2) _and_ the #396 W7 window-metrics fixes — both ship in runtime `v1.16.0` (bundle `0.17.0`).** Against an older runtime the plugin emits a one-shot WARN and passes the raw views through, which renders **no stereo**. Update the runtime to `0.17.0`+ before installing this plugin version.
+- The BiRP per-eye projection override (`SetStereoProjectionMatrix`) is **retained and always applied**. A probe showed BiRP consumes `views[i].fov` directly when the window is centered, but for **window-relative off-center** windows the rig fov is a sheared off-axis frustum that Unity's XR fov→projection path mishandles (over-separates the eyes) — so the plugin keeps building the projection itself. BiRP also keeps the `SetStereoViewMatrix` + `FlipViewZ` handedness shim.
+- Foreground-only clip (#57 family) is preserved under the rig path: the rig fov is clip-independent, so the per-view far plane is rebuilt app-side (display rig = eye→display-plane distance; camera rig = convergence distance) — BiRP via `SetStereoProjectionMatrix`, **URP via `Camera.farClipPlane`** (URP ignores `SetStereoProjectionMatrix`).
+
+### Fixed
+- macOS (Metal): Gamma-space projects now downgrade the sRGB eye swapchain to UNORM on the Metal backend too (the branch was missing), fixing washed-out / overexposed output on macOS.
+- macOS C# compile: a Windows-only fullscreen-overlay P/Invoke is now correctly guarded for Windows (#147) — it was latent because CI only builds the native plugin.
+- Sample `DisplayXRInputController`: mouse-look drag is smooth again (uses `Mouse.current.delta` instead of a pointer-position diff).
+
+### Known limitations
+- **URP off-center window-relative Kooima**: URP ignores `SetStereoProjectionMatrix`, so the off-center frustum shear cannot be injected; centered / fullscreen URP is correct. (BiRP handles off-center.)
+
 ## [1.18.0] - 2026-06-09
 
 ### Added
