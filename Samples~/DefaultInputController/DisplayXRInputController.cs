@@ -234,12 +234,18 @@ namespace DisplayXR
 
             if (m_Dragging)
             {
-                Vector2 pos = GetMousePosition();
-                Vector2 delta = pos - m_LastMousePos;
+                // Use the Input System's frame-accumulated delta, NOT a manual
+                // position difference. Mouse.current.position only updates on input
+                // events, so differencing it stutters when frames outrun events
+                // (same value -> zero delta -> then a jump). delta.ReadValue() is
+                // accumulated + zeroed per frame, so mouse-look stays smooth. (Same
+                // primitive the shell/SA path above already uses.)
+                Vector2 delta = Mouse.current != null
+                    ? Mouse.current.delta.ReadValue() : Vector2.zero;
                 m_Yaw += delta.x * rotationSensitivity;
                 m_Pitch -= delta.y * rotationSensitivity;
                 m_Pitch = Mathf.Clamp(m_Pitch, -1.4f, 1.4f);
-                m_LastMousePos = pos;
+                m_LastMousePos = GetMousePosition();
 
                 transform.rotation = Quaternion.Euler(
                     m_Pitch * Mathf.Rad2Deg,
