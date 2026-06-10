@@ -43,7 +43,7 @@ Raw CMake (`cd native~ && mkdir build && cd build && cmake .. -DCMAKE_BUILD_TYPE
 
 1. **Runtime (C#)** — `DisplayXRFeature.cs` hooks into OpenXR lifecycle; `DisplayXRCamera.cs` and `DisplayXRDisplay.cs` are the two stereo rig modes; `DisplayXRRigManager.cs` coordinates multi-camera scenes; `DisplayXRPreview.cs` provides inline preview textures (SBS, readback, SharedTexture)
 2. **Editor (C#)** — Custom inspectors, settings page, and the standalone preview system (`DisplayXRPreviewSession.cs` manages an independent OpenXR session; `DisplayXRPreviewWindow.cs` provides the editor UI with camera selector and rendering mode controls)
-3. **Native (C/C++)** — Hook chain on `xrLocateViews`, `xrCreateSession`, `xrGetSystemProperties`, `xrEndFrame`; Kooima projection math; thread-safe shared state
+3. **Native (C/C++)** — Hook chain on `xrLocateViews`, `xrCreateSession`, `xrGetSystemProperties`, `xrEndFrame`; chains the runtime's view-rig descriptor (`XR_EXT_view_rig`) and consumes render-ready views — the runtime owns the Kooima math; thread-safe shared state
 
 ### Key Features
 
@@ -52,7 +52,7 @@ Raw CMake (`cd native~ && mkdir build && cd build && cmake .. -DCMAKE_BUILD_TYPE
 - **Standalone editor preview**: Own OpenXR session bypassing Unity XR. Camera selector dropdown, dynamic rendering mode enumeration, zero-copy SharedTexture output (IOSurface/DXGI). Replaces Play Mode for DisplayXR workflows.
 - **Play Mode conflict prevention**: Preview auto-removes Unity's OpenXR loader on Play entry, restores on exit (saved via SessionState)
 - **2D UI overlay**: Canvas → `XrCompositionLayerWindowSpaceEXT` with stereo disparity
-- **Native Kooima math**: `display3d_view.c` (screen-edge frustum) and `camera3d_view.c` (tangent-space frustum) — pure C, no DisplayXR dependency
+- **Runtime-owned Kooima math (`XR_EXT_view_rig`, #396 W7)**: the plugin no longer computes Kooima. It chains an `XrDisplayRigEXT`/`XrCameraRigEXT` descriptor (the handful of tunables) onto `xrLocateViews` and consumes render-ready `XrView{pose, fov}` — on both the built-app hook path and the standalone preview session. **This requires a runtime that advertises `XR_EXT_view_rig` (SPEC_VERSION 2)**; against an older runtime the plugin emits a one-shot WARN and passes raw views through (no stereo). The former vendored/`displayxr::math` display3d/camera3d math is gone (do not re-add — see the `no-vendored-math` drift guard).
 
 ### Multi-Camera Rig Management
 
@@ -81,9 +81,10 @@ Scenes can contain multiple cameras with different rig types (display-centric, c
 ### OpenXR Hook Chain
 
 The native plugin intercepts OpenXR calls via `xrGetInstanceProcAddr` hooking:
-- `xrLocateViews` → applies scene transform + tunables + Kooima projection
+- `xrLocateViews` → chains an `XR_EXT_view_rig` descriptor (built from scene transform + tunables) and consumes the runtime's render-ready `XrView{pose, fov}`. Also builds the BiRP view-matrix handedness shim and applies the URP head-pose comp (#115). Falls back to raw passthrough (one-shot WARN) if the runtime lacks `XR_EXT_view_rig`.
 - `xrCreateSession` → injects window binding extension
-- `xrGetSystemProperties` → extracts display info
+- `xrGetSystemProperties` → extracts display info; detects `XR_EXT_view_rig`
+- `xrCreateSwapchain` → downgrades sRGB color swapchains to UNORM in Gamma-space projects (DXGI/Vulkan/Metal) so output isn't double-gamma-encoded
 - `xrEndFrame` → submits overlay composition layers
 
 ### Shared Texture Architecture (IOSurface / DXGI)
