@@ -125,13 +125,21 @@ namespace DisplayXR
             leftView = FlipViewZ(leftView);
             rightView = FlipViewZ(rightView);
 
-            // Only the view matrix is overridden: it carries the OpenXR→Unity
+            // The view matrix is always overridden: it carries the OpenXR→Unity
             // handedness conversion (FlipViewZ) that BiRP's pose path doesn't apply.
-            // The projection is NOT overridden — BiRP consumes the runtime's
-            // render-ready views[i].fov directly (verified, #396 Probe A). leftProj/
-            // rightProj are unused here.
             cam.SetStereoViewMatrix(Camera.StereoscopicEye.Left, leftView);
             cam.SetStereoViewMatrix(Camera.StereoscopicEye.Right, rightView);
+
+            // Projection is normally NOT overridden — BiRP consumes the runtime's
+            // render-ready views[i].fov directly (#396 Probe A). The exception is
+            // foreground-only clip (#57 family): the rig fov is clip-independent, so
+            // the per-view far at the display plane is applied app-side via the
+            // native foreground projection (leftProj/rightProj carry it).
+            if (foregroundOnlyClip)
+            {
+                cam.SetStereoProjectionMatrix(Camera.StereoscopicEye.Left, leftProj);
+                cam.SetStereoProjectionMatrix(Camera.StereoscopicEye.Right, rightProj);
+            }
         }
 
         /// <summary>Negate column 2 (Z) of a view matrix to convert OpenXR → Unity world handedness.</summary>
