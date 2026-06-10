@@ -287,6 +287,20 @@ static void dxr_projection_from_fov(const XrFovf *fov, float near_z, float far_z
 	out[14] = -2.0f * far_z * near_z / (far_z - near_z);
 }
 
+// Foreground-only clip (#57 family): the eye's distance to the display plane =
+// z of (rigPose^-1 * eyeWorld). Used as the per-view far so geometry behind the
+// display plane is clipped. Degenerates to eyeWorld.z at an identity rig pose.
+static float dxr_rig_local_eye_z(const XrPosef *rig, const XrVector3f *eye_world) {
+	const float dx = eye_world->x - rig->position.x;
+	const float dy = eye_world->y - rig->position.y;
+	const float dz = eye_world->z - rig->position.z;
+	const float qx = -rig->orientation.x, qy = -rig->orientation.y;
+	const float qz = -rig->orientation.z, qw = rig->orientation.w;
+	const float cx = qy * dz - qz * dy + qw * dx;
+	const float cy = qz * dx - qx * dz + qw * dy;
+	return dz + 2.0f * (qx * cy - qy * cx);
+}
+
 // ============================================================================
 // Intercepted OpenXR functions
 // ============================================================================
@@ -362,31 +376,29 @@ hooked_xrLocateViews(XrSession session,
 	XrDisplayRigEXT rig_display = {XR_TYPE_DISPLAY_RIG_EXT};
 	XrCameraRigEXT rig_camera = {XR_TYPE_CAMERA_RIG_EXT};
 	XrViewDisplayRawEXT rig_raw = {XR_TYPE_VIEW_DISPLAY_RAW_EXT};
+	XrPosef rig_pose_world = {{0, 0, 0, 1}, {0, 0, 0}}; // display-plane / camera pose (for foreground clip)
 	bool rig_chained = false;
 	if (s_has_view_rig) {
 		DisplayXRTunables rt = displayxr_state_get_tunables();
 		DisplayXRSceneTransform rx = displayxr_state_get_scene_transform();
 		DisplayXRState *rs = displayxr_get_state();
 		if (rs->display_info.is_valid) {
-			XrPosef rp = {};
 			if (rx.enabled) {
-				rp.position = XrVector3f{rx.position[0], rx.position[1], -rx.position[2]};
-				rp.orientation = XrQuaternionf{-rx.orientation[0], -rx.orientation[1],
+				rig_pose_world.position = XrVector3f{rx.position[0], rx.position[1], -rx.position[2]};
+				rig_pose_world.orientation = XrQuaternionf{-rx.orientation[0], -rx.orientation[1],
 				                               rx.orientation[2], rx.orientation[3]};
-			} else {
-				rp.orientation = XrQuaternionf{0, 0, 0, 1};
 			}
 			float ssy = (rx.enabled && rx.scale[1] > 0.001f) ? rx.scale[1] : 1.0f;
 			float ssz = (rx.enabled && rx.scale[2] > 0.001f) ? rx.scale[2] : 1.0f;
 			if (rt.camera_centric) {
-				rig_camera.pose = rp;
+				rig_camera.pose = rig_pose_world;
 				rig_camera.ipdFactor = rt.ipd_factor;
 				rig_camera.parallaxFactor = rt.parallax_factor;
 				rig_camera.convergenceDiopters = rt.inv_convergence_distance / ssz;
 				rig_camera.verticalFov = 2.0f * atanf(rt.fov_override);
 				modified_info.next = &rig_camera;
 			} else {
-				rig_display.pose = rp;
+				rig_display.pose = rig_pose_world;
 				rig_display.virtualDisplayHeight = rt.virtual_display_height / ssy;
 				rig_display.ipdFactor = rt.ipd_factor;
 				rig_display.parallaxFactor = rt.parallax_factor;
@@ -443,12 +455,30 @@ hooked_xrLocateViews(XrSession session,
 
 		// BiRP view-matrix shim (handedness): built from the render-ready pose
 		// BEFORE the #115 comp below, so BiRP gets the eye_world view and URP gets
-		// the comp'd pose. proj is filled from fov but unused by the C# shim now.
+		// the comp'd pose. Projection: the rig fov is clip-independent, so near/far
+		// stay app-side. For foreground-only clip (#57 family) rebuild the per-view
+		// far at the eye's display-plane distance (display rig = |rig-local eye Z|;
+		// camera rig = the convergence distance) so geometry behind the plane is
+		// clipped — matches the runtime test apps. The C# shim applies this
+		// projection ONLY when foregroundOnlyClip is set; otherwise BiRP reads
+		// views[i].fov directly (Probe A) and this projection is unused.
 		DisplayXRStereoMatrices mats = {};
 		dxr_view_matrix_from_pose(&views[0].pose, mats.left_view);
 		dxr_view_matrix_from_pose(&views[1].pose, mats.right_view);
-		dxr_projection_from_fov(&views[0].fov, rt.near_z, rt.far_z, mats.left_projection);
-		dxr_projection_from_fov(&views[1].fov, rt.near_z, rt.far_z, mats.right_projection);
+		for (int e = 0; e < 2; e++) {
+			float far_eff = rt.far_z;
+			if (rt.clip_at_display_plane) {
+				if (rt.camera_centric) {
+					if (rt.inv_convergence_distance > 1e-4f)
+						far_eff = 1.0f / rt.inv_convergence_distance;
+				} else {
+					float ez = fabsf(dxr_rig_local_eye_z(&rig_pose_world, &views[e].pose.position));
+					if (ez > rt.near_z + 0.001f) far_eff = ez;
+				}
+			}
+			dxr_projection_from_fov(&views[e].fov, rt.near_z, far_eff,
+			                        e == 0 ? mats.left_projection : mats.right_projection);
+		}
 		mats.valid = 1;
 		displayxr_state_set_stereo_matrices(&mats);
 
