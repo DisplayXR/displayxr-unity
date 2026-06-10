@@ -1239,7 +1239,16 @@ hooked_xrCreateSwapchain(XrSession session,
 			else if (info.format == 58) info.format = 51; // A8B8G8R8_SRGB_PACK32 → _UNORM_PACK32
 		} else
 #endif
-		{
+		if (s_backend_type == kBackendMetal) {
+			// MTLPixelFormat sRGB → UNORM. Unity (macOS) requests an sRGB eye
+			// swapchain (RGBA8Unorm_sRGB=71 / BGRA8Unorm_sRGB=81) even in a Gamma
+			// project; writing already-gamma-encoded shader output to it makes the
+			// GPU sRGB-encode a second time (double-gamma → washed out / over-
+			// exposed on display). Metal was previously missed here (only DXGI +
+			// Vulkan were mapped), so Gamma projects looked overexposed on macOS.
+			if      (info.format == 71) info.format = 70; // RGBA8Unorm_sRGB → RGBA8Unorm
+			else if (info.format == 81) info.format = 80; // BGRA8Unorm_sRGB → BGRA8Unorm
+		} else {
 			if      (info.format == 29) info.format = 28; // DXGI RGBA8 SRGB → UNORM
 			else if (info.format == 91) info.format = 87; // DXGI BGRA8 SRGB → UNORM
 		}
