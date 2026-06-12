@@ -19,7 +19,7 @@ jobs:
   no-vendored-math:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - name: No re-vendored displayxr::math sources
         shell: bash
         run: |
