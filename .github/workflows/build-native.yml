@@ -30,7 +30,7 @@ jobs:
     name: Windows x64
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Configure CMake
         run: cmake -S native~ -B native~/build -A x64 -DCMAKE_BUILD_TYPE=Release
@@ -48,7 +48,7 @@ jobs:
           Get-Item "Runtime/Plugins/Windows/x64/displayxr_unity.dll" | Select-Object Name, Length
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: displayxr_unity-windows-x64
           path: Runtime/Plugins/Windows/x64/displayxr_unity.dll
@@ -57,7 +57,7 @@ jobs:
     name: macOS (Universal)
     runs-on: macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Configure CMake
         run: cmake -S native~ -B native~/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64"
@@ -77,7 +77,7 @@ jobs:
           file "$BUNDLE/displayxr_unity" 2>/dev/null || file "$BUNDLE/Contents/MacOS/displayxr_unity" 2>/dev/null || echo "Binary location varies by CMake version"
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: displayxr_unity-macos
           path: Runtime/Plugins/macOS/displayxr_unity.bundle
@@ -91,16 +91,16 @@ jobs:
     permissions:
       contents: write
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Download Windows artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: displayxr_unity-windows-x64
           path: Runtime/Plugins/Windows/x64/
 
       - name: Download macOS artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: displayxr_unity-macos
           path: Runtime/Plugins/macOS/
@@ -231,22 +231,22 @@ jobs:
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Download Windows artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: displayxr_unity-windows-x64
           path: Runtime/Plugins/Windows/x64/
 
       - name: Download macOS artifact
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           name: displayxr_unity-macos
           path: Runtime/Plugins/macOS/
 
       - name: Upload combined artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: displayxr-unity-plugin
           path: |
