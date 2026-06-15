@@ -54,6 +54,40 @@ Raw CMake (`cd native~ && mkdir build && cd build && cmake .. -DCMAKE_BUILD_TYPE
 - **2D UI overlay**: Canvas → `XrCompositionLayerWindowSpaceEXT` with stereo disparity
 - **Runtime-owned Kooima math (`XR_EXT_view_rig`, #396 W7)**: the plugin no longer computes Kooima. It chains an `XrDisplayRigEXT`/`XrCameraRigEXT` descriptor (the handful of tunables) onto `xrLocateViews` and consumes render-ready `XrView{pose, fov}` — on both the built-app hook path and the standalone preview session. **This requires a runtime that advertises `XR_EXT_view_rig` (SPEC_VERSION 2)**; against an older runtime the plugin emits a one-shot WARN and passes raw views through (no stereo). The former vendored/`displayxr::math` display3d/camera3d math is gone (do not re-add — see the `no-vendored-math` drift guard).
 
+### Render Pipeline Support (BiRP vs URP)
+
+Both pipelines render from the **same source of truth** — the per-eye matrices from
+`DisplayXRFeature.GetStereoMatrices` (`leftProj`/`rightProj`) — but inject the projection through
+**two thin, non-shared adapters** (the injection mechanism is pipeline-specific and cannot be shared):
+
+- **BiRP adapter**: the rig (`DisplayXRDisplay`/`DisplayXRCamera.OnCameraPreRender`) calls
+  `Camera.SetStereoProjectionMatrix(leftProj/rightProj)`. BiRP honors it; the override carries the
+  off-center frustum shear and the foreground-clip per-view far directly in the projection (#396/#57).
+- **URP adapter**: URP **ignores** `SetStereoProjectionMatrix` (Unity #1328435) and builds each eye's
+  projection from `views[i].fov`, which it mishandles for strongly off-center frustums (head x<0
+  shifts/deforms). The fix lives in a **URP-guarded sub-assembly** (`Runtime/URP/`,
+  `Editor/URP/` — asmdefs gated by `defineConstraints: ["DISPLAYXR_URP"]` + a `versionDefines` that
+  defines `DISPLAYXR_URP` only for `com.unity.render-pipelines.universal >= 17.0.0`, so BiRP-only and
+  older-URP projects never compile it):
+  - **`KooimaProjectionFixFeature`** (universal, auto-wired) — a `ScriptableRendererFeature` that
+    re-pushes the correct per-eye `leftProj`/`rightProj` via `cmd.SetViewProjectionMatrices` at
+    `BeforeRenderingOpaques` (URP pushes the projection once per eye-pass at camera setup, not per
+    draw, so it sticks). Has a NaN/identity startup guard. **Every URP DisplayXR app needs this** —
+    `DisplayXRUrpAutoWire` adds it automatically when a URP DisplayXR rig is in an open scene (toggle:
+    `DisplayXR > Auto-Wire URP Projection Fix`; or run `DisplayXR > Setup URP Projection Fix`).
+  - **`DisplayXR/ForegroundClipURP`** (opt-in, transparent-overlay apps only) — a per-eye depth-based
+    foreground clip. The rig publishes the two per-eye fars + eye positions via the `_DXRForegroundFar`
+    / `_DXREyePosL`/`_DXREyePosR` globals (the rig's URP branch does this and nothing else — no
+    projection/`farClipPlane` hacks); Unity's built-in `FullScreenPassRendererFeature` + a shipped
+    material do the clip. Wire with `DisplayXR > Setup URP Foreground Clip`. The globals are inert if
+    the pass isn't wired, so they're safe for normal URP apps. The clip shader lives in
+    `Runtime/URP/Shaders/` and **must never move into `Runtime/Resources/`** — a URP-include shader in
+    `Resources/` force-compiles in every build and breaks BiRP-only projects (the #130 revert).
+  - **URP transparency** also requires the per-project Player Setting **Preserve Framebuffer Alpha**
+    (`preserveFramebufferAlpha = 1`) — the plugin cannot set it at runtime; document it for URP
+    transparent apps (without it, HDR+32-bit picks `B10G11R11`, no alpha → opaque black).
+  - HDRP gets no off-axis fix (the RendererFeature is URP-only); see #127/#129.
+
 ### Multi-Camera Rig Management
 
 Scenes can contain multiple cameras with different rig types (display-centric, camera-centric, or plain cameras). A static registry coordinates which rig is active at any time.

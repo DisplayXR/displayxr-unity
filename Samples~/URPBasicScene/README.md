@@ -37,10 +37,39 @@ fall back to mono.
    on the cubes); toggle `logEyeTracking` on the rig to confirm the per-frame
    stereo callback is firing.
 
+## Off-axis projection fix (URP 17 / Unity 6)
+
+URP ignores `Camera.SetStereoProjectionMatrix` (Unity #1328435) and builds each
+eye's projection from `views[i].fov`, which it mishandles for strongly off-center
+(window-relative) Kooima frustums — the image is correct on-axis but shifts and
+deforms when the head moves far off-center. The plugin fixes this with a
+`ScriptableRendererFeature` (`KooimaProjectionFixFeature`) that re-pushes the
+runtime's correct per-eye projection. It ships in a **URP-guarded sub-assembly**
+(URP ≥ 17.0.0 only) and is **auto-wired** into your URP renderer asset when a
+DisplayXR rig is present in an open scene.
+
+- If it isn't applied automatically, run **DisplayXR > Setup URP Projection Fix**.
+- To stop the auto-wiring, toggle **DisplayXR > Auto-Wire URP Projection Fix**.
+- The fix requires **URP 17 / Unity 6** (RenderGraph). On older URP the assembly
+  is excluded and off-center Kooima remains a known limitation.
+
+## Transparent overlays on URP
+
+Two extra steps for transparent-overlay apps (not needed for this opaque sample):
+
+- **Preserve Framebuffer Alpha** — enable it in *Project Settings > Player >
+  Other Settings*. The plugin can't set it at runtime; without it the URP color
+  target loses its alpha channel (HDR + 32-bit → `B10G11R11`) and the overlay
+  renders opaque black.
+- **Per-eye foreground clip** (optional) — run **DisplayXR > Setup URP Foreground
+  Clip** to create the clip material and add Unity's Full Screen Pass feature. The
+  rig publishes the per-eye fars automatically when `foregroundOnlyClip` is on.
+
 ## HDRP
 
 HDRP routes through the same SRP callback (`RenderPipelineManager
-.beginCameraRendering`), so the rig should work without code changes. HDRP
+.beginCameraRendering`), so the rig should work without code changes. The URP
+off-axis projection fix above is URP-only (the RendererFeature targets URP); HDRP
 end-to-end testing is not bundled here — file an issue with repro steps if
 you hit problems.
 

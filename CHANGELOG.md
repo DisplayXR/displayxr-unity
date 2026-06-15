@@ -5,6 +5,19 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **URP off-axis projection fix** (#127/#129): URP ignores `Camera.SetStereoProjectionMatrix` (Unity #1328435) and builds each eye's projection from `views[i].fov`, which it mishandles for strongly off-center window-relative Kooima frustums (head x<0 shifts/deforms — the prior "URP off-center" known limitation). A new URP-guarded sub-assembly (`Runtime/URP/`, `Editor/URP/`) ships **`KooimaProjectionFixFeature`**, a `ScriptableRendererFeature` that re-pushes the runtime's correct per-eye `leftProj`/`rightProj` via `cmd.SetViewProjectionMatrices` at `BeforeRenderingOpaques` (URP pushes the projection once per eye-pass at camera setup, so it sticks). Has a NaN/identity startup guard. **Auto-wired** into the URP renderer when a DisplayXR rig is in an open scene (`DisplayXRUrpAutoWire`; toggle `DisplayXR > Auto-Wire URP Projection Fix`, or run `DisplayXR > Setup URP Projection Fix`).
+  - The sub-assembly is gated by `defineConstraints: ["DISPLAYXR_URP"]` + a `versionDefines` that only defines `DISPLAYXR_URP` for `com.unity.render-pipelines.universal >= 17.0.0` (RenderGraph), so BiRP-only and older-URP projects never compile it. Requires **URP 17 / Unity 6**.
+- **Per-eye foreground clip on URP** (opt-in, #57/#129): a `DisplayXR/ForegroundClipURP` shader (in `Runtime/URP/Shaders/`, deliberately **not** in `Resources/` to keep BiRP builds safe — the #130 revert) does a per-eye depth-based foreground cut. The rig publishes both per-eye fars + eye positions via the `_DXRForegroundFar`/`_DXREyePosL`/`_DXREyePosR` globals; Unity's built-in `FullScreenPassRendererFeature` + a shipped material do the clip. Wire with `DisplayXR > Setup URP Foreground Clip`.
+
+### Changed
+- The rig's URP branch (`DisplayXRDisplay`/`DisplayXRCamera.OnCameraPreRender`) no longer clamps `Camera.farClipPlane` to a single shared foreground far. Projection is now owned by `KooimaProjectionFixFeature`; the rig only publishes the per-eye `_DXRForegroundFar` globals for the opt-in clip pass (inert if that pass isn't wired). BiRP is unchanged (still `SetStereoProjectionMatrix`).
+
+### Notes
+- URP transparent overlays also require the per-project Player Setting **Preserve Framebuffer Alpha** (`preserveFramebufferAlpha = 1`); the plugin cannot set it at runtime. HDRP gets no off-axis fix (the RendererFeature is URP-only).
+
 ## [1.19.0] - 2026-06-09
 
 ### Changed

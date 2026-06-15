@@ -61,8 +61,12 @@ namespace DisplayXR
         // True when running under URP/HDRP. BiRP fires Camera.onPreRender; SRP doesn't,
         // so we route through RenderPipelineManager.beginCameraRendering instead.
         private bool m_UsingSRP;
-        // URP foreground-clip: cached Camera.farClipPlane while overridden (-1 = not overriding).
-        private float m_UrpSavedFar = -1f;
+        // URP foreground-clip globals consumed by DisplayXR/ForegroundClipURP (the opt-in
+        // FullScreenPassRendererFeature). The off-axis projection itself is owned by
+        // KooimaProjectionFixFeature on URP, not by this rig.
+        private static readonly int s_ForegroundFarId = Shader.PropertyToID("_DXRForegroundFar");
+        private static readonly int s_EyePosLId = Shader.PropertyToID("_DXREyePosL");
+        private static readonly int s_EyePosRId = Shader.PropertyToID("_DXREyePosR");
 
 #if UNITY_EDITOR
         void OnValidate()
@@ -140,19 +144,26 @@ namespace DisplayXR
                 cam.SetStereoProjectionMatrix(Camera.StereoscopicEye.Left, leftProj);
                 cam.SetStereoProjectionMatrix(Camera.StereoscopicEye.Right, rightProj);
             }
-            // URP ignores SetStereoProjectionMatrix; feed the foreground-clip far via
-            // Camera.farClipPlane. The off-center frustum shear can't be injected into
-            // URP this way → off-center window-relative Kooima is a URP-only limitation.
-            else if (foregroundOnlyClip)
+            // URP path: projection is owned by KooimaProjectionFixFeature (it re-pushes
+            // these same leftProj/rightProj per eye-pass — URP ignores
+            // SetStereoProjectionMatrix, #1328435). The rig no longer touches projection
+            // or farClipPlane here. It only publishes the per-eye foreground far + eye
+            // positions so the opt-in DisplayXR/ForegroundClipURP pass can clip per-eye
+            // in screen space (#57/#129). The global is inert if that pass isn't wired,
+            // so this is safe for every URP app. leftView/rightView are already
+            // FlipViewZ'd above, matching the shader's UNITY_MATRIX_I_V.
+            else
             {
-                float fgFar = leftProj.m23 / (leftProj.m22 + 1f);
-                if (m_UrpSavedFar < 0f) m_UrpSavedFar = cam.farClipPlane;
-                if (fgFar > cam.nearClipPlane) cam.farClipPlane = fgFar;
-            }
-            else if (m_UrpSavedFar >= 0f)
-            {
-                cam.farClipPlane = m_UrpSavedFar; // restore when foreground clip turns off
-                m_UrpSavedFar = -1f;
+                float farL = leftProj.m23 / (leftProj.m22 + 1f);
+                float farR = rightProj.m23 / (rightProj.m22 + 1f);
+                bool clip = foregroundOnlyClip && farL > cam.nearClipPlane && farR > cam.nearClipPlane;
+                Shader.SetGlobalVector(s_ForegroundFarId,
+                    clip ? new Vector4(farL, farR, 1f, 0f) : Vector4.zero); // z = enable
+                if (clip)
+                {
+                    Shader.SetGlobalVector(s_EyePosLId, leftView.inverse.GetColumn(3));
+                    Shader.SetGlobalVector(s_EyePosRId, rightView.inverse.GetColumn(3));
+                }
             }
         }
 
