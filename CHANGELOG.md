@@ -5,6 +5,11 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **`XR_EXT_view_rig` SPEC_VERSION 3 compatibility** (native): the runtime advanced the extension to SPEC 3, which adds a trailing `metersToVirtual` float to `XrCameraRigEXT`. The plugin shipped the SPEC 2 struct, so against a SPEC 3 runtime the runtime read that field past the end of the plugin's struct for **camera-centric** rigs (`DisplayXRCamera`) — undefined value (best case 0 → runtime's pre-v3 default of 1.0, worst case garbage → wrong world scale). The plugin now declares SPEC 3 and writes `metersToVirtual = 1.0f` (scene scale is already folded into `convergenceDiopters`, so this exactly preserves pre-v3 behavior). **Display-centric rigs (`DisplayXRDisplay` → `XrDisplayRigEXT`) were unaffected** — that struct is byte-identical across SPEC 2/3 — so the transparent/2D-UI display-centric demos already worked on a SPEC 3 runtime; this fixes the camera-centric path. Detection remains name-based (no version gate).
+
 ## [1.20.0] - 2026-06-15
 
 ### Added

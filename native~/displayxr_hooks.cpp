@@ -396,6 +396,9 @@ hooked_xrLocateViews(XrSession session,
 				rig_camera.parallaxFactor = rt.parallax_factor;
 				rig_camera.convergenceDiopters = rt.inv_convergence_distance / ssz;
 				rig_camera.verticalFov = 2.0f * atanf(rt.fov_override);
+				// Spec v3: scene scale is already folded into convergenceDiopters
+				// (/ssz), so pass identity meters->world to preserve pre-v3 behavior.
+				rig_camera.metersToVirtual = 1.0f;
 				modified_info.next = &rig_camera;
 			} else {
 				rig_display.pose = rig_pose_world;
