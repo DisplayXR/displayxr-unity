@@ -224,9 +224,9 @@ typedef XrResult(XRAPI_PTR *PFN_xrCaptureAtlasEXT)(
 // keeps the default raw-eye transport. Out-of-range values clamp (one-shot runtime
 // WARN), never reject; if both rigs are chained the camera rig wins. Source of
 // truth: displayxr-runtime/src/external/openxr_includes/openxr/XR_EXT_view_rig.h
-// (SPEC_VERSION 2 — reconcile with the Khronos registry before spec freeze).
+// (SPEC_VERSION 3 — reconcile with the Khronos registry before spec freeze).
 #define XR_EXT_VIEW_RIG_EXTENSION_NAME "XR_EXT_view_rig"
-#define XR_EXT_view_rig_SPEC_VERSION 2
+#define XR_EXT_view_rig_SPEC_VERSION 3
 
 #define XR_TYPE_DISPLAY_RIG_EXT ((XrStructureType)1000999140)
 #define XR_TYPE_CAMERA_RIG_EXT ((XrStructureType)1000999141)
@@ -255,6 +255,10 @@ typedef struct XrCameraRigEXT {
     float parallaxFactor;     // [0,1] lerps eye centroid toward nominal viewer
     float convergenceDiopters; // 1/m to the convergence plane; 0 = infinity
     float verticalFov;        // radians, full vertical angle
+    float metersToVirtual;    // meters->world scale on the eye; 0/unset = 1.0 (spec v3).
+                              // The plugin already folds scene scale into
+                              // convergenceDiopters (/ssz), so it passes 1.0 here to
+                              // keep the runtime's pre-v3 (1 unit = 1 m) behavior.
 } XrCameraRigEXT;
 
 // Raw rig inputs for the locate, filled by the runtime. Chain on XrViewState::next.

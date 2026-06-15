@@ -1551,6 +1551,7 @@ displayxr_standalone_begin_frame(int *should_render)
 				camera_rig.parallaxFactor = t.parallax_factor;
 				camera_rig.convergenceDiopters = s_sa.inv_convergence_distance;
 				camera_rig.verticalFov = 2.0f * atanf(s_sa.fov_override);
+				camera_rig.metersToVirtual = 1.0f; // spec v3: identity meters->world (pre-v3 behavior)
 				locate_info.next = &camera_rig;
 			} else {
 				display_rig.pose = rig_pose;
