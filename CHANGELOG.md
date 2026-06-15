@@ -5,7 +5,7 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.20.0] - 2026-06-15
 
 ### Added
 - **URP off-axis projection fix** (#127/#129): URP ignores `Camera.SetStereoProjectionMatrix` (Unity #1328435) and builds each eye's projection from `views[i].fov`, which it mishandles for strongly off-center window-relative Kooima frustums (head x<0 shifts/deforms — the prior "URP off-center" known limitation). A new URP-guarded sub-assembly (`Runtime/URP/`, `Editor/URP/`) ships **`KooimaProjectionFixFeature`**, a `ScriptableRendererFeature` that re-pushes the runtime's correct per-eye `leftProj`/`rightProj` via `cmd.SetViewProjectionMatrices` at `BeforeRenderingOpaques` (URP pushes the projection once per eye-pass at camera setup, so it sticks). Has a NaN/identity startup guard. **Auto-wired** into the URP renderer when a DisplayXR rig is in an open scene (`DisplayXRUrpAutoWire`; toggle `DisplayXR > Auto-Wire URP Projection Fix`, or run `DisplayXR > Setup URP Projection Fix`).
