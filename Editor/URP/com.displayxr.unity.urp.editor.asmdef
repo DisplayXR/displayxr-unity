@@ -5,6 +5,7 @@
         "com.displayxr.unity",
         "com.displayxr.unity.urp",
         "com.displayxr.unity.editor",
+        "Unity.XR.OpenXR",
         "Unity.RenderPipelines.Universal.Runtime",
         "Unity.RenderPipelines.Core.Runtime"
     ],

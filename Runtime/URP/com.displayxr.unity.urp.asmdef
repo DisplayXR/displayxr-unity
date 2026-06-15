@@ -3,6 +3,7 @@
     "rootNamespace": "DisplayXR.URP",
     "references": [
         "com.displayxr.unity",
+        "Unity.XR.OpenXR",
         "Unity.RenderPipelines.Universal.Runtime",
         "Unity.RenderPipelines.Core.Runtime"
     ],

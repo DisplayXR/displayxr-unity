@@ -40,6 +40,7 @@ namespace DisplayXR.URP
             class PassData { public Matrix4x4 view; public Matrix4x4 proj; }
 
             static DisplayXRFeature s_feature;
+            static readonly int s_ForegroundFarId = Shader.PropertyToID("_DXRForegroundFar");
             int m_LogCount;
 
             public override void RecordRenderGraph(RenderGraph renderGraph, ContextContainer frameData)
@@ -66,6 +67,26 @@ namespace DisplayXR.URP
                 Vector3 eyeR = FlipZ(rv).inverse.GetColumn(3);
                 bool isLeft = (curEye - eyeL).sqrMagnitude <= (curEye - eyeR).sqrMagnitude;
                 Matrix4x4 correctProj = isLeft ? lp : rp;
+
+                // Foreground clip: when the opt-in DisplayXR/ForegroundClipURP pass is
+                // active, the runtime bakes the (small) per-eye foreground far into
+                // leftProj/rightProj. Don't let that clip the RENDER — the scene must
+                // render fully so the shader can do the per-eye cut, and the projection
+                // far must agree with _ZBufferParams (camera near/far), which the clip
+                // shader uses to reconstruct eyeZ. So rebuild only the depth terms to the
+                // camera's far, keeping the off-axis shear (m00/m02) intact. Inert when
+                // the clip is off (then the proj already carries the camera far).
+                if (Shader.GetGlobalVector(s_ForegroundFarId).z > 0.5f)
+                {
+                    float near = correctProj.m23 / (correctProj.m22 - 1f);  // recover near
+                    float far = cameraData.camera.farClipPlane;             // full render far
+                    if (far > near && near > 0f)
+                    {
+                        // GL projection depth terms (clip z in [-1, 1]).
+                        correctProj.m22 = -(far + near) / (far - near);
+                        correctProj.m23 = -2.0f * far * near / (far - near);
+                    }
+                }
 
                 // Keep URP's view (it's correct, from the provider); replace only the
                 // projection. SetViewProjectionMatrices expects the non-GPU projection.
