@@ -91,6 +91,19 @@ typedef struct DisplayXRWindowLayer {
     uint8_t active;
 } DisplayXRWindowLayer;
 
+// --- Local2D layer descriptor (#439/#491). Post-weave 2D content at a
+// client-window PIXEL rect, composited "glass over 3D" via the runtime's
+// implicit mask. Filled by local2d_hooked_pre_end_frame, consumed in
+// hooked_xrEndFrame as an XrCompositionLayerLocal2DEXT.
+typedef struct DisplayXRLocal2DLayer {
+    XrSwapchain swapchain;      // Overlay swapchain handle
+    uint32_t swapchain_width;
+    uint32_t swapchain_height;
+    int32_t rect_x, rect_y;     // Dest, client-window pixels (post-DPI)
+    int32_t rect_w, rect_h;
+    uint8_t active;
+} DisplayXRLocal2DLayer;
+
 // --- Global shared state ---
 
 typedef struct DisplayXRState {
@@ -119,6 +132,9 @@ typedef struct DisplayXRState {
     // Window-space overlay layers
     DisplayXRWindowLayer window_layers[DISPLAYXR_MAX_WINDOW_LAYERS];
     int window_layer_count;
+
+    // Local2D overlay layer (#439/#491) — single slot (one speech bubble etc.)
+    DisplayXRLocal2DLayer local2d_layer;
 
     // Readback state
     uint8_t *readback_pixels;

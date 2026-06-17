@@ -88,6 +88,7 @@ set(SOURCES
     displayxr_standalone_opengles.cpp
     displayxr_vk_loader.cpp
     displayxr_window_space_ui.cpp
+    displayxr_local2d.cpp
 )
 
 set(HEADERS
@@ -99,6 +100,7 @@ set(HEADERS
     displayxr_standalone.h
     displayxr_standalone_internal.h
     displayxr_window_space_ui.h
+    displayxr_local2d.h
 )
 
 # Apple-only: IOSurface helpers (Objective-C) + transparent-overlay NSWindow config
