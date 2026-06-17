@@ -345,6 +345,36 @@ namespace DisplayXR
         public static extern void displayxr_window_space_ui_clear();
 
         // ====================================================================
+        // Local2D overlay (#439/#491) — modern mask-based 2D-over-3D layer
+        // (XrCompositionLayerLocal2DEXT, "glass over 3D"). Replaces the legacy
+        // 2D-surround handoff for in-canvas 2D content (e.g. a speech bubble).
+        // ====================================================================
+
+        /// <summary>
+        /// Register the Unity RenderTexture whose contents become the Local2D
+        /// layer. Safe to call every frame; a changed pointer/size lazily
+        /// recreates the overlay swapchain. Pass IntPtr.Zero to deregister.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void displayxr_local2d_set_texture(
+            IntPtr nativeTex, int width, int height);
+
+        /// <summary>
+        /// Set the destination rect in client-window PIXELS (post-DPI) — the
+        /// XrCompositionLayerLocal2DEXT::rect / mask-tier coordinate space.
+        /// Cheap; safe to call every frame.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void displayxr_local2d_set_rect(
+            int x, int y, int width, int height);
+
+        /// <summary>
+        /// Clear the registered texture and mark the Local2D layer inactive.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void displayxr_local2d_clear();
+
+        // ====================================================================
         // Native log callback (routes native messages to Debug.Log)
         // ====================================================================
 

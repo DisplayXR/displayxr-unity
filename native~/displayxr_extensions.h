@@ -136,6 +136,22 @@ typedef struct XrCompositionLayerWindowSpaceEXT {
     float disparity; // Horizontal shift, fraction of window
 } XrCompositionLayerWindowSpaceEXT;
 
+// --- XR_EXT_local_3d_zone (#439/#491) ---
+// Post-weave 2D content placed at a client-window PIXEL rect, composited over
+// the woven 3D with an implicit mask (the union of Local2D layer rects implies
+// M=0 inside / M=1 elsewhere — the region under the rect goes flat 2D, "glass
+// over 3D"). Unlike XrCompositionLayerWindowSpaceEXT (fractional, disparity),
+// the dest rect here is in post-DPI client-window pixels.
+#define XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT ((XrStructureType)1000999165)
+
+typedef struct XrCompositionLayerLocal2DEXT {
+    XrStructureType type;
+    const void *next;
+    XrCompositionLayerFlags layerFlags; // alpha bits honored
+    XrSwapchainSubImage subImage;       // source texture + sub-rect
+    XrRect2Di rect;                     // dest, client-window pixels
+} XrCompositionLayerLocal2DEXT;
+
 // --- XR_EXT_cocoa_window_binding ---
 // SPEC_VERSION 5 adds transparentBackgroundEnabled — runtime configures
 // the runtime-owned NSWindow + CAMetalLayer with isOpaque=NO so per-pixel

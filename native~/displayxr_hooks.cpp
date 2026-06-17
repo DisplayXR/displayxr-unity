@@ -6,6 +6,7 @@
 
 #include "displayxr_hooks_internal.h"
 #include "displayxr_window_space_ui.h"
+#include "displayxr_local2d.h"
 
 // --- Logging helper ---
 // On Windows built apps, fprintf(stderr) goes nowhere (no console).
@@ -1014,6 +1015,7 @@ hooked_xrDestroySession(XrSession session)
 	s_local_space = XR_NULL_HANDLE;
 	s_view_space = XR_NULL_HANDLE;
 	wsui_hooked_on_session_destroyed();
+	local2d_hooked_on_session_destroyed();
 	if (s_backend) { s_backend->on_session_destroyed(); }
 
 	// Destroy the editor preview window before deferring the session destroy.
@@ -1127,6 +1129,11 @@ hooked_xrEndFrame(XrSession session, const XrFrameEndInfo *frameEndInfo)
 	// swapchain and populate window_layers[0]. The loop below picks it up.
 	wsui_hooked_pre_end_frame(session, s_backend);
 
+	// Local2D overlay (#439/#491): copy Unity texture into our overlay
+	// swapchain and populate local2d_layer. Appended below as a
+	// XrCompositionLayerLocal2DEXT ("glass over 3D").
+	local2d_hooked_pre_end_frame(session, s_backend);
+
 	// Count active window-space layers
 	int active_layers = 0;
 	for (int i = 0; i < DISPLAYXR_MAX_WINDOW_LAYERS; i++) {
@@ -1134,15 +1141,17 @@ hooked_xrEndFrame(XrSession session, const XrFrameEndInfo *frameEndInfo)
 			active_layers++;
 		}
 	}
+	int local2d_active = (state->local2d_layer.active &&
+	                      state->local2d_layer.swapchain != XR_NULL_HANDLE) ? 1 : 0;
 
 	XrResult ef_result;
-	if (active_layers == 0) {
+	if (active_layers == 0 && local2d_active == 0) {
 		// No overlay layers — pass through
 		ef_result = s_real_end_frame(session, frameEndInfo);
 	} else {
 
-	// Build extended layer array: original layers + window-space layers
-	uint32_t total = frameEndInfo->layerCount + (uint32_t)active_layers;
+	// Build extended layer array: original layers + window-space + local2d
+	uint32_t total = frameEndInfo->layerCount + (uint32_t)active_layers + (uint32_t)local2d_active;
 	const XrCompositionLayerBaseHeader **layers = new const XrCompositionLayerBaseHeader *[total];
 
 	// Copy original layers
@@ -1186,6 +1195,29 @@ hooked_xrEndFrame(XrSession session, const XrFrameEndInfo *frameEndInfo)
 		ws_layers[i].disparity = wl->disparity;
 
 		layers[idx++] = (const XrCompositionLayerBaseHeader *)&ws_layers[i];
+	}
+
+	// Append the Local2D layer (#439/#491). The runtime composites it post-weave
+	// at the pixel rect with an implicit mask (region goes flat 2D, "glass over
+	// 3D"). Unity Canvas content is straight (unpremultiplied) alpha — same as
+	// the window-space path — so flag it UNPREMULTIPLIED so the runtime's
+	// alpha-over math is correct.
+	static XrCompositionLayerLocal2DEXT l2d_layer = {};
+	if (local2d_active) {
+		DisplayXRLocal2DLayer *l2 = &state->local2d_layer;
+		l2d_layer.type = XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT;
+		l2d_layer.next = nullptr;
+		l2d_layer.layerFlags =
+			XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT |
+			XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
+		l2d_layer.subImage.swapchain = l2->swapchain;
+		l2d_layer.subImage.imageRect.offset = {0, 0};
+		l2d_layer.subImage.imageRect.extent = {(int32_t)l2->swapchain_width,
+		                                       (int32_t)l2->swapchain_height};
+		l2d_layer.subImage.imageArrayIndex = 0;
+		l2d_layer.rect.offset = {l2->rect_x, l2->rect_y};
+		l2d_layer.rect.extent = {l2->rect_w, l2->rect_h};
+		layers[idx++] = (const XrCompositionLayerBaseHeader *)&l2d_layer;
 	}
 
 	// Submit with extended layers
