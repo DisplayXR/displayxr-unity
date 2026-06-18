@@ -85,6 +85,21 @@ void displayxr_get_overlay_pointer(int *clientX, int *clientY, int *buttons);
 /// virtualDisplayHeight to zoom-in-window).
 int displayxr_consume_overlay_wheel_delta(void);
 
+/// (display-zones port) Atomically read + zero the overlay's close-request
+/// flag. Returns 1 once after the user pressed the decorated overlay's close
+/// (X) button or Alt+F4 — the plugin swallows WM_CLOSE (so it does NOT destroy
+/// the overlay) and raises this instead. C# polls it each frame and calls
+/// Application.Quit() so the whole app shuts down cleanly, not just the overlay.
+int displayxr_consume_overlay_close_request(void);
+
+/// (display-zones port) Resize the managed window (overlay HWND, or the dormant
+/// simple-window HWND) to width x height client/window px via SetWindowPos. The
+/// reliable resize path on the SR display: the weaver subclass eats mouse edge
+/// interactions on the non-activating overlay, but SetWindowPos is never
+/// intercepted. #61-bracketed for lenticular phase-snap. Clamped to a minimum
+/// size. App drives this from a keyboard shortcut.
+void displayxr_resize_overlay(int width, int height);
+
 #ifdef __cplusplus
 }
 #endif

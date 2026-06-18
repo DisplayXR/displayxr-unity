@@ -404,6 +404,24 @@ DISPLAYXR_EXPORT void displayxr_get_overlay_pointer(int *clientX, int *clientY,
 /// and decide what to do (e.g. drive a DisplayXRDisplay rig's
 /// virtualDisplayHeight for zoom-in-window).
 DISPLAYXR_EXPORT int displayxr_consume_overlay_wheel_delta(void);
+
+/// (display-zones port) Atomically read + zero the overlay's close-request flag.
+/// Returns 1 once after the user pressed the decorated overlay's close (X)
+/// button or Alt+F4. The plugin swallows the overlay's WM_CLOSE (so it does NOT
+/// self-destruct the overlay HWND, which would leave cloaked Unity running
+/// headless) and raises this flag instead. Apps poll it each frame and call
+/// Application.Quit() to shut the whole process down cleanly. Windows
+/// transparent overlay only; always 0 elsewhere.
+DISPLAYXR_EXPORT int displayxr_consume_overlay_close_request(void);
+
+/// (display-zones port) Resize the managed window (transparent overlay HWND, or
+/// the dormant simple-window HWND) to width x height px via SetWindowPos,
+/// #61-bracketed for lenticular phase-snap and clamped to a minimum size. This
+/// is the RELIABLE resize path on the SR display: the Leia weaver subclass on a
+/// non-activating overlay claims edge button-downs (so mouse/OS-border resize
+/// can't start), but SetWindowPos is never intercepted. Apps drive this from a
+/// keyboard shortcut. Windows transparent overlay only; no-op elsewhere.
+DISPLAYXR_EXPORT void displayxr_resize_overlay(int width, int height);
 #endif // _WIN32
 
 #ifdef __cplusplus

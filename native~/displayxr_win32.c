@@ -116,6 +116,13 @@ static POINT s_resize_anchor_screen = {0, 0};
 static RECT  s_resize_anchor_rect   = {0, 0, 0, 0};
 #define DXR_MIN_WINDOW_PX 200
 
+// (display-zones port) Quit request raised from WM_CLOSE on the overlay HWND
+// (decorated close button or Alt+F4). Default WM_CLOSE would DestroyWindow only
+// the overlay, leaving cloaked Unity running headless; instead we swallow it and
+// flag a quit for C# to poll (displayxr_consume_overlay_close_request) →
+// Application.Quit(), which tears the whole app down cleanly.
+static volatile LONG s_overlay_close_requested = 0;
+
 static int
 is_resize_ht(WPARAM ht)
 {
@@ -814,6 +821,18 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		}
 		break;
 	}
+
+	// ----- close: quit the whole app, not just the overlay -----
+	// The decorated overlay's close (X) button sends SC_CLOSE → WM_CLOSE, and
+	// Alt+F4 sends WM_CLOSE directly. DefWindowProc's default WM_CLOSE would
+	// DestroyWindow only the overlay HWND, leaving cloaked Unity running headless
+	// (no visible window, process alive). Flag a quit request for C# to poll
+	// (displayxr_consume_overlay_close_request) → Application.Quit() instead, and
+	// swallow the message so the overlay survives the few frames until C# acts.
+	case WM_CLOSE:
+		displayxr_log("[DisplayXR][OvlWnd] WM_CLOSE -> quit request\n");
+		InterlockedExchange(&s_overlay_close_requested, 1);
+		return 0;
 
 	default:
 		break;
@@ -2211,6 +2230,37 @@ displayxr_consume_overlay_wheel_delta(void)
 {
 	// Atomic read-and-zero. Win32 raw delta units (120 per notch).
 	return (int)InterlockedExchange(&s_overlay_wheel_accum, 0);
+}
+
+int
+displayxr_consume_overlay_close_request(void)
+{
+	// Atomic read-and-zero. Returns 1 once after the overlay's close button
+	// (or Alt+F4) was pressed; C# calls Application.Quit() on a 1.
+	return (int)InterlockedExchange(&s_overlay_close_requested, 0);
+}
+
+void
+displayxr_resize_overlay(int width, int height)
+{
+	// Keyboard-/app-driven resize of the managed window (overlay HWND, or the
+	// dormant simple-window HWND). This is the RELIABLE resize path on the SR
+	// display: the Leia weaver subclass on the overlay claims edge button-downs
+	// when the overlay is a non-activating satellite of cloaked Unity (hardware-
+	// traced), so OS sizing-border / mouse-edge resize cannot start. SetWindowPos
+	// is not a mouse interaction and is never intercepted (it is exactly what the
+	// working right-drag MOVE uses), so it resizes cleanly. #61-bracketed so the
+	// weaver phase-snaps to lenticular-aligned pixels across the size change.
+	HWND hwnd = managed_window_hwnd();
+	if (hwnd == NULL)
+		return;
+	if (width  < DXR_MIN_WINDOW_PX) width  = DXR_MIN_WINDOW_PX;
+	if (height < DXR_MIN_WINDOW_PX) height = DXR_MIN_WINDOW_PX;
+	SendMessageW(hwnd, WM_ENTERSIZEMOVE, 0, 0);
+	SetWindowPos(hwnd, NULL, 0, 0, width, height,
+	             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+	SendMessageW(hwnd, WM_EXITSIZEMOVE, 0, 0);
+	displayxr_log("[DisplayXR] resize_overlay -> %dx%d\n", width, height);
 }
 
 // ============================================================================

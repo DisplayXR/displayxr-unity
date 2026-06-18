@@ -332,6 +332,17 @@ namespace DisplayXR
 #if UNITY_STANDALONE_WIN
             if (Application.isEditor || m_Camera == null)
                 return;
+            // Quit the whole app when the overlay's close (X) button or Alt+F4
+            // was pressed. The plugin swallows WM_CLOSE (so it doesn't destroy
+            // just the overlay, orphaning cloaked Unity) and raises a flag we
+            // poll here. Done before the clickableRenderers gate so closing
+            // works even on a rig with no clickable renderers configured.
+            PollCloseRequest();
+            // Reliable keyboard resize on the SR display: the Leia weaver
+            // subclass eats mouse edge interactions on the non-activating
+            // overlay, so resize is driven from the keyboard (Ctrl+arrows) →
+            // direct SetWindowPos, which the subclass never intercepts.
+            PollWindowManagementKeys();
             if (clickableRenderers == null || clickableRenderers.Length == 0)
                 return;
             // Multi-rig gate: only the active rig drives hit_active.
@@ -825,6 +836,65 @@ namespace DisplayXR
             if (Input.GetKeyDown(decorationToggleKey))
                 DisplayXRNative.displayxr_toggle_window_decoration();
 #endif
+        }
+
+        // Quit the app when the user closes the overlay window (decorated close
+        // button or Alt+F4). The plugin raises a one-shot flag instead of
+        // destroying the overlay HWND itself, so Application.Quit() can shut the
+        // whole process down cleanly (without it the overlay would vanish while
+        // cloaked Unity keeps running headless).
+        private void PollCloseRequest()
+        {
+            if (DisplayXRNative.displayxr_consume_overlay_close_request() != 0)
+            {
+                Debug.Log("[DisplayXR] Overlay close requested — quitting.");
+                Application.Quit();
+            }
+        }
+
+        // Step (px) applied per Ctrl+arrow press when resizing the overlay window.
+        private const int kResizeStepPx = 80;
+
+        // Reliable keyboard resize on the SR display (the weaver subclass eats
+        // mouse edge interactions on the non-activating overlay):
+        //   Ctrl + Right / Left  → wider / narrower
+        //   Ctrl + Up    / Down  → taller / shorter
+        // Discrete (one step per press) to avoid per-frame swapchain churn.
+        // (Quit is left to the app — the test app already binds ESC.)
+        private void PollWindowManagementKeys()
+        {
+#if HAS_INPUT_SYSTEM
+            var kb = Keyboard.current;
+            if (kb == null) return;
+            bool ctrl = kb.leftCtrlKey.isPressed || kb.rightCtrlKey.isPressed;
+            if (!ctrl) return;
+
+            int dw = 0, dh = 0;
+            if (kb.rightArrowKey.wasPressedThisFrame) dw += kResizeStepPx;
+            if (kb.leftArrowKey.wasPressedThisFrame)  dw -= kResizeStepPx;
+            if (kb.upArrowKey.wasPressedThisFrame)    dh += kResizeStepPx;
+            if (kb.downArrowKey.wasPressedThisFrame)  dh -= kResizeStepPx;
+            if (dw != 0 || dh != 0)
+                ApplyKeyboardResize(dw, dh);
+#else
+            bool ctrl = Input.GetKey(KeyCode.LeftControl) || Input.GetKey(KeyCode.RightControl);
+            if (!ctrl) return;
+
+            int dw = 0, dh = 0;
+            if (Input.GetKeyDown(KeyCode.RightArrow)) dw += kResizeStepPx;
+            if (Input.GetKeyDown(KeyCode.LeftArrow))  dw -= kResizeStepPx;
+            if (Input.GetKeyDown(KeyCode.UpArrow))    dh += kResizeStepPx;
+            if (Input.GetKeyDown(KeyCode.DownArrow))  dh -= kResizeStepPx;
+            if (dw != 0 || dh != 0)
+                ApplyKeyboardResize(dw, dh);
+#endif
+        }
+
+        private void ApplyKeyboardResize(int dw, int dh)
+        {
+            DisplayXRNative.displayxr_get_overlay_size(out int w, out int h);
+            if (w <= 0 || h <= 0) return;
+            DisplayXRNative.displayxr_resize_overlay(w + dw, h + dh);
         }
 #endif
 
