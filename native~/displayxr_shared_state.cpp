@@ -22,12 +22,15 @@ displayxr_state_init(void)
 {
 	// Preserve flags that may have been set BEFORE install_hooks runs (the
 	// caller of state_init). The C# side writes transparent_background_requested
-	// at SubsystemRegistration, which fires before the OpenXR loader hooks us.
+	// and simple_window_requested at SubsystemRegistration, which fires before
+	// the OpenXR loader hooks us (and thus before this re-init).
 	uint8_t saved_transparent = s_state.transparent_background_requested;
+	uint8_t saved_simple_window = s_state.simple_window_requested;
 
 	memset(&s_state, 0, sizeof(s_state));
 
 	s_state.transparent_background_requested = saved_transparent;
+	s_state.simple_window_requested = saved_simple_window;
 
 	// Default tunables: all factors at 1.0
 	for (int i = 0; i < 2; i++) {

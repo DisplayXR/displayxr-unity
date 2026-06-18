@@ -296,6 +296,90 @@ typedef struct XrViewDisplayRawEXT {
 // never the workspace controller); typedef kept for header completeness.
 typedef XrResult(XRAPI_PTR *PFN_xrSetWorkspaceViewRigEXT)(XrSession session, const void *rig);
 
+// --- XR_EXT_display_zones ---
+// Compose N 3D zones (each a window-pixel rect with its own view-rig framing and
+// its own projection layer) within the window. Built BY COMPOSITION on top of
+// XR_EXT_view_rig (the rig descriptors are chained per-locate as usual) and
+// XR_EXT_local_3d_zone (the 2D zones are XrCompositionLayerLocal2DEXT). A frame
+// is a ZONES FRAME iff >= 1 projection layer carries an XrDisplayZoneEXT chain;
+// then the canvas output rect (xrSetSharedTextureOutputRectEXT) and the surround
+// path are inert. Chain the SAME XrDisplayZoneEXT instance at the locate
+// (XrViewLocateInfo::next, scoping the Kooima framing to the rect — the rect IS
+// the canvas) and at the submit (XrCompositionLayerProjection::next, binding the
+// layer's views into that rect). Source of truth: displayxr-runtime (and the
+// avatar's openxr_includes/openxr/XR_EXT_display_zones.h), SPEC_VERSION 1.
+#define XR_EXT_DISPLAY_ZONES_EXTENSION_NAME "XR_EXT_display_zones"
+#define XR_EXT_display_zones_SPEC_VERSION 1
+
+#define XR_TYPE_DISPLAY_ZONE_CAPABILITIES_EXT               ((XrStructureType)1000999150)
+#define XR_TYPE_DISPLAY_ZONE_EXT                            ((XrStructureType)1000999151)
+#define XR_TYPE_DISPLAY_ZONES_FRAME_END_INFO_EXT            ((XrStructureType)1000999152)
+#define XR_TYPE_EVENT_DATA_DISPLAY_ZONE_METRICS_CHANGED_EXT ((XrStructureType)1000999153)
+
+typedef XrFlags64 XrDisplayZonesFrameEndFlagsEXT;
+// Cross-check zone/locate/mask consistency this frame (one-shot WARN per
+// violation class, never a per-frame error). Bring-up diagnostic only.
+#define XR_DISPLAY_ZONES_FRAME_END_VALIDATE_BIT_EXT ((XrDisplayZonesFrameEndFlagsEXT)0x00000001)
+
+// Capabilities of the display-zones path for a session. supported==XR_FALSE =>
+// only the legacy single-canvas path. maxZones3D = max zone-chained projection
+// layers per frame.
+typedef struct XrDisplayZoneCapabilitiesEXT {
+	XrStructureType type; // Must be XR_TYPE_DISPLAY_ZONE_CAPABILITIES_EXT
+	void *next;
+	XrBool32 supported;
+	uint32_t maxZones3D;
+} XrDisplayZoneCapabilitiesEXT;
+
+// A 3D display zone: identity + placement. Valid at TWO chain points —
+// XrViewLocateInfo::next (zone-scoped locate, rect IS the canvas) and
+// XrCompositionLayerProjection::next (binds the layer's views to the zone at
+// xrEndFrame). Chain the SAME instance at both points within a frame; the
+// xrEndFrame values are authoritative. rect is in client-window pixels (same
+// space as XrCompositionLayerLocal2DEXT::rect). zoneId is app-chosen, unique
+// among the frame's 3D zones; there is NO zone handle (zones are stateless
+// per-frame data, like layers).
+typedef struct XrDisplayZoneEXT {
+	XrStructureType type; // Must be XR_TYPE_DISPLAY_ZONE_EXT
+	const void *next;
+	uint32_t zoneId;
+	XrRect2Di rect; // client-window pixels
+} XrDisplayZoneEXT;
+
+// The mask handle from XR_EXT_local_3d_zone. The plugin never authors a wish
+// mask (it always auto-derives), so we forward-declare the handle here rather
+// than pull in the full mask-authoring API. (XR_DEFINE_HANDLE-equivalent.)
+#ifndef XR_DISPLAYXR_LOCAL3D_ZONE_MASK_DEFINED
+#define XR_DISPLAYXR_LOCAL3D_ZONE_MASK_DEFINED
+XR_DEFINE_HANDLE(XrLocal3DZoneMaskEXT)
+#endif
+
+// Per-frame wish reference. Optional, chained on XrFrameEndInfo::next in a zones
+// frame. Absent or wishMask==XR_NULL_HANDLE: the wish auto-derives as the union
+// of the frame's 3D-zone rects (feathered). The plugin chains this only when the
+// VALIDATE bit is requested for bring-up; otherwise nothing is chained.
+typedef struct XrDisplayZonesFrameEndInfoEXT {
+	XrStructureType type; // Must be XR_TYPE_DISPLAY_ZONES_FRAME_END_INFO_EXT
+	const void *next;
+	XrDisplayZonesFrameEndFlagsEXT flags;
+	XrLocal3DZoneMaskEXT wishMask; // XR_NULL_HANDLE = auto-derive
+} XrDisplayZonesFrameEndInfoEXT;
+
+// Advisory: per-zone recommended view sizes may have changed (display-mode /
+// tile-count switch, DPI change). Re-query each zone via
+// xrGetDisplayZoneRecommendedViewSizeEXT; stale sizes stay correct, just soft.
+typedef struct XrEventDataDisplayZoneMetricsChangedEXT {
+	XrStructureType type; // Must be XR_TYPE_EVENT_DATA_DISPLAY_ZONE_METRICS_CHANGED_EXT
+	const void *next;
+	XrSession session;
+} XrEventDataDisplayZoneMetricsChangedEXT;
+
+typedef XrResult(XRAPI_PTR *PFN_xrGetDisplayZoneCapabilitiesEXT)(
+    XrSession session, XrDisplayZoneCapabilitiesEXT *capabilities);
+
+typedef XrResult(XRAPI_PTR *PFN_xrGetDisplayZoneRecommendedViewSizeEXT)(
+    XrSession session, const XrRect2Di *zoneRect, XrExtent2Di *recommendedViewSize);
+
 #ifdef __cplusplus
 }
 #endif

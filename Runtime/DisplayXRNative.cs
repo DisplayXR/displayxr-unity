@@ -110,6 +110,18 @@ namespace DisplayXR
         public static extern void displayxr_set_transparent_background(int enabled);
 
         /// <summary>
+        /// (avatar simple-window) Opt into binding the runtime to Unity's REAL
+        /// main HWND (no off-screen overlay, no DWM cloak, no off-screen move).
+        /// Click-through is region-based; decoration toggles via
+        /// displayxr_toggle_window_decoration. Must be called BEFORE
+        /// xrCreateSession — typically from
+        /// [RuntimeInitializeOnLoadMethod(SubsystemRegistration)], like
+        /// displayxr_set_transparent_background. Windows only.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void displayxr_request_simple_window(int enabled);
+
+        /// <summary>
         /// (#34 / #131) Define the 3D canvas sub-rect within the window client
         /// area, in pixels. The runtime weaves the 3D into this rect; the rest
         /// of the window is the 2D surround region. Pass width==0 || height==0
@@ -130,6 +142,27 @@ namespace DisplayXR
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern int displayxr_get_canvas_rect_px(
             out int x, out int y, out uint width, out uint height);
+
+        /// <summary>
+        /// (XR_EXT_display_zones) Define the 3D-zone rect (client-window pixels,
+        /// top-left origin) the runtime frames the Kooima 3D into. The locate
+        /// hook chains an XrDisplayZoneEXT in front of the view-rig (zone-scoped
+        /// projection) and the xrEndFrame hook chains the same zone on each
+        /// projection layer (binding its views into the rect). width&lt;=0 ||
+        /// height&lt;=0 clears. Inert unless the runtime advertises
+        /// XR_EXT_display_zones and reports caps.supported. Mutually exclusive
+        /// with displayxr_set_canvas_rect (a zones frame makes the output rect
+        /// inert). Hooked path (built apps) only.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void displayxr_set_3d_zone_rect(int x, int y, int width, int height);
+
+        /// <summary>
+        /// (XR_EXT_display_zones) Clear the 3D-zone rect (revert to full-window
+        /// framing). Hooked path (built apps) only.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void displayxr_clear_3d_zone();
 
         /// <summary>
         /// (#131) Register a Unity RenderTexture (R8G8B8A8_UNORM) as the 2D
@@ -658,6 +691,36 @@ namespace DisplayXR
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern void displayxr_set_transparent_overlay(
             int enabled, int topmost);
+
+        /// <summary>
+        /// (avatar simple-window) Style Unity's real main HWND for avatar-style
+        /// windowing: strip to borderless WS_POPUP, subclass for the borderless
+        /// right-drag (#61-bracketed), and let the hit-mask path drive
+        /// SetWindowRgn on this HWND. enabled=0 restores Unity's styles. Pair
+        /// with displayxr_request_simple_window. Call after the session starts.
+        /// </summary>
+        /// <param name="enabled">1 to enable, 0 to restore original styles.</param>
+        /// <param name="topmost">1 to add WS_EX_TOPMOST while enabled.</param>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void displayxr_set_simple_window(int enabled, int topmost);
+
+        /// <summary>
+        /// (avatar simple-window) Toggle window decoration: WS_POPUP (borderless)
+        /// &lt;-&gt; WS_OVERLAPPEDWINDOW (title bar + sizing frame for OS
+        /// move/resize). The client rect is preserved across the toggle so
+        /// content doesn't jump or rescale. Matches the avatar's B key. No-op
+        /// unless simple-window mode is active.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void displayxr_toggle_window_decoration();
+
+        /// <summary>
+        /// (avatar simple-window) Set decoration state explicitly (1=decorated,
+        /// 0=borderless). Idempotent variant of displayxr_toggle_window_decoration.
+        /// No-op unless simple-window mode is active.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void displayxr_set_window_decorated(int decorated);
 
         /// <summary>
         /// Set the rectangular hit-test region of the overlay. Coords

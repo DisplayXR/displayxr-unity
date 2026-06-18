@@ -47,6 +47,26 @@ namespace DisplayXR
         [Tooltip("Keep the window above all others (WS_EX_TOPMOST).")]
         public bool alwaysOnTop = true;
 
+        [Tooltip("DORMANT / not viable for transparent apps. Binding the runtime " +
+                 "to Unity's REAL main HWND can't give clean transparency — " +
+                 "Unity's own opaque window swapchain composites behind the " +
+                 "runtime's output (WS_EX_NOREDIRECTIONBITMAP can't be retrofitted " +
+                 "onto Unity's window). The transparent path uses the off-screen " +
+                 "overlay; the avatar windowing (B-toggle decoration, region " +
+                 "click-through, right-drag move) is applied to THAT overlay. " +
+                 "Leave off.")]
+        public bool useSimpleWindow = false;
+
+        [Tooltip("Key that toggles the (overlay) window decoration: borderless " +
+                 "<-> title bar + sizing frame for OS move/resize. Matches the " +
+                 "avatar's B.")]
+        public KeyCode decorationToggleKey = KeyCode.B;
+
+        // Runtime mirror of useSimpleWindow, resolved in OnEnable (true only on
+        // a Windows build, non-editor, with useSimpleWindow set). LateUpdate and
+        // OnDisable branch on this so the editor / non-Win paths stay inert.
+        private bool m_SimpleWindow;
+
         [Header("Hit testing")]
 
         [Tooltip("Renderers (must have colliders) that drive the pointer events. " +
@@ -220,6 +240,24 @@ namespace DisplayXR
 #endif
         }
 
+        /// <summary>
+        /// (avatar simple-window) Opt into binding the runtime to Unity's REAL
+        /// main HWND for the next OpenXR session — no off-screen overlay, no DWM
+        /// cloak, no off-screen move. MUST be called BEFORE the session is
+        /// created (from the SAME
+        /// [RuntimeInitializeOnLoadMethod(SubsystemRegistration)] bootstrap as
+        /// <see cref="RequestTransparentSession"/>). The component must also
+        /// have <see cref="useSimpleWindow"/> enabled so OnEnable styles the
+        /// real HWND; the two together pick the avatar-style window. Windows
+        /// only — inert elsewhere.
+        /// </summary>
+        public static void RequestSimpleWindow()
+        {
+#if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
+            DisplayXRNative.displayxr_request_simple_window(1);
+#endif
+        }
+
         void OnEnable()
         {
             m_Camera = GetComponent<Camera>();
@@ -239,9 +277,9 @@ namespace DisplayXR
             m_Camera.backgroundColor = new Color(0f, 0f, 0f, 0f);
 
 #if UNITY_STANDALONE_WIN
-            // Native overlay restyle (cloak Unity, top-level NOREDIRECTIONBITMAP
-            // overlay, off-screen Unity HWND for click-through) is build-only:
-            // no top-level Unity HWND we want to mutate from the editor.
+            // Native restyle (overlay cloak/off-screen, or simple-window style
+            // strip) is build-only: no top-level Unity HWND we want to mutate
+            // from the editor.
             if (Application.isEditor)
                 return;
 
@@ -250,8 +288,19 @@ namespace DisplayXR
             // don't actually depend on focus, but other components might.
             Application.runInBackground = true;
 
-            DisplayXRNative.displayxr_set_transparent_overlay(
-                1, alwaysOnTop ? 1 : 0);
+            m_SimpleWindow = useSimpleWindow;
+            if (m_SimpleWindow)
+            {
+                // Avatar-style: style Unity's REAL HWND borderless. The session
+                // must have bound the real HWND (RequestSimpleWindow() at
+                // SubsystemRegistration); if it didn't, this no-ops harmlessly.
+                DisplayXRNative.displayxr_set_simple_window(1, alwaysOnTop ? 1 : 0);
+            }
+            else
+            {
+                DisplayXRNative.displayxr_set_transparent_overlay(
+                    1, alwaysOnTop ? 1 : 0);
+            }
             // Default hit rect = whole window until LateUpdate refines it.
             DisplayXRNative.displayxr_set_overlay_hit_rect(
                 0, 0, Screen.width, Screen.height);
@@ -299,18 +348,35 @@ namespace DisplayXR
                 && DisplayXRRigManager.ActiveCamera != m_Camera)
                 return;
 
-            // Poll cursor + buttons via native (GetCursorPos + ScreenToClient
-            // on the overlay HWND, plus s_vkey_state populated by raw input).
-            // Bypasses Unity's New Input System entirely, which is broken for
-            // cloaked windows — see component header comment.
-            DisplayXRNative.displayxr_get_overlay_pointer(
-                out int clientX, out int clientY, out int buttons);
-            // Overlay's actual client size — needed for cursor → NDC. Cannot
-            // use Screen.width/height because Unity's HWND is parked off-
-            // screen with frozen dimensions; the overlay can be scroll-
-            // resized independently.
-            DisplayXRNative.displayxr_get_overlay_size(
-                out int overlayW, out int overlayH);
+            // (avatar B key) Toggle decoration on the managed window (the
+            // overlay, or the dormant simple-window HWND). Works in both modes.
+            PollDecorationToggleKey();
+
+            int clientX, clientY, buttons, overlayW, overlayH;
+            if (m_SimpleWindow)
+            {
+                // Simple-window mode: Unity IS the real on-screen foreground
+                // window, so Mouse.current and Screen.* are live — no cloaked-
+                // HWND polling needed. Read the cursor in top-left client px.
+                GetRealWindowPointer(out clientX, out clientY, out buttons);
+                overlayW = Screen.width;
+                overlayH = Screen.height;
+            }
+            else
+            {
+                // Overlay mode: poll cursor + buttons via native (GetCursorPos
+                // + ScreenToClient on the overlay HWND, plus s_vkey_state from
+                // raw input). Bypasses Unity's New Input System, which is broken
+                // for the cloaked off-screen Unity HWND — see header comment.
+                DisplayXRNative.displayxr_get_overlay_pointer(
+                    out clientX, out clientY, out buttons);
+                // Overlay's actual client size — needed for cursor → NDC. Cannot
+                // use Screen.width/height because Unity's HWND is parked off-
+                // screen with frozen dimensions; the overlay can be scroll-
+                // resized independently.
+                DisplayXRNative.displayxr_get_overlay_size(
+                    out overlayW, out overlayH);
+            }
 
             // Per-pixel hit test: build a CYCLOPEAN world-space ray from the
             // cursor pixel through the midpoint-eye Kooima projection, then
@@ -439,7 +505,7 @@ namespace DisplayXR
 
 #if HAS_INPUT_SYSTEM
             // Inject the polled state into Unity's Mouse.current so any
-            // standard input code keeps working in transparent mode:
+            // standard input code keeps working in (overlay) transparent mode:
             // OnMouseDown, IPointerClickHandler / EventSystem, anything
             // reading Input.mousePosition or Mouse.current.leftButton, etc.
             // Without this, only DisplayXRTransparentOverlay's own
@@ -448,7 +514,11 @@ namespace DisplayXR
             // state because the cloaked HWND can't observe raw input.
             // Unity's Mouse uses bottom-left screen origin; client coords
             // are top-left. Flip Y on both position and delta.
-            if (Mouse.current != null && clientX >= 0 && clientY >= 0)
+            //
+            // SKIPPED in simple-window mode: Unity's real HWND is the on-screen
+            // foreground window, so Mouse.current is already live — re-injecting
+            // our polled copy would fight Unity's own raw input.
+            if (!m_SimpleWindow && Mouse.current != null && clientX >= 0 && clientY >= 0)
             {
                 // Y-flip relative to the overlay's height (not Screen.height,
                 // which is the off-screen Unity HWND's frozen size).
@@ -702,12 +772,71 @@ namespace DisplayXR
         }
 
 
+#if UNITY_STANDALONE_WIN
+        // Simple-window mode: read the cursor + buttons from Unity's real
+        // input (Mouse.current is live because the real HWND is foreground).
+        // Returns top-left-origin client pixels to match the overlay path's
+        // GetCursorPos+ScreenToClient convention. buttons: bit0=L,1=R,2=M.
+        private void GetRealWindowPointer(out int clientX, out int clientY, out int buttons)
+        {
+            clientX = -1; clientY = -1; buttons = 0;
+#if HAS_INPUT_SYSTEM
+            var m = Mouse.current;
+            if (m == null) return;
+            Vector2 raw = m.position.ReadValue();        // bottom-left origin
+            clientX = Mathf.RoundToInt(raw.x);
+            clientY = Mathf.RoundToInt(Screen.height - raw.y); // → top-left origin
+            if (m.leftButton.isPressed)   buttons |= 1;
+            if (m.rightButton.isPressed)  buttons |= 2;
+            if (m.middleButton.isPressed) buttons |= 4;
+#else
+            Vector3 mp = Input.mousePosition;
+            clientX = Mathf.RoundToInt(mp.x);
+            clientY = Mathf.RoundToInt(Screen.height - mp.y);
+            if (Input.GetMouseButton(0)) buttons |= 1;
+            if (Input.GetMouseButton(1)) buttons |= 2;
+            if (Input.GetMouseButton(2)) buttons |= 4;
+#endif
+        }
+
+#if HAS_INPUT_SYSTEM
+        private Key  m_DecorationKey = Key.None;
+        private bool m_DecorationKeyResolved;
+#endif
+
+        // (avatar B key) Toggle window decoration (borderless <-> title bar)
+        // when the configured key is pressed. Simple-window mode only.
+        private void PollDecorationToggleKey()
+        {
+#if HAS_INPUT_SYSTEM
+            var kb = Keyboard.current;
+            if (kb == null) return;
+            if (!m_DecorationKeyResolved)
+            {
+                m_DecorationKeyResolved = true;
+                // KeyCode and InputSystem.Key share names for letter keys
+                // (KeyCode.B == "B" == Key.B), so resolve by name.
+                if (!System.Enum.TryParse(decorationToggleKey.ToString(), out m_DecorationKey))
+                    m_DecorationKey = Key.B;
+            }
+            if (m_DecorationKey != Key.None && kb[m_DecorationKey].wasPressedThisFrame)
+                DisplayXRNative.displayxr_toggle_window_decoration();
+#else
+            if (Input.GetKeyDown(decorationToggleKey))
+                DisplayXRNative.displayxr_toggle_window_decoration();
+#endif
+        }
+#endif
+
         void OnDisable()
         {
 #if UNITY_STANDALONE_WIN
             if (!Application.isEditor)
             {
-                DisplayXRNative.displayxr_set_transparent_overlay(0, 0);
+                if (m_SimpleWindow)
+                    DisplayXRNative.displayxr_set_simple_window(0, 0);
+                else
+                    DisplayXRNative.displayxr_set_transparent_overlay(0, 0);
                 DisplayXRNative.displayxr_set_overlay_hit_active(0);
             }
             ReleaseHitMaskResources();
