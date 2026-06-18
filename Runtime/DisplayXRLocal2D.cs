@@ -3,6 +3,8 @@
 
 using UnityEngine;
 using UnityEngine.Experimental.Rendering;
+using UnityEngine.Rendering;
+using UnityEngine.XR.OpenXR;
 
 namespace DisplayXR
 {
@@ -47,6 +49,26 @@ namespace DisplayXR
         [Tooltip("Height as fraction of window height.")]
         [Range(0f, 1f)] public float height = 0.18f;
 
+        [Header("Explicit pixel rect (overrides fractional)")]
+
+        [Tooltip("When set, the dest rect is taken from ExplicitRect (client-window " +
+                 "pixels, top-left) instead of the fractional position above. Use when " +
+                 "the caller already computes an exact panel-pixel rect (e.g. a region " +
+                 "editor). Set via SetExplicitRect each frame.")]
+        public bool useExplicitRect;
+
+        /// <summary>Dest rect in client-window pixels (top-left origin) when
+        /// <see cref="useExplicitRect"/> is true.</summary>
+        public RectInt ExplicitRect;
+
+        /// <summary>Set the explicit dest rect (client-window pixels) and enable
+        /// explicit-rect mode. Safe to call every frame.</summary>
+        public void SetExplicitRect(int x, int y, int w, int h)
+        {
+            useExplicitRect = true;
+            ExplicitRect = new RectInt(x, y, w, h);
+        }
+
         [Header("Render Settings")]
 
         [Tooltip("Resolution of the overlay RenderTexture.")]
@@ -72,10 +94,50 @@ namespace DisplayXR
 
         private int m_LastRectX = int.MinValue, m_LastRectY, m_LastRectW, m_LastRectH;
 
+        // The opt-in URP foreground clip (DisplayXR/ForegroundClipURP) is a built-in
+        // FullScreenPassRendererFeature with NO XR-camera guard (unlike
+        // KooimaProjectionFixFeature, which returns early on !cameraData.xr.enabled).
+        // With a single default renderer it therefore also runs on THIS overlay
+        // camera — clipping the bubble against the main rig's per-eye foreground far
+        // (a different camera space), so the bubble vanishes when the 3D content
+        // crosses the display plane (zoom-in / head-forward). The clip is enabled via
+        // the _DXRForegroundFar global (z>0.5); we save+zero it for our render and
+        // restore after, so the clip only ever applies to the projection/XR camera.
+        // Inert in BiRP (RenderPipelineManager doesn't fire; the global is unset).
+        private static readonly int s_ForegroundFarId = Shader.PropertyToID("_DXRForegroundFar");
+        private Vector4 m_SavedForegroundFar;
+        private bool m_CamRenderHooked;
+
         void OnEnable()
         {
+            // Submitting an XrCompositionLayerLocal2DEXT when XR_EXT_local_3d_zone
+            // isn't enabled makes the runtime reject the WHOLE xrEndFrame
+            // (XR_ERROR_LAYER_INVALID) — black screen. Gate on it: if the runtime
+            // doesn't support Local2D, stay inert (no RT, no submission) so the
+            // rest of the scene renders normally.
+            if (!OpenXRRuntime.IsExtensionEnabled("XR_EXT_local_3d_zone"))
+            {
+                Debug.LogWarning("[DisplayXR] Local2D: XR_EXT_local_3d_zone not enabled — " +
+                                 "bubble layer disabled (runtime lacks Local2D support).");
+                return;
+            }
+
             m_Canvas = GetComponent<Canvas>();
             m_CanvasRect = m_Canvas.GetComponent<RectTransform>();
+
+            // A CanvasScaler fights the WorldSpace transform this component drives:
+            // it rewrites canvas.scaleFactor / referencePixelsPerUnit from the live
+            // screen size every frame. On a full-screen transparent overlay the
+            // reported screen size can flap during setup/resize, intermittently
+            // mis-scaling the content off the ortho camera's frustum → the RT
+            // renders blank that frame (the "bubble shows up intermittently" bug).
+            // We own the canvas transform fully, so neutralize any scaler.
+            var scaler = GetComponent<UnityEngine.UI.CanvasScaler>();
+            if (scaler != null && scaler.enabled)
+            {
+                scaler.enabled = false;
+                Debug.Log("[DisplayXR] Local2D: disabled CanvasScaler (component drives the WorldSpace transform).");
+            }
 
             m_OrigRenderMode = m_Canvas.renderMode;
             m_OrigCanvasPos = m_CanvasRect.position;
@@ -124,18 +186,57 @@ namespace DisplayXR
             m_OverlayCamera.targetTexture = OverlayTexture;
             m_OverlayCamera.cullingMask = 1 << kPrivateLayer;
             m_OverlayCamera.depth = -1000;
-            m_OverlayCamera.enabled = false;
+            // Render in Unity's normal camera loop (enabled), NOT via a manual
+            // Camera.Render() in LateUpdate. The manual path raced the canvas
+            // rebuild: Unity rebuilds the UI batch in willRenderCanvases, which
+            // runs AFTER LateUpdate, so a LateUpdate Render() intermittently
+            // captured an empty canvas batch (camera clear landed, UI didn't —
+            // the "bubble shows up intermittently" bug; confirmed by an opaque-
+            // clear bisect: the clear was stable, the UI content was not). An
+            // enabled offscreen camera with a targetTexture renders every frame
+            // after the engine's canvas rebuild, so the UI is always present.
+            m_OverlayCamera.enabled = true;
 
             m_Canvas.worldCamera = m_OverlayCamera;
 
             DisplayXRNative.displayxr_local2d_set_texture(
                 OverlayTexture.GetNativeTexturePtr(), resolution.x, resolution.y);
 
+            // Scope the URP foreground clip out of our overlay camera (see field doc).
+            RenderPipelineManager.beginCameraRendering += OnBeginOverlayCamera;
+            RenderPipelineManager.endCameraRendering += OnEndOverlayCamera;
+            m_CamRenderHooked = true;
+
             Debug.Log($"[DisplayXR] Local2D enabled: {resolution.x}x{resolution.y}");
+        }
+
+        // Disable the foreground clip for the overlay camera's render, restore after,
+        // so the clip never reaches the bubble (it must only clip the projection/XR
+        // camera). cam-identity gated so other cameras are untouched.
+        void OnBeginOverlayCamera(ScriptableRenderContext ctx, Camera cam)
+        {
+            if (cam != m_OverlayCamera) return;
+            m_SavedForegroundFar = Shader.GetGlobalVector(s_ForegroundFarId);
+            if (m_SavedForegroundFar.z > 0.5f)
+                Shader.SetGlobalVector(s_ForegroundFarId, Vector4.zero);
+        }
+
+        void OnEndOverlayCamera(ScriptableRenderContext ctx, Camera cam)
+        {
+            if (cam != m_OverlayCamera) return;
+            if (m_SavedForegroundFar.z > 0.5f)
+                Shader.SetGlobalVector(s_ForegroundFarId, m_SavedForegroundFar);
         }
 
         void OnDisable()
         {
+            if (m_CamRenderHooked)
+            {
+                RenderPipelineManager.beginCameraRendering -= OnBeginOverlayCamera;
+                RenderPipelineManager.endCameraRendering -= OnEndOverlayCamera;
+                m_CamRenderHooked = false;
+            }
+
             DisplayXRNative.displayxr_local2d_clear();
 
             if (m_StateSaved && m_Canvas != null)
@@ -190,8 +291,9 @@ namespace DisplayXR
                     m_LastRectW = pw; m_LastRectH = ph;
                 }
             }
-
-            m_OverlayCamera.Render();
+            // No manual Render() here — the camera is enabled and renders in
+            // Unity's loop after the canvas rebuild (see OnEnable). This is the
+            // fix for the intermittent-blank UI content.
         }
 
         // Convert the fractional rect to client-window pixels using the live
@@ -199,6 +301,17 @@ namespace DisplayXR
         // Screen.* is the panel).
         private bool TryGetPanelPixelSize(out int x, out int y, out int w, out int h)
         {
+            // Explicit-rect mode: the caller supplies an exact client-window pixel
+            // rect (e.g. a region editor that already knows the panel size). This
+            // is authoritative — no Screen.* scaling, which can disagree with the
+            // runtime's actual panel size for a full-screen overlay.
+            if (useExplicitRect)
+            {
+                x = ExplicitRect.x; y = ExplicitRect.y;
+                w = ExplicitRect.width; h = ExplicitRect.height;
+                return w > 0 && h > 0;
+            }
+
             x = y = w = h = 0;
             if (Screen.width <= 0 || Screen.height <= 0) return false;
             float sw = Screen.width, sh = Screen.height;

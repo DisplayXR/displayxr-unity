@@ -119,6 +119,7 @@ PFN_xrLocateSpace s_real_locate_space = nullptr; // URP head-pose comp (#115)
 volatile PFN_xrPollEvent s_real_poll_event = nullptr;
 PFN_xrDestroyInstance s_real_destroy_instance = nullptr;
 
+PFN_xrEnumerateViewConfigurationViews s_real_enumerate_view_configuration_views = nullptr;
 PFN_xrEnumerateSwapchainFormats s_real_enumerate_swapchain_formats = nullptr;
 PFN_xrCreateSwapchain s_real_create_swapchain = nullptr;
 PFN_xrEnumerateSwapchainImages s_real_enumerate_swapchain_images = nullptr;
@@ -245,6 +246,45 @@ static PFN_xrCaptureAtlasEXT s_pfn_capture_atlas = nullptr;
 // and consumes the runtime's render-ready XrView{pose,fov} instead of computing
 // Kooima locally (the legacy display3d/camera3d path is the fallback).
 static int s_has_view_rig = 0;
+
+// XR_EXT_display_zones: 3D content framed to a window-pixel zone rect instead of
+// the full window + surround crop. Detected (extension present) in the
+// xrGetSystemProperties hook alongside view_rig, with the two entry points
+// resolved there too. Caps are queried lazily on the first frame a zone rect is
+// set (the query needs a live session). When a zone rect is set
+// (displayxr_set_3d_zone_rect) AND caps are OK, hooked_xrLocateViews chains an
+// XrDisplayZoneEXT in front of the rig (zone-scoped Kooima) and hooked_xrEndFrame
+// chains the same zone on each projection layer (binding its views into the
+// rect). Requires view_rig — zones compose on top of it.
+static int s_has_display_zones = 0;
+static PFN_xrGetDisplayZoneCapabilitiesEXT s_pfn_get_zone_caps = nullptr;
+static PFN_xrGetDisplayZoneRecommendedViewSizeEXT s_pfn_get_zone_view_size = nullptr;
+static int s_zone_caps_ok = -1; // -1 untried, 0 unsupported, 1 supported (maxZones3D>=1)
+
+// App-supplied 3D-zone rect (client-window pixels, top-left origin), pushed via
+// displayxr_set_3d_zone_rect / cleared via displayxr_clear_3d_zone. When valid
+// (and zones are supported) the locate + endframe hooks scope the 3D to it.
+static volatile int s_zone_valid = 0;
+static volatile int32_t s_zone_x = 0, s_zone_y = 0;
+static volatile int32_t s_zone_w = 0, s_zone_h = 0;
+
+// Lazy caps query: zones are supported iff the runtime advertised the extension,
+// resolved the caps entry point, and reports supported && maxZones3D>=1. Returns
+// nonzero when the zone path may run this frame (ext + caps + view_rig).
+static int dxr_zones_ready(XrSession session) {
+	if (!s_has_display_zones || !s_has_view_rig || !s_pfn_get_zone_caps)
+		return 0;
+	if (s_zone_caps_ok < 0) {
+		if (session == XR_NULL_HANDLE) return 0;
+		XrDisplayZoneCapabilitiesEXT caps = {XR_TYPE_DISPLAY_ZONE_CAPABILITIES_EXT};
+		XrResult cr = s_pfn_get_zone_caps(session, &caps);
+		s_zone_caps_ok = (XR_SUCCEEDED(cr) && caps.supported && caps.maxZones3D >= 1) ? 1 : 0;
+		displayxr_log("[DisplayXR] display-zones caps: result=0x%x supported=%d maxZones3D=%u -> %s\n",
+		              (unsigned)cr, (int)caps.supported, caps.maxZones3D,
+		              s_zone_caps_ok ? "ACTIVE" : "unsupported (legacy single-canvas path)");
+	}
+	return s_zone_caps_ok > 0;
+}
 
 // XR_EXT_view_rig: render-ready XrView{pose,fov} -> renderer matrices. Same
 // convention the displayxr::math rigs emit (OpenXR view matrix = R^T*translate(-p);
@@ -377,6 +417,7 @@ hooked_xrLocateViews(XrSession session,
 	XrDisplayRigEXT rig_display = {XR_TYPE_DISPLAY_RIG_EXT};
 	XrCameraRigEXT rig_camera = {XR_TYPE_CAMERA_RIG_EXT};
 	XrViewDisplayRawEXT rig_raw = {XR_TYPE_VIEW_DISPLAY_RAW_EXT};
+	XrDisplayZoneEXT rig_zone = {XR_TYPE_DISPLAY_ZONE_EXT}; // XR_EXT_display_zones (#zones)
 	XrPosef rig_pose_world = {{0, 0, 0, 1}, {0, 0, 0}}; // display-plane / camera pose (for foreground clip)
 	bool rig_chained = false;
 	if (s_has_view_rig) {
@@ -409,6 +450,21 @@ hooked_xrLocateViews(XrSession session,
 				rig_display.perspectiveFactor = rt.perspective_factor;
 				modified_info.next = &rig_display;
 			}
+
+			// XR_EXT_display_zones: scope the rig's Kooima framing to the app's
+			// zone rect (the rect IS the canvas) by chaining the zone in FRONT of
+			// the rig. The runtime returns render-ready XrView{pose,fov} framed to
+			// the rect, and reports the resolved canvas via rig_raw.canvasRectPx.
+			// Gated on caps (queried lazily here — session is live). Mutually
+			// exclusive with the canvas-rect/surround path (inert in a zones frame).
+			if (s_zone_valid && dxr_zones_ready(session)) {
+				rig_zone.zoneId = 1;
+				rig_zone.rect.offset = {(int32_t)s_zone_x, (int32_t)s_zone_y};
+				rig_zone.rect.extent = {(int32_t)s_zone_w, (int32_t)s_zone_h};
+				rig_zone.next = modified_info.next; // the rig
+				modified_info.next = &rig_zone;
+			}
+
 			rig_raw.next = (void *)viewState->next;
 			viewState->next = &rig_raw;
 			rig_chained = true;
@@ -456,6 +512,20 @@ hooked_xrLocateViews(XrSession session,
 			displayxr_state_set_eye_positions(&rig_raw.rawEyes[0], &rig_raw.rawEyes[1], rtracked);
 		else
 			displayxr_state_set_eye_positions(&views[0].pose.position, &views[1].pose.position, rtracked);
+
+		// XR_EXT_display_zones: log the canvas the runtime resolved for the zone
+		// (verification — should match the requested rect on the panel). Throttled.
+		if (s_zone_valid && dxr_zones_ready(session)) {
+			static int s_zone_loc_count = 0;
+			if (s_zone_loc_count % 120 == 0) {
+				displayxr_log("[DisplayXR] zone locate: req=(%d,%d %dx%d) -> "
+				              "canvasRectPx=(%d,%d %dx%d)\n",
+				              (int)s_zone_x, (int)s_zone_y, (int)s_zone_w, (int)s_zone_h,
+				              rig_raw.canvasRectPx.offset.x, rig_raw.canvasRectPx.offset.y,
+				              rig_raw.canvasRectPx.extent.width, rig_raw.canvasRectPx.extent.height);
+			}
+			s_zone_loc_count++;
+		}
 
 		// BiRP view-matrix shim (handedness): built from the render-ready pose
 		// BEFORE the #115 comp below, so BiRP gets the eye_world view and URP gets
@@ -595,6 +665,16 @@ hooked_xrGetSystemProperties(XrInstance instance, XrSystemId systemId, XrSystemP
 					s_pfn_capture_atlas = (PFN_xrCaptureAtlasEXT)fn;
 					displayxr_log( "[DisplayXR] Resolved xrCaptureAtlasEXT (#140)\n");
 				}
+				fn = nullptr;
+				if (XR_SUCCEEDED(s_next_gipa(s_instance, "xrGetDisplayZoneCapabilitiesEXT", &fn)) && fn) {
+					s_pfn_get_zone_caps = (PFN_xrGetDisplayZoneCapabilitiesEXT)fn;
+					displayxr_log( "[DisplayXR] Resolved xrGetDisplayZoneCapabilitiesEXT (display_zones)\n");
+				}
+				fn = nullptr;
+				if (XR_SUCCEEDED(s_next_gipa(s_instance, "xrGetDisplayZoneRecommendedViewSizeEXT", &fn)) && fn) {
+					s_pfn_get_zone_view_size = (PFN_xrGetDisplayZoneRecommendedViewSizeEXT)fn;
+					displayxr_log( "[DisplayXR] Resolved xrGetDisplayZoneRecommendedViewSizeEXT (display_zones)\n");
+				}
 
 				// XR_EXT_view_rig (#396): no entry point to resolve (rig is chained
 				// on xrLocateViews), so detect by enumerating available instance
@@ -614,14 +694,17 @@ hooked_xrGetSystemProperties(XrInstance instance, XrSystemId systemId, XrSystemP
 							props[i].type = XR_TYPE_EXTENSION_PROPERTIES;
 						if (XR_SUCCEEDED(enum_ext(nullptr, avail, &avail, props))) {
 							for (uint32_t i = 0; i < avail; i++) {
-								if (strcmp(props[i].extensionName, XR_EXT_VIEW_RIG_EXTENSION_NAME) == 0) {
+								if (strcmp(props[i].extensionName, XR_EXT_VIEW_RIG_EXTENSION_NAME) == 0)
 									s_has_view_rig = 1;
-									break;
-								}
+								else if (strcmp(props[i].extensionName, XR_EXT_DISPLAY_ZONES_EXTENSION_NAME) == 0)
+									s_has_display_zones = 1;
 							}
 						}
 						free(props);
 					}
+					displayxr_log("[DisplayXR] XR_EXT_display_zones: %s\n",
+					              s_has_display_zones ? "AVAILABLE (zone-framed 3D)"
+					                                  : "not found (full-window + surround path)");
 					displayxr_log("[DisplayXR] XR_EXT_view_rig: %s\n",
 					              s_has_view_rig ? "AVAILABLE (runtime owns Kooima)"
 					                             : "not found (legacy local Kooima path)");
@@ -742,6 +825,20 @@ hooked_xrCreateSession(XrInstance instance, const XrSessionCreateInfo *createInf
 					displayxr_install_focus_hook(hwnd);
 				} else {
 					displayxr_log("[DisplayXR] Shell mode: no main HWND found\n");
+				}
+			} else if (state->simple_window_requested) {
+				// Avatar-style simple-window mode: bind Unity's REAL main HWND
+				// directly (no overlay, no cloak, no off-screen move). Unity
+				// stays the on-screen render target; transparentBackgroundEnabled
+				// (below) still applies, and click-through / decoration are
+				// driven on this same HWND via displayxr_set_simple_window.
+				void *hwnd = displayxr_get_unity_main_hwnd();
+				if (hwnd != nullptr) {
+					state->window_handle = hwnd;
+					displayxr_log("[DisplayXR] Simple-window mode: using real top-level HWND %p (no overlay)\n", hwnd);
+					displayxr_install_focus_hook(hwnd);
+				} else {
+					displayxr_log("[DisplayXR] Simple-window mode: no main HWND found\n");
 				}
 			} else {
 				void *hwnd = displayxr_get_app_main_view();
@@ -1050,13 +1147,57 @@ hooked_xrEndFrame(XrSession session, const XrFrameEndInfo *frameEndInfo)
 		return s_real_end_frame(session, frameEndInfo);
 	}
 
+	// XR_EXT_display_zones: this is a ZONES FRAME when the app set a zone rect and
+	// the runtime supports it. We then chain the zone on each projection layer
+	// below (binding its views into the rect — the runtime weaves Unity's
+	// full-swapchain eye tiles into the zone), and the legacy canvas output rect
+	// becomes INERT (skip it). Computed up front so the canvas block can gate on it.
+	bool zones_frame = s_zone_valid && frameEndInfo != nullptr && dxr_zones_ready(session);
+
 	// Canvas sub-rect (#34/#131): re-apply each frame so the runtime weaves the
 	// 3D content into the app-chosen sub-rect (the rest becomes the 2D surround
 	// region). No-op unless an app called displayxr_set_canvas_rect. Per-frame
-	// matches the cube_texture reference and survives runtime state resets.
-	if (s_canvas_rect_valid && s_pfn_set_output_rect) {
+	// matches the cube_texture reference and survives runtime state resets. Inert
+	// in a zones frame (the zone rect places the 3D instead).
+	if (s_canvas_rect_valid && s_pfn_set_output_rect && !zones_frame) {
 		s_pfn_set_output_rect(session, s_canvas_rect_x, s_canvas_rect_y,
 		                      s_canvas_rect_w, s_canvas_rect_h);
+	}
+
+	// XR_EXT_display_zones: chain the zone on each projection layer Unity submitted
+	// (XrCompositionLayerProjection::next), making it a zones frame so the runtime
+	// frames the views into the rect. Unity owns the layer structs (const) so we
+	// patch ::next in place and restore after s_real_end_frame — mirrors the
+	// D3D11 ef_patches view-rect restore below. Unity submits a single projection
+	// layer (MultiPass, N views), so one zoneId=1 suffices; if it ever submits
+	// more, all get the same zone (the runtime auto-derives the wish from the
+	// union of zone rects regardless).
+	XrDisplayZoneEXT end_zone = {XR_TYPE_DISPLAY_ZONE_EXT};
+	const void *zone_saved_next[16];
+	XrCompositionLayerProjection *zone_patched[16];
+	int zone_npatch = 0;
+	if (zones_frame) {
+		end_zone.zoneId = 1;
+		end_zone.rect.offset = {(int32_t)s_zone_x, (int32_t)s_zone_y};
+		end_zone.rect.extent = {(int32_t)s_zone_w, (int32_t)s_zone_h};
+		end_zone.next = nullptr;
+		for (uint32_t i = 0; i < frameEndInfo->layerCount && zone_npatch < 16; i++) {
+			const XrCompositionLayerBaseHeader *hdr = frameEndInfo->layers[i];
+			if (hdr && hdr->type == XR_TYPE_COMPOSITION_LAYER_PROJECTION) {
+				XrCompositionLayerProjection *proj = (XrCompositionLayerProjection *)hdr;
+				zone_saved_next[zone_npatch] = proj->next;
+				zone_patched[zone_npatch] = proj;
+				proj->next = &end_zone;
+				zone_npatch++;
+			}
+		}
+		static int s_zone_ef_count = 0;
+		if (s_zone_ef_count % 120 == 0) {
+			displayxr_log("[DisplayXR] zones frame: rect=(%d,%d %dx%d), chained on %d "
+			              "projection layer(s)\n", (int)s_zone_x, (int)s_zone_y,
+			              (int)s_zone_w, (int)s_zone_h, zone_npatch);
+		}
+		s_zone_ef_count++;
 	}
 
 	// 2D surround (#131): copy the registered Unity RT into the SHARED surround
@@ -1236,6 +1377,9 @@ hooked_xrEndFrame(XrSession session, const XrFrameEndInfo *frameEndInfo)
 		ef_patches[i].view->subImage.imageRect = ef_patches[i].orig_rect;
 	}
 #endif
+	// XR_EXT_display_zones: restore the projection layers' original ::next.
+	for (int i = 0; i < zone_npatch; i++)
+		zone_patched[i]->next = zone_saved_next[i];
 	return ef_result;
 }
 
@@ -1271,6 +1415,67 @@ hooked_xrEnumerateSwapchainFormats(XrSession session,
 			}
 #endif
 			displayxr_log( "\n");
+		}
+	}
+	return result;
+}
+
+// ============================================================================
+// xrEnumerateViewConfigurationViews — zone-sized eye render (avatar-faithful)
+// ============================================================================
+// When the app has published a 3D-zone rect *before* XR init (the early seed
+// from C# via displayxr_set_3d_zone_rect), size Unity's per-eye swapchain to the
+// zone extent instead of the full window. Then Unity renders the zone-scoped
+// frustum into a zone-aspect eye RT and submits subImage.imageRect == that RT ==
+// the zone extent. By the runtime contract recommendedViewSize == zone rect
+// extent, so the compositor blit is a clean 1:1-aspect fit into the zone rect —
+// zone-confined by construction, exactly like displayxr-demo-avatar (which
+// renders each eye at xrGetDisplayZoneRecommendedViewSizeEXT and submits a
+// zone-sized imageRect). Because recommendedViewSize == zone extent we can use
+// s_zone_w/h directly and need no live session / s_pfn_get_zone_view_size here
+// (a session does not yet exist at enumerate time).
+//
+// Gated on the explicit app seed (s_zone_valid) rather than s_has_display_zones:
+// the extension-presence flag is set in hooked_xrGetSystemProperties, whose order
+// relative to this call is not guaranteed, so depending on it could silently
+// disable the override (the plan's primary risk). When unseeded we pass through
+// unchanged (today's full-window behavior).
+static XrResult XRAPI_CALL
+hooked_xrEnumerateViewConfigurationViews(XrInstance instance,
+                                         XrSystemId systemId,
+                                         XrViewConfigurationType viewConfigurationType,
+                                         uint32_t viewCapacityInput,
+                                         uint32_t *viewCountOutput,
+                                         XrViewConfigurationView *views)
+{
+	XrResult result = s_real_enumerate_view_configuration_views(
+	    instance, systemId, viewConfigurationType,
+	    viewCapacityInput, viewCountOutput, views);
+
+	if (XR_SUCCEEDED(result) && views != nullptr && viewCapacityInput > 0) {
+		uint32_t count = viewCapacityInput;
+		if (viewCountOutput != nullptr && *viewCountOutput < count)
+			count = *viewCountOutput;
+
+		if (s_zone_valid && s_zone_w > 0 && s_zone_h > 0) {
+			uint32_t zw = (uint32_t)s_zone_w;
+			uint32_t zh = (uint32_t)s_zone_h;
+			for (uint32_t i = 0; i < count; i++) {
+				uint32_t orig_w = views[i].recommendedImageRectWidth;
+				uint32_t orig_h = views[i].recommendedImageRectHeight;
+				if (views[i].maxImageRectWidth  < zw) views[i].maxImageRectWidth  = zw;
+				if (views[i].maxImageRectHeight < zh) views[i].maxImageRectHeight = zh;
+				views[i].recommendedImageRectWidth  = zw;
+				views[i].recommendedImageRectHeight = zh;
+				displayxr_log("[DisplayXR] xrEnumerateViewConfigurationViews: view[%u] zone-override recommended %ux%u -> %ux%u (max now %ux%u, has_zones=%d)\n",
+				              i, orig_w, orig_h, zw, zh,
+				              views[i].maxImageRectWidth, views[i].maxImageRectHeight,
+				              s_has_display_zones);
+			}
+		} else {
+			displayxr_log("[DisplayXR] xrEnumerateViewConfigurationViews: %u view(s), no zone override (zone_valid=%d zone=%dx%d has_zones=%d) — full-window eye RT\n",
+			              count, (int)s_zone_valid, (int)s_zone_w, (int)s_zone_h,
+			              s_has_display_zones);
 		}
 	}
 	return result;
@@ -1638,6 +1843,11 @@ displayxr_hook_xrGetInstanceProcAddr(XrInstance instance, const char *name, PFN_
 		s_real_destroy_instance = (PFN_xrDestroyInstance)*function;
 		*function = (PFN_xrVoidFunction)hooked_xrDestroyInstance;
 	}
+	// --- Zone-sized eye render (avatar-faithful, XR_EXT_display_zones) ---
+	else if (strcmp(name, "xrEnumerateViewConfigurationViews") == 0) {
+		s_real_enumerate_view_configuration_views = (PFN_xrEnumerateViewConfigurationViews)*function;
+		*function = (PFN_xrVoidFunction)hooked_xrEnumerateViewConfigurationViews;
+	}
 	// --- Swapchain diagnostic hooks (issue #36) ---
 	else if (strcmp(name, "xrEnumerateSwapchainFormats") == 0) {
 		s_real_enumerate_swapchain_formats = (PFN_xrEnumerateSwapchainFormats)*function;
@@ -1844,6 +2054,15 @@ displayxr_set_transparent_background(int enabled)
 }
 
 DISPLAYXR_EXPORT void
+displayxr_request_simple_window(int enabled)
+{
+	DisplayXRState *state = displayxr_get_state();
+	state->simple_window_requested = (uint8_t)(enabled != 0);
+	displayxr_log("[DisplayXR] request_simple_window: requested=%d\n",
+	              (int)state->simple_window_requested);
+}
+
+DISPLAYXR_EXPORT void
 displayxr_surround_set_texture(void *unity_native_tex, uint32_t width, uint32_t height)
 {
 	// Register a Unity RenderTexture (R8G8B8A8_UNORM) as the 2D surround source
@@ -2042,6 +2261,35 @@ displayxr_set_canvas_rect(int32_t x, int32_t y, uint32_t w, uint32_t h)
 	if (s_pfn_set_output_rect && s_session != XR_NULL_HANDLE)
 		s_pfn_set_output_rect(s_session, x, y, w, h);
 	displayxr_log("[DisplayXR] set_canvas_rect: (%d,%d) %ux%u\n", x, y, w, h);
+}
+
+void
+displayxr_set_3d_zone_rect(int32_t x, int32_t y, int32_t w, int32_t h)
+{
+	// XR_EXT_display_zones: define the 3D-zone rect (client-window pixels,
+	// top-left origin) the runtime frames the Kooima 3D into. hooked_xrLocateViews
+	// chains it in front of the rig (zone-scoped projection) and hooked_xrEndFrame
+	// chains it on the projection layer (binding the views into the rect). w<=0 ||
+	// h<=0 clears. Inert until the runtime advertises XR_EXT_display_zones and
+	// reports caps.supported (the locate/endframe hooks gate on dxr_zones_ready).
+	if (w <= 0 || h <= 0) {
+		s_zone_valid = 0;
+		displayxr_log("[DisplayXR] set_3d_zone_rect: cleared\n");
+		return;
+	}
+	s_zone_x = x;
+	s_zone_y = y;
+	s_zone_w = w;
+	s_zone_h = h;
+	s_zone_valid = 1;
+	displayxr_log("[DisplayXR] set_3d_zone_rect: (%d,%d) %dx%d\n", x, y, w, h);
+}
+
+void
+displayxr_clear_3d_zone(void)
+{
+	s_zone_valid = 0;
+	displayxr_log("[DisplayXR] clear_3d_zone\n");
 }
 
 DISPLAYXR_EXPORT int

@@ -105,6 +105,25 @@ static int   s_drag_active        = 0;
 static POINT s_drag_anchor_screen = {0, 0};
 static POINT s_drag_anchor_window = {0, 0};
 
+// Custom capture-based RESIZE of the decorated overlay. DefWindowProc's sizing-
+// border modal loop silently no-ops on a WS_EX_NOREDIRECTIONBITMAP window (no
+// DWM redirection surface for the live preview) even though its MOVE loop works,
+// so we drive resize ourselves from the WM_NCLBUTTONDOWN hit on a resize border
+// (HTLEFT/HTRIGHT/HTTOP/HTBOTTOM/corners), #61-bracketed like the move drag.
+static int   s_resize_active        = 0;
+static int   s_resize_edge          = 0;   // HT* code of the grabbed border
+static POINT s_resize_anchor_screen = {0, 0};
+static RECT  s_resize_anchor_rect   = {0, 0, 0, 0};
+#define DXR_MIN_WINDOW_PX 200
+
+static int
+is_resize_ht(WPARAM ht)
+{
+	return ht == HTLEFT || ht == HTRIGHT || ht == HTTOP || ht == HTBOTTOM ||
+	       ht == HTTOPLEFT || ht == HTTOPRIGHT ||
+	       ht == HTBOTTOMLEFT || ht == HTBOTTOMRIGHT;
+}
+
 // (#131) App-managed fixed full-screen window mode. When set via
 // displayxr_set_overlay_fullscreen(1), the native right-drag MOVE in
 // overlay_wnd_proc is disabled — the app owns all window interaction by placing
@@ -177,6 +196,32 @@ static int      s_surround_mask_w     = 0;
 static int      s_surround_mask_h     = 0;
 static RECT     s_surround_mask_dst   = {0, 0, 0, 0};
 static int      s_surround_mask_valid = 0;
+
+// ============================================================================
+// Simple-window mode (avatar-style): bind + style Unity's REAL main HWND
+// directly. No off-screen overlay, no DWM cloak, no off-screen move — Unity is
+// the on-screen render target the runtime composites into. Click-through is
+// region-based (the existing hit-mask SetWindowRgn path retargeted to this
+// HWND); a borderless right-drag moves the window (#61-bracketed); B toggles
+// WS_POPUP <-> WS_OVERLAPPEDWINDOW. Mutually exclusive with the overlay path.
+// ============================================================================
+static HWND    s_simple_hwnd          = NULL;   // Unity's real main HWND
+static WNDPROC s_simple_orig_wndproc  = NULL;   // saved Unity wndproc (subclass)
+static int     s_simple_active        = 0;      // styling applied
+static DWORD   s_simple_saved_style   = 0;
+static DWORD   s_simple_saved_exstyle = 0;
+static int     s_window_decorated     = 0;      // WS_OVERLAPPEDWINDOW vs WS_POPUP
+static int     s_simple_topmost       = 0;
+// Borderless right-drag move state (mirrors the overlay's #61-bracketed drag;
+// left button stays free for scene interaction, e.g. DragRotateCube).
+static int     s_simple_drag_active        = 0;
+static POINT   s_simple_drag_anchor_screen = {0, 0};
+static POINT   s_simple_drag_anchor_window = {0, 0};
+
+// Forward decl — the window the avatar-style decoration toggle manages
+// (overlay when active, else the dormant simple-window real HWND). Defined
+// with the region helpers further down.
+static HWND    managed_window_hwnd(void);
 
 // ============================================================================
 // Shell mode detection
@@ -468,12 +513,14 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 	switch (msg) {
 	case WM_NCHITTEST: {
 		if (s_overlay_is_toplevel) {
-			// Transparent overlay: WS_EX_TRANSPARENT toggling in
-			// displayxr_set_overlay_hit_active drives the OS hit-
-			// test routing. When WS_EX_TRANSPARENT is ON, the OS
-			// skips us in WindowFromPoint and never calls our
-			// WM_NCHITTEST. When it's OFF (cursor over the cube),
-			// the OS calls us — return HTCLIENT to claim the click.
+			// Decorated (avatar B-toggle): defer to DefWindowProc so the
+			// title bar + sizing border hit-test normally (HTCAPTION /
+			// HTLEFT / ...) for OS move/resize.
+			if (s_window_decorated)
+				break;
+			// Borderless transparent overlay: the SetWindowRgn silhouette
+			// drives OS routing; any hit the OS delivers is inside the
+			// shape, so claim it as client.
 			return HTCLIENT;
 		}
 		// Opaque WS_CHILD path: rect-based click-through is correct
@@ -488,8 +535,12 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		return HTTRANSPARENT;
 	}
 	case WM_MOUSEACTIVATE:
-		// Belt-and-braces with WS_EX_NOACTIVATE: refuse activation on
-		// click so foreground stays on Unity (cloaked but active).
+		// Decorated (avatar B-toggle): allow activation so the title bar
+		// drag/resize works normally. Borderless: refuse activation
+		// (belt-and-braces with WS_EX_NOACTIVATE) so foreground stays on
+		// Unity (cloaked but active).
+		if (s_window_decorated)
+			break;
 		return MA_NOACTIVATE;
 
 	case WM_SETCURSOR:
@@ -514,6 +565,41 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 			SetCursor(LoadCursorW(NULL, id));
 			return TRUE;
 		}
+		break;
+
+	// ----- decorated frame: custom capture-based resize -----
+	// Only when decorated and the OS hit-tested a sizing border. DefWindowProc's
+	// own SC_SIZE loop no-ops on this NOREDIRECTIONBITMAP window, so we drive it.
+	case WM_NCLBUTTONDOWN:
+		displayxr_log("[DisplayXR][OvlWnd] WM_NCLBUTTONDOWN ht=0x%04X decorated=%d resize=%d\n",
+		              (unsigned)wParam, s_window_decorated, is_resize_ht(wParam) ? 1 : 0);
+		if (s_window_decorated && is_resize_ht(wParam)) {
+			s_resize_active = 1;
+			s_resize_edge = (int)wParam;
+			GetCursorPos(&s_resize_anchor_screen);
+			GetWindowRect(hwnd, &s_resize_anchor_rect);
+			SetCapture(hwnd);
+			SendMessageW(hwnd, WM_ENTERSIZEMOVE, 0, 0);
+			displayxr_log("[DisplayXR][OvlWnd] resize START edge=0x%04X rect=(%ld,%ld %ldx%ld)\n",
+			              (unsigned)wParam,
+			              s_resize_anchor_rect.left, s_resize_anchor_rect.top,
+			              s_resize_anchor_rect.right - s_resize_anchor_rect.left,
+			              s_resize_anchor_rect.bottom - s_resize_anchor_rect.top);
+			return 0;
+		}
+		break; // HTCAPTION (move), sysmenu, buttons → DefWindowProc
+
+	case WM_NCRBUTTONDOWN:
+	case WM_NCMBUTTONDOWN:
+		displayxr_log("[DisplayXR][OvlWnd] WM_NC*BUTTONDOWN msg=0x%04X ht=0x%04X decorated=%d\n",
+		              (unsigned)msg, (unsigned)wParam, s_window_decorated);
+		break;
+
+	case WM_SYSCOMMAND:
+		// SC_SIZE/SC_MOVE/SC_CLOSE diagnostics (mask off the low 4 bits the OS
+		// uses for the active-edge / accelerator).
+		displayxr_log("[DisplayXR][OvlWnd] WM_SYSCOMMAND sc=0x%04X decorated=%d\n",
+		              (unsigned)(wParam & 0xFFF0), s_window_decorated);
 		break;
 
 	// ----- right-button: capture-based drag of the OVERLAY window -----
@@ -578,8 +664,9 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		}
 		break;
 	case WM_CAPTURECHANGED: {
-		int was_active = s_drag_active;
+		int was_active = s_drag_active || s_resize_active;
 		s_drag_active = 0;
+		s_resize_active = 0;
 		if (was_active)
 			SendMessageW(hwnd, WM_EXITSIZEMOVE, 0, 0);
 		break;
@@ -592,6 +679,42 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 	// hover / TrackMouseEvent / tooltips / taskbar previews / cursor
 	// adaptation all fire on the real recipient without our help.
 	case WM_MOUSEMOVE: {
+		if (s_resize_active) {
+			POINT cur;
+			GetCursorPos(&cur);
+			int dx = cur.x - s_resize_anchor_screen.x;
+			int dy = cur.y - s_resize_anchor_screen.y;
+			RECT r = s_resize_anchor_rect;
+			switch (s_resize_edge) {
+			case HTLEFT:        r.left   += dx;               break;
+			case HTRIGHT:       r.right  += dx;               break;
+			case HTTOP:         r.top    += dy;               break;
+			case HTBOTTOM:      r.bottom += dy;               break;
+			case HTTOPLEFT:     r.left   += dx; r.top += dy;  break;
+			case HTTOPRIGHT:    r.right  += dx; r.top += dy;  break;
+			case HTBOTTOMLEFT:  r.left   += dx; r.bottom += dy; break;
+			case HTBOTTOMRIGHT: r.right  += dx; r.bottom += dy; break;
+			}
+			// Clamp to a minimum size, pinning the opposite edge.
+			if (r.right - r.left < DXR_MIN_WINDOW_PX) {
+				if (s_resize_edge == HTLEFT || s_resize_edge == HTTOPLEFT ||
+				    s_resize_edge == HTBOTTOMLEFT)
+					r.left = r.right - DXR_MIN_WINDOW_PX;
+				else
+					r.right = r.left + DXR_MIN_WINDOW_PX;
+			}
+			if (r.bottom - r.top < DXR_MIN_WINDOW_PX) {
+				if (s_resize_edge == HTTOP || s_resize_edge == HTTOPLEFT ||
+				    s_resize_edge == HTTOPRIGHT)
+					r.top = r.bottom - DXR_MIN_WINDOW_PX;
+				else
+					r.bottom = r.top + DXR_MIN_WINDOW_PX;
+			}
+			SetWindowPos(hwnd, NULL, r.left, r.top,
+			             r.right - r.left, r.bottom - r.top,
+			             SWP_NOZORDER | SWP_NOACTIVATE);
+			return 0;
+		}
 		if (s_drag_active) {
 			POINT cur;
 			GetCursorPos(&cur);
@@ -611,6 +734,14 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 	case WM_LBUTTONDOWN: case WM_LBUTTONUP:
 	case WM_LBUTTONDBLCLK:
 	case WM_MBUTTONDOWN: case WM_MBUTTONUP: {
+		// End a custom frame-resize on button-up (the WM_NCLBUTTONDOWN that
+		// started it arrives as WM_LBUTTONUP once the capture is held).
+		if (msg == WM_LBUTTONUP && s_resize_active) {
+			s_resize_active = 0;
+			SendMessageW(hwnd, WM_EXITSIZEMOVE, 0, 0);
+			ReleaseCapture();
+			return 0;
+		}
 		// Same gating as above: reaching this case means we're in the
 		// cube area (WS_EX_TRANSPARENT OFF). Transparent-zone clicks
 		// are routed to the desktop natively and never arrive here.
@@ -741,6 +872,78 @@ parent_subclass_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		}
 	}
 	return CallWindowProcW(s_original_wndproc, hwnd, msg, wParam, lParam);
+}
+
+// Subclass installed on Unity's REAL main HWND in simple-window mode. Handles
+// the borderless right-drag window move (#61-bracketed so the SR weaver phase-
+// snaps) and claims WM_NCHITTEST while borderless (the SetWindowRgn silhouette
+// already governs OS routing). Everything else falls through to Unity's
+// original wndproc so Unity's input system behaves normally — Unity is the
+// real on-screen foreground window here, unlike the cloaked-overlay path.
+static LRESULT CALLBACK
+unity_simple_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+	switch (msg) {
+	case WM_NCHITTEST:
+		// Borderless: any hit the OS delivers is inside the shaped region, so
+		// claim it as client. Decorated: defer to Unity/DefWindowProc for the
+		// standard title-bar drag + sizing border (matches the avatar).
+		if (!s_window_decorated)
+			return HTCLIENT;
+		break;
+
+	// ----- right-button: capture-based borderless move of Unity's HWND -----
+	// Mirrors overlay_wnd_proc's right-drag. Disabled when decorated (the OS
+	// title bar handles move/resize). Left button stays free for the scene.
+	case WM_RBUTTONDOWN:
+		if (!s_window_decorated) {
+			GetCursorPos(&s_simple_drag_anchor_screen);
+			RECT wr;
+			GetWindowRect(hwnd, &wr);
+			s_simple_drag_anchor_window.x = wr.left;
+			s_simple_drag_anchor_window.y = wr.top;
+			s_simple_drag_active = 1;
+			SetCapture(hwnd);
+			// #61: synchronous bracketing so the SR SDK weaver's WndProc
+			// subclass sees the in-drag flag and phase-snaps. Must precede
+			// the first SetWindowPos in WM_MOUSEMOVE.
+			SendMessageW(hwnd, WM_ENTERSIZEMOVE, 0, 0);
+			return 0;
+		}
+		break;
+	case WM_RBUTTONUP:
+		if (s_simple_drag_active) {
+			// Clear the flag before WM_EXITSIZEMOVE so the recursive
+			// WM_CAPTURECHANGED from ReleaseCapture() won't re-send it.
+			s_simple_drag_active = 0;
+			SendMessageW(hwnd, WM_EXITSIZEMOVE, 0, 0);
+			ReleaseCapture();
+			return 0;
+		}
+		break;
+	case WM_CAPTURECHANGED: {
+		int was_active = s_simple_drag_active;
+		s_simple_drag_active = 0;
+		if (was_active)
+			SendMessageW(hwnd, WM_EXITSIZEMOVE, 0, 0);
+		break;
+	}
+	case WM_MOUSEMOVE:
+		if (s_simple_drag_active) {
+			POINT cur;
+			GetCursorPos(&cur);
+			int nx = s_simple_drag_anchor_window.x + (cur.x - s_simple_drag_anchor_screen.x);
+			int ny = s_simple_drag_anchor_window.y + (cur.y - s_simple_drag_anchor_screen.y);
+			SetWindowPos(hwnd, NULL, nx, ny, 0, 0,
+			             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+			return 0;
+		}
+		break;
+
+	default:
+		break;
+	}
+	return CallWindowProcW(s_simple_orig_wndproc, hwnd, msg, wParam, lParam);
 }
 
 static int
@@ -1215,6 +1418,164 @@ displayxr_set_transparent_overlay(int enabled, int topmost)
 	}
 }
 
+// ============================================================================
+// Simple-window mode (avatar-style) public API
+// ============================================================================
+
+void
+displayxr_set_simple_window(int enabled, int topmost)
+{
+	displayxr_log("[DisplayXR] set_simple_window: called enabled=%d topmost=%d shell=%d\n",
+	              enabled, topmost, displayxr_is_shell_mode());
+
+	if (displayxr_is_shell_mode())
+		return;
+
+	// Style the SAME HWND the runtime was bound to at xrCreateSession
+	// (state->window_handle), not a fresh find_unity_hwnd() — the latter
+	// can race the foreground/splash window and return a different HWND than
+	// the one the runtime composites into (observed: bound CC0F88 vs a later
+	// find returning 5D00DA), leaving the real window decorated + unshaped.
+	HWND hwnd = NULL;
+	DisplayXRState *bound_state = displayxr_get_state();
+	if (bound_state != NULL && bound_state->window_handle != NULL)
+		hwnd = (HWND)bound_state->window_handle;
+	if (hwnd == NULL || !IsWindow(hwnd))
+		hwnd = find_unity_hwnd();
+	if (hwnd == NULL) {
+		displayxr_log("[DisplayXR] set_simple_window: no Unity HWND\n");
+		return;
+	}
+
+	if (enabled && !s_simple_active) {
+		s_simple_hwnd          = hwnd;
+		s_simple_topmost       = topmost ? 1 : 0;
+		s_simple_saved_style   = (DWORD)GetWindowLongPtrW(hwnd, GWL_STYLE);
+		s_simple_saved_exstyle = (DWORD)GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+
+		// Borderless by default (avatar model): strip Unity's decorations to
+		// WS_POPUP. No DWM cloak and no off-screen move — Unity IS the on-
+		// screen window the runtime composites into. Decoration toggles back
+		// on demand via displayxr_toggle_window_decoration (the B key).
+		s_window_decorated = 0;
+		SetWindowLongPtrW(hwnd, GWL_STYLE, WS_POPUP | WS_VISIBLE);
+		DWORD ex = s_simple_saved_exstyle & ~WS_EX_LAYERED;
+		if (topmost)
+			ex |= WS_EX_TOPMOST;
+		SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (LONG_PTR)ex);
+		SetWindowPos(hwnd, topmost ? HWND_TOPMOST : HWND_TOP, 0, 0, 0, 0,
+		             SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED | SWP_SHOWWINDOW);
+
+		// Subclass Unity's wndproc for the borderless right-drag (#61-
+		// bracketed) and the WM_NCHITTEST claim.
+		s_simple_orig_wndproc = (WNDPROC)SetWindowLongPtrW(
+			hwnd, GWLP_WNDPROC, (LONG_PTR)unity_simple_wnd_proc);
+
+		s_simple_active = 1;
+		displayxr_log("[DisplayXR] set_simple_window: enabled on Unity HWND %p (borderless, topmost=%d)\n",
+		              (void *)hwnd, topmost);
+	} else if (!enabled && s_simple_active) {
+		// Restore Unity's original wndproc + styles, drop any region.
+		if (s_simple_orig_wndproc != NULL) {
+			SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)s_simple_orig_wndproc);
+			s_simple_orig_wndproc = NULL;
+		}
+		SetWindowRgn(hwnd, NULL, TRUE);
+		SetWindowLongPtrW(hwnd, GWL_STYLE, (LONG_PTR)s_simple_saved_style);
+		SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (LONG_PTR)s_simple_saved_exstyle);
+		SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
+		             SWP_NOMOVE | SWP_NOSIZE | SWP_FRAMECHANGED);
+		s_simple_active    = 0;
+		s_simple_hwnd      = NULL;
+		s_window_decorated = 0;
+		displayxr_log("[DisplayXR] set_simple_window: disabled\n");
+	}
+}
+
+// Saved borderless ex-style of the managed window, captured the first time
+// decoration is toggled so we can restore it when going borderless again.
+static DWORD s_deco_saved_exstyle = 0;
+static int   s_deco_exstyle_saved = 0;
+
+// Toggle window decoration (WS_POPUP borderless <-> WS_OVERLAPPEDWINDOW) on the
+// managed window — the transparent overlay (default) or the dormant simple-
+// window real HWND. Preserves the client rect across the style change so the
+// rendered content doesn't jump/rescale (port of the avatar's ToggleDecoration).
+static void
+apply_window_decoration(int decorated)
+{
+	HWND hwnd = managed_window_hwnd();
+	if (hwnd == NULL)
+		return;
+	int is_overlay = (hwnd == s_overlay_hwnd);
+
+	// Capture the current client rect in screen space — the invariant we keep
+	// fixed so the rendered content doesn't jump or rescale.
+	RECT client = {0};
+	GetClientRect(hwnd, &client);
+	POINT tl = { client.left, client.top };
+	ClientToScreen(hwnd, &tl);
+	int cw = client.right - client.left;
+	int ch = client.bottom - client.top;
+
+	// Remember the borderless ex-style once, to restore it on the way back.
+	if (!s_deco_exstyle_saved) {
+		s_deco_saved_exstyle = (DWORD)GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+		s_deco_exstyle_saved = 1;
+	}
+
+	s_window_decorated = decorated ? 1 : 0;
+	DWORD style = (DWORD)((s_window_decorated ? WS_OVERLAPPEDWINDOW : WS_POPUP) | WS_VISIBLE);
+	SetWindowLongPtrW(hwnd, GWL_STYLE, style);
+
+	if (is_overlay) {
+		// The overlay is born WS_EX_NOREDIRECTIONBITMAP | TOPMOST | TOOLWINDOW |
+		// NOACTIVATE. When decorated, drop TOOLWINDOW + NOACTIVATE so a normal
+		// title bar shows and the window can be activated for OS drag/resize;
+		// keep NOREDIRECTIONBITMAP (transparency) + TOPMOST. Restore the saved
+		// borderless ex-style when going back.
+		DWORD ex = s_window_decorated
+		    ? (s_deco_saved_exstyle & ~(DWORD)(WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE))
+		    : s_deco_saved_exstyle;
+		SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (LONG_PTR)ex);
+	}
+
+	// Inflate the desired client rect by the NEW frame so the client area
+	// stays put (WS_POPUP has no frame, so this is a no-op going borderless).
+	RECT want = { tl.x, tl.y, tl.x + cw, tl.y + ch };
+	AdjustWindowRect(&want, style, FALSE);
+	SetWindowPos(hwnd, HWND_TOPMOST,
+	             want.left, want.top,
+	             want.right - want.left, want.bottom - want.top,
+	             SWP_FRAMECHANGED);
+
+	// Decorated: clear the silhouette region so the whole framed window is
+	// grabbable/visible. Borderless: the next hit-mask push re-shapes it (the
+	// region path skips updates while decorated — see region_target_ready).
+	if (s_window_decorated)
+		SetWindowRgn(hwnd, NULL, TRUE);
+
+	displayxr_log("[DisplayXR] window decoration: %s (hwnd=%p overlay=%d)\n",
+	              s_window_decorated ? "ON (move/resize)" : "OFF (borderless)",
+	              (void *)hwnd, is_overlay);
+}
+
+void
+displayxr_set_window_decorated(int decorated)
+{
+	if (managed_window_hwnd() == NULL)
+		return;
+	apply_window_decoration(decorated);
+}
+
+void
+displayxr_toggle_window_decoration(void)
+{
+	if (managed_window_hwnd() == NULL)
+		return;
+	apply_window_decoration(!s_window_decorated);
+}
+
 // Set the rectangular hit-test region of the overlay.
 //
 // In opaque WS_CHILD mode (legacy / Game View overlay): updates
@@ -1261,6 +1622,43 @@ displayxr_set_transparent_overlay(int enabled, int topmost)
 #define DXR_HIT_RECT_PADDING_PX     16
 #define DXR_HIT_RECT_HYSTERESIS_PX  4
 
+// The HWND that owns the click-through region: Unity's REAL HWND in simple-
+// window mode, the top-level overlay HWND otherwise. Both use the identical
+// SetWindowRgn region machinery below.
+static HWND
+region_target_hwnd(void)
+{
+	if (s_simple_active)
+		return s_simple_hwnd;
+	return s_overlay_hwnd;
+}
+
+// True when a region target exists and is accepting region updates. A decorated
+// window shows its full frame (no silhouette clip), so region updates are
+// suppressed until it goes borderless again — for both the overlay and the
+// (dormant) simple-window real HWND.
+static int
+region_target_ready(void)
+{
+	if (s_window_decorated)
+		return 0;
+	if (s_simple_active)
+		return s_simple_hwnd != NULL && IsWindow(s_simple_hwnd);
+	return s_overlay_is_toplevel && s_overlay_hwnd != NULL && IsWindow(s_overlay_hwnd);
+}
+
+// The window the avatar-style decoration toggle (B key) manages: the transparent
+// overlay when active, else the (dormant) simple-window real HWND.
+static HWND
+managed_window_hwnd(void)
+{
+	if (s_overlay_active && s_overlay_hwnd != NULL && IsWindow(s_overlay_hwnd))
+		return s_overlay_hwnd;
+	if (s_simple_active && s_simple_hwnd != NULL && IsWindow(s_simple_hwnd))
+		return s_simple_hwnd;
+	return NULL;
+}
+
 void
 displayxr_set_overlay_hit_rect(int x, int y, int w, int h)
 {
@@ -1269,10 +1667,12 @@ displayxr_set_overlay_hit_rect(int x, int y, int w, int h)
 	s_hit_rect.right  = x + w;
 	s_hit_rect.bottom = y + h;
 
-	if (!s_overlay_is_toplevel)
-		return; // opaque WS_CHILD: WM_NCHITTEST consumes s_hit_rect, done.
-	if (s_overlay_hwnd == NULL || !IsWindow(s_overlay_hwnd))
+	// Opaque WS_CHILD overlay: WM_NCHITTEST consumes s_hit_rect, no region.
+	if (!s_simple_active && !s_overlay_is_toplevel)
 		return;
+	if (!region_target_ready())
+		return;
+	HWND target = region_target_hwnd();
 	// Per-pixel silhouette mask path is active: stop driving the
 	// region from the AABB. Mask owns SetWindowRgn from here on.
 	if (s_hit_mask_active)
@@ -1284,7 +1684,7 @@ displayxr_set_overlay_hit_rect(int x, int y, int w, int h)
 	static RECT s_last_rgn_rect = { INT_MIN, INT_MIN, INT_MIN, INT_MIN };
 
 	if (w <= 0 || h <= 0) {
-		SetWindowRgn(s_overlay_hwnd, NULL, TRUE);
+		SetWindowRgn(target, NULL, TRUE);
 		s_last_rgn_rect.left = INT_MIN;
 		displayxr_log("[DisplayXR] hit_region: cleared (overlay catches everywhere)\n");
 		return;
@@ -1328,7 +1728,7 @@ displayxr_set_overlay_hit_rect(int x, int y, int w, int h)
 		return;
 	}
 	// SetWindowRgn takes ownership of rgn on success.
-	if (!SetWindowRgn(s_overlay_hwnd, rgn, TRUE)) {
+	if (!SetWindowRgn(target, rgn, TRUE)) {
 		DeleteObject(rgn);
 		displayxr_log("[DisplayXR] hit_region: SetWindowRgn failed (%ld,%ld %ldx%ld) err=%lu\n",
 		              padded.left, padded.top,
@@ -1344,11 +1744,11 @@ displayxr_set_overlay_hit_rect(int x, int y, int w, int h)
 	DWORD now = GetTickCount();
 	if (now - s_last_log_tick >= 1000) {
 		s_last_log_tick = now;
-		displayxr_log("[DisplayXR] hit_region: raw=(%d,%d %dx%d) padded=(%ld,%ld %ldx%ld) on overlay=%p\n",
+		displayxr_log("[DisplayXR] hit_region: raw=(%d,%d %dx%d) padded=(%ld,%ld %ldx%ld) on hwnd=%p\n",
 		              x, y, w, h,
 		              padded.left, padded.top,
 		              padded.right - padded.left, padded.bottom - padded.top,
-		              (void *)s_overlay_hwnd);
+		              (void *)target);
 	}
 }
 
@@ -1396,15 +1796,14 @@ void
 displayxr_set_overlay_hit_mask(const uint8_t *mask, int mask_w, int mask_h,
                                int dst_w, int dst_h)
 {
-	if (!s_overlay_is_toplevel)
+	if (!region_target_ready())
 		return;
-	if (s_overlay_hwnd == NULL || !IsWindow(s_overlay_hwnd))
-		return;
+	HWND target = region_target_hwnd();
 
 	if (mask == NULL || mask_w <= 0 || mask_h <= 0 ||
 	    dst_w <= 0 || dst_h <= 0) {
 		// NULL/empty: clear and revert to AABB-region path.
-		SetWindowRgn(s_overlay_hwnd, NULL, TRUE);
+		SetWindowRgn(target, NULL, TRUE);
 		s_hit_mask_active = 0;
 		displayxr_log("[DisplayXR] hit_mask: cleared (reverting to AABB region)\n");
 		return;
@@ -1558,7 +1957,7 @@ displayxr_set_overlay_hit_mask(const uint8_t *mask, int mask_w, int mask_h,
 	}
 	free(rects);
 
-	if (!SetWindowRgn(s_overlay_hwnd, rgn, TRUE)) {
+	if (!SetWindowRgn(target, rgn, TRUE)) {
 		DeleteObject(rgn);
 		displayxr_log("[DisplayXR] hit_mask: SetWindowRgn failed err=%lu\n",
 		              (unsigned long)GetLastError());
@@ -1571,7 +1970,7 @@ displayxr_set_overlay_hit_mask(const uint8_t *mask, int mask_w, int mask_h,
 	DWORD now = GetTickCount();
 	if (now - s_last_log_tick >= 1000) {
 		s_last_log_tick = now;
-		displayxr_log("[DisplayXR] hit_mask: mask=%dx%d rects=%d dst=%dx%d\n",
+		displayxr_log( "[DisplayXR] hit_mask: mask=%dx%d rects=%d dst=%dx%d\n",
 		              mask_w, mask_h, n, dst_w, dst_h);
 	}
 }
@@ -1732,9 +2131,13 @@ displayxr_set_overlay_cursor(int shape)
 void
 displayxr_get_overlay_size(int *width, int *height)
 {
-	if (s_overlay_hwnd != NULL && IsWindow(s_overlay_hwnd)) {
+	// Simple-window mode has no overlay — report Unity's REAL HWND client
+	// size so C# silhouette/dst math uses the live window dimensions.
+	HWND h = (s_simple_active && s_simple_hwnd != NULL) ? s_simple_hwnd
+	                                                    : s_overlay_hwnd;
+	if (h != NULL && IsWindow(h)) {
 		RECT rc;
-		GetClientRect(s_overlay_hwnd, &rc);
+		GetClientRect(h, &rc);
 		if (width)  *width  = (int)(rc.right - rc.left);
 		if (height) *height = (int)(rc.bottom - rc.top);
 	} else {

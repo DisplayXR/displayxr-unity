@@ -43,7 +43,9 @@ namespace DisplayXR
             "XR_EXT_win32_window_binding " +
             "XR_EXT_cocoa_window_binding " +
             "XR_EXT_atlas_capture " +
-            "XR_EXT_view_rig";
+            "XR_EXT_view_rig " +
+            "XR_EXT_local_3d_zone " + // #439/#491 — required to submit Local2D layers
+            "XR_EXT_display_zones"; // zones port — 3D content framed to a window-pixel zone rect
 
         /// <summary>Singleton instance, set during OnInstanceCreate.</summary>
         public static DisplayXRFeature Instance { get; private set; }

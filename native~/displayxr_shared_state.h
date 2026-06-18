@@ -151,6 +151,14 @@ typedef struct DisplayXRState {
     // runtime's BitBlt (D3D11) or DComp (D3D12) swapchain path.
     uint8_t transparent_background_requested;
 
+    // Simple-window mode opt-in (displayxr-unity, avatar-style windowing).
+    // Set from C# at SubsystemRegistration before xrCreateSession. When set
+    // (and transparent, non-shell, non-editor), the plugin binds Unity's REAL
+    // main HWND directly — no off-screen overlay, no DWM cloak, no off-screen
+    // move. Window decoration toggles via displayxr_toggle_window_decoration
+    // and click-through is region-based (SetWindowRgn on Unity's HWND).
+    uint8_t simple_window_requested;
+
     // Color-space hint for typed-swapchain substitution (D3D11).
     // 1 = use DXGI_FORMAT_R8G8B8A8_UNORM_SRGB (matches Unity Linear color space).
     // 0 = use DXGI_FORMAT_R8G8B8A8_UNORM (matches Unity Gamma color space; also

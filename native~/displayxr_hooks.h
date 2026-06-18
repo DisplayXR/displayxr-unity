@@ -98,6 +98,14 @@ DISPLAYXR_EXPORT void displayxr_set_editor_mode(int enabled);
 /// the end of the struct and is harmlessly ignored.
 DISPLAYXR_EXPORT void displayxr_set_transparent_background(int enabled);
 
+/// Opt into avatar-style "simple window" mode (Windows). When enabled the
+/// plugin binds the runtime to Unity's REAL main HWND directly — no off-screen
+/// overlay, no DWM cloak, no off-screen move. Click-through is region-based
+/// (SetWindowRgn on Unity's HWND) and decoration toggles via
+/// displayxr_toggle_window_decoration. Call from C# at SubsystemRegistration
+/// (before xrCreateSession), like displayxr_set_transparent_background.
+DISPLAYXR_EXPORT void displayxr_request_simple_window(int enabled);
+
 /// (#131) Register a Unity RenderTexture (R8G8B8A8_UNORM) as the 2D surround
 /// source. The runtime fills the non-canvas region (outside the canvas sub-rect
 /// set via displayxr_set_canvas_rect) from this texture each frame, post-weave,
@@ -228,6 +236,20 @@ DISPLAYXR_EXPORT void displayxr_set_canvas_rect(
 DISPLAYXR_EXPORT int displayxr_get_canvas_rect_px(
     int32_t *x, int32_t *y, uint32_t *w, uint32_t *h);
 
+/// XR_EXT_display_zones: define the 3D-zone rect (client-window pixels, top-left
+/// origin) the runtime frames the Kooima 3D into. The locate hook chains an
+/// XrDisplayZoneEXT in front of the view-rig (zone-scoped projection) and the
+/// xrEndFrame hook chains the same zone on each projection layer (binding its
+/// views into the rect). w<=0 || h<=0 clears. Inert unless the runtime advertises
+/// XR_EXT_display_zones and reports caps.supported. Mutually exclusive with the
+/// canvas-rect/surround path (a zones frame makes the output rect inert). Hooked
+/// path (built apps) only.
+DISPLAYXR_EXPORT void displayxr_set_3d_zone_rect(
+    int32_t x, int32_t y, int32_t w, int32_t h);
+
+/// XR_EXT_display_zones: clear the 3D-zone rect (revert to full-window framing).
+DISPLAYXR_EXPORT void displayxr_clear_3d_zone(void);
+
 /// Kill xrPollEvent forwarding immediately. Call from C# before session/instance
 /// teardown to prevent use-after-free when the runtime is unloaded.
 DISPLAYXR_EXPORT void displayxr_stop_polling(void);
@@ -247,6 +269,32 @@ DISPLAYXR_EXPORT void displayxr_destroy_preview_window(void);
 /// @param topmost  Non-zero to add WS_EX_TOPMOST while enabled.
 DISPLAYXR_EXPORT void displayxr_set_transparent_overlay(int enabled,
                                                         int topmost);
+
+/// (avatar simple-window) Style Unity's REAL main HWND for avatar-style
+/// windowing: strip to borderless WS_POPUP (no off-screen overlay, no DWM
+/// cloak, no off-screen move — Unity stays the on-screen render target the
+/// runtime composites into). Click-through is region-based (SetWindowRgn via
+/// the existing hit-mask path, retargeted to this HWND); a borderless
+/// right-drag moves the window (#61-bracketed). Decoration toggles via
+/// displayxr_toggle_window_decoration. Pair with displayxr_request_simple_window
+/// (which selects the real HWND at session create). Mutually exclusive with
+/// shell mode and the transparent overlay. enabled=0 restores Unity's styles.
+/// @param enabled  Non-zero to enable, zero to restore.
+/// @param topmost  Non-zero to add WS_EX_TOPMOST while enabled.
+DISPLAYXR_EXPORT void displayxr_set_simple_window(int enabled, int topmost);
+
+/// (avatar simple-window) Toggle window decoration on the simple-window HWND:
+/// WS_POPUP (borderless) <-> WS_OVERLAPPEDWINDOW (title bar + sizing frame for
+/// OS move/resize). The client rect is preserved across the toggle so rendered
+/// content doesn't jump/rescale. Decorating clears the silhouette region (whole
+/// frame grabbable); going borderless lets the next hit-mask push re-shape it.
+/// No-op unless displayxr_set_simple_window is active. Matches the avatar's B key.
+DISPLAYXR_EXPORT void displayxr_toggle_window_decoration(void);
+
+/// (avatar simple-window) Set decoration state explicitly (1=decorated,
+/// 0=borderless). Same behavior as displayxr_toggle_window_decoration but
+/// idempotent. No-op unless displayxr_set_simple_window is active.
+DISPLAYXR_EXPORT void displayxr_set_window_decorated(int decorated);
 
 /// (issue #57) Update the rectangular hit-test region used while transparent
 /// overlay mode is enabled. Inside the rect, WM_NCHITTEST returns HTCLIENT;
