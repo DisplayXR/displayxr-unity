@@ -870,6 +870,29 @@ namespace DisplayXR
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern int displayxr_consume_overlay_wheel_delta();
+
+        /// <summary>
+        /// (display-zones port) Atomically read + zero the overlay's close-
+        /// request flag. Returns 1 once after the user pressed the decorated
+        /// overlay's close (X) button or Alt+F4. The plugin swallows the
+        /// overlay's WM_CLOSE (it does NOT destroy the overlay HWND, which would
+        /// leave cloaked Unity running headless) and raises this flag instead.
+        /// Apps poll it each frame and call Application.Quit() so the whole
+        /// process shuts down cleanly. Always 0 when no transparent overlay.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int displayxr_consume_overlay_close_request();
+
+        /// <summary>
+        /// (display-zones port) Resize the managed overlay window to width x
+        /// height px via SetWindowPos (#61-bracketed, clamped to a min size).
+        /// The reliable resize path on the SR display — the weaver subclass eats
+        /// mouse edge interactions on the non-activating overlay, but
+        /// SetWindowPos is never intercepted. Apps drive it from a keyboard
+        /// shortcut. No-op when there is no managed overlay window.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void displayxr_resize_overlay(int width, int height);
 #endif
 
     }
