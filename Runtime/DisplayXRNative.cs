@@ -893,6 +893,17 @@ namespace DisplayXR
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern void displayxr_resize_overlay(int width, int height);
+
+        /// <summary>
+        /// (display-zones port) Get/set the managed overlay window's screen-space
+        /// top-left, for app-side window-position persistence. Set is #61-bracketed
+        /// (size unchanged). No-op when there is no managed overlay window.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void displayxr_get_overlay_position(out int x, out int y);
+
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void displayxr_set_overlay_position(int x, int y);
 #endif
 
     }

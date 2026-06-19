@@ -422,6 +422,12 @@ DISPLAYXR_EXPORT int displayxr_consume_overlay_close_request(void);
 /// can't start), but SetWindowPos is never intercepted. Apps drive this from a
 /// keyboard shortcut. Windows transparent overlay only; no-op elsewhere.
 DISPLAYXR_EXPORT void displayxr_resize_overlay(int width, int height);
+
+/// (display-zones port) Get/set the managed overlay window's screen-space
+/// top-left, for app-side window-position persistence (remember/restore across
+/// launches). set is #61-bracketed (size unchanged). Windows overlay only.
+DISPLAYXR_EXPORT void displayxr_get_overlay_position(int *x, int *y);
+DISPLAYXR_EXPORT void displayxr_set_overlay_position(int x, int y);
 #endif // _WIN32
 
 #ifdef __cplusplus

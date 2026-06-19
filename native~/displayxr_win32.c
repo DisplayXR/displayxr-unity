@@ -2263,6 +2263,39 @@ displayxr_resize_overlay(int width, int height)
 	displayxr_log("[DisplayXR] resize_overlay -> %dx%d\n", width, height);
 }
 
+void
+displayxr_get_overlay_position(int *x, int *y)
+{
+	// Screen-space top-left of the managed window. Pairs with
+	// displayxr_set_overlay_position for app-side window-position persistence.
+	if (x) *x = 0;
+	if (y) *y = 0;
+	HWND hwnd = managed_window_hwnd();
+	if (hwnd == NULL)
+		return;
+	RECT r;
+	if (GetWindowRect(hwnd, &r)) {
+		if (x) *x = (int)r.left;
+		if (y) *y = (int)r.top;
+	}
+}
+
+void
+displayxr_set_overlay_position(int x, int y)
+{
+	// Move the managed window to a screen-space top-left (size unchanged).
+	// #61-bracketed like resize/drag so the weaver phase-snaps. App drives this
+	// to restore a remembered window position at launch.
+	HWND hwnd = managed_window_hwnd();
+	if (hwnd == NULL)
+		return;
+	SendMessageW(hwnd, WM_ENTERSIZEMOVE, 0, 0);
+	SetWindowPos(hwnd, NULL, x, y, 0, 0,
+	             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+	SendMessageW(hwnd, WM_EXITSIZEMOVE, 0, 0);
+	displayxr_log("[DisplayXR] set_overlay_position -> (%d,%d)\n", x, y);
+}
+
 // ============================================================================
 // Shell mode: IAT hooks + window subclass for background input
 //

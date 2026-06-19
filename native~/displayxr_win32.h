@@ -100,6 +100,12 @@ int displayxr_consume_overlay_close_request(void);
 /// size. App drives this from a keyboard shortcut.
 void displayxr_resize_overlay(int width, int height);
 
+/// (display-zones port) Get/set the managed window's screen-space top-left.
+/// For app-side window-position persistence (remember/restore across launches).
+/// set is #61-bracketed (size unchanged); get returns (0,0) if no window.
+void displayxr_get_overlay_position(int *x, int *y);
+void displayxr_set_overlay_position(int x, int y);
+
 #ifdef __cplusplus
 }
 #endif
