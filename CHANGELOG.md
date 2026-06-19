@@ -5,7 +5,19 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [1.20.1] - 2026-06-15
+## [1.21.0] - 2026-06-19
+
+### Added
+- **`XR_EXT_display_zones` port — 3D display zones**: the plugin renders into runtime-advertised display zones, sizing the 3D eye render to `xrGetDisplayZoneRecommendedViewSize` (via `renderViewportScale`) so the zone-sized stereo render no longer leaks a band under zoom.
+- **Local2D composition layer (#439/#491)** — modern 2D-over-3D path: a `DisplayXRLocal2D` component composites a 2D layer over the 3D scene.
+- **Avatar-style windowing primitives** on the transparent overlay: native toggle-decoration (B), keyboard window resize, drag-move, get/set overlay window position (for app-side persistence), and consume-overlay-close-request (close-to-quit). Window-chrome UI policy moved out of the plugin into the app.
+
+### Fixed
+- **URP per-eye view (#127)**: each eye now renders with the runtime's `eye_world` VIEW matrix instead of URP's view, fixing the off-axis URP path.
+- Local2D bubble vanish under foreground clip.
+
+### Changed
+- **Window-chrome UI policy moved out of the plugin into the app** — the plugin exposes native windowing primitives (decoration toggle, resize, position get/set, close-request) and the app owns the UX policy.
 
 ### Fixed
 - **`XR_EXT_view_rig` SPEC_VERSION 3 compatibility** (native): the runtime advanced the extension to SPEC 3, which adds a trailing `metersToVirtual` float to `XrCameraRigEXT`. The plugin shipped the SPEC 2 struct, so against a SPEC 3 runtime the runtime read that field past the end of the plugin's struct for **camera-centric** rigs (`DisplayXRCamera`) — undefined value (best case 0 → runtime's pre-v3 default of 1.0, worst case garbage → wrong world scale). The plugin now declares SPEC 3 and writes `metersToVirtual = 1.0f` (scene scale is already folded into `convergenceDiopters`, so this exactly preserves pre-v3 behavior). **Display-centric rigs (`DisplayXRDisplay` → `XrDisplayRigEXT`) were unaffected** — that struct is byte-identical across SPEC 2/3 — so the transparent/2D-UI display-centric demos already worked on a SPEC 3 runtime; this fixes the camera-centric path. Detection remains name-based (no version gate).
