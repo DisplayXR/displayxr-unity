@@ -88,9 +88,17 @@ namespace DisplayXR.URP
                     }
                 }
 
-                // Keep URP's view (it's correct, from the provider); replace only the
-                // projection. SetViewProjectionMatrices expects the non-GPU projection.
-                Matrix4x4 view = xr.GetViewMatrix(0);
+                // Use the runtime eye_world VIEW too — NOT URP's view. URP's view
+                // comes from the head-pose-compensated pose (#115), which diverges
+                // from the eye_world position the projection is built for as the
+                // head moves off-centre. Pairing eye_world proj with URP's view made
+                // the rendered parallax track the head FASTER than the click-through
+                // silhouette (which uses eye_world view+proj, same as BiRP) — so the
+                // tiger slid out from under its own silhouette/mask. Pairing eye_world
+                // view AND proj makes URP render identical to BiRP and the silhouette.
+                // FlipZ → Unity convention (the rig's FlipViewZ before SetStereoView).
+                // SetViewProjectionMatrices expects the non-GPU projection.
+                Matrix4x4 view = FlipZ(isLeft ? lv : rv);
 
                 if (m_LogCount < 4)
                 {
