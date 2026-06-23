@@ -294,7 +294,7 @@ Three sibling Unity projects exercise the plugin against different feature areas
 | Repo | Focus | Notes |
 |------|-------|-------|
 | [`DisplayXR/displayxr-unity-test`](https://github.com/DisplayXR/displayxr-unity-test) | Baseline rendering / stereo correctness | Plain cube + camera-centric and display-centric rigs |
-| [`DisplayXR/displayxr-unity-test-transparent`](https://github.com/DisplayXR/displayxr-unity-test-transparent) | Transparent overlay + click-through (#57 family, alpha-native) | Tiger FBX clickable, foreground-only render |
+| [`DisplayXR/displayxr-unity-test-transparent`](https://github.com/DisplayXR/displayxr-unity-test-transparent) | Transparent overlay + click-through (#57 family, alpha-native), now **URP + `XR_EXT_display_zones` / Local2D bubble** in a floating window | Tiger FBX clickable, foreground-only render. `main` = URP/zones (v2.0.0+); the Built-in (BiRP) baseline lives on the `legacy-birp` branch |
 | [`DisplayXR/displayxr-unity-test-2d-ui`](https://github.com/DisplayXR/displayxr-unity-test-2d-ui) | 2D UI window-space composition layer | Tuning panel built from `DisplayXRWindowSpaceUI` |
 
 All three pin the plugin via `https://github.com/DisplayXR/displayxr-unity.git#upm` (floating; tracks latest release).
