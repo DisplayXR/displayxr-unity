@@ -4,6 +4,8 @@
 // OpenXR function interception layer for the DisplayXR Unity plugin.
 // Hooks into Unity's OpenXR loader chain via HookGetInstanceProcAddr.
 
+#include <cstdlib>   // calloc/free — explicit; macOS clang/libc++ no longer pulls these in transitively
+#include <cstring>   // strcmp — same reason
 #include "displayxr_hooks_internal.h"
 #include "displayxr_window_space_ui.h"
 #include "displayxr_local2d.h"
