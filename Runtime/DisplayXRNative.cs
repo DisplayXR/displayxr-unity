@@ -240,7 +240,8 @@ namespace DisplayXR
 
         /// <summary>
         /// Check whether the plugin is running in shell/IPC mode.
-        /// Detected via DISPLAYXR_SHELL_SESSION=1 environment variable.
+        /// Detected via DISPLAYXR_WORKSPACE_SESSION=1 (legacy
+        /// DISPLAYXR_SHELL_SESSION=1 is also honored) environment variable.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern int displayxr_is_shell_mode();

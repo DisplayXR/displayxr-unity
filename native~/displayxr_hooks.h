@@ -172,7 +172,8 @@ DISPLAYXR_EXPORT void displayxr_macos_set_window_borderless(int enabled);
 DISPLAYXR_EXPORT void displayxr_set_use_srgb_swapchain(int enabled);
 
 /// Check whether the plugin is running in shell/IPC mode.
-/// Detected via DISPLAYXR_SHELL_SESSION=1 environment variable.
+/// Detected via DISPLAYXR_WORKSPACE_SESSION=1 (legacy DISPLAYXR_SHELL_SESSION=1
+/// is also honored) environment variable.
 /// Callable from C# via P/Invoke.
 DISPLAYXR_EXPORT int displayxr_is_shell_mode(void);
 

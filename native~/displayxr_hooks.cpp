@@ -369,6 +369,68 @@ hooked_xrLocateViews(XrSession session,
 		if (poll_state->window_handle != nullptr) {
 			HWND hwnd = (HWND)poll_state->window_handle;
 
+			// Keep Unity rendering under the shell (#unity-black).
+			//
+			// Unlike a native Win32 render loop (e.g. cube_handle_d3d12, which
+			// renders regardless of window state), Unity's player does NOT run
+			// the camera/scene render while its main window lacks WS_VISIBLE —
+			// it still ticks scripts (Application.runInBackground) and submits
+			// the XR frame, but the eye textures are never drawn, so the
+			// swapchain the shell composites stays black.
+			//
+			// In workspace/shell mode the app's HWND gets hidden because the
+			// shell shows the composited content via the IPC swapchain, not the
+			// app's own window. It is hidden in (at least) TWO places — the
+			// runtime at session create (`ShowWindow SW_HIDE` in
+			// oxr_session.c) AND the shell's own window management at workspace
+			// takeover (verified: fixing only the runtime site is undone by the
+			// shell, which re-hides + repositions the window). That hide is
+			// exactly what stops Unity from rendering.
+			//
+			// Resolve it from the app process — the one place that sees every
+			// hide regardless of who issued it — by keeping the window VISIBLE
+			// but parked far OFF-SCREEN: Unity resumes rendering (verified:
+			// off-screen + visible draws the full scene into the swapchain) and
+			// the user never sees the bare window.
+			//
+			// Two failure modes are corrected here, every frame, until both are
+			// satisfied (then this is a no-op):
+			//   * HIDDEN      → the engine stops rendering → black.
+			//   * ON-SCREEN   → the bare app window would be visible to the user
+			//                   (the shell repositions it back on-screen after
+			//                   hiding it, so a visibility-only gate isn't
+			//                   enough).
+			// "On-screen" uses a generous off-screen threshold (-8000): the
+			// shell/runtime sometimes parks the window at its own off-screen
+			// spot (e.g. -12800, the modal-owner convention). Treating that as
+			// already-parked avoids a per-frame tug-of-war between our -32000
+			// and the shell's -12800 (both invisible, so the fight is harmless,
+			// but pointless). Only a window actually near/on a monitor re-parks.
+			//
+			// CRITICAL: this runs on Unity's RENDER thread (xrLocateViews), but
+			// the HWND is owned by the main thread. A synchronous SetWindowPos /
+			// ShowWindow here SendMessages cross-thread and DEADLOCKs (verified:
+			// app stalled at frame 1); an *async* SetWindowPos from the render
+			// thread did not reliably move the window (only the show took, so it
+			// stayed on-screen). So delegate to the main thread:
+			// displayxr_shell_park_offscreen() PostMessages a request that the
+			// window subclass handles synchronously on the main thread, where
+			// the move actually sticks. GetWindowRect / IsWindowVisible are
+			// read-only and safe to call from here.
+			RECT park_rc;
+			bool on_screen = GetWindowRect(hwnd, &park_rc) && park_rc.left > -8000;
+			if (!IsWindowVisible(hwnd) || on_screen) {
+				displayxr_shell_park_offscreen(hwnd);
+				static int s_parked_logged = 0;
+				if (!s_parked_logged) {
+					s_parked_logged = 1;
+					displayxr_log("[DisplayXR] Shell mode: requesting off-screen + visible park "
+					              "of app HWND %p so Unity keeps rendering (hidden/repositioned by "
+					              "the runtime or shell)\n",
+					              hwnd);
+				}
+			}
+
 			// Poll window size/position since we have no parent_subclass_proc.
 			// Keeps Kooima projection correct when the shell resizes the app.
 			RECT rc;
@@ -384,7 +446,6 @@ hooked_xrLocateViews(XrSession session,
 						(int32_t)origin.x, (int32_t)origin.y);
 				}
 			}
-
 		}
 	}
 #elif defined(__APPLE__)

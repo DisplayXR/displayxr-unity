@@ -241,7 +241,12 @@ int
 displayxr_is_shell_mode(void)
 {
 	if (!s_shell_checked) {
-		const char *val = getenv("DISPLAYXR_SHELL_SESSION");
+		// The shell + runtime set DISPLAYXR_WORKSPACE_SESSION=1 (renamed from
+		// the legacy DISPLAYXR_SHELL_SESSION). Accept the old name too so an
+		// older shell still flips the plugin into shell/IPC mode.
+		const char *val = getenv("DISPLAYXR_WORKSPACE_SESSION");
+		if (val == NULL)
+			val = getenv("DISPLAYXR_SHELL_SESSION");
 		s_shell_mode = (val != NULL && val[0] == '1' && val[1] == '\0');
 		s_shell_checked = 1;
 	}
@@ -2168,6 +2173,18 @@ displayxr_get_overlay_size(int *width, int *height)
 int
 displayxr_is_our_process_foreground(void)
 {
+	// Shell/workspace mode: the workspace shell is the OS-foreground process,
+	// never us — but it forwards input ONLY to the shell-focused app. So any
+	// input that reaches us is, by construction, meant for us; always report
+	// "foreground" so the app's input controller (which gates WASD/mouse on
+	// this) doesn't drop shell-forwarded input. Without this, Unity apps under
+	// the shell silently ignore all keyboard/mouse (the real check below
+	// returns the shell's PID). This bug was masked until window-gated engines
+	// actually rendered under the shell. Mirrors the macOS stub, which returns
+	// 1 unconditionally for the same "if we're seeing input, it's ours" reason.
+	if (displayxr_is_shell_mode())
+		return 1;
+
 	// GetForegroundWindow is IAT-hooked in Unity's exe + UnityPlayer.dll
 	// (see displayxr_install_focus_hook) so Unity always sees itself as
 	// foreground. The plugin DLL's IAT is NOT hooked, so this call returns
@@ -2324,6 +2341,15 @@ displayxr_set_overlay_position(int x, int y)
 static HWND s_shell_unity_hwnd = NULL;
 static WNDPROC s_shell_original_wndproc = NULL;
 
+// Custom message: park the window off-screen + visible (handled synchronously
+// on the main UI thread by shell_subclass_proc). Posted from the render thread
+// via displayxr_shell_park_offscreen — see that function and the header doc.
+#define DXR_WM_PARK_OFFSCREEN (WM_APP + 0x37)
+// Far-off-screen parking origin (matches the runtime's off-screen owner
+// convention); negative enough to clear any monitor arrangement.
+#define DXR_PARK_X (-32000)
+#define DXR_PARK_Y (-32000)
+
 // Real function pointers (saved before IAT patching)
 static HWND (WINAPI *s_real_GetForegroundWindow)(void) = NULL;
 static HWND (WINAPI *s_real_GetFocus)(void) = NULL;
@@ -2373,6 +2399,18 @@ hooked_RegisterRawInputDevices(PCRAWINPUTDEVICE pRawInputDevices, UINT uiNumDevi
 static LRESULT CALLBACK
 shell_subclass_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
+	// Park off-screen + visible (render-thread request). Done here on the main
+	// UI thread so the SetWindowPos/ShowWindow are synchronous and actually
+	// stick — an async SetWindowPos from the render thread did not reliably
+	// move the window. Keeps Unity rendering (it skips the scene render for a
+	// hidden window) while the bare window stays out of sight.
+	if (msg == DXR_WM_PARK_OFFSCREEN) {
+		SetWindowPos(hwnd, NULL, DXR_PARK_X, DXR_PARK_Y, 0, 0,
+		             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+		ShowWindow(hwnd, SW_SHOWNA);
+		return 0;
+	}
+
 	// Track key/button state from shell-forwarded PostMessage input.
 	switch (msg) {
 	case WM_KEYDOWN: case WM_SYSKEYDOWN:
@@ -2460,6 +2498,18 @@ shell_subclass_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 	}
 
 	return CallWindowProcW(s_shell_original_wndproc, hwnd, msg, wParam, lParam);
+}
+
+// Render-thread-safe request to park the window off-screen + visible.
+// PostMessage just queues to the window's (main) thread, so this never blocks
+// or deadlocks the caller. The actual move happens synchronously in
+// shell_subclass_proc (DXR_WM_PARK_OFFSCREEN) on the main thread.
+void
+displayxr_shell_park_offscreen(void *unity_hwnd)
+{
+	HWND hwnd = (HWND)unity_hwnd;
+	if (hwnd != NULL && IsWindow(hwnd))
+		PostMessageW(hwnd, DXR_WM_PARK_OFFSCREEN, 0, 0);
 }
 
 // --- IAT patching infrastructure ---
