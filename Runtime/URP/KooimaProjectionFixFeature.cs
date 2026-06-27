@@ -25,6 +25,15 @@
 // DISPLAYXR_URP (versionDefines, URP >= 17.0.0); BiRP-only and older-URP projects
 // never compile it. Wire via DisplayXR > Setup URP Projection Fix (auto-wired by
 // DisplayXRUrpAutoWire when a URP DisplayXR rig is present), or add manually.
+//
+// SPI EXPERIMENT (experiment/spi-single-pass, DISPLAYXR_SPI_EXPERIMENTAL): the same
+// "re-push via command buffer" idea is the one mechanism NOT gated to MultiPass, so
+// it's the only credible route to Single Pass Instanced. Under SPI a single pass
+// carries BOTH eyes (indexed by unity_StereoEyeIndex), so instead of one
+// SetViewProjectionMatrices we write both slots of the unity_StereoMatrix* arrays.
+// Whether the engine honours that override vs re-binding its own fov-built stereo
+// cbuffer is unproven — this branch exists to A/B it on hardware. SPI is inherently
+// a 2-views-in-an-array mode, so the array push is gated on xr.viewCount == 2.
 using UnityEngine;
 using UnityEngine.Rendering;
 using UnityEngine.Rendering.Universal;
@@ -37,7 +46,26 @@ namespace DisplayXR.URP
     {
         class KooimaProjPass : ScriptableRenderPass
         {
-            class PassData { public Matrix4x4 view; public Matrix4x4 proj; }
+            // MultiPass uses (view, proj); SPI uses the stereo* arrays. The two
+            // render funcs read disjoint fields — the unused ones stay default.
+            class PassData
+            {
+                public Matrix4x4 view;
+                public Matrix4x4 proj;
+                public Matrix4x4[] stereoV;
+                public Matrix4x4[] stereoP;
+                public Matrix4x4[] stereoVP;
+                public Matrix4x4[] stereoInvVP;
+            }
+
+            // Built-in stereo shader constant arrays (UnityStereoGlobals cbuffer).
+            // Shaders read unity_StereoMatrix*[unity_StereoEyeIndex] under instanced
+            // stereo. Whether SetGlobalMatrixArray overrides these for subsequent
+            // draws is exactly what the SPI A/B is meant to find out (see below).
+            static readonly int s_StereoV     = Shader.PropertyToID("unity_StereoMatrixV");
+            static readonly int s_StereoP     = Shader.PropertyToID("unity_StereoMatrixP");
+            static readonly int s_StereoVP    = Shader.PropertyToID("unity_StereoMatrixVP");
+            static readonly int s_StereoInvVP = Shader.PropertyToID("unity_StereoMatrixInvVP");
 
             static DisplayXRFeature s_feature;
             static readonly int s_ForegroundFarId = Shader.PropertyToID("_DXRForegroundFar");
@@ -59,14 +87,13 @@ namespace DisplayXR.URP
                 // would flash/break those frames — skip until the matrices are real.
                 if (!IsFinite(lp) || !IsFinite(rp)) return;
 
-                // Identify the current eye (multipass: xr has one view this pass) by
-                // matching its world position to the nearer runtime eye.
                 var xr = cameraData.xr;
-                Vector3 curEye = xr.GetViewMatrix(0).inverse.GetColumn(3);
+
+                // Runtime eye_world positions, used to match each XR view index to the
+                // L or R eye. eye_world (not URP's head-pose-compensated view #115) —
+                // see the long note on the view below.
                 Vector3 eyeL = FlipZ(lv).inverse.GetColumn(3);
                 Vector3 eyeR = FlipZ(rv).inverse.GetColumn(3);
-                bool isLeft = (curEye - eyeL).sqrMagnitude <= (curEye - eyeR).sqrMagnitude;
-                Matrix4x4 correctProj = isLeft ? lp : rp;
 
                 // Foreground clip: when the opt-in DisplayXR/ForegroundClipURP pass is
                 // active, the runtime bakes the (small) per-eye foreground far into
@@ -76,17 +103,10 @@ namespace DisplayXR.URP
                 // shader uses to reconstruct eyeZ. So rebuild only the depth terms to the
                 // camera's far, keeping the off-axis shear (m00/m02) intact. Inert when
                 // the clip is off (then the proj already carries the camera far).
-                if (Shader.GetGlobalVector(s_ForegroundFarId).z > 0.5f)
-                {
-                    float near = correctProj.m23 / (correctProj.m22 - 1f);  // recover near
-                    float far = cameraData.camera.farClipPlane;             // full render far
-                    if (far > near && near > 0f)
-                    {
-                        // GL projection depth terms (clip z in [-1, 1]).
-                        correctProj.m22 = -(far + near) / (far - near);
-                        correctProj.m23 = -2.0f * far * near / (far - near);
-                    }
-                }
+                bool fgClip = Shader.GetGlobalVector(s_ForegroundFarId).z > 0.5f;
+                float camFar = cameraData.camera.farClipPlane;
+                Matrix4x4 projL = fgClip ? RebuildDepthToFar(lp, camFar) : lp;
+                Matrix4x4 projR = fgClip ? RebuildDepthToFar(rp, camFar) : rp;
 
                 // Use the runtime eye_world VIEW too — NOT URP's view. URP's view
                 // comes from the head-pose-compensated pose (#115), which diverges
@@ -97,8 +117,82 @@ namespace DisplayXR.URP
                 // tiger slid out from under its own silhouette/mask. Pairing eye_world
                 // view AND proj makes URP render identical to BiRP and the silhouette.
                 // FlipZ → Unity convention (the rig's FlipViewZ before SetStereoView).
+                Matrix4x4 viewL = FlipZ(lv);
+                Matrix4x4 viewR = FlipZ(rv);
+
+#if DISPLAYXR_SPI_EXPERIMENTAL
+                // ---- Single Pass Instanced (experiment/spi-single-pass) ----------
+                // ONE pass carries BOTH views; the shader indexes the stereo arrays
+                // by unity_StereoEyeIndex. We must write BOTH slots, in the SAME
+                // order as the XR pass's views (slot i ↔ xr.GetViewMatrix(i)'s eye) —
+                // a single SetViewProjectionMatrices can't express two eyes.
+                //
+                // GATE: exactly 2 views in this single pass. DisplayXR is N-view in
+                // general (the runtime synthesises 4/8 views downstream), but Unity's
+                // OpenXR render path is always PRIMARY_STEREO. If a pass ever carried
+                // != 2 views we bail rather than write wrong slots — the precise form
+                // of "display max view count == 2".
+                if (xr.singlePassEnabled && xr.viewCount == 2)
+                {
+                    var sV     = new Matrix4x4[2];
+                    var sP     = new Matrix4x4[2];
+                    var sVP    = new Matrix4x4[2];
+                    var sInvVP = new Matrix4x4[2];
+                    for (int i = 0; i < 2; i++)
+                    {
+                        Vector3 vi = xr.GetViewMatrix(i).inverse.GetColumn(3);
+                        bool left = (vi - eyeL).sqrMagnitude <= (vi - eyeR).sqrMagnitude;
+                        Matrix4x4 view = left ? viewL : viewR;
+                        // unity_StereoMatrixP is the GPU-convention projection
+                        // (reversed-Z / platform clip range) — the same conversion
+                        // SetViewProjectionMatrices bakes internally in the multipass
+                        // path. renderIntoTexture=true: XR renders into an RT.
+                        Matrix4x4 gpuProj = GL.GetGPUProjectionMatrix(left ? projL : projR, true);
+                        sV[i]     = view;
+                        sP[i]     = gpuProj;
+                        sVP[i]    = gpuProj * view;
+                        sInvVP[i] = sVP[i].inverse;
+                    }
+
+                    if (m_LogCount < 4)
+                    {
+                        m_LogCount++;
+                        Debug.Log($"[KooimaProjFix][SPI] views={xr.viewCount} " +
+                                  $"slot0.VP.m02={sVP[0].m02:F4} slot1.VP.m02={sVP[1].m02:F4} " +
+                                  $"(urp slot0 proj.m02={xr.GetProjMatrix(0).m02:F4})");
+                    }
+
+                    using (var builder = renderGraph.AddUnsafePass<PassData>("KooimaProjectionFixSPI", out var passData))
+                    {
+                        passData.stereoV = sV;
+                        passData.stereoP = sP;
+                        passData.stereoVP = sVP;
+                        passData.stereoInvVP = sInvVP;
+                        builder.AllowPassCulling(false);
+                        builder.SetRenderFunc((PassData d, UnsafeGraphContext ctx) =>
+                        {
+                            var cmd = CommandBufferHelpers.GetNativeCommandBuffer(ctx.cmd);
+                            // EXPERIMENTAL LEVER. If these overrides stick for the
+                            // opaque draws, the image matches MultiPass; if the engine
+                            // re-binds its own (fov-built) UnityStereoGlobals cbuffer,
+                            // expect off-axis deformation / over-separation. That
+                            // verdict is the whole point of this branch.
+                            cmd.SetGlobalMatrixArray(s_StereoV,     d.stereoV);
+                            cmd.SetGlobalMatrixArray(s_StereoP,     d.stereoP);
+                            cmd.SetGlobalMatrixArray(s_StereoVP,    d.stereoVP);
+                            cmd.SetGlobalMatrixArray(s_StereoInvVP, d.stereoInvVP);
+                        });
+                    }
+                    return;
+                }
+#endif
+                // ---- MultiPass (default) -----------------------------------------
+                // One view per pass: identify this eye and push a single (view, proj).
+                Vector3 curEye = xr.GetViewMatrix(0).inverse.GetColumn(3);
+                bool isLeft = (curEye - eyeL).sqrMagnitude <= (curEye - eyeR).sqrMagnitude;
+                Matrix4x4 correctProj = isLeft ? projL : projR;
                 // SetViewProjectionMatrices expects the non-GPU projection.
-                Matrix4x4 view = FlipZ(isLeft ? lv : rv);
+                Matrix4x4 mpView = isLeft ? viewL : viewR;
 
                 if (m_LogCount < 4)
                 {
@@ -109,7 +203,7 @@ namespace DisplayXR.URP
 
                 using (var builder = renderGraph.AddUnsafePass<PassData>("KooimaProjectionFix", out var passData))
                 {
-                    passData.view = view;
+                    passData.view = mpView;
                     passData.proj = correctProj;
                     builder.AllowPassCulling(false);
                     builder.SetRenderFunc((PassData d, UnsafeGraphContext ctx) =>
@@ -118,6 +212,21 @@ namespace DisplayXR.URP
                         cmd.SetViewProjectionMatrices(d.view, d.proj);
                     });
                 }
+            }
+
+            // Rebuild only the depth (m22/m23) terms of an OpenGL-convention
+            // projection (clip z in [-1,1]) so its far plane = far, preserving the
+            // off-axis shear (m00/m02). Used when the foreground-clip pass baked a
+            // short per-eye far into the projection (see caller).
+            static Matrix4x4 RebuildDepthToFar(Matrix4x4 proj, float far)
+            {
+                float near = proj.m23 / (proj.m22 - 1f);  // recover near
+                if (far > near && near > 0f)
+                {
+                    proj.m22 = -(far + near) / (far - near);
+                    proj.m23 = -2.0f * far * near / (far - near);
+                }
+                return proj;
             }
 
             // Negate column 2 (Z) of a view matrix — the OpenXR->Unity handedness flip

@@ -183,7 +183,30 @@ namespace DisplayXR
             // silently rejected ("Can't set custom eye projection matrix when
             // not in multipass mode") and the scene renders with a degenerate
             // frustum. Verified by experiment on Windows D3D12, issue #69.
+            //
+            // SPI EXPERIMENT (experiment/spi-single-pass): under URP the projection
+            // no longer rides on SetStereoProjectionMatrix at all — KooimaProjection
+            // FixFeature re-pushes the runtime matrices via the command buffer (#127),
+            // the exact API that was MultiPass-gated. So SPI is at least conceivable
+            // for the URP path. With DISPLAYXR_SPI_EXPERIMENTAL defined we LEAVE the
+            // project's chosen render mode alone (so you can select Single Pass
+            // Instanced) and let the RendererFeature drive both eyes. Without the
+            // define, behavior is unchanged: MultiPass is forced. SPI is inherently a
+            // 2-views-in-an-array mode — the RendererFeature gates the array push on
+            // the XR pass actually carrying exactly 2 views (see KooimaProjectionFix
+            // Feature), which is the precise form of "display max view count == 2".
             var settings = OpenXRSettings.Instance;
+#if DISPLAYXR_SPI_EXPERIMENTAL
+            if (settings != null)
+            {
+                Debug.LogWarning(
+                    "[DisplayXR][SPI-EXPERIMENT] DISPLAYXR_SPI_EXPERIMENTAL is defined — " +
+                    "NOT forcing MultiPass. Active render mode = " + settings.renderMode +
+                    ". Single Pass Instanced is only handled on the URP path (Windows); " +
+                    "BiRP and macOS/Metal still require MultiPass and will render wrong " +
+                    "under SPI.");
+            }
+#else
             if (settings != null && settings.renderMode != OpenXRSettings.RenderMode.MultiPass)
             {
                 Debug.Log("[DisplayXR] Forcing MultiPass render mode (required for asymmetric frustum projection)");
@@ -196,6 +219,7 @@ namespace DisplayXR
                 if (field != null)
                     field.SetValue(settings, OpenXRSettings.RenderMode.MultiPass);
             }
+#endif
 
             // When the app requested transparent background, opt the session
             // into AlphaBlend so Unity's render path preserves alpha=0 in the
@@ -364,6 +388,7 @@ namespace DisplayXR
         /// <inheritdoc />
         protected override void GetValidationChecks(List<ValidationRule> rules, BuildTargetGroup targetGroup)
         {
+#if !DISPLAYXR_SPI_EXPERIMENTAL
             rules.Add(new ValidationRule(this)
             {
                 message = "DisplayXR requires Multi-Pass render mode. " +
@@ -384,6 +409,7 @@ namespace DisplayXR
                 },
                 fixItAutomatic = true,
             });
+#endif // !DISPLAYXR_SPI_EXPERIMENTAL
         }
 #endif
 
