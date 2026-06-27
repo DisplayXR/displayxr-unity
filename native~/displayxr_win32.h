@@ -24,7 +24,8 @@ void *displayxr_get_app_main_view(void);
 void *displayxr_get_unity_main_hwnd(void);
 
 /// Check whether the plugin is running in shell/IPC mode.
-/// Detected via DISPLAYXR_SHELL_SESSION=1 environment variable.
+/// Detected via DISPLAYXR_WORKSPACE_SESSION=1 (legacy DISPLAYXR_SHELL_SESSION=1
+/// is also honored) environment variable.
 int displayxr_is_shell_mode(void);
 
 /// Install IAT hooks and window subclass for shell mode input.
@@ -33,6 +34,18 @@ int displayxr_is_shell_mode(void);
 /// @param unity_hwnd The Unity main HWND.
 /// @return 1 on success, 0 on failure.
 int displayxr_install_focus_hook(void *unity_hwnd);
+
+/// Shell mode: ask the main UI thread to park the app window far OFF-SCREEN
+/// while keeping it visible (WS_VISIBLE), so Unity keeps rendering into the XR
+/// swapchain (it skips the scene render for a hidden window) without the user
+/// ever seeing the bare window. Posts a message handled SYNCHRONOUSLY in the
+/// window subclass (main thread) — safe to call from the render thread, where a
+/// direct SetWindowPos/ShowWindow would deadlock against the main thread and an
+/// async SetWindowPos does not reliably move the window. Idempotent: a no-op
+/// once the window is already off-screen + visible. Requires the focus-hook
+/// subclass to be installed (it is, in shell mode).
+/// @param unity_hwnd The Unity main HWND (window_handle).
+void displayxr_shell_park_offscreen(void *unity_hwnd);
 
 /// (issue #57) Toggle transparent overlay mode on the parent (Unity top-
 /// level) HWND. Strips decorations, cloaks Unity, moves it off-screen so
