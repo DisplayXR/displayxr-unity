@@ -1,59 +1,61 @@
 # Experiment: Single Pass Instanced (SPI) on the URP path
 
-**Branch:** `experiment/spi-single-pass` · **Status:** ⛔ BLOCKED (hardware A/B 2026-06-28)
+**Branch:** `experiment/spi-single-pass` · **Status:** ✅ ROOT-CAUSED — one runtime fix away
 
-## Result (2026-06-28) — BLOCKED upstream of C#
+## Result (2026-06-28) — plugin/Unity side correct; blocker is one runtime change
 
 Tested on hardware (displayxr-unity-test-2d-ui, RTX 3080 SR display, D3D12, URP 17.0.4).
-**SPI engages cleanly but renders FLAT (no disparity).** The block is *not* the
-projection-injection mechanism this experiment set out to test — it's that distinct
-per-eye matrices are not available at the URP RendererFeature stage under single-pass.
+SPI renders FLAT, but **not** because of anything in the plugin or Unity. With an
+eye-tracking lock the entire chain is per-eye correct; the woven image stays flat solely
+because the **runtime compositor ignores `XrSwapchainSubImage::imageArrayIndex`** and
+samples array layer 0 for both eyes. Fix that one thing (we own the runtime) and SPI works.
 
-Evidence (Player.log, head ~centred):
-- `Render Mode: Single Pass Instanced`, `XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO`,
-  the SPI branch runs with `viewCount==2`. Gating + define all correct.
-- At `RecordRenderGraph` time under SPI, **both Unity views are identical**:
-  `xr.GetViewMatrix(0)==GetViewMatrix(1)` and `GetProjMatrix(0)==GetProjMatrix(1)`
-  (`unityViewX L==R=0.0071`, `unityProj.m02 L==R=-0.0396`). The plugin's
-  `GetStereoMatrices` readback **and** the raw-eye channel are mono here too
-  (`rawEyeX L==R=0.0000`).
-- **MultiPass renders correct 3D from the same runtime/scene** (user-confirmed). Its
-  RendererFeature also sees mono matrices at record time — Unity binds the distinct
-  per-eye matrices *later, per eye-pass*, which a record-time hook can't observe (and
-  needn't, since each MP pass is a single eye). SPI has no second pass: it needs both
-  eyes resolved at record time, and they aren't.
-- The override lever itself **works**: pushing identical matrices into the stereo
-  arrays flattened the image further, confirming `SetGlobalMatrixArray` reaches the
-  instanced draws. There is simply no distinct per-eye *source* to feed it.
+### The investigation had two red herrings — record them so we don't repeat them
 
-**Conclusion.** SPI is not achievable as a C#/RendererFeature change. The blocker moved
-from "can we inject per-eye projection" (viable) to "single-pass doesn't expose distinct
-per-eye view/projection at the injection point." **MultiPass stays forced.**
+1. **`tracking=0` fallback looks like "SPI is mono."** When no face is locked, the runtime
+   correctly collapses both eyes to the nominal viewer (flat 2D is the safe no-track
+   output). Several early captures (and the first native `xrLocateViews` A/B that
+   "proved the runtime returns identical views under SPI") were taken with `tracking=0`.
+   That conclusion was an artifact — **invalid; do not trust it.** WITH a lock
+   (`tracking=1`), `hooked_xrLocateViews` returns fully distinct eyes under SPI
+   (`rawEyes` separated, `dPosX≈0.01–0.08`, fovs differ) exactly like MultiPass.
+2. **The boot splash** (transient 2nd rig, on by default) truncated `displayxr.log` and
+   muddied early captures. Run diagnostics with `DISPLAYXR_NO_SPLASH=1`.
 
-### Native `xrLocateViews` A/B (2026-06-28) — collapse is at the RUNTIME OUTPUT, not Unity-OpenXR
+### What is actually true (tracking=1, splash off)
 
-Added a throttled log in `hooked_xrLocateViews` of the RAW per-view poses+fovs straight
-out of `s_real_locate_views`, before any plugin processing. Same native DLL, same runtime,
-same scene — only the Unity render mode differs:
+- Per-eye separation is present at EVERY stage: `GetStereoMatrices` `projL!=projR`;
+  Unity's own `xr.GetProjMatrix(0)!=(1)` and `GetViewMatrix(0)!=(1)` at RecordRenderGraph;
+  our pushed `sVP0!=sVP1`. The `SetGlobalMatrixArray` override is distinct and reaches the
+  instanced draws. **Nothing on the plugin or Unity side is mono.**
+- `xrCreateSwapchain: ... arrays=2` — Unity creates a **2-layer texture-array** swapchain
+  and renders the two distinct eyes into layers 0 and 1.
+- `xrEndFrame` submits ONE `XrCompositionLayerProjection` with `viewCount=2`, two views
+  into that one swapchain: `view[0].subImage.imageArrayIndex=0` (left),
+  `view[1].subImage.imageArrayIndex=1` (right), distinct poses. **Textbook SPI.**
+- Yet the woven output is FLAT. The only explanation consistent with "MultiPass 3D, SPI
+  flat" is that the compositor reads array **layer 0 for both views**. MultiPass works
+  because each eye is its own swapchain (always layer 0); SPI puts the right eye in layer 1.
 
-| Mode | `v0.pos` vs `v1.pos` | `v0.fov` vs `v1.fov` | visual |
-|------|----------------------|----------------------|--------|
-| **SPI**       | identical, `dPosX=0.0000` (and static frame-to-frame) | identical, `dFovL=0.0000` | flat |
-| **MultiPass** | distinct, `dPosX≈0.011→0.034` (tracks head) | distinct, `dFovL≈-0.015→-0.054` | 3D ✓ |
+### The fix (both sides — we control the runtime)
 
-So the runtime's `xrLocateViews` **returns two identical views under the single SPI locate**
-and two distinct eyes under MultiPass. The disparity is gone *at the runtime's output* —
-Unity-OpenXR is **not** discarding separation after a correct return; there was none to
-discard. Because the runtime is render-mode-agnostic, the trigger is upstream of its Kooima
-math: the locate INPUTS under SPI are collapsed (consistent with the C# `rawEyeX L==R==0`
-under SPI vs separated under MultiPass). That is a runtime / plugin-rig-input path
-(eye-tracking → `XR_EXT_view_rig` descriptor → single SPI locate), **not** a Unity-side or
-RendererFeature fix.
+- **Runtime (the blocker):** in the Display Processor / weave, when reading each projection
+  view's source image, sample swapchain array layer = `view.subImage.imageArrayIndex`
+  instead of a hardcoded 0. Equivalently, create the per-view image view / SRV for the
+  texture-array layer the view references. This is the single change that unblocks SPI.
+- **Plugin (already done on this branch):** `DISPLAYXR_SPI_EXPERIMENTAL` skips the forced
+  MultiPass; `KooimaProjectionFixFeature` gates on `xr.viewCount==2` and re-pushes the
+  runtime per-eye projection into both `unity_StereoMatrix*` slots (off-axis #127 fix,
+  proven distinct + reaching the draws). No further plugin work needed for disparity.
+- **Payoff:** ~half the CPU draw/cull cost vs MultiPass, URP-on-Windows. BiRP and
+  macOS/Metal stay MultiPass (no command-buffer hook / Unity SPI-Metal broken).
 
-**Next step (if pursued):** log the chained `XrDisplayRigEXT`/`XrCameraRigEXT` descriptor's
-eye inputs in `hooked_xrLocateViews` for both modes to see whether the plugin chains
-collapsed eyes under SPI, or whether Unity's single SPI locate call drives the runtime to
-duplicate one eye. Likely runtime/Unity-OpenXR work; SPI remains de-prioritised.
+### Verify after the runtime fix
+
+Build the test repo SPI (`DISPLAYXR_SPI_EXPERIMENTAL` define + OpenXR Render Mode =
+Single Pass Instanced), run with `DISPLAYXR_NO_SPLASH=1`, sit in front (tracking=1), and
+confirm 3D matches the MultiPass build. The native `[rig-diag]` and C# `[KooimaProjFix][SPI]`
+logs already print everything needed to confirm per-eye distinctness end-to-end.
 
 ---
 

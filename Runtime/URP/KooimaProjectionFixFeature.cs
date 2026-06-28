@@ -126,27 +126,26 @@ namespace DisplayXR.URP
                 // "display max view count == 2" (Unity's render path is always
                 // PRIMARY_STEREO; the runtime synthesises 4/8 views downstream).
                 //
-                // ⚠ BLOCKED — hardware A/B 2026-06-28 (2d-ui, RTX 3080 SR, D3D12).
-                // SPI engages cleanly and this branch runs, but the image is FLAT (no
-                // disparity). Root cause is UPSTREAM of this RendererFeature and could
-                // not be fixed in C#:
-                //   • At RecordRenderGraph time under single-pass, BOTH Unity views are
-                //     identical: xr.GetViewMatrix(0)==GetViewMatrix(1) and
-                //     GetProjMatrix(0)==GetProjMatrix(1) (logged: unityViewX L==R,
-                //     unityProj.m02 L==R). The plugin's GetStereoMatrices readback and
-                //     the raw-eye channel are mono here too.
-                //   • MultiPass renders correct 3D from the SAME runtime/scene — Unity
-                //     binds the distinct per-eye matrices later, per eye-pass, where this
-                //     record-time hook can't observe (and needn't, since each MP pass is
-                //     one eye). SPI has no second pass: it needs both eyes resolved at
-                //     record time, and they aren't.
-                //   • Pushing per-eye arrays here DID affect the draws (feeding identical
-                //     matrices flattened it further), so SetGlobalMatrixArray is a viable
-                //     lever — but there is no distinct per-eye SOURCE to feed it.
-                // Verdict: SPI needs per-eye view data that single-pass doesn't expose at
-                // the RendererFeature stage. Next step is native/Unity-OpenXR level (does
-                // the runtime's xrLocateViews return distinct views under the SPI locate?),
-                // NOT a C# RendererFeature change. See docs~/experiments/spi-single-pass.md.
+                // STATUS (hardware diag 2026-06-28, 2d-ui, RTX 3080 SR, D3D12): the
+                // PLUGIN + UNITY side are CORRECT for SPI. The remaining blocker is in the
+                // RUNTIME compositor and is fixable there (we own the runtime). Evidence:
+                //   • With an eye-tracking lock (tracking=1) the whole chain is per-eye
+                //     distinct: GetStereoMatrices projL!=projR, Unity's own
+                //     xr.GetProjMatrix(0)!=(1), and our pushed sVP0!=sVP1 (periodic log).
+                //     Earlier "all mono" captures were tracking=0 — the runtime's correct
+                //     nominal-viewer fallback renders flat 2D when no face is locked.
+                //   • xrCreateSwapchain shows arrays=2 (Unity made a 2-LAYER texture-array
+                //     swapchain); xrEndFrame submits two projection views into ONE
+                //     swapchain with subImage.imageArrayIndex 0 (left) and 1 (right),
+                //     distinct poses. Textbook-correct SPI submission.
+                //   • Yet the woven image is FLAT → the runtime compositor samples array
+                //     LAYER 0 for BOTH views, ignoring subImage.imageArrayIndex. MultiPass
+                //     works because each eye is its own swapchain (always layer 0); SPI
+                //     puts the right eye in layer 1.
+                // RUNTIME FIX: per projection view, sample swapchain array layer =
+                //   view.subImage.imageArrayIndex (not hardcoded 0) in the Display
+                //   Processor / weave. Then SPI renders 3D and this off-axis push (#127)
+                //   makes it pixel-correct. See docs~/experiments/spi-single-pass.md.
                 if (xr.singlePassEnabled && xr.viewCount == 2)
                 {
                     var sV     = new Matrix4x4[2];
@@ -165,6 +164,27 @@ namespace DisplayXR.URP
                         sInvVP[i] = sVP[i].inverse;
                     }
 
+                    // PERIODIC diag (every ~120 calls) — fires in steady state so it
+                    // catches tracking=1 (the first-N-frames throttle only saw the
+                    // no-track startup). Shows where per-eye separation is lost:
+                    //   getStereo projL!=projR  → source has separation
+                    //   unityProj(0)!=unityProj(1) → Unity surfaces per-eye at record
+                    //   sVP0!=sVP1 → our push is distinct
+                    if ((m_LogCount++ % 120) == 0)
+                    {
+                        Vector3 uv0 = xr.GetViewMatrix(0).inverse.GetColumn(3);
+                        Vector3 uv1 = xr.GetViewMatrix(1).inverse.GetColumn(3);
+                        Debug.Log($"[KooimaProjFix][SPI] getStereo projL.m02={projL.m02:F4} projR.m02={projR.m02:F4} | " +
+                                  $"unityProj.m02 0={xr.GetProjMatrix(0).m02:F4} 1={xr.GetProjMatrix(1).m02:F4} | " +
+                                  $"unityViewX 0={uv0.x:F4} 1={uv1.x:F4} | " +
+                                  $"pushed sVP0.m02={sVP[0].m02:F4} sVP1.m02={sVP[1].m02:F4} d={(sVP[0].m02 - sVP[1].m02):F4}");
+                    }
+
+                    // Off-axis correction (#127) for SPI: re-push the runtime per-eye
+                    // projection into both stereo array slots. PROVEN distinct + reaching
+                    // the instanced draws (the periodic log above shows sVP0 != sVP1 when
+                    // tracked). This is NOT what blocks SPI disparity — see the header:
+                    // the runtime compositor must honor subImage.imageArrayIndex first.
                     using (var builder = renderGraph.AddUnsafePass<PassData>("KooimaProjectionFixSPI", out var passData))
                     {
                         passData.stereoV = sV;

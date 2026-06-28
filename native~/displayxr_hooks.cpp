@@ -546,27 +546,43 @@ hooked_xrLocateViews(XrSession session,
 		return result;
 	}
 
-	// SPI diagnostic (experiment/spi-single-pass): log the RAW per-view poses + fovs
-	// the runtime just returned, BEFORE any of our processing. This localizes the
-	// single-pass disparity collapse: run the SAME native build in SPI vs MultiPass
-	// (C# render mode) and compare here. If v0 != v1 in BOTH modes, the runtime
-	// returns distinct eyes and the collapse is Unity-OpenXR-side (it loses the
-	// separation before C# sees it under single-pass). If v0 == v1 under SPI but
-	// distinct under MultiPass, the runtime itself returns identical views for the
-	// single SPI locate (runtime-side). Throttled to the first few frames.
+	// SPI rig diagnostic (experiment/spi-single-pass): we KNOW the runtime returns
+	// identical views[0]==views[1] under the single SPI locate but distinct under
+	// MultiPass (same DLL+runtime). This logs the FULL rig contract — the descriptor
+	// INPUTS we chain (tunables, esp. ipdFactor — the eye-spread driver), the
+	// locate-call params (displayTime / viewConfig / space-swap), and the runtime's
+	// returned rawEyes — to localize the collapse:
+	//   • inputs (ipdF…) DIFFER between modes → plugin-side: the rig isn't getting the
+	//     tunables under SPI (active-rig gating / LateUpdate timing). Fix C#.
+	//   • inputs IDENTICAL but displayTime differs → Unity passes a different predicted
+	//     time under SPI → runtime samples eye-tracking differently. Fix time, plugin or
+	//     runtime.
+	//   • inputs + displayTime IDENTICAL but rawEyes/views collapse under SPI → runtime
+	//     produces mono output for identical input → dig runtime-side (we own it).
+	// Throttled. rig_raw is filled by the runtime only when rig_chained.
 	{
-		static int s_locate_diag = 0;
-		if (s_locate_diag < 6) {
-			s_locate_diag++;
-			displayxr_log("[DisplayXR][locate-diag] capIn=%u countOut=%u "
-			              "v0.pos=(%.4f,%.4f,%.4f) v1.pos=(%.4f,%.4f,%.4f) dPosX=%.4f "
-			              "v0.fov(L,R)=(%.4f,%.4f) v1.fov(L,R)=(%.4f,%.4f) dFovL=%.4f\n",
-			              viewCapacityInput, count,
+		// Periodic (every ~90 calls) so it captures STEADY STATE (tracking=1 once a
+		// face locks), not just the no-track startup frames.
+		static int s_rig_diag = 0;
+		if ((s_rig_diag++ % 90) == 0) {
+			DisplayXRTunables dt = displayxr_state_get_tunables();
+			displayxr_log("[DisplayXR][rig-diag] mode=%s chained=%d spaceSwap=%d "
+			              "ipdF=%.4f parF=%.4f perF=%.4f vdh=%.4f convD=%.4f fov=%.4f "
+			              "dispTime=%lld viewCfg=%d | "
+			              "rawEyeCount=%u tracking=%d rawE0=(%.4f,%.4f,%.4f) rawE1=(%.4f,%.4f,%.4f) drawX=%.4f | "
+			              "v0.pos=(%.4f,%.4f,%.4f) v1.pos=(%.4f,%.4f,%.4f) dPosX=%.4f dFovL=%.4f\n",
+			              dt.camera_centric ? "cam" : "disp", rig_chained ? 1 : 0,
+			              (s_local_space != XR_NULL_HANDLE) ? 1 : 0,
+			              dt.ipd_factor, dt.parallax_factor, dt.perspective_factor,
+			              dt.virtual_display_height, dt.inv_convergence_distance, dt.fov_override,
+			              (long long)viewLocateInfo->displayTime, (int)viewLocateInfo->viewConfigurationType,
+			              rig_raw.eyeCountOutput, (int)rig_raw.isTracking,
+			              rig_raw.rawEyes[0].x, rig_raw.rawEyes[0].y, rig_raw.rawEyes[0].z,
+			              rig_raw.rawEyes[1].x, rig_raw.rawEyes[1].y, rig_raw.rawEyes[1].z,
+			              rig_raw.rawEyes[1].x - rig_raw.rawEyes[0].x,
 			              views[0].pose.position.x, views[0].pose.position.y, views[0].pose.position.z,
 			              views[1].pose.position.x, views[1].pose.position.y, views[1].pose.position.z,
 			              views[1].pose.position.x - views[0].pose.position.x,
-			              views[0].fov.angleLeft, views[0].fov.angleRight,
-			              views[1].fov.angleLeft, views[1].fov.angleRight,
 			              views[1].fov.angleLeft - views[0].fov.angleLeft);
 		}
 	}
