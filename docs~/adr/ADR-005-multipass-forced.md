@@ -23,3 +23,16 @@ Force Multi-Pass in `DisplayXRFeature.OnInstanceCreate()`:
 - Rendering cost is 2x draw calls (one per eye) — acceptable for 3D displays where per-eye asymmetric frustum is required
 - No Single-Pass Instanced support, even on platforms where it works (Windows)
 - The reflection hack (`m_renderMode` field access) may break if Unity changes the internal field name
+
+## Revisited (2026-06-28): SPI still not viable, for a *new* reason
+
+After the URP off-axis fix (#127) moved projection injection off the MultiPass-only
+`SetStereoProjectionMatrix` onto a command-buffer re-push, SPI looked conceivable for the
+URP path, so it was re-tried on hardware (branch `experiment/spi-single-pass`). It does
+**not** work, but the blocker has shifted: under single-pass the per-eye view/projection
+matrices are identical at the URP RendererFeature stage (`xr.GetViewMatrix/GetProjMatrix`
+return the same matrix for both eyes at RecordRenderGraph time), so no per-eye disparity
+is available to inject — the image renders flat. MultiPass works because Unity binds the
+distinct per-eye matrices later, per eye-pass. This is upstream of C# (native /
+Unity-OpenXR), not a RendererFeature-fixable issue. Full evidence:
+`docs~/experiments/spi-single-pass.md`. **MultiPass remains forced.**

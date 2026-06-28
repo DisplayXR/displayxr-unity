@@ -1,6 +1,44 @@
 # Experiment: Single Pass Instanced (SPI) on the URP path
 
-**Branch:** `experiment/spi-single-pass` · **Status:** prototype, untested on hardware
+**Branch:** `experiment/spi-single-pass` · **Status:** ⛔ BLOCKED (hardware A/B 2026-06-28)
+
+## Result (2026-06-28) — BLOCKED upstream of C#
+
+Tested on hardware (displayxr-unity-test-2d-ui, RTX 3080 SR display, D3D12, URP 17.0.4).
+**SPI engages cleanly but renders FLAT (no disparity).** The block is *not* the
+projection-injection mechanism this experiment set out to test — it's that distinct
+per-eye matrices are not available at the URP RendererFeature stage under single-pass.
+
+Evidence (Player.log, head ~centred):
+- `Render Mode: Single Pass Instanced`, `XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO`,
+  the SPI branch runs with `viewCount==2`. Gating + define all correct.
+- At `RecordRenderGraph` time under SPI, **both Unity views are identical**:
+  `xr.GetViewMatrix(0)==GetViewMatrix(1)` and `GetProjMatrix(0)==GetProjMatrix(1)`
+  (`unityViewX L==R=0.0071`, `unityProj.m02 L==R=-0.0396`). The plugin's
+  `GetStereoMatrices` readback **and** the raw-eye channel are mono here too
+  (`rawEyeX L==R=0.0000`).
+- **MultiPass renders correct 3D from the same runtime/scene** (user-confirmed). Its
+  RendererFeature also sees mono matrices at record time — Unity binds the distinct
+  per-eye matrices *later, per eye-pass*, which a record-time hook can't observe (and
+  needn't, since each MP pass is a single eye). SPI has no second pass: it needs both
+  eyes resolved at record time, and they aren't.
+- The override lever itself **works**: pushing identical matrices into the stereo
+  arrays flattened the image further, confirming `SetGlobalMatrixArray` reaches the
+  instanced draws. There is simply no distinct per-eye *source* to feed it.
+
+**Conclusion.** SPI is not achievable as a C#/RendererFeature change. The blocker moved
+from "can we inject per-eye projection" (viable) to "single-pass doesn't expose distinct
+per-eye view/projection at the injection point." Resolving it is a native / Unity-OpenXR
+question — does the runtime's `xrLocateViews` return two distinct views under the *single*
+SPI locate call, and if so why doesn't Unity surface them at RecordRenderGraph? — not a
+plugin RendererFeature fix. **MultiPass stays forced.** Next step (if pursued): throttled
+native logging in `hooked_xrLocateViews` of `views[0].pose` vs `views[1].pose` + render
+mode, to see whether the collapse is runtime-side or Unity-OpenXR-side. Likely needs
+runtime/Unity work, so de-prioritised.
+
+---
+
+(Original prototype plan, kept for reference:)
 
 ## Goal
 

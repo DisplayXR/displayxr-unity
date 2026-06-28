@@ -122,16 +122,31 @@ namespace DisplayXR.URP
 
 #if DISPLAYXR_SPI_EXPERIMENTAL
                 // ---- Single Pass Instanced (experiment/spi-single-pass) ----------
-                // ONE pass carries BOTH views; the shader indexes the stereo arrays
-                // by unity_StereoEyeIndex. We must write BOTH slots, in the SAME
-                // order as the XR pass's views (slot i ↔ xr.GetViewMatrix(i)'s eye) —
-                // a single SetViewProjectionMatrices can't express two eyes.
+                // GATE: exactly 2 views in this single pass — the precise form of
+                // "display max view count == 2" (Unity's render path is always
+                // PRIMARY_STEREO; the runtime synthesises 4/8 views downstream).
                 //
-                // GATE: exactly 2 views in this single pass. DisplayXR is N-view in
-                // general (the runtime synthesises 4/8 views downstream), but Unity's
-                // OpenXR render path is always PRIMARY_STEREO. If a pass ever carried
-                // != 2 views we bail rather than write wrong slots — the precise form
-                // of "display max view count == 2".
+                // ⚠ BLOCKED — hardware A/B 2026-06-28 (2d-ui, RTX 3080 SR, D3D12).
+                // SPI engages cleanly and this branch runs, but the image is FLAT (no
+                // disparity). Root cause is UPSTREAM of this RendererFeature and could
+                // not be fixed in C#:
+                //   • At RecordRenderGraph time under single-pass, BOTH Unity views are
+                //     identical: xr.GetViewMatrix(0)==GetViewMatrix(1) and
+                //     GetProjMatrix(0)==GetProjMatrix(1) (logged: unityViewX L==R,
+                //     unityProj.m02 L==R). The plugin's GetStereoMatrices readback and
+                //     the raw-eye channel are mono here too.
+                //   • MultiPass renders correct 3D from the SAME runtime/scene — Unity
+                //     binds the distinct per-eye matrices later, per eye-pass, where this
+                //     record-time hook can't observe (and needn't, since each MP pass is
+                //     one eye). SPI has no second pass: it needs both eyes resolved at
+                //     record time, and they aren't.
+                //   • Pushing per-eye arrays here DID affect the draws (feeding identical
+                //     matrices flattened it further), so SetGlobalMatrixArray is a viable
+                //     lever — but there is no distinct per-eye SOURCE to feed it.
+                // Verdict: SPI needs per-eye view data that single-pass doesn't expose at
+                // the RendererFeature stage. Next step is native/Unity-OpenXR level (does
+                // the runtime's xrLocateViews return distinct views under the SPI locate?),
+                // NOT a C# RendererFeature change. See docs~/experiments/spi-single-pass.md.
                 if (xr.singlePassEnabled && xr.viewCount == 2)
                 {
                     var sV     = new Matrix4x4[2];
@@ -140,26 +155,14 @@ namespace DisplayXR.URP
                     var sInvVP = new Matrix4x4[2];
                     for (int i = 0; i < 2; i++)
                     {
-                        Vector3 vi = xr.GetViewMatrix(i).inverse.GetColumn(3);
-                        bool left = (vi - eyeL).sqrMagnitude <= (vi - eyeR).sqrMagnitude;
+                        // Unity view index 0 = left eye, 1 = right (runtime view order).
+                        bool left = (i == 0);
                         Matrix4x4 view = left ? viewL : viewR;
-                        // unity_StereoMatrixP is the GPU-convention projection
-                        // (reversed-Z / platform clip range) — the same conversion
-                        // SetViewProjectionMatrices bakes internally in the multipass
-                        // path. renderIntoTexture=true: XR renders into an RT.
                         Matrix4x4 gpuProj = GL.GetGPUProjectionMatrix(left ? projL : projR, true);
                         sV[i]     = view;
                         sP[i]     = gpuProj;
                         sVP[i]    = gpuProj * view;
                         sInvVP[i] = sVP[i].inverse;
-                    }
-
-                    if (m_LogCount < 4)
-                    {
-                        m_LogCount++;
-                        Debug.Log($"[KooimaProjFix][SPI] views={xr.viewCount} " +
-                                  $"slot0.VP.m02={sVP[0].m02:F4} slot1.VP.m02={sVP[1].m02:F4} " +
-                                  $"(urp slot0 proj.m02={xr.GetProjMatrix(0).m02:F4})");
                     }
 
                     using (var builder = renderGraph.AddUnsafePass<PassData>("KooimaProjectionFixSPI", out var passData))
@@ -172,11 +175,6 @@ namespace DisplayXR.URP
                         builder.SetRenderFunc((PassData d, UnsafeGraphContext ctx) =>
                         {
                             var cmd = CommandBufferHelpers.GetNativeCommandBuffer(ctx.cmd);
-                            // EXPERIMENTAL LEVER. If these overrides stick for the
-                            // opaque draws, the image matches MultiPass; if the engine
-                            // re-binds its own (fov-built) UnityStereoGlobals cbuffer,
-                            // expect off-axis deformation / over-separation. That
-                            // verdict is the whole point of this branch.
                             cmd.SetGlobalMatrixArray(s_StereoV,     d.stereoV);
                             cmd.SetGlobalMatrixArray(s_StereoP,     d.stereoP);
                             cmd.SetGlobalMatrixArray(s_StereoVP,    d.stereoVP);
