@@ -28,13 +28,32 @@ Evidence (Player.log, head ~centred):
 
 **Conclusion.** SPI is not achievable as a C#/RendererFeature change. The blocker moved
 from "can we inject per-eye projection" (viable) to "single-pass doesn't expose distinct
-per-eye view/projection at the injection point." Resolving it is a native / Unity-OpenXR
-question — does the runtime's `xrLocateViews` return two distinct views under the *single*
-SPI locate call, and if so why doesn't Unity surface them at RecordRenderGraph? — not a
-plugin RendererFeature fix. **MultiPass stays forced.** Next step (if pursued): throttled
-native logging in `hooked_xrLocateViews` of `views[0].pose` vs `views[1].pose` + render
-mode, to see whether the collapse is runtime-side or Unity-OpenXR-side. Likely needs
-runtime/Unity work, so de-prioritised.
+per-eye view/projection at the injection point." **MultiPass stays forced.**
+
+### Native `xrLocateViews` A/B (2026-06-28) — collapse is at the RUNTIME OUTPUT, not Unity-OpenXR
+
+Added a throttled log in `hooked_xrLocateViews` of the RAW per-view poses+fovs straight
+out of `s_real_locate_views`, before any plugin processing. Same native DLL, same runtime,
+same scene — only the Unity render mode differs:
+
+| Mode | `v0.pos` vs `v1.pos` | `v0.fov` vs `v1.fov` | visual |
+|------|----------------------|----------------------|--------|
+| **SPI**       | identical, `dPosX=0.0000` (and static frame-to-frame) | identical, `dFovL=0.0000` | flat |
+| **MultiPass** | distinct, `dPosX≈0.011→0.034` (tracks head) | distinct, `dFovL≈-0.015→-0.054` | 3D ✓ |
+
+So the runtime's `xrLocateViews` **returns two identical views under the single SPI locate**
+and two distinct eyes under MultiPass. The disparity is gone *at the runtime's output* —
+Unity-OpenXR is **not** discarding separation after a correct return; there was none to
+discard. Because the runtime is render-mode-agnostic, the trigger is upstream of its Kooima
+math: the locate INPUTS under SPI are collapsed (consistent with the C# `rawEyeX L==R==0`
+under SPI vs separated under MultiPass). That is a runtime / plugin-rig-input path
+(eye-tracking → `XR_EXT_view_rig` descriptor → single SPI locate), **not** a Unity-side or
+RendererFeature fix.
+
+**Next step (if pursued):** log the chained `XrDisplayRigEXT`/`XrCameraRigEXT` descriptor's
+eye inputs in `hooked_xrLocateViews` for both modes to see whether the plugin chains
+collapsed eyes under SPI, or whether Unity's single SPI locate call drives the runtime to
+duplicate one eye. Likely runtime/Unity-OpenXR work; SPI remains de-prioritised.
 
 ---
 

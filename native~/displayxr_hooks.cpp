@@ -545,6 +545,32 @@ hooked_xrLocateViews(XrSession session,
 	if (count < 2) {
 		return result;
 	}
+
+	// SPI diagnostic (experiment/spi-single-pass): log the RAW per-view poses + fovs
+	// the runtime just returned, BEFORE any of our processing. This localizes the
+	// single-pass disparity collapse: run the SAME native build in SPI vs MultiPass
+	// (C# render mode) and compare here. If v0 != v1 in BOTH modes, the runtime
+	// returns distinct eyes and the collapse is Unity-OpenXR-side (it loses the
+	// separation before C# sees it under single-pass). If v0 == v1 under SPI but
+	// distinct under MultiPass, the runtime itself returns identical views for the
+	// single SPI locate (runtime-side). Throttled to the first few frames.
+	{
+		static int s_locate_diag = 0;
+		if (s_locate_diag < 6) {
+			s_locate_diag++;
+			displayxr_log("[DisplayXR][locate-diag] capIn=%u countOut=%u "
+			              "v0.pos=(%.4f,%.4f,%.4f) v1.pos=(%.4f,%.4f,%.4f) dPosX=%.4f "
+			              "v0.fov(L,R)=(%.4f,%.4f) v1.fov(L,R)=(%.4f,%.4f) dFovL=%.4f\n",
+			              viewCapacityInput, count,
+			              views[0].pose.position.x, views[0].pose.position.y, views[0].pose.position.z,
+			              views[1].pose.position.x, views[1].pose.position.y, views[1].pose.position.z,
+			              views[1].pose.position.x - views[0].pose.position.x,
+			              views[0].fov.angleLeft, views[0].fov.angleRight,
+			              views[1].fov.angleLeft, views[1].fov.angleRight,
+			              views[1].fov.angleLeft - views[0].fov.angleLeft);
+		}
+	}
+
 	// Sim_display advertises max-view-count over all render modes (quad => 4),
 	// even in 2D / anaglyph where it replicates view 0 into the extras. We
 	// compute Kooima for all `count` views: replica raw eyes propagate to

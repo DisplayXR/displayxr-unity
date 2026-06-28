@@ -36,3 +36,10 @@ is available to inject — the image renders flat. MultiPass works because Unity
 distinct per-eye matrices later, per eye-pass. This is upstream of C# (native /
 Unity-OpenXR), not a RendererFeature-fixable issue. Full evidence:
 `docs~/experiments/spi-single-pass.md`. **MultiPass remains forced.**
+
+A native `xrLocateViews` A/B (same DLL/runtime, only render mode varies) localized it
+further: the runtime returns two **identical** views under the single SPI locate
+(`dPosX=0`, `dFovL=0`) but two **distinct** eyes under MultiPass (tracks head). So the
+collapse is at the runtime's locate OUTPUT — not Unity-OpenXR dropping separation
+afterward — triggered by collapsed locate inputs under single-pass. Fixing SPI would mean
+runtime/plugin-rig-input work, not a plugin RendererFeature change.
