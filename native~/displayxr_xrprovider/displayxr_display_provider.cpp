@@ -56,9 +56,13 @@ bool                    s_textures_created = false;
 uint32_t                s_current_image_index = 0;  // acquired this frame
 bool                    s_frame_in_flight = false;
 
+extern "C" void dxr_prov_file_log(const char *s); // defined in the session TU
+
 void prov_log(const char *msg)
 {
 	fprintf(stderr, "%s", msg);
+	OutputDebugStringA(msg);
+	dxr_prov_file_log(msg);
 }
 
 // OpenXR (right-handed, -Z forward) -> Unity (left-handed, +Z forward).
