@@ -53,6 +53,19 @@ because Unity already presents its own swapchain on its HWND (DXGI one-swapchain
 for D3D12 → `E_ACCESSDENIED`) and its flat present would fight the weave; Unity's own OpenXR
 plugin never emits the binding, so the hook injects it.
 
+> **What this looks like from the runtime's side (and why the overlay exists).**
+> The injected HWND is a **plugin-created child overlay** over Unity's main window
+> (`displayxr_get_app_main_view` in `native~/displayxr_win32.c`: default opaque =
+> `WS_CHILD`; transparent #57 = top-level `WS_POPUP`). On the runtime this makes
+> Unity-standalone-D3D12 an ordinary `_handle` app on the **in-process native
+> `comp_d3d12_compositor`** — same compositor/atlas/crop/DP-weave path as
+> `cube_handle_d3d12_win`; the overlay is the only structural difference. (Unity
+> *under the shell* instead passes the top-level HWND and takes the
+> client→IPC→D3D11-service route.) For the full cross-process trace and the three
+> reasons the overlay is required, see the runtime doc:
+> **`displayxr-runtime/docs/architecture/unity-d3d12-app-path.md`**
+> (<https://github.com/DisplayXR/displayxr-runtime/blob/main/docs/architecture/unity-d3d12-app-path.md>).
+
 ### `xrGetSystemProperties` — display info + view-rig detection
 
 Extracts physical display geometry / pixel dims, and detects whether the runtime advertises
