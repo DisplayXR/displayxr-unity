@@ -26,6 +26,11 @@
 #include "IUnityGraphicsVulkan.h"
 #endif
 
+// Custom IUnityXRDisplay Display Provider registration (epic #166, M1).
+// Implemented in displayxr_xrprovider/displayxr_display_provider.cpp.
+extern "C" void displayxr_register_xr_display_provider(IUnityInterfaces *ifaces);
+extern "C" void displayxr_unregister_xr_display_provider(void);
+
 static IUnityInterfaces *s_unity_ifaces = nullptr;
 static IUnityGraphics   *s_unity_gfx    = nullptr;
 #if defined(DXR_HAVE_UNITY_VULKAN)
@@ -89,11 +94,19 @@ UnityPluginLoad(IUnityInterfaces *unityInterfaces)
 		// case kUnityGfxDeviceEventInitialize already fired — capture now too.
 		on_graphics_device_event(kUnityGfxDeviceEventInitialize);
 	}
+
+	// Register the custom IUnityXRDisplay Display Provider (epic #166, M1).
+	// This is what makes Unity drive the DisplayXR runtime as a first-class
+	// display subsystem (instead of the OpenXR hook). Safe even when the
+	// DisplayXR display subsystem isn't selected in XR Plug-in Management —
+	// RegisterLifecycleProvider just sits idle until Unity starts it.
+	displayxr_register_xr_display_provider(s_unity_ifaces);
 }
 
 extern "C" void UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API
 UnityPluginUnload(void)
 {
+	displayxr_unregister_xr_display_provider();
 	if (s_unity_gfx)
 		s_unity_gfx->UnregisterDeviceEventCallback(on_graphics_device_event);
 	s_unity_gfx    = nullptr;
