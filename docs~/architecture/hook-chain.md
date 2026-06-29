@@ -89,14 +89,17 @@ composition layers: `XrCompositionLayerWindowSpaceEXT` (2D UI), `XrCompositionLa
 | **Built app** (this doc) | Unity's loader session | yes (`hooked_*`) | **always 2** eyes |
 | **Standalone preview / Play Mode** | plugin-owned SA session | **no** (calls the real entry points directly) | **N** (2/4/8) via a multi-camera atlas rig |
 
-A built Unity app **renders and submits only its 2 eyes**; the runtime's Display Processor
-synthesises the extra quad/lenticular views (4/8) downstream. Distinct N-view *rendering*
-exists only in the standalone preview, where the plugin runs its **own** OpenXR session
-(view capacity 32) and renders one Unity `Camera` per view into an atlas RenderTexture —
-not Unity's stereo pipeline. (`hooked_xrLocateViews` may receive `*viewCountOutput` = the
-display's **max-mode** view count — 2 on a Leia 2D/3D panel, up to 4/8 on quad/lenticular —
-so the `count > 2` loop is **real on multi-view displays**, not dead; but Unity still
-submits 2-eye projection layers. See the note below.)
+A built Unity app **renders and submits only its 2 eyes**. **There is no view synthesis
+downstream** — nothing reconstructs additional views from those 2 eyes, so a built Unity app
+can only drive display modes whose view count is ≤ 2; a mode with more views (e.g. a 2×2 Quad
+mode, `view_count = 4`) requires the app to render all N views itself. Distinct N-view
+*rendering* exists only in the standalone preview, where the plugin runs its **own** OpenXR
+session (view capacity 32) and renders one Unity `Camera` per view into an atlas RenderTexture
+— not Unity's stereo pipeline. (`hooked_xrLocateViews` may receive `*viewCountOutput` = the
+display's **max-mode** view count — 2 on a 2-view eye-tracked panel, up to 4 on a Quad/N-view
+display — so the `count > 2` loop is **real on multi-view displays**, not dead; but Unity still
+submits 2-eye projection layers, which is exactly why it is limited to ≤2-view modes. See the
+note below.)
 
 > **The view-configuration type is *not* what makes this 2-view.** The DisplayXR runtime
 > advertises only `XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO` to **every** app — native
@@ -105,8 +108,9 @@ submits 2-eye projection layers. See the note below.)
 > accepts a projection `viewCount` matching *any* mode's `view_count`). The difference is
 > what each app *does* with that: a native handle app renders the active mode's **N views as
 > tiles in one worst-case-sized swapchain** (multiview tiling, ADR-010); the Unity built app
-> renders **only the 2 eyes** and lets the DP synthesise the rest. So "always 2-view" is a
-> property of the **Unity built-app submission model**, not of `PRIMARY_STEREO`.
+> renders **only the 2 eyes**, so it is restricted to modes with view count ≤ 2 (there is no
+> view synthesis to fill the rest). So "always 2-view" is a property of the **Unity built-app
+> submission model**, not of `PRIMARY_STEREO`.
 
 ## Rendering model: native handle app vs Unity plugin
 
@@ -157,9 +161,9 @@ Wherever the atlas composite reads the per-view source it must sample the layer 
 **SPI eligibility:** SPI is structurally a 2-view feature, and what matters is Unity's
 **rendered** view count — `xr.viewCount` (the URP `XRPass`), which is the 2 eyes Unity
 submits, *not* the native locate `*viewCountOutput` (the display's max-mode count). Unity
-renders 2 eyes regardless of the display's lenticular view count (those are DP-synthesised),
-so SPI is valid; the per-frame `xr.viewCount == 2` guard in `KooimaProjectionFixFeature`
-enforces it.
+renders 2 eyes regardless of the display's lenticular view count (Unity simply cannot drive
+modes that need more than 2 views — there is no view synthesis), so SPI is valid; the
+per-frame `xr.viewCount == 2` guard in `KooimaProjectionFixFeature` enforces it.
 
 ## Thread-safe shared state
 
