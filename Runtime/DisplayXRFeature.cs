@@ -558,7 +558,7 @@ namespace DisplayXR
         /// version apart from a stock build without it — for local dev against an
         /// unreleased runtime, set the DISPLAYXR_FORCE_SPI=1 environment variable.
         /// </summary>
-        private static readonly System.Version k_MinSpiRuntimeVersion = new System.Version(1, 26, 0);
+        private static readonly System.Version k_MinSpiRuntimeVersion = new System.Version(1, 26, 1);
 
         /// <summary>
         /// Whether the active runtime is new enough to render SPI correctly (has the

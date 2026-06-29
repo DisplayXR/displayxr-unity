@@ -545,48 +545,6 @@ hooked_xrLocateViews(XrSession session,
 	if (count < 2) {
 		return result;
 	}
-
-	// SPI rig diagnostic (experiment/spi-single-pass): we KNOW the runtime returns
-	// identical views[0]==views[1] under the single SPI locate but distinct under
-	// MultiPass (same DLL+runtime). This logs the FULL rig contract — the descriptor
-	// INPUTS we chain (tunables, esp. ipdFactor — the eye-spread driver), the
-	// locate-call params (displayTime / viewConfig / space-swap), and the runtime's
-	// returned rawEyes — to localize the collapse:
-	//   • inputs (ipdF…) DIFFER between modes → plugin-side: the rig isn't getting the
-	//     tunables under SPI (active-rig gating / LateUpdate timing). Fix C#.
-	//   • inputs IDENTICAL but displayTime differs → Unity passes a different predicted
-	//     time under SPI → runtime samples eye-tracking differently. Fix time, plugin or
-	//     runtime.
-	//   • inputs + displayTime IDENTICAL but rawEyes/views collapse under SPI → runtime
-	//     produces mono output for identical input → dig runtime-side (we own it).
-	// Throttled. rig_raw is filled by the runtime only when rig_chained.
-	{
-		// Periodic (every ~90 calls) so it captures STEADY STATE (tracking=1 once a
-		// face locks), not just the no-track startup frames.
-		static int s_rig_diag = 0;
-		if ((s_rig_diag++ % 90) == 0) {
-			DisplayXRTunables dt = displayxr_state_get_tunables();
-			displayxr_log("[DisplayXR][rig-diag] mode=%s chained=%d spaceSwap=%d "
-			              "ipdF=%.4f parF=%.4f perF=%.4f vdh=%.4f convD=%.4f fov=%.4f "
-			              "dispTime=%lld viewCfg=%d | "
-			              "rawEyeCount=%u tracking=%d rawE0=(%.4f,%.4f,%.4f) rawE1=(%.4f,%.4f,%.4f) drawX=%.4f | "
-			              "v0.pos=(%.4f,%.4f,%.4f) v1.pos=(%.4f,%.4f,%.4f) dPosX=%.4f dFovL=%.4f\n",
-			              dt.camera_centric ? "cam" : "disp", rig_chained ? 1 : 0,
-			              (s_local_space != XR_NULL_HANDLE) ? 1 : 0,
-			              dt.ipd_factor, dt.parallax_factor, dt.perspective_factor,
-			              dt.virtual_display_height, dt.inv_convergence_distance, dt.fov_override,
-			              (long long)viewLocateInfo->displayTime, (int)viewLocateInfo->viewConfigurationType,
-			              rig_raw.eyeCountOutput, (int)rig_raw.isTracking,
-			              rig_raw.rawEyes[0].x, rig_raw.rawEyes[0].y, rig_raw.rawEyes[0].z,
-			              rig_raw.rawEyes[1].x, rig_raw.rawEyes[1].y, rig_raw.rawEyes[1].z,
-			              rig_raw.rawEyes[1].x - rig_raw.rawEyes[0].x,
-			              views[0].pose.position.x, views[0].pose.position.y, views[0].pose.position.z,
-			              views[1].pose.position.x, views[1].pose.position.y, views[1].pose.position.z,
-			              views[1].pose.position.x - views[0].pose.position.x,
-			              views[1].fov.angleLeft - views[0].fov.angleLeft);
-		}
-	}
-
 	// Sim_display advertises max-view-count over all render modes (quad => 4),
 	// even in 2D / anaglyph where it replicates view 0 into the extras. We
 	// compute Kooima for all `count` views: replica raw eyes propagate to
