@@ -177,57 +177,35 @@ namespace DisplayXR
             EditorApplication.playModeStateChanged += OnPlayModeStateChanged;
 #endif
 
-            // Force multi-pass rendering. DisplayXRDisplay/DisplayXRCamera push
-            // the Kooima asymmetric projection via Camera.SetStereoProjectionMatrix,
-            // which Unity gates to MultiPass on every platform — in SPI it is
-            // silently rejected ("Can't set custom eye projection matrix when
-            // not in multipass mode") and the scene renders with a degenerate
-            // frustum. Verified by experiment on Windows D3D12, issue #69.
+            // Render-mode decision. Single Pass Instanced (SPI) ~halves the per-eye
+            // CPU draw/cull cost. It works ONLY on URP + Windows + D3D12 against a
+            // DisplayXR runtime that samples per-view subImage.imageArrayIndex —
+            // KooimaProjectionFixFeature re-pushes the off-axis projection via the
+            // command buffer (#127) and the runtime reads the correct array layer per
+            // eye. Everywhere else SPI renders wrong:
+            //   • BiRP pushes Kooima via Camera.SetStereoProjectionMatrix, which Unity
+            //     gates to MultiPass-only (#69) — no command-buffer injection hook.
+            //   • macOS/Metal SPI is broken in Unity (Won't Fix).
+            //   • non-D3D12 backends: the runtime's imageArrayIndex sampling fix is D3D12.
+            // So: force MultiPass on every non-SPI-capable target, and HONOR the
+            // project's chosen render mode on capable ones (Unity defaults to SPI).
             //
-            // SPI EXPERIMENT (experiment/spi-single-pass): under URP the projection
-            // no longer rides on SetStereoProjectionMatrix at all — KooimaProjection
-            // FixFeature re-pushes the runtime matrices via the command buffer (#127),
-            // the exact API that was MultiPass-gated. So SPI is achievable on the URP
-            // path. With DISPLAYXR_SPI_EXPERIMENTAL defined we LEAVE the project's
-            // chosen render mode alone (so you can select Single Pass Instanced) and
-            // let the RendererFeature drive both eyes. Without the define, behavior is
-            // unchanged: MultiPass is forced.
-            //
-            // SPI ELIGIBILITY GATE (the rule, documented):
-            //  • SPI is structurally a 2-view feature (eyes in array layers 0/1,
-            //    unity_StereoEyeIndex ∈ {0,1}). It is valid iff the app renders exactly
-            //    2 views — "max active view count == 2".
-            //  • The Unity BUILT-APP path is ALWAYS 2-view (PRIMARY_STEREO). N-view
-            //    quad/lenticular output is synthesised by the runtime's Display
-            //    Processor downstream (or, for distinct N-view rendering, by the
-            //    editor standalone preview's own multi-camera session) — it is NEVER
-            //    driven through Unity's built-app stereo pipeline. So the gate is
-            //    structurally satisfied here regardless of the display's view count.
-            //  • Enforcement is per-frame in KooimaProjectionFixFeature
-            //    (`xr.singlePassEnabled && xr.viewCount == 2`); if a pass ever carried
-            //    != 2 views the SPI push is skipped (it can't, for Unity).
-            //  • Platform: URP only (the RendererFeature assembly is DISPLAYXR_URP-
-            //    gated); Windows/D3D12 with a runtime that samples per-view
-            //    subImage.imageArrayIndex (see docs~/experiments/spi-single-pass.md —
-            //    the runtime fix). BiRP and macOS/Metal stay MultiPass.
-            // Productionising = replace the define with an auto-decision on
-            // (URP && Windows && D3D12), since the view-count condition is always met.
+            // Eligibility is purely platform/pipeline — the *view-count* condition is
+            // always satisfied: the Unity built-app path is always 2-view
+            // (PRIMARY_STEREO); N-view quad/lenticular output is synthesised by the
+            // runtime's Display Processor downstream (distinct N-view rendering only
+            // happens in the editor standalone preview's own multi-camera session, never
+            // through the built-app stereo pipeline). KooimaProjectionFixFeature's
+            // per-frame `xr.viewCount == 2` is the belt-and-suspenders guard. SPI also
+            // requires a runtime new enough to carry the imageArrayIndex fix; ship the
+            // plugin and runtime together (see docs~/experiments/spi-single-pass.md).
             var settings = OpenXRSettings.Instance;
-#if DISPLAYXR_SPI_EXPERIMENTAL
-            if (settings != null)
+            bool spiCapable = IsSinglePassInstancedSupported();
+            if (settings != null && !spiCapable &&
+                settings.renderMode != OpenXRSettings.RenderMode.MultiPass)
             {
-                Debug.LogWarning(
-                    "[DisplayXR][SPI-EXPERIMENT] DISPLAYXR_SPI_EXPERIMENTAL is defined — " +
-                    "NOT forcing MultiPass. Active render mode = " + settings.renderMode +
-                    ". SPI valid because the Unity built-app path is always 2-view " +
-                    "(PRIMARY_STEREO; N-view is DP-synthesised downstream). Per-frame " +
-                    "viewCount==2 guard enforces it. URP/Windows/D3D12 only (needs the " +
-                    "runtime imageArrayIndex fix); BiRP and macOS/Metal still need MultiPass.");
-            }
-#else
-            if (settings != null && settings.renderMode != OpenXRSettings.RenderMode.MultiPass)
-            {
-                Debug.Log("[DisplayXR] Forcing MultiPass render mode (required for asymmetric frustum projection)");
+                Debug.Log("[DisplayXR] Forcing MultiPass — SPI unsupported here (needs " +
+                          "URP + Windows + D3D12). Was: " + settings.renderMode);
                 settings.renderMode = OpenXRSettings.RenderMode.MultiPass;
 
                 // Also update the serialized backing field so ApplySettings()
@@ -237,7 +215,12 @@ namespace DisplayXR
                 if (field != null)
                     field.SetValue(settings, OpenXRSettings.RenderMode.MultiPass);
             }
-#endif
+            else if (settings != null && spiCapable &&
+                     settings.renderMode == OpenXRSettings.RenderMode.SinglePassInstanced)
+            {
+                Debug.Log("[DisplayXR] Single Pass Instanced enabled (URP + Windows + D3D12). " +
+                          "Requires a DisplayXR runtime that samples per-view imageArrayIndex.");
+            }
 
             // When the app requested transparent background, opt the session
             // into AlphaBlend so Unity's render path preserves alpha=0 in the
@@ -406,18 +389,25 @@ namespace DisplayXR
         /// <inheritdoc />
         protected override void GetValidationChecks(List<ValidationRule> rules, BuildTargetGroup targetGroup)
         {
-#if !DISPLAYXR_SPI_EXPERIMENTAL
+            // Single Pass Instanced is supported on URP + Windows + D3D12 (with a
+            // DisplayXR runtime that samples per-view imageArrayIndex); on any other
+            // target the feature forces MultiPass automatically at session start. So
+            // this is a NON-blocking note shown only when SPI is selected — not an
+            // error (SPI is correct on capable setups). MultiPass remains the safe
+            // default and the fallback the runtime enforces.
             rules.Add(new ValidationRule(this)
             {
-                message = "DisplayXR requires Multi-Pass render mode. " +
-                          "Single-pass instanced is incompatible with Camera.SetStereoProjectionMatrix " +
-                          "(MultiPass-only on every platform), which DisplayXR uses to push the Kooima " +
-                          "asymmetric projection per eye.",
-                error = true,
+                message = "DisplayXR: Single Pass Instanced is supported only on URP + " +
+                          "Windows + D3D12 with a DisplayXR runtime that has the per-view " +
+                          "imageArrayIndex fix. On any other target the feature forces " +
+                          "MultiPass automatically. If unsure, select MultiPass.",
+                error = false,
                 checkPredicate = () =>
                 {
                     var settings = OpenXRSettings.GetSettingsForBuildTargetGroup(targetGroup);
-                    return settings != null && settings.renderMode == OpenXRSettings.RenderMode.MultiPass;
+                    // Pass silently for MultiPass; surface the note when SPI is selected.
+                    return settings == null ||
+                           settings.renderMode == OpenXRSettings.RenderMode.MultiPass;
                 },
                 fixIt = () =>
                 {
@@ -425,9 +415,8 @@ namespace DisplayXR
                     if (settings != null)
                         settings.renderMode = OpenXRSettings.RenderMode.MultiPass;
                 },
-                fixItAutomatic = true,
+                fixItAutomatic = false,
             });
-#endif // !DISPLAYXR_SPI_EXPERIMENTAL
         }
 #endif
 
@@ -552,6 +541,28 @@ namespace DisplayXR
             mat.m02 = m[8];  mat.m12 = m[9];  mat.m22 = m[10]; mat.m32 = m[11];
             mat.m03 = m[12]; mat.m13 = m[13]; mat.m23 = m[14]; mat.m33 = m[15];
             return mat;
+        }
+
+        /// <summary>
+        /// Whether Single Pass Instanced is supported on the current platform/pipeline:
+        /// URP + Windows + D3D12. Elsewhere SPI renders wrong (BiRP — MultiPass-only
+        /// SetStereoProjectionMatrix; macOS/Metal — Unity SPI broken; non-D3D12 — no
+        /// runtime imageArrayIndex fix), so we force MultiPass. The Unity built-app path
+        /// is always 2-view, so the view count never disqualifies SPI — only the
+        /// platform does. URP is detected by the active pipeline asset's type (no hard
+        /// URP assembly reference: this type lives in the core assembly).
+        /// </summary>
+        private static bool IsSinglePassInstancedSupported()
+        {
+            var plat = Application.platform;
+            bool isWindows = plat == RuntimePlatform.WindowsPlayer
+                          || plat == RuntimePlatform.WindowsEditor;
+            if (!isWindows) return false;
+            if (SystemInfo.graphicsDeviceType != UnityEngine.Rendering.GraphicsDeviceType.Direct3D12)
+                return false;
+            var rp = UnityEngine.Rendering.GraphicsSettings.currentRenderPipeline;
+            var typeName = rp != null ? rp.GetType().FullName : null;
+            return typeName != null && typeName.Contains("Universal");
         }
 
         /// <summary>
