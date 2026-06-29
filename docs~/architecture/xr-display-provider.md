@@ -80,16 +80,25 @@ compositor-owned `ID3D12Resource`s on Unity's device"). Then:
 3. `PopulateNextFrameDesc` sets `renderPasses[0].textureId` to the Unity texture
    wrapping the **acquired** swapchain image (rotates by acquired index).
 
-> **Why not the cross-device bridge** (the plan's "bridge-first")? The bridge
-> (separate runtime device + shared texture + per-frame copy) exists in the
-> standalone because the editor may run **D3D11**; its comment warns that sharing
-> Unity's device "caused device-removal" — but that was the **D3D11-editor** case.
-> For a **built player on D3D12** (the M1 validation target), sharing Unity's D3D12
-> device is exactly what UE does and what the runtime documents, and it is *less*
-> code (no bridge, no copy). So M1 implements zero-copy directly; the bridge
-> remains the editor/D3D11 fallback (M2). **This is the one deliberate deviation
-> from the approved plan, made because zero-copy turned out simpler *and* proven
-> for the D3D12 target.**
+> **M1 EMPIRICAL RESULT — zero-copy fails; the bridge IS required.** M1 first
+> tried zero-copy (deviating from the plan's "bridge-first"). On-panel validation
+> (RTX 3080, Leia DP, dev runtime v1.26.1) showed the full path works up to and
+> including a *successful* `CreateTexture` — and then Unity **crashes with D3D12
+> device-removed** (`887a0005`) the moment it touches the XR textures
+> (`XRTextureManager::RequestCreateTexture`). Root cause: although we pass Unity's
+> `ID3D12Device` to `xrCreateSession`, the runtime's in-process D3D12 compositor
+> allocates its swapchain `ID3D12Resource`s on its **own** device instance;
+> handing those raw cross-device pointers to Unity is invalid D3D12 usage →
+> device removal. **Cross-`ID3D12Device` sharing requires shared NT handles — i.e.
+> the bridge.** This vindicates the plan's original "bridge-first" call.
+>
+> **Required fix (M1b):** run the runtime session on a **separate** D3D12 device
+> (as `displayxr_standalone_d3d12.cpp` already does), allocate a **shared,
+> 2-slice-array** bridge texture (NT handle, opened on Unity's device), hand the
+> *bridge's* Unity-side pointer to `CreateTexture`, and per-frame copy
+> bridge→runtime-swapchain with a cross-device fence (mirror `create_atlas_bridge`
+> / `blit_atlas`, extended from `arraySize=1` to `arraySize=2`). Everything else in
+> this provider is unchanged and already validated.
 
 ## SPI render-pass setup
 

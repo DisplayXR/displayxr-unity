@@ -179,6 +179,22 @@ static DxrProvLogCallback s_log_cb = NULL;
 
 void dxr_prov_set_log_callback(DxrProvLogCallback cb) { s_log_cb = cb; }
 
+// Append a line to %TEMP%\displayxr_prov_native.log. Unity's Player.log does not
+// capture a native plugin's stderr, so route provider diagnostics to a file we
+// can read after a run (M1 bring-up aid). Shared by the provider TU via
+// dxr_prov_file_log.
+extern "C" void dxr_prov_file_log(const char *s)
+{
+	char path[MAX_PATH];
+	DWORD n = GetTempPathA(MAX_PATH, path);
+	if (n == 0 || n > MAX_PATH - 32) return;
+	strncat(path, "displayxr_prov_native.log", MAX_PATH - strlen(path) - 1);
+	FILE *f = fopen(path, "a");
+	if (!f) return;
+	fputs(s, f);
+	fclose(f);
+}
+
 static void ps_log(const char *fmt, ...)
 {
 	char buf[1024];
@@ -187,6 +203,8 @@ static void ps_log(const char *fmt, ...)
 	vsnprintf(buf, sizeof(buf), fmt, ap);
 	va_end(ap);
 	fputs(buf, stderr);
+	OutputDebugStringA(buf);
+	dxr_prov_file_log(buf);
 	if (s_log_cb) s_log_cb(buf);
 }
 
