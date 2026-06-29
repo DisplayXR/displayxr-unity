@@ -187,14 +187,31 @@ namespace DisplayXR
             // SPI EXPERIMENT (experiment/spi-single-pass): under URP the projection
             // no longer rides on SetStereoProjectionMatrix at all — KooimaProjection
             // FixFeature re-pushes the runtime matrices via the command buffer (#127),
-            // the exact API that was MultiPass-gated. So SPI is at least conceivable
-            // for the URP path. With DISPLAYXR_SPI_EXPERIMENTAL defined we LEAVE the
-            // project's chosen render mode alone (so you can select Single Pass
-            // Instanced) and let the RendererFeature drive both eyes. Without the
-            // define, behavior is unchanged: MultiPass is forced. SPI is inherently a
-            // 2-views-in-an-array mode — the RendererFeature gates the array push on
-            // the XR pass actually carrying exactly 2 views (see KooimaProjectionFix
-            // Feature), which is the precise form of "display max view count == 2".
+            // the exact API that was MultiPass-gated. So SPI is achievable on the URP
+            // path. With DISPLAYXR_SPI_EXPERIMENTAL defined we LEAVE the project's
+            // chosen render mode alone (so you can select Single Pass Instanced) and
+            // let the RendererFeature drive both eyes. Without the define, behavior is
+            // unchanged: MultiPass is forced.
+            //
+            // SPI ELIGIBILITY GATE (the rule, documented):
+            //  • SPI is structurally a 2-view feature (eyes in array layers 0/1,
+            //    unity_StereoEyeIndex ∈ {0,1}). It is valid iff the app renders exactly
+            //    2 views — "max active view count == 2".
+            //  • The Unity BUILT-APP path is ALWAYS 2-view (PRIMARY_STEREO). N-view
+            //    quad/lenticular output is synthesised by the runtime's Display
+            //    Processor downstream (or, for distinct N-view rendering, by the
+            //    editor standalone preview's own multi-camera session) — it is NEVER
+            //    driven through Unity's built-app stereo pipeline. So the gate is
+            //    structurally satisfied here regardless of the display's view count.
+            //  • Enforcement is per-frame in KooimaProjectionFixFeature
+            //    (`xr.singlePassEnabled && xr.viewCount == 2`); if a pass ever carried
+            //    != 2 views the SPI push is skipped (it can't, for Unity).
+            //  • Platform: URP only (the RendererFeature assembly is DISPLAYXR_URP-
+            //    gated); Windows/D3D12 with a runtime that samples per-view
+            //    subImage.imageArrayIndex (see docs~/experiments/spi-single-pass.md —
+            //    the runtime fix). BiRP and macOS/Metal stay MultiPass.
+            // Productionising = replace the define with an auto-decision on
+            // (URP && Windows && D3D12), since the view-count condition is always met.
             var settings = OpenXRSettings.Instance;
 #if DISPLAYXR_SPI_EXPERIMENTAL
             if (settings != null)
@@ -202,9 +219,10 @@ namespace DisplayXR
                 Debug.LogWarning(
                     "[DisplayXR][SPI-EXPERIMENT] DISPLAYXR_SPI_EXPERIMENTAL is defined — " +
                     "NOT forcing MultiPass. Active render mode = " + settings.renderMode +
-                    ". Single Pass Instanced is only handled on the URP path (Windows); " +
-                    "BiRP and macOS/Metal still require MultiPass and will render wrong " +
-                    "under SPI.");
+                    ". SPI valid because the Unity built-app path is always 2-view " +
+                    "(PRIMARY_STEREO; N-view is DP-synthesised downstream). Per-frame " +
+                    "viewCount==2 guard enforces it. URP/Windows/D3D12 only (needs the " +
+                    "runtime imageArrayIndex fix); BiRP and macOS/Metal still need MultiPass.");
             }
 #else
             if (settings != null && settings.renderMode != OpenXRSettings.RenderMode.MultiPass)
