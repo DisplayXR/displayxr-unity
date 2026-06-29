@@ -177,16 +177,40 @@ namespace DisplayXR
             EditorApplication.playModeStateChanged += OnPlayModeStateChanged;
 #endif
 
-            // Force multi-pass rendering. DisplayXRDisplay/DisplayXRCamera push
-            // the Kooima asymmetric projection via Camera.SetStereoProjectionMatrix,
-            // which Unity gates to MultiPass on every platform — in SPI it is
-            // silently rejected ("Can't set custom eye projection matrix when
-            // not in multipass mode") and the scene renders with a degenerate
-            // frustum. Verified by experiment on Windows D3D12, issue #69.
+            // Render-mode decision. Single Pass Instanced (SPI) ~halves the per-eye
+            // CPU draw/cull cost. It works ONLY on URP + Windows + D3D12 against a
+            // DisplayXR runtime that samples per-view subImage.imageArrayIndex —
+            // KooimaProjectionFixFeature re-pushes the off-axis projection via the
+            // command buffer (#127) and the runtime reads the correct array layer per
+            // eye. Everywhere else SPI renders wrong:
+            //   • BiRP pushes Kooima via Camera.SetStereoProjectionMatrix, which Unity
+            //     gates to MultiPass-only (#69) — no command-buffer injection hook.
+            //   • macOS/Metal SPI is broken in Unity (Won't Fix).
+            //   • non-D3D12 backends: the runtime's imageArrayIndex sampling fix is D3D12.
+            // So: force MultiPass on every non-SPI-capable target, and HONOR the
+            // project's chosen render mode on capable ones (Unity defaults to SPI).
+            //
+            // Eligibility is purely platform/pipeline — the *view-count* condition is
+            // always satisfied: the Unity built-app path is always 2-view
+            // (PRIMARY_STEREO); N-view quad/lenticular output is synthesised by the
+            // runtime's Display Processor downstream (distinct N-view rendering only
+            // happens in the editor standalone preview's own multi-camera session, never
+            // through the built-app stereo pipeline). KooimaProjectionFixFeature's
+            // per-frame `xr.viewCount == 2` is the belt-and-suspenders guard. SPI also
+            // requires a runtime new enough to carry the imageArrayIndex fix; ship the
+            // plugin and runtime together (see docs~/experiments/spi-single-pass.md).
             var settings = OpenXRSettings.Instance;
-            if (settings != null && settings.renderMode != OpenXRSettings.RenderMode.MultiPass)
+            bool spiCapable = IsSinglePassInstancedSupported();
+            if (settings != null && !spiCapable &&
+                settings.renderMode != OpenXRSettings.RenderMode.MultiPass)
             {
-                Debug.Log("[DisplayXR] Forcing MultiPass render mode (required for asymmetric frustum projection)");
+                // Distinguish the two reasons SPI is unavailable so the log is useful.
+                string reason = IsUrpWindowsD3D12()
+                    ? "the runtime '" + OpenXRRuntime.name + "' predates the imageArrayIndex " +
+                      "fix (need >= " + k_MinSpiRuntimeVersion + ") — update the DisplayXR runtime, " +
+                      "or set DISPLAYXR_FORCE_SPI=1 for dev"
+                    : "SPI needs URP + Windows + D3D12";
+                Debug.LogWarning("[DisplayXR] Forcing MultiPass: " + reason + ". Was: " + settings.renderMode);
                 settings.renderMode = OpenXRSettings.RenderMode.MultiPass;
 
                 // Also update the serialized backing field so ApplySettings()
@@ -195,6 +219,12 @@ namespace DisplayXR
                     System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
                 if (field != null)
                     field.SetValue(settings, OpenXRSettings.RenderMode.MultiPass);
+            }
+            else if (settings != null && spiCapable &&
+                     settings.renderMode == OpenXRSettings.RenderMode.SinglePassInstanced)
+            {
+                Debug.Log("[DisplayXR] Single Pass Instanced enabled (URP + Windows + D3D12; runtime '" +
+                          OpenXRRuntime.name + "', min " + k_MinSpiRuntimeVersion + ").");
             }
 
             // When the app requested transparent background, opt the session
@@ -364,17 +394,25 @@ namespace DisplayXR
         /// <inheritdoc />
         protected override void GetValidationChecks(List<ValidationRule> rules, BuildTargetGroup targetGroup)
         {
+            // Single Pass Instanced is supported on URP + Windows + D3D12 (with a
+            // DisplayXR runtime that samples per-view imageArrayIndex); on any other
+            // target the feature forces MultiPass automatically at session start. So
+            // this is a NON-blocking note shown only when SPI is selected — not an
+            // error (SPI is correct on capable setups). MultiPass remains the safe
+            // default and the fallback the runtime enforces.
             rules.Add(new ValidationRule(this)
             {
-                message = "DisplayXR requires Multi-Pass render mode. " +
-                          "Single-pass instanced is incompatible with Camera.SetStereoProjectionMatrix " +
-                          "(MultiPass-only on every platform), which DisplayXR uses to push the Kooima " +
-                          "asymmetric projection per eye.",
-                error = true,
+                message = "DisplayXR: Single Pass Instanced is supported only on URP + " +
+                          "Windows + D3D12 with a DisplayXR runtime that has the per-view " +
+                          "imageArrayIndex fix. On any other target the feature forces " +
+                          "MultiPass automatically. If unsure, select MultiPass.",
+                error = false,
                 checkPredicate = () =>
                 {
                     var settings = OpenXRSettings.GetSettingsForBuildTargetGroup(targetGroup);
-                    return settings != null && settings.renderMode == OpenXRSettings.RenderMode.MultiPass;
+                    // Pass silently for MultiPass; surface the note when SPI is selected.
+                    return settings == null ||
+                           settings.renderMode == OpenXRSettings.RenderMode.MultiPass;
                 },
                 fixIt = () =>
                 {
@@ -382,7 +420,7 @@ namespace DisplayXR
                     if (settings != null)
                         settings.renderMode = OpenXRSettings.RenderMode.MultiPass;
                 },
-                fixItAutomatic = true,
+                fixItAutomatic = false,
             });
         }
 #endif
@@ -508,6 +546,81 @@ namespace DisplayXR
             mat.m02 = m[8];  mat.m12 = m[9];  mat.m22 = m[10]; mat.m32 = m[11];
             mat.m03 = m[12]; mat.m13 = m[13]; mat.m23 = m[14]; mat.m33 = m[15];
             return mat;
+        }
+
+        /// <summary>
+        /// Minimum DisplayXR runtime version that ships the per-view imageArrayIndex
+        /// compositor fix (PR #656) SPI depends on. Without that fix the runtime samples
+        /// swapchain array layer 0 for both eyes and SPI renders FLAT — so we must NOT
+        /// enable SPI against an older runtime. **Set this to the DisplayXR runtime
+        /// release that includes the fix** (bump the runtime's u_version alongside it).
+        /// A version can't tell a dev build that has the fix but still reports an older
+        /// version apart from a stock build without it — for local dev against an
+        /// unreleased runtime, set the DISPLAYXR_FORCE_SPI=1 environment variable.
+        /// </summary>
+        private static readonly System.Version k_MinSpiRuntimeVersion = new System.Version(1, 26, 1);
+
+        /// <summary>
+        /// Whether the active runtime is new enough to render SPI correctly (has the
+        /// imageArrayIndex fix). The DisplayXR RELEASE version lives in the runtime NAME
+        /// (e.g. "DisplayXR Runtime (based on Monado/XRT) 'v1.25.0-…'") — NOT
+        /// OpenXRRuntime.version, which is the Monado/XRT base (e.g. 1.6.0) and is the
+        /// same across DisplayXR releases. Unknown/older → false (conservative:
+        /// MultiPass). DISPLAYXR_FORCE_SPI=1 bypasses for dev against an unreleased build.
+        /// </summary>
+        private static bool RuntimeSupportsSpi()
+        {
+            if (System.Environment.GetEnvironmentVariable("DISPLAYXR_FORCE_SPI") == "1")
+                return true;
+            var v = ParseDisplayXRRuntimeVersion(OpenXRRuntime.name);
+            return v != null && v >= k_MinSpiRuntimeVersion;
+        }
+
+        /// <summary>
+        /// Extract the "vMAJOR.MINOR.PATCH" DisplayXR release version from the OpenXR
+        /// runtime name string. Returns null if the name doesn't carry one (then SPI is
+        /// gated off — conservative).
+        /// </summary>
+        private static System.Version ParseDisplayXRRuntimeVersion(string runtimeName)
+        {
+            if (string.IsNullOrEmpty(runtimeName)) return null;
+            var m = System.Text.RegularExpressions.Regex.Match(runtimeName, @"v(\d+)\.(\d+)\.(\d+)");
+            if (!m.Success) return null;
+            return new System.Version(
+                int.Parse(m.Groups[1].Value),
+                int.Parse(m.Groups[2].Value),
+                int.Parse(m.Groups[3].Value));
+        }
+
+        /// <summary>
+        /// Platform/pipeline supports SPI: URP + Windows + D3D12. Elsewhere SPI renders
+        /// wrong (BiRP — MultiPass-only SetStereoProjectionMatrix; macOS/Metal — Unity
+        /// SPI broken; non-D3D12 — no runtime fix). The Unity built-app path is always
+        /// 2-view, so view count never disqualifies SPI — only platform + runtime do.
+        /// URP is detected by the active pipeline asset's type (no hard URP assembly
+        /// reference here).
+        /// </summary>
+        private static bool IsUrpWindowsD3D12()
+        {
+            var plat = Application.platform;
+            bool isWindows = plat == RuntimePlatform.WindowsPlayer
+                          || plat == RuntimePlatform.WindowsEditor;
+            if (!isWindows) return false;
+            if (SystemInfo.graphicsDeviceType != UnityEngine.Rendering.GraphicsDeviceType.Direct3D12)
+                return false;
+            var rp = UnityEngine.Rendering.GraphicsSettings.currentRenderPipeline;
+            var typeName = rp != null ? rp.GetType().FullName : null;
+            return typeName != null && typeName.Contains("Universal");
+        }
+
+        /// <summary>
+        /// Full SPI eligibility: an SPI-capable platform AND a runtime new enough to
+        /// carry the imageArrayIndex fix (else SPI renders flat). When false, the feature
+        /// forces MultiPass.
+        /// </summary>
+        private static bool IsSinglePassInstancedSupported()
+        {
+            return IsUrpWindowsD3D12() && RuntimeSupportsSpi();
         }
 
         /// <summary>
