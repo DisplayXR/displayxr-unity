@@ -115,6 +115,13 @@ endif()
 if(WIN32)
     list(APPEND SOURCES displayxr_win32.c displayxr_gpu_preference.cpp displayxr_unity_plugin.cpp)
     list(APPEND HEADERS displayxr_win32.h displayxr_vk_loader.h)
+    # Custom IUnityXRDisplay Display Provider (epic #166, M1 — Windows/D3D12).
+    # Compiled into the same displayxr_unity DLL; registered from UnityPluginLoad.
+    # Does not disturb the hook path or the editor standalone path.
+    list(APPEND SOURCES
+        displayxr_xrprovider/displayxr_provider_session.cpp
+        displayxr_xrprovider/displayxr_display_provider.cpp)
+    list(APPEND HEADERS displayxr_xrprovider/displayxr_provider_session.h)
     link_libraries(user32 d3d11 d3d12 dxgi)
 endif()
 

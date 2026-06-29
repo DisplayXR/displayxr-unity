@@ -1,0 +1,10 @@
+{
+  "name": "DisplayXR",
+  "version": "1.0.0",
+  "libraryName": "displayxr_unity",
+  "displays": [
+    {
+      "id": "DisplayXR Display"
+    }
+  ]
+}
