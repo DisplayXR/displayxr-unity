@@ -5,6 +5,14 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.23.0] - 2026-06-28
+
+### Added
+- **Single-Pass-Instanced (SPI) stereo rendering** on URP + Windows + D3D12, auto-gated by platform and runtime version (requires DisplayXR runtime >= v1.26.1); falls back to MultiPass otherwise (#162).
+
+### Changed
+- Rewrote `docs~/architecture/hook-chain.md`: two rendering paths, `PRIMARY_STEREO` clarification, SPI corollary, and an overlay/runtime-integration note (#163).
+
 ## [1.21.0] - 2026-06-19
 
 ### Added
