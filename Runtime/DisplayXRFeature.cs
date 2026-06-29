@@ -192,10 +192,10 @@ namespace DisplayXR
             //
             // Eligibility is purely platform/pipeline — the *view-count* condition is
             // always satisfied: the Unity built-app path is always 2-view
-            // (PRIMARY_STEREO); N-view quad/lenticular output is synthesised by the
-            // runtime's Display Processor downstream (distinct N-view rendering only
-            // happens in the editor standalone preview's own multi-camera session, never
-            // through the built-app stereo pipeline). KooimaProjectionFixFeature's
+            // (PRIMARY_STEREO). There is no view synthesis downstream, so a built Unity
+            // app is limited to display modes with view count <= 2; distinct N-view
+            // rendering only happens in the editor standalone preview's own multi-camera
+            // session, never through the built-app stereo pipeline. KooimaProjectionFixFeature's
             // per-frame `xr.viewCount == 2` is the belt-and-suspenders guard. SPI also
             // requires a runtime new enough to carry the imageArrayIndex fix; ship the
             // plugin and runtime together (see docs~/experiments/spi-single-pass.md).

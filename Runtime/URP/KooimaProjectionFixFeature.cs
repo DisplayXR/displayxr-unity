@@ -129,8 +129,9 @@ namespace DisplayXR.URP
                 // the off-axis (#127) correction for the SPI path.
                 //
                 // GATE: exactly 2 views in this single pass. The Unity built-app path is
-                // always PRIMARY_STEREO, so this holds; the runtime synthesises N-view
-                // quad/lenticular downstream (see hook-chain.md). Requires a DisplayXR
+                // always PRIMARY_STEREO, so this holds; a built Unity app renders only
+                // 2 views and there is no view synthesis downstream, so it is limited to
+                // <=2-view display modes (see hook-chain.md). Requires a DisplayXR
                 // runtime that samples per-view subImage.imageArrayIndex — otherwise the
                 // compositor reads array layer 0 for both eyes and the image is flat.
                 // Verified on Windows/D3D12 (see docs~/experiments/spi-single-pass.md).
