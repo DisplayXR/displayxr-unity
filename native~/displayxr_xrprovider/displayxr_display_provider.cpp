@@ -128,36 +128,34 @@ void create_textures_if_ready()
 {
 	if (s_textures_created || !s_display || !s_handle) return;
 
-	uint32_t w = 0, h = 0, arr = 0, imgs = 0;
-	dxr_prov_get_swapchain_info(&w, &h, &arr, &imgs);
-	if (imgs == 0 || w == 0) return; // swapchain not created yet (await session-ready)
+	uint32_t w = 0, h = 0, arr = 0;
+	void *bridge = dxr_prov_get_bridge_unity_texture(&w, &h, &arr);
+	if (!bridge || w == 0) return; // bridge not created yet (await session-ready)
 
-	for (uint32_t i = 0; i < imgs && i < 8; i++) {
-		void *native = dxr_prov_get_swapchain_image(i);
-		if (!native) { prov_log("[DisplayXR-PROV] swapchain image native ptr null\n"); continue; }
+	// One Unity texture wrapping the shared 2-slice-array BRIDGE. Unity renders
+	// both eyes into it; the provider copies it into the runtime swapchain each
+	// frame (dxr_prov_submit_frame). Cross-device-safe (NT-handle shared resource).
+	UnityXRRenderTextureDesc desc;
+	memset(&desc, 0, sizeof(desc));
+	desc.colorFormat = kUnityXRRenderTextureFormatRGBA32; // bridge is R8G8B8A8_UNORM (fmt 28)
+	desc.color.nativePtr = bridge;
+	desc.depthFormat = kUnityXRDepthTextureFormat24bitOrGreater;
+	desc.depth.nativePtr = (void *)(uintptr_t)kUnityXRRenderTextureIdDontCare; // Unity allocates depth
+	desc.width = w;
+	desc.height = h;
+	desc.textureArrayLength = arr;  // 2 -> SPI texture array
+	desc.flags = kUnityXRRenderTextureFlagsUVDirectionTopToBottom; // D3D top-left origin
 
-		UnityXRRenderTextureDesc desc;
-		memset(&desc, 0, sizeof(desc));
-		desc.colorFormat = kUnityXRRenderTextureFormatBGRA32; // matches DXGI 87; 28=RGBA also fine
-		desc.color.nativePtr = native;                        // zero-copy: Unity renders into this
-		desc.depthFormat = kUnityXRDepthTextureFormat24bitOrGreater;
-		desc.depth.nativePtr = (void *)(uintptr_t)kUnityXRRenderTextureIdDontCare; // Unity allocates depth
-		desc.width = w;
-		desc.height = h;
-		desc.textureArrayLength = arr;  // 2 -> SPI texture array
-		desc.flags = kUnityXRRenderTextureFlagsUVDirectionTopToBottom; // D3D top-left origin
-
-		UnityXRRenderTextureId id = 0;
-		UnitySubsystemErrorCode rc = s_display->CreateTexture(s_handle, &desc, &id);
-		if (rc != kUnitySubsystemErrorCodeSuccess) {
-			prov_log("[DisplayXR-PROV] CreateTexture failed\n");
-			return;
-		}
-		s_tex_ids[i] = id;
+	UnityXRRenderTextureId id = 0;
+	UnitySubsystemErrorCode rc = s_display->CreateTexture(s_handle, &desc, &id);
+	if (rc != kUnitySubsystemErrorCodeSuccess) {
+		prov_log("[DisplayXR-PROV] CreateTexture (bridge) failed\n");
+		return;
 	}
-	s_tex_count = imgs;
+	s_tex_ids[0] = id;
+	s_tex_count = 1;
 	s_textures_created = true;
-	prov_log("[DisplayXR-PROV] CreateTexture: wrapped runtime swapchain images (zero-copy)\n");
+	prov_log("[DisplayXR-PROV] CreateTexture: wrapped shared bridge (2-slice array)\n");
 }
 
 void destroy_textures()
@@ -225,9 +223,10 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 	s_current_image_index = img;
 	s_frame_in_flight = true;
 
-	// Single-Pass-Instanced: 1 render pass, 2 render params over a 2-slice array.
+	// Single-Pass-Instanced: 1 render pass, 2 render params over the 2-slice
+	// bridge array. (img drives the swapchain copy destination in SubmitCurrentFrame.)
 	UnityXRNextFrameDesc::UnityXRRenderPass &pass = next->renderPasses[0];
-	pass.textureId = s_tex_ids[img < s_tex_count ? img : 0];
+	pass.textureId = s_tex_ids[0];
 	pass.cullingPassIndex = 0;
 	pass.renderParamsCount = 2;
 

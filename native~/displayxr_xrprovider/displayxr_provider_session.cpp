@@ -118,14 +118,34 @@ typedef struct ProviderSession {
 	int  running;
 	int  session_ready;
 	int  frame_begun;
+	int  image_acquired;     // 1 between xrAcquire/Wait and xrRelease (guards double-acquire)
+	uint32_t acquired_index;
 	XrTime predicted_display_time;
 
 	int has_view_rig;
 
-	// Unity D3D12 device/queue (we bind the session to these — zero-copy).
+	// Unity's D3D12 device — used ONLY to open the shared bridge (NOT to bind the
+	// session; see own_device below).
 	ID3D12Device       *unity_device;
-	ID3D12CommandQueue *unity_queue;
 	void               *overlay_hwnd;
+
+	// The session's OWN D3D12 device (matched to the runtime adapter LUID). The
+	// runtime allocates its swapchain on THIS device. (Binding to Unity's device
+	// crashed with device-removed — cross-device raw pointers are invalid.)
+	ID3D12Device              *own_device;
+	ID3D12CommandQueue        *own_queue;
+	ID3D12CommandAllocator    *own_cmd_alloc;
+	ID3D12GraphicsCommandList *own_cmd_list;
+	ID3D12Fence               *own_fence;
+	HANDLE                     own_fence_event;
+	UINT64                     own_fence_value;
+
+	// Cross-device 2-slice-array bridge: SHARED on own_device, opened on Unity's
+	// device. Unity renders both eyes into it; we copy it into the acquired
+	// runtime swapchain image (both slices) each frame.
+	ID3D12Resource            *bridge_own;     // own_device side (copy source)
+	ID3D12Resource            *bridge_unity;   // Unity-device side (Unity renders here)
+	HANDLE                     bridge_handle;
 
 	DxrProvDisplayInfo display_info;
 
@@ -334,13 +354,26 @@ static void ps_enumerate_modes(void)
 // SPI swapchain (arraySize=2). Images live on Unity's D3D12 device (zero-copy).
 // ============================================================================
 
+static int ps_create_bridge(void); // defined after this function
+
 static int ps_create_swapchain(void)
 {
 	if (s_ps.swapchain_created) return 1;
 	if (!s_ps.display_info.is_valid) return 0;
 
-	uint32_t w = s_ps.display_info.pixel_width;
-	uint32_t h = s_ps.display_info.pixel_height;
+	// Size the SPI swapchain to the active 3D mode's PER-VIEW (per-eye) pixels —
+	// each array slice is one eye. Sizing to the full display caused the runtime's
+	// "VIEW SIZE MISMATCH" (app_rect 3840x2160 vs expected per-view 1920x1080).
+	uint32_t w = 0, h = 0;
+	for (uint32_t i = 0; i < s_ps.mode_count; i++) {
+		if (s_ps.modes[i].hardwareDisplay3D && s_ps.modes[i].viewCount == 2 &&
+		    s_ps.modes[i].viewWidthPixels > 0) {
+			w = s_ps.modes[i].viewWidthPixels;
+			h = s_ps.modes[i].viewHeightPixels;
+			break;
+		}
+	}
+	if (w == 0 || h == 0) { w = s_ps.display_info.pixel_width / 2; h = s_ps.display_info.pixel_height; }
 	if (w == 0 || h == 0) { w = 1920; h = 1080; }
 
 	uint32_t fmt_count = 0;
@@ -388,6 +421,99 @@ static int ps_create_swapchain(void)
 	s_ps.swapchain_created = 1;
 	ps_log("[DisplayXR-PROV] SPI swapchain: %ux%u arraySize=2, %u images, fmt=%lld\n",
 	       w, h, count, format);
+
+	ps_create_bridge(); // pair the cross-device bridge with the swapchain
+	return 1;
+}
+
+// Create the session's OWN D3D12 device on the runtime's adapter LUID, plus a
+// queue + command list + fence for the per-frame bridge→swapchain copy.
+// (Mirrors displayxr_standalone_d3d12.cpp create_device.)
+static int ps_create_own_device(void)
+{
+	PFN_xrVoidFunction fn = NULL;
+	s_ps.gipa(s_ps.instance, "xrGetD3D12GraphicsRequirementsKHR", &fn);
+	LUID luid = {};
+	if (fn) {
+		XrGraphicsRequirementsD3D12KHR req = {XR_TYPE_GRAPHICS_REQUIREMENTS_D3D12_KHR};
+		if (XR_FAILED(((PFN_xrGetD3D12GraphicsRequirementsKHR)fn)(s_ps.instance, s_ps.system_id, &req))) {
+			ps_log("[DisplayXR-PROV] xrGetD3D12GraphicsRequirementsKHR failed\n");
+			return 0;
+		}
+		luid = req.adapterLuid;
+	}
+
+	IDXGIFactory4 *factory = NULL;
+	CreateDXGIFactory2(0, __uuidof(IDXGIFactory4), (void **)&factory);
+	IDXGIAdapter1 *adapter = NULL;
+	if (factory && (luid.HighPart != 0 || luid.LowPart != 0))
+		factory->EnumAdapterByLuid(luid, __uuidof(IDXGIAdapter1), (void **)&adapter);
+	HRESULT hr = D3D12CreateDevice(adapter, D3D_FEATURE_LEVEL_11_0,
+	                               __uuidof(ID3D12Device), (void **)&s_ps.own_device);
+	if (adapter) adapter->Release();
+	if (factory) factory->Release();
+	if (FAILED(hr) || !s_ps.own_device) {
+		ps_log("[DisplayXR-PROV] D3D12CreateDevice (own) failed: 0x%08lx\n", hr);
+		return 0;
+	}
+
+	D3D12_COMMAND_QUEUE_DESC qd = {};
+	qd.Type = D3D12_COMMAND_LIST_TYPE_DIRECT;
+	if (FAILED(s_ps.own_device->CreateCommandQueue(&qd, __uuidof(ID3D12CommandQueue),
+	        (void **)&s_ps.own_queue))) {
+		ps_log("[DisplayXR-PROV] CreateCommandQueue (own) failed\n");
+		return 0;
+	}
+	s_ps.own_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+	        __uuidof(ID3D12CommandAllocator), (void **)&s_ps.own_cmd_alloc);
+	s_ps.own_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+	        s_ps.own_cmd_alloc, NULL, __uuidof(ID3D12GraphicsCommandList),
+	        (void **)&s_ps.own_cmd_list);
+	s_ps.own_cmd_list->Close();
+	s_ps.own_device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+	        __uuidof(ID3D12Fence), (void **)&s_ps.own_fence);
+	s_ps.own_fence_event = CreateEvent(NULL, FALSE, FALSE, NULL);
+	s_ps.own_fence_value = 0;
+	ps_log("[DisplayXR-PROV] Own D3D12 device + queue created (runtime session device)\n");
+	return 1;
+}
+
+// Create the SHARED 2-slice-array bridge on own_device and open it on Unity's
+// device. Unity renders both eyes into the Unity-side resource; submit copies
+// the own-side resource into the runtime swapchain. (Mirrors create_atlas_bridge,
+// extended arraySize=1 → 2 for SPI.)
+static int ps_create_bridge(void)
+{
+	if (s_ps.bridge_own || !s_ps.own_device || !s_ps.unity_device) return s_ps.bridge_own ? 1 : 0;
+	uint32_t w = s_ps.sc_width, h = s_ps.sc_height;
+	if (w == 0 || h == 0) return 0;
+
+	D3D12_HEAP_PROPERTIES heap = {};
+	heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+	D3D12_RESOURCE_DESC bd = {};
+	bd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+	bd.Width = w;
+	bd.Height = h;
+	bd.DepthOrArraySize = 2;   // SPI: 2 array slices (left/right)
+	bd.MipLevels = 1;
+	bd.Format = (s_ps.sc_format == 87) ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
+	bd.SampleDesc.Count = 1;
+	bd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+	bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+
+	HRESULT hr = s_ps.own_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &bd,
+	        D3D12_RESOURCE_STATE_COMMON, NULL, __uuidof(ID3D12Resource), (void **)&s_ps.bridge_own);
+	if (FAILED(hr)) { ps_log("[DisplayXR-PROV] bridge CreateCommittedResource failed: 0x%08lx\n", hr); return 0; }
+
+	hr = s_ps.own_device->CreateSharedHandle(s_ps.bridge_own, NULL, GENERIC_ALL, NULL, &s_ps.bridge_handle);
+	if (FAILED(hr) || !s_ps.bridge_handle) { ps_log("[DisplayXR-PROV] bridge CreateSharedHandle failed: 0x%08lx\n", hr); return 0; }
+
+	hr = s_ps.unity_device->OpenSharedHandle(s_ps.bridge_handle, __uuidof(ID3D12Resource),
+	        (void **)&s_ps.bridge_unity);
+	if (FAILED(hr) || !s_ps.bridge_unity) { ps_log("[DisplayXR-PROV] bridge OpenSharedHandle (Unity) failed: 0x%08lx\n", hr); return 0; }
+
+	ps_log("[DisplayXR-PROV] Bridge (2-slice array): %ux%u, own=%p unity=%p\n",
+	       w, h, (void *)s_ps.bridge_own, (void *)s_ps.bridge_unity);
 	return 1;
 }
 
@@ -401,13 +527,13 @@ int dxr_prov_session_start(const char *runtime_json_path,
                            void *overlay_hwnd)
 {
 	memset(&s_ps, 0, sizeof(s_ps));
-	s_ps.unity_device = (ID3D12Device *)unity_d3d12_device;
-	s_ps.unity_queue  = (ID3D12CommandQueue *)unity_d3d12_queue;
+	s_ps.unity_device = (ID3D12Device *)unity_d3d12_device; // only for opening the bridge
+	(void)unity_d3d12_queue;                                // not used (session runs on own device)
 	s_ps.overlay_hwnd = overlay_hwnd;
 	s_ps.ipd_factor = s_ps.parallax_factor = s_ps.perspective_factor = 1.0f;
 
-	if (!s_ps.unity_device || !s_ps.unity_queue) {
-		ps_log("[DisplayXR-PROV] start: missing Unity D3D12 device/queue\n");
+	if (!s_ps.unity_device) {
+		ps_log("[DisplayXR-PROV] start: missing Unity D3D12 device (needed for bridge)\n");
 		return 0;
 	}
 
@@ -501,18 +627,9 @@ int dxr_prov_session_start(const char *runtime_json_path,
 		ps_log("[DisplayXR-PROV] xrGetSystem failed\n"); dxr_prov_session_stop(); return 0;
 	}
 
-	// --- D3D12 graphics requirements (spec requires the call before xrCreateSession).
-	//     We honor Unity's device regardless of the returned LUID (validation point). ---
-	{
-		PFN_xrVoidFunction fn = NULL;
-		s_ps.gipa(s_ps.instance, "xrGetD3D12GraphicsRequirementsKHR", &fn);
-		if (fn) {
-			XrGraphicsRequirementsD3D12KHR req = {XR_TYPE_GRAPHICS_REQUIREMENTS_D3D12_KHR};
-			((PFN_xrGetD3D12GraphicsRequirementsKHR)fn)(s_ps.instance, s_ps.system_id, &req);
-			ps_log("[DisplayXR-PROV] D3D12 req LUID=%08lx%08lx (using Unity's device)\n",
-			       (unsigned long)req.adapterLuid.HighPart, (unsigned long)req.adapterLuid.LowPart);
-		}
-	}
+	// --- Create the session's OWN D3D12 device (matched to runtime adapter LUID).
+	//     The runtime allocates its swapchain on this device; we bridge to Unity. ---
+	if (!ps_create_own_device()) { dxr_prov_session_stop(); return 0; }
 
 	// --- Display info ---
 	XrDisplayInfoEXT di = {};
@@ -547,8 +664,8 @@ int dxr_prov_session_start(const char *runtime_json_path,
 
 	XrGraphicsBindingD3D12KHR d3d12 = {};
 	d3d12.type = XR_TYPE_GRAPHICS_BINDING_D3D12_KHR;
-	d3d12.device = s_ps.unity_device;
-	d3d12.queue = s_ps.unity_queue;
+	d3d12.device = s_ps.own_device;   // session runs on our own device
+	d3d12.queue = s_ps.own_queue;
 	d3d12.next = &win_binding;
 
 	XrSessionCreateInfo sci = {XR_TYPE_SESSION_CREATE_INFO};
@@ -557,7 +674,7 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	if (XR_FAILED(s_ps.pfn_create_session(s_ps.instance, &sci, &s_ps.session))) {
 		ps_log("[DisplayXR-PROV] xrCreateSession failed\n"); dxr_prov_session_stop(); return 0;
 	}
-	ps_log("[DisplayXR-PROV] Session created (Unity D3D12 device, overlay HWND=%p)\n", s_ps.overlay_hwnd);
+	ps_log("[DisplayXR-PROV] Session created (own D3D12 device, overlay HWND=%p)\n", s_ps.overlay_hwnd);
 
 	// --- LOCAL reference space ---
 	XrReferenceSpaceCreateInfo rsci = {XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
@@ -585,10 +702,20 @@ void dxr_prov_session_stop(void)
 	if (s_ps.session && s_ps.session_ready && s_ps.pfn_end_session) s_ps.pfn_end_session(s_ps.session);
 	if (s_ps.session && s_ps.pfn_destroy_session) s_ps.pfn_destroy_session(s_ps.session);
 	if (s_ps.instance && s_ps.pfn_destroy_instance) s_ps.pfn_destroy_instance(s_ps.instance);
+
+	// Bridge + own-device resources.
+	if (s_ps.bridge_unity)    s_ps.bridge_unity->Release();
+	if (s_ps.bridge_handle)   CloseHandle(s_ps.bridge_handle);
+	if (s_ps.bridge_own)      s_ps.bridge_own->Release();
+	if (s_ps.own_fence_event) CloseHandle(s_ps.own_fence_event);
+	if (s_ps.own_fence)       s_ps.own_fence->Release();
+	if (s_ps.own_cmd_list)    s_ps.own_cmd_list->Release();
+	if (s_ps.own_cmd_alloc)   s_ps.own_cmd_alloc->Release();
+	if (s_ps.own_queue)       s_ps.own_queue->Release();
+	if (s_ps.own_device)      s_ps.own_device->Release();
+
 	// Intentionally do NOT FreeLibrary(runtime_lib): background threads may still
 	// reference it (matches the standalone's deliberate leak).
-	XrInstance keep_lib_alive = s_ps.instance;
-	(void)keep_lib_alive;
 	void *lib = s_ps.runtime_lib;
 	memset(&s_ps, 0, sizeof(s_ps));
 	s_ps.runtime_lib = lib;
@@ -609,10 +736,12 @@ void dxr_prov_get_swapchain_info(uint32_t *width, uint32_t *height,
 	if (image_count) *image_count = s_ps.sc_image_count;
 }
 
-void *dxr_prov_get_swapchain_image(uint32_t index)
+void *dxr_prov_get_bridge_unity_texture(uint32_t *width, uint32_t *height, uint32_t *array_size)
 {
-	if (index >= s_ps.sc_image_count) return NULL;
-	return s_ps.sc_images[index].texture;
+	if (width) *width = s_ps.sc_width;
+	if (height) *height = s_ps.sc_height;
+	if (array_size) *array_size = 2;
+	return (void *)s_ps.bridge_unity;
 }
 
 // ============================================================================
@@ -683,8 +812,14 @@ int dxr_prov_begin_frame(uint32_t *out_image_index, int *out_should_render)
 		XrPosef rig_pose = s_ps.display_pose_set ? s_ps.display_pose
 		                                         : XrPosef{{0, 0, 0, 1}, {0, 0, 0}};
 		if (s_ps.has_view_rig) {
+			// Default virtualDisplayHeight to the physical display height (a
+			// window-as-portal 1:1 framing) so a scene with no DisplayXR rig
+			// pushing tunables still gets real stereo separation. Apps override
+			// via dxr_prov_set_tunables (M2: wired from DisplayXRDisplay).
+			float vdh = s_ps.display_info.is_valid && s_ps.display_info.height_m > 0.0f
+			            ? s_ps.display_info.height_m : 0.2f;
 			rig.pose = rig_pose;
-			rig.virtualDisplayHeight = s_ps.tunables_set ? s_ps.virtual_display_height : 0.0f;
+			rig.virtualDisplayHeight = s_ps.tunables_set ? s_ps.virtual_display_height : vdh;
 			rig.ipdFactor = s_ps.tunables_set ? s_ps.ipd_factor : 1.0f;
 			rig.parallaxFactor = s_ps.tunables_set ? s_ps.parallax_factor : 1.0f;
 			rig.perspectiveFactor = s_ps.tunables_set ? s_ps.perspective_factor : 1.0f;
@@ -716,15 +851,22 @@ int dxr_prov_begin_frame(uint32_t *out_image_index, int *out_should_render)
 	}
 
 	// --- Acquire + wait the swapchain image Unity renders into next ---
-	uint32_t index = 0;
-	XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-	if (s_ps.swapchain_created &&
-	    XR_SUCCEEDED(s_ps.pfn_acquire_swapchain_image(s_ps.swapchain, &ai, &index))) {
-		XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
-		wi.timeout = 1000000000;
-		s_ps.pfn_wait_swapchain_image(s_ps.swapchain, &wi);
-		if (out_image_index) *out_image_index = index;
+	// Guard against a double-acquire: if a previous frame acquired an image but
+	// never submitted (Unity may call PopulateNextFrameDesc without a matching
+	// SubmitCurrentFrame on startup), reuse it rather than acquire again
+	// (xrWaitSwapchainImage would return XR_ERROR_CALL_ORDER_INVALID).
+	if (s_ps.swapchain_created && !s_ps.image_acquired) {
+		uint32_t index = 0;
+		XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+		if (XR_SUCCEEDED(s_ps.pfn_acquire_swapchain_image(s_ps.swapchain, &ai, &index))) {
+			XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+			wi.timeout = 1000000000;
+			s_ps.pfn_wait_swapchain_image(s_ps.swapchain, &wi);
+			s_ps.image_acquired = 1;
+			s_ps.acquired_index = index;
+		}
 	}
+	if (out_image_index) *out_image_index = s_ps.acquired_index;
 
 	if (out_should_render) *out_should_render = fs.shouldRender ? 1 : 0;
 	return 1;
@@ -744,11 +886,43 @@ int dxr_prov_submit_frame(uint32_t image_index)
 		return 0;
 	}
 	s_ps.frame_begun = 0;
-	(void)image_index;
 
-	// Unity already rendered both eyes into the acquired image's two array slices.
-	XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-	s_ps.pfn_release_swapchain_image(s_ps.swapchain, &ri);
+	// Unity rendered both eyes into the shared BRIDGE (slices 0/1) on its device.
+	// Copy the bridge into the acquired runtime swapchain image (both slices) on
+	// our own device, then fence-wait. (Coarse cross-device sync — mirrors the
+	// standalone's blit_atlas; a shared fence is a future refinement.)
+	if (s_ps.bridge_own && image_index < s_ps.sc_image_count &&
+	    s_ps.sc_images[image_index].texture && s_ps.own_cmd_list) {
+		ID3D12Resource *dst = s_ps.sc_images[image_index].texture;
+		s_ps.own_cmd_alloc->Reset();
+		s_ps.own_cmd_list->Reset(s_ps.own_cmd_alloc, NULL);
+		for (UINT slice = 0; slice < 2; slice++) {
+			D3D12_TEXTURE_COPY_LOCATION dl = {};
+			dl.pResource = dst;
+			dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+			dl.SubresourceIndex = slice;
+			D3D12_TEXTURE_COPY_LOCATION sl = {};
+			sl.pResource = s_ps.bridge_own;
+			sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+			sl.SubresourceIndex = slice;
+			s_ps.own_cmd_list->CopyTextureRegion(&dl, 0, 0, 0, &sl, NULL);
+		}
+		s_ps.own_cmd_list->Close();
+		ID3D12CommandList *lists[] = { s_ps.own_cmd_list };
+		s_ps.own_queue->ExecuteCommandLists(1, lists);
+		s_ps.own_fence_value++;
+		s_ps.own_queue->Signal(s_ps.own_fence, s_ps.own_fence_value);
+		if (s_ps.own_fence->GetCompletedValue() < s_ps.own_fence_value) {
+			s_ps.own_fence->SetEventOnCompletion(s_ps.own_fence_value, s_ps.own_fence_event);
+			WaitForSingleObject(s_ps.own_fence_event, INFINITE);
+		}
+	}
+
+	if (s_ps.image_acquired) {
+		XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+		s_ps.pfn_release_swapchain_image(s_ps.swapchain, &ri);
+		s_ps.image_acquired = 0;
+	}
 
 	// Build a 2-view projection layer; eyes are array layers 0/1 (SPI).
 	uint32_t n = s_ps.view_count >= 2 ? 2 : s_ps.view_count;
