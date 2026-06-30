@@ -99,6 +99,23 @@ compositor-owned `ID3D12Resource`s on Unity's device"). Then:
 > bridge→runtime-swapchain with a cross-device fence (mirror `create_atlas_bridge`
 > / `blit_atlas`, extended from `arraySize=1` to `arraySize=2`). Everything else in
 > this provider is unchanged and already validated.
+>
+> **M1b RESULT — SOLVED (2026-06-29, on the Leia panel).** Implemented the bridge
+> (own D3D12 device matched to the runtime adapter LUID → session bound to it →
+> shared 2-slice-array bridge → per-frame copy bridge→swapchain both slices,
+> fence-synced). The crash is gone; the session now runs to **FOCUSED** and the
+> runtime's D3D12 native compositor **weaves to the panel** (`D3D12 weaving via
+> display processor`, `atlas=3840x1080 tile 2x1`) with **zero** device-removed,
+> `VIEW SIZE MISMATCH`, or `CALL_ORDER_INVALID` errors. The SPI swapchain is sized
+> to the active 3D mode's **per-eye** pixels (1920×1080), and an acquire guard
+> prevents a startup double-`xrWaitSwapchainImage`. Remaining refinements (not
+> blockers): (1) coarse cross-device sync — copy fence-waits on the own queue but
+> has no shared fence with Unity's writes (possible 1-frame latency/tearing);
+> (2) stereo separation needs a tracked face *or* app tunables — the bare scene's
+> view-rig defaults to `virtualDisplayHeight = display height`, and the raw eyes
+> read nominal when untracked; (3) wire `dxr_prov_set_tunables` from
+> `DisplayXRDisplay` (M2); (4) `WS_CHILD` overlay for in-app-window weave (M1 uses
+> `windowHandle=NULL` → runtime self-hosts).
 
 ## SPI render-pass setup
 

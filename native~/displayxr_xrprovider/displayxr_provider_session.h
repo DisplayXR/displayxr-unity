@@ -77,17 +77,22 @@ void dxr_prov_session_stop(void);
 /// Whether the session is currently running.
 int  dxr_prov_session_is_running(void);
 
-// ---- Swapchain surfacing (for CreateTexture) --------------------------------
+// ---- Bridge surfacing (for CreateTexture) -----------------------------------
 
 /// Swapchain shape, valid after a successful start.
 void dxr_prov_get_swapchain_info(uint32_t *width, uint32_t *height,
                                  uint32_t *array_size, uint32_t *image_count);
 
-/// Native texture pointer (ID3D12Resource* on Unity's device) for swapchain
-/// image `index`. The provider wraps each via CreateTexture so Unity renders
-/// directly into the runtime's swapchain image (zero-copy). Returns NULL if
-/// index is out of range.
-void *dxr_prov_get_swapchain_image(uint32_t index);
+/// The cross-device BRIDGE texture's Unity-side native pointer (ID3D12Resource*
+/// on Unity's device, a 2-slice array). The provider wraps this ONCE via
+/// CreateTexture; Unity renders both eyes into it (slices 0/1); the provider
+/// then copies it into the runtime swapchain on its own device each frame
+/// (dxr_prov_submit_frame). This replaces the zero-copy handoff, which crashed
+/// with D3D12 device-removed because the runtime allocates its swapchain on its
+/// own ID3D12Device instance (cross-device raw pointers are invalid). Returns
+/// NULL if the bridge isn't created yet.
+void *dxr_prov_get_bridge_unity_texture(uint32_t *width, uint32_t *height,
+                                        uint32_t *array_size);
 
 // ---- Frame loop -------------------------------------------------------------
 
