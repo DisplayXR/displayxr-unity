@@ -248,6 +248,32 @@ namespace DisplayXR
             }
         }
 
+        /// <summary>
+        /// (epic #166 provider) The stereo tunables this camera-centric rig would
+        /// push this frame, as raw rig fields. fovOverride = tan(halfVFov) from the
+        /// cached camera FOV (cached because XR overrides Camera.fieldOfView).
+        /// Mirrors the hook-path LateUpdate push; used by the provider driver.
+        /// Read-only — does not touch native.
+        /// </summary>
+        public DisplayXRTunables GetProviderTunables()
+        {
+            var cam = m_Camera != null ? m_Camera : GetComponent<Camera>();
+            float fovDeg = m_CachedCameraFov >= 1.0f ? m_CachedCameraFov
+                          : (cam != null ? cam.fieldOfView : 60f);
+            var t = DisplayXRTunables.Default;
+            t.ipdFactor = ipdFactor;
+            t.parallaxFactor = parallaxFactor;
+            t.perspectiveFactor = 1.0f;
+            t.virtualDisplayHeight = 0f;
+            t.invConvergenceDistance = invConvergenceDistance;
+            t.fovOverride = Mathf.Tan(fovDeg * 0.5f * Mathf.Deg2Rad);
+            t.nearZ = cam != null ? cam.nearClipPlane : 0.3f;
+            t.farZ = cam != null ? cam.farClipPlane : 1000f;
+            t.cameraCentricMode = true;
+            t.clipAtDisplayPlane = foregroundOnlyClip;
+            return t;
+        }
+
 #if UNITY_EDITOR
         // Selection-driven in plain Edit Mode; active-rig-only when a
         // DisplayXR session is alive (preview window, or Play Mode XR loader).

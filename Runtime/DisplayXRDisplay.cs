@@ -264,6 +264,32 @@ namespace DisplayXR
             }
         }
 
+        /// <summary>
+        /// (epic #166 provider) The stereo tunables this display-centric rig would
+        /// push this frame, as raw rig fields — no <see cref="DisplayXRFeature"/>
+        /// dependency (the custom display provider runs without Unity's OpenXR
+        /// loader, so the feature singleton is null in that mode).
+        /// virtualDisplayHeight is the raw field (0 = use the physical display
+        /// height); the provider driver resolves it and folds scene scale. Mirrors
+        /// the hook-path LateUpdate push. Read-only — does not touch native.
+        /// </summary>
+        public DisplayXRTunables GetProviderTunables()
+        {
+            var cam = m_Camera != null ? m_Camera : GetComponent<Camera>();
+            var t = DisplayXRTunables.Default;
+            t.ipdFactor = ipdFactor;
+            t.parallaxFactor = parallaxFactor;
+            t.perspectiveFactor = perspectiveFactor;
+            t.virtualDisplayHeight = virtualDisplayHeight;
+            t.invConvergenceDistance = 0f;
+            t.fovOverride = 0f;
+            t.nearZ = cam != null ? cam.nearClipPlane : 0.3f;
+            t.farZ = cam != null ? cam.farClipPlane : 1000f;
+            t.cameraCentricMode = false;
+            t.clipAtDisplayPlane = foregroundOnlyClip;
+            return t;
+        }
+
 #if UNITY_EDITOR
         // Gating: selection-driven in plain Edit Mode; active-rig-only when
         // a DisplayXR session is alive (preview window running, or Play Mode

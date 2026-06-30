@@ -1,9 +1,20 @@
-# Custom IUnityXRDisplay Display Provider (epic #166, M1)
+# Custom IUnityXRDisplay Display Provider (epic #166)
 
-> **Status: M1 spike (GO/NO-GO).** Native side builds and is registered; on-panel /
-> sim_display weave validation is the user-run step (see the runbook at the end).
-> This document describes the architecture, the design decisions, and the open
-> questions that the Editor-side validation must resolve.
+> **Status: M1 GO + M2 control plane & architecture validated on hardware;
+> final pixel-correctness (content) WIP.** M1/M1b proved the architecture. **M2**
+> makes the provider a first-class extension app: rig-EXT-driven per-frame
+> tunables (display- AND camera-centric), the adaptive render contract
+> (window×scaleXY), mode enumerate/request + mode/hardware/eye-tracking events,
+> and a proper `DisplayXRDisplayLoader : XRLoader` (XR Plug-in Management toggle,
+> no bootstrap / manifest hand-copy). On-panel validation (RTX 3080, Leia DP)
+> **proved the whole pipeline end-to-end** — provider registers via the XRLoader,
+> reaches FOCUSED, enumerates modes, fires events, adapts resolution, supplies
+> valid projections, and **Unity renders its scene directly into the provider's
+> bridge** (Unity eye-texture pointer == bridge pointer), carried cross-device to
+> the runtime weave. **Open:** the woven image is uniform white instead of the
+> scene — a rendering-correctness detail (what Unity draws into the eye texture;
+> color-space ruled out — project is Gamma, UNORM correct), to resolve with the
+> frame debugger. See **M2** + **M2 hardware validation** below.
 
 ## Why this exists
 
@@ -144,6 +155,133 @@ enabling, since older runtimes reject unknown extensions). Without `XR_EXT_view_
 the provider logs a one-shot WARN and produces no stereo (same contract as the hook
 / standalone).
 
+## M2 — native-app parity (implemented)
+
+M2 turns the M1 spike into a first-class extension app matching the native
+handle app (`cube_handle_d3d12_win`) / the UE plugin. Three buckets + a proper
+loader.
+
+### A. Rig-EXT driven by real per-frame tunables
+
+The provider now drives the runtime's Kooima math from the **active DisplayXR
+rig**, not fixed defaults — so a tracked face gets correct depth/parallax.
+
+- New C# layer (`Runtime/Provider/`): `DisplayXRProviderNative` (the `dxr_prov_*`
+  P/Invokes), `DisplayXRProvider` (app-facing facade), `DisplayXRProviderDriver`
+  (the per-frame runner created/destroyed by the loader).
+- The driver reads the active rig
+  (`DisplayXRRigManager.ActiveCamera` → `DisplayXRDisplay` /`DisplayXRCamera`)
+  via a new behaviour-preserving `GetProviderTunables()` on each rig, and pushes
+  `dxr_prov_set_tunables` + `dxr_prov_set_display_pose` each frame (mirroring the
+  hook-path LateUpdate push, which is inert in provider mode because
+  `DisplayXRFeature` needs Unity's OpenXR loader). It respects the same gating
+  (`SplashActive`, active-rig-only) as the rigs.
+- Native `dxr_prov_begin_frame` chains `XrDisplayRigEXT` (display-centric) or
+  `XrCameraRigEXT` (camera-centric) exactly like `displayxr_standalone.cpp`. The
+  rig pose is converted Unity→OpenXR (negate posZ, negate quat X/Y) in
+  `dxr_prov_set_display_pose`; scene scale (`lossyScale`, scale-as-zoom) is folded
+  into `virtualDisplayHeight` / `convergenceDiopters` on the C# side, matching the
+  standalone (native ignores scale).
+
+### B. Adaptive N-tile rendering contract
+
+- **In-app weave (WS_CHILD overlay):** `GfxStart` calls the hook path's
+  `displayxr_get_app_main_view()` (reused from `displayxr_win32.c`) to create a
+  `WS_CHILD` overlay sized to Unity's client area + subclass Unity's wndproc, and
+  binds the runtime to that HWND (M1 used `windowHandle=NULL` → runtime
+  self-hosted). In provider mode the OpenXR hook is not installed, so the provider
+  is the sole caller. If the overlay can't be created it falls back to self-host.
+- **Worst-case swapchain (ADR-010):** the SPI (`arraySize=2`) swapchain + bridge
+  are sized once to `max(viewWidthPixels) × max(viewHeightPixels)` across **all**
+  enumerated modes, and never reallocated.
+- **Per-frame adaptive render rect:** `dxr_prov_begin_frame` derives
+  `render = overlayClient × active-mode scaleXY`, clamped to the worst-case
+  swapchain. The provider sets `renderParams[eye].viewportRect` to the normalized
+  sub-rect (`render / swapchain`) so Unity renders only that sub-region, and
+  submits each eye with `subImage.imageArrayIndex = eye`,
+  `imageRect.extent = render` (SPI per-slice sub-region). Re-derived every frame,
+  so a live window resize / mode switch needs no reallocation.
+
+### C. Mode enumeration + control + events
+
+- Native exports surface the enumerated modes (`dxr_prov_get_mode_count/info`),
+  the active mode, and `xrRequestDisplayRenderingModeEXT` /
+  `xrRequestDisplayModeEXT` / `xrRequestEyeTrackingModeEXT` (all soft-resolved —
+  inert on an older runtime).
+- `dxr_prov_poll_events` handles `XrEventDataRenderingModeChangedEXT` (re-enumerate
+  modes + re-derive tiling/resolution live), `…HardwareDisplayStateChangedEXT`,
+  and `…EyeTrackingStateChangedEXT`, latching each into atomic read-and-clear
+  flags. The driver pumps them into `DisplayXRProvider`'s C# events. Mode
+  *keybinding* stays app policy — the plugin only exposes the API. The three event
+  structs were added to `displayxr_extensions.h` verbatim from the runtime's
+  `XR_EXT_display_info.h`.
+
+### Loader (XR Plug-in Management)
+
+`DisplayXRDisplayLoader : XRLoaderHelper` creates/starts/stops the
+`XRDisplaySubsystem` from the `"DisplayXR Display"` descriptor and owns the
+driver's lifecycle; `DisplayXRDisplaySettings` (`[XRConfigurationData]`) +
+`Editor/Provider/DisplayXRDisplayPackage` (`IXRPackage`) register it as a
+**Standalone** XR Plug-in Management toggle so Unity ships the loader +
+`UnitySubsystemsManifest.json` automatically — the M1 bootstrap + hand-copy hack
+is gone. Display-only (no input subsystem) by design.
+
+## M2 hardware validation (RTX 3080, Leia DP, dev runtime v1.26.1)
+
+Drove a built `displayxr-unity-test` (BiRP, Gamma) player through the provider via
+the real `XRLoader` (loader swapped from OpenXR → `DisplayXRDisplayLoader` with
+`XRPackageMetadataStore`; the manifest shipped automatically). **Confirmed
+working end-to-end:** provider registers (`DisplayXR successfully registered
+Provider for DisplayXR Display`), session → **FOCUSED**, mode enumeration (`2D`
+1-view + `LeiaSR` 2-view `2×1`, active mode detected), eye-tracking event fires
+(`isTracking=1`), `window×scaleXY` adaptive sizing (640×360 from a 1280×720
+window), valid per-eye projections (`shouldRender=1`, real FOV), and the runtime
+weaves every frame with **zero** device-removed / VIEW-SIZE / CALL_ORDER errors.
+
+Three bugs found + fixed on hardware:
+
+1. **Render-thread overlay deadlock.** Creating the `WS_CHILD` overlay in
+   `GfxStart` (render thread) deadlocks — a `WS_CHILD` of Unity's main-thread
+   window attaches the two threads' input queues while Unity's main thread is
+   blocked waiting for `GfxStart`. **Fix:** create the overlay in `LifecycleStart`
+   (main thread); `GfxStart` only binds the stored HWND. (Symptom: white window,
+   `GfxStart` never logged.)
+2. **Worst-case-swapchain sub-rect → black.** A render sub-rect inside a larger
+   worst-case texture mismatches Unity's bottom-left viewport vs the runtime's
+   D3D top-left `imageRect`, so the runtime sampled empty texels. **Fix (for now):**
+   size the swapchain/bridge to the actual render rect (`window×scaleXY`) so
+   render == swapchain (no sub-rect). The worst-case/no-realloc ADR-010
+   optimization is deferred until that Y-origin is reconciled + a live resize
+   realloc is added.
+3. **Cross-device bridge handoff → black.** Unity renders into the shared bridge
+   on *its* device and leaves it in `RENDER_TARGET`; the provider's separate
+   device read it incoherently. **Fix:** a SHARED cross-device fence (Unity's
+   queue signals after its render; the own-device copy GPU-waits before copying)
+   **plus** `IUnityGraphicsD3D12v8::RequestResourceState(bridge, COMMON)` so Unity
+   transitions the bridge to a cross-device-readable state. This is what carried
+   Unity's pixels through (black → the bridge now reflects Unity's output).
+
+**Decisive proof the architecture works:** Unity's eye color-texture pointer
+(`XRTextureManager::SetupRenderTextureFromXRRequest col:`) == the provider's
+bridge Unity-side pointer — Unity renders its scene *directly into our bridge*.
+
+**Open item — uniform white instead of the scene.** With the handoff fixed the
+woven output is uniform white rather than the skybox+cube. Color-space is ruled
+out (the test project is **Gamma**, so the `R8G8B8A8_UNORM` bridge is correct;
+toggling `kUnityXRRenderTextureFlagsSRGB` changed nothing). This is a
+render-correctness detail — *what Unity draws into the eye texture* — to diagnose
+with the Unity frame debugger. Likely-next probe: confirm Unity draws geometry
+(not just a clear) into the bridge, and compare against the standalone/preview
+path (which has Unity render to its own RT and `Graphics.CopyTexture` into the
+bridge — a known-good content path the provider could adopt if the direct
+external-RT render proves problematic).
+
+**Weave target.** Self-host (runtime's own window, `windowHandle=NULL`) is the
+validated baseline. The in-app `WS_CHILD` overlay is env-gated opt-in
+(`DISPLAYXR_PROV_OVERLAY=1`) until its D3D12 swapchain-present on a child window
+is brought up (a child window doesn't composite a flip swapchain the way the
+hook path's top-level `WS_POPUP` does).
+
 ## Open questions (resolve at Editor validation)
 
 1. **Does a third-party provider register + start?** Cardboard proves the API is
@@ -165,10 +303,11 @@ the provider logs a one-shot WARN and produces no stereo (same contract as the h
    thread inside the gfx callbacks (the contract allows `PopulateNextFrameDesc` to
    block for cadence). UE uses a dedicated compositor thread so the render thread
    never blocks on vsync — adopt that if cadence stalls appear.
-6. **Window binding.** M1 passes `windowHandle = NULL` (runtime self-hosts a window
-   — fine for sim_display bring-up). In-app weave over Unity's own window needs the
-   `WS_CHILD` overlay (`displayxr_get_app_main_view`, reused from the hook path) —
-   M2.
+6. **Window binding.** ✅ **Done (M2).** The provider creates a `WS_CHILD` overlay
+   over Unity's window (`displayxr_get_app_main_view`, reused from the hook path)
+   and binds the runtime to it — in-app weave, with per-view resolution tracking
+   Unity's live client size. Validate that the overlay creates correctly when
+   `GfxStart` runs on the render thread (it falls back to runtime self-host if not).
 
 ## Validation runbook (user-run)
 
@@ -180,11 +319,16 @@ when elevated).
    `set SIM_DISPLAY_OUTPUT=sbs`; sanity-check `displayxr-cli selftest`. Point
    `XR_RUNTIME_JSON` at the dev runtime JSON.
 2. **Import the plugin** into `displayxr-unity-test` (BiRP) — the freshly built
-   `Runtime/Plugins/Windows/x64/displayxr_unity.dll` ships with the package — and in
-   **XR Plug-in Management** enable the **DisplayXR** display subsystem.
-3. **Run / build a player.** Confirm in `Player.log`:
-   `[DisplayXR-PROV] RegisterLifecycleProvider OK` → `Lifecycle Initialize` →
-   `GfxStart OK` → `SPI swapchain: …arraySize=2` → `session state: …`.
+   `Runtime/Plugins/Windows/x64/displayxr_unity.dll` ships with the package. In
+   **Project Settings > XR Plug-in Management (Standalone)**: **enable "DisplayXR
+   Display"** and **disable Unity's OpenXR** (the provider replaces it). Remove the
+   M1 `[RuntimeInitializeOnLoadMethod]` bootstrap + manifest hand-copy — the
+   XRLoader ships the manifest now.
+3. **Run / build a player.** Confirm in `Player.log` / `%TEMP%\displayxr_prov_native.log`:
+   `RegisterLifecycleProvider OK` → `Lifecycle Initialize` → `GfxStart OK` →
+   worst-case `SPI swapchain: …arraySize=2` → `session state: …FOCUSED`. With a
+   tracked face, eye0≠eye1 separation tracks head motion; resize the window and
+   confirm the per-view render rect adapts (no `VIEW SIZE MISMATCH`).
 4. **SPI active:** confirm Unity renders **1 instanced pass** to a 2-slice array
    (frame debugger / `XRSettings`), not 2 passes.
 5. **Weave:** capture the atlas via the runtime file trigger —

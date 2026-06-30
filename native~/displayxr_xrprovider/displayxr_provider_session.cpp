@@ -147,6 +147,17 @@ typedef struct ProviderSession {
 	ID3D12Resource            *bridge_unity;   // Unity-device side (Unity renders here)
 	HANDLE                     bridge_handle;
 
+	// Unity's command queue + a SHARED cross-device fence so the own-device
+	// bridge→swapchain copy waits for Unity's render into the bridge to FINISH.
+	// Without it the copy races ahead of Unity's writes and reads empty texels
+	// (black). Unity's queue signals shared_fence_unity after its render; the own
+	// queue GPU-waits on shared_fence_own (same shared fence) before copying.
+	ID3D12CommandQueue        *unity_queue;
+	ID3D12Fence               *shared_fence_own;
+	ID3D12Fence               *shared_fence_unity;
+	HANDLE                     shared_fence_handle;
+	UINT64                     sync_val;
+
 	DxrProvDisplayInfo display_info;
 
 	// Rendering modes
@@ -166,9 +177,20 @@ typedef struct ProviderSession {
 
 	// Tunables / pose pushed from the rig
 	float ipd_factor, parallax_factor, perspective_factor, virtual_display_height;
+	float inv_convergence_distance, fov_override, near_z, far_z;
+	int   camera_centric;
 	int   tunables_set;
 	XrPosef display_pose;
 	int     display_pose_set;
+
+	// Active mode + per-frame render rect (Bucket B: window×scaleXY adaptive)
+	uint32_t active_mode_index;
+	uint32_t render_w, render_h;
+
+	// Event latches (Bucket C: atomic read-and-clear, pumped by poll_events)
+	int      ev_mode_changed;  uint32_t ev_mode_prev, ev_mode_cur;
+	int      ev_hw_changed;     int ev_hw3d;
+	int      ev_track_changed;  int ev_track_is_tracking, ev_track_mode;
 
 	// Resolved function pointers
 	PFN_xrGetSystem                   pfn_get_system;
@@ -191,7 +213,10 @@ typedef struct ProviderSession {
 	PFN_xrBeginSession                pfn_begin_session;
 	PFN_xrEndSession                  pfn_end_session;
 	PFN_xrDestroyInstance             pfn_destroy_instance;
-	PFN_xrEnumerateDisplayRenderingModesEXT pfn_enumerate_modes; // optional
+	PFN_xrEnumerateDisplayRenderingModesEXT pfn_enumerate_modes;          // optional
+	PFN_xrRequestDisplayRenderingModeEXT    pfn_request_rendering_mode;   // optional
+	PFN_xrRequestDisplayModeEXT             pfn_request_display_mode;     // optional
+	PFN_xrRequestEyeTrackingModeEXT         pfn_request_eye_tracking_mode;// optional
 } ProviderSession;
 
 static ProviderSession s_ps;
@@ -318,11 +343,21 @@ static int ps_resolve_functions(void)
 	PS_RESOLVE("xrBeginSession", pfn_begin_session, PFN_xrBeginSession);
 	PS_RESOLVE("xrEndSession", pfn_end_session, PFN_xrEndSession);
 	PS_RESOLVE("xrDestroyInstance", pfn_destroy_instance, PFN_xrDestroyInstance);
-	// Optional EXT — soft-resolve (mode enumeration is M2; OK if absent in M1).
+	// Optional EXT (XR_EXT_display_info mode/eye-tracking control) — soft-resolve;
+	// OK if absent (older runtime → the C# mode UI/events simply stay inert).
 	{
 		PFN_xrVoidFunction _fn = NULL;
 		s_ps.gipa(s_ps.instance, "xrEnumerateDisplayRenderingModesEXT", &_fn);
 		s_ps.pfn_enumerate_modes = (PFN_xrEnumerateDisplayRenderingModesEXT)_fn;
+		_fn = NULL;
+		s_ps.gipa(s_ps.instance, "xrRequestDisplayRenderingModeEXT", &_fn);
+		s_ps.pfn_request_rendering_mode = (PFN_xrRequestDisplayRenderingModeEXT)_fn;
+		_fn = NULL;
+		s_ps.gipa(s_ps.instance, "xrRequestDisplayModeEXT", &_fn);
+		s_ps.pfn_request_display_mode = (PFN_xrRequestDisplayModeEXT)_fn;
+		_fn = NULL;
+		s_ps.gipa(s_ps.instance, "xrRequestEyeTrackingModeEXT", &_fn);
+		s_ps.pfn_request_eye_tracking_mode = (PFN_xrRequestEyeTrackingModeEXT)_fn;
 	}
 	return 1;
 }
@@ -343,11 +378,66 @@ static void ps_enumerate_modes(void)
 		s_ps.modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT;
 	if (XR_SUCCEEDED(s_ps.pfn_enumerate_modes(s_ps.session, total, &total, s_ps.modes)))
 		s_ps.mode_count = total;
+	for (uint32_t i = 0; i < s_ps.mode_count; i++) {
+		if (s_ps.modes[i].isActive) s_ps.active_mode_index = s_ps.modes[i].modeIndex;
+		ps_log("[DisplayXR-PROV] mode[%u] idx=%u '%s' views=%u tiles=%ux%u %ux%u "
+		       "scale=%.3fx%.3f hw3d=%d active=%d req=%d\n",
+		       i, s_ps.modes[i].modeIndex, s_ps.modes[i].modeName,
+		       s_ps.modes[i].viewCount, s_ps.modes[i].tileColumns, s_ps.modes[i].tileRows,
+		       s_ps.modes[i].viewWidthPixels, s_ps.modes[i].viewHeightPixels,
+		       (double)s_ps.modes[i].viewScaleX, (double)s_ps.modes[i].viewScaleY,
+		       (int)s_ps.modes[i].hardwareDisplay3D,
+		       (int)s_ps.modes[i].isActive, (int)s_ps.modes[i].isRequestable);
+	}
+}
+
+// Find an enumerated mode by modeIndex (NULL if absent).
+static const XrDisplayRenderingModeInfoEXT *ps_find_mode(uint32_t mode_index)
+{
 	for (uint32_t i = 0; i < s_ps.mode_count; i++)
-		ps_log("[DisplayXR-PROV] mode[%u] '%s' views=%u %ux%u hw3d=%d\n",
-		       i, s_ps.modes[i].modeName, s_ps.modes[i].viewCount,
-		       s_ps.modes[i].tileColumns, s_ps.modes[i].tileRows,
-		       (int)s_ps.modes[i].hardwareDisplay3D);
+		if (s_ps.modes[i].modeIndex == mode_index) return &s_ps.modes[i];
+	return NULL;
+}
+
+// The active 3D (hardwareDisplay3D, viewCount==2) mode's per-view scaleXY, used
+// to size the per-frame render rect = window × scaleXY. Falls back to the
+// XR_EXT_display_info recommended scale, then to 0.5×1.0 (half-width SBS).
+static void ps_active_view_scale(float *sx, float *sy)
+{
+	const XrDisplayRenderingModeInfoEXT *m = ps_find_mode(s_ps.active_mode_index);
+	if ((!m || !m->hardwareDisplay3D) ) {
+		// No active 3D mode resolved — prefer the first 3D stereo mode.
+		for (uint32_t i = 0; i < s_ps.mode_count; i++)
+			if (s_ps.modes[i].hardwareDisplay3D && s_ps.modes[i].viewCount == 2)
+				{ m = &s_ps.modes[i]; break; }
+	}
+	float x = (m && m->viewScaleX > 0.0f) ? m->viewScaleX
+	          : (s_ps.display_info.is_valid && s_ps.display_info.scale_x > 0.0f
+	             ? s_ps.display_info.scale_x : 0.5f);
+	float y = (m && m->viewScaleY > 0.0f) ? m->viewScaleY
+	          : (s_ps.display_info.is_valid && s_ps.display_info.scale_y > 0.0f
+	             ? s_ps.display_info.scale_y : 1.0f);
+	*sx = x; *sy = y;
+}
+
+// The bound overlay's live client size (= Unity's window client area). The
+// runtime weaves into this WS_CHILD overlay; per-view render res tracks it.
+// Falls back to the display pixel dims when no overlay is bound yet.
+static void ps_window_size(uint32_t *w, uint32_t *h)
+{
+	uint32_t ww = 0, hh = 0;
+	if (s_ps.overlay_hwnd) {
+		RECT rc;
+		if (GetClientRect((HWND)s_ps.overlay_hwnd, &rc)) {
+			ww = (uint32_t)(rc.right - rc.left);
+			hh = (uint32_t)(rc.bottom - rc.top);
+		}
+	}
+	if (ww == 0 || hh == 0) {
+		ww = s_ps.display_info.is_valid ? s_ps.display_info.pixel_width : 1920;
+		hh = s_ps.display_info.is_valid ? s_ps.display_info.pixel_height : 1080;
+	}
+	*w = ww; *h = hh;
 }
 
 // ============================================================================
@@ -361,18 +451,19 @@ static int ps_create_swapchain(void)
 	if (s_ps.swapchain_created) return 1;
 	if (!s_ps.display_info.is_valid) return 0;
 
-	// Size the SPI swapchain to the active 3D mode's PER-VIEW (per-eye) pixels —
-	// each array slice is one eye. Sizing to the full display caused the runtime's
-	// "VIEW SIZE MISMATCH" (app_rect 3840x2160 vs expected per-view 1920x1080).
-	uint32_t w = 0, h = 0;
-	for (uint32_t i = 0; i < s_ps.mode_count; i++) {
-		if (s_ps.modes[i].hardwareDisplay3D && s_ps.modes[i].viewCount == 2 &&
-		    s_ps.modes[i].viewWidthPixels > 0) {
-			w = s_ps.modes[i].viewWidthPixels;
-			h = s_ps.modes[i].viewHeightPixels;
-			break;
-		}
-	}
+	// Per-view (per-eye) render resolution = window(overlay client) × active-mode
+	// scaleXY. Each SPI array slice IS one eye, sized to exactly this — so the
+	// render rect == the swapchain and Unity renders the FULL slice (viewportRect
+	// {0,0,1,1}, imageRect = full). This avoids a sub-rect within a larger
+	// worst-case texture, whose viewport (Unity bottom-left) vs imageRect (D3D
+	// top-left) Y origins don't align → the runtime would sample empty texels
+	// (black). The ADR-010 "worst-case, never realloc" optimization needs that
+	// Y-origin reconciled and a live bridge/swapchain realloc on resize — deferred
+	// as a follow-up; for now we size to the current window (startup-adaptive).
+	uint32_t ww = 0, wh = 0; ps_window_size(&ww, &wh);
+	float sx = 0.5f, sy = 0.5f; ps_active_view_scale(&sx, &sy);
+	uint32_t w = (uint32_t)(ww * sx);
+	uint32_t h = (uint32_t)(wh * sy);
 	if (w == 0 || h == 0) { w = s_ps.display_info.pixel_width / 2; h = s_ps.display_info.pixel_height; }
 	if (w == 0 || h == 0) { w = 1920; h = 1080; }
 
@@ -514,6 +605,26 @@ static int ps_create_bridge(void)
 
 	ps_log("[DisplayXR-PROV] Bridge (2-slice array): %ux%u, own=%p unity=%p\n",
 	       w, h, (void *)s_ps.bridge_own, (void *)s_ps.bridge_unity);
+
+	// Cross-device SHARED fence: own_device creates it shared; Unity's device
+	// opens the same fence. submit_frame signals it on Unity's queue (after the
+	// render) and waits on it on the own queue (before the copy).
+	if (s_ps.unity_queue) {
+		HRESULT hr2 = s_ps.own_device->CreateFence(0, D3D12_FENCE_FLAG_SHARED,
+		        __uuidof(ID3D12Fence), (void **)&s_ps.shared_fence_own);
+		if (SUCCEEDED(hr2)) {
+			hr2 = s_ps.own_device->CreateSharedHandle(s_ps.shared_fence_own, NULL,
+			        GENERIC_ALL, NULL, &s_ps.shared_fence_handle);
+			if (SUCCEEDED(hr2) && s_ps.shared_fence_handle)
+				s_ps.unity_device->OpenSharedHandle(s_ps.shared_fence_handle,
+				        __uuidof(ID3D12Fence), (void **)&s_ps.shared_fence_unity);
+		}
+		ps_log("[DisplayXR-PROV] Shared sync fence: %s\n",
+		       s_ps.shared_fence_unity ? "OK (cross-device render->copy sync)"
+		                               : "FAILED (falling back to coarse sync)");
+	} else {
+		ps_log("[DisplayXR-PROV] No Unity queue → coarse sync only (possible black/tearing)\n");
+	}
 	return 1;
 }
 
@@ -527,10 +638,11 @@ int dxr_prov_session_start(const char *runtime_json_path,
                            void *overlay_hwnd)
 {
 	memset(&s_ps, 0, sizeof(s_ps));
-	s_ps.unity_device = (ID3D12Device *)unity_d3d12_device; // only for opening the bridge
-	(void)unity_d3d12_queue;                                // not used (session runs on own device)
+	s_ps.unity_device = (ID3D12Device *)unity_d3d12_device; // for opening the bridge + shared fence
+	s_ps.unity_queue  = (ID3D12CommandQueue *)unity_d3d12_queue; // signals the cross-device sync fence
 	s_ps.overlay_hwnd = overlay_hwnd;
 	s_ps.ipd_factor = s_ps.parallax_factor = s_ps.perspective_factor = 1.0f;
+	s_ps.fov_override = tanf(0.5f * 1.0471975512f); // tan(30°) — neutral ~60° vFOV default
 
 	if (!s_ps.unity_device) {
 		ps_log("[DisplayXR-PROV] start: missing Unity D3D12 device (needed for bridge)\n");
@@ -703,7 +815,10 @@ void dxr_prov_session_stop(void)
 	if (s_ps.session && s_ps.pfn_destroy_session) s_ps.pfn_destroy_session(s_ps.session);
 	if (s_ps.instance && s_ps.pfn_destroy_instance) s_ps.pfn_destroy_instance(s_ps.instance);
 
-	// Bridge + own-device resources.
+	// Bridge + cross-device fence + own-device resources.
+	if (s_ps.shared_fence_unity)  s_ps.shared_fence_unity->Release();
+	if (s_ps.shared_fence_handle) CloseHandle(s_ps.shared_fence_handle);
+	if (s_ps.shared_fence_own)    s_ps.shared_fence_own->Release();
 	if (s_ps.bridge_unity)    s_ps.bridge_unity->Release();
 	if (s_ps.bridge_handle)   CloseHandle(s_ps.bridge_handle);
 	if (s_ps.bridge_own)      s_ps.bridge_own->Release();
@@ -777,6 +892,30 @@ void dxr_prov_poll_events(void)
 				break;
 			default: break;
 			}
+		} else if (ev.type == XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_EXT) {
+			XrEventDataRenderingModeChangedEXT *mc = (XrEventDataRenderingModeChangedEXT *)&ev;
+			// Re-enumerate so active_mode_index + per-mode tiling/scale refresh;
+			// the per-frame render rect (dxr_prov_get_render_rect) then adapts with
+			// NO swapchain realloc (worst-case sized). Latch for C#.
+			ps_enumerate_modes();
+			s_ps.active_mode_index = mc->currentModeIndex;
+			s_ps.ev_mode_prev = mc->previousModeIndex;
+			s_ps.ev_mode_cur = mc->currentModeIndex;
+			s_ps.ev_mode_changed = 1;
+			ps_log("[DisplayXR-PROV] event: rendering mode %u -> %u\n",
+			       mc->previousModeIndex, mc->currentModeIndex);
+		} else if (ev.type == XR_TYPE_EVENT_DATA_HARDWARE_DISPLAY_STATE_CHANGED_EXT) {
+			XrEventDataHardwareDisplayStateChangedEXT *hc = (XrEventDataHardwareDisplayStateChangedEXT *)&ev;
+			s_ps.ev_hw3d = hc->hardwareDisplay3D ? 1 : 0;
+			s_ps.ev_hw_changed = 1;
+			ps_log("[DisplayXR-PROV] event: hardware 3D -> %d\n", s_ps.ev_hw3d);
+		} else if (ev.type == XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_EXT) {
+			XrEventDataEyeTrackingStateChangedEXT *tc = (XrEventDataEyeTrackingStateChangedEXT *)&ev;
+			s_ps.ev_track_is_tracking = tc->isTracking ? 1 : 0;
+			s_ps.ev_track_mode = (int)tc->activeMode;
+			s_ps.ev_track_changed = 1;
+			ps_log("[DisplayXR-PROV] event: eye tracking -> %d (mode %d)\n",
+			       s_ps.ev_track_is_tracking, s_ps.ev_track_mode);
 		}
 		ev = {XR_TYPE_EVENT_DATA_BUFFER};
 	}
@@ -794,6 +933,22 @@ int dxr_prov_begin_frame(uint32_t *out_image_index, int *out_should_render)
 	s_ps.predicted_display_time = fs.predictedDisplayTime;
 	s_ps.frame_begun = 1;
 
+	// --- Per-frame render rect = window(overlay client) × active-mode scaleXY,
+	//     clamped to the worst-case swapchain (ADR-010). Re-derived every frame so
+	//     a live window resize / mode switch needs no swapchain reallocation. ---
+	{
+		uint32_t ww, wh; ps_window_size(&ww, &wh);
+		float sx, sy; ps_active_view_scale(&sx, &sy);
+		uint32_t rw = (uint32_t)(ww * sx);
+		uint32_t rh = (uint32_t)(wh * sy);
+		if (rw == 0) rw = 1;
+		if (rh == 0) rh = 1;
+		if (s_ps.sc_width  && rw > s_ps.sc_width)  rw = s_ps.sc_width;
+		if (s_ps.sc_height && rh > s_ps.sc_height) rh = s_ps.sc_height;
+		s_ps.render_w = rw;
+		s_ps.render_h = rh;
+	}
+
 	// --- Locate views (XR_EXT_view_rig chained → render-ready pose+fov) ---
 	s_ps.view_count = 0;
 	if (s_ps.local_space != XR_NULL_HANDLE && s_ps.pfn_locate_views) {
@@ -807,23 +962,43 @@ int dxr_prov_begin_frame(uint32_t *out_image_index, int *out_should_render)
 		XrViewState vstate = {XR_TYPE_VIEW_STATE};
 		uint32_t vcount = 0;
 
-		XrDisplayRigEXT rig = {XR_TYPE_DISPLAY_RIG_EXT};
+		// XR_EXT_view_rig: chain the rig descriptor matching the active rig mode
+		// (mirrors displayxr_standalone.cpp). Camera-centric → XrCameraRigEXT;
+		// display-centric → XrDisplayRigEXT. The runtime returns render-ready
+		// XrView{pose,fov}; the raw channel recovers the raw display-space eyes.
+		XrDisplayRigEXT display_rig = {XR_TYPE_DISPLAY_RIG_EXT};
+		XrCameraRigEXT  camera_rig  = {XR_TYPE_CAMERA_RIG_EXT};
 		XrViewDisplayRawEXT raw = {XR_TYPE_VIEW_DISPLAY_RAW_EXT};
 		XrPosef rig_pose = s_ps.display_pose_set ? s_ps.display_pose
 		                                         : XrPosef{{0, 0, 0, 1}, {0, 0, 0}};
 		if (s_ps.has_view_rig) {
-			// Default virtualDisplayHeight to the physical display height (a
-			// window-as-portal 1:1 framing) so a scene with no DisplayXR rig
-			// pushing tunables still gets real stereo separation. Apps override
-			// via dxr_prov_set_tunables (M2: wired from DisplayXRDisplay).
-			float vdh = s_ps.display_info.is_valid && s_ps.display_info.height_m > 0.0f
-			            ? s_ps.display_info.height_m : 0.2f;
-			rig.pose = rig_pose;
-			rig.virtualDisplayHeight = s_ps.tunables_set ? s_ps.virtual_display_height : vdh;
-			rig.ipdFactor = s_ps.tunables_set ? s_ps.ipd_factor : 1.0f;
-			rig.parallaxFactor = s_ps.tunables_set ? s_ps.parallax_factor : 1.0f;
-			rig.perspectiveFactor = s_ps.tunables_set ? s_ps.perspective_factor : 1.0f;
-			li.next = &rig;
+			if (s_ps.camera_centric) {
+				camera_rig.pose = rig_pose;
+				camera_rig.ipdFactor = s_ps.tunables_set ? s_ps.ipd_factor : 1.0f;
+				camera_rig.parallaxFactor = s_ps.tunables_set ? s_ps.parallax_factor : 1.0f;
+				camera_rig.convergenceDiopters = s_ps.inv_convergence_distance;
+				camera_rig.verticalFov = 2.0f * atanf(s_ps.fov_override);
+				camera_rig.metersToVirtual = 1.0f; // spec v3: identity meters->world
+				li.next = &camera_rig;
+			} else {
+				// Default virtualDisplayHeight to the physical display height (a
+				// window-as-portal 1:1 framing) so a scene with no DisplayXR rig
+				// pushing tunables still gets real stereo separation. Apps override
+				// via dxr_prov_set_tunables (wired from DisplayXRDisplay).
+				float vdh = s_ps.display_info.is_valid && s_ps.display_info.height_m > 0.0f
+				            ? s_ps.display_info.height_m : 0.2f;
+				display_rig.pose = rig_pose;
+				// vdh <= 0 always means "use the physical display height" (matches the
+				// rig's own resolution), so the C# driver can pass a raw 0 safely even
+				// before its display-info query resolves.
+				display_rig.virtualDisplayHeight =
+				    (s_ps.tunables_set && s_ps.virtual_display_height > 0.0f)
+				        ? s_ps.virtual_display_height : vdh;
+				display_rig.ipdFactor = s_ps.tunables_set ? s_ps.ipd_factor : 1.0f;
+				display_rig.parallaxFactor = s_ps.tunables_set ? s_ps.parallax_factor : 1.0f;
+				display_rig.perspectiveFactor = s_ps.tunables_set ? s_ps.perspective_factor : 1.0f;
+				li.next = &display_rig;
+			}
 			vstate.next = &raw;
 		}
 
@@ -889,8 +1064,7 @@ int dxr_prov_submit_frame(uint32_t image_index)
 
 	// Unity rendered both eyes into the shared BRIDGE (slices 0/1) on its device.
 	// Copy the bridge into the acquired runtime swapchain image (both slices) on
-	// our own device, then fence-wait. (Coarse cross-device sync — mirrors the
-	// standalone's blit_atlas; a shared fence is a future refinement.)
+	// our own device, fence-synced against Unity's render (shared fence below).
 	if (s_ps.bridge_own && image_index < s_ps.sc_image_count &&
 	    s_ps.sc_images[image_index].texture && s_ps.own_cmd_list) {
 		ID3D12Resource *dst = s_ps.sc_images[image_index].texture;
@@ -908,6 +1082,17 @@ int dxr_prov_submit_frame(uint32_t image_index)
 			s_ps.own_cmd_list->CopyTextureRegion(&dl, 0, 0, 0, &sl, NULL);
 		}
 		s_ps.own_cmd_list->Close();
+
+		// Cross-device sync: signal a SHARED fence on Unity's queue (ordered after
+		// Unity's already-submitted render into the bridge — Unity's queue is FIFO)
+		// and GPU-wait on it on the own queue, so the copy reads the FINISHED render
+		// (not empty texels → black).
+		if (s_ps.shared_fence_unity && s_ps.shared_fence_own && s_ps.unity_queue) {
+			s_ps.sync_val++;
+			s_ps.unity_queue->Signal(s_ps.shared_fence_unity, s_ps.sync_val);
+			s_ps.own_queue->Wait(s_ps.shared_fence_own, s_ps.sync_val);
+		}
+
 		ID3D12CommandList *lists[] = { s_ps.own_cmd_list };
 		s_ps.own_queue->ExecuteCommandLists(1, lists);
 		s_ps.own_fence_value++;
@@ -941,9 +1126,13 @@ int dxr_prov_submit_frame(uint32_t image_index)
 		pv[eye].fov.angleRight = s_ps.views[eye].fov[1];
 		pv[eye].fov.angleUp    = s_ps.views[eye].fov[2];
 		pv[eye].fov.angleDown  = s_ps.views[eye].fov[3];
+		// SPI: each eye is array slice 0/1; imageRect is the active render
+		// sub-region (window×scaleXY) within the worst-case-sized slice.
+		uint32_t rw = s_ps.render_w ? s_ps.render_w : s_ps.sc_width;
+		uint32_t rh = s_ps.render_h ? s_ps.render_h : s_ps.sc_height;
 		pv[eye].subImage.swapchain = s_ps.swapchain;
 		pv[eye].subImage.imageRect.offset = {0, 0};
-		pv[eye].subImage.imageRect.extent = {(int32_t)s_ps.sc_width, (int32_t)s_ps.sc_height};
+		pv[eye].subImage.imageRect.extent = {(int32_t)rw, (int32_t)rh};
 		pv[eye].subImage.imageArrayIndex = eye; // SPI: left=0, right=1
 	}
 
@@ -982,21 +1171,34 @@ void dxr_prov_end_frame_empty(void)
 // ============================================================================
 
 void dxr_prov_set_tunables(float ipd_factor, float parallax_factor,
-                           float perspective_factor, float virtual_display_height)
+                           float perspective_factor, float virtual_display_height,
+                           float inv_convergence_distance, float fov_override,
+                           float near_z, float far_z, int camera_centric)
 {
 	s_ps.ipd_factor = ipd_factor;
 	s_ps.parallax_factor = parallax_factor;
 	s_ps.perspective_factor = perspective_factor;
 	s_ps.virtual_display_height = virtual_display_height;
+	s_ps.inv_convergence_distance = inv_convergence_distance;
+	s_ps.fov_override = fov_override;
+	s_ps.near_z = near_z;            // owned by Unity's projection; stored, unused
+	s_ps.far_z = far_z;
+	s_ps.camera_centric = camera_centric;
 	s_ps.tunables_set = 1;
 }
 
 void dxr_prov_set_display_pose(float px, float py, float pz,
                                float ox, float oy, float oz, float ow, int enabled)
 {
-	s_ps.display_pose.position = XrVector3f{px, py, pz};
-	s_ps.display_pose.orientation = XrQuaternionf{ox, oy, oz, ow};
-	s_ps.display_pose_set = enabled ? 1 : 0;
+	if (enabled) {
+		// Unity (left-hand, +Z forward) → OpenXR (right-hand, -Z forward):
+		// negate position Z, negate quaternion X/Y. Matches the standalone / hook.
+		s_ps.display_pose.position = XrVector3f{px, py, -pz};
+		s_ps.display_pose.orientation = XrQuaternionf{-ox, -oy, oz, ow};
+		s_ps.display_pose_set = 1;
+	} else {
+		s_ps.display_pose_set = 0;
+	}
 }
 
 void dxr_prov_get_display_info(DxrProvDisplayInfo *out_info)
@@ -1005,3 +1207,91 @@ void dxr_prov_get_display_info(DxrProvDisplayInfo *out_info)
 }
 
 int dxr_prov_has_view_rig(void) { return s_ps.has_view_rig; }
+
+void dxr_prov_get_render_rect(uint32_t *out_w, uint32_t *out_h)
+{
+	if (out_w) *out_w = s_ps.render_w ? s_ps.render_w : s_ps.sc_width;
+	if (out_h) *out_h = s_ps.render_h ? s_ps.render_h : s_ps.sc_height;
+}
+
+// ============================================================================
+// Rendering modes (XR_EXT_display_info)
+// ============================================================================
+
+uint32_t dxr_prov_get_mode_count(void) { return s_ps.mode_count; }
+
+int dxr_prov_get_mode_info(uint32_t index, DxrProvModeInfo *out_info)
+{
+	if (!out_info || index >= s_ps.mode_count) return 0;
+	const XrDisplayRenderingModeInfoEXT *m = &s_ps.modes[index];
+	out_info->mode_index = m->modeIndex;
+	out_info->view_count = m->viewCount;
+	out_info->tile_columns = m->tileColumns;
+	out_info->tile_rows = m->tileRows;
+	out_info->view_width_px = m->viewWidthPixels;
+	out_info->view_height_px = m->viewHeightPixels;
+	out_info->view_scale_x = m->viewScaleX;
+	out_info->view_scale_y = m->viewScaleY;
+	out_info->hardware_display_3d = (int)m->hardwareDisplay3D;
+	out_info->is_active = (int)m->isActive;
+	out_info->is_requestable = (int)m->isRequestable;
+	strncpy(out_info->name, m->modeName, sizeof(out_info->name) - 1);
+	out_info->name[sizeof(out_info->name) - 1] = '\0';
+	return 1;
+}
+
+uint32_t dxr_prov_get_active_mode_index(void) { return s_ps.active_mode_index; }
+
+int dxr_prov_request_rendering_mode(uint32_t mode_index)
+{
+	if (!s_ps.session || !s_ps.pfn_request_rendering_mode) return 0;
+	XrResult r = s_ps.pfn_request_rendering_mode(s_ps.session, mode_index);
+	ps_log("[DisplayXR-PROV] request rendering mode %u -> %d\n", mode_index, r);
+	return XR_SUCCEEDED(r) ? 1 : 0;
+}
+
+int dxr_prov_request_display_mode(int mode3d)
+{
+	if (!s_ps.session || !s_ps.pfn_request_display_mode) return 0;
+	XrResult r = s_ps.pfn_request_display_mode(s_ps.session,
+	        mode3d ? XR_DISPLAY_MODE_3D_EXT : XR_DISPLAY_MODE_2D_EXT);
+	ps_log("[DisplayXR-PROV] request display mode %s -> %d\n", mode3d ? "3D" : "2D", r);
+	return XR_SUCCEEDED(r) ? 1 : 0;
+}
+
+int dxr_prov_set_eye_tracking_mode(int manual)
+{
+	if (!s_ps.session || !s_ps.pfn_request_eye_tracking_mode) return 0;
+	XrResult r = s_ps.pfn_request_eye_tracking_mode(s_ps.session,
+	        manual ? XR_EYE_TRACKING_MODE_MANUAL_EXT : XR_EYE_TRACKING_MODE_MANAGED_EXT);
+	ps_log("[DisplayXR-PROV] request eye-tracking mode %s -> %d\n", manual ? "MANUAL" : "MANAGED", r);
+	return XR_SUCCEEDED(r) ? 1 : 0;
+}
+
+// ---- Event latches (read-and-clear) -----------------------------------------
+
+int dxr_prov_consume_mode_changed(uint32_t *prev_index, uint32_t *cur_index)
+{
+	if (!s_ps.ev_mode_changed) return 0;
+	s_ps.ev_mode_changed = 0;
+	if (prev_index) *prev_index = s_ps.ev_mode_prev;
+	if (cur_index)  *cur_index = s_ps.ev_mode_cur;
+	return 1;
+}
+
+int dxr_prov_consume_hw_state_changed(int *hw3d)
+{
+	if (!s_ps.ev_hw_changed) return 0;
+	s_ps.ev_hw_changed = 0;
+	if (hw3d) *hw3d = s_ps.ev_hw3d;
+	return 1;
+}
+
+int dxr_prov_consume_eye_tracking_changed(int *is_tracking, int *active_mode)
+{
+	if (!s_ps.ev_track_changed) return 0;
+	s_ps.ev_track_changed = 0;
+	if (is_tracking) *is_tracking = s_ps.ev_track_is_tracking;
+	if (active_mode) *active_mode = s_ps.ev_track_mode;
+	return 1;
+}
