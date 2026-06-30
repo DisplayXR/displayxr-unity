@@ -26,6 +26,14 @@ namespace DisplayXR
     {
         static DisplayXRProviderDriver s_instance;
 
+        /// <summary>
+        /// True while the custom display provider is driving rendering. Rigs use this
+        /// to disable provider-incompatible features — notably post-process AA, whose
+        /// OnRenderImage Blit can't address the provider's 2-slice texture-array eye
+        /// RT (garbage / white blocks) in either SPI or MultiPass (#166).
+        /// </summary>
+        public static bool IsActive { get; private set; }
+
         bool  m_SessionStarted;
         float m_DisplayHeightM;
 
@@ -39,6 +47,7 @@ namespace DisplayXR
             };
             DontDestroyOnLoad(go);
             s_instance = go.AddComponent<DisplayXRProviderDriver>();
+            IsActive = true;
         }
 
         /// <summary>Destroy the singleton driver. Called from the loader's Stop.</summary>
@@ -47,6 +56,7 @@ namespace DisplayXR
             if (s_instance == null) return;
             Destroy(s_instance.gameObject);
             s_instance = null;
+            IsActive = false;
         }
 
         void LateUpdate()

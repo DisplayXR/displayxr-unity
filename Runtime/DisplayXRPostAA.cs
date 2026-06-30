@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 using UnityEngine;
+using UnityEngine.XR;
 
 namespace DisplayXR
 {
@@ -71,6 +72,25 @@ namespace DisplayXR
         /// return it. Called by the rig components to mirror their
         /// <c>postProcessAntiAliasing</c> flag onto the effect's enabled state.
         /// </summary>
+        /// <summary>
+        /// Post-AA is valid only in MultiPass. Single-pass-instanced (the custom
+        /// display provider, #166) renders both eyes into a 2-slice texture array;
+        /// <see cref="OnRenderImage"/>'s <c>Graphics.Blit</c> can't address the array
+        /// and leaves the eye texture undefined (uniform white). The rigs gate the
+        /// effect's enabled state on this so post-AA stays off under SPI.
+        /// </summary>
+        internal static bool SupportedForCurrentStereoMode()
+        {
+            // The custom display provider renders into a 2-slice texture ARRAY in
+            // both SPI and MultiPass; OnRenderImage's Blit can't address the array
+            // (garbage / white blocks). Disable post-AA whenever the provider drives
+            // rendering — it's a hook/standalone-only feature. (#166)
+            if (DisplayXRProviderDriver.IsActive)
+                return false;
+            // Single-pass-instanced breaks the Blit even on the hook/standalone path.
+            return XRSettings.stereoRenderingMode != XRSettings.StereoRenderingMode.SinglePassInstanced;
+        }
+
         internal static DisplayXRPostAA Ensure(GameObject go)
         {
             var c = go.GetComponent<DisplayXRPostAA>();

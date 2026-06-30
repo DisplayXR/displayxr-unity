@@ -93,7 +93,7 @@ namespace DisplayXR
             // Post-process AA: Unity drops MSAA on the XR eye RT, so attach a
             // (hidden, rig-managed) FXAA pass and mirror the toggle onto it.
             m_PostAA = DisplayXRPostAA.Ensure(gameObject);
-            m_PostAA.enabled = postProcessAntiAliasing;
+            m_PostAA.enabled = postProcessAntiAliasing && DisplayXRPostAA.SupportedForCurrentStereoMode();
 #if !UNITY_EDITOR
             if (m_Feature == null)
             {
@@ -194,7 +194,7 @@ namespace DisplayXR
         {
             // Keep the post-process AA pass tracking the toggle (inspector or
             // runtime). Before the active-rig gate so every rig tracks its own flag.
-            if (m_PostAA != null) m_PostAA.enabled = postProcessAntiAliasing;
+            if (m_PostAA != null) m_PostAA.enabled = postProcessAntiAliasing && DisplayXRPostAA.SupportedForCurrentStereoMode();
 
             if (bootSplashOverlay)
             {

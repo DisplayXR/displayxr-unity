@@ -160,6 +160,16 @@ static int   s_app_managed_window = 0;
 // creation time; setting it later has no effect on birth size.
 static int   s_fullscreen_overlay_pref = 0;
 
+// (#166) Provider in-app weave: when set before displayxr_get_app_main_view(),
+// the overlay is created as a TOP-LEVEL WS_POPUP + WS_EX_NOREDIRECTIONBITMAP
+// (owned by Unity) instead of a WS_CHILD. A WS_CHILD doesn't composite the
+// runtime's D3D12 DComp flip swapchain (the weave shows white/see-through); a
+// top-level NOREDIRECTIONBITMAP popup composites it exactly like the hook path's
+// transparent overlay, but WITHOUT the transparent-app extras (no Unity cloak /
+// off-screen move / click-through). Opaque weave over Unity's own window = one
+// window UX. Set by the custom IUnityXRDisplay provider (DISPLAYXR_PROV_OVERLAY=1).
+static int   s_provider_opaque_overlay = 0;
+
 // (#131) App-requested overlay cursor shape, applied in WM_SETCURSOR. The
 // overlay window class has no hCursor, so we must SetCursor explicitly (incl.
 // the arrow for shape 0) or a resize cursor would stick. 0=arrow, 1=size-WE,
@@ -522,6 +532,14 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		}
 	}
 
+	// (#166) Provider in-app weave: the overlay is a pure display surface sitting
+	// over Unity's client area. Pass EVERY hit straight through to Unity beneath so
+	// Unity's keyboard/mouse work normally and no overlay drag/hit/foreground logic
+	// fires. (s_overlay_is_toplevel is also set — it's genuinely top-level — but the
+	// transparent-app interaction model below must NOT apply to the provider.)
+	if (s_provider_opaque_overlay && msg == WM_NCHITTEST)
+		return HTTRANSPARENT;
+
 	switch (msg) {
 	case WM_NCHITTEST: {
 		if (s_overlay_is_toplevel) {
@@ -860,7 +878,19 @@ parent_subclass_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 	if (msg == WM_SIZE && s_overlay_hwnd != NULL && IsWindow(s_overlay_hwnd)) {
 		int w = LOWORD(lParam);
 		int h = HIWORD(lParam);
-		if (s_overlay_is_toplevel) {
+		if (s_provider_opaque_overlay) {
+			// (#166) Top-level provider overlay follows Unity's on-screen client
+			// area (screen coords, unlike the WS_CHILD 0,0). Reposition + resize +
+			// push the new viewport rect to the runtime.
+			POINT client_origin = {0, 0};
+			ClientToScreen(hwnd, &client_origin);
+			SetWindowPos(s_overlay_hwnd, NULL, client_origin.x, client_origin.y,
+			             w, h, SWP_NOZORDER | SWP_NOACTIVATE);
+			if (w > 0 && h > 0)
+				displayxr_set_viewport_size_native(
+					(uint32_t)w, (uint32_t)h,
+					(int32_t)client_origin.x, (int32_t)client_origin.y);
+		} else if (s_overlay_is_toplevel) {
 			// Transparent mode: Unity lives off-screen at (-32000,-32000)
 			// for cross-process click-through (Approach A, #57 session 4).
 			// Don't follow Unity's position — the overlay owns its own
@@ -882,9 +912,26 @@ parent_subclass_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 	if (msg == WM_MOVE) {
 		// In transparent mode, Unity's position is meaningless (off-screen);
 		// the overlay tracks its own position via overlay_wnd_proc WM_MOVE.
-		// In opaque (WS_CHILD) mode, the overlay follows Unity 1:1 and we
-		// also push viewport_size_native from Unity's client_origin.
-		if (!s_overlay_is_toplevel) {
+		// In opaque WS_CHILD mode the overlay follows Unity automatically (it's a
+		// child); we only push the viewport client_origin. In provider top-level
+		// mode (#166) the overlay is a separate window, so we must also move it to
+		// Unity's new client origin.
+		if (s_provider_opaque_overlay) {
+			POINT client_origin = {0, 0};
+			ClientToScreen(hwnd, &client_origin);
+			if (s_overlay_hwnd != NULL && IsWindow(s_overlay_hwnd)) {
+				RECT cr;
+				GetClientRect(hwnd, &cr);
+				SetWindowPos(s_overlay_hwnd, NULL, client_origin.x, client_origin.y,
+				             cr.right - cr.left, cr.bottom - cr.top,
+				             SWP_NOZORDER | SWP_NOACTIVATE);
+			}
+			DisplayXRState *state = displayxr_get_state();
+			if (state->viewport_width > 0)
+				displayxr_set_viewport_size_native(
+					state->viewport_width, state->viewport_height,
+					(int32_t)client_origin.x, (int32_t)client_origin.y);
+		} else if (!s_overlay_is_toplevel) {
 			POINT client_origin = {0, 0};
 			ClientToScreen(hwnd, &client_origin);
 			DisplayXRState *state = displayxr_get_state();
@@ -1028,10 +1075,16 @@ displayxr_get_app_main_view(void)
 	DisplayXRState *state = displayxr_get_state();
 	int transparent_mode = (state != NULL && state->transparent_background_requested);
 
+	// (#166) Provider in-app weave wants a TOP-LEVEL popup (composites the runtime
+	// DComp weave) but opaque — no transparent-app extras. transparent_mode keeps
+	// precedence if both are somehow set.
+	int provider_opaque = s_provider_opaque_overlay && !transparent_mode;
+	int toplevel = transparent_mode || provider_opaque;
+
 	POINT client_origin = {0, 0};
 	ClientToScreen(unity_hwnd, &client_origin);
 
-	DWORD style    = transparent_mode
+	DWORD style    = toplevel
 	    ? (DWORD)(WS_POPUP | WS_VISIBLE)
 	    : (DWORD)(WS_CHILD | WS_VISIBLE);
 	// Transparent path: WS_EX_TRANSPARENT is NOT in the creation exstyle —
@@ -1047,11 +1100,22 @@ displayxr_get_app_main_view(void)
 	// when the user clicks the cube — otherwise Application.isFocused
 	// flips false and Unity stops processing input.
 	// WS_EX_TOPMOST keeps the avatar visually above the underlying app.
+	// Provider-opaque: NOREDIRECTIONBITMAP so DWM composites purely from the
+	// runtime's DComp visuals (same as transparent); NOACTIVATE so the overlay
+	// never takes foreground (focus/keyboard stay on Unity); and TRANSPARENT so the
+	// overlay is invisible to OS hit-testing — mouse clicks pass straight through to
+	// Unity's window directly beneath (the overlay is a pure display surface over
+	// Unity's client area). Without TRANSPARENT the overlay swallows mouse input and
+	// the #57 RMB-drag wndproc branches (enabled by s_overlay_is_toplevel) fire
+	// (#166). No TOPMOST/TOOLWINDOW — the popup is owned by Unity (below), so it
+	// tracks Unity's z-order/visibility without being a global top-most tool window.
 	DWORD ex_style = transparent_mode
 	    ? (DWORD)(WS_EX_NOREDIRECTIONBITMAP | WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)
-	    : (DWORD)(WS_EX_TRANSPARENT);
-	int x = transparent_mode ? client_origin.x : 0;
-	int y = transparent_mode ? client_origin.y : 0;
+	    : provider_opaque
+	        ? (DWORD)(WS_EX_NOREDIRECTIONBITMAP | WS_EX_NOACTIVATE | WS_EX_TRANSPARENT)
+	        : (DWORD)(WS_EX_TRANSPARENT);
+	int x = toplevel ? client_origin.x : 0;
+	int y = toplevel ? client_origin.y : 0;
 
 	// (#131) Fullscreen-overlay preference: when the app opted in BEFORE the
 	// overlay was created (displayxr_set_fullscreen_overlay_pref, from a
@@ -1108,14 +1172,16 @@ displayxr_get_app_main_view(void)
 		return NULL;
 	}
 
-	s_overlay_is_toplevel = transparent_mode;
+	s_overlay_is_toplevel = toplevel;
 
 	s_original_wndproc = (WNDPROC)SetWindowLongPtrW(
 	    unity_hwnd, GWLP_WNDPROC, (LONG_PTR)parent_subclass_proc);
 
 	displayxr_log("[DisplayXR] Created overlay HWND (%dx%d at %d,%d) on Unity window %p — %s\n",
 	              w, h, x, y, (void *)unity_hwnd,
-	              transparent_mode ? "TOP-LEVEL WS_POPUP + NOREDIRECTIONBITMAP (transparent)" : "WS_CHILD (opaque)");
+	              transparent_mode ? "TOP-LEVEL WS_POPUP + NOREDIRECTIONBITMAP (transparent)"
+	              : provider_opaque ? "TOP-LEVEL WS_POPUP + NOREDIRECTIONBITMAP (provider opaque)"
+	              : "WS_CHILD (opaque)");
 
 	displayxr_set_viewport_size_native(
 		(uint32_t)w, (uint32_t)h,
@@ -2071,6 +2137,18 @@ displayxr_set_fullscreen_overlay_pref(int enabled)
 	s_fullscreen_overlay_pref = enabled ? 1 : 0;
 	displayxr_log("[DisplayXR] fullscreen_overlay_pref = %d\n",
 	              s_fullscreen_overlay_pref);
+}
+
+void
+displayxr_set_provider_opaque_overlay(int enabled)
+{
+	// (#166) Call BEFORE displayxr_get_app_main_view() so the overlay is born as a
+	// top-level WS_POPUP + NOREDIRECTIONBITMAP (composites the runtime's DComp
+	// weave) instead of a WS_CHILD (which doesn't). Used by the provider's in-app
+	// weave path. No effect if transparent-overlay mode is also requested.
+	s_provider_opaque_overlay = enabled ? 1 : 0;
+	displayxr_log("[DisplayXR] provider_opaque_overlay = %d\n",
+	              s_provider_opaque_overlay);
 }
 
 void
