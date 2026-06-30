@@ -31,6 +31,14 @@
 #include <stdio.h>
 #include <string.h>
 
+// Hook-path Win32 helper (displayxr_win32.c): finds Unity's main HWND and
+// creates a WS_CHILD overlay sized to its client area, subclassing Unity's
+// wndproc so the overlay tracks Unity's window on resize. In provider mode the
+// OpenXR hook is NOT installed, so the provider is the sole caller — the runtime
+// weaves into this overlay (in-app weave) and per-view resolution tracks the
+// overlay's live client size (displayxr_get_overlay_size).
+extern "C" void *displayxr_get_app_main_view(void);
+
 // Must match Runtime/UnitySubsystemsManifest.json ("name" + display "id").
 static const char *k_plugin_name = "DisplayXR";
 static const char *k_display_id  = "DisplayXR Display";
@@ -46,6 +54,14 @@ IUnityXRDisplayInterface *s_display = nullptr;
 
 UnitySubsystemHandle    s_handle = nullptr;   // from lifecycle callbacks
 bool                    s_session_active = false;
+
+// WS_CHILD overlay HWND over Unity's window, created on the MAIN thread in
+// LifecycleStart (NOT in GfxStart). Creating a WS_CHILD of Unity's main-thread
+// window from the render thread attaches the two threads' input queues and
+// deadlocks (Unity's main thread is blocked waiting for GfxStart to return).
+// The hook path avoids this because it creates the overlay during xrCreateSession
+// on the main thread. NULL → runtime self-hosts a window (fallback).
+void                   *s_overlay_hwnd = nullptr;
 
 // Unity textures wrapping each runtime swapchain image (zero-copy). Indexed by
 // swapchain image index; PopulateNextFrameDesc rotates to the acquired index.
@@ -187,10 +203,21 @@ GfxStart(UnitySubsystemHandle handle, void *userData, UnityXRRenderingCapabiliti
 	ID3D12CommandQueue *q = nullptr;
 	if (!get_unity_d3d12(&dev, &q)) return kUnitySubsystemErrorCodeFailure;
 
+	// Weave target. Default = runtime self-hosts its own window (the M1b known-good
+	// baseline, validated on the panel). Set DISPLAYXR_PROV_OVERLAY=1 to instead
+	// bind to the WS_CHILD overlay over Unity's window (in-app weave) created on
+	// the main thread in LifecycleStart — that path's D3D12 swapchain present on a
+	// WS_CHILD is still being brought up (a child window doesn't composite a D3D12
+	// flip swapchain the way the hook path's top-level WS_POPUP does), so it is
+	// opt-in until that window-side issue is resolved.
+	const char *use_overlay = getenv("DISPLAYXR_PROV_OVERLAY");
+	void *overlay_hwnd = (use_overlay && use_overlay[0] == '1') ? s_overlay_hwnd : nullptr;
+	prov_log(overlay_hwnd
+	             ? "[DisplayXR-PROV] weave target: WS_CHILD overlay (in-app)\n"
+	             : "[DisplayXR-PROV] weave target: runtime self-hosted window\n");
+
 	// runtime_json = NULL -> resolve from XR_RUNTIME_JSON (sim_display bring-up).
-	// overlay_hwnd = NULL -> runtime self-hosts a window (hosted class). The
-	// WS_CHILD overlay over Unity's window is an M2 refinement.
-	if (!dxr_prov_session_start(nullptr, dev, q, nullptr)) {
+	if (!dxr_prov_session_start(nullptr, dev, q, overlay_hwnd)) {
 		prov_log("[DisplayXR-PROV] dxr_prov_session_start failed\n");
 		return kUnitySubsystemErrorCodeFailure;
 	}
@@ -230,6 +257,18 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 	pass.cullingPassIndex = 0;
 	pass.renderParamsCount = 2;
 
+	// Adaptive viewport: Unity renders only the active sub-region (render rect =
+	// window×scaleXY) of the worst-case-sized bridge slice, matching the per-view
+	// imageRect the session submits. Normalized to the swapchain/bridge size.
+	uint32_t scW = 0, scH = 0, scArr = 0, scImgs = 0;
+	dxr_prov_get_swapchain_info(&scW, &scH, &scArr, &scImgs);
+	uint32_t rW = 0, rH = 0;
+	dxr_prov_get_render_rect(&rW, &rH);
+	float vpW = (scW > 0 && rW > 0) ? (float)rW / (float)scW : 1.0f;
+	float vpH = (scH > 0 && rH > 0) ? (float)rH / (float)scH : 1.0f;
+	if (vpW > 1.0f) vpW = 1.0f;
+	if (vpH > 1.0f) vpH = 1.0f;
+
 	for (uint32_t eye = 0; eye < 2; eye++) {
 		DxrProvView v;
 		dxr_prov_get_view(eye, &v);
@@ -243,7 +282,7 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 		rp.projection.data.halfAngles.bottom = tanf(v.fov[3]);
 		rp.occlusionMeshId = 0;
 		rp.textureArraySlice = (int32_t)eye;          // SPI slice
-		rp.viewportRect = UnityXRRectf{0.0f, 0.0f, 1.0f, 1.0f};
+		rp.viewportRect = UnityXRRectf{0.0f, 0.0f, vpW, vpH};
 	}
 
 	// One combined culling pass (use the left eye as the culling viewpoint).
@@ -262,6 +301,20 @@ GfxSubmitCurrentFrame(UnitySubsystemHandle handle, void *userData)
 	(void)handle; (void)userData;
 	if (!s_session_active || !s_frame_in_flight) return kUnitySubsystemErrorCodeSuccess;
 	s_frame_in_flight = false;
+
+	// Cross-device handoff: Unity just rendered both eyes into the shared bridge
+	// (leaving it in RENDER_TARGET on Unity's device). Ask Unity to transition it
+	// to COMMON in its active command list so our SEPARATE device can read it
+	// coherently across the device boundary (a D3D12 shared resource must be in
+	// COMMON at a cross-device sync point). Without this the own-device copy reads
+	// incoherent/empty memory → black. Pairs with the shared sync fence.
+	uint32_t bw = 0, bh = 0, ba = 0;
+	void *bridge = dxr_prov_get_bridge_unity_texture(&bw, &bh, &ba);
+	if (bridge) {
+		if (IUnityGraphicsD3D12v8 *v8 = s_ifaces->Get<IUnityGraphicsD3D12v8>())
+			v8->RequestResourceState((ID3D12Resource *)bridge, D3D12_RESOURCE_STATE_COMMON);
+	}
+
 	dxr_prov_submit_frame(s_current_image_index);
 	return kUnitySubsystemErrorCodeSuccess;
 }
@@ -348,7 +401,14 @@ UnitySubsystemErrorCode UNITY_INTERFACE_API
 LifecycleStart(UnitySubsystemHandle handle, void *userData)
 {
 	(void)handle; (void)userData;
-	prov_log("[DisplayXR-PROV] Lifecycle Start\n");
+	// Create the WS_CHILD overlay over Unity's window HERE — this is the MAIN
+	// thread. (Doing it in GfxStart, the render thread, deadlocks: a WS_CHILD of
+	// Unity's main-thread window attaches the input queues while the main thread
+	// waits on GfxStart.) GfxStart binds the runtime to s_overlay_hwnd.
+	s_overlay_hwnd = displayxr_get_app_main_view();
+	prov_log(s_overlay_hwnd
+	             ? "[DisplayXR-PROV] Lifecycle Start (overlay created on main thread)\n"
+	             : "[DisplayXR-PROV] Lifecycle Start (no overlay; runtime self-hosts)\n");
 	return kUnitySubsystemErrorCodeSuccess;
 }
 

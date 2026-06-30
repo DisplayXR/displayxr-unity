@@ -71,6 +71,50 @@ typedef XrResult(XRAPI_PTR *PFN_xrEnumerateDisplayRenderingModesEXT)(
     uint32_t *modeCountOutput,
     XrDisplayRenderingModeInfoEXT *modes);
 
+// --- Eye-tracking mode control (XR_EXT_display_info v6) ---
+// Verbatim from the runtime's openxr/XR_EXT_display_info.h. MANAGED (0) is the
+// default (vendor SDK owns transitions); MANUAL (1) gives unfiltered positions +
+// an explicit isTracking flag the app drives its own 2D/3D ramp from.
+typedef enum XrEyeTrackingModeEXT {
+    XR_EYE_TRACKING_MODE_MANAGED_EXT  = 0,
+    XR_EYE_TRACKING_MODE_MANUAL_EXT   = 1,
+    XR_EYE_TRACKING_MODE_MAX_ENUM_EXT = 0x7FFFFFFF
+} XrEyeTrackingModeEXT;
+
+typedef XrResult(XRAPI_PTR *PFN_xrRequestEyeTrackingModeEXT)(
+    XrSession session, XrEyeTrackingModeEXT mode);
+
+// --- Unified display-mode events (XR_EXT_display_info v10/v14) ---
+// Verbatim struct layouts + type values from the runtime header. The provider's
+// xrPollEvent loop consumes these to reconfigure tiling/resolution live and to
+// notify C#. (Not used by the hook/standalone path; provider-only for #166 M2.)
+#define XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_EXT         ((XrStructureType)1000999010)
+#define XR_TYPE_EVENT_DATA_HARDWARE_DISPLAY_STATE_CHANGED_EXT ((XrStructureType)1000999011)
+#define XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_EXT     ((XrStructureType)1000999013)
+
+typedef struct XrEventDataRenderingModeChangedEXT {
+    XrStructureType type; // Must be XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_EXT
+    const void *next;
+    XrSession session;
+    uint32_t previousModeIndex;
+    uint32_t currentModeIndex;
+} XrEventDataRenderingModeChangedEXT;
+
+typedef struct XrEventDataHardwareDisplayStateChangedEXT {
+    XrStructureType type; // Must be XR_TYPE_EVENT_DATA_HARDWARE_DISPLAY_STATE_CHANGED_EXT
+    const void *next;
+    XrSession session;
+    XrBool32 hardwareDisplay3D;
+} XrEventDataHardwareDisplayStateChangedEXT;
+
+typedef struct XrEventDataEyeTrackingStateChangedEXT {
+    XrStructureType type; // Must be XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_EXT
+    const void *next;
+    XrSession session;
+    XrBool32 isTracking;          // New derived state
+    XrEyeTrackingModeEXT activeMode; // Session's MANAGED/MANUAL preference
+} XrEventDataEyeTrackingStateChangedEXT;
+
 // --- Shared texture output rect (canvas positioning for weaver alignment) ---
 typedef XrResult (XRAPI_PTR *PFN_xrSetSharedTextureOutputRectEXT)(
     XrSession session, int32_t x, int32_t y, uint32_t width, uint32_t height);
