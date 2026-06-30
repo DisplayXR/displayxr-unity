@@ -52,6 +52,16 @@ namespace DisplayXR
         public static extern int dxr_prov_session_is_running();
 
         /// <summary>
+        /// Select the stereo render mode BEFORE the session starts (#166 task #8):
+        /// 1 = Single-Pass-Instanced (URP+Win+D3D12 — 1 pass × 2 over a 2-slice array),
+        /// 0 = MultiPass (BiRP/other — 2 pass × 1, one texture per eye). SPI renders
+        /// opaque geometry wrong on BiRP, so the loader gates on the active pipeline.
+        /// Must be called before StartSubsystem (GfxStart reads it).
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void dxr_prov_set_single_pass(int enable);
+
+        /// <summary>
         /// Push the stereo rig tunables (mirrors displayxr_set_tunables, minus the
         /// clipAtDisplayPlane flag the rig descriptor doesn't carry). Scale-as-zoom
         /// must be folded into virtualDisplayHeight / invConvergenceDistance by the

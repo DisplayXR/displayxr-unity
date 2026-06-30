@@ -120,6 +120,21 @@ void dxr_prov_get_swapchain_info(uint32_t *width, uint32_t *height,
 void *dxr_prov_get_bridge_unity_texture(uint32_t *width, uint32_t *height,
                                         uint32_t *array_size);
 
+/// MultiPass mode (BiRP): the per-eye single-slice BRIDGE's Unity-side pointer.
+/// In MultiPass each render pass needs its own texture (textureArraySlice is
+/// SPI-only), so the provider wraps these two as separate Unity textures. Returns
+/// NULL for eye>1 or in SPI mode (use dxr_prov_get_bridge_unity_texture instead).
+void *dxr_prov_get_bridge_unity_texture_eye(uint32_t eye, uint32_t *width, uint32_t *height);
+
+/// Render mode gate (#166 task #8). Set from C# BEFORE the session starts:
+/// 1 = Single-Pass-Instanced (URP+Win+D3D12), 0 = MultiPass (BiRP/other — SPI
+/// renders opaque geometry wrong on BiRP). Default (unset) = SPI, preserving the
+/// pre-gating behavior. Preserved across the session_start reset.
+DISPLAYXR_EXPORT void dxr_prov_set_single_pass(int enable);
+
+/// Effective render mode: 1 = SPI, 0 = MultiPass.
+int  dxr_prov_get_single_pass(void);
+
 // ---- Frame loop -------------------------------------------------------------
 
 /// Pump OpenXR session-state events (xrPollEvent). Drives the session to READY.

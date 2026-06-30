@@ -147,6 +147,26 @@ typedef struct ProviderSession {
 	ID3D12Resource            *bridge_unity;   // Unity-device side (Unity renders here)
 	HANDLE                     bridge_handle;
 
+	// MultiPass (BiRP) bridges. The IUnityXRDisplay contract is "one texture per
+	// render pass", and textureArraySlice is "Only valid if single-pass rendering
+	// mode is active" (IUnityXRDisplay.h) — so a 2-pass MultiPass eye CANNOT target
+	// a slice of a shared array (that was the failed black+white-blocks attempt).
+	// Instead each eye gets its OWN single-slice bridge: Unity renders eye 0/1 into
+	// bridge_unity_eye[0/1]; submit copies bridge_own_eye[0/1] into swapchain slices
+	// 0/1 (the runtime still gets its 2-slice array swapchain). Unused in SPI mode.
+	ID3D12Resource            *bridge_own_eye[2];
+	ID3D12Resource            *bridge_unity_eye[2];
+	HANDLE                     bridge_handle_eye[2];
+
+	// Render mode: 1 = Single-Pass-Instanced (1 pass × 2 over the 2-slice array
+	// bridge); 0 = MultiPass (2 pass × 1 over the per-eye bridges). Set from C#
+	// (dxr_prov_set_single_pass) BEFORE the session starts — URP+Win+D3D12 → SPI,
+	// BiRP/other → MultiPass. single_pass_set distinguishes "C# chose" from the
+	// zero-initialized default; readers fall back to SPI (current behavior) when
+	// unset. Preserved across the session_start memset (like runtime_lib).
+	int single_pass;
+	int single_pass_set;
+
 	// Unity's command queue + a SHARED cross-device fence so the own-device
 	// bridge→swapchain copy waits for Unity's render into the bridge to FINISH.
 	// Without it the copy races ahead of Unity's writes and reads empty texels
@@ -589,19 +609,19 @@ static int ps_create_own_device(void)
 // device. Unity renders both eyes into the Unity-side resource; submit copies
 // the own-side resource into the runtime swapchain. (Mirrors create_atlas_bridge,
 // extended arraySize=1 → 2 for SPI.)
-static int ps_create_bridge(void)
+// Allocate one SHARED render-target texture on own_device and open it on Unity's
+// device. arr = 2 (SPI 2-slice array) or 1 (a single MultiPass eye).
+static int ps_alloc_shared_tex(uint32_t w, uint32_t h, UINT16 arr,
+                               ID3D12Resource **out_own, ID3D12Resource **out_unity,
+                               HANDLE *out_handle, const char *label)
 {
-	if (s_ps.bridge_own || !s_ps.own_device || !s_ps.unity_device) return s_ps.bridge_own ? 1 : 0;
-	uint32_t w = s_ps.sc_width, h = s_ps.sc_height;
-	if (w == 0 || h == 0) return 0;
-
 	D3D12_HEAP_PROPERTIES heap = {};
 	heap.Type = D3D12_HEAP_TYPE_DEFAULT;
 	D3D12_RESOURCE_DESC bd = {};
 	bd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
 	bd.Width = w;
 	bd.Height = h;
-	bd.DepthOrArraySize = 2;   // SPI: 2 array slices (left/right)
+	bd.DepthOrArraySize = arr;
 	bd.MipLevels = 1;
 	bd.Format = (s_ps.sc_format == 87) ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
 	bd.SampleDesc.Count = 1;
@@ -609,18 +629,40 @@ static int ps_create_bridge(void)
 	bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
 
 	HRESULT hr = s_ps.own_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &bd,
-	        D3D12_RESOURCE_STATE_COMMON, NULL, __uuidof(ID3D12Resource), (void **)&s_ps.bridge_own);
-	if (FAILED(hr)) { ps_log("[DisplayXR-PROV] bridge CreateCommittedResource failed: 0x%08lx\n", hr); return 0; }
+	        D3D12_RESOURCE_STATE_COMMON, NULL, __uuidof(ID3D12Resource), (void **)out_own);
+	if (FAILED(hr)) { ps_log("[DisplayXR-PROV] %s CreateCommittedResource failed: 0x%08lx\n", label, hr); return 0; }
+	hr = s_ps.own_device->CreateSharedHandle(*out_own, NULL, GENERIC_ALL, NULL, out_handle);
+	if (FAILED(hr) || !*out_handle) { ps_log("[DisplayXR-PROV] %s CreateSharedHandle failed: 0x%08lx\n", label, hr); return 0; }
+	hr = s_ps.unity_device->OpenSharedHandle(*out_handle, __uuidof(ID3D12Resource), (void **)out_unity);
+	if (FAILED(hr) || !*out_unity) { ps_log("[DisplayXR-PROV] %s OpenSharedHandle (Unity) failed: 0x%08lx\n", label, hr); return 0; }
+	ps_log("[DisplayXR-PROV] %s: %ux%u arr=%u own=%p unity=%p\n", label, w, h, (unsigned)arr,
+	       (void *)*out_own, (void *)*out_unity);
+	return 1;
+}
 
-	hr = s_ps.own_device->CreateSharedHandle(s_ps.bridge_own, NULL, GENERIC_ALL, NULL, &s_ps.bridge_handle);
-	if (FAILED(hr) || !s_ps.bridge_handle) { ps_log("[DisplayXR-PROV] bridge CreateSharedHandle failed: 0x%08lx\n", hr); return 0; }
+static int ps_create_bridge(void)
+{
+	if (!s_ps.own_device || !s_ps.unity_device) return 0;
+	uint32_t w = s_ps.sc_width, h = s_ps.sc_height;
+	if (w == 0 || h == 0) return 0;
 
-	hr = s_ps.unity_device->OpenSharedHandle(s_ps.bridge_handle, __uuidof(ID3D12Resource),
-	        (void **)&s_ps.bridge_unity);
-	if (FAILED(hr) || !s_ps.bridge_unity) { ps_log("[DisplayXR-PROV] bridge OpenSharedHandle (Unity) failed: 0x%08lx\n", hr); return 0; }
-
-	ps_log("[DisplayXR-PROV] Bridge (2-slice array): %ux%u, own=%p unity=%p\n",
-	       w, h, (void *)s_ps.bridge_own, (void *)s_ps.bridge_unity);
+	if (dxr_prov_get_single_pass()) {
+		if (s_ps.bridge_own) return 1; // already created
+		// SPI: one shared 2-slice array bridge (slice 0 = left, slice 1 = right).
+		if (!ps_alloc_shared_tex(w, h, 2, &s_ps.bridge_own, &s_ps.bridge_unity,
+		                         &s_ps.bridge_handle, "Bridge (SPI 2-slice array)"))
+			return 0;
+	} else {
+		if (s_ps.bridge_own_eye[0]) return 1; // already created
+		// MultiPass: two separate single-slice bridges, one per eye (one texture
+		// per pass; textureArraySlice is SPI-only per the IUnityXRDisplay contract).
+		for (int e = 0; e < 2; e++) {
+			if (!ps_alloc_shared_tex(w, h, 1, &s_ps.bridge_own_eye[e], &s_ps.bridge_unity_eye[e],
+			                         &s_ps.bridge_handle_eye[e],
+			                         e == 0 ? "Bridge (MultiPass left)" : "Bridge (MultiPass right)"))
+				return 0;
+		}
+	}
 
 	// Cross-device SHARED fence: own_device creates it shared; Unity's device
 	// opens the same fence. submit_frame signals it on Unity's queue (after the
@@ -825,7 +867,13 @@ int dxr_prov_session_start(const char *runtime_json_path,
                            void *unity_d3d12_queue,
                            void *overlay_hwnd)
 {
+	// Preserve the C#-chosen render mode across the reset — it is pushed by the
+	// loader (dxr_prov_set_single_pass) BEFORE this start runs.
+	int saved_single_pass = s_ps.single_pass;
+	int saved_single_pass_set = s_ps.single_pass_set;
 	memset(&s_ps, 0, sizeof(s_ps));
+	s_ps.single_pass = saved_single_pass;
+	s_ps.single_pass_set = saved_single_pass_set;
 	s_ps.unity_device = (ID3D12Device *)unity_d3d12_device; // for opening the bridge + shared fence
 	s_ps.unity_queue  = (ID3D12CommandQueue *)unity_d3d12_queue; // signals the cross-device sync fence
 	s_ps.overlay_hwnd = overlay_hwnd;
@@ -1014,6 +1062,11 @@ void dxr_prov_session_stop(void)
 	if (s_ps.bridge_unity)    s_ps.bridge_unity->Release();
 	if (s_ps.bridge_handle)   CloseHandle(s_ps.bridge_handle);
 	if (s_ps.bridge_own)      s_ps.bridge_own->Release();
+	for (int e = 0; e < 2; e++) {
+		if (s_ps.bridge_unity_eye[e])  s_ps.bridge_unity_eye[e]->Release();
+		if (s_ps.bridge_handle_eye[e]) CloseHandle(s_ps.bridge_handle_eye[e]);
+		if (s_ps.bridge_own_eye[e])    s_ps.bridge_own_eye[e]->Release();
+	}
 	if (s_ps.own_fence_event) CloseHandle(s_ps.own_fence_event);
 	if (s_ps.own_fence)       s_ps.own_fence->Release();
 	if (s_ps.own_cmd_list)    s_ps.own_cmd_list->Release();
@@ -1029,6 +1082,21 @@ void dxr_prov_session_stop(void)
 }
 
 int dxr_prov_session_is_running(void) { return s_ps.running; }
+
+// Render-mode gate (#166 task #8). C# decides SPI vs MultiPass from the active
+// render pipeline (URP+Win+D3D12 → SPI; BiRP/other → MultiPass — SPI renders
+// opaque geometry wrong on BiRP) and pushes it before the session starts.
+void dxr_prov_set_single_pass(int enable)
+{
+	s_ps.single_pass = enable ? 1 : 0;
+	s_ps.single_pass_set = 1;
+	ps_log("[DisplayXR-PROV] render mode: %s\n",
+	       s_ps.single_pass ? "Single-Pass-Instanced (SPI)" : "MultiPass (2 pass x 1)");
+}
+
+// Effective mode. Default = SPI (1) when C# never set one, preserving the
+// pre-gating behavior.
+int dxr_prov_get_single_pass(void) { return s_ps.single_pass_set ? s_ps.single_pass : 1; }
 
 // ============================================================================
 // Swapchain surfacing
@@ -1048,7 +1116,15 @@ void *dxr_prov_get_bridge_unity_texture(uint32_t *width, uint32_t *height, uint3
 	if (width) *width = s_ps.sc_width;
 	if (height) *height = s_ps.sc_height;
 	if (array_size) *array_size = 2;
-	return (void *)s_ps.bridge_unity;
+	return (void *)s_ps.bridge_unity; // SPI mode; NULL in MultiPass mode
+}
+
+void *dxr_prov_get_bridge_unity_texture_eye(uint32_t eye, uint32_t *width, uint32_t *height)
+{
+	if (width) *width = s_ps.sc_width;
+	if (height) *height = s_ps.sc_height;
+	if (eye > 1) return NULL;
+	return (void *)s_ps.bridge_unity_eye[eye]; // MultiPass mode; NULL in SPI mode
 }
 
 // ============================================================================
@@ -1254,10 +1330,13 @@ int dxr_prov_submit_frame(uint32_t image_index)
 	}
 	s_ps.frame_begun = 0;
 
-	// Unity rendered both eyes into the shared BRIDGE (slices 0/1) on its device.
-	// Copy the bridge into the acquired runtime swapchain image (both slices) on
-	// our own device, fence-synced against Unity's render (shared fence below).
-	if (s_ps.bridge_own && image_index < s_ps.sc_image_count &&
+	// Unity rendered the eyes into the shared BRIDGE on its device. Copy the bridge
+	// into the acquired runtime swapchain image's two array slices on our own device,
+	// fence-synced against Unity's render (shared fence below). SPI: one 2-slice array
+	// bridge → both slices. MultiPass: two single-slice eye bridges → slices 0/1.
+	int sp = dxr_prov_get_single_pass();
+	ID3D12Resource *copy_src = sp ? s_ps.bridge_own : s_ps.bridge_own_eye[0];
+	if (copy_src && image_index < s_ps.sc_image_count &&
 	    s_ps.sc_images[image_index].texture && s_ps.own_cmd_list) {
 		ID3D12Resource *dst = s_ps.sc_images[image_index].texture;
 		s_ps.own_cmd_alloc->Reset();
@@ -1268,9 +1347,11 @@ int dxr_prov_submit_frame(uint32_t image_index)
 			dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
 			dl.SubresourceIndex = slice;
 			D3D12_TEXTURE_COPY_LOCATION sl = {};
-			sl.pResource = s_ps.bridge_own;
+			// SPI: slice `slice` of the array bridge. MultiPass: subresource 0 of the
+			// per-eye bridge for this eye.
+			sl.pResource = sp ? s_ps.bridge_own : s_ps.bridge_own_eye[slice];
 			sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-			sl.SubresourceIndex = slice;
+			sl.SubresourceIndex = sp ? slice : 0;
 			s_ps.own_cmd_list->CopyTextureRegion(&dl, 0, 0, 0, &sl, NULL);
 		}
 		s_ps.own_cmd_list->Close();

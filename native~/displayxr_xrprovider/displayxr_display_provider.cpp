@@ -155,35 +155,68 @@ void create_textures_if_ready()
 {
 	if (s_textures_created || !s_display || !s_handle) return;
 
-	uint32_t w = 0, h = 0, arr = 0;
-	void *bridge = dxr_prov_get_bridge_unity_texture(&w, &h, &arr);
-	if (!bridge || w == 0) return; // bridge not created yet (await session-ready)
+	if (dxr_prov_get_single_pass()) {
+		// SPI: ONE Unity texture wrapping the shared 2-slice-array BRIDGE. Unity
+		// renders both eyes into it (slices 0/1); the provider copies it into the
+		// runtime swapchain each frame. Cross-device-safe (NT-handle shared resource).
+		uint32_t w = 0, h = 0, arr = 0;
+		void *bridge = dxr_prov_get_bridge_unity_texture(&w, &h, &arr);
+		if (!bridge || w == 0) return; // bridge not created yet (await session-ready)
 
-	// One Unity texture wrapping the shared 2-slice-array BRIDGE. Unity renders
-	// both eyes into it; the provider copies it into the runtime swapchain each
-	// frame (dxr_prov_submit_frame). Cross-device-safe (NT-handle shared resource).
-	UnityXRRenderTextureDesc desc;
-	memset(&desc, 0, sizeof(desc));
-	desc.colorFormat = kUnityXRRenderTextureFormatRGBA32; // bridge is R8G8B8A8_UNORM (fmt 28)
-	desc.color.nativePtr = bridge;
-	desc.depthFormat = kUnityXRDepthTextureFormat24bitOrGreater;
-	desc.depth.nativePtr = (void *)(uintptr_t)kUnityXRRenderTextureIdDontCare; // Unity allocates depth
-	// Unity allocates a matched 2-slice depth array (verified via QueryTextureDesc).
-	desc.width = w;
-	desc.height = h;
-	desc.textureArrayLength = arr;  // 2 -> SPI texture array
-	desc.flags = kUnityXRRenderTextureFlagsUVDirectionTopToBottom; // D3D top-left origin
+		UnityXRRenderTextureDesc desc;
+		memset(&desc, 0, sizeof(desc));
+		desc.colorFormat = kUnityXRRenderTextureFormatRGBA32; // bridge is R8G8B8A8_UNORM (fmt 28)
+		desc.color.nativePtr = bridge;
+		desc.depthFormat = kUnityXRDepthTextureFormat24bitOrGreater;
+		desc.depth.nativePtr = (void *)(uintptr_t)kUnityXRRenderTextureIdDontCare; // Unity allocates depth
+		// Unity allocates a matched 2-slice depth array (verified via QueryTextureDesc).
+		desc.width = w;
+		desc.height = h;
+		desc.textureArrayLength = arr;  // 2 -> SPI texture array
+		desc.flags = kUnityXRRenderTextureFlagsUVDirectionTopToBottom; // D3D top-left origin
 
-	UnityXRRenderTextureId id = 0;
-	UnitySubsystemErrorCode rc = s_display->CreateTexture(s_handle, &desc, &id);
-	if (rc != kUnitySubsystemErrorCodeSuccess) {
-		prov_log("[DisplayXR-PROV] CreateTexture (bridge) failed\n");
-		return;
+		UnityXRRenderTextureId id = 0;
+		UnitySubsystemErrorCode rc = s_display->CreateTexture(s_handle, &desc, &id);
+		if (rc != kUnitySubsystemErrorCodeSuccess) {
+			prov_log("[DisplayXR-PROV] CreateTexture (bridge) failed\n");
+			return;
+		}
+		s_tex_ids[0] = id;
+		s_tex_count = 1;
+		s_textures_created = true;
+		prov_log("[DisplayXR-PROV] CreateTexture: wrapped shared bridge (SPI 2-slice array)\n");
+	} else {
+		// MultiPass: TWO Unity textures, one per eye, each wrapping a separate
+		// single-slice BRIDGE (textureArrayLength=1). One texture per render pass —
+		// the spec-correct MultiPass topology (textureArraySlice is SPI-only).
+		uint32_t w0 = 0, h0 = 0;
+		void *bl = dxr_prov_get_bridge_unity_texture_eye(0, &w0, &h0);
+		void *br = dxr_prov_get_bridge_unity_texture_eye(1, &w0, &h0);
+		if (!bl || !br || w0 == 0) return; // bridges not created yet (await session-ready)
+
+		for (uint32_t eye = 0; eye < 2; eye++) {
+			UnityXRRenderTextureDesc desc;
+			memset(&desc, 0, sizeof(desc));
+			desc.colorFormat = kUnityXRRenderTextureFormatRGBA32;
+			desc.color.nativePtr = (eye == 0) ? bl : br;
+			desc.depthFormat = kUnityXRDepthTextureFormat24bitOrGreater;
+			desc.depth.nativePtr = (void *)(uintptr_t)kUnityXRRenderTextureIdDontCare;
+			desc.width = w0;
+			desc.height = h0;
+			desc.textureArrayLength = 1;  // single-slice per eye
+			desc.flags = kUnityXRRenderTextureFlagsUVDirectionTopToBottom;
+
+			UnityXRRenderTextureId id = 0;
+			if (s_display->CreateTexture(s_handle, &desc, &id) != kUnitySubsystemErrorCodeSuccess) {
+				prov_log("[DisplayXR-PROV] CreateTexture (MultiPass eye) failed\n");
+				return;
+			}
+			s_tex_ids[eye] = id;
+		}
+		s_tex_count = 2;
+		s_textures_created = true;
+		prov_log("[DisplayXR-PROV] CreateTexture: wrapped per-eye bridges (MultiPass, 2 textures)\n");
 	}
-	s_tex_ids[0] = id;
-	s_tex_count = 1;
-	s_textures_created = true;
-	prov_log("[DisplayXR-PROV] CreateTexture: wrapped shared bridge (2-slice array)\n");
 }
 
 void destroy_textures()
@@ -206,10 +239,17 @@ GfxStart(UnitySubsystemHandle handle, void *userData, UnityXRRenderingCapabiliti
 	(void)userData;
 	s_handle = handle;
 	if (caps) {
-		caps->noSinglePassRenderingSupport = false;          // SPI supported
+		// Match the gated render mode (set from C# before the subsystem starts):
+		// SPI on URP+Win+D3D12, MultiPass on BiRP/other (SPI renders opaque geometry
+		// wrong on BiRP). noSinglePassRenderingSupport=true tells Unity to use
+		// MultiPass; false allows the 1-pass-x-2 instanced path.
+		caps->noSinglePassRenderingSupport = dxr_prov_get_single_pass() ? false : true;
 		caps->invalidateRenderStateAfterEachCallback = true; // we touch D3D state
 		caps->skipPresentToMainScreen = false;
 	}
+	prov_log(dxr_prov_get_single_pass()
+	             ? "[DisplayXR-PROV] GfxStart: render mode = Single-Pass-Instanced\n"
+	             : "[DisplayXR-PROV] GfxStart: render mode = MultiPass (2 pass x 1)\n");
 
 	ID3D12Device *dev = nullptr;
 	ID3D12CommandQueue *q = nullptr;
@@ -262,17 +302,6 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 	s_current_image_index = img;
 	s_frame_in_flight = true;
 
-	// Single-Pass-Instanced: 1 render pass, 2 render params over the 2-slice bridge
-	// array (slice 0 = left, slice 1 = right). (img drives the swapchain copy
-	// destination in SubmitCurrentFrame.) NOTE: SPI renders opaque geometry wrong on
-	// BiRP (skybox survives, geometry doesn't — Unity's per-eye projection there is
-	// MultiPass-only); SPI is correct on URP+D3D12. BiRP MultiPass-into-array was
-	// tried and rendered worse — proper BiRP support is a follow-up (#166).
-	UnityXRNextFrameDesc::UnityXRRenderPass &pass = next->renderPasses[0];
-	pass.textureId = s_tex_ids[0];
-	pass.cullingPassIndex = 0;
-	pass.renderParamsCount = 2;
-
 	uint32_t scW = 0, scH = 0, scArr = 0, scImgs = 0;
 	dxr_prov_get_swapchain_info(&scW, &scH, &scArr, &scImgs);
 	uint32_t rW = 0, rH = 0;
@@ -282,29 +311,71 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 	if (vpW > 1.0f) vpW = 1.0f;
 	if (vpH > 1.0f) vpH = 1.0f;
 
-	for (uint32_t eye = 0; eye < 2; eye++) {
-		DxrProvView v;
-		dxr_prov_get_view(eye, &v);
-		UnityXRNextFrameDesc::UnityXRRenderPass::UnityXRRenderParams &rp = pass.renderParams[eye];
-		rp.deviceAnchorToEyePose.position = oxr_to_unity_pos(v.position);
-		rp.deviceAnchorToEyePose.rotation = oxr_to_unity_quat(v.orientation);
-		rp.projection.type = kUnityXRProjectionTypeHalfAngles;
-		rp.projection.data.halfAngles.left   = tanf(v.fov[0]);
-		rp.projection.data.halfAngles.right  = tanf(v.fov[1]);
-		rp.projection.data.halfAngles.top    = tanf(v.fov[2]);
-		rp.projection.data.halfAngles.bottom = tanf(v.fov[3]);
-		rp.occlusionMeshId = 0;
-		rp.textureArraySlice = (int32_t)eye;          // SPI slice
-		rp.viewportRect = UnityXRRectf{0.0f, 0.0f, vpW, vpH};
+	if (dxr_prov_get_single_pass()) {
+		// Single-Pass-Instanced: 1 render pass, 2 render params over the 2-slice
+		// bridge array (slice 0 = left, slice 1 = right). Correct on URP+D3D12.
+		UnityXRNextFrameDesc::UnityXRRenderPass &pass = next->renderPasses[0];
+		pass.textureId = s_tex_ids[0];
+		pass.cullingPassIndex = 0;
+		pass.renderParamsCount = 2;
+
+		for (uint32_t eye = 0; eye < 2; eye++) {
+			DxrProvView v;
+			dxr_prov_get_view(eye, &v);
+			UnityXRNextFrameDesc::UnityXRRenderPass::UnityXRRenderParams &rp = pass.renderParams[eye];
+			rp.deviceAnchorToEyePose.position = oxr_to_unity_pos(v.position);
+			rp.deviceAnchorToEyePose.rotation = oxr_to_unity_quat(v.orientation);
+			rp.projection.type = kUnityXRProjectionTypeHalfAngles;
+			rp.projection.data.halfAngles.left   = tanf(v.fov[0]);
+			rp.projection.data.halfAngles.right  = tanf(v.fov[1]);
+			rp.projection.data.halfAngles.top    = tanf(v.fov[2]);
+			rp.projection.data.halfAngles.bottom = tanf(v.fov[3]);
+			rp.occlusionMeshId = 0;
+			rp.textureArraySlice = (int32_t)eye;          // SPI slice
+			rp.viewportRect = UnityXRRectf{0.0f, 0.0f, vpW, vpH};
+		}
+
+		// One combined culling pass (use the left eye as the culling viewpoint).
+		UnityXRNextFrameDesc::UnityXRCullingPass &cull = next->cullingPasses[0];
+		cull.deviceAnchorToCullingPose = pass.renderParams[0].deviceAnchorToEyePose;
+		cull.projection = pass.renderParams[0].projection;
+		cull.separation = 0.0f;
+
+		next->renderPassesCount = 1;
+	} else {
+		// MultiPass (BiRP): 2 render passes × 1 param, each rendering one eye into
+		// its OWN single-slice texture (s_tex_ids[0]=left, [1]=right). This is the
+		// spec-correct MultiPass topology — textureArraySlice is SPI-only, so the
+		// earlier "MultiPass into a 2-slice array" attempt produced garbage. Renders
+		// opaque geometry correctly where SPI doesn't (BiRP off-center projection).
+		for (uint32_t eye = 0; eye < 2; eye++) {
+			DxrProvView v;
+			dxr_prov_get_view(eye, &v);
+			UnityXRNextFrameDesc::UnityXRRenderPass &pass = next->renderPasses[eye];
+			pass.textureId = s_tex_ids[eye];
+			pass.cullingPassIndex = eye;
+			pass.renderParamsCount = 1;
+			UnityXRNextFrameDesc::UnityXRRenderPass::UnityXRRenderParams &rp = pass.renderParams[0];
+			rp.deviceAnchorToEyePose.position = oxr_to_unity_pos(v.position);
+			rp.deviceAnchorToEyePose.rotation = oxr_to_unity_quat(v.orientation);
+			rp.projection.type = kUnityXRProjectionTypeHalfAngles;
+			rp.projection.data.halfAngles.left   = tanf(v.fov[0]);
+			rp.projection.data.halfAngles.right  = tanf(v.fov[1]);
+			rp.projection.data.halfAngles.top    = tanf(v.fov[2]);
+			rp.projection.data.halfAngles.bottom = tanf(v.fov[3]);
+			rp.occlusionMeshId = 0;
+			rp.textureArraySlice = 0;                     // single-slice per eye
+			rp.viewportRect = UnityXRRectf{0.0f, 0.0f, vpW, vpH};
+
+			// Per-eye culling pass (mirrors the eye's projection).
+			UnityXRNextFrameDesc::UnityXRCullingPass &cull = next->cullingPasses[eye];
+			cull.deviceAnchorToCullingPose = rp.deviceAnchorToEyePose;
+			cull.projection = rp.projection;
+			cull.separation = 0.0f;
+		}
+
+		next->renderPassesCount = 2;
 	}
-
-	// One combined culling pass (use the left eye as the culling viewpoint).
-	UnityXRNextFrameDesc::UnityXRCullingPass &cull = next->cullingPasses[0];
-	cull.deviceAnchorToCullingPose = pass.renderParams[0].deviceAnchorToEyePose;
-	cull.projection = pass.renderParams[0].projection;
-	cull.separation = 0.0f;
-
-	next->renderPassesCount = 1;
 	return kUnitySubsystemErrorCodeSuccess;
 }
 
@@ -321,11 +392,21 @@ GfxSubmitCurrentFrame(UnitySubsystemHandle handle, void *userData)
 	// coherently across the device boundary (a D3D12 shared resource must be in
 	// COMMON at a cross-device sync point). Without this the own-device copy reads
 	// incoherent/empty memory → black. Pairs with the shared sync fence.
-	uint32_t bw = 0, bh = 0, ba = 0;
-	void *bridge = dxr_prov_get_bridge_unity_texture(&bw, &bh, &ba);
-	if (bridge) {
-		if (IUnityGraphicsD3D12v8 *v8 = s_ifaces->Get<IUnityGraphicsD3D12v8>())
-			v8->RequestResourceState((ID3D12Resource *)bridge, D3D12_RESOURCE_STATE_COMMON);
+	IUnityGraphicsD3D12v8 *v8 = s_ifaces->Get<IUnityGraphicsD3D12v8>();
+	if (v8) {
+		uint32_t bw = 0, bh = 0, ba = 0;
+		if (dxr_prov_get_single_pass()) {
+			void *bridge = dxr_prov_get_bridge_unity_texture(&bw, &bh, &ba);
+			if (bridge)
+				v8->RequestResourceState((ID3D12Resource *)bridge, D3D12_RESOURCE_STATE_COMMON);
+		} else {
+			// MultiPass: both per-eye bridges were rendered into this frame.
+			for (uint32_t eye = 0; eye < 2; eye++) {
+				void *be = dxr_prov_get_bridge_unity_texture_eye(eye, &bw, &bh);
+				if (be)
+					v8->RequestResourceState((ID3D12Resource *)be, D3D12_RESOURCE_STATE_COMMON);
+			}
+		}
 	}
 
 	dxr_prov_submit_frame(s_current_image_index);
