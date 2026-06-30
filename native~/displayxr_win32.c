@@ -875,6 +875,22 @@ parent_subclass_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		}
 		return HTTRANSPARENT;
 	}
+	// (#166/#61) Provider-overlay drag phase-snap. In provider mode the runtime
+	// weave target is the top-level overlay (the SR SDK weaver subclasses IT),
+	// but the overlay is click-through (WS_EX_TRANSPARENT) so the user drags
+	// Unity's OWN title bar — Unity's HWND (this subclass) gets the OS modal-move
+	// WM_ENTERSIZEMOVE/EXITSIZEMOVE bracket, the overlay never does. Without the
+	// bracket the weaver's WndProc subclass doesn't see the in-drag flag and
+	// won't phase-snap to lenticular-aligned positions → 3D stutters mid-drag.
+	// Forward the bracket to the overlay so the weaver phase-snaps and Kooima
+	// stays live throughout (#61). Mirrors the SendMessageW bracketing in
+	// overlay_wnd_proc / unity_simple_wnd_proc / sa_wndproc, which each send the
+	// bracket to their own weave-bound HWND around a custom drag.
+	if (s_provider_opaque_overlay &&
+	    (msg == WM_ENTERSIZEMOVE || msg == WM_EXITSIZEMOVE) &&
+	    s_overlay_hwnd != NULL && IsWindow(s_overlay_hwnd)) {
+		SendMessageW(s_overlay_hwnd, msg, 0, 0);
+	}
 	if (msg == WM_SIZE && s_overlay_hwnd != NULL && IsWindow(s_overlay_hwnd)) {
 		int w = LOWORD(lParam);
 		int h = HIWORD(lParam);
