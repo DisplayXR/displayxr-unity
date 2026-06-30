@@ -79,6 +79,15 @@ namespace DisplayXR
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern void dxr_prov_get_render_rect(out uint width, out uint height);
 
+        // ---- Window-space UI (HUD) bridge (#67/#166) -------------------------
+        // Lazily creates the provider's wsui overlay swapchain + cross-device
+        // bridge sized to w×h and returns the Unity-device handle of the bridge.
+        // C# Graphics.CopyTexture's the canvas RT into it each frame.
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void dxr_prov_get_wsui_bridge(
+            uint width, uint height,
+            out System.IntPtr nativePtr, out uint outWidth, out uint outHeight);
+
         // ---- Rendering modes -------------------------------------------------
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]

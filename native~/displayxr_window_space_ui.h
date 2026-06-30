@@ -105,6 +105,16 @@ DISPLAYXR_EXPORT void displayxr_window_space_ui_set_layer(float x, float y,
 // Clear the registered texture and mark the layer inactive.
 DISPLAYXR_EXPORT void displayxr_window_space_ui_clear(void);
 
+// (#166) Read the current pending wsui state (Unity RT native ptr + texture dims +
+// fractional layer rect/disparity). Lets the custom IUnityXRDisplay provider drive
+// its OWN window-space composition layer from its own session/device — the provider
+// is neither the hooked nor the standalone session, but C# sets the same s_pending
+// via set_texture/set_layer regardless. Returns 1 if a texture is registered (the
+// layer should be shown this frame), 0 otherwise.
+int displayxr_window_space_ui_get_pending(void **out_tex, int *out_tex_w, int *out_tex_h,
+                                          float *out_x, float *out_y,
+                                          float *out_lw, float *out_lh, float *out_disp);
+
 #ifdef __cplusplus
 }
 #endif

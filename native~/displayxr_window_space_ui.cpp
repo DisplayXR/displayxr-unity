@@ -221,6 +221,23 @@ displayxr_window_space_ui_clear(void)
 	displayxr_log("[DisplayXR] wsui_clear\n");
 }
 
+extern "C" int
+displayxr_window_space_ui_get_pending(void **out_tex, int *out_tex_w, int *out_tex_h,
+                                      float *out_x, float *out_y,
+                                      float *out_lw, float *out_lh, float *out_disp)
+{
+	void *tex = s_pending.native_tex;
+	if (out_tex)   *out_tex   = tex;
+	if (out_tex_w) *out_tex_w = s_pending.width;
+	if (out_tex_h) *out_tex_h = s_pending.height;
+	if (out_x)     *out_x     = s_pending.x;
+	if (out_y)     *out_y     = s_pending.y;
+	if (out_lw)    *out_lw    = s_pending.w;
+	if (out_lh)    *out_lh    = s_pending.h;
+	if (out_disp)  *out_disp  = s_pending.disparity;
+	return (tex != nullptr && s_pending.width > 0 && s_pending.height > 0) ? 1 : 0;
+}
+
 // =============================================================================
 // Hooked path (Unity OpenXR loader)
 // =============================================================================
