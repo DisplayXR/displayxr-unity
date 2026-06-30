@@ -41,6 +41,14 @@ extern "C" void *displayxr_get_app_main_view(void);
 // (#166) Make the overlay a top-level WS_POPUP+NOREDIRECTIONBITMAP (composites the
 // runtime DComp weave) instead of a WS_CHILD. Call before displayxr_get_app_main_view().
 extern "C" void displayxr_set_provider_opaque_overlay(int enabled);
+// (#166) Keyboard input: the focus / raw-input hooks the transparent & shell paths
+// use so Unity receives input while not the OS-foreground window — IAT-hooks
+// GetForegroundWindow/GetFocus → Unity's HWND (Application.isFocused stays true),
+// adds RIDEV_INPUTSINK so raw input (WM_INPUT, the Input System's keyboard/mouse
+// source) flows to Unity in the background, and subclasses Unity's wndproc to
+// suppress deactivation. Idempotent.
+extern "C" int   displayxr_install_focus_hook(void *unity_hwnd);
+extern "C" void *displayxr_get_unity_main_hwnd(void);
 
 // Must match Runtime/UnitySubsystemsManifest.json ("name" + display "id").
 static const char *k_plugin_name = "DisplayXR";
@@ -420,6 +428,28 @@ LifecycleStart(UnitySubsystemHandle handle, void *userData)
 		prov_log(s_overlay_hwnd
 		             ? "[DisplayXR-PROV] Lifecycle Start (top-level overlay created on main thread)\n"
 		             : "[DisplayXR-PROV] Lifecycle Start (overlay create FAILED; runtime self-hosts)\n");
+
+		// Keyboard input (#166 task #9). The overlay is a NOACTIVATE, click-through
+		// (WS_EX_TRANSPARENT) display surface sitting on top of Unity, so Unity never
+		// takes OS foreground on its own — and Windows delivers raw input (WM_INPUT,
+		// the source the Input System reads keyboard/mouse from) only to the
+		// FOREGROUND HWND. Mouse messages still reach Unity (they route to the window
+		// under the cursor), which is why dragging worked but keys didn't. Install the
+		// same focus / raw-input hooks the transparent path uses so Unity's input
+		// system behaves as if it were foreground (RIDEV_INPUTSINK + GetForegroundWindow
+		// /GetFocus → Unity + deactivation suppression). Also explicitly hand Unity real
+		// foreground + focus once at startup so the legacy Input Manager — which needs
+		// actual WM_KEYDOWN delivery to the focused window — works too; the overlay is
+		// NOACTIVATE so it won't fight Unity for it. Runs on the main (UI) thread, where
+		// SetFocus is valid. (The focus hook chains cleanly after parent_subclass_proc,
+		// already installed by displayxr_get_app_main_view above.)
+		void *unity_hwnd = displayxr_get_unity_main_hwnd();
+		if (unity_hwnd != nullptr) {
+			displayxr_install_focus_hook(unity_hwnd);
+			SetForegroundWindow((HWND)unity_hwnd);
+			SetFocus((HWND)unity_hwnd);
+			prov_log("[DisplayXR-PROV] Lifecycle Start: installed keyboard focus/raw-input hooks + handed Unity foreground\n");
+		}
 	} else {
 		s_overlay_hwnd = nullptr;
 		prov_log("[DisplayXR-PROV] Lifecycle Start (no overlay; runtime self-hosts)\n");
