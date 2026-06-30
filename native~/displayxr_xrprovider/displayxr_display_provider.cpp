@@ -38,6 +38,9 @@
 // weaves into this overlay (in-app weave) and per-view resolution tracks the
 // overlay's live client size (displayxr_get_overlay_size).
 extern "C" void *displayxr_get_app_main_view(void);
+// (#166) Make the overlay a top-level WS_POPUP+NOREDIRECTIONBITMAP (composites the
+// runtime DComp weave) instead of a WS_CHILD. Call before displayxr_get_app_main_view().
+extern "C" void displayxr_set_provider_opaque_overlay(int enabled);
 
 // Must match Runtime/UnitySubsystemsManifest.json ("name" + display "id").
 static const char *k_plugin_name = "DisplayXR";
@@ -157,6 +160,7 @@ void create_textures_if_ready()
 	desc.color.nativePtr = bridge;
 	desc.depthFormat = kUnityXRDepthTextureFormat24bitOrGreater;
 	desc.depth.nativePtr = (void *)(uintptr_t)kUnityXRRenderTextureIdDontCare; // Unity allocates depth
+	// Unity allocates a matched 2-slice depth array (verified via QueryTextureDesc).
 	desc.width = w;
 	desc.height = h;
 	desc.textureArrayLength = arr;  // 2 -> SPI texture array
@@ -213,7 +217,7 @@ GfxStart(UnitySubsystemHandle handle, void *userData, UnityXRRenderingCapabiliti
 	const char *use_overlay = getenv("DISPLAYXR_PROV_OVERLAY");
 	void *overlay_hwnd = (use_overlay && use_overlay[0] == '1') ? s_overlay_hwnd : nullptr;
 	prov_log(overlay_hwnd
-	             ? "[DisplayXR-PROV] weave target: WS_CHILD overlay (in-app)\n"
+	             ? "[DisplayXR-PROV] weave target: top-level WS_POPUP overlay (in-app)\n"
 	             : "[DisplayXR-PROV] weave target: runtime self-hosted window\n");
 
 	// runtime_json = NULL -> resolve from XR_RUNTIME_JSON (sim_display bring-up).
@@ -250,16 +254,17 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 	s_current_image_index = img;
 	s_frame_in_flight = true;
 
-	// Single-Pass-Instanced: 1 render pass, 2 render params over the 2-slice
-	// bridge array. (img drives the swapchain copy destination in SubmitCurrentFrame.)
+	// Single-Pass-Instanced: 1 render pass, 2 render params over the 2-slice bridge
+	// array (slice 0 = left, slice 1 = right). (img drives the swapchain copy
+	// destination in SubmitCurrentFrame.) NOTE: SPI renders opaque geometry wrong on
+	// BiRP (skybox survives, geometry doesn't — Unity's per-eye projection there is
+	// MultiPass-only); SPI is correct on URP+D3D12. BiRP MultiPass-into-array was
+	// tried and rendered worse — proper BiRP support is a follow-up (#166).
 	UnityXRNextFrameDesc::UnityXRRenderPass &pass = next->renderPasses[0];
 	pass.textureId = s_tex_ids[0];
 	pass.cullingPassIndex = 0;
 	pass.renderParamsCount = 2;
 
-	// Adaptive viewport: Unity renders only the active sub-region (render rect =
-	// window×scaleXY) of the worst-case-sized bridge slice, matching the per-view
-	// imageRect the session submits. Normalized to the swapchain/bridge size.
 	uint32_t scW = 0, scH = 0, scArr = 0, scImgs = 0;
 	dxr_prov_get_swapchain_info(&scW, &scH, &scArr, &scImgs);
 	uint32_t rW = 0, rH = 0;
@@ -401,14 +406,24 @@ UnitySubsystemErrorCode UNITY_INTERFACE_API
 LifecycleStart(UnitySubsystemHandle handle, void *userData)
 {
 	(void)handle; (void)userData;
-	// Create the WS_CHILD overlay over Unity's window HERE — this is the MAIN
-	// thread. (Doing it in GfxStart, the render thread, deadlocks: a WS_CHILD of
-	// Unity's main-thread window attaches the input queues while the main thread
-	// waits on GfxStart.) GfxStart binds the runtime to s_overlay_hwnd.
-	s_overlay_hwnd = displayxr_get_app_main_view();
-	prov_log(s_overlay_hwnd
-	             ? "[DisplayXR-PROV] Lifecycle Start (overlay created on main thread)\n"
-	             : "[DisplayXR-PROV] Lifecycle Start (no overlay; runtime self-hosts)\n");
+	// In-app weave (DISPLAYXR_PROV_OVERLAY=1): create a TOP-LEVEL WS_POPUP overlay
+	// over Unity's window HERE — this is the MAIN thread. (Creating it in GfxStart,
+	// the render thread, deadlocks: attaching to Unity's main-thread window joins
+	// the input queues while the main thread waits on GfxStart.) GfxStart binds the
+	// runtime to s_overlay_hwnd. Default (env unset) = runtime self-hosts its own
+	// window (the M1b baseline). The top-level popup composites the runtime's DComp
+	// weave; a WS_CHILD does not (#166).
+	const char *use_overlay = getenv("DISPLAYXR_PROV_OVERLAY");
+	if (use_overlay && use_overlay[0] == '1') {
+		displayxr_set_provider_opaque_overlay(1);
+		s_overlay_hwnd = displayxr_get_app_main_view();
+		prov_log(s_overlay_hwnd
+		             ? "[DisplayXR-PROV] Lifecycle Start (top-level overlay created on main thread)\n"
+		             : "[DisplayXR-PROV] Lifecycle Start (overlay create FAILED; runtime self-hosts)\n");
+	} else {
+		s_overlay_hwnd = nullptr;
+		prov_log("[DisplayXR-PROV] Lifecycle Start (no overlay; runtime self-hosts)\n");
+	}
 	return kUnitySubsystemErrorCodeSuccess;
 }
 
