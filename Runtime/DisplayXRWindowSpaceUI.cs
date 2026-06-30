@@ -226,17 +226,30 @@ namespace DisplayXR
             if (m_BridgeTex != null) return;
             try
             {
-                DisplayXRNative.displayxr_standalone_get_wsui_bridge_texture(
-                    (uint)resolution.x, (uint)resolution.y,
-                    out System.IntPtr bridgePtr,
-                    out uint bw, out uint bh);
+                System.IntPtr bridgePtr;
+                uint bw, bh;
+                if (DisplayXRProviderDriver.IsActive)
+                {
+                    // Custom display-provider mode: the provider owns a SEPARATE
+                    // D3D12 device (like the standalone), so it exposes its own
+                    // cross-device wsui bridge. (#166)
+                    DisplayXRProviderNative.dxr_prov_get_wsui_bridge(
+                        (uint)resolution.x, (uint)resolution.y,
+                        out bridgePtr, out bw, out bh);
+                }
+                else
+                {
+                    DisplayXRNative.displayxr_standalone_get_wsui_bridge_texture(
+                        (uint)resolution.x, (uint)resolution.y,
+                        out bridgePtr, out bw, out bh);
+                }
                 if (bridgePtr != System.IntPtr.Zero && bw > 0 && bh > 0)
                 {
                     m_BridgeTex = Texture2D.CreateExternalTexture(
                         (int)bw, (int)bh, TextureFormat.BGRA32, false, true,
                         bridgePtr);
                     m_BridgeTex.name = "DisplayXR_WsuiBridge";
-                    Debug.Log($"[DisplayXR] wsui: bridge acquired {bw}x{bh}");
+                    Debug.Log($"[DisplayXR] wsui: bridge acquired {bw}x{bh} (provider={DisplayXRProviderDriver.IsActive})");
                 }
             }
             catch (System.EntryPointNotFoundException)

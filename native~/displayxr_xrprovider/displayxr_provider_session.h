@@ -185,6 +185,14 @@ int  dxr_prov_has_view_rig(void);
 /// each view's imageRect.extent = {w, h}. Re-derived every frame (live resize).
 DISPLAYXR_EXPORT void dxr_prov_get_render_rect(uint32_t *out_w, uint32_t *out_h);
 
+/// Window-space UI (HUD) layer (#67/#166): lazily create the provider's wsui
+/// overlay swapchain + cross-device bridge sized to w×h and return the Unity-device
+/// handle of the bridge. C# (DisplayXRWindowSpaceUI) Graphics.CopyTexture's its
+/// canvas RT into it each frame; the provider submits the wsui composition layer.
+/// Returns *out_ptr = NULL when no session is running.
+DISPLAYXR_EXPORT void dxr_prov_get_wsui_bridge(uint32_t w, uint32_t h,
+                                               void **out_ptr, uint32_t *out_w, uint32_t *out_h);
+
 // ---- Rendering modes (XR_EXT_display_info) ----------------------------------
 
 /// Number of enumerated rendering modes.
