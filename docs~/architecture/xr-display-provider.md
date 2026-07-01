@@ -282,6 +282,36 @@ validated baseline. The in-app `WS_CHILD` overlay is env-gated opt-in
 is brought up (a child window doesn't composite a flip swapchain the way the
 hook path's top-level `WS_POPUP` does).
 
+## Porting hook-path features to provider mode — the inert-`DisplayXRFeature` rule
+
+> **Rule of thumb:** in provider mode there is **no OpenXR API-layer hook and no
+> Unity OpenXR loader**, so **any C# that reaches the runtime through
+> `DisplayXRFeature` is dead code.** `DisplayXRFeature.Instance` is `null` and its
+> `GetStereoMatrices` / lifecycle callbacks never fire. Before assuming a hook-path
+> feature "just works" under the provider, check what it reads — if it touches
+> `DisplayXRFeature`, `OpenXRRuntime.IsExtensionEnabled`, or any Unity-OpenXR API,
+> it needs a **provider branch** gated on `DisplayXRProviderDriver.IsActive` that
+> reads the equivalent **native shared state** instead. This has bitten us
+> repeatedly; treat it as the default failure mode when a ported feature silently
+> no-ops.
+
+The provider publishes the state the hook used to route through `DisplayXRFeature`
+into the same native shared-state exports the hook populated, so the C# side only
+needs to change *where it reads from*, not the downstream logic:
+
+| Hook-path source (inert under provider) | Provider-mode source | Consumers that needed a branch |
+|---|---|---|
+| `DisplayXRFeature.Instance.GetStereoMatrices(...)` | `displayxr_get_stereo_matrices` (provider-populated via `ps_publish_stereo_matrices`) | `DisplayXRTransparentOverlay` silhouette/hit-test; **`KooimaProjectionFixFeature`** (URP eye_world view+proj — the #127 fix, else the click-through silhouette truncates popped-out geometry, bc001ce) |
+| hook `LateUpdate` push of `dxr_set_tunables` / display pose | `DisplayXRProviderDriver` per-frame `dxr_prov_set_tunables` / `dxr_prov_set_display_pose` | display/camera rig tunables |
+| `OpenXRRuntime.IsExtensionEnabled("XR_EXT_local_3d_zone")` gate | `DisplayXRProviderDriver.IsActive` | `DisplayXRLocal2D` bridge branch |
+| `SetEnvironmentBlendMode(AlphaBlend)` on the OpenXR feature | `dxr_prov_set_transparent_background` | `DisplayXRTransparentOverlay` |
+| foreground-clip globals from `GetStereoMatrices` (rig URP branch) | `dxr_prov_get_eye_clip` published in `DisplayXRDisplay.PublishProviderForegroundClip` | `DisplayXR/ForegroundClipURP` |
+
+**When adding or auditing a hook-path C# component for provider mode:** grep it for
+`DisplayXRFeature`, `OpenXRRuntime`, `OpenXRSettings`, and `GetStereoMatrices`. Each
+hit is a spot that needs an `if (DisplayXRProviderDriver.IsActive)` branch reading
+the native export. This is the substance of "Phase C" gating cleanup.
+
 ## Open questions (resolve at Editor validation)
 
 1. **Does a third-party provider register + start?** Cardboard proves the API is
