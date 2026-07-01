@@ -12,6 +12,7 @@
 
 #include <openxr/openxr.h>
 #include "../displayxr_extensions.h"
+#include "../displayxr_shared_state.h" // displayxr_state_set_stereo_matrices (overlay hit-test)
 
 #include <windows.h>
 #include <d3d12.h>
@@ -124,6 +125,28 @@ typedef struct ProviderSession {
 
 	int has_view_rig;
 
+	// XR_EXT_display_zones + XR_EXT_local_3d_zone (#166 Phase B). Detected in
+	// session_start (probe) and enabled on the instance. Caps queried lazily on the
+	// first frame a zone rect is set (needs a live session). zone_caps_ok: -1 untried,
+	// 0 unsupported, 1 supported (maxZones3D>=1).
+	int has_display_zones;
+	int has_local_3d_zone;
+	int zone_caps_ok;
+	uint32_t zone_max_3d;
+	PFN_xrGetDisplayZoneCapabilitiesEXT       pfn_get_zone_caps;
+	PFN_xrGetDisplayZoneRecommendedViewSizeEXT pfn_get_zone_view_size;
+
+	// App-supplied single 3D-zone rect (client-window px, top-left origin). When
+	// valid + caps OK, the locate hook chains XrDisplayZoneEXT before the rig
+	// (zone-scoped Kooima) and submit chains the same zone on the projection layer,
+	// and the swapchain is sized to the zone's recommended view size. w<=0||h<=0
+	// clears (full-window framing = the Phase A path). (Single-zone first;
+	// generalized to N in a follow-up.)
+	int      zone_valid;
+	uint32_t zone_id;
+	int32_t  zone_x, zone_y, zone_w, zone_h;
+	uint32_t zone_rec_w, zone_rec_h; // recommended view size for zone_[wh]
+
 	// Unity's D3D12 device — used ONLY to open the shared bridge (NOT to bind the
 	// session; see own_device below).
 	ID3D12Device       *unity_device;
@@ -167,6 +190,16 @@ typedef struct ProviderSession {
 	int single_pass;
 	int single_pass_set;
 
+	// Transparent background (#166 Phase A): when the app requests it AND the
+	// runtime advertises ALPHA_BLEND, the win32 binding sets
+	// transparentBackgroundEnabled and xrEndFrame submits with ALPHA_BLEND (the
+	// DComp overlay is already WS_EX_NOREDIRECTIONBITMAP). Set from C#
+	// (dxr_prov_set_transparent_background) BEFORE the session starts; preserved
+	// across the session_start memset like single_pass. alpha_blend_supported is
+	// probed per-session in session_start (reset OK).
+	int transparent_requested;
+	int alpha_blend_supported;
+
 	// Unity's command queue + a SHARED cross-device fence so the own-device
 	// bridge→swapchain copy waits for Unity's render into the bridge to FINISH.
 	// Without it the copy races ahead of Unity's writes and reads empty texels
@@ -206,6 +239,21 @@ typedef struct ProviderSession {
 	ID3D12Resource *wsui_bridge_unity;  // Unity-device side (C# CopyTexture target)
 	HANDLE          wsui_bridge_handle;
 	uint32_t        wsui_registered_w, wsui_registered_h; // bridge+swapchain sized for this
+
+	// Local2D layer (#166 Phase B, XR_EXT_local_3d_zone) — post-weave 2D content at a
+	// client-window PIXEL rect (the 2D band). Same cross-device-bridge shape as wsui,
+	// but submitted as XrCompositionLayerLocal2DEXT with a pixel rect (not fractional).
+	XrSwapchain l2d_swapchain;
+	uint32_t    l2d_w, l2d_h, l2d_image_count;
+	int64_t     l2d_format;
+	XrSwapchainImageD3D12KHR l2d_images[PS_MAX_SWAPCHAIN_IMAGES];
+	int         l2d_swapchain_created;
+	ID3D12Resource *l2d_bridge_own;
+	ID3D12Resource *l2d_bridge_unity;
+	HANDLE          l2d_bridge_handle;
+	uint32_t        l2d_registered_w, l2d_registered_h;
+	int32_t         l2d_rect_x, l2d_rect_y, l2d_rect_w, l2d_rect_h; // dest, client px
+	int             l2d_rect_set;
 
 	// Per-frame located views (render-ready)
 	DxrProvView views[DXR_PROV_MAX_VIEWS];
@@ -249,6 +297,7 @@ typedef struct ProviderSession {
 	PFN_xrBeginSession                pfn_begin_session;
 	PFN_xrEndSession                  pfn_end_session;
 	PFN_xrDestroyInstance             pfn_destroy_instance;
+	PFN_xrEnumerateEnvironmentBlendModes    pfn_enumerate_blend_modes;    // transparency
 	PFN_xrEnumerateDisplayRenderingModesEXT pfn_enumerate_modes;          // optional
 	PFN_xrRequestDisplayRenderingModeEXT    pfn_request_rendering_mode;   // optional
 	PFN_xrRequestDisplayModeEXT             pfn_request_display_mode;     // optional
@@ -379,6 +428,7 @@ static int ps_resolve_functions(void)
 	PS_RESOLVE("xrBeginSession", pfn_begin_session, PFN_xrBeginSession);
 	PS_RESOLVE("xrEndSession", pfn_end_session, PFN_xrEndSession);
 	PS_RESOLVE("xrDestroyInstance", pfn_destroy_instance, PFN_xrDestroyInstance);
+	PS_RESOLVE("xrEnumerateEnvironmentBlendModes", pfn_enumerate_blend_modes, PFN_xrEnumerateEnvironmentBlendModes);
 	// Optional EXT (XR_EXT_display_info mode/eye-tracking control) — soft-resolve;
 	// OK if absent (older runtime → the C# mode UI/events simply stay inert).
 	{
@@ -394,6 +444,13 @@ static int ps_resolve_functions(void)
 		_fn = NULL;
 		s_ps.gipa(s_ps.instance, "xrRequestEyeTrackingModeEXT", &_fn);
 		s_ps.pfn_request_eye_tracking_mode = (PFN_xrRequestEyeTrackingModeEXT)_fn;
+		// Zones (#166 Phase B) — soft-resolve; inert on older runtimes.
+		_fn = NULL;
+		s_ps.gipa(s_ps.instance, "xrGetDisplayZoneCapabilitiesEXT", &_fn);
+		s_ps.pfn_get_zone_caps = (PFN_xrGetDisplayZoneCapabilitiesEXT)_fn;
+		_fn = NULL;
+		s_ps.gipa(s_ps.instance, "xrGetDisplayZoneRecommendedViewSizeEXT", &_fn);
+		s_ps.pfn_get_zone_view_size = (PFN_xrGetDisplayZoneRecommendedViewSizeEXT)_fn;
 	}
 	return 1;
 }
@@ -477,15 +534,65 @@ static void ps_window_size(uint32_t *w, uint32_t *h)
 }
 
 // ============================================================================
+// Zones (XR_EXT_display_zones) — #166 Phase B
+// ============================================================================
+
+// Lazy caps query: zones are usable iff the runtime advertised the extension,
+// resolved the caps entry point, and reports supported && maxZones3D>=1. Mirrors
+// the hook path's dxr_zones_ready.
+static int ps_zones_ready(void)
+{
+	if (!s_ps.has_display_zones || !s_ps.has_view_rig || !s_ps.pfn_get_zone_caps)
+		return 0;
+	if (s_ps.zone_caps_ok < 0) {
+		if (s_ps.session == XR_NULL_HANDLE) return 0;
+		XrDisplayZoneCapabilitiesEXT caps = {XR_TYPE_DISPLAY_ZONE_CAPABILITIES_EXT};
+		XrResult cr = s_ps.pfn_get_zone_caps(s_ps.session, &caps);
+		s_ps.zone_caps_ok = (XR_SUCCEEDED(cr) && caps.supported && caps.maxZones3D >= 1) ? 1 : 0;
+		s_ps.zone_max_3d = caps.maxZones3D;
+		ps_log("[DisplayXR-PROV] display-zones caps: result=0x%x supported=%d maxZones3D=%u -> %s\n",
+		       (unsigned)cr, (int)caps.supported, caps.maxZones3D,
+		       s_ps.zone_caps_ok ? "ACTIVE" : "unsupported (full-window path)");
+	}
+	return s_ps.zone_caps_ok > 0;
+}
+
+// Recommended per-view render size for the current zone rect (== zone extent per
+// the runtime). Falls back to the rect extent if the entry point is absent.
+static void ps_query_zone_rec_size(void)
+{
+	s_ps.zone_rec_w = s_ps.zone_w > 0 ? (uint32_t)s_ps.zone_w : 0;
+	s_ps.zone_rec_h = s_ps.zone_h > 0 ? (uint32_t)s_ps.zone_h : 0;
+	if (s_ps.pfn_get_zone_view_size && s_ps.zone_valid && s_ps.session != XR_NULL_HANDLE) {
+		XrRect2Di rect = {{s_ps.zone_x, s_ps.zone_y}, {s_ps.zone_w, s_ps.zone_h}};
+		XrExtent2Di rec = {0, 0};
+		if (XR_SUCCEEDED(s_ps.pfn_get_zone_view_size(s_ps.session, &rect, &rec)) &&
+		    rec.width > 0 && rec.height > 0) {
+			s_ps.zone_rec_w = (uint32_t)rec.width;
+			s_ps.zone_rec_h = (uint32_t)rec.height;
+		}
+	}
+}
+
+// Whether the 3D zone should drive this frame (rect set + caps OK).
+static int ps_zone_active(void) { return s_ps.zone_valid && ps_zones_ready(); }
+
+// ============================================================================
 // SPI swapchain (arraySize=2). Images live on Unity's D3D12 device (zero-copy).
 // ============================================================================
 
 static int ps_create_bridge(void); // defined after this function
+static void ps_publish_stereo_matrices(void); // defined after dxr_prov_begin_frame (overlay hit-test)
 
 static int ps_create_swapchain(void)
 {
 	if (s_ps.swapchain_created) return 1;
 	if (!s_ps.display_info.is_valid) return 0;
+	// Zone frames size the swapchain from the zone caps + recommended-view-size
+	// queries, which need a READY (begun) session. Defer the early (pre-ready)
+	// attempt so we don't create it window-sized before caps resolve; the
+	// session-ready path recreates it correctly.
+	if (s_ps.zone_valid && s_ps.has_display_zones && !s_ps.session_ready) return 0;
 
 	// Per-view (per-eye) render resolution = window(overlay client) × active-mode
 	// scaleXY. Each SPI array slice IS one eye, sized to exactly this — so the
@@ -496,10 +603,21 @@ static int ps_create_swapchain(void)
 	// (black). The ADR-010 "worst-case, never realloc" optimization needs that
 	// Y-origin reconciled and a live bridge/swapchain realloc on resize — deferred
 	// as a follow-up; for now we size to the current window (startup-adaptive).
-	uint32_t ww = 0, wh = 0; ps_window_size(&ww, &wh);
-	float sx = 0.5f, sy = 0.5f; ps_active_view_scale(&sx, &sy);
-	uint32_t w = (uint32_t)(ww * sx);
-	uint32_t h = (uint32_t)(wh * sy);
+	uint32_t w, h;
+	if (ps_zone_active()) {
+		// 3D-zone frame: render each eye at the zone's recommended view size (== zone
+		// extent), so the weave is zone-confined by construction (like the avatar /
+		// cube_zones). imageRect == swapchain == zone size, no sub-rect.
+		ps_query_zone_rec_size();
+		w = s_ps.zone_rec_w; h = s_ps.zone_rec_h;
+		ps_log("[DisplayXR-PROV] swapchain sized to 3D-zone recommended view %ux%u (zone %dx%d)\n",
+		       w, h, s_ps.zone_w, s_ps.zone_h);
+	} else {
+		uint32_t ww = 0, wh = 0; ps_window_size(&ww, &wh);
+		float sx = 0.5f, sy = 0.5f; ps_active_view_scale(&sx, &sy);
+		w = (uint32_t)(ww * sx);
+		h = (uint32_t)(wh * sy);
+	}
 	if (w == 0 || h == 0) { w = s_ps.display_info.pixel_width / 2; h = s_ps.display_info.pixel_height; }
 	if (w == 0 || h == 0) { w = 1920; h = 1080; }
 
@@ -859,6 +977,158 @@ static int ps_submit_wsui(XrCompositionLayerWindowSpaceEXT *out_layer)
 }
 
 // ============================================================================
+// Local2D layer (#166 Phase B) — mirrors the wsui bridge, but XrCompositionLayer-
+// Local2DEXT at a client-window PIXEL rect (the 2D band). BGRA8 to match Unity's URP RT.
+// ============================================================================
+
+static int ps_create_local2d(uint32_t w, uint32_t h)
+{
+	if (w == 0 || h == 0 || !s_ps.own_device || !s_ps.unity_device) return 0;
+	if (s_ps.l2d_swapchain_created && s_ps.l2d_registered_w == w && s_ps.l2d_registered_h == h)
+		return 1;
+	if (s_ps.l2d_swapchain && s_ps.pfn_destroy_swapchain) s_ps.pfn_destroy_swapchain(s_ps.l2d_swapchain);
+	if (s_ps.l2d_bridge_unity)  { s_ps.l2d_bridge_unity->Release();  s_ps.l2d_bridge_unity = NULL; }
+	if (s_ps.l2d_bridge_own)    { s_ps.l2d_bridge_own->Release();    s_ps.l2d_bridge_own = NULL; }
+	if (s_ps.l2d_bridge_handle) { CloseHandle(s_ps.l2d_bridge_handle); s_ps.l2d_bridge_handle = NULL; }
+	s_ps.l2d_swapchain = XR_NULL_HANDLE;
+	s_ps.l2d_swapchain_created = 0;
+
+	uint32_t fmt_count = 0;
+	s_ps.pfn_enumerate_swapchain_formats(s_ps.session, 0, &fmt_count, NULL);
+	if (fmt_count == 0) { ps_log("[DisplayXR-PROV] local2d: no swapchain formats\n"); return 0; }
+	int64_t formats[32];
+	if (fmt_count > 32) fmt_count = 32;
+	s_ps.pfn_enumerate_swapchain_formats(s_ps.session, fmt_count, &fmt_count, formats);
+	int64_t format = formats[0];
+	for (uint32_t i = 0; i < fmt_count; i++) { if (formats[i] == 87) { format = 87; break; } }
+
+	XrSwapchainCreateInfo ci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+	ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
+	                XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT |
+	                XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+	ci.format = format;
+	ci.sampleCount = 1; ci.width = w; ci.height = h;
+	ci.faceCount = 1; ci.arraySize = 1; ci.mipCount = 1;
+	if (XR_FAILED(s_ps.pfn_create_swapchain(s_ps.session, &ci, &s_ps.l2d_swapchain))) {
+		ps_log("[DisplayXR-PROV] local2d: xrCreateSwapchain failed\n"); s_ps.l2d_swapchain = XR_NULL_HANDLE; return 0;
+	}
+	uint32_t count = 0;
+	s_ps.pfn_enumerate_swapchain_images(s_ps.l2d_swapchain, 0, &count, NULL);
+	if (count > PS_MAX_SWAPCHAIN_IMAGES) count = PS_MAX_SWAPCHAIN_IMAGES;
+	for (uint32_t i = 0; i < count; i++) {
+		s_ps.l2d_images[i].type = XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR;
+		s_ps.l2d_images[i].next = NULL; s_ps.l2d_images[i].texture = NULL;
+	}
+	if (XR_FAILED(s_ps.pfn_enumerate_swapchain_images(s_ps.l2d_swapchain, count, &count,
+	        (XrSwapchainImageBaseHeader *)s_ps.l2d_images))) {
+		ps_log("[DisplayXR-PROV] local2d: enumerate images failed\n"); return 0;
+	}
+	s_ps.l2d_image_count = count;
+
+	D3D12_HEAP_PROPERTIES heap = {}; heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+	D3D12_RESOURCE_DESC bd = {};
+	bd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+	bd.Width = w; bd.Height = h; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+	bd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+	bd.SampleDesc.Count = 1;
+	bd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+	bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+	HRESULT hr = s_ps.own_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &bd,
+	        D3D12_RESOURCE_STATE_COMMON, NULL, __uuidof(ID3D12Resource), (void **)&s_ps.l2d_bridge_own);
+	if (FAILED(hr)) { ps_log("[DisplayXR-PROV] local2d bridge create failed: 0x%08lx\n", hr); return 0; }
+	hr = s_ps.own_device->CreateSharedHandle(s_ps.l2d_bridge_own, NULL, GENERIC_ALL, NULL, &s_ps.l2d_bridge_handle);
+	if (FAILED(hr) || !s_ps.l2d_bridge_handle) { ps_log("[DisplayXR-PROV] local2d bridge share failed\n"); return 0; }
+	hr = s_ps.unity_device->OpenSharedHandle(s_ps.l2d_bridge_handle, __uuidof(ID3D12Resource),
+	        (void **)&s_ps.l2d_bridge_unity);
+	if (FAILED(hr) || !s_ps.l2d_bridge_unity) { ps_log("[DisplayXR-PROV] local2d bridge open(Unity) failed\n"); return 0; }
+
+	s_ps.l2d_w = w; s_ps.l2d_h = h; s_ps.l2d_format = format;
+	s_ps.l2d_registered_w = w; s_ps.l2d_registered_h = h;
+	s_ps.l2d_swapchain_created = 1;
+	ps_log("[DisplayXR-PROV] local2d: swapchain %ux%u (%u imgs) + bridge own=%p unity=%p\n",
+	       w, h, count, (void *)s_ps.l2d_bridge_own, (void *)s_ps.l2d_bridge_unity);
+	return 1;
+}
+
+void dxr_prov_get_local2d_bridge(uint32_t w, uint32_t h,
+                                 void **out_ptr, uint32_t *out_w, uint32_t *out_h)
+{
+	if (out_ptr) *out_ptr = NULL;
+	if (out_w) *out_w = 0;
+	if (out_h) *out_h = 0;
+	if (!s_ps.running || !s_ps.session_ready) return;
+	if (!ps_create_local2d(w, h)) return;
+	if (out_ptr) *out_ptr = s_ps.l2d_bridge_unity;
+	if (out_w) *out_w = s_ps.l2d_w;
+	if (out_h) *out_h = s_ps.l2d_h;
+}
+
+void dxr_prov_set_local2d_rect(int32_t x, int32_t y, int32_t w, int32_t h)
+{
+	if (w <= 0 || h <= 0) { s_ps.l2d_rect_set = 0; return; }
+	s_ps.l2d_rect_x = x; s_ps.l2d_rect_y = y; s_ps.l2d_rect_w = w; s_ps.l2d_rect_h = h;
+	s_ps.l2d_rect_set = 1;
+}
+
+// Per-frame: copy the Local2D bridge into its overlay swapchain image and fill the
+// layer (XrCompositionLayerLocal2DEXT, dest = client-window pixel rect). Returns 1
+// if the layer should be submitted. Called from submit after the projection copy.
+static int ps_submit_local2d(XrCompositionLayerLocal2DEXT *out_layer)
+{
+	if (!out_layer) return 0;
+	memset(out_layer, 0, sizeof(*out_layer));
+	if (!s_ps.l2d_rect_set || !s_ps.l2d_swapchain_created || !s_ps.l2d_bridge_own || s_ps.l2d_image_count == 0)
+		return 0;
+
+	uint32_t idx = 0;
+	XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+	if (XR_FAILED(s_ps.pfn_acquire_swapchain_image(s_ps.l2d_swapchain, &ai, &idx)) ||
+	    idx >= s_ps.l2d_image_count)
+		return 0;
+	XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+	wi.timeout = 1000000000;
+	s_ps.pfn_wait_swapchain_image(s_ps.l2d_swapchain, &wi);
+
+	if (s_ps.l2d_images[idx].texture && s_ps.own_cmd_list) {
+		s_ps.own_cmd_alloc->Reset();
+		s_ps.own_cmd_list->Reset(s_ps.own_cmd_alloc, NULL);
+		D3D12_TEXTURE_COPY_LOCATION dl = {};
+		dl.pResource = s_ps.l2d_images[idx].texture;
+		dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dl.SubresourceIndex = 0;
+		D3D12_TEXTURE_COPY_LOCATION sl = {};
+		sl.pResource = s_ps.l2d_bridge_own;
+		sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; sl.SubresourceIndex = 0;
+		s_ps.own_cmd_list->CopyTextureRegion(&dl, 0, 0, 0, &sl, NULL);
+		s_ps.own_cmd_list->Close();
+		ID3D12CommandList *lists[] = { s_ps.own_cmd_list };
+		s_ps.own_queue->ExecuteCommandLists(1, lists);
+		s_ps.own_fence_value++;
+		s_ps.own_queue->Signal(s_ps.own_fence, s_ps.own_fence_value);
+		if (s_ps.own_fence->GetCompletedValue() < s_ps.own_fence_value) {
+			s_ps.own_fence->SetEventOnCompletion(s_ps.own_fence_value, s_ps.own_fence_event);
+			WaitForSingleObject(s_ps.own_fence_event, INFINITE);
+		}
+	}
+
+	XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+	s_ps.pfn_release_swapchain_image(s_ps.l2d_swapchain, &ri);
+
+	out_layer->type = XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT;
+	out_layer->next = NULL;
+	// Unity Canvas is straight (unpremultiplied) alpha — flag it so the runtime
+	// doesn't double-darken (matches the hook path's Local2D + avatar bubble).
+	out_layer->layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT |
+	                        XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
+	out_layer->subImage.swapchain = s_ps.l2d_swapchain;
+	out_layer->subImage.imageRect.offset = {0, 0};
+	out_layer->subImage.imageRect.extent = {(int32_t)s_ps.l2d_w, (int32_t)s_ps.l2d_h};
+	out_layer->subImage.imageArrayIndex = 0;
+	out_layer->rect.offset = {s_ps.l2d_rect_x, s_ps.l2d_rect_y};
+	out_layer->rect.extent = {s_ps.l2d_rect_w, s_ps.l2d_rect_h};
+	return 1;
+}
+
+// ============================================================================
 // Lifecycle
 // ============================================================================
 
@@ -871,14 +1141,25 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	// loader (dxr_prov_set_single_pass) BEFORE this start runs.
 	int saved_single_pass = s_ps.single_pass;
 	int saved_single_pass_set = s_ps.single_pass_set;
+	int saved_transparent = s_ps.transparent_requested;
+	// Zone rect may be seeded before the session starts (demo SubsystemRegistration,
+	// like the hook SeedLaunchZone) so the swapchain is born zone-sized. Preserve it.
+	int saved_zone_valid = s_ps.zone_valid;
+	uint32_t saved_zone_id = s_ps.zone_id;
+	int32_t saved_zx = s_ps.zone_x, saved_zy = s_ps.zone_y, saved_zw = s_ps.zone_w, saved_zh = s_ps.zone_h;
 	memset(&s_ps, 0, sizeof(s_ps));
 	s_ps.single_pass = saved_single_pass;
 	s_ps.single_pass_set = saved_single_pass_set;
+	s_ps.transparent_requested = saved_transparent;
+	s_ps.zone_valid = saved_zone_valid;
+	s_ps.zone_id = saved_zone_id;
+	s_ps.zone_x = saved_zx; s_ps.zone_y = saved_zy; s_ps.zone_w = saved_zw; s_ps.zone_h = saved_zh;
 	s_ps.unity_device = (ID3D12Device *)unity_d3d12_device; // for opening the bridge + shared fence
 	s_ps.unity_queue  = (ID3D12CommandQueue *)unity_d3d12_queue; // signals the cross-device sync fence
 	s_ps.overlay_hwnd = overlay_hwnd;
 	s_ps.ipd_factor = s_ps.parallax_factor = s_ps.perspective_factor = 1.0f;
 	s_ps.fov_override = tanf(0.5f * 1.0471975512f); // tan(30°) — neutral ~60° vFOV default
+	s_ps.zone_caps_ok = -1; // untried (lazy caps query on first zone frame)
 
 	if (!s_ps.unity_device) {
 		ps_log("[DisplayXR-PROV] start: missing Unity D3D12 device (needed for bridge)\n");
@@ -931,13 +1212,21 @@ int dxr_prov_session_start(const char *runtime_json_path,
 				XrExtensionProperties *props = (XrExtensionProperties *)calloc(avail, sizeof(XrExtensionProperties));
 				for (uint32_t i = 0; i < avail; i++) props[i].type = XR_TYPE_EXTENSION_PROPERTIES;
 				if (XR_SUCCEEDED(enum_ext(NULL, avail, &avail, props))) {
-					for (uint32_t i = 0; i < avail; i++)
+					for (uint32_t i = 0; i < avail; i++) {
 						if (strcmp(props[i].extensionName, XR_EXT_VIEW_RIG_EXTENSION_NAME) == 0)
-							{ s_ps.has_view_rig = 1; break; }
+							s_ps.has_view_rig = 1;
+						else if (strcmp(props[i].extensionName, XR_EXT_DISPLAY_ZONES_EXTENSION_NAME) == 0)
+							s_ps.has_display_zones = 1;
+						else if (strcmp(props[i].extensionName, XR_EXT_LOCAL_3D_ZONE_EXTENSION_NAME) == 0)
+							s_ps.has_local_3d_zone = 1;
+					}
 				}
 				free(props);
 			}
 		}
+		ps_log("[DisplayXR-PROV] display_zones: %s; local_3d_zone: %s\n",
+		       s_ps.has_display_zones ? "AVAILABLE" : "no",
+		       s_ps.has_local_3d_zone ? "AVAILABLE" : "no");
 		ps_log("[DisplayXR-PROV] XR_EXT_view_rig: %s\n",
 		       s_ps.has_view_rig ? "AVAILABLE" : "not found (no stereo)");
 	}
@@ -949,6 +1238,12 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	extensions[ext_count++] = "XR_KHR_D3D12_enable";
 	extensions[ext_count++] = XR_EXT_WIN32_WINDOW_BINDING_EXTENSION_NAME;
 	if (s_ps.has_view_rig) extensions[ext_count++] = XR_EXT_VIEW_RIG_EXTENSION_NAME;
+	// Zones (#166 Phase B): display_zones needs view_rig (composes on top of it);
+	// local_3d_zone is required to submit Local2D layers for the 2D bands.
+	if (s_ps.has_display_zones && s_ps.has_view_rig)
+		extensions[ext_count++] = XR_EXT_DISPLAY_ZONES_EXTENSION_NAME;
+	if (s_ps.has_local_3d_zone)
+		extensions[ext_count++] = XR_EXT_LOCAL_3D_ZONE_EXTENSION_NAME;
 
 	PFN_xrVoidFunction fn_create = NULL;
 	s_ps.gipa(XR_NULL_HANDLE, "xrCreateInstance", &fn_create);
@@ -1002,6 +1297,29 @@ int dxr_prov_session_start(const char *runtime_json_path,
 		ps_log("[DisplayXR-PROV] xrGetSystemProperties failed\n");
 	}
 
+	// --- Environment blend modes (transparency, #166 Phase A) ---
+	// Probe whether the runtime advertises ALPHA_BLEND for the primary-stereo view
+	// config. Only then do we opt the session into a transparent background.
+	s_ps.alpha_blend_supported = 0;
+	if (s_ps.pfn_enumerate_blend_modes) {
+		uint32_t bm_count = 0;
+		s_ps.pfn_enumerate_blend_modes(s_ps.instance, s_ps.system_id,
+		        XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, 0, &bm_count, NULL);
+		if (bm_count > 0 && bm_count <= 8) {
+			XrEnvironmentBlendMode bms[8];
+			if (XR_SUCCEEDED(s_ps.pfn_enumerate_blend_modes(s_ps.instance, s_ps.system_id,
+			        XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO, bm_count, &bm_count, bms))) {
+				for (uint32_t i = 0; i < bm_count; i++)
+					if (bms[i] == XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND)
+						{ s_ps.alpha_blend_supported = 1; break; }
+			}
+		}
+		ps_log("[DisplayXR-PROV] ALPHA_BLEND: %s (transparent requested=%d)\n",
+		       s_ps.alpha_blend_supported ? "advertised" : "not advertised",
+		       s_ps.transparent_requested);
+	}
+	int use_transparent = s_ps.transparent_requested && s_ps.alpha_blend_supported;
+
 	// --- Session: D3D12 binding on UNITY'S device + window binding (overlay HWND) ---
 	XrWin32WindowBindingCreateInfoEXT win_binding = {};
 	win_binding.type = XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT;
@@ -1009,6 +1327,11 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	win_binding.readbackCallback = NULL;
 	win_binding.readbackUserdata = NULL;
 	win_binding.sharedTextureHandle = NULL;
+	// Transparent background (#166 Phase A): opt the runtime's DComp swapchain into
+	// per-pixel alpha over the desktop. chromaKeyColor=0 (no post-weave conversion —
+	// the runtime composes-under-bg + alpha-gates, same as the hook path).
+	win_binding.transparentBackgroundEnabled = use_transparent ? XR_TRUE : XR_FALSE;
+	win_binding.chromaKeyColor = 0;
 
 	XrGraphicsBindingD3D12KHR d3d12 = {};
 	d3d12.type = XR_TYPE_GRAPHICS_BINDING_D3D12_KHR;
@@ -1050,6 +1373,10 @@ void dxr_prov_session_stop(void)
 	if (s_ps.wsui_bridge_unity)  s_ps.wsui_bridge_unity->Release();
 	if (s_ps.wsui_bridge_handle) CloseHandle(s_ps.wsui_bridge_handle);
 	if (s_ps.wsui_bridge_own)    s_ps.wsui_bridge_own->Release();
+	if (s_ps.l2d_swapchain && s_ps.pfn_destroy_swapchain) s_ps.pfn_destroy_swapchain(s_ps.l2d_swapchain);
+	if (s_ps.l2d_bridge_unity)  s_ps.l2d_bridge_unity->Release();
+	if (s_ps.l2d_bridge_handle) CloseHandle(s_ps.l2d_bridge_handle);
+	if (s_ps.l2d_bridge_own)    s_ps.l2d_bridge_own->Release();
 	if (s_ps.swapchain && s_ps.pfn_destroy_swapchain) s_ps.pfn_destroy_swapchain(s_ps.swapchain);
 	if (s_ps.session && s_ps.session_ready && s_ps.pfn_end_session) s_ps.pfn_end_session(s_ps.session);
 	if (s_ps.session && s_ps.pfn_destroy_session) s_ps.pfn_destroy_session(s_ps.session);
@@ -1097,6 +1424,50 @@ void dxr_prov_set_single_pass(int enable)
 // Effective mode. Default = SPI (1) when C# never set one, preserving the
 // pre-gating behavior.
 int dxr_prov_get_single_pass(void) { return s_ps.single_pass_set ? s_ps.single_pass : 1; }
+
+// Transparent-background request (#166 Phase A). Set from C# BEFORE the session
+// starts; the actual ALPHA_BLEND opt-in also requires the runtime to advertise it
+// (probed in session_start). Preserved across the session_start memset.
+void dxr_prov_set_transparent_background(int enable)
+{
+	s_ps.transparent_requested = enable ? 1 : 0;
+	ps_log("[DisplayXR-PROV] transparent background requested: %d\n", s_ps.transparent_requested);
+}
+
+int dxr_prov_wants_transparent(void) { return s_ps.transparent_requested; }
+
+// --- Zones (#166 Phase B) ---------------------------------------------------
+// Define the single 3D-zone rect (client-window px, top-left origin). The locate
+// chains XrDisplayZoneEXT in front of the rig and submit chains it on the
+// projection layer; the swapchain is (re)sized to the zone's recommended view
+// size. w<=0||h<=0 clears (full-window framing). Seed BEFORE the session starts
+// (demo SubsystemRegistration) so the swapchain is born zone-sized — a later
+// change only re-sizes the swapchain on the next session start (live realloc is a
+// follow-up, mirroring the hook path's launch-seed model).
+void dxr_prov_set_3d_zone_rect(int32_t x, int32_t y, int32_t w, int32_t h)
+{
+	if (w <= 0 || h <= 0) {
+		if (s_ps.zone_valid) ps_log("[DisplayXR-PROV] 3d_zone: cleared\n");
+		s_ps.zone_valid = 0;
+		return;
+	}
+	int changed = (!s_ps.zone_valid || s_ps.zone_x != x || s_ps.zone_y != y ||
+	               s_ps.zone_w != w || s_ps.zone_h != h);
+	s_ps.zone_x = x; s_ps.zone_y = y; s_ps.zone_w = w; s_ps.zone_h = h;
+	if (s_ps.zone_id == 0) s_ps.zone_id = 1;
+	s_ps.zone_valid = 1;
+	if (changed) {
+		ps_query_zone_rec_size();
+		ps_log("[DisplayXR-PROV] 3d_zone: (%d,%d) %dx%d -> rec %ux%u\n",
+		       x, y, w, h, s_ps.zone_rec_w, s_ps.zone_rec_h);
+	}
+}
+
+void dxr_prov_clear_3d_zone(void)
+{
+	s_ps.zone_valid = 0;
+	ps_log("[DisplayXR-PROV] clear_3d_zone\n");
+}
 
 // ============================================================================
 // Swapchain surfacing
@@ -1201,10 +1572,13 @@ int dxr_prov_begin_frame(uint32_t *out_image_index, int *out_should_render)
 	s_ps.predicted_display_time = fs.predictedDisplayTime;
 	s_ps.frame_begun = 1;
 
-	// --- Per-frame render rect = window(overlay client) × active-mode scaleXY,
-	//     clamped to the worst-case swapchain (ADR-010). Re-derived every frame so
-	//     a live window resize / mode switch needs no swapchain reallocation. ---
-	{
+	// --- Per-frame render rect. In a 3D-zone frame the swapchain IS zone-sized, so
+	//     render == swapchain (full slice, no sub-rect). Otherwise render =
+	//     window(overlay client) × active-mode scaleXY, clamped to the swapchain. ---
+	if (ps_zone_active()) {
+		s_ps.render_w = s_ps.sc_width;
+		s_ps.render_h = s_ps.sc_height;
+	} else {
 		uint32_t ww, wh; ps_window_size(&ww, &wh);
 		float sx, sy; ps_active_view_scale(&sx, &sy);
 		uint32_t rw = (uint32_t)(ww * sx);
@@ -1236,6 +1610,7 @@ int dxr_prov_begin_frame(uint32_t *out_image_index, int *out_should_render)
 		// XrView{pose,fov}; the raw channel recovers the raw display-space eyes.
 		XrDisplayRigEXT display_rig = {XR_TYPE_DISPLAY_RIG_EXT};
 		XrCameraRigEXT  camera_rig  = {XR_TYPE_CAMERA_RIG_EXT};
+		XrDisplayZoneEXT locate_zone = {XR_TYPE_DISPLAY_ZONE_EXT};
 		XrViewDisplayRawEXT raw = {XR_TYPE_VIEW_DISPLAY_RAW_EXT};
 		XrPosef rig_pose = s_ps.display_pose_set ? s_ps.display_pose
 		                                         : XrPosef{{0, 0, 0, 1}, {0, 0, 0}};
@@ -1267,6 +1642,16 @@ int dxr_prov_begin_frame(uint32_t *out_image_index, int *out_should_render)
 				display_rig.perspectiveFactor = s_ps.tunables_set ? s_ps.perspective_factor : 1.0f;
 				li.next = &display_rig;
 			}
+			// Zones (#166 Phase B): chain XrDisplayZoneEXT in FRONT of the rig so the
+			// runtime frames the Kooima into the zone rect (the rect IS the canvas).
+			// Same instance is chained on the projection layer at submit.
+			if (ps_zone_active()) {
+				locate_zone.zoneId = s_ps.zone_id ? s_ps.zone_id : 1;
+				locate_zone.rect.offset = {s_ps.zone_x, s_ps.zone_y};
+				locate_zone.rect.extent = {s_ps.zone_w, s_ps.zone_h};
+				locate_zone.next = li.next; // the rig
+				li.next = &locate_zone;
+			}
 			vstate.next = &raw;
 		}
 
@@ -1292,6 +1677,10 @@ int dxr_prov_begin_frame(uint32_t *out_image_index, int *out_should_render)
 			s_ps.view_count = n;
 		}
 	}
+
+	// Publish stereo matrices for the transparent overlay's cyclopean hit-test
+	// (LMB drag on the silhouette) — inert on the hook path, which owns this state.
+	ps_publish_stereo_matrices();
 
 	// --- Acquire + wait the swapchain image Unity renders into next ---
 	// Guard against a double-acquire: if a previous frame acquired an image but
@@ -1320,6 +1709,110 @@ void dxr_prov_get_view(uint32_t view_index, DxrProvView *out_view)
 	if (!out_view) return;
 	if (view_index >= DXR_PROV_MAX_VIEWS) { memset(out_view, 0, sizeof(*out_view)); return; }
 	*out_view = s_ps.views[view_index];
+}
+
+// View matrix (column-major, OpenXR convention) from an eye pose — replicates the
+// hook path's dxr_view_matrix_from_pose so the provider publishes matrices in the
+// EXACT convention the transparent overlay's cyclopean hit-test expects.
+static void ps_view_matrix_from_pose(const float pos[3], const float q[4], float *out)
+{
+	const float qx = q[0], qy = q[1], qz = q[2], qw = q[3];
+	float rot[16] = {};
+	rot[0] = 1.0f - 2.0f * (qy * qy + qz * qz);
+	rot[1] = 2.0f * (qx * qy + qz * qw);
+	rot[2] = 2.0f * (qx * qz - qy * qw);
+	rot[4] = 2.0f * (qx * qy - qz * qw);
+	rot[5] = 1.0f - 2.0f * (qx * qx + qz * qz);
+	rot[6] = 2.0f * (qy * qz + qx * qw);
+	rot[8] = 2.0f * (qx * qz + qy * qw);
+	rot[9] = 2.0f * (qy * qz - qx * qw);
+	rot[10] = 1.0f - 2.0f * (qx * qx + qy * qy);
+	rot[15] = 1.0f;
+	for (int i = 0; i < 16; i++) out[i] = 0.0f;
+	for (int i = 0; i < 3; i++)
+		for (int j = 0; j < 3; j++)
+			out[j * 4 + i] = rot[i * 4 + j]; // R^T
+	out[15] = 1.0f;
+	out[12] = -(out[0] * pos[0] + out[4] * pos[1] + out[8] * pos[2]);
+	out[13] = -(out[1] * pos[0] + out[5] * pos[1] + out[9] * pos[2]);
+	out[14] = -(out[2] * pos[0] + out[6] * pos[1] + out[10] * pos[2]);
+}
+
+// Projection (column-major, GL clip) from an XrFovf — replicates dxr_projection_from_fov.
+// fov[] = {angleLeft, angleRight, angleUp, angleDown} (the DxrProvView layout).
+static void ps_projection_from_fov(const float fov[4], float nz, float fz, float *out)
+{
+	const float l = tanf(fov[0]) * nz;
+	const float r = tanf(fov[1]) * nz;
+	const float t = tanf(fov[2]) * nz;
+	const float b = tanf(fov[3]) * nz;
+	for (int i = 0; i < 16; i++) out[i] = 0.0f;
+	out[0] = 2.0f * nz / (r - l);
+	out[5] = 2.0f * nz / (t - b);
+	out[8] = (r + l) / (r - l);
+	out[9] = (t + b) / (t - b);
+	out[10] = -(fz + nz) / (fz - nz);
+	out[11] = -1.0f;
+	out[14] = -2.0f * fz * nz / (fz - nz);
+}
+
+// Publish the per-eye view+proj to the hook's shared stereo-matrices state so the
+// transparent overlay's cyclopean hit-test (DisplayXRTransparentOverlay, via
+// displayxr_get_stereo_matrices) works in provider mode — DisplayXRFeature.
+// GetStereoMatrices is inert without Unity's OpenXR loader. Same math as the hook.
+static void ps_publish_stereo_matrices(void)
+{
+	if (s_ps.view_count < 2) return;
+	DisplayXRStereoMatrices mats = {};
+	float nz = s_ps.near_z > 0.0f ? s_ps.near_z : 0.01f;
+	float fz = s_ps.far_z > nz ? s_ps.far_z : 1000.0f;
+	ps_view_matrix_from_pose(s_ps.views[0].position, s_ps.views[0].orientation, mats.left_view);
+	ps_view_matrix_from_pose(s_ps.views[1].position, s_ps.views[1].orientation, mats.right_view);
+	ps_projection_from_fov(s_ps.views[0].fov, nz, fz, mats.left_projection);
+	ps_projection_from_fov(s_ps.views[1].fov, nz, fz, mats.right_projection);
+	mats.valid = 1;
+	displayxr_state_set_stereo_matrices(&mats);
+}
+
+// Foreground clip (#166 Phase B / #57): z of (rigPose^-1 * eyeWorld) = the eye's
+// signed distance to the display plane along the rig forward. Copied verbatim from
+// the hook path (dxr_rig_local_eye_z) so the provider computes the SAME per-view far.
+static float ps_rig_local_eye_z(const XrPosef *rig, const float eye[3])
+{
+	const float dx = eye[0] - rig->position.x;
+	const float dy = eye[1] - rig->position.y;
+	const float dz = eye[2] - rig->position.z;
+	const float qx = -rig->orientation.x, qy = -rig->orientation.y;
+	const float qz = -rig->orientation.z, qw = rig->orientation.w;
+	const float cx = qy * dz - qz * dy + qw * dx;
+	const float cy = qz * dx - qx * dz + qw * dy;
+	return dz + 2.0f * (qx * cy - qy * cx);
+}
+
+void dxr_prov_get_eye_clip(uint32_t eye, float *out_far,
+                           float *out_ex, float *out_ey, float *out_ez)
+{
+	if (eye >= DXR_PROV_MAX_VIEWS) eye = 0;
+	const float *p = s_ps.views[eye].position;
+	// Eye world position in Unity coords (oxr_to_unity_pos = x, y, -z) — matches the
+	// deviceAnchorToEyePose the provider hands Unity, so it aligns with the shader's
+	// UNITY_MATRIX_I_V eye position (_DXREyePosL/R).
+	if (out_ex) *out_ex = p[0];
+	if (out_ey) *out_ey = p[1];
+	if (out_ez) *out_ez = -p[2];
+	// Per-view foreground far = display-plane distance (display rig = |rig-local eye
+	// Z|) or the convergence distance (camera rig), matching the hook path's far_eff.
+	float far_eff = s_ps.far_z > 0.0f ? s_ps.far_z : 1000.0f;
+	float near_z = s_ps.near_z > 0.0f ? s_ps.near_z : 0.01f;
+	if (s_ps.camera_centric) {
+		if (s_ps.inv_convergence_distance > 1e-4f) far_eff = 1.0f / s_ps.inv_convergence_distance;
+	} else {
+		XrPosef rig = s_ps.display_pose_set ? s_ps.display_pose
+		                                    : XrPosef{{0, 0, 0, 1}, {0, 0, 0}};
+		float ez = fabsf(ps_rig_local_eye_z(&rig, p));
+		if (ez > near_z + 0.001f) far_eff = ez;
+	}
+	if (out_far) *out_far = far_eff;
 }
 
 int dxr_prov_submit_frame(uint32_t image_index)
@@ -1409,26 +1902,56 @@ int dxr_prov_submit_frame(uint32_t image_index)
 		pv[eye].subImage.imageArrayIndex = eye; // SPI: left=0, right=1
 	}
 
+	// Zones (#166 Phase B): bind the projection layer's views into the zone rect.
+	// SAME instance/values as the locate chain; the submit values are authoritative.
+	XrDisplayZoneEXT submit_zone = {XR_TYPE_DISPLAY_ZONE_EXT};
+	int zone_frame = ps_zone_active();
+	if (zone_frame) {
+		submit_zone.zoneId = s_ps.zone_id ? s_ps.zone_id : 1;
+		submit_zone.rect.offset = {s_ps.zone_x, s_ps.zone_y};
+		submit_zone.rect.extent = {s_ps.zone_w, s_ps.zone_h};
+	}
+
 	XrCompositionLayerProjection layer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
+	layer.next = zone_frame ? (const void *)&submit_zone : NULL;
+	// Transparent (ALPHA_BLEND) session: the runtime alpha-gates the projection
+	// layer against the environment (compose-under-bg desktop) using the texture
+	// alpha, so regions transparent in ALL views become pure see-through and the
+	// desktop fill only shows in de-occluded regions. Without this flag the layer
+	// reads as opaque-over-environment and the composed-under desktop bleeds through
+	// everywhere at partial alpha. Matches Unity's own projection layer
+	// (XrCompositionLayerFlags.SourceAlpha) and the runtime's cube_zones handle test.
+	// Unity's eye texture is premultiplied (SourceAlpha, no UNPREMULTIPLIED bit).
+	layer.layerFlags = (s_ps.transparent_requested && s_ps.alpha_blend_supported)
+	        ? XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT : 0;
 	layer.space = s_ps.local_space;
 	layer.viewCount = n;
 	layer.views = pv;
 
-	// Optional 2nd layer: window-space UI (HUD). Copies the bridge into the wsui
-	// overlay swapchain and fills the layer; the runtime composites it over the
-	// eye projection. Inactive (returns 0) when no canvas RT is registered.
+	// Local2D band(s): post-weave 2D content at a client-window pixel rect,
+	// composited over the woven 3D (the "glass over 3D" 2D zone). Inactive when no
+	// rect/bridge is registered.
+	XrCompositionLayerLocal2DEXT l2d_layer = {};
+	int has_l2d = ps_submit_local2d(&l2d_layer);
+
+	// Window-space UI (HUD). Composites over everything (fractional coords + disparity).
 	XrCompositionLayerWindowSpaceEXT wsui_layer = {};
 	int has_wsui = ps_submit_wsui(&wsui_layer);
 
-	const XrCompositionLayerBaseHeader *layers[2] = {
-		(const XrCompositionLayerBaseHeader *)&layer,
-		(const XrCompositionLayerBaseHeader *)&wsui_layer,
-	};
+	// Order: 3D projection under, Local2D bands over the 3D, HUD on top (canonical
+	// zones rule — 1 zone projection + 1 Local2D per 2D band, both ALPHA_BLEND).
+	const XrCompositionLayerBaseHeader *layers[3];
+	uint32_t lc = 0;
+	layers[lc++] = (const XrCompositionLayerBaseHeader *)&layer;
+	if (has_l2d)  layers[lc++] = (const XrCompositionLayerBaseHeader *)&l2d_layer;
+	if (has_wsui) layers[lc++] = (const XrCompositionLayerBaseHeader *)&wsui_layer;
 
 	XrFrameEndInfo ei = {XR_TYPE_FRAME_END_INFO};
 	ei.displayTime = s_ps.predicted_display_time;
-	ei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
-	ei.layerCount = has_wsui ? 2 : 1;
+	ei.environmentBlendMode = (s_ps.transparent_requested && s_ps.alpha_blend_supported)
+	        ? XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND
+	        : XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+	ei.layerCount = lc;
 	ei.layers = layers;
 	XrResult r = s_ps.pfn_end_frame(s_ps.session, &ei);
 	if (XR_FAILED(r)) { ps_log("[DisplayXR-PROV] xrEndFrame failed: %d\n", r); return 0; }
@@ -1441,7 +1964,9 @@ void dxr_prov_end_frame_empty(void)
 	s_ps.frame_begun = 0;
 	XrFrameEndInfo ei = {XR_TYPE_FRAME_END_INFO};
 	ei.displayTime = s_ps.predicted_display_time;
-	ei.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
+	ei.environmentBlendMode = (s_ps.transparent_requested && s_ps.alpha_blend_supported)
+	        ? XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND
+	        : XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
 	ei.layerCount = 0;
 	ei.layers = NULL;
 	s_ps.pfn_end_frame(s_ps.session, &ei);

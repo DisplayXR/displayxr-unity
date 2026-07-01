@@ -221,6 +221,14 @@ namespace DisplayXR
             // preserves alpha=0 in the swapchain (#85).
             DisplayXRFeature.s_TransparentBackgroundRequested = true;
 #endif
+#if UNITY_STANDALONE_WIN
+            // Provider mode (#166): the custom Display Provider drives its own
+            // session, so DisplayXRFeature's hook-path opt-in above is inert. Mirror
+            // the request on the provider so it sets ALPHA_BLEND +
+            // transparentBackgroundEnabled on ITS session. Harmless on the hook path
+            // (the native flag is only read when the provider session starts).
+            DisplayXRProvider.RequestTransparentBackground(true);
+#endif
         }
 
         /// <summary>
@@ -290,6 +298,16 @@ namespace DisplayXR
             // background. Pointer events here come from native polling so they
             // don't actually depend on focus, but other components might.
             Application.runInBackground = true;
+
+            // Provider mode (#166): the transparent overlay machinery is SHARED with
+            // the hook path — the overlay is already the unowned NOREDIRECTIONBITMAP
+            // transparent window (transparent_background_requested drives
+            // displayxr_get_app_main_view), and the runtime is bound to it by the
+            // provider. We STILL need the Unity cloak + off-screen move below: without
+            // it, Unity's suppressed (black) window shows behind the transparent
+            // overlay (the "solid black background" symptom). The provider skips
+            // provider-opaque overlay mode when transparent so parent_subclass_proc
+            // doesn't drag the overlay off-screen following cloaked Unity.
 
             m_SimpleWindow = useSimpleWindow;
             if (m_SimpleWindow)
@@ -996,16 +1014,45 @@ namespace DisplayXR
         // Lazy-fetch the feature singleton — DisplayXRFeature.Instance may be
         // null at OnEnable time if our OnEnable runs before the OpenXR loader
         // initialises the feature.
+        private readonly float[] m_SmLV = new float[16], m_SmLP = new float[16],
+                                 m_SmRV = new float[16], m_SmRP = new float[16];
+
         private bool TryGetStereoMatrices(out Matrix4x4 leftView, out Matrix4x4 leftProj,
                                            out Matrix4x4 rightView, out Matrix4x4 rightProj)
         {
             leftView = leftProj = rightView = rightProj = Matrix4x4.identity;
+
+            // Provider mode (#166): DisplayXRFeature is inert (no Unity OpenXR loader),
+            // but the provider publishes the same per-eye matrices to the shared state
+            // each frame — read them directly via the native getter so the cyclopean
+            // hit-test (LMB drag on the silhouette) works.
+            if (DisplayXRProviderDriver.IsActive)
+            {
+                DisplayXRNative.displayxr_get_stereo_matrices(
+                    m_SmLV, m_SmLP, m_SmRV, m_SmRP, out int pvalid);
+                if (pvalid == 0) return false;
+                leftView = FloatsToMatrix(m_SmLV); leftProj = FloatsToMatrix(m_SmLP);
+                rightView = FloatsToMatrix(m_SmRV); rightProj = FloatsToMatrix(m_SmRP);
+                return true;
+            }
+
             if (m_Feature == null)
                 m_Feature = DisplayXRFeature.Instance;
             if (m_Feature == null)
                 return false;
             return m_Feature.GetStereoMatrices(out leftView, out leftProj,
                                                 out rightView, out rightProj);
+        }
+
+        // Column-major float[16] → Unity Matrix4x4 (mirrors DisplayXRFeature.FloatsToMatrix).
+        private static Matrix4x4 FloatsToMatrix(float[] m)
+        {
+            var mat = new Matrix4x4();
+            mat.m00 = m[0];  mat.m10 = m[1];  mat.m20 = m[2];  mat.m30 = m[3];
+            mat.m01 = m[4];  mat.m11 = m[5];  mat.m21 = m[6];  mat.m31 = m[7];
+            mat.m02 = m[8];  mat.m12 = m[9];  mat.m22 = m[10]; mat.m32 = m[11];
+            mat.m03 = m[12]; mat.m13 = m[13]; mat.m23 = m[14]; mat.m33 = m[15];
+            return mat;
         }
 
         // The stereo viewport (overlay client px) the Kooima projection from

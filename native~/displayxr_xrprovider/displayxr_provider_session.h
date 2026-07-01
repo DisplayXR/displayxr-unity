@@ -135,6 +135,43 @@ DISPLAYXR_EXPORT void dxr_prov_set_single_pass(int enable);
 /// Effective render mode: 1 = SPI, 0 = MultiPass.
 int  dxr_prov_get_single_pass(void);
 
+/// Transparent-background request (#166 Phase A). Set from C# BEFORE the session
+/// starts: 1 = opt the session into a transparent background (ALPHA_BLEND env
+/// blend mode + transparentBackgroundEnabled on the win32 binding) so the runtime's
+/// DComp overlay composites the woven 3D over the desktop with per-pixel alpha.
+/// The opt-in only takes effect if the runtime advertises ALPHA_BLEND (probed in
+/// session_start). Preserved across the session_start reset (like single_pass).
+DISPLAYXR_EXPORT void dxr_prov_set_transparent_background(int enable);
+
+/// Whether a transparent background was requested (read by the display-provider
+/// TU in LifecycleStart to pick the transparent overlay path — unowned + Unity
+/// cloaked/off-screen — over the provider-opaque one, which follows Unity and
+/// would drag the overlay off-screen once the transparent path cloaks Unity).
+int dxr_prov_wants_transparent(void);
+
+/// Set the single 3D-zone rect (client-window px, top-left origin) the runtime
+/// frames the Kooima 3D into (#166 Phase B). The locate chains XrDisplayZoneEXT in
+/// front of the view-rig and submit chains the same zone on the projection layer;
+/// the swapchain is sized to the zone's recommended view size. w<=0||h<=0 clears
+/// (full-window framing). Requires the runtime to advertise XR_EXT_display_zones.
+/// Seed BEFORE the session starts (like the hook SeedLaunchZone) for born-zone-sized.
+DISPLAYXR_EXPORT void dxr_prov_set_3d_zone_rect(int32_t x, int32_t y, int32_t w, int32_t h);
+
+/// Clear the 3D-zone rect (revert to full-window framing).
+DISPLAYXR_EXPORT void dxr_prov_clear_3d_zone(void);
+
+/// Local2D layer (#166 Phase B): lazily create the provider's Local2D overlay
+/// swapchain + cross-device bridge sized to w×h and return the Unity-device handle
+/// of the bridge. C# (DisplayXRLocal2D) Graphics.CopyTexture's its canvas RT into it
+/// each frame; the provider submits an XrCompositionLayerLocal2DEXT at the pixel
+/// rect. Mirrors dxr_prov_get_wsui_bridge. *out_ptr = NULL when no session running.
+DISPLAYXR_EXPORT void dxr_prov_get_local2d_bridge(uint32_t w, uint32_t h,
+                                                  void **out_ptr, uint32_t *out_w, uint32_t *out_h);
+
+/// Set the Local2D dest rect in client-window PIXELS (post-DPI). w<=0||h<=0 clears
+/// (layer inactive). Cheap; safe to call every frame.
+DISPLAYXR_EXPORT void dxr_prov_set_local2d_rect(int32_t x, int32_t y, int32_t w, int32_t h);
+
 // ---- Frame loop -------------------------------------------------------------
 
 /// Pump OpenXR session-state events (xrPollEvent). Drives the session to READY.
@@ -149,6 +186,15 @@ int  dxr_prov_begin_frame(uint32_t *out_image_index, int *out_should_render);
 
 /// Copy out a render-ready view (after dxr_prov_begin_frame).
 void dxr_prov_get_view(uint32_t view_index, DxrProvView *out_view);
+
+/// Per-eye foreground-clip data (#166 Phase B): the eye's foreground far (view-space
+/// display-plane distance in world units — display rig = |rig-local eye Z|, camera
+/// rig = convergence distance) + the eye WORLD position (Unity coords). C#
+/// (DisplayXRDisplay) publishes these to the URP DisplayXR/ForegroundClipURP globals
+/// (_DXRForegroundFar / _DXREyePosL/R), since DisplayXRFeature.GetStereoMatrices —
+/// the hook-path source — is inert in provider mode.
+DISPLAYXR_EXPORT void dxr_prov_get_eye_clip(uint32_t eye, float *out_far,
+                                            float *out_ex, float *out_ey, float *out_ez);
 
 /// Submit the rendered frame: release the swapchain image + xrEndFrame a 2-view
 /// projection layer (per-eye subImage.imageArrayIndex 0/1).

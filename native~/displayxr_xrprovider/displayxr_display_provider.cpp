@@ -504,7 +504,15 @@ LifecycleStart(UnitySubsystemHandle handle, void *userData)
 	// weave; a WS_CHILD does not (#166).
 	const char *use_overlay = getenv("DISPLAYXR_PROV_OVERLAY");
 	if (use_overlay && use_overlay[0] == '1') {
-		displayxr_set_provider_opaque_overlay(1);
+		// Transparent apps take the UNOWNED transparent overlay path (created by
+		// displayxr_get_app_main_view because transparent_background_requested is set)
+		// + Unity cloak/off-screen (DisplayXRTransparentOverlay). Do NOT set
+		// provider-opaque there: it makes parent_subclass_proc FOLLOW Unity, which the
+		// transparent path moves off-screen — dragging the overlay off-screen with it
+		// (the "[DisplayXR.Inject] clientX=-413" fight). Opaque apps keep provider-opaque
+		// (top-level popup that tracks Unity's on-screen window).
+		if (!dxr_prov_wants_transparent())
+			displayxr_set_provider_opaque_overlay(1);
 		s_overlay_hwnd = displayxr_get_app_main_view();
 		prov_log(s_overlay_hwnd
 		             ? "[DisplayXR-PROV] Lifecycle Start (top-level overlay created on main thread)\n"

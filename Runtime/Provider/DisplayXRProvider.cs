@@ -53,6 +53,31 @@ namespace DisplayXR
         public static bool SetEyeTrackingMode(bool manual) =>
             IsRunning && DisplayXRProviderNative.dxr_prov_set_eye_tracking_mode(manual ? 1 : 0) != 0;
 
+        /// <summary>
+        /// Request a transparent background for the provider session (#166 Phase A).
+        /// Must be called BEFORE the session starts (e.g. from a transparent app's
+        /// bootstrap, mirroring <see cref="DisplayXRTransparentOverlay.RequestTransparentSession"/>
+        /// on the hook path). Opts the session into ALPHA_BLEND +
+        /// transparentBackgroundEnabled so the runtime's DComp overlay composites the
+        /// woven 3D over the desktop; only takes effect if the runtime advertises
+        /// ALPHA_BLEND. Safe to call whether or not the provider ends up active.
+        /// </summary>
+        public static void RequestTransparentBackground(bool enabled = true) =>
+            DisplayXRProviderNative.dxr_prov_set_transparent_background(enabled ? 1 : 0);
+
+        /// <summary>
+        /// Set the single 3D-zone rect (client-window pixels) the runtime frames the
+        /// Kooima 3D into (#166 Phase B) — the provider analog of
+        /// <see cref="DisplayXRNative.displayxr_set_3d_zone_rect"/> on the hook path.
+        /// Seed early (SubsystemRegistration) so the swapchain is born zone-sized.
+        /// width&lt;=0||height&lt;=0 clears. Safe to call whether or not the provider is active.
+        /// </summary>
+        public static void SetZoneRect(int x, int y, int width, int height) =>
+            DisplayXRProviderNative.dxr_prov_set_3d_zone_rect(x, y, width, height);
+
+        /// <summary>Clear the 3D-zone rect (revert to full-window framing).</summary>
+        public static void ClearZone() => DisplayXRProviderNative.dxr_prov_clear_3d_zone();
+
         /// <summary>Re-read the enumerated modes from native. Called at session start + on mode change.</summary>
         public static void RefreshModes()
         {
