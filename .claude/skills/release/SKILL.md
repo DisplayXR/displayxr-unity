@@ -166,14 +166,28 @@ place inside both distribution channels (the `.tgz` asset and the `upm`
 orphan branch). No-ops cleanly without signing capability.
 
 ### Step 3.5.1: Capability check
+Two methods; neither names a signing endpoint. Unity signs a **prebuilt** DLL
+(no build step), so the **remote** method needs no Windows host — it works from
+anywhere with `gh`.
+- **Remote** — `$DXR_SIGN_HOOK` (a local executable that signs a folder in place).
+- **Local** — `$SIGN_CMD` (per-file signer; needs a Windows host for signtool).
+
 ```bash
-if [ -z "$SIGN_CMD" ] || ! uname -s | grep -qiE 'mingw|msys|cygwin|windows'; then
-  echo "⚠  SIGNING SKIPPED — no signing capability; release DLL stays UNSIGNED."
-  echo "   Re-run /release on a signing-capable build machine (SIGN_CMD set)."
-  SIGNED=no   # continue — do not fail
+if [ -n "$DXR_SIGN_HOOK" ] && [ -x "$DXR_SIGN_HOOK" ]; then
+  SIGN_METHOD=remote; SIGNED=yes
+elif [ -n "$SIGN_CMD" ] && uname -s | grep -qiE 'mingw|msys|cygwin|windows'; then
+  SIGN_METHOD=local;  SIGNED=yes
 else
-  SIGNED=yes
+  echo "⚠  SIGNING SKIPPED — no signing capability; release DLL stays UNSIGNED."
+  echo "   Set DXR_SIGN_HOOK (remote) or SIGN_CMD (local, Windows) and re-run."
+  SIGN_METHOD=none; SIGNED=no
 fi
+
+# Sign a folder of binaries in place, by whichever method is active:
+sign_folder() {
+  if [ "$SIGN_METHOD" = remote ]; then "$DXR_SIGN_HOOK" "$1"
+  else powershell -NoProfile -ExecutionPolicy Bypass -File Scripts\\sign-release.ps1 -Path "$1" -SignCmd "$SIGN_CMD"; fi
+}
 ```
 
 ### Step 3.5.2: Sign the DLL in the `.tgz` asset, repack, re-upload (if SIGNED=yes)
@@ -182,7 +196,7 @@ TGZ="com.displayxr.unity-[VERSION_NUMBER].tgz"
 gh release download [VERSION] --repo DisplayXR/displayxr-unity --pattern "$TGZ" --dir /tmp/usign
 mkdir -p /tmp/usign/x && tar -xzf "/tmp/usign/$TGZ" -C /tmp/usign/x
 DLL=$(find /tmp/usign/x -ipath '*Windows/x64/displayxr_unity.dll')
-powershell -NoProfile -ExecutionPolicy Bypass -File Scripts\\sign-release.ps1 -Path "$(dirname "$DLL")" -SignCmd "$SIGN_CMD"
+sign_folder "$(dirname "$DLL")"
 # repack with the same internal layout (npm packages root at 'package/')
 ( cd /tmp/usign/x && tar -czf "/tmp/usign/$TGZ" package )
 gh release upload [VERSION] "/tmp/usign/$TGZ" --clobber --repo DisplayXR/displayxr-unity
@@ -193,8 +207,7 @@ Users who install by git URL get the DLL from the `upm` orphan branch,
 not the `.tgz` — sign that copy as well.
 ```bash
 git fetch origin upm && git checkout upm
-powershell -NoProfile -ExecutionPolicy Bypass -File Scripts\\sign-release.ps1 \
-  -Path "Runtime/Plugins/Windows/x64" -SignCmd "$SIGN_CMD"
+sign_folder "Runtime/Plugins/Windows/x64"
 git commit -am "Sign displayxr_unity.dll for [VERSION]"
 git push origin upm
 # move the upm/[VERSION] tag onto the signed commit so the pinned install is signed too
