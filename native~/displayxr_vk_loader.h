@@ -1,5 +1,5 @@
 // Copyright 2024-2026, DisplayXR contributors
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // Dynamic Vulkan loader for the standalone preview backend (issue #124).
 //

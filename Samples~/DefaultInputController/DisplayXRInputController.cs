@@ -1,5 +1,5 @@
 // Copyright 2024-2026, DisplayXR contributors
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 
 using UnityEngine;
 #if ENABLE_INPUT_SYSTEM

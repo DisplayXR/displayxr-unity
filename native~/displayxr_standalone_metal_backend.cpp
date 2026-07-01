@@ -1,5 +1,5 @@
 // Copyright 2024-2026, DisplayXR contributors
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // Metal graphics backend for the standalone OpenXR session.
 // Extracted from displayxr_standalone.cpp — no logic changes.

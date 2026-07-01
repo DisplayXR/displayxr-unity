@@ -1,5 +1,5 @@
 // Copyright 2024-2026, DisplayXR contributors
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // Inject the runtime's correct per-eye projection into URP (the URP adapter of the
 // Kooima projection pipeline; #127/#396).

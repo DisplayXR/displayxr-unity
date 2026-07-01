@@ -1,5 +1,5 @@
 // Copyright 2024-2026, DisplayXR contributors
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // macOS-specific helpers for DisplayXRTransparentOverlay (issue #85).
 // Flips Unity's NSWindow + contentView layer so per-pixel alpha from the

@@ -1,5 +1,5 @@
 // Copyright 2024-2026, DisplayXR contributors
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // Custom OpenXR extension constants and structs for DisplayXR support.
 // These mirror the definitions in the CNSDK-OpenXR extension headers.
