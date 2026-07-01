@@ -1,5 +1,5 @@
 // Copyright 2024-2026, DisplayXR contributors
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // Used by DisplayXRScreenshot's flash overlay (built-app capture path).
 // Renders a fullscreen alpha-blended fill from the _Color uniform.

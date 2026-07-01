@@ -1,5 +1,5 @@
 // Copyright 2024-2026, DisplayXR contributors
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // Win32 window management for the DisplayXR Unity plugin.
 // Standalone mode: overlay child window. Shell mode: IAT hooks + subclass.

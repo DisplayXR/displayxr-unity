@@ -1,5 +1,5 @@
 // Copyright 2024-2026, DisplayXR contributors
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // OpenGL standalone graphics backend stub (desktop GL for Windows/macOS/Linux).
 // Active when ENABLE_OPENGL is defined on non-Android platforms.

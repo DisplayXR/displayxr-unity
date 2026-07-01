@@ -24,4 +24,6 @@ A ready-to-open sample project lives in [`displayxr-unity-test`](https://github.
 
 ## License
 
-By contributing, you agree your code is licensed under the same terms as the rest of the repository (see [LICENSE](LICENSE)).
+Inbound contributions are accepted under the **Apache License, Version 2.0** (the same license as this repository — see [LICENSE](LICENSE)).
+
+We use the [Developer Certificate of Origin (DCO)](https://developercertificate.org/): sign off every commit with `git commit -s` (which appends a `Signed-off-by: Your Name <you@example.com>` line) to certify you have the right to submit the code under the project's license.

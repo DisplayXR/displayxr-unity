@@ -1,5 +1,5 @@
 // Copyright 2024-2026, DisplayXR contributors
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // Vulkan graphics backend.
 // Active when ENABLE_VULKAN is defined (Windows opt-in via CMakeLists) or on

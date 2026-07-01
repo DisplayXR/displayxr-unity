@@ -1,5 +1,5 @@
 // Copyright 2024-2026, DisplayXR contributors
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // Unity native-plugin-interface glue (issue #124). Implements UnityPluginLoad
 // to capture Unity's editor graphics device. Currently used to expose Unity's
