@@ -1,0 +1,49 @@
+name: lint
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  checks:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Vendor-name guard
+        run: |
+          # Enforces the DisplayXR vendor-neutrality contract: authored files must
+          # not self-brand with the display vendor's company name. The literal is
+          # constructed at runtime so this workflow does not itself contain it.
+          #
+          # Excluded paths:
+          #   .git, .claude       - not authored product content
+          #   openxr/             - OpenXR extension headers vendored VERBATIM from
+          #                         displayxr-runtime; they carry upstream's copyright
+          #                         line and must match byte-for-byte.
+          #   displayxr-common    - policed in its own repo (submodule / FetchContent).
+          #   CHANGELOG.md        - historical record; may name the original vendor SDK.
+          #   CLAUDE.md           - documents the DisplayXR org, which legitimately
+          #                         names the vendor plug-in repo by its published name.
+          #
+          # Tier-A allowlist (ALLOW): legitimate names of the vendor hardware /
+          # plug-in / SDK / OEM the ecosystem integrates with - like naming NVIDIA in
+          # CUDA code. A line containing any of these tokens is permitted.
+          FORBIDDEN="le""ia"
+          ALLOW='cnsdk|leia_cnsdk|libdxrp050_leia_cnsdk|leiasdk|leiasr|displayxr-leia|leia-plugin|leiaplugin|leia_plugin|leia_tag|leia-sr|leia sr|leia hardware|leia display|leia dp|leia android dp|leia sdk|leia plug|leia panel|leia weave|leia face|leia viewer|leia-viewer|leia convention|leia lif|leia heif|leia image format|leiaschema|classic leia|leialoft|leiainc/|LEIA_EXE|LEIA_VER|LEIA_TAG|SecLeia|G_Leia|LeiaUnrealSDK|LeiaPlayerWin'
+          hits=$(grep -rniI \
+                   --exclude-dir=.git --exclude-dir=.claude \
+                   --exclude-dir=openxr --exclude-dir=displayxr-common \
+                   --exclude=CHANGELOG.md --exclude=CLAUDE.md \
+                   "$FORBIDDEN" . | grep -viE "$ALLOW" || true)
+          if [ -n "$hits" ]; then
+            echo "$hits"
+            echo "::error::Vendor company name found in authored files (not covered by the Tier-A allowlist). Neutralize it, or add a legitimate hardware/plug-in token to ALLOW."
+            exit 1
+          fi
+          echo "OK: no non-allowlisted vendor-name references in authored files."
+
+      - name: Workflow YAML is valid
+        run: |
+          python3 -m pip install --quiet pyyaml
+          python3 -c "import yaml, glob; [yaml.safe_load(open(f)) for f in glob.glob('.github/workflows/*.yml')]"

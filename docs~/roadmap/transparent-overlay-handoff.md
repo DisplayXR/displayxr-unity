@@ -305,7 +305,7 @@ Logs:
 
 ## Open issues elsewhere
 
-- `displayxr-runtime#190` — vendor request to Leia for alpha-respecting weaver. When that lands, plugin can drop magenta clear and use `chromaKeyColor = 0`; runtime relies on per-pixel alpha straight through, eliminating the silhouette fringe entirely.
+- `displayxr-runtime#190` — vendor request to the vendor for alpha-respecting weaver. When that lands, plugin can drop magenta clear and use `chromaKeyColor = 0`; runtime relies on per-pixel alpha straight through, eliminating the silhouette fringe entirely.
 - `displayxr-runtime#193` — app-driven "external drag" API for window movement with phase-snap. Required to eliminate the right-drag 3D stutter in transparent overlay mode (and to re-enable real-time Kooima during the standalone preview's parked SC_MOVE intercept). See CLAUDE.md "Known Issues" for the failure modes that block plugin-only solutions.
 - `displayxr-unity#57` — open, will be closed when click-through and drag-by-cube land. Cross-referenced from runtime#191.
 - `docs~/roadmap/d3d11-typeless-fix-plan.md` — Unity D3D11 TYPELESS engine bug fix plan. Not strictly needed for transparent overlay (since Unity 6 defaults to D3D12) but would unblock the D3D11 BitBlt path for the rare D3D11-only Unity build.
