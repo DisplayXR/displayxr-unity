@@ -62,6 +62,50 @@ namespace DisplayXR
         public static extern void dxr_prov_set_single_pass(int enable);
 
         /// <summary>
+        /// Request a transparent background BEFORE the session starts (#166 Phase A):
+        /// 1 opts the session into ALPHA_BLEND + transparentBackgroundEnabled so the
+        /// runtime's DComp overlay composites the woven 3D over the desktop with
+        /// per-pixel alpha. Only takes effect if the runtime advertises ALPHA_BLEND.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void dxr_prov_set_transparent_background(int enable);
+
+        /// <summary>
+        /// Set the single 3D-zone rect (client-window px) the runtime frames the
+        /// Kooima 3D into (#166 Phase B). Seed BEFORE the session starts (like the
+        /// hook SeedLaunchZone) so the swapchain is born zone-sized. w&lt;=0||h&lt;=0 clears.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void dxr_prov_set_3d_zone_rect(int x, int y, int w, int h);
+
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void dxr_prov_clear_3d_zone();
+
+        /// <summary>
+        /// Lazily create the provider's Local2D overlay swapchain + cross-device bridge
+        /// (#166 Phase B) sized to w×h and return the Unity-device handle. Mirrors
+        /// dxr_prov_get_wsui_bridge. C# CopyTexture's the canvas RT into it each frame.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void dxr_prov_get_local2d_bridge(
+            uint width, uint height,
+            out System.IntPtr nativePtr, out uint outWidth, out uint outHeight);
+
+        /// <summary>Set the Local2D dest rect in client-window pixels. w&lt;=0||h&lt;=0 clears.</summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void dxr_prov_set_local2d_rect(int x, int y, int w, int h);
+
+        /// <summary>
+        /// Per-eye foreground-clip data (#166 Phase B): the eye's foreground far
+        /// (view-space display-plane distance, world units) + the eye WORLD position
+        /// (Unity coords). DisplayXRDisplay publishes these to the URP ForegroundClipURP
+        /// globals in provider mode (DisplayXRFeature.GetStereoMatrices is inert then).
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void dxr_prov_get_eye_clip(
+            uint eye, out float outFar, out float outEx, out float outEy, out float outEz);
+
+        /// <summary>
         /// Push the stereo rig tunables (mirrors displayxr_set_tunables, minus the
         /// clipAtDisplayPlane flag the rig descriptor doesn't carry). Scale-as-zoom
         /// must be folded into virtualDisplayHeight / invConvergenceDistance by the

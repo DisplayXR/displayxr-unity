@@ -119,7 +119,20 @@ namespace DisplayXR
 
         void OnCameraPreRender(Camera cam)
         {
-            if (cam != m_Camera || m_Feature == null) return;
+            if (cam != m_Camera) return;
+
+            // Provider mode (#166): DisplayXRFeature is inert (no Unity OpenXR loader),
+            // so GetStereoMatrices can't feed the URP foreground clip. Publish the
+            // ForegroundClipURP globals from the provider's per-eye clip data instead.
+            // (BiRP provider clip via SetStereoProjectionMatrix is a separate follow-up;
+            // the transparent demo is URP.)
+            if (DisplayXRProviderDriver.IsActive)
+            {
+                if (m_UsingSRP) PublishProviderForegroundClip();
+                return;
+            }
+
+            if (m_Feature == null) return;
 
             if (!m_Feature.GetStereoMatrices(out Matrix4x4 leftView, out Matrix4x4 leftProj,
                                               out Matrix4x4 rightView, out Matrix4x4 rightProj))
@@ -169,6 +182,30 @@ namespace DisplayXR
                     Shader.SetGlobalVector(s_EyePosLId, leftView.inverse.GetColumn(3));
                     Shader.SetGlobalVector(s_EyePosRId, rightView.inverse.GetColumn(3));
                 }
+            }
+        }
+
+        // Provider mode: publish the URP DisplayXR/ForegroundClipURP globals from the
+        // provider's per-eye clip data (far + eye world pos), mirroring the hook-path
+        // URP branch in OnCameraPreRender. The globals are inert if the clip pass isn't
+        // wired, so this is safe when foregroundOnlyClip is off. #166 Phase B.
+        void PublishProviderForegroundClip()
+        {
+            if (!foregroundOnlyClip)
+            {
+                Shader.SetGlobalVector(s_ForegroundFarId, Vector4.zero);
+                return;
+            }
+            DisplayXRProviderNative.dxr_prov_get_eye_clip(0, out float farL, out float lx, out float ly, out float lz);
+            DisplayXRProviderNative.dxr_prov_get_eye_clip(1, out float farR, out float rx, out float ry, out float rz);
+            float nz = m_Camera != null ? m_Camera.nearClipPlane : 0.3f;
+            bool clip = farL > nz && farR > nz;
+            Shader.SetGlobalVector(s_ForegroundFarId,
+                clip ? new Vector4(farL, farR, 1f, 0f) : Vector4.zero);
+            if (clip)
+            {
+                Shader.SetGlobalVector(s_EyePosLId, new Vector4(lx, ly, lz, 0f));
+                Shader.SetGlobalVector(s_EyePosRId, new Vector4(rx, ry, rz, 0f));
             }
         }
 

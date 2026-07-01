@@ -186,6 +186,9 @@ typedef struct XrCompositionLayerWindowSpaceEXT {
 // M=0 inside / M=1 elsewhere — the region under the rect goes flat 2D, "glass
 // over 3D"). Unlike XrCompositionLayerWindowSpaceEXT (fractional, disparity),
 // the dest rect here is in post-DPI client-window pixels.
+#define XR_EXT_LOCAL_3D_ZONE_EXTENSION_NAME "XR_EXT_local_3d_zone"
+#define XR_EXT_local_3d_zone_SPEC_VERSION 1
+
 #define XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT ((XrStructureType)1000999165)
 
 typedef struct XrCompositionLayerLocal2DEXT {

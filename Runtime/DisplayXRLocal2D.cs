@@ -94,6 +94,13 @@ namespace DisplayXR
 
         private int m_LastRectX = int.MinValue, m_LastRectY, m_LastRectW, m_LastRectH;
 
+        // Provider mode (#166): the custom Display Provider owns a separate D3D12
+        // device, so it exposes its own cross-device Local2D bridge (like wsui). We
+        // Graphics.CopyTexture the overlay RT into it each frame instead of handing the
+        // RT pointer to the hook-path displayxr_local2d_set_texture.
+        private bool m_ProviderMode;
+        private Texture2D m_BridgeTex;
+
         // The opt-in URP foreground clip (DisplayXR/ForegroundClipURP) is a built-in
         // FullScreenPassRendererFeature with NO XR-camera guard (unlike
         // KooimaProjectionFixFeature, which returns early on !cameraData.xr.enabled).
@@ -115,7 +122,14 @@ namespace DisplayXR
             // (XR_ERROR_LAYER_INVALID) — black screen. Gate on it: if the runtime
             // doesn't support Local2D, stay inert (no RT, no submission) so the
             // rest of the scene renders normally.
-            if (!OpenXRRuntime.IsExtensionEnabled("XR_EXT_local_3d_zone"))
+            //
+            // Provider mode (#166): Unity's OpenXR loader isn't active, so
+            // OpenXRRuntime.IsExtensionEnabled is always false — gate on the provider
+            // instead (it enables XR_EXT_local_3d_zone on its own instance). Without
+            // this branch the component early-returns and the Canvas falls through to
+            // the main eye texture (the "bubble pollutes the 3D" symptom).
+            m_ProviderMode = DisplayXRProviderDriver.IsActive;
+            if (!m_ProviderMode && !OpenXRRuntime.IsExtensionEnabled("XR_EXT_local_3d_zone"))
             {
                 Debug.LogWarning("[DisplayXR] Local2D: XR_EXT_local_3d_zone not enabled — " +
                                  "bubble layer disabled (runtime lacks Local2D support).");
@@ -199,8 +213,11 @@ namespace DisplayXR
 
             m_Canvas.worldCamera = m_OverlayCamera;
 
-            DisplayXRNative.displayxr_local2d_set_texture(
-                OverlayTexture.GetNativeTexturePtr(), resolution.x, resolution.y);
+            if (m_ProviderMode)
+                TryAcquireBridge(); // provider owns its own cross-device Local2D bridge
+            else
+                DisplayXRNative.displayxr_local2d_set_texture(
+                    OverlayTexture.GetNativeTexturePtr(), resolution.x, resolution.y);
 
             // Scope the URP foreground clip out of our overlay camera (see field doc).
             RenderPipelineManager.beginCameraRendering += OnBeginOverlayCamera;
@@ -228,8 +245,36 @@ namespace DisplayXR
                 Shader.SetGlobalVector(s_ForegroundFarId, m_SavedForegroundFar);
         }
 
+        // Provider mode: acquire the provider's cross-device Local2D bridge and wrap it
+        // as an external Texture2D we Graphics.CopyTexture the overlay RT into. Lazy —
+        // the session may come up after OnEnable. Mirrors DisplayXRWindowSpaceUI.
+        private void TryAcquireBridge()
+        {
+            if (m_BridgeTex != null) return;
+            try
+            {
+                DisplayXRProviderNative.dxr_prov_get_local2d_bridge(
+                    (uint)resolution.x, (uint)resolution.y,
+                    out System.IntPtr bridgePtr, out uint bw, out uint bh);
+                if (bridgePtr != System.IntPtr.Zero && bw > 0 && bh > 0)
+                {
+                    m_BridgeTex = Texture2D.CreateExternalTexture(
+                        (int)bw, (int)bh, TextureFormat.BGRA32, false, true, bridgePtr);
+                    m_BridgeTex.name = "DisplayXR_Local2DBridge";
+                    Debug.Log($"[DisplayXR] Local2D: provider bridge acquired {bw}x{bh}");
+                }
+            }
+            catch (System.EntryPointNotFoundException) { }
+        }
+
         void OnDisable()
         {
+            if (m_BridgeTex != null)
+            {
+                if (Application.isPlaying) Destroy(m_BridgeTex); else DestroyImmediate(m_BridgeTex);
+                m_BridgeTex = null;
+            }
+
             if (m_CamRenderHooked)
             {
                 RenderPipelineManager.beginCameraRendering -= OnBeginOverlayCamera;
@@ -237,7 +282,10 @@ namespace DisplayXR
                 m_CamRenderHooked = false;
             }
 
-            DisplayXRNative.displayxr_local2d_clear();
+            if (m_ProviderMode)
+                DisplayXRProviderNative.dxr_prov_set_local2d_rect(0, 0, 0, 0);
+            else
+                DisplayXRNative.displayxr_local2d_clear();
 
             if (m_StateSaved && m_Canvas != null)
             {
@@ -286,10 +334,24 @@ namespace DisplayXR
                 if (px != m_LastRectX || py != m_LastRectY ||
                     pw != m_LastRectW || ph != m_LastRectH)
                 {
-                    DisplayXRNative.displayxr_local2d_set_rect(px, py, pw, ph);
+                    if (m_ProviderMode)
+                        DisplayXRProviderNative.dxr_prov_set_local2d_rect(px, py, pw, ph);
+                    else
+                        DisplayXRNative.displayxr_local2d_set_rect(px, py, pw, ph);
                     m_LastRectX = px; m_LastRectY = py;
                     m_LastRectW = pw; m_LastRectH = ph;
                 }
+            }
+
+            // Provider mode: mirror the overlay RT into the provider's cross-device
+            // bridge each frame (the enabled camera rendered it in Unity's loop). The
+            // provider copies the bridge into its Local2D swapchain at submit. 1-frame
+            // latency is invisible for a HUD/bubble.
+            if (m_ProviderMode)
+            {
+                if (m_BridgeTex == null) TryAcquireBridge();
+                if (m_BridgeTex != null && OverlayTexture != null)
+                    Graphics.CopyTexture(OverlayTexture, m_BridgeTex);
             }
             // No manual Render() here — the camera is enabled and renders in
             // Unity's loop after the canvas rebuild (see OnEnable). This is the
