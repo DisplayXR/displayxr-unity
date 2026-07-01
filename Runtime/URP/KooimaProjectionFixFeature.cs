@@ -73,16 +73,55 @@ namespace DisplayXR.URP
             static readonly int s_ForegroundFarId = Shader.PropertyToID("_DXRForegroundFar");
             int m_LogCount;
 
+            // Provider-mode matrix read (#166): the provider publishes the per-eye
+            // view+proj to the same native shared state the silhouette reads, so we can
+            // fetch them here (DisplayXRFeature.GetStereoMatrices needs the inactive hook).
+            static readonly float[] s_pLV = new float[16], s_pLP = new float[16],
+                                    s_pRV = new float[16], s_pRP = new float[16];
+
+            static bool ProviderStereoMatrices(out Matrix4x4 lv, out Matrix4x4 lp,
+                                               out Matrix4x4 rv, out Matrix4x4 rp)
+            {
+                lv = lp = rv = rp = Matrix4x4.identity;
+                DisplayXRNative.displayxr_get_stereo_matrices(s_pLV, s_pLP, s_pRV, s_pRP, out int valid);
+                if (valid == 0) return false;
+                lv = ToMat(s_pLV); lp = ToMat(s_pLP); rv = ToMat(s_pRV); rp = ToMat(s_pRP);
+                return true;
+            }
+
+            static Matrix4x4 ToMat(float[] m)
+            {
+                var r = new Matrix4x4();
+                r.m00 = m[0];  r.m10 = m[1];  r.m20 = m[2];  r.m30 = m[3];
+                r.m01 = m[4];  r.m11 = m[5];  r.m21 = m[6];  r.m31 = m[7];
+                r.m02 = m[8];  r.m12 = m[9];  r.m22 = m[10]; r.m32 = m[11];
+                r.m03 = m[12]; r.m13 = m[13]; r.m23 = m[14]; r.m33 = m[15];
+                return r;
+            }
+
             public override void RecordRenderGraph(RenderGraph renderGraph, ContextContainer frameData)
             {
                 var cameraData = frameData.Get<UniversalCameraData>();
                 if (cameraData == null || !cameraData.xr.enabled) return;
 
-                if (s_feature == null) s_feature = DisplayXRFeature.Instance;
-                if (s_feature == null) return;
-                if (!s_feature.GetStereoMatrices(out Matrix4x4 lv, out Matrix4x4 lp,
-                                                 out Matrix4x4 rv, out Matrix4x4 rp))
-                    return;
+                Matrix4x4 lv, lp, rv, rp;
+                if (DisplayXRProviderDriver.IsActive)
+                {
+                    // Provider mode (#166): DisplayXRFeature is inert, so this feature
+                    // would no-op and URP would render with its own head-pose-compensated
+                    // view (#115), diverging from the silhouette (which reads the
+                    // provider's published eye_world view+proj) — the #127 parallax
+                    // mismatch (tiger slides out from under its mask when popped out).
+                    // Read the provider's published matrices (the SAME ones the silhouette
+                    // uses) so URP renders identical to the silhouette.
+                    if (!ProviderStereoMatrices(out lv, out lp, out rv, out rp)) return;
+                }
+                else
+                {
+                    if (s_feature == null) s_feature = DisplayXRFeature.Instance;
+                    if (s_feature == null) return;
+                    if (!s_feature.GetStereoMatrices(out lv, out lp, out rv, out rp)) return;
+                }
 
                 // Startup guard: the first few frames GetStereoMatrices can return
                 // not-yet-ready (identity / NaN) matrices. Applying a NaN projection
