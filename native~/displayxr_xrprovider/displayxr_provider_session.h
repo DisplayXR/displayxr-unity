@@ -160,6 +160,30 @@ DISPLAYXR_EXPORT void dxr_prov_set_3d_zone_rect(int32_t x, int32_t y, int32_t w,
 /// Clear the 3D-zone rect (revert to full-window framing).
 DISPLAYXR_EXPORT void dxr_prov_clear_3d_zone(void);
 
+// ---- Multiple 3D zones (#166 Phase B2) --------------------------------------
+// index 0 = the primary zone (== dxr_prov_set_3d_zone_rect); index>=1 = extra
+// zones, each with its own zone-sized swapchain + bridge + render pass. Total 3D
+// zones <= PS_MAX_ZONES (4, Unity's render-pass cap). Seed BEFORE session start.
+
+/// Set the total number of 3D zones (1 primary + extras). 0/1 → no extra zones.
+DISPLAYXR_EXPORT void dxr_prov_set_zone_count(uint32_t total_3d_zones);
+
+/// Set zone `index`'s rect (client-window px). index 0 → primary; >=1 → extra.
+DISPLAYXR_EXPORT void dxr_prov_set_zone(uint32_t index, uint32_t zone_id,
+                                        int32_t x, int32_t y, int32_t w, int32_t h);
+
+/// Number of active EXTRA zones (total 3D zones = 1 + this).
+DISPLAYXR_EXPORT uint32_t dxr_prov_get_extra_zone_count(void);
+
+/// Extra zone `ei`'s Unity-side SPI bridge (2-slice array) pointer, or NULL.
+void *dxr_prov_get_extra_zone_bridge(uint32_t ei, uint32_t *w, uint32_t *h);
+
+/// Extra zone `ei`'s Unity-side MultiPass per-eye bridge pointer, or NULL.
+void *dxr_prov_get_extra_zone_bridge_eye(uint32_t ei, uint32_t eye, uint32_t *w, uint32_t *h);
+
+/// Copy out extra zone `ei`'s render-ready view for `eye` (after begin_frame).
+void dxr_prov_get_extra_zone_view(uint32_t ei, uint32_t eye, DxrProvView *out_view);
+
 /// Local2D layer (#166 Phase B): lazily create the provider's Local2D overlay
 /// swapchain + cross-device bridge sized to w×h and return the Unity-device handle
 /// of the bridge. C# (DisplayXRLocal2D) Graphics.CopyTexture's its canvas RT into it

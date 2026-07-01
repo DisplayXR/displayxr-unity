@@ -101,6 +101,33 @@ typedef XrResult (XRAPI_PTR *PFN_xrGetD3D12GraphicsRequirementsKHR)(
 #define PS_MAX_SWAPCHAIN_IMAGES 4
 #define PS_MAX_RENDERING_MODES  16
 #define PS_MAX_VIEWS            8   // runtime may report max-mode count; we submit 2
+#define PS_MAX_ZONES           4   // Unity kUnityXRMaxNumRenderPasses (SPI: 1 pass/zone)
+
+// Additional 3D zone beyond the PRIMARY zone (#166 Phase B2). The primary zone
+// (index 0) uses the top-level single-zone fields (swapchain/bridge/views/zone_*),
+// which stay the validated Phase-B path. Each extra zone carries its OWN zone-sized
+// swapchain + cross-device bridge(s) + located views + Unity render pass, so N 3D
+// zones weave into N window-pixel rects (mirrors the runtime cube_zones handle test).
+typedef struct ProviderExtraZone {
+	int      valid;
+	uint32_t zone_id;
+	int32_t  rect_x, rect_y, rect_w, rect_h;
+	uint32_t rec_w, rec_h;                      // recommended view size (== swapchain size)
+
+	XrSwapchain swapchain;
+	int         swapchain_created;
+	uint32_t    sc_width, sc_height, sc_image_count;
+	int64_t     sc_format;
+	XrSwapchainImageD3D12KHR sc_images[PS_MAX_SWAPCHAIN_IMAGES];
+	int         image_acquired;
+	uint32_t    acquired_index;
+
+	ID3D12Resource *bridge_own, *bridge_unity; HANDLE bridge_handle;              // SPI (2-slice)
+	ID3D12Resource *bridge_own_eye[2], *bridge_unity_eye[2]; HANDLE bridge_handle_eye[2]; // MultiPass
+
+	DxrProvView views[2];
+	uint32_t    view_count;
+} ProviderExtraZone;
 
 // ============================================================================
 // Session state
@@ -146,6 +173,12 @@ typedef struct ProviderSession {
 	uint32_t zone_id;
 	int32_t  zone_x, zone_y, zone_w, zone_h;
 	uint32_t zone_rec_w, zone_rec_h; // recommended view size for zone_[wh]
+
+	// Additional 3D zones beyond the primary (#166 Phase B2). extra_zone_count is the
+	// number of ACTIVE entries; total 3D zones = 1 (primary) + extra_zone_count.
+	// Capped so total zones <= PS_MAX_ZONES (Unity render-pass limit).
+	ProviderExtraZone extra_zones[PS_MAX_ZONES - 1];
+	uint32_t          extra_zone_count;
 
 	// Unity's D3D12 device — used ONLY to open the shared bridge (NOT to bind the
 	// session; see own_device below).
@@ -1129,6 +1162,209 @@ static int ps_submit_local2d(XrCompositionLayerLocal2DEXT *out_layer)
 }
 
 // ============================================================================
+// Extra 3D zones (#166 Phase B2) — per-zone swapchain + bridge + locate + copy,
+// mirroring the primary zone path. The primary zone stays on the top-level fields.
+// ============================================================================
+
+static void ps_query_extra_zone_rec(ProviderExtraZone *z)
+{
+	z->rec_w = z->rect_w > 0 ? (uint32_t)z->rect_w : 0;
+	z->rec_h = z->rect_h > 0 ? (uint32_t)z->rect_h : 0;
+	if (s_ps.pfn_get_zone_view_size && z->valid && s_ps.session != XR_NULL_HANDLE) {
+		XrRect2Di rect = {{z->rect_x, z->rect_y}, {z->rect_w, z->rect_h}};
+		XrExtent2Di rec = {0, 0};
+		if (XR_SUCCEEDED(s_ps.pfn_get_zone_view_size(s_ps.session, &rect, &rec)) && rec.width > 0 && rec.height > 0) {
+			z->rec_w = (uint32_t)rec.width; z->rec_h = (uint32_t)rec.height;
+		}
+	}
+}
+
+static int ps_create_extra_zone(ProviderExtraZone *z)
+{
+	if (z->swapchain_created) return 1;
+	if (!z->valid || !s_ps.session_ready) return 0;
+	ps_query_extra_zone_rec(z);
+	uint32_t w = z->rec_w, h = z->rec_h;
+	if (w == 0 || h == 0) return 0;
+
+	uint32_t fmt_count = 0;
+	s_ps.pfn_enumerate_swapchain_formats(s_ps.session, 0, &fmt_count, NULL);
+	if (fmt_count == 0) return 0;
+	int64_t formats[32]; if (fmt_count > 32) fmt_count = 32;
+	s_ps.pfn_enumerate_swapchain_formats(s_ps.session, fmt_count, &fmt_count, formats);
+	int64_t format = formats[0];
+	for (uint32_t i = 0; i < fmt_count; i++) { if (formats[i] == 28) { format = 28; break; } if (formats[i] == 87) format = 87; }
+
+	XrSwapchainCreateInfo ci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+	ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+	ci.format = format; ci.sampleCount = 1; ci.width = w; ci.height = h;
+	ci.faceCount = 1; ci.arraySize = 2; ci.mipCount = 1;
+	if (XR_FAILED(s_ps.pfn_create_swapchain(s_ps.session, &ci, &z->swapchain))) { z->swapchain = XR_NULL_HANDLE; return 0; }
+	z->sc_width = w; z->sc_height = h; z->sc_format = format;
+	uint32_t count = 0;
+	s_ps.pfn_enumerate_swapchain_images(z->swapchain, 0, &count, NULL);
+	if (count > PS_MAX_SWAPCHAIN_IMAGES) count = PS_MAX_SWAPCHAIN_IMAGES;
+	z->sc_image_count = count;
+	for (uint32_t i = 0; i < count; i++) { z->sc_images[i].type = XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR; z->sc_images[i].next = NULL; z->sc_images[i].texture = NULL; }
+	if (XR_FAILED(s_ps.pfn_enumerate_swapchain_images(z->swapchain, count, &count, (XrSwapchainImageBaseHeader *)z->sc_images))) return 0;
+
+	// Bridge(s). ps_alloc_shared_tex reads s_ps.sc_format for the D3D12 format; the
+	// extra zone picks the SAME format as the primary, so this matches.
+	int sp = dxr_prov_get_single_pass();
+	if (sp) {
+		if (!ps_alloc_shared_tex(w, h, 2, &z->bridge_own, &z->bridge_unity, &z->bridge_handle, "extra-zone bridge (SPI)")) return 0;
+	} else {
+		if (!ps_alloc_shared_tex(w, h, 1, &z->bridge_own_eye[0], &z->bridge_unity_eye[0], &z->bridge_handle_eye[0], "extra-zone bridge L")) return 0;
+		if (!ps_alloc_shared_tex(w, h, 1, &z->bridge_own_eye[1], &z->bridge_unity_eye[1], &z->bridge_handle_eye[1], "extra-zone bridge R")) return 0;
+	}
+	z->swapchain_created = 1;
+	ps_log("[DisplayXR-PROV] extra zone id=%u: swapchain %ux%u + bridge(s) (sp=%d)\n", z->zone_id, w, h, sp);
+	return 1;
+}
+
+// Create all pending extra-zone swapchains/bridges (called at session-ready + lazily).
+static void ps_create_extra_zones(void)
+{
+	for (uint32_t i = 0; i < s_ps.extra_zone_count; i++)
+		if (s_ps.extra_zones[i].valid && !s_ps.extra_zones[i].swapchain_created)
+			ps_create_extra_zone(&s_ps.extra_zones[i]);
+}
+
+// Locate each extra zone (zone-scoped, XrDisplayZoneEXT chained) → z->views, and
+// acquire its swapchain image. Mirrors the primary locate in dxr_prov_begin_frame.
+static void ps_locate_extra_zones(XrTime display_time)
+{
+	for (uint32_t i = 0; i < s_ps.extra_zone_count; i++) {
+		ProviderExtraZone *z = &s_ps.extra_zones[i];
+		z->view_count = 0;
+		if (!z->valid) continue;
+		if (!z->swapchain_created) ps_create_extra_zone(z);
+		if (s_ps.local_space == XR_NULL_HANDLE || !s_ps.pfn_locate_views) continue;
+
+		XrViewLocateInfo li = {XR_TYPE_VIEW_LOCATE_INFO};
+		li.viewConfigurationType = XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;
+		li.displayTime = display_time; li.space = s_ps.local_space;
+		XrView views[PS_MAX_VIEWS]; for (int k = 0; k < PS_MAX_VIEWS; k++) views[k] = {XR_TYPE_VIEW};
+		XrViewState vstate = {XR_TYPE_VIEW_STATE};
+		XrDisplayRigEXT display_rig = {XR_TYPE_DISPLAY_RIG_EXT};
+		XrCameraRigEXT  camera_rig  = {XR_TYPE_CAMERA_RIG_EXT};
+		XrDisplayZoneEXT zone = {XR_TYPE_DISPLAY_ZONE_EXT};
+		XrPosef rig_pose = s_ps.display_pose_set ? s_ps.display_pose : XrPosef{{0, 0, 0, 1}, {0, 0, 0}};
+		if (s_ps.has_view_rig) {
+			if (s_ps.camera_centric) {
+				camera_rig.pose = rig_pose;
+				camera_rig.ipdFactor = s_ps.tunables_set ? s_ps.ipd_factor : 1.0f;
+				camera_rig.parallaxFactor = s_ps.tunables_set ? s_ps.parallax_factor : 1.0f;
+				camera_rig.convergenceDiopters = s_ps.inv_convergence_distance;
+				camera_rig.verticalFov = 2.0f * atanf(s_ps.fov_override);
+				camera_rig.metersToVirtual = 1.0f;
+				li.next = &camera_rig;
+			} else {
+				float vdh = s_ps.display_info.is_valid && s_ps.display_info.height_m > 0.0f ? s_ps.display_info.height_m : 0.2f;
+				display_rig.pose = rig_pose;
+				display_rig.virtualDisplayHeight = (s_ps.tunables_set && s_ps.virtual_display_height > 0.0f) ? s_ps.virtual_display_height : vdh;
+				display_rig.ipdFactor = s_ps.tunables_set ? s_ps.ipd_factor : 1.0f;
+				display_rig.parallaxFactor = s_ps.tunables_set ? s_ps.parallax_factor : 1.0f;
+				display_rig.perspectiveFactor = s_ps.tunables_set ? s_ps.perspective_factor : 1.0f;
+				li.next = &display_rig;
+			}
+			zone.zoneId = z->zone_id;
+			zone.rect.offset = {z->rect_x, z->rect_y};
+			zone.rect.extent = {z->rect_w, z->rect_h};
+			zone.next = li.next; li.next = &zone;
+		}
+		uint32_t vcount = 0;
+		if (XR_SUCCEEDED(s_ps.pfn_locate_views(s_ps.session, &li, &vstate, PS_MAX_VIEWS, &vcount, views)) && vcount >= 1) {
+			uint32_t n = vcount < 2 ? vcount : 2;
+			for (uint32_t k = 0; k < n; k++) {
+				z->views[k].position[0] = views[k].pose.position.x;
+				z->views[k].position[1] = views[k].pose.position.y;
+				z->views[k].position[2] = views[k].pose.position.z;
+				z->views[k].orientation[0] = views[k].pose.orientation.x;
+				z->views[k].orientation[1] = views[k].pose.orientation.y;
+				z->views[k].orientation[2] = views[k].pose.orientation.z;
+				z->views[k].orientation[3] = views[k].pose.orientation.w;
+				z->views[k].fov[0] = views[k].fov.angleLeft;
+				z->views[k].fov[1] = views[k].fov.angleRight;
+				z->views[k].fov[2] = views[k].fov.angleUp;
+				z->views[k].fov[3] = views[k].fov.angleDown;
+				z->views[k].valid = s_ps.has_view_rig ? 1 : 0;
+			}
+			if (n == 1) { z->views[1] = z->views[0]; n = 2; }
+			z->view_count = n;
+		}
+		if (z->swapchain_created && !z->image_acquired) {
+			uint32_t idx = 0; XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+			if (XR_SUCCEEDED(s_ps.pfn_acquire_swapchain_image(z->swapchain, &ai, &idx))) {
+				XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO}; wi.timeout = 1000000000;
+				s_ps.pfn_wait_swapchain_image(z->swapchain, &wi);
+				z->image_acquired = 1; z->acquired_index = idx;
+			}
+		}
+	}
+}
+
+// Copy an extra zone's bridge → its acquired swapchain image + release (mirrors the
+// primary copy). Cross-device fence-synced against Unity's render.
+static void ps_copy_extra_zone(ProviderExtraZone *z)
+{
+	if (!z->swapchain_created || !z->image_acquired || z->acquired_index >= z->sc_image_count) return;
+	int sp = dxr_prov_get_single_pass();
+	ID3D12Resource *dst = z->sc_images[z->acquired_index].texture;
+	ID3D12Resource *copy_src = sp ? z->bridge_own : z->bridge_own_eye[0];
+	if (dst && copy_src && s_ps.own_cmd_list) {
+		s_ps.own_cmd_alloc->Reset();
+		s_ps.own_cmd_list->Reset(s_ps.own_cmd_alloc, NULL);
+		for (UINT slice = 0; slice < 2; slice++) {
+			D3D12_TEXTURE_COPY_LOCATION dl = {}; dl.pResource = dst; dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dl.SubresourceIndex = slice;
+			D3D12_TEXTURE_COPY_LOCATION sl = {}; sl.pResource = sp ? z->bridge_own : z->bridge_own_eye[slice]; sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; sl.SubresourceIndex = sp ? slice : 0;
+			s_ps.own_cmd_list->CopyTextureRegion(&dl, 0, 0, 0, &sl, NULL);
+		}
+		s_ps.own_cmd_list->Close();
+		if (s_ps.shared_fence_unity && s_ps.shared_fence_own && s_ps.unity_queue) {
+			s_ps.sync_val++;
+			s_ps.unity_queue->Signal(s_ps.shared_fence_unity, s_ps.sync_val);
+			s_ps.own_queue->Wait(s_ps.shared_fence_own, s_ps.sync_val);
+		}
+		ID3D12CommandList *lists[] = { s_ps.own_cmd_list };
+		s_ps.own_queue->ExecuteCommandLists(1, lists);
+		s_ps.own_fence_value++;
+		s_ps.own_queue->Signal(s_ps.own_fence, s_ps.own_fence_value);
+		if (s_ps.own_fence->GetCompletedValue() < s_ps.own_fence_value) {
+			s_ps.own_fence->SetEventOnCompletion(s_ps.own_fence_value, s_ps.own_fence_event);
+			WaitForSingleObject(s_ps.own_fence_event, INFINITE);
+		}
+	}
+	XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+	s_ps.pfn_release_swapchain_image(z->swapchain, &ri);
+	z->image_acquired = 0;
+}
+
+// Getters for the display-provider (Unity texture wrap + render passes).
+void *dxr_prov_get_extra_zone_bridge(uint32_t ei, uint32_t *w, uint32_t *h)
+{
+	if (ei >= PS_MAX_ZONES - 1) return NULL;
+	ProviderExtraZone *z = &s_ps.extra_zones[ei];
+	if (w) *w = z->sc_width; if (h) *h = z->sc_height;
+	return (void *)z->bridge_unity;
+}
+
+void *dxr_prov_get_extra_zone_bridge_eye(uint32_t ei, uint32_t eye, uint32_t *w, uint32_t *h)
+{
+	if (ei >= PS_MAX_ZONES - 1 || eye > 1) return NULL;
+	ProviderExtraZone *z = &s_ps.extra_zones[ei];
+	if (w) *w = z->sc_width; if (h) *h = z->sc_height;
+	return (void *)z->bridge_unity_eye[eye];
+}
+
+void dxr_prov_get_extra_zone_view(uint32_t ei, uint32_t eye, DxrProvView *out_view)
+{
+	if (!out_view) return;
+	if (ei >= PS_MAX_ZONES - 1 || eye > 1) { memset(out_view, 0, sizeof(*out_view)); return; }
+	*out_view = s_ps.extra_zones[ei].views[eye];
+}
+
+// ============================================================================
 // Lifecycle
 // ============================================================================
 
@@ -1147,6 +1383,11 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	int saved_zone_valid = s_ps.zone_valid;
 	uint32_t saved_zone_id = s_ps.zone_id;
 	int32_t saved_zx = s_ps.zone_x, saved_zy = s_ps.zone_y, saved_zw = s_ps.zone_w, saved_zh = s_ps.zone_h;
+	// Extra-zone rects are seeded before session start too; save + restore just the
+	// rect fields (the swapchain/bridge handles are session-specific → reset to 0).
+	uint32_t saved_extra_count = s_ps.extra_zone_count;
+	ProviderExtraZone saved_extra[PS_MAX_ZONES - 1];
+	for (uint32_t i = 0; i < PS_MAX_ZONES - 1; i++) saved_extra[i] = s_ps.extra_zones[i];
 	memset(&s_ps, 0, sizeof(s_ps));
 	s_ps.single_pass = saved_single_pass;
 	s_ps.single_pass_set = saved_single_pass_set;
@@ -1154,6 +1395,15 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	s_ps.zone_valid = saved_zone_valid;
 	s_ps.zone_id = saved_zone_id;
 	s_ps.zone_x = saved_zx; s_ps.zone_y = saved_zy; s_ps.zone_w = saved_zw; s_ps.zone_h = saved_zh;
+	s_ps.extra_zone_count = saved_extra_count;
+	for (uint32_t i = 0; i < PS_MAX_ZONES - 1; i++) {
+		s_ps.extra_zones[i].valid = saved_extra[i].valid;
+		s_ps.extra_zones[i].zone_id = saved_extra[i].zone_id;
+		s_ps.extra_zones[i].rect_x = saved_extra[i].rect_x;
+		s_ps.extra_zones[i].rect_y = saved_extra[i].rect_y;
+		s_ps.extra_zones[i].rect_w = saved_extra[i].rect_w;
+		s_ps.extra_zones[i].rect_h = saved_extra[i].rect_h;
+	}
 	s_ps.unity_device = (ID3D12Device *)unity_d3d12_device; // for opening the bridge + shared fence
 	s_ps.unity_queue  = (ID3D12CommandQueue *)unity_d3d12_queue; // signals the cross-device sync fence
 	s_ps.overlay_hwnd = overlay_hwnd;
@@ -1377,6 +1627,18 @@ void dxr_prov_session_stop(void)
 	if (s_ps.l2d_bridge_unity)  s_ps.l2d_bridge_unity->Release();
 	if (s_ps.l2d_bridge_handle) CloseHandle(s_ps.l2d_bridge_handle);
 	if (s_ps.l2d_bridge_own)    s_ps.l2d_bridge_own->Release();
+	for (uint32_t i = 0; i < PS_MAX_ZONES - 1; i++) {
+		ProviderExtraZone *z = &s_ps.extra_zones[i];
+		if (z->swapchain && s_ps.pfn_destroy_swapchain) s_ps.pfn_destroy_swapchain(z->swapchain);
+		if (z->bridge_unity) z->bridge_unity->Release();
+		if (z->bridge_handle) CloseHandle(z->bridge_handle);
+		if (z->bridge_own) z->bridge_own->Release();
+		for (int e = 0; e < 2; e++) {
+			if (z->bridge_unity_eye[e]) z->bridge_unity_eye[e]->Release();
+			if (z->bridge_handle_eye[e]) CloseHandle(z->bridge_handle_eye[e]);
+			if (z->bridge_own_eye[e]) z->bridge_own_eye[e]->Release();
+		}
+	}
 	if (s_ps.swapchain && s_ps.pfn_destroy_swapchain) s_ps.pfn_destroy_swapchain(s_ps.swapchain);
 	if (s_ps.session && s_ps.session_ready && s_ps.pfn_end_session) s_ps.pfn_end_session(s_ps.session);
 	if (s_ps.session && s_ps.pfn_destroy_session) s_ps.pfn_destroy_session(s_ps.session);
@@ -1469,6 +1731,41 @@ void dxr_prov_clear_3d_zone(void)
 	ps_log("[DisplayXR-PROV] clear_3d_zone\n");
 }
 
+// Multi-zone (#166 Phase B2). total_3d_zones = number of 3D zones (index 0 =
+// primary, 1.. = extra). Clamped to PS_MAX_ZONES. 0/1 → no extra zones.
+void dxr_prov_set_zone_count(uint32_t total_3d_zones)
+{
+	if (total_3d_zones > PS_MAX_ZONES) total_3d_zones = PS_MAX_ZONES;
+	uint32_t extra = total_3d_zones > 1 ? total_3d_zones - 1 : 0;
+	if (extra != s_ps.extra_zone_count)
+		ps_log("[DisplayXR-PROV] zone count: %u 3D zone(s) (1 primary + %u extra)\n",
+		       total_3d_zones ? total_3d_zones : 1, extra);
+	// Deactivate any extra zones beyond the new count.
+	for (uint32_t i = extra; i < PS_MAX_ZONES - 1; i++) s_ps.extra_zones[i].valid = 0;
+	s_ps.extra_zone_count = extra;
+}
+
+// Set 3D zone `index`'s rect (client-window px). index 0 → primary (== set_3d_zone_rect);
+// index>=1 → extra zone [index-1]. Seed BEFORE session start for born-zone-sized.
+void dxr_prov_set_zone(uint32_t index, uint32_t zone_id, int32_t x, int32_t y, int32_t w, int32_t h)
+{
+	if (index == 0) {
+		dxr_prov_set_3d_zone_rect(x, y, w, h);
+		if (zone_id) s_ps.zone_id = zone_id;
+		return;
+	}
+	uint32_t ei = index - 1;
+	if (ei >= PS_MAX_ZONES - 1) return;
+	ProviderExtraZone *z = &s_ps.extra_zones[ei];
+	if (w <= 0 || h <= 0) { z->valid = 0; return; }
+	z->zone_id = zone_id ? zone_id : (index + 1);
+	z->rect_x = x; z->rect_y = y; z->rect_w = w; z->rect_h = h;
+	z->valid = 1;
+	if (ei + 1 > s_ps.extra_zone_count) s_ps.extra_zone_count = ei + 1;
+}
+
+uint32_t dxr_prov_get_extra_zone_count(void) { return s_ps.extra_zone_count; }
+
 // ============================================================================
 // Swapchain surfacing
 // ============================================================================
@@ -1518,6 +1815,7 @@ void dxr_prov_poll_events(void)
 				if (XR_SUCCEEDED(s_ps.pfn_begin_session(s_ps.session, &bi))) {
 					s_ps.session_ready = 1;
 					if (!s_ps.swapchain_created) ps_create_swapchain();
+					ps_create_extra_zones();
 				}
 				break;
 			}
@@ -1681,6 +1979,9 @@ int dxr_prov_begin_frame(uint32_t *out_image_index, int *out_should_render)
 	// Publish stereo matrices for the transparent overlay's cyclopean hit-test
 	// (LMB drag on the silhouette) — inert on the hook path, which owns this state.
 	ps_publish_stereo_matrices();
+
+	// Locate the extra 3D zones (each zone-scoped) + acquire their swapchain images.
+	ps_locate_extra_zones(fs.predictedDisplayTime);
 
 	// --- Acquire + wait the swapchain image Unity renders into next ---
 	// Guard against a double-acquire: if a previous frame acquired an image but
@@ -1928,6 +2229,43 @@ int dxr_prov_submit_frame(uint32_t image_index)
 	layer.viewCount = n;
 	layer.views = pv;
 
+	// Extra 3D zones (#166 Phase B2): copy each bridge → its swapchain + build a
+	// zone-chained projection layer. Structs persist until xrEndFrame below.
+	XrCompositionLayerProjectionView extra_pv[PS_MAX_ZONES - 1][2] = {};
+	XrCompositionLayerProjection     extra_layer[PS_MAX_ZONES - 1] = {};
+	XrDisplayZoneEXT                 extra_zone_struct[PS_MAX_ZONES - 1] = {};
+	int extra_has[PS_MAX_ZONES - 1] = {};
+	for (uint32_t i = 0; i < s_ps.extra_zone_count; i++) {
+		ProviderExtraZone *z = &s_ps.extra_zones[i];
+		if (!z->valid || z->view_count < 2 || !z->swapchain_created) continue;
+		ps_copy_extra_zone(z);
+		for (uint32_t eye = 0; eye < 2; eye++) {
+			extra_pv[i][eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
+			extra_pv[i][eye].pose.position = XrVector3f{ z->views[eye].position[0], z->views[eye].position[1], z->views[eye].position[2] };
+			extra_pv[i][eye].pose.orientation = XrQuaternionf{ z->views[eye].orientation[0], z->views[eye].orientation[1], z->views[eye].orientation[2], z->views[eye].orientation[3] };
+			extra_pv[i][eye].fov.angleLeft  = z->views[eye].fov[0];
+			extra_pv[i][eye].fov.angleRight = z->views[eye].fov[1];
+			extra_pv[i][eye].fov.angleUp    = z->views[eye].fov[2];
+			extra_pv[i][eye].fov.angleDown  = z->views[eye].fov[3];
+			extra_pv[i][eye].subImage.swapchain = z->swapchain;
+			extra_pv[i][eye].subImage.imageRect.offset = {0, 0};
+			extra_pv[i][eye].subImage.imageRect.extent = {(int32_t)z->sc_width, (int32_t)z->sc_height};
+			extra_pv[i][eye].subImage.imageArrayIndex = eye;
+		}
+		extra_zone_struct[i].type = XR_TYPE_DISPLAY_ZONE_EXT;
+		extra_zone_struct[i].zoneId = z->zone_id;
+		extra_zone_struct[i].rect.offset = {z->rect_x, z->rect_y};
+		extra_zone_struct[i].rect.extent = {z->rect_w, z->rect_h};
+		extra_layer[i].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION;
+		extra_layer[i].next = &extra_zone_struct[i];
+		extra_layer[i].layerFlags = (s_ps.transparent_requested && s_ps.alpha_blend_supported)
+		        ? XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT : 0;
+		extra_layer[i].space = s_ps.local_space;
+		extra_layer[i].viewCount = 2;
+		extra_layer[i].views = extra_pv[i];
+		extra_has[i] = 1;
+	}
+
 	// Local2D band(s): post-weave 2D content at a client-window pixel rect,
 	// composited over the woven 3D (the "glass over 3D" 2D zone). Inactive when no
 	// rect/bridge is registered.
@@ -1938,11 +2276,14 @@ int dxr_prov_submit_frame(uint32_t image_index)
 	XrCompositionLayerWindowSpaceEXT wsui_layer = {};
 	int has_wsui = ps_submit_wsui(&wsui_layer);
 
-	// Order: 3D projection under, Local2D bands over the 3D, HUD on top (canonical
-	// zones rule — 1 zone projection + 1 Local2D per 2D band, both ALPHA_BLEND).
-	const XrCompositionLayerBaseHeader *layers[3];
+	// Order: 3D projections (primary + extra zones) under, Local2D bands over the 3D,
+	// HUD on top (canonical zones rule — 1 zone projection per 3D zone + 1 Local2D per
+	// 2D band, all ALPHA_BLEND).
+	const XrCompositionLayerBaseHeader *layers[PS_MAX_ZONES + 2];
 	uint32_t lc = 0;
 	layers[lc++] = (const XrCompositionLayerBaseHeader *)&layer;
+	for (uint32_t i = 0; i < s_ps.extra_zone_count; i++)
+		if (extra_has[i]) layers[lc++] = (const XrCompositionLayerBaseHeader *)&extra_layer[i];
 	if (has_l2d)  layers[lc++] = (const XrCompositionLayerBaseHeader *)&l2d_layer;
 	if (has_wsui) layers[lc++] = (const XrCompositionLayerBaseHeader *)&wsui_layer;
 
