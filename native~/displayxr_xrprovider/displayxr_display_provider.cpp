@@ -80,6 +80,12 @@ UnityXRRenderTextureId  s_tex_ids[8] = {0};
 uint32_t                s_tex_count = 0;
 bool                    s_textures_created = false;
 
+// Extra 3D zones (#166 Phase B2): each extra zone gets its own Unity texture(s)
+// (SPI: [i][0] = 2-slice array; MultiPass: [i][0/1] = per-eye) + render pass.
+#define PROV_MAX_EXTRA_ZONES 3   // PS_MAX_ZONES - 1
+UnityXRRenderTextureId  s_extra_tex_ids[PROV_MAX_EXTRA_ZONES][2] = {};
+bool                    s_extra_tex_created[PROV_MAX_EXTRA_ZONES] = {};
+
 uint32_t                s_current_image_index = 0;  // acquired this frame
 bool                    s_frame_in_flight = false;
 
@@ -151,9 +157,57 @@ bool get_unity_d3d12(ID3D12Device **out_device, ID3D12CommandQueue **out_queue)
 // CreateTexture: wrap each runtime swapchain image as a Unity render texture.
 // ============================================================================
 
+// Wrap the extra 3D zones' bridges as Unity textures (once each). #166 Phase B2.
+static void create_extra_zone_textures()
+{
+	uint32_t ez = dxr_prov_get_extra_zone_count();
+	bool sp = dxr_prov_get_single_pass();
+	for (uint32_t i = 0; i < ez && i < PROV_MAX_EXTRA_ZONES; i++) {
+		if (s_extra_tex_created[i]) continue;
+		if (sp) {
+			uint32_t w = 0, h = 0;
+			void *b = dxr_prov_get_extra_zone_bridge(i, &w, &h);
+			if (!b || w == 0) continue;
+			UnityXRRenderTextureDesc desc; memset(&desc, 0, sizeof(desc));
+			desc.colorFormat = kUnityXRRenderTextureFormatRGBA32;
+			desc.color.nativePtr = b;
+			desc.depthFormat = kUnityXRDepthTextureFormat24bitOrGreater;
+			desc.depth.nativePtr = (void *)(uintptr_t)kUnityXRRenderTextureIdDontCare;
+			desc.width = w; desc.height = h; desc.textureArrayLength = 2;
+			desc.flags = kUnityXRRenderTextureFlagsUVDirectionTopToBottom;
+			UnityXRRenderTextureId id = 0;
+			if (s_display->CreateTexture(s_handle, &desc, &id) == kUnitySubsystemErrorCodeSuccess) {
+				s_extra_tex_ids[i][0] = id; s_extra_tex_created[i] = true;
+				prov_log("[DisplayXR-PROV] extra zone: CreateTexture (SPI 2-slice) OK\n");
+			}
+		} else {
+			uint32_t w = 0, h = 0;
+			void *bl = dxr_prov_get_extra_zone_bridge_eye(i, 0, &w, &h);
+			void *br = dxr_prov_get_extra_zone_bridge_eye(i, 1, &w, &h);
+			if (!bl || !br || w == 0) continue;
+			bool ok = true;
+			for (uint32_t eye = 0; eye < 2; eye++) {
+				UnityXRRenderTextureDesc desc; memset(&desc, 0, sizeof(desc));
+				desc.colorFormat = kUnityXRRenderTextureFormatRGBA32;
+				desc.color.nativePtr = (eye == 0) ? bl : br;
+				desc.depthFormat = kUnityXRDepthTextureFormat24bitOrGreater;
+				desc.depth.nativePtr = (void *)(uintptr_t)kUnityXRRenderTextureIdDontCare;
+				desc.width = w; desc.height = h; desc.textureArrayLength = 1;
+				desc.flags = kUnityXRRenderTextureFlagsUVDirectionTopToBottom;
+				UnityXRRenderTextureId id = 0;
+				if (s_display->CreateTexture(s_handle, &desc, &id) != kUnitySubsystemErrorCodeSuccess) { ok = false; break; }
+				s_extra_tex_ids[i][eye] = id;
+			}
+			if (ok) { s_extra_tex_created[i] = true; prov_log("[DisplayXR-PROV] extra zone: CreateTexture (MP 2-tex) OK\n"); }
+		}
+	}
+}
+
 void create_textures_if_ready()
 {
-	if (s_textures_created || !s_display || !s_handle) return;
+	if (!s_display || !s_handle) return;
+	// Extra zones can come up alongside / after the primary; keep trying until wrapped.
+	if (s_textures_created) { create_extra_zone_textures(); return; }
 
 	if (dxr_prov_get_single_pass()) {
 		// SPI: ONE Unity texture wrapping the shared 2-slice-array BRIDGE. Unity
@@ -376,6 +430,71 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 
 		next->renderPassesCount = 2;
 	}
+
+	// Extra 3D zones (#166 Phase B2): append one render-pass group per zone (SPI: 1
+	// pass × 2 params; MultiPass: 2 passes × 1), each rendering the full scene from
+	// the zone's Kooima framing into the zone's own zone-sized texture (viewport full,
+	// no sub-rect). Capped at Unity's render-pass limit.
+	{
+		uint32_t ez = dxr_prov_get_extra_zone_count();
+		bool sp = dxr_prov_get_single_pass();
+		uint32_t pi = next->renderPassesCount;
+		for (uint32_t i = 0; i < ez && i < PROV_MAX_EXTRA_ZONES; i++) {
+			if (!s_extra_tex_created[i]) continue;
+			if (sp) {
+				if (pi >= (uint32_t)kUnityXRMaxNumRenderPasses) { prov_log("[DisplayXR-PROV] zone pass cap hit (SPI)\n"); break; }
+				UnityXRNextFrameDesc::UnityXRRenderPass &pass = next->renderPasses[pi];
+				pass.textureId = s_extra_tex_ids[i][0];
+				pass.cullingPassIndex = pi;
+				pass.renderParamsCount = 2;
+				for (uint32_t eye = 0; eye < 2; eye++) {
+					DxrProvView v; dxr_prov_get_extra_zone_view(i, eye, &v);
+					UnityXRNextFrameDesc::UnityXRRenderPass::UnityXRRenderParams &rp = pass.renderParams[eye];
+					rp.deviceAnchorToEyePose.position = oxr_to_unity_pos(v.position);
+					rp.deviceAnchorToEyePose.rotation = oxr_to_unity_quat(v.orientation);
+					rp.projection.type = kUnityXRProjectionTypeHalfAngles;
+					rp.projection.data.halfAngles.left   = tanf(v.fov[0]);
+					rp.projection.data.halfAngles.right  = tanf(v.fov[1]);
+					rp.projection.data.halfAngles.top    = tanf(v.fov[2]);
+					rp.projection.data.halfAngles.bottom = tanf(v.fov[3]);
+					rp.occlusionMeshId = 0;
+					rp.textureArraySlice = (int32_t)eye;
+					rp.viewportRect = UnityXRRectf{0.0f, 0.0f, 1.0f, 1.0f};
+				}
+				UnityXRNextFrameDesc::UnityXRCullingPass &cull = next->cullingPasses[pi];
+				cull.deviceAnchorToCullingPose = pass.renderParams[0].deviceAnchorToEyePose;
+				cull.projection = pass.renderParams[0].projection;
+				cull.separation = 0.0f;
+				pi++;
+			} else {
+				if (pi + 1 >= (uint32_t)kUnityXRMaxNumRenderPasses) { prov_log("[DisplayXR-PROV] zone pass cap hit (MP)\n"); break; }
+				for (uint32_t eye = 0; eye < 2; eye++) {
+					DxrProvView v; dxr_prov_get_extra_zone_view(i, eye, &v);
+					UnityXRNextFrameDesc::UnityXRRenderPass &pass = next->renderPasses[pi];
+					pass.textureId = s_extra_tex_ids[i][eye];
+					pass.cullingPassIndex = pi;
+					pass.renderParamsCount = 1;
+					UnityXRNextFrameDesc::UnityXRRenderPass::UnityXRRenderParams &rp = pass.renderParams[0];
+					rp.deviceAnchorToEyePose.position = oxr_to_unity_pos(v.position);
+					rp.deviceAnchorToEyePose.rotation = oxr_to_unity_quat(v.orientation);
+					rp.projection.type = kUnityXRProjectionTypeHalfAngles;
+					rp.projection.data.halfAngles.left   = tanf(v.fov[0]);
+					rp.projection.data.halfAngles.right  = tanf(v.fov[1]);
+					rp.projection.data.halfAngles.top    = tanf(v.fov[2]);
+					rp.projection.data.halfAngles.bottom = tanf(v.fov[3]);
+					rp.occlusionMeshId = 0;
+					rp.textureArraySlice = 0;
+					rp.viewportRect = UnityXRRectf{0.0f, 0.0f, 1.0f, 1.0f};
+					UnityXRNextFrameDesc::UnityXRCullingPass &cull = next->cullingPasses[pi];
+					cull.deviceAnchorToCullingPose = rp.deviceAnchorToEyePose;
+					cull.projection = rp.projection;
+					cull.separation = 0.0f;
+					pi++;
+				}
+			}
+		}
+		next->renderPassesCount = pi;
+	}
 	return kUnitySubsystemErrorCodeSuccess;
 }
 
@@ -405,6 +524,19 @@ GfxSubmitCurrentFrame(UnitySubsystemHandle handle, void *userData)
 				void *be = dxr_prov_get_bridge_unity_texture_eye(eye, &bw, &bh);
 				if (be)
 					v8->RequestResourceState((ID3D12Resource *)be, D3D12_RESOURCE_STATE_COMMON);
+			}
+		}
+		// Extra 3D zones: transition their bridges too (#166 Phase B2).
+		uint32_t ez = dxr_prov_get_extra_zone_count();
+		for (uint32_t i = 0; i < ez && i < PROV_MAX_EXTRA_ZONES; i++) {
+			if (dxr_prov_get_single_pass()) {
+				void *b = dxr_prov_get_extra_zone_bridge(i, &bw, &bh);
+				if (b) v8->RequestResourceState((ID3D12Resource *)b, D3D12_RESOURCE_STATE_COMMON);
+			} else {
+				for (uint32_t eye = 0; eye < 2; eye++) {
+					void *b = dxr_prov_get_extra_zone_bridge_eye(i, eye, &bw, &bh);
+					if (b) v8->RequestResourceState((ID3D12Resource *)b, D3D12_RESOURCE_STATE_COMMON);
+				}
 			}
 		}
 	}

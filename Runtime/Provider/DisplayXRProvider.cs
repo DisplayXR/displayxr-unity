@@ -78,6 +78,22 @@ namespace DisplayXR
         /// <summary>Clear the 3D-zone rect (revert to full-window framing).</summary>
         public static void ClearZone() => DisplayXRProviderNative.dxr_prov_clear_3d_zone();
 
+        /// <summary>
+        /// Set the total number of 3D zones (#166 Phase B2): 1 primary + extras (max 4,
+        /// Unity's render-pass cap). Call before setting the zone rects. Seed early
+        /// (SubsystemRegistration) so the swapchains are born zone-sized.
+        /// </summary>
+        public static void SetZoneCount(int totalZones) =>
+            DisplayXRProviderNative.dxr_prov_set_zone_count((uint)System.Math.Max(0, totalZones));
+
+        /// <summary>
+        /// Set 3D zone <paramref name="index"/>'s rect (client-window pixels). index 0 is
+        /// the primary zone (equivalent to <see cref="SetZoneRect"/>); index &gt;= 1 are the
+        /// extra zones. Each 3D zone weaves into its own window-pixel rect.
+        /// </summary>
+        public static void SetZone(int index, int zoneId, int x, int y, int width, int height) =>
+            DisplayXRProviderNative.dxr_prov_set_zone((uint)index, (uint)zoneId, x, y, width, height);
+
         /// <summary>Re-read the enumerated modes from native. Called at session start + on mode change.</summary>
         public static void RefreshModes()
         {

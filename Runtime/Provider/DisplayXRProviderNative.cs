@@ -82,6 +82,17 @@ namespace DisplayXR
         public static extern void dxr_prov_clear_3d_zone();
 
         /// <summary>
+        /// Set the total number of 3D zones (#166 Phase B2): 1 primary + extras. 0/1 →
+        /// no extra zones. Clamped to the provider's max (4, Unity's render-pass cap).
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void dxr_prov_set_zone_count(uint totalZones);
+
+        /// <summary>Set 3D zone `index`'s rect (client-window px). index 0 = primary.</summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void dxr_prov_set_zone(uint index, uint zoneId, int x, int y, int w, int h);
+
+        /// <summary>
         /// Lazily create the provider's Local2D overlay swapchain + cross-device bridge
         /// (#166 Phase B) sized to w×h and return the Unity-device handle. Mirrors
         /// dxr_prov_get_wsui_bridge. C# CopyTexture's the canvas RT into it each frame.
