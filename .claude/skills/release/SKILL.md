@@ -147,8 +147,65 @@ Run: `gh run watch RUN_ID --interval 15` (timeout 600000ms)
 
 ### Step 3.4: Check result
 Run: `gh run view RUN_ID --json status,conclusion`
-- If success: continue to Phase 4
+- If success: continue to Phase 3.5
 - If failure: Go to PHASE 5 (Rollback)
+
+---
+
+## PHASE 3.5: CODE-SIGN THE WINDOWS NATIVE PLUGIN (capability-gated)
+
+`displayxr_unity.dll` is the native plugin that loads into the Unity
+player, so Smart App Control blocks it when unsigned. CI builds it on a
+GitHub-hosted runner (unsigned; the code-signing key is held on a build
+machine and isn't available to cloud CI, and no secret lives in this
+public repo). So a signed release is produced by signing the shipped DLL
+on a signing-capable machine and re-publishing.
+
+Signing does **not** require rebuilding — we sign the CI-built DLL in
+place inside both distribution channels (the `.tgz` asset and the `upm`
+orphan branch). No-ops cleanly without signing capability.
+
+### Step 3.5.1: Capability check
+```bash
+if [ -z "$SIGN_CMD" ] || ! uname -s | grep -qiE 'mingw|msys|cygwin|windows'; then
+  echo "⚠  SIGNING SKIPPED — no signing capability; release DLL stays UNSIGNED."
+  echo "   Re-run /release on a signing-capable build machine (SIGN_CMD set)."
+  SIGNED=no   # continue — do not fail
+else
+  SIGNED=yes
+fi
+```
+
+### Step 3.5.2: Sign the DLL in the `.tgz` asset, repack, re-upload (if SIGNED=yes)
+```bash
+TGZ="com.displayxr.unity-[VERSION_NUMBER].tgz"
+gh release download [VERSION] --repo DisplayXR/displayxr-unity --pattern "$TGZ" --dir /tmp/usign
+mkdir -p /tmp/usign/x && tar -xzf "/tmp/usign/$TGZ" -C /tmp/usign/x
+DLL=$(find /tmp/usign/x -ipath '*Windows/x64/displayxr_unity.dll')
+powershell -NoProfile -ExecutionPolicy Bypass -File Scripts\\sign-release.ps1 -Path "$(dirname "$DLL")" -SignCmd "$SIGN_CMD"
+# repack with the same internal layout (npm packages root at 'package/')
+( cd /tmp/usign/x && tar -czf "/tmp/usign/$TGZ" package )
+gh release upload [VERSION] "/tmp/usign/$TGZ" --clobber --repo DisplayXR/displayxr-unity
+```
+
+### Step 3.5.3: Sign the DLL on the `upm` branch too
+Users who install by git URL get the DLL from the `upm` orphan branch,
+not the `.tgz` — sign that copy as well.
+```bash
+git fetch origin upm && git checkout upm
+powershell -NoProfile -ExecutionPolicy Bypass -File Scripts\\sign-release.ps1 \
+  -Path "Runtime/Plugins/Windows/x64" -SignCmd "$SIGN_CMD"
+git commit -am "Sign displayxr_unity.dll for [VERSION]"
+git push origin upm
+# move the upm/[VERSION] tag onto the signed commit so the pinned install is signed too
+git tag -f "upm/[VERSION]" && git push -f origin "upm/[VERSION]"
+git checkout main
+```
+
+Note: the macOS `displayxr_unity.bundle` is signed with an Apple
+Developer ID cert + notarization (a separate track from the Windows EV
+cert) — out of scope here; flag it as macOS-unsigned in the report.
+Carry `SIGNED` into the final report.
 
 ---
 
