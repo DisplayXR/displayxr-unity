@@ -2189,9 +2189,20 @@ displayxr_set_viewport_size_native(uint32_t width, uint32_t height,
 	state->viewport_y = screen_y;
 }
 
+// Custom display-provider session (#166) lives in the same DLL; route hook-path
+// hardware requests to it when it's the active session (Unity's OpenXR hook session
+// doesn't exist in provider mode, so the hook path is inert there).
+extern "C" int dxr_prov_session_is_running(void);
+extern "C" int dxr_prov_request_display_mode(int mode3d);
+
 int
 displayxr_request_display_mode(int mode_3d)
 {
+	// Provider mode: forward to the provider's own xrRequestDisplayModeEXT so the
+	// V-key 2D/3D hardware switch reaches the panel in provider apps too (#166).
+	if (dxr_prov_session_is_running())
+		return dxr_prov_request_display_mode(mode_3d);
+
 	DisplayXRState *state = displayxr_get_state();
 	if (!state->has_display_mode_ext || state->pfn_request_display_mode == nullptr || s_session == XR_NULL_HANDLE) {
 		return 0; // Not supported

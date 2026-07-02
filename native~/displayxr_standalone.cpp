@@ -18,6 +18,10 @@
 class GraphicsBackend;
 GraphicsBackend *displayxr_get_hooked_backend();
 XrSession displayxr_get_hooked_session();
+// Custom display-provider session (#166), same DLL — route hardware mode requests
+// to it in provider mode (no standalone/hooked session exists there).
+extern "C" int dxr_prov_session_is_running(void);
+extern "C" int dxr_prov_request_rendering_mode(uint32_t mode_index);
 // Accessors on the GraphicsBackend opaque class — defined as a thin wrapper
 // in displayxr_hooks.cpp so we don't need the full class definition here.
 uint32_t displayxr_hooked_get_rendering_mode_count(GraphicsBackend *b);
@@ -2485,6 +2489,14 @@ displayxr_standalone_get_rendering_mode_name(uint32_t array_slot, char *buffer, 
 int
 displayxr_standalone_request_rendering_mode(uint32_t mode_index)
 {
+	// Provider mode (#166): neither the standalone nor the hooked session exists —
+	// only the custom display provider's own session. Route the mode switch there so
+	// the V-key 2D/3D toggle actually reaches the hardware in provider apps (the
+	// content already ramps via the per-frame tunable push; without this the panel
+	// stays in its current mode).
+	if (dxr_prov_session_is_running())
+		return dxr_prov_request_rendering_mode(mode_index);
+
 	// Standalone session running → use its function pointer + session.
 	if (s_sa.pfn_request_rendering_mode && s_sa.session != XR_NULL_HANDLE) {
 		XrResult result = s_sa.pfn_request_rendering_mode(s_sa.session, mode_index);
