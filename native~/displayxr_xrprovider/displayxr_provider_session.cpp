@@ -257,9 +257,14 @@ typedef struct ProviderSession {
 	XrDisplayRenderingModeInfoEXT modes[PS_MAX_RENDERING_MODES];
 	uint32_t mode_count;
 
-	// SPI swapchain (arraySize=2)
+	// SPI swapchain. arraySize is ALWAYS 2 (Unity's stereo topology is fixed at
+	// subsystem start — rendering into fewer slices would overlap the two eyes into
+	// one → ghosting). Hardware 2D is handled by SUBMITTING only sc_view_count views
+	// (the first slice), not by shrinking the array (#172 P4). sc_view_count = the
+	// active mode's view count (1 = 2D single tile, 2 = 3D stereo).
 	XrSwapchain swapchain;
 	uint32_t    sc_width, sc_height, sc_array, sc_image_count;
+	uint32_t    sc_view_count;   // views to SUBMIT (1=2D, 2=3D); arraySize stays 2
 	int64_t     sc_format;
 	XrSwapchainImageD3D12KHR sc_images[PS_MAX_SWAPCHAIN_IMAGES];
 	int         swapchain_created;
@@ -539,14 +544,26 @@ static const XrDisplayRenderingModeInfoEXT *ps_find_mode(uint32_t mode_index)
 	return NULL;
 }
 
-// The active 3D (hardwareDisplay3D, viewCount==2) mode's per-view scaleXY, used
-// to size the per-frame render rect = window × scaleXY. Falls back to the
-// XR_EXT_display_info recommended scale, then to 0.5×1.0 (half-width SBS).
+// The ACTIVE mode's view count: 1 for hardware 2D (one full-res tile submitted),
+// 2 for stereo 3D. Caps at 2 (#166 scope). Defaults to 2 before a mode resolves so
+// startup comes up in 3D. (#172 P4)
+static uint32_t ps_active_view_count(void)
+{
+	const XrDisplayRenderingModeInfoEXT *m = ps_find_mode(s_ps.active_mode_index);
+	if (m && m->viewCount >= 1) return m->viewCount >= 2 ? 2 : 1;
+	return 2;
+}
+
+// The ACTIVE mode's per-view scaleXY, used to size the per-frame render rect =
+// window × scaleXY. Honors the active mode directly: hardware 2D → 1.0×1.0 (one
+// full-res tile), stereo 3D → e.g. 0.5×0.5. Falls back to the first stereo mode's
+// scale, then display-info, then 0.5×1.0, only when NO active mode has resolved
+// (startup). Previously this forced the 3D scale even in 2D, so 2D rendered at
+// half-res instead of full-res (#172 P4).
 static void ps_active_view_scale(float *sx, float *sy)
 {
 	const XrDisplayRenderingModeInfoEXT *m = ps_find_mode(s_ps.active_mode_index);
-	if ((!m || !m->hardwareDisplay3D) ) {
-		// No active 3D mode resolved — prefer the first 3D stereo mode.
+	if (!m) {
 		for (uint32_t i = 0; i < s_ps.mode_count; i++)
 			if (s_ps.modes[i].hardwareDisplay3D && s_ps.modes[i].viewCount == 2)
 				{ m = &s_ps.modes[i]; break; }
@@ -621,8 +638,10 @@ static void ps_query_zone_rec_size(void)
 	}
 }
 
-// Whether the 3D zone should drive this frame (rect set + caps OK).
-static int ps_zone_active(void) { return s_ps.zone_valid && ps_zones_ready(); }
+// Whether the 3D zone should drive this frame (rect set + caps OK + a stereo 3D mode
+// is active). Hardware 2D (1 view) is a single full-window flat tile — zones are a
+// 3D concept, so they're inert in 2D (#172 P4).
+static int ps_zone_active(void) { return s_ps.zone_valid && ps_zones_ready() && ps_active_view_count() >= 2; }
 
 // ============================================================================
 // SPI swapchain (arraySize=2). Images live on Unity's D3D12 device (zero-copy).
@@ -695,7 +714,10 @@ static int ps_create_swapchain(void)
 	XrResult r = s_ps.pfn_create_swapchain(s_ps.session, &ci, &s_ps.swapchain);
 	if (XR_FAILED(r)) { ps_log("[DisplayXR-PROV] xrCreateSwapchain failed: %d\n", r); return 0; }
 
-	s_ps.sc_width = w; s_ps.sc_height = h; s_ps.sc_array = 2; s_ps.sc_format = format;
+	// arraySize is always 2 (Unity renders both eyes into separate slices); the
+	// active view count only governs how many views we SUBMIT (#172 P4).
+	s_ps.sc_width = w; s_ps.sc_height = h; s_ps.sc_array = 2;
+	s_ps.sc_view_count = ps_active_view_count(); s_ps.sc_format = format;
 
 	uint32_t count = 0;
 	s_ps.pfn_enumerate_swapchain_images(s_ps.swapchain, 0, &count, NULL);
@@ -711,8 +733,8 @@ static int ps_create_swapchain(void)
 	if (XR_FAILED(r)) { ps_log("[DisplayXR-PROV] enumerate swapchain images failed: %d\n", r); return 0; }
 
 	s_ps.swapchain_created = 1;
-	ps_log("[DisplayXR-PROV] SPI swapchain: %ux%u arraySize=2, %u images, fmt=%lld\n",
-	       w, h, count, format);
+	ps_log("[DisplayXR-PROV] swapchain: %ux%u arraySize=2 submit=%u-view (%s), %u images, fmt=%lld\n",
+	       w, h, s_ps.sc_view_count, s_ps.sc_view_count >= 2 ? "3D" : "2D", count, format);
 
 	ps_create_bridge(); // pair the cross-device bridge with the swapchain
 	return 1;
@@ -950,7 +972,16 @@ static int ps_reconcile_primary(void)
 	uint32_t tw = 0, th = 0;
 	ps_primary_target_size(&tw, &th);
 	if (tw == 0 || th == 0) return 0;
+	uint32_t tvc = ps_active_view_count();
 
+	// A view-count change (2D↔3D mode switch) is a discrete user action → realloc
+	// immediately (no debounce) so the submit count + tile size flip together (#172 P4).
+	if (tvc != s_ps.sc_view_count) {
+		s_ps.realloc_pending_w = 0; s_ps.realloc_pending_h = 0; s_ps.realloc_stable = 0;
+		ps_log("[DisplayXR-PROV] realloc: submit views %u -> %u (mode switch, %ux%u -> %ux%u)\n",
+		       s_ps.sc_view_count, tvc, s_ps.sc_width, s_ps.sc_height, tw, th);
+		return ps_recreate_primary_swapchain();
+	}
 	if (tw == s_ps.sc_width && th == s_ps.sc_height) {
 		s_ps.realloc_pending_w = 0; s_ps.realloc_pending_h = 0; s_ps.realloc_stable = 0;
 		return 0; // already the right size
@@ -2063,6 +2094,30 @@ void dxr_prov_poll_events(void)
 			s_ps.ev_hw3d = hc->hardwareDisplay3D ? 1 : 0;
 			s_ps.ev_hw_changed = 1;
 			ps_log("[DisplayXR-PROV] event: hardware 3D -> %d\n", s_ps.ev_hw3d);
+			// Couple the RENDERING mode (view count / tile config) to the hardware
+			// display state (#172 P4): a light-field 2D display wants ONE view submitted;
+			// 3D wants two. Apps that only toggle the hardware display mode (2d-ui's V key
+			// → xrRequestDisplayMode) otherwise keep the 2-view submit → the two eyes weave
+			// as if 3D on the flat screen (ghosting). If the active rendering mode's
+			// hardwareDisplay3D no longer matches, request the matching enumerated mode;
+			// the runtime sends RENDERING_MODE_CHANGED and the provider flips submit count
+			// (and reallocs the tile to full-res 2D).
+			if (s_ps.pfn_request_rendering_mode) {
+				const XrDisplayRenderingModeInfoEXT *cur = ps_find_mode(s_ps.active_mode_index);
+				int cur_is3d = cur ? (cur->hardwareDisplay3D ? 1 : 0) : 1;
+				if (cur_is3d != s_ps.ev_hw3d) {
+					for (uint32_t i = 0; i < s_ps.mode_count; i++) {
+						if ((s_ps.modes[i].hardwareDisplay3D ? 1 : 0) == s_ps.ev_hw3d &&
+						    s_ps.modes[i].isRequestable) {
+							s_ps.pfn_request_rendering_mode(s_ps.session, s_ps.modes[i].modeIndex);
+							ps_log("[DisplayXR-PROV] hw display %s -> couple rendering mode idx %u (%u-view)\n",
+							       s_ps.ev_hw3d ? "3D" : "2D", s_ps.modes[i].modeIndex,
+							       s_ps.modes[i].viewCount);
+							break;
+						}
+					}
+				}
+			}
 		} else if (ev.type == XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_EXT) {
 			XrEventDataEyeTrackingStateChangedEXT *tc = (XrEventDataEyeTrackingStateChangedEXT *)&ev;
 			s_ps.ev_track_is_tracking = tc->isTracking ? 1 : 0;
@@ -2429,10 +2484,13 @@ int dxr_prov_submit_frame(uint32_t image_index)
 	}
 	s_ps.frame_begun = 0;
 
-	// Unity rendered the eyes into the shared BRIDGE on its device. Copy the bridge
-	// into the acquired runtime swapchain image's two array slices on our own device,
-	// fence-synced against Unity's render (shared fence below). SPI: one 2-slice array
-	// bridge → both slices. MultiPass: two single-slice eye bridges → slices 0/1.
+	// Unity rendered both eyes into the shared BRIDGE on its device (topology is fixed
+	// at 2 views). Copy the SUBMITTED slices into the acquired runtime swapchain image
+	// on our own device, fence-synced against Unity's render (shared fence below). 3D:
+	// both slices. 2D (#172 P4): only slice 0 — submitting a single view avoids the two
+	// eyes weaving as a ghost on the flat screen. SPI: 2-slice array bridge; MultiPass:
+	// per-eye bridges.
+	uint32_t submit_n = s_ps.sc_view_count >= 2 ? 2 : 1;
 	int sp = dxr_prov_get_single_pass();
 	ID3D12Resource *copy_src = sp ? s_ps.bridge_own : s_ps.bridge_own_eye[0];
 	if (copy_src && image_index < s_ps.sc_image_count &&
@@ -2440,7 +2498,7 @@ int dxr_prov_submit_frame(uint32_t image_index)
 		ID3D12Resource *dst = s_ps.sc_images[image_index].texture;
 		s_ps.own_cmd_alloc->Reset();
 		s_ps.own_cmd_list->Reset(s_ps.own_cmd_alloc, NULL);
-		for (UINT slice = 0; slice < 2; slice++) {
+		for (UINT slice = 0; slice < submit_n; slice++) {
 			D3D12_TEXTURE_COPY_LOCATION dl = {};
 			dl.pResource = dst;
 			dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
@@ -2481,8 +2539,12 @@ int dxr_prov_submit_frame(uint32_t image_index)
 		s_ps.image_acquired = 0;
 	}
 
-	// Build a 2-view projection layer; eyes are array layers 0/1 (SPI).
-	uint32_t n = s_ps.view_count >= 2 ? 2 : s_ps.view_count;
+	// Build the projection layer. Submit sc_view_count views (#172 P4): 2 in stereo 3D
+	// (array layers 0/1), 1 in hardware 2D (layer 0 only = a single full-res tile). The
+	// runtime composites only the submitted views, so 2D shows one clean view (no weave
+	// ghost) even though Unity rendered both eyes into the 2-slice bridge.
+	uint32_t n = submit_n;
+	if (n > s_ps.view_count) n = s_ps.view_count;
 	if (n == 0) { dxr_prov_end_frame_empty(); return 0; }
 	XrCompositionLayerProjectionView pv[DXR_PROV_MAX_VIEWS] = {};
 	for (uint32_t eye = 0; eye < n; eye++) {
