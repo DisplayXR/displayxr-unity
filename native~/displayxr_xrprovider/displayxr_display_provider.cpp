@@ -53,6 +53,8 @@ extern "C" void *displayxr_get_unity_main_hwnd(void);
 // top-level window that does NOT track Unity's (whole-editor) window, bound as the
 // runtime's weave target. See displayxr_win32.c.
 extern "C" void *displayxr_create_provider_dedicated_window(void);
+// (#173) Destroy that window on teardown so it doesn't linger frozen after Play stop.
+extern "C" void  displayxr_destroy_provider_dedicated_window(void);
 
 // Must match Runtime/UnitySubsystemsManifest.json ("name" + display "id").
 static const char *k_plugin_name = "DisplayXR";
@@ -805,6 +807,15 @@ void UNITY_INTERFACE_API
 LifecycleStop(UnitySubsystemHandle handle, void *userData)
 {
 	(void)handle; (void)userData;
+	// (#173) Editor Play Mode: destroy the dedicated weave window so it doesn't
+	// linger frozen after Play stops. Runs on the MAIN thread, after GfxStop already
+	// ran dxr_prov_session_stop (xrDestroySession unhooked the SR weaver subclass) —
+	// so the destroy is clean. Built-player overlay/self-host paths don't create it
+	// (the call is a no-op there). A re-Play recreates it in LifecycleStart.
+	if (prov_want_dedicated_window()) {
+		displayxr_destroy_provider_dedicated_window();
+		s_overlay_hwnd = nullptr;
+	}
 	prov_log("[DisplayXR-PROV] Lifecycle Stop\n");
 }
 

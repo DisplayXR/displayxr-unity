@@ -35,6 +35,11 @@ void *displayxr_get_unity_main_hwnd(void);
 /// @return HWND cast to void*, or NULL on failure (caller falls back to self-host).
 void *displayxr_create_provider_dedicated_window(void);
 
+/// (#173) Destroy the dedicated provider window (editor Play Mode). Call from the
+/// provider's LifecycleStop (MAIN thread, after the session is stopped) so the
+/// window doesn't linger frozen after Play stops. Idempotent.
+void displayxr_destroy_provider_dedicated_window(void);
+
 /// Check whether the plugin is running in shell/IPC mode.
 /// Detected via DISPLAYXR_WORKSPACE_SESSION=1 (legacy DISPLAYXR_SHELL_SESSION=1
 /// is also honored) environment variable.
