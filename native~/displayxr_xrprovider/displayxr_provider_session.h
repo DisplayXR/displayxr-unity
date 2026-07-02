@@ -273,6 +273,11 @@ DISPLAYXR_EXPORT void dxr_prov_set_display_pose(float px, float py, float pz,
                                float ox, float oy, float oz, float ow,
                                int enabled);
 
+/// Get the sent rig pose in the OpenXR frame (as stored). Returns 1 if a pose is
+/// set, else 0. The render handoff uses this to make deviceAnchorToEyePose
+/// rig-RELATIVE so the rig origin isn't applied twice (#166).
+DISPLAYXR_EXPORT int dxr_prov_get_display_pose_oxr(float out_pos[3], float out_quat[4]);
+
 // ---- Queries ----------------------------------------------------------------
 
 /// Display info surfaced from XR_EXT_display_info.

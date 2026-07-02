@@ -32,6 +32,13 @@ namespace DisplayXR
         /// <summary>Fired on every edge of the derived eye-tracking state (isTracking, activeMode 0=MANAGED/1=MANUAL).</summary>
         public static event Action<bool, int> EyeTrackingStateChanged;
 
+        /// <summary>Unity-world display-plane pose the driver last sent to the runtime
+        /// via dxr_prov_set_display_pose, captured pre-XR-reset in LateUpdate. The URP
+        /// foreground clip reads this so its plane tracks the moving rig (#166).</summary>
+        public static Vector3 RigPlanePos     { get; internal set; }
+        public static Vector3 RigPlaneForward { get; internal set; } = Vector3.forward;
+        public static bool    RigPlaneValid   { get; internal set; }
+
         static DisplayXRProviderNative.ModeInfo[] s_modes = Array.Empty<DisplayXRProviderNative.ModeInfo>();
 
         /// <summary>The enumerated rendering modes (refreshed at session start + on mode change).</summary>
