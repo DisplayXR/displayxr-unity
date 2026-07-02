@@ -167,7 +167,8 @@ static int   s_fullscreen_overlay_pref = 0;
 // top-level NOREDIRECTIONBITMAP popup composites it exactly like the hook path's
 // transparent overlay, but WITHOUT the transparent-app extras (no Unity cloak /
 // off-screen move / click-through). Opaque weave over Unity's own window = one
-// window UX. Set by the custom IUnityXRDisplay provider (DISPLAYXR_PROV_OVERLAY=1).
+// window UX. Set by the custom IUnityXRDisplay provider (the default app-owned
+// window path; opt out with DISPLAYXR_PROV_SELFHOST=1).
 static int   s_provider_opaque_overlay = 0;
 
 // (#131) App-requested overlay cursor shape, applied in WM_SETCURSOR. The
