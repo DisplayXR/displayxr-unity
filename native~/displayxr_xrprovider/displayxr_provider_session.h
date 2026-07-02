@@ -220,6 +220,11 @@ void dxr_prov_poll_events(void);
 /// textures). Runs only between frames (no-op mid-frame).
 int  dxr_prov_reconcile_size(void);
 
+/// Consume the per-extra-zone realloc latch (0-based index). Returns 1 (and clears)
+/// if that extra zone was just reallocated by dxr_prov_reconcile_size and its Unity
+/// texture(s) must be dropped + re-wrapped. Call for each extra zone each frame.
+int  dxr_prov_consume_zone_rewrap(uint32_t index);
+
 /// Begin a frame: xrWaitFrame + xrBeginFrame + xrLocateViews (view-rig chained)
 /// + acquire/wait the swapchain image Unity should render into next.
 /// @param out_image_index Receives the acquired swapchain image index.

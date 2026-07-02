@@ -328,6 +328,16 @@ void destroy_textures()
 	s_textures_created = false;
 }
 
+// Drop one extra zone's Unity texture(s) after a live realloc (#172) so
+// create_extra_zone_textures re-wraps the zone's fresh bridge next frame.
+static void destroy_extra_zone_texture(uint32_t i)
+{
+	if (!s_display || !s_handle || i >= PROV_MAX_EXTRA_ZONES) return;
+	for (int e = 0; e < 2; e++)
+		if (s_extra_tex_ids[i][e]) { s_display->DestroyTexture(s_handle, s_extra_tex_ids[i][e]); s_extra_tex_ids[i][e] = 0; }
+	s_extra_tex_created[i] = false;
+}
+
 // ============================================================================
 // Graphics-thread provider callbacks
 // ============================================================================
@@ -393,7 +403,10 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 	// Live tile realloc (#172): if the window/zone target size changed, the session
 	// recreates the swapchain+bridge here (between frames). Drop the stale Unity
 	// textures wrapping the old bridge so create_textures_if_ready rewraps the new one.
+	// The primary is signalled by the return; each reallocated extra zone via its latch.
 	if (dxr_prov_reconcile_size()) destroy_textures();
+	for (uint32_t z = 0; z < PROV_MAX_EXTRA_ZONES; z++)
+		if (dxr_prov_consume_zone_rewrap(z)) destroy_extra_zone_texture(z);
 	create_textures_if_ready();
 	if (!s_textures_created) return kUnitySubsystemErrorCodeSuccess; // not session-ready yet
 

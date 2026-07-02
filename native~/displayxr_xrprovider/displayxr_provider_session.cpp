@@ -125,6 +125,13 @@ typedef struct ProviderExtraZone {
 	ID3D12Resource *bridge_own, *bridge_unity; HANDLE bridge_handle;              // SPI (2-slice)
 	ID3D12Resource *bridge_own_eye[2], *bridge_unity_eye[2]; HANDLE bridge_handle_eye[2]; // MultiPass
 
+	// Live tile realloc (#172): recreate this zone's swapchain+bridge when its rect
+	// (recommended view size) changes. Debounced like the primary; needs_rewrap is a
+	// latch consumed by the Unity side so it drops+rewraps this zone's texture(s).
+	uint32_t    realloc_pending_w, realloc_pending_h;
+	int         realloc_stable;
+	int         needs_rewrap;
+
 	DxrProvView views[2];
 	uint32_t    view_count;
 } ProviderExtraZone;
@@ -936,15 +943,10 @@ static void ps_primary_target_size(uint32_t *out_w, uint32_t *out_h)
 	*out_w = w; *out_h = h;
 }
 
-// Called at the top of the Unity frame (before the eye textures are wrapped). If the
-// primary per-view target size has changed and held stable for PS_REALLOC_DEBOUNCE
-// frames, realloc the swapchain+bridge to the new size and return 1 so the caller
-// drops + rewraps the Unity textures. Runs only between frames (never mid-frame).
-int dxr_prov_reconcile_size(void)
+// Debounce + realloc the PRIMARY swapchain to its current target size. Returns 1 if
+// it reallocated this call (caller drops+rewraps the primary Unity texture).
+static int ps_reconcile_primary(void)
 {
-	if (!s_ps.running || !s_ps.session_ready || !s_ps.swapchain_created) return 0;
-	if (s_ps.frame_begun) return 0; // never realloc between begin_frame and submit
-
 	uint32_t tw = 0, th = 0;
 	ps_primary_target_size(&tw, &th);
 	if (tw == 0 || th == 0) return 0;
@@ -953,7 +955,6 @@ int dxr_prov_reconcile_size(void)
 		s_ps.realloc_pending_w = 0; s_ps.realloc_pending_h = 0; s_ps.realloc_stable = 0;
 		return 0; // already the right size
 	}
-
 	// Debounce: require the same new target for PS_REALLOC_DEBOUNCE frames.
 	if (tw == s_ps.realloc_pending_w && th == s_ps.realloc_pending_h) {
 		if (++s_ps.realloc_stable < PS_REALLOC_DEBOUNCE) return 0;
@@ -965,6 +966,23 @@ int dxr_prov_reconcile_size(void)
 	ps_log("[DisplayXR-PROV] realloc: primary target %ux%u -> %ux%u (settled)\n",
 	       s_ps.sc_width, s_ps.sc_height, tw, th);
 	return ps_recreate_primary_swapchain();
+}
+
+static void ps_reconcile_extra_zones(void); // defined with the zone helpers below
+
+// Called at the top of the Unity frame (before the eye textures are wrapped).
+// Reconciles the primary tile AND every extra 3D zone tile against their current
+// target sizes (window×scaleXY / zone recommended view size), each debounced. Returns
+// 1 if the PRIMARY reallocated (caller drops+rewraps the primary texture); extra-zone
+// reallocs are signalled per-zone via dxr_prov_consume_zone_rewrap. Between frames only.
+int dxr_prov_reconcile_size(void)
+{
+	if (!s_ps.running || !s_ps.session_ready || !s_ps.swapchain_created) return 0;
+	if (s_ps.frame_begun) return 0; // never realloc between begin_frame and submit
+
+	int primary_changed = ps_reconcile_primary();
+	ps_reconcile_extra_zones();
+	return primary_changed;
 }
 
 // ============================================================================
@@ -1358,6 +1376,75 @@ static void ps_create_extra_zones(void)
 	for (uint32_t i = 0; i < s_ps.extra_zone_count; i++)
 		if (s_ps.extra_zones[i].valid && !s_ps.extra_zones[i].swapchain_created)
 			ps_create_extra_zone(&s_ps.extra_zones[i]);
+}
+
+// Live tile realloc (#172) for an extra zone: drain, release+destroy the zone's
+// swapchain+bridge(s), recreate at the current recommended view size, and set the
+// rewrap latch so the Unity side re-wraps this zone's texture(s). Runs between frames.
+static int ps_recreate_extra_zone(ProviderExtraZone *z)
+{
+	ps_drain_gpu();
+	if (z->image_acquired && z->swapchain && s_ps.pfn_release_swapchain_image) {
+		XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+		s_ps.pfn_release_swapchain_image(z->swapchain, &ri);
+	}
+	z->image_acquired = 0;
+	if (z->swapchain && s_ps.pfn_destroy_swapchain) s_ps.pfn_destroy_swapchain(z->swapchain);
+	z->swapchain = XR_NULL_HANDLE;
+	z->swapchain_created = 0;
+	z->sc_image_count = 0;
+	if (z->bridge_unity) { z->bridge_unity->Release(); z->bridge_unity = NULL; }
+	if (z->bridge_handle) { CloseHandle(z->bridge_handle); z->bridge_handle = NULL; }
+	if (z->bridge_own)   { z->bridge_own->Release();   z->bridge_own = NULL; }
+	for (int e = 0; e < 2; e++) {
+		if (z->bridge_unity_eye[e]) { z->bridge_unity_eye[e]->Release(); z->bridge_unity_eye[e] = NULL; }
+		if (z->bridge_handle_eye[e]) { CloseHandle(z->bridge_handle_eye[e]); z->bridge_handle_eye[e] = NULL; }
+		if (z->bridge_own_eye[e])   { z->bridge_own_eye[e]->Release();   z->bridge_own_eye[e] = NULL; }
+	}
+	int ok = ps_create_extra_zone(z);
+	z->needs_rewrap = 1;
+	ps_log("[DisplayXR-PROV] realloc: extra zone id=%u swapchain+bridge recreated -> %ux%u (%s)\n",
+	       z->zone_id, z->sc_width, z->sc_height, ok ? "OK" : "FAILED");
+	return ok;
+}
+
+// Reconcile every extra zone's tile against its current recommended view size,
+// debounced. Runs inside dxr_prov_reconcile_size after the primary. Recreated zones
+// set needs_rewrap (consumed by dxr_prov_consume_zone_rewrap).
+static void ps_reconcile_extra_zones(void)
+{
+	for (uint32_t i = 0; i < s_ps.extra_zone_count; i++) {
+		ProviderExtraZone *z = &s_ps.extra_zones[i];
+		if (!z->valid || !z->swapchain_created) continue;
+		ps_query_extra_zone_rec(z);
+		uint32_t tw = z->rec_w, th = z->rec_h;
+		if (tw == 0 || th == 0) continue;
+		if (tw == z->sc_width && th == z->sc_height) {
+			z->realloc_pending_w = 0; z->realloc_pending_h = 0; z->realloc_stable = 0;
+			continue;
+		}
+		if (tw == z->realloc_pending_w && th == z->realloc_pending_h) {
+			if (++z->realloc_stable < PS_REALLOC_DEBOUNCE) continue;
+		} else {
+			z->realloc_pending_w = tw; z->realloc_pending_h = th; z->realloc_stable = 0;
+			continue;
+		}
+		z->realloc_pending_w = 0; z->realloc_pending_h = 0; z->realloc_stable = 0;
+		ps_log("[DisplayXR-PROV] realloc: extra zone id=%u target %ux%u -> %ux%u (settled)\n",
+		       z->zone_id, z->sc_width, z->sc_height, tw, th);
+		ps_recreate_extra_zone(z);
+	}
+}
+
+// Consume the rewrap latch for extra zone `index` (0-based). Returns 1 (and clears)
+// if that zone was just reallocated and its Unity texture(s) must be re-wrapped.
+int dxr_prov_consume_zone_rewrap(uint32_t index)
+{
+	if (index >= PS_MAX_ZONES - 1) return 0;
+	ProviderExtraZone *z = &s_ps.extra_zones[index];
+	if (!z->needs_rewrap) return 0;
+	z->needs_rewrap = 0;
+	return 1;
 }
 
 // Locate each extra zone (zone-scoped, XrDisplayZoneEXT chained) → z->views, and
