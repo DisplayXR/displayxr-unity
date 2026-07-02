@@ -112,11 +112,20 @@ namespace DisplayXR
 
         private static void CaptureLive()
         {
-            var feature = DisplayXRFeature.Instance;
-            if (feature == null)
+            // Two live backends can own the capture: the custom display Provider
+            // (epic #166 — DisplayXRFeature.Instance is null in provider mode) and the
+            // legacy OpenXR hook. Both fulfil it runtime-side via xrCaptureAtlasEXT; the
+            // prefix / success / flash plumbing below is identical, only the call differs.
+            bool usingProvider = DisplayXRProviderDriver.IsActive;
+            DisplayXRFeature feature = null;
+            if (!usingProvider)
             {
-                Fail("DisplayXRFeature not active (enable DisplayXR in OpenXR settings)");
-                return;
+                feature = DisplayXRFeature.Instance;
+                if (feature == null)
+                {
+                    Fail("DisplayXRFeature not active (enable DisplayXR in OpenXR settings)");
+                    return;
+                }
             }
 
             // Built-app stereo is two-view (Unity SetStereoViewMatrix L/R); this
@@ -150,7 +159,10 @@ namespace DisplayXR
             }
 
             // projectionOnly: true matches the native test apps / demos default.
-            if (!feature.CaptureAtlas(prefix, projectionOnly: true))
+            bool ok = usingProvider
+                ? DisplayXRProvider.CaptureAtlas(prefix, projectionOnly: true)
+                : feature.CaptureAtlas(prefix, projectionOnly: true);
+            if (!ok)
             {
                 Fail("xrCaptureAtlasEXT unavailable or rejected the request "
                      + "(runtime missing XR_EXT_atlas_capture or no live session)");

@@ -338,6 +338,16 @@ DISPLAYXR_EXPORT int  dxr_prov_request_display_mode(int mode3d);
 /// MANUAL, 0 → MANAGED. Returns 1 on XR_SUCCEEDED (0 if unsupported/unresolved).
 DISPLAYXR_EXPORT int  dxr_prov_set_eye_tracking_mode(int manual);
 
+// ---- Atlas capture (XR_EXT_atlas_capture, #140) -----------------------------
+
+/// App-facing atlas screenshot ('I' key / DisplayXRScreenshot): hand the runtime
+/// a path prefix + capture stage; the runtime reads back its own compositor atlas
+/// and writes "<prefix>_atlas_<viewCount>_<cols>x<rows>.png". Non-blocking (the PNG
+/// lands on the next composed frame). stage!=0 → PROJECTION_ONLY, 0 → POST_COMPOSE.
+/// Returns 1 on XR_SUCCEEDED, 0 if the extension is unresolved or no live session.
+/// Provider-mode analog of displayxr_capture_atlas on the hook path.
+DISPLAYXR_EXPORT int  dxr_prov_capture_atlas(const char *path_prefix, int stage);
+
 // ---- Event consumption (atomic read-and-clear; pumped by dxr_prov_poll_events) --
 
 /// Returns 1 once after a XrEventDataRenderingModeChangedEXT, filling the

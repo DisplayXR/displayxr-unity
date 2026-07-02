@@ -70,6 +70,17 @@ namespace DisplayXR
             IsRunning && DisplayXRProviderNative.dxr_prov_set_eye_tracking_mode(manual ? 1 : 0) != 0;
 
         /// <summary>
+        /// App-facing atlas screenshot via XR_EXT_atlas_capture (#140) — the provider
+        /// analog of <see cref="DisplayXRFeature.CaptureAtlas"/>, which is inert in
+        /// provider mode. The runtime reads back its own compositor atlas and writes
+        /// "&lt;pathPrefix&gt;_atlas_&lt;viewCount&gt;_&lt;cols&gt;x&lt;rows&gt;.png" on the next composed
+        /// frame (non-blocking). Only captures while weaving (3D). Returns true if the
+        /// request was accepted (runtime advertises the extension and a session is live).
+        /// </summary>
+        public static bool CaptureAtlas(string pathPrefix, bool projectionOnly = true) =>
+            IsRunning && DisplayXRProviderNative.dxr_prov_capture_atlas(pathPrefix, projectionOnly ? 1 : 0) != 0;
+
+        /// <summary>
         /// Provider display geometry (XR_EXT_display_info) — the provider analog of
         /// <see cref="DisplayXRFeature.DisplayInfo"/>, which is inert in provider mode.
         /// Returns false if the provider isn't running or the runtime hasn't reported
