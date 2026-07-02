@@ -638,10 +638,13 @@ static void ps_query_zone_rec_size(void)
 	}
 }
 
-// Whether the 3D zone should drive this frame (rect set + caps OK + a stereo 3D mode
-// is active). Hardware 2D (1 view) is a single full-window flat tile — zones are a
-// 3D concept, so they're inert in 2D (#172 P4).
-static int ps_zone_active(void) { return s_ps.zone_valid && ps_zones_ready() && ps_active_view_count() >= 2; }
+// Whether the zone should drive this frame (rect set + caps OK). Zones apply in BOTH
+// 2D and 3D: the zone confines WHERE the content is placed (its band), independent of
+// view count. In 2D the zone tile is still rendered zone-sized and zone-scoped — just
+// as a single submitted view (see sc_view_count) instead of a stereo pair. (#172 P4:
+// an earlier `&& viewCount>=2` here made 2D fall back to full-window, so a zoned app's
+// content escaped its band in 2D — the regression this reverts.)
+static int ps_zone_active(void) { return s_ps.zone_valid && ps_zones_ready(); }
 
 // ============================================================================
 // SPI swapchain (arraySize=2). Images live on Unity's D3D12 device (zero-copy).
