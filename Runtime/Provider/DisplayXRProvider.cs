@@ -32,6 +32,15 @@ namespace DisplayXR
         /// <summary>Fired on every edge of the derived eye-tracking state (isTracking, activeMode 0=MANAGED/1=MANUAL).</summary>
         public static event Action<bool, int> EyeTrackingStateChanged;
 
+        /// <summary>
+        /// Latest eye-tracking state, cached from <see cref="EyeTrackingStateChanged"/>
+        /// (the runtime emits an edge on session start). The provider exposes no eye
+        /// positions — only whether a face is currently tracked — so editor runtime
+        /// status can surface tracked/not-tracked in provider mode. False until the
+        /// first edge / when the provider isn't running.
+        /// </summary>
+        public static bool IsEyeTracked { get; private set; }
+
         /// <summary>Unity-world display-plane pose the driver last sent to the runtime
         /// via dxr_prov_set_display_pose, captured pre-XR-reset in LateUpdate. The URP
         /// foreground clip reads this so its plane tracks the moving rig (#166).</summary>
@@ -128,7 +137,11 @@ namespace DisplayXR
 
         // ---- Called by DisplayXRProviderDriver -------------------------------
 
-        internal static void OnSessionStarted() => RefreshModes();
+        internal static void OnSessionStarted()
+        {
+            IsEyeTracked = false;
+            RefreshModes();
+        }
 
         internal static void PumpEvents()
         {
@@ -140,7 +153,10 @@ namespace DisplayXR
             if (DisplayXRProviderNative.dxr_prov_consume_hw_state_changed(out int hw3d) != 0)
                 HardwareDisplayStateChanged?.Invoke(hw3d != 0);
             if (DisplayXRProviderNative.dxr_prov_consume_eye_tracking_changed(out int tracking, out int mode) != 0)
+            {
+                IsEyeTracked = tracking != 0;
                 EyeTrackingStateChanged?.Invoke(tracking != 0, mode);
+            }
         }
     }
 }

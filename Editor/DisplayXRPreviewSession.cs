@@ -87,6 +87,11 @@ namespace DisplayXR.Editor
         /// <summary>
         /// When true, entering play mode auto-starts the SA preview and disables Unity's XR loader.
         /// This avoids the Game View XR rendering crash during teardown.
+        ///
+        /// Ignored when the DisplayXR Display Provider is the active XR loader
+        /// (<see cref="IsProviderLoaderActive"/>): in that case Play Mode runs the
+        /// provider through Unity's normal XR lifecycle — the same code path as a
+        /// built app (#171) — and the standalone integration stands aside.
         /// </summary>
         public static bool PlayModeIntegration { get; set; } = true;
 
@@ -112,6 +117,15 @@ namespace DisplayXR.Editor
         private static void OnPlayModeStateChanged(PlayModeStateChange state)
         {
             if (!PlayModeIntegration) return;
+
+            // #171: When the DisplayXR Display Provider (DisplayXRDisplayLoader) is the
+            // active XR loader, Play Mode brings the provider up through Unity's normal
+            // XR Plug-in Management lifecycle — identical to a built app (true parity;
+            // catches provider bugs in-editor; makes #172 live tile realloc testable in
+            // Play Mode). Stand aside completely: don't strip Unity's loaders and don't
+            // auto-start the standalone session (both would fight the provider). The
+            // legacy OpenXR-hook / no-provider workflow keeps the SA integration below.
+            if (IsProviderLoaderActive()) return;
 
             switch (state)
             {
@@ -153,6 +167,23 @@ namespace DisplayXR.Editor
                         sceneView.Focus();
                     break;
             }
+        }
+
+        /// <summary>
+        /// True when the custom DisplayXR Display Provider (<see cref="DisplayXRDisplayLoader"/>)
+        /// is a configured active XR loader for the current build target. In that case
+        /// Play Mode runs the provider via Unity's XR lifecycle (#171) and the standalone
+        /// PlayModeIntegration must not interfere.
+        /// </summary>
+        public static bool IsProviderLoaderActive()
+        {
+            var xrSettings = UnityEngine.XR.Management.XRGeneralSettings.Instance;
+            if (xrSettings == null || xrSettings.Manager == null) return false;
+
+            var loaders = xrSettings.Manager.activeLoaders;
+            for (int i = 0; i < loaders.Count; i++)
+                if (loaders[i] is DisplayXRDisplayLoader) return true;
+            return false;
         }
 
         private static bool DisableXRLoader()

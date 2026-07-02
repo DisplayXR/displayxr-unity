@@ -226,6 +226,38 @@ driver's lifecycle; `DisplayXRDisplaySettings` (`[XRConfigurationData]`) +
 `UnitySubsystemsManifest.json` automatically — the M1 bootstrap + hand-copy hack
 is gone. Display-only (no input subsystem) by design.
 
+## Play Mode runs the provider (#171)
+
+There are three DisplayXR session paths: the **OpenXR hook** (legacy built app), the
+**provider** (new built app), and the **standalone (SA)** session (the edit-mode
+Preview window, and — historically — Play Mode via `PlayModeIntegration`, which
+stripped Unity's OpenXR loader and auto-started the SA session).
+
+Because the provider is a real `IUnityXRDisplay` subsystem, **Play Mode can run it
+directly** through Unity's standard XR Plug-in Management lifecycle — no loader
+stripping, no SA. `DisplayXRPreviewSession.OnPlayModeStateChanged` now checks
+`IsProviderLoaderActive()` (is `DisplayXRDisplayLoader` a configured active XR
+loader?) and, when true, **stands aside completely** so XR-mgmt brings the provider
+up. This makes Play Mode == built app: true parity, provider bugs surface in-editor,
+and #172 live tile realloc is testable in Play Mode (resize the Game/Player window).
+
+When the provider is *not* the active loader (OpenXR-hook or SA-only projects), the
+legacy `PlayModeIntegration` SA path is unchanged.
+
+**The edit-mode Preview window stays on the SA session and is effectively
+deprecated for provider projects.** A Unity XR subsystem's lifecycle is tied to
+Play/build, not to an arbitrary `EditorWindow`, so the Preview window *cannot* host
+the provider — that is exactly why the SA session exists. The window shows an info
+banner (when the provider is the active loader) pointing users to Play Mode for
+provider-fidelity preview. The Preview window remains useful for hook/SA workflows
+and quick edit-mode iteration; provider projects should prefer Play Mode.
+
+Editor inspectors and the settings page read runtime status through
+`DisplayXREditorStatus` (Editor), which unifies display info + eye-tracking across
+all three backends (provider → SA preview → hook). This closes gap #6: they
+previously read `DisplayXRFeature.Instance.DisplayInfo`, which is null in provider
+mode.
+
 ## M2 hardware validation (RTX 3080, Leia DP, dev runtime v1.26.1)
 
 Drove a built `displayxr-unity-test` (BiRP, Gamma) player through the provider via

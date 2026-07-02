@@ -210,6 +210,20 @@ namespace DisplayXR.Editor
             }
             EditorGUILayout.EndHorizontal();
 
+            // #171 deprecation note: the edit-mode Preview window runs the standalone
+            // OpenXR session, NOT the DisplayXR Display Provider (a Unity XR subsystem
+            // only activates on Play/build, not in an arbitrary EditorWindow). When the
+            // provider is the project's active loader, Play Mode now runs the provider —
+            // same code path as a built app — which is the higher-fidelity preview.
+            if (DisplayXRPreviewSession.IsProviderLoaderActive())
+            {
+                EditorGUILayout.HelpBox(
+                    "This Preview window uses the standalone session, not the DisplayXR " +
+                    "Display Provider. For provider parity (and to test live tile realloc), " +
+                    "enter Play Mode — it now runs the provider directly.",
+                    MessageType.Info);
+            }
+
             // Preview area — shows the raw eye tile atlas
             Rect previewRect = GUILayoutUtility.GetRect(
                 GUIContent.none, GUIStyle.none,

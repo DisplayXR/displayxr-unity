@@ -86,16 +86,19 @@ namespace DisplayXR.Editor
                 m_InvConvergenceDistance.floatValue = 0f;
             }
 
-            // Runtime info
-            if (Application.isPlaying && DisplayXRFeature.Instance != null)
+            // Runtime info (Provider / Standalone Preview / OpenXR hook)
+            if (Application.isPlaying &&
+                DisplayXREditorStatus.TryGetEyeTracking(out bool tracked, out Vector3 leftEye,
+                                                        out Vector3 rightEye, out bool hasPositions))
             {
                 EditorGUILayout.Space();
                 EditorGUILayout.LabelField("Runtime Status", EditorStyles.boldLabel);
-
-                var feature = DisplayXRFeature.Instance;
-                EditorGUILayout.LabelField("Eye Tracked", feature.IsEyeTracked ? "Yes" : "No");
-                EditorGUILayout.Vector3Field("Left Eye", feature.LeftEyePosition);
-                EditorGUILayout.Vector3Field("Right Eye", feature.RightEyePosition);
+                EditorGUILayout.LabelField("Eye Tracked", tracked ? "Yes" : "No");
+                if (hasPositions)
+                {
+                    EditorGUILayout.Vector3Field("Left Eye", leftEye);
+                    EditorGUILayout.Vector3Field("Right Eye", rightEye);
+                }
             }
 
             serializedObject.ApplyModifiedProperties();
@@ -103,18 +106,20 @@ namespace DisplayXR.Editor
 
         private void DrawDisplayInfoBox()
         {
-            var feature = DisplayXRFeature.Instance;
-            if (feature == null || !feature.DisplayInfo.isValid)
+            if (!DisplayXREditorStatus.TryGetDisplayInfo(out var info, out var source))
             {
                 EditorGUILayout.HelpBox(
-                    "Display info not available. DisplayXRFeature must be active with a connected runtime.",
+                    "Display info not available. Connect a DisplayXR runtime via the " +
+                    "Display Provider (Play Mode / built app), the standalone Preview window, " +
+                    "or the OpenXR hook.",
                     MessageType.Info);
                 return;
             }
 
-            var info = feature.DisplayInfo;
             EditorGUILayout.BeginVertical(EditorStyles.helpBox);
-            EditorGUILayout.LabelField("Connected Display", EditorStyles.boldLabel);
+            EditorGUILayout.LabelField(
+                "Connected Display (" + DisplayXREditorStatus.SourceLabel(source) + ")",
+                EditorStyles.boldLabel);
             EditorGUILayout.LabelField("Resolution", $"{info.displayPixelWidth} x {info.displayPixelHeight}");
             EditorGUILayout.LabelField("Physical Size",
                 $"{info.displayWidthMeters * 100:F1} x {info.displayHeightMeters * 100:F1} cm");
