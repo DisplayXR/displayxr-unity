@@ -71,6 +71,17 @@ namespace DisplayXR
         public static extern int dxr_prov_get_single_pass();
 
         /// <summary>
+        /// (#173) Opt the provider into a DEDICATED standalone weave window instead of
+        /// the default app-owned overlay. Set BEFORE the subsystem starts — the loader
+        /// calls this with 1 when <c>Application.isEditor</c>, so editor Play Mode gets a
+        /// movable window that coexists with the editor (window-relative Kooima + input,
+        /// no focus-switch crash) rather than an overlay that covers the whole editor.
+        /// Built players never call it (overlay default). Windows-only.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void dxr_prov_set_dedicated_window(int enable);
+
+        /// <summary>
         /// Request a transparent background BEFORE the session starts (#166 Phase A):
         /// 1 opts the session into ALPHA_BLEND + transparentBackgroundEnabled so the
         /// runtime's DComp overlay composites the woven 3D over the desktop with

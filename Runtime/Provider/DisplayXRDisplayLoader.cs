@@ -47,6 +47,19 @@ namespace DisplayXR
                           ? GraphicsSettings.currentRenderPipeline.GetType().Name : "Built-in")
                       + ", gfx=" + SystemInfo.graphicsDeviceType + ")");
 
+            // In editor Play Mode the runtime must weave into a window that COEXISTS
+            // with the editor, not the app-owned overlay (which tracks Unity's window =
+            // the whole editor) and not self-host (no bound HWND → window-relative Kooima
+            // dead + focus-switch crash). Opt into the dedicated standalone window (#173)
+            // before the subsystem starts (LifecycleStart reads the flag). Built players
+            // keep the overlay default. Windows-only export, but the loader only runs on
+            // Windows (the provider is gated to Win+D3D12).
+            if (Application.isEditor)
+            {
+                DisplayXRProviderNative.dxr_prov_set_dedicated_window(1);
+                Debug.Log("[DisplayXR] Provider: editor Play Mode → dedicated weave window (#173)");
+            }
+
             CreateSubsystem<XRDisplaySubsystemDescriptor, XRDisplaySubsystem>(
                 s_DisplayDescriptors, k_DisplayId);
             if (DisplaySubsystem == null)
