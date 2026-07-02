@@ -18,6 +18,8 @@
 #include <d3d12.h>
 #include <dxgi1_4.h>
 
+#pragma comment(lib, "advapi32.lib") // RegGetValueA — ActiveRuntime registry fallback (#173)
+
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -446,14 +448,37 @@ static char *ps_resolve_library_path(const char *json_path, const char *lib_path
 	return result;
 }
 
-// Resolve the active runtime manifest path: explicit arg → XR_RUNTIME_JSON.
-// (Registry ActiveRuntime fallback is a future addition; XR_RUNTIME_JSON covers
-// the dev / sim_display bring-up path.)
+// Read the OpenXR ActiveRuntime manifest path from a registry root (HKCU/HKLM).
+// Returns a heap copy or NULL. Mirrors the OpenXR loader's registry convention.
+static char *ps_read_active_runtime(HKEY root)
+{
+	char path[1024];
+	DWORD sz = sizeof(path);
+	LSTATUS rc = RegGetValueA(root, "SOFTWARE\\Khronos\\OpenXR\\1",
+	                          "ActiveRuntime", RRF_RT_REG_SZ, NULL, path, &sz);
+	if (rc == ERROR_SUCCESS && path[0]) return _strdup(path);
+	return NULL;
+}
+
+// Resolve the active runtime manifest path: explicit arg → XR_RUNTIME_JSON →
+// registry ActiveRuntime (#173). The registry fallback lets the provider find the
+// INSTALLED runtime with no env var (mirrors what the OpenXR loader does for the
+// hook path); a newer dev runtime still needs XR_RUNTIME_JSON (checked first). The
+// loader passes NULL for the explicit path, so GfxStart → session_start relies on
+// this resolver.
 static char *ps_resolve_runtime_json(const char *explicit_path)
 {
 	if (explicit_path && explicit_path[0]) return _strdup(explicit_path);
 	const char *env = getenv("XR_RUNTIME_JSON");
 	if (env && env[0]) return _strdup(env);
+	// HKCU (per-user override) takes precedence over HKLM (machine install), same
+	// order as the OpenXR loader.
+	char *reg = ps_read_active_runtime(HKEY_CURRENT_USER);
+	if (!reg) reg = ps_read_active_runtime(HKEY_LOCAL_MACHINE);
+	if (reg) {
+		ps_log("[DisplayXR-PROV] runtime JSON from registry ActiveRuntime: %s\n", reg);
+		return reg;
+	}
 	return NULL;
 }
 
@@ -1955,6 +1980,18 @@ void dxr_prov_set_single_pass(int enable)
 // Effective mode. Default = SPI (1) when C# never set one, preserving the
 // pre-gating behavior.
 int dxr_prov_get_single_pass(void) { return s_ps.single_pass_set ? s_ps.single_pass : 1; }
+
+// (#173) Dedicated-window weave target for editor Play Mode. A plain file-static
+// (NOT part of s_ps) so it is untouched by the session_start memset — the loader
+// sets it once before the subsystem starts and the display-provider TU reads it in
+// LifecycleStart/GfxStart.
+static int s_prov_dedicated_window = 0;
+void dxr_prov_set_dedicated_window(int enable)
+{
+	s_prov_dedicated_window = enable ? 1 : 0;
+	ps_log("[DisplayXR-PROV] dedicated window (editor): %d\n", s_prov_dedicated_window);
+}
+int dxr_prov_get_dedicated_window(void) { return s_prov_dedicated_window; }
 
 // Transparent-background request (#166 Phase A). Set from C# BEFORE the session
 // starts; the actual ALPHA_BLEND opt-in also requires the runtime to advertise it

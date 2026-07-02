@@ -23,6 +23,18 @@ void *displayxr_get_app_main_view(void);
 /// @return HWND cast to void*, or NULL if no window found.
 void *displayxr_get_unity_main_hwnd(void);
 
+/// (#173) Create a DEDICATED, standalone weave window for the provider's editor
+/// Play Mode. Unlike displayxr_get_app_main_view (which tracks Unity's window),
+/// this is a top-level, movable/resizable WS_OVERLAPPEDWINDOW that is NOT parented
+/// to or tracking Unity — so in the editor it coexists with the whole editor window
+/// instead of covering it, while the runtime still weaves into a bound HWND (so
+/// window-relative Kooima + #172 live realloc work). WS_EX_NOACTIVATE keeps the
+/// editor foreground (the Input System keeps receiving keyboard/mouse); an explicit
+/// Per-Monitor-V2 DPI awareness context avoids the SR weaver DPI/activation crash
+/// self-host hit on focus-switch. Idempotent: returns the existing HWND on re-call.
+/// @return HWND cast to void*, or NULL on failure (caller falls back to self-host).
+void *displayxr_create_provider_dedicated_window(void);
+
 /// Check whether the plugin is running in shell/IPC mode.
 /// Detected via DISPLAYXR_WORKSPACE_SESSION=1 (legacy DISPLAYXR_SHELL_SESSION=1
 /// is also honored) environment variable.

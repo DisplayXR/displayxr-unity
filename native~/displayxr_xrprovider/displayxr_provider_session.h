@@ -137,6 +137,17 @@ DISPLAYXR_EXPORT void dxr_prov_set_single_pass(int enable);
 /// is its own single-slice RT; SPI's 2-slice array breaks the Blit — #166).
 DISPLAYXR_EXPORT int  dxr_prov_get_single_pass(void);
 
+/// (#173) Dedicated-window weave target for editor Play Mode. Set from C# BEFORE
+/// the subsystem starts (the loader does so when Application.isEditor): 1 = the
+/// provider creates its OWN standalone, movable weave window (coexists with the
+/// editor + window-relative Kooima + input, no focus-switch crash) instead of the
+/// default app-owned overlay that tracks Unity's (whole-editor) window. Built
+/// players keep the overlay default. Env fallback: DISPLAYXR_PROV_EDITOR_WINDOW=1.
+/// Read by the display-provider TU (LifecycleStart/GfxStart); a plain file-static,
+/// so it survives the session_start reset without special handling.
+DISPLAYXR_EXPORT void dxr_prov_set_dedicated_window(int enable);
+DISPLAYXR_EXPORT int  dxr_prov_get_dedicated_window(void);
+
 /// Transparent-background request (#166 Phase A). Set from C# BEFORE the session
 /// starts: 1 = opt the session into a transparent background (ALPHA_BLEND env
 /// blend mode + transparentBackgroundEnabled on the win32 binding) so the runtime's

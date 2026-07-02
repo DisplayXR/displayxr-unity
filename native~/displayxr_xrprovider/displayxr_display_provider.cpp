@@ -49,6 +49,10 @@ extern "C" void displayxr_set_provider_opaque_overlay(int enabled);
 // suppress deactivation. Idempotent.
 extern "C" int   displayxr_install_focus_hook(void *unity_hwnd);
 extern "C" void *displayxr_get_unity_main_hwnd(void);
+// (#173) Create a DEDICATED standalone weave window (editor Play Mode) — a movable
+// top-level window that does NOT track Unity's (whole-editor) window, bound as the
+// runtime's weave target. See displayxr_win32.c.
+extern "C" void *displayxr_create_provider_dedicated_window(void);
 
 // Must match Runtime/UnitySubsystemsManifest.json ("name" + display "id").
 static const char *k_plugin_name = "DisplayXR";
@@ -355,6 +359,21 @@ prov_want_app_window(void)
 	return (self_host && self_host[0] == '1') ? 0 : 1;
 }
 
+// Dedicated-window weave target (#173) — editor Play Mode. Prefer the C#-driven
+// flag (the loader sets dxr_prov_set_dedicated_window(1) when Application.isEditor,
+// before the subsystem starts); env fallback DISPLAYXR_PROV_EDITOR_WINDOW=1. When
+// set, the provider creates its OWN standalone movable weave window (coexists with
+// the editor) instead of the app-owned overlay that tracks Unity's window. Built
+// players never set it → they keep the overlay default. Takes precedence over
+// self-host: if both are somehow set, the dedicated window wins.
+static int
+prov_want_dedicated_window(void)
+{
+	if (dxr_prov_get_dedicated_window()) return 1;
+	const char *env = getenv("DISPLAYXR_PROV_EDITOR_WINDOW");
+	return (env && env[0] == '1') ? 1 : 0;
+}
+
 // ============================================================================
 // Graphics-thread provider callbacks
 // ============================================================================
@@ -381,15 +400,22 @@ GfxStart(UnitySubsystemHandle handle, void *userData, UnityXRRenderingCapabiliti
 	ID3D12CommandQueue *q = nullptr;
 	if (!get_unity_d3d12(&dev, &q)) return kUnitySubsystemErrorCodeFailure;
 
-	// Weave target. Default = the app-owned top-level WS_POPUP overlay over Unity's
-	// window (created on the main thread in LifecycleStart), so the runtime weaves
-	// into the app's own window like a native handle app. DISPLAYXR_PROV_SELFHOST=1
-	// falls back to the runtime self-hosting its own window (bring-up diagnostic).
-	// When the app owns the window but the overlay HWND failed to create, self-host
-	// is the safe fallback (overlay_hwnd stays NULL).
-	void *overlay_hwnd = prov_want_app_window() ? s_overlay_hwnd : nullptr;
+	// Weave target. Three modes (window created on the MAIN thread in LifecycleStart,
+	// which sets s_overlay_hwnd for the bound-HWND modes):
+	//   - Dedicated window (#173, editor Play Mode): a standalone movable window that
+	//     does NOT track Unity → bind s_overlay_hwnd.
+	//   - App-owned overlay (default, built players): a top-level WS_POPUP overlay
+	//     tracking Unity's window → bind s_overlay_hwnd.
+	//   - Self-host (DISPLAYXR_PROV_SELFHOST=1, bring-up diagnostic): runtime hosts its
+	//     own window → windowHandle=NULL.
+	// If a bound-HWND mode's window failed to create, self-host is the safe fallback
+	// (s_overlay_hwnd stays NULL).
+	bool want_bound = prov_want_dedicated_window() || prov_want_app_window();
+	void *overlay_hwnd = want_bound ? s_overlay_hwnd : nullptr;
 	prov_log(overlay_hwnd
-	             ? "[DisplayXR-PROV] weave target: app-owned top-level overlay (in-app)\n"
+	             ? (prov_want_dedicated_window()
+	                    ? "[DisplayXR-PROV] weave target: dedicated provider window (editor, #173)\n"
+	                    : "[DisplayXR-PROV] weave target: app-owned top-level overlay (in-app)\n")
 	             : "[DisplayXR-PROV] weave target: runtime self-hosted window (SELFHOST diagnostic)\n");
 
 	// runtime_json = NULL -> resolve from XR_RUNTIME_JSON (sim_display bring-up).
@@ -700,14 +726,39 @@ UnitySubsystemErrorCode UNITY_INTERFACE_API
 LifecycleStart(UnitySubsystemHandle handle, void *userData)
 {
 	(void)handle; (void)userData;
-	// App-owned window (default): create a TOP-LEVEL WS_POPUP overlay over Unity's
-	// window HERE — this is the MAIN thread. (Creating it in GfxStart, the render
-	// thread, deadlocks: attaching to Unity's main-thread window joins the input
-	// queues while the main thread waits on GfxStart.) GfxStart binds the runtime to
-	// s_overlay_hwnd. DISPLAYXR_PROV_SELFHOST=1 opts out to the runtime self-hosting
-	// its own window (bring-up diagnostic). The top-level popup composites the
-	// runtime's DComp weave; a WS_CHILD does not (#166).
-	if (prov_want_app_window()) {
+	// Window creation happens HERE on the MAIN thread. (Creating a window that
+	// attaches to / tracks Unity's main-thread window from GfxStart, the render
+	// thread, deadlocks: the input queues join while the main thread waits on
+	// GfxStart.) GfxStart binds the runtime to s_overlay_hwnd.
+	if (prov_want_dedicated_window()) {
+		// (#173) Editor Play Mode: a STANDALONE movable weave window that does NOT
+		// track Unity's (whole-editor) window — coexists with the editor while still
+		// binding a real HWND (window-relative Kooima + #172 realloc). See
+		// displayxr_win32.c for the WS_OVERLAPPEDWINDOW + NOACTIVATE/TOPMOST + DPI
+		// recipe (mirrors the proven standalone preview window).
+		s_overlay_hwnd = displayxr_create_provider_dedicated_window();
+		prov_log(s_overlay_hwnd
+		             ? "[DisplayXR-PROV] Lifecycle Start (dedicated provider window created, #173)\n"
+		             : "[DisplayXR-PROV] Lifecycle Start (dedicated window FAILED; runtime self-hosts)\n");
+
+		// Keyboard/mouse input (#166 task #9): install the same focus / raw-input
+		// hooks the app-owned overlay uses, so Unity's Input System keeps receiving
+		// input (RIDEV_INPUTSINK + GetForegroundWindow/GetFocus → Unity) even if the
+		// separate weave window is ever the OS-foreground window. The window is
+		// WS_EX_NOACTIVATE so it should not steal foreground from the editor in the
+		// first place (that alone keeps input alive, like the standalone preview) —
+		// the hook is belt-and-braces / parity with the overlay path.
+		void *unity_hwnd = displayxr_get_unity_main_hwnd();
+		if (unity_hwnd != nullptr) {
+			displayxr_install_focus_hook(unity_hwnd);
+			prov_log("[DisplayXR-PROV] Lifecycle Start: installed keyboard focus/raw-input hooks (dedicated window)\n");
+		}
+	} else if (prov_want_app_window()) {
+		// App-owned window (default, built players): create a TOP-LEVEL WS_POPUP
+		// overlay over Unity's window so the runtime weaves into the app's own window
+		// like a native handle app. DISPLAYXR_PROV_SELFHOST=1 opts out to the runtime
+		// self-hosting its own window (bring-up diagnostic). The top-level popup
+		// composites the runtime's DComp weave; a WS_CHILD does not (#166).
 		// Transparent apps take the UNOWNED transparent overlay path (created by
 		// displayxr_get_app_main_view because transparent_background_requested is set)
 		// + Unity cloak/off-screen (DisplayXRTransparentOverlay). Do NOT set

@@ -41,6 +41,10 @@
 static HWND s_overlay_hwnd = NULL;
 static WNDPROC s_original_wndproc = NULL;
 static const wchar_t OVERLAY_CLASS_NAME[] = L"DisplayXROverlay";
+// (#173) Dedicated provider window class (editor Play Mode weave target). Declared
+// here alongside the overlay class so find_unity_hwnd can skip it too (a visible,
+// >100px window of our own process that must never be mistaken for Unity's window).
+static const wchar_t DEDICATED_CLASS_NAME[] = L"DisplayXRProviderWindow";
 static int s_class_registered = 0;
 // True when the overlay HWND is a top-level WS_POPUP + NOREDIRECTIONBITMAP
 // (issue #57 transparent path) instead of a WS_CHILD of Unity's HWND.
@@ -268,17 +272,19 @@ displayxr_is_shell_mode(void)
 // Window discovery (shared by both modes)
 // ============================================================================
 
-// Skip our own overlay window (created by displayxr_get_app_main_view) when
-// searching for Unity's main HWND. After the overlay becomes visible it can
-// otherwise win the foreground/visible-window race in find_unity_hwnd and
-// we end up styling our own overlay as Unity, leaving Unity untouched.
+// Skip our OWN windows (the overlay created by displayxr_get_app_main_view, or the
+// #173 dedicated provider window) when searching for Unity's main HWND. After ours
+// becomes visible it can otherwise win the foreground/visible-window race in
+// find_unity_hwnd and we end up styling / hooking our own window as Unity, leaving
+// Unity untouched.
 static int
 is_displayxr_overlay_class(HWND hwnd)
 {
 	wchar_t cls[64] = {0};
 	if (GetClassNameW(hwnd, cls, 63) == 0)
 		return 0;
-	return wcscmp(cls, OVERLAY_CLASS_NAME) == 0;
+	return wcscmp(cls, OVERLAY_CLASS_NAME) == 0
+	    || wcscmp(cls, DEDICATED_CLASS_NAME) == 0;
 }
 
 static HWND
@@ -1205,6 +1211,119 @@ displayxr_get_app_main_view(void)
 		(int32_t)client_origin.x, (int32_t)client_origin.y);
 
 	return (void *)s_overlay_hwnd;
+}
+
+// ============================================================================
+// (#173) Dedicated provider window — editor Play Mode weave target.
+//
+// The app-owned overlay (displayxr_get_app_main_view) binds a real HWND but
+// TRACKS Unity's window: in the editor "Unity's window" is the whole editor, so
+// the overlay covers it. Self-host coexists but binds windowHandle=NULL (no real
+// geometry → window-relative Kooima dead, and the runtime's own activatable
+// window steals foreground → keyboard dead + an SR-weaver DPI crash on focus
+// switch). This third mode gives BOTH: a standalone, movable/resizable weave
+// window that does NOT track Unity, bound as win_binding.windowHandle.
+//
+// Recipe mirrors the proven standalone preview window (displayxr_standalone.cpp):
+// WS_OVERLAPPEDWINDOW (OS-native title-bar move + sizing-border resize; the SR
+// weaver subclass sees the OS modal-move WM_ENTERSIZEMOVE/EXITSIZEMOVE bracket
+// natively and phase-snaps — no synthetic #61 bracket needed) + WS_EX_NOACTIVATE
+// (never steals OS foreground, so the editor keeps focus and the Input System
+// keeps receiving input) + WS_EX_TOPMOST (stays visible on the Leia panel) +
+// Per-Monitor-Aware-V2 DPI (the SR weaver crashed on a DPI/activation message
+// when self-host handed focus to the per-monitor-aware editor).
+// ============================================================================
+
+static HWND s_dedicated_hwnd = NULL; // DEDICATED_CLASS_NAME declared at top (find_unity_hwnd skip)
+static int s_dedicated_class_registered = 0;
+
+static LRESULT CALLBACK
+dedicated_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+	// Quit the whole app on close (X button / Alt+F4), mirroring the overlay
+	// path: swallow WM_CLOSE (so DefWindowProc doesn't DestroyWindow the weave
+	// target out from under the runtime) and raise the close-request flag for C#
+	// to poll (displayxr_consume_overlay_close_request → Application.Quit).
+	if (msg == WM_CLOSE) {
+		displayxr_log("[DisplayXR][DedWnd] WM_CLOSE -> quit request\n");
+		InterlockedExchange(&s_overlay_close_requested, 1);
+		return 0;
+	}
+	// Everything else — including the OS caption move and sizing-border resize
+	// modal loops (and WM_DPICHANGED for the Per-Monitor-V2 context) — is handled
+	// by DefWindowProc. Window-relative Kooima + #172 live realloc read the live
+	// HWND geometry directly (the runtime tracks the bound HWND's screen position;
+	// the provider polls GetClientRect), so no per-message viewport push is needed.
+	return DefWindowProcW(hwnd, msg, wParam, lParam);
+}
+
+void *
+displayxr_create_provider_dedicated_window(void)
+{
+	if (s_dedicated_hwnd != NULL && IsWindow(s_dedicated_hwnd))
+		return (void *)s_dedicated_hwnd;
+
+	if (!s_dedicated_class_registered) {
+		WNDCLASSEXW wc = {0};
+		wc.cbSize = sizeof(wc);
+		wc.lpfnWndProc = dedicated_wnd_proc;
+		wc.hInstance = GetModuleHandleW(NULL);
+		wc.lpszClassName = DEDICATED_CLASS_NAME;
+		wc.hCursor = LoadCursorW(NULL, (LPCWSTR)IDC_ARROW);
+		wc.style = CS_OWNDC;
+		if (RegisterClassExW(&wc) == 0) {
+			fprintf(stderr, "[DisplayXR] Failed to register dedicated provider window class: %lu\n",
+			        GetLastError());
+			return NULL;
+		}
+		s_dedicated_class_registered = 1;
+	}
+
+	// Per-Monitor DPI Awareness V2 so the SR weaver's window subclass reads a
+	// consistent physical-pixel geometry from GetClientRect() and DefWindowProc
+	// handles WM_DPICHANGED — WITHOUT this the weaver crashed on a DPI/activation
+	// message when self-host handed focus to the per-monitor-aware editor (#173).
+	// Matches displayxr_standalone.cpp's preview-window setup.
+	SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+	// Default windowed size + OS-picked position (CW_USEDEFAULT) so it coexists
+	// with the editor; the user drags it onto the Leia panel and resizes to taste
+	// (#172 live realloc tracks the new client size). Intentionally NOT sized to /
+	// positioned over Unity's window — this is a standalone window that does NOT
+	// track the editor.
+	const int def_w = 1280, def_h = 720;
+
+	s_dedicated_hwnd = CreateWindowExW(
+		WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+		DEDICATED_CLASS_NAME,
+		L"DisplayXR (Provider)",
+		WS_OVERLAPPEDWINDOW,
+		CW_USEDEFAULT, CW_USEDEFAULT, def_w, def_h,
+		NULL, NULL, GetModuleHandleW(NULL), NULL);
+
+	if (s_dedicated_hwnd == NULL) {
+		fprintf(stderr, "[DisplayXR] Failed to create dedicated provider window: %lu\n",
+		        GetLastError());
+		return NULL;
+	}
+
+	// Show WITHOUT activating so the editor keeps OS foreground (input stays live).
+	ShowWindow(s_dedicated_hwnd, SW_SHOWNOACTIVATE);
+
+	// Publish as the managed top-level overlay HWND so the app-facing window
+	// helpers (displayxr_resize_overlay / _get/_set_overlay_position /
+	// _consume_overlay_close_request) target the dedicated window too — the app's
+	// keyboard windowing (e.g. Ctrl+arrows, #172 testing) then works in editor Play
+	// Mode. The overlay_wnd_proc branches gated on these only run for OVERLAY_CLASS
+	// windows (the dedicated window uses its own class + wndproc), so this is inert
+	// for message dispatch; it only redirects the app-facing helpers.
+	s_overlay_hwnd = s_dedicated_hwnd;
+	s_overlay_is_toplevel = 1;
+
+	displayxr_log("[DisplayXR] Created dedicated provider window %p (%dx%d) — "
+	              "WS_OVERLAPPEDWINDOW + NOACTIVATE/TOPMOST, Per-Monitor-V2 DPI (#173)\n",
+	              (void *)s_dedicated_hwnd, def_w, def_h);
+	return (void *)s_dedicated_hwnd;
 }
 
 void *
