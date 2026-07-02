@@ -338,6 +338,36 @@ static void destroy_extra_zone_texture(uint32_t i)
 	s_extra_tex_created[i] = false;
 }
 
+// Fill one render param's projection. Default = half-angles (the runtime's off-center
+// fov tangents; Unity builds the matrix with cam.near/far). When the BiRP foreground
+// clip is active (#166), dxr_prov_get_clip_projection returns a full matrix with the
+// per-eye display-plane far baked in (Unity's half-angles path can't express a per-eye
+// far), mirroring the hook path's SetStereoProjectionMatrix. URP keeps half-angles and
+// clips in the ForegroundClipURP shader, so C# enables the bake only on BiRP.
+// zone 0 = primary; >=1 = extra zone i-1.
+static void set_eye_projection(
+    UnityXRNextFrameDesc::UnityXRRenderPass::UnityXRRenderParams &rp,
+    uint32_t zone, uint32_t eye, const DxrProvView &v)
+{
+	float m[16];
+	if (dxr_prov_get_clip_projection(zone, eye, m)) {
+		rp.projection.type = kUnityXRProjectionTypeMatrix;
+		// GL column-major (m[col*4+row]) → UnityXRMatrix4x4 columns[col] = (x,y,z,w).
+		for (int c = 0; c < 4; c++) {
+			rp.projection.data.matrix.columns[c].x = m[c * 4 + 0];
+			rp.projection.data.matrix.columns[c].y = m[c * 4 + 1];
+			rp.projection.data.matrix.columns[c].z = m[c * 4 + 2];
+			rp.projection.data.matrix.columns[c].w = m[c * 4 + 3];
+		}
+	} else {
+		rp.projection.type = kUnityXRProjectionTypeHalfAngles;
+		rp.projection.data.halfAngles.left   = tanf(v.fov[0]);
+		rp.projection.data.halfAngles.right  = tanf(v.fov[1]);
+		rp.projection.data.halfAngles.top    = tanf(v.fov[2]);
+		rp.projection.data.halfAngles.bottom = tanf(v.fov[3]);
+	}
+}
+
 // ============================================================================
 // Graphics-thread provider callbacks
 // ============================================================================
@@ -440,11 +470,7 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 			dxr_prov_get_view(eye, &v);
 			UnityXRNextFrameDesc::UnityXRRenderPass::UnityXRRenderParams &rp = pass.renderParams[eye];
 			set_eye_pose_rig_relative(rp, v);
-			rp.projection.type = kUnityXRProjectionTypeHalfAngles;
-			rp.projection.data.halfAngles.left   = tanf(v.fov[0]);
-			rp.projection.data.halfAngles.right  = tanf(v.fov[1]);
-			rp.projection.data.halfAngles.top    = tanf(v.fov[2]);
-			rp.projection.data.halfAngles.bottom = tanf(v.fov[3]);
+			set_eye_projection(rp, 0, eye, v);
 			rp.occlusionMeshId = 0;
 			rp.textureArraySlice = (int32_t)eye;          // SPI slice
 			rp.viewportRect = UnityXRRectf{0.0f, 0.0f, vpW, vpH};
@@ -472,11 +498,7 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 			pass.renderParamsCount = 1;
 			UnityXRNextFrameDesc::UnityXRRenderPass::UnityXRRenderParams &rp = pass.renderParams[0];
 			set_eye_pose_rig_relative(rp, v);
-			rp.projection.type = kUnityXRProjectionTypeHalfAngles;
-			rp.projection.data.halfAngles.left   = tanf(v.fov[0]);
-			rp.projection.data.halfAngles.right  = tanf(v.fov[1]);
-			rp.projection.data.halfAngles.top    = tanf(v.fov[2]);
-			rp.projection.data.halfAngles.bottom = tanf(v.fov[3]);
+			set_eye_projection(rp, 0, eye, v);
 			rp.occlusionMeshId = 0;
 			rp.textureArraySlice = 0;                     // single-slice per eye
 			rp.viewportRect = UnityXRRectf{0.0f, 0.0f, vpW, vpH};
@@ -511,11 +533,7 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 					DxrProvView v; dxr_prov_get_extra_zone_view(i, eye, &v);
 					UnityXRNextFrameDesc::UnityXRRenderPass::UnityXRRenderParams &rp = pass.renderParams[eye];
 					set_eye_pose_rig_relative(rp, v);
-					rp.projection.type = kUnityXRProjectionTypeHalfAngles;
-					rp.projection.data.halfAngles.left   = tanf(v.fov[0]);
-					rp.projection.data.halfAngles.right  = tanf(v.fov[1]);
-					rp.projection.data.halfAngles.top    = tanf(v.fov[2]);
-					rp.projection.data.halfAngles.bottom = tanf(v.fov[3]);
+					set_eye_projection(rp, i + 1, eye, v);
 					rp.occlusionMeshId = 0;
 					rp.textureArraySlice = (int32_t)eye;
 					rp.viewportRect = UnityXRRectf{0.0f, 0.0f, 1.0f, 1.0f};
@@ -535,11 +553,7 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 					pass.renderParamsCount = 1;
 					UnityXRNextFrameDesc::UnityXRRenderPass::UnityXRRenderParams &rp = pass.renderParams[0];
 					set_eye_pose_rig_relative(rp, v);
-					rp.projection.type = kUnityXRProjectionTypeHalfAngles;
-					rp.projection.data.halfAngles.left   = tanf(v.fov[0]);
-					rp.projection.data.halfAngles.right  = tanf(v.fov[1]);
-					rp.projection.data.halfAngles.top    = tanf(v.fov[2]);
-					rp.projection.data.halfAngles.bottom = tanf(v.fov[3]);
+					set_eye_projection(rp, i + 1, eye, v);
 					rp.occlusionMeshId = 0;
 					rp.textureArraySlice = 0;
 					rp.viewportRect = UnityXRRectf{0.0f, 0.0f, 1.0f, 1.0f};

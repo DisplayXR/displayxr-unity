@@ -73,20 +73,21 @@ namespace DisplayXR
         /// <c>postProcessAntiAliasing</c> flag onto the effect's enabled state.
         /// </summary>
         /// <summary>
-        /// Post-AA is valid only in MultiPass. Single-pass-instanced (the custom
-        /// display provider, #166) renders both eyes into a 2-slice texture array;
-        /// <see cref="OnRenderImage"/>'s <c>Graphics.Blit</c> can't address the array
-        /// and leaves the eye texture undefined (uniform white). The rigs gate the
-        /// effect's enabled state on this so post-AA stays off under SPI.
+        /// Post-AA is OnRenderImage-based, so it works only when each eye renders into
+        /// its own single-slice RT — i.e. MultiPass. Single-pass-instanced renders both
+        /// eyes into a 2-slice texture array; <see cref="OnRenderImage"/>'s
+        /// <c>Graphics.Blit</c> can't address the array and leaves the eye texture
+        /// undefined (uniform white). The rigs gate the effect's enabled state on this.
         /// </summary>
         internal static bool SupportedForCurrentStereoMode()
         {
-            // The custom display provider renders into a 2-slice texture ARRAY in
-            // both SPI and MultiPass; OnRenderImage's Blit can't address the array
-            // (garbage / white blocks). Disable post-AA whenever the provider drives
-            // rendering — it's a hook/standalone-only feature. (#166)
+            // Custom display provider (#166): SPI (URP) renders both eyes into a 2-slice
+            // texture ARRAY that Blit can't address (and URP doesn't fire OnRenderImage
+            // anyway); MultiPass (BiRP) renders each eye into its OWN single-slice RT, so
+            // OnRenderImage's Blit works exactly as on the hook path. Support post-AA
+            // under the provider only in MultiPass.
             if (DisplayXRProviderDriver.IsActive)
-                return false;
+                return DisplayXRProviderNative.dxr_prov_get_single_pass() == 0;
             // Single-pass-instanced breaks the Blit even on the hook/standalone path.
             return XRSettings.stereoRenderingMode != XRSettings.StereoRenderingMode.SinglePassInstanced;
         }
