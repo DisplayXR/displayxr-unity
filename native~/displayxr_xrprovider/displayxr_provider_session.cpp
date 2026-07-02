@@ -257,6 +257,13 @@ typedef struct ProviderSession {
 	XrSwapchainImageD3D12KHR sc_images[PS_MAX_SWAPCHAIN_IMAGES];
 	int         swapchain_created;
 
+	// Live tile realloc (#172): the primary swapchain+bridge are recreated to track
+	// the live per-view target (window(client)×scaleXY, or the 3D-zone recommended
+	// view size) when it changes — resize / split-drag / mode-switch. Debounced so an
+	// interactive resize drag reallocs once on settle, not every frame.
+	uint32_t    realloc_pending_w, realloc_pending_h; // last-seen target awaiting stability
+	int         realloc_stable;                        // consecutive frames the target held
+
 	// Window-space UI (HUD) overlay layer (#67/#166): own overlay swapchain +
 	// cross-device bridge. C# (DisplayXRWindowSpaceUI) Graphics.CopyTexture's the
 	// canvas RT into wsui_bridge_unity each frame; submit copies wsui_bridge_own ->
@@ -817,8 +824,10 @@ static int ps_create_bridge(void)
 
 	// Cross-device SHARED fence: own_device creates it shared; Unity's device
 	// opens the same fence. submit_frame signals it on Unity's queue (after the
-	// render) and waits on it on the own queue (before the copy).
-	if (s_ps.unity_queue) {
+	// render) and waits on it on the own queue (before the copy). Device-level and
+	// size-independent, so a live-realloc (#172) keeps the existing fence and skips
+	// this (recreating it would leak the old one and reset sync_val ordering).
+	if (s_ps.unity_queue && !s_ps.shared_fence_own) {
 		HRESULT hr2 = s_ps.own_device->CreateFence(0, D3D12_FENCE_FLAG_SHARED,
 		        __uuidof(ID3D12Fence), (void **)&s_ps.shared_fence_own);
 		if (SUCCEEDED(hr2)) {
@@ -835,6 +844,127 @@ static int ps_create_bridge(void)
 		ps_log("[DisplayXR-PROV] No Unity queue → coarse sync only (possible black/tearing)\n");
 	}
 	return 1;
+}
+
+// ============================================================================
+// Live tile realloc (#172) — track the per-view target size on resize / split /
+// mode change, like a real handle app. See dxr_prov_reconcile_size().
+// ============================================================================
+
+// Target awaits this many consecutive stable frames before we realloc. An
+// interactive resize drag changes GetClientRect every frame; debouncing reallocs
+// once the drag settles instead of thrashing the swapchain (the Leia weaver
+// stutters during a resize drag regardless — this just avoids churn).
+#define PS_REALLOC_DEBOUNCE 6
+
+// Block the CPU until all GPU work touching the bridge/swapchain has retired, so
+// they can be safely destroyed. Drains our own copy queue, then Unity's render
+// queue via the shared fence (shared_fence_own mirrors unity_queue's signal).
+static void ps_drain_gpu(void)
+{
+	if (s_ps.own_queue && s_ps.own_fence && s_ps.own_fence_event) {
+		s_ps.own_fence_value++;
+		s_ps.own_queue->Signal(s_ps.own_fence, s_ps.own_fence_value);
+		if (s_ps.own_fence->GetCompletedValue() < s_ps.own_fence_value) {
+			s_ps.own_fence->SetEventOnCompletion(s_ps.own_fence_value, s_ps.own_fence_event);
+			WaitForSingleObject(s_ps.own_fence_event, INFINITE);
+		}
+	}
+	if (s_ps.unity_queue && s_ps.shared_fence_unity && s_ps.shared_fence_own) {
+		s_ps.sync_val++;
+		s_ps.unity_queue->Signal(s_ps.shared_fence_unity, s_ps.sync_val);
+		if (s_ps.shared_fence_own->GetCompletedValue() < s_ps.sync_val) {
+			HANDLE ev = CreateEvent(NULL, FALSE, FALSE, NULL);
+			if (ev) {
+				s_ps.shared_fence_own->SetEventOnCompletion(s_ps.sync_val, ev);
+				WaitForSingleObject(ev, INFINITE);
+				CloseHandle(ev);
+			}
+		}
+	}
+}
+
+// Tear down the primary swapchain + its cross-device bridge(s) (NOT the shared
+// fence or own device — those are size-independent), then recreate at the current
+// target size via ps_create_swapchain (which recomputes size from the window/zone
+// and re-pairs the bridge). Must run between frames with the GPU drained. Returns 1
+// if the swapchain was recreated (caller drops+rewraps the Unity textures).
+static int ps_recreate_primary_swapchain(void)
+{
+	ps_drain_gpu();
+
+	// Release an acquired-but-unsubmitted image before destroying the swapchain.
+	if (s_ps.image_acquired && s_ps.swapchain && s_ps.pfn_release_swapchain_image) {
+		XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+		s_ps.pfn_release_swapchain_image(s_ps.swapchain, &ri);
+	}
+	s_ps.image_acquired = 0;
+
+	if (s_ps.swapchain && s_ps.pfn_destroy_swapchain) s_ps.pfn_destroy_swapchain(s_ps.swapchain);
+	s_ps.swapchain = XR_NULL_HANDLE;
+	s_ps.swapchain_created = 0;
+	s_ps.sc_image_count = 0;
+
+	// SPI bridge (2-slice) + MultiPass per-eye bridges. Keep the shared fence.
+	if (s_ps.bridge_unity) { s_ps.bridge_unity->Release(); s_ps.bridge_unity = NULL; }
+	if (s_ps.bridge_handle) { CloseHandle(s_ps.bridge_handle); s_ps.bridge_handle = NULL; }
+	if (s_ps.bridge_own)   { s_ps.bridge_own->Release();   s_ps.bridge_own = NULL; }
+	for (int e = 0; e < 2; e++) {
+		if (s_ps.bridge_unity_eye[e]) { s_ps.bridge_unity_eye[e]->Release(); s_ps.bridge_unity_eye[e] = NULL; }
+		if (s_ps.bridge_handle_eye[e]) { CloseHandle(s_ps.bridge_handle_eye[e]); s_ps.bridge_handle_eye[e] = NULL; }
+		if (s_ps.bridge_own_eye[e])   { s_ps.bridge_own_eye[e]->Release();   s_ps.bridge_own_eye[e] = NULL; }
+	}
+
+	int ok = ps_create_swapchain(); // recomputes target size + re-pairs the bridge
+	ps_log("[DisplayXR-PROV] realloc: primary swapchain+bridge recreated -> %ux%u (%s)\n",
+	       s_ps.sc_width, s_ps.sc_height, ok ? "OK" : "FAILED");
+	return ok;
+}
+
+// The primary swapchain's current target per-view size (matches ps_create_swapchain).
+static void ps_primary_target_size(uint32_t *out_w, uint32_t *out_h)
+{
+	uint32_t w = 0, h = 0;
+	if (ps_zone_active()) {
+		ps_query_zone_rec_size();
+		w = s_ps.zone_rec_w; h = s_ps.zone_rec_h;
+	} else {
+		uint32_t ww = 0, wh = 0; ps_window_size(&ww, &wh);
+		float sx = 0.5f, sy = 0.5f; ps_active_view_scale(&sx, &sy);
+		w = (uint32_t)(ww * sx); h = (uint32_t)(wh * sy);
+	}
+	*out_w = w; *out_h = h;
+}
+
+// Called at the top of the Unity frame (before the eye textures are wrapped). If the
+// primary per-view target size has changed and held stable for PS_REALLOC_DEBOUNCE
+// frames, realloc the swapchain+bridge to the new size and return 1 so the caller
+// drops + rewraps the Unity textures. Runs only between frames (never mid-frame).
+int dxr_prov_reconcile_size(void)
+{
+	if (!s_ps.running || !s_ps.session_ready || !s_ps.swapchain_created) return 0;
+	if (s_ps.frame_begun) return 0; // never realloc between begin_frame and submit
+
+	uint32_t tw = 0, th = 0;
+	ps_primary_target_size(&tw, &th);
+	if (tw == 0 || th == 0) return 0;
+
+	if (tw == s_ps.sc_width && th == s_ps.sc_height) {
+		s_ps.realloc_pending_w = 0; s_ps.realloc_pending_h = 0; s_ps.realloc_stable = 0;
+		return 0; // already the right size
+	}
+
+	// Debounce: require the same new target for PS_REALLOC_DEBOUNCE frames.
+	if (tw == s_ps.realloc_pending_w && th == s_ps.realloc_pending_h) {
+		if (++s_ps.realloc_stable < PS_REALLOC_DEBOUNCE) return 0;
+	} else {
+		s_ps.realloc_pending_w = tw; s_ps.realloc_pending_h = th; s_ps.realloc_stable = 0;
+		return 0;
+	}
+	s_ps.realloc_pending_w = 0; s_ps.realloc_pending_h = 0; s_ps.realloc_stable = 0;
+	ps_log("[DisplayXR-PROV] realloc: primary target %ux%u -> %ux%u (settled)\n",
+	       s_ps.sc_width, s_ps.sc_height, tw, th);
+	return ps_recreate_primary_swapchain();
 }
 
 // ============================================================================

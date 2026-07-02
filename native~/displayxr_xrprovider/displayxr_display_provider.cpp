@@ -390,6 +390,10 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 	if (!s_session_active) return kUnitySubsystemErrorCodeSuccess;
 
 	dxr_prov_poll_events();
+	// Live tile realloc (#172): if the window/zone target size changed, the session
+	// recreates the swapchain+bridge here (between frames). Drop the stale Unity
+	// textures wrapping the old bridge so create_textures_if_ready rewraps the new one.
+	if (dxr_prov_reconcile_size()) destroy_textures();
 	create_textures_if_ready();
 	if (!s_textures_created) return kUnitySubsystemErrorCodeSuccess; // not session-ready yet
 

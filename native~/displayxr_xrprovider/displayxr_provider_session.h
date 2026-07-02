@@ -213,6 +213,13 @@ DISPLAYXR_EXPORT void dxr_prov_set_local2d_rect(int32_t x, int32_t y, int32_t w,
 /// Pump OpenXR session-state events (xrPollEvent). Drives the session to READY.
 void dxr_prov_poll_events(void);
 
+/// Live tile realloc (#172): if the primary per-view target size (window×scaleXY,
+/// or the 3D-zone recommended view size) has changed and held stable, recreate the
+/// swapchain+bridge to match. Call at the top of the Unity frame BEFORE wrapping the
+/// eye textures. Returns 1 if it reallocated (caller must drop + rewrap the Unity
+/// textures). Runs only between frames (no-op mid-frame).
+int  dxr_prov_reconcile_size(void);
+
 /// Begin a frame: xrWaitFrame + xrBeginFrame + xrLocateViews (view-rig chained)
 /// + acquire/wait the swapchain image Unity should render into next.
 /// @param out_image_index Receives the acquired swapchain image index.
