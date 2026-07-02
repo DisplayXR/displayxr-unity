@@ -230,13 +230,6 @@ typedef struct ProviderSession {
 	int single_pass;
 	int single_pass_set;
 
-	// BiRP foreground clip (#166): when set, the render-pass projection is a full
-	// matrix with the per-eye display-plane far baked in (dxr_prov_get_clip_projection)
-	// instead of half-angles. C# sets this per frame only on the BiRP path (URP clips
-	// in the ForegroundClipURP shader). A per-frame tunable — not preserved across the
-	// session_start memset (the driver re-pushes it every frame).
-	int foreground_clip;
-
 	// Transparent background (#166 Phase A): when the app requests it AND the
 	// runtime advertises ALPHA_BLEND, the win32 binding sets
 	// transparentBackgroundEnabled and xrEndFrame submits with ALPHA_BLEND (the
@@ -2421,41 +2414,6 @@ int dxr_prov_get_zone_eye_clip(uint32_t zone, uint32_t eye, float *out_far,
 		p = z->views[eye].position;
 	}
 	ps_compute_eye_clip(p, out_far, out_ex, out_ey, out_ez);
-	return 1;
-}
-
-// BiRP foreground clip (#166): the provider hands Unity a half-angles projection,
-// which Unity turns into a matrix using cam.near/far — one far for both eyes, so a
-// per-eye clip can't be expressed that way. When foreground clip is enabled on the
-// BiRP path we instead hand Unity a full matrix projection with the per-eye far baked
-// in (mirrors the hook path's dxr_projection_from_fov + SetStereoProjectionMatrix).
-void dxr_prov_set_foreground_clip(int enable) { s_ps.foreground_clip = enable ? 1 : 0; }
-int  dxr_prov_get_foreground_clip(void)       { return s_ps.foreground_clip; }
-
-// Build the per-eye GL projection matrix (Matrix4x4.Frustum convention) with the
-// foreground-clip far baked in. zone 0 = primary; >=1 = extra zone i-1. Returns 1 and
-// fills out_mat when the clip is enabled and the far is valid; 0 otherwise (caller
-// keeps the half-angles path). Reuses ps_compute_eye_clip (display rig = rig-local
-// eye Z; camera rig = convergence) so it's per-view + N-view correct.
-int dxr_prov_get_clip_projection(uint32_t zone, uint32_t eye, float out_mat[16])
-{
-	if (!s_ps.foreground_clip || eye >= 2 || !out_mat) return 0;
-	const DxrProvView *view;
-	if (zone == 0) {
-		if (s_ps.view_count < 2) return 0;
-		view = &s_ps.views[eye];
-	} else {
-		uint32_t ei = zone - 1;
-		if (ei >= s_ps.extra_zone_count) return 0;
-		ProviderExtraZone *z = &s_ps.extra_zones[ei];
-		if (!z->valid || z->view_count < 2) return 0;
-		view = &z->views[eye];
-	}
-	float far_eff = 0.0f;
-	ps_compute_eye_clip(view->position, &far_eff, NULL, NULL, NULL);
-	float nz = s_ps.near_z > 0.0f ? s_ps.near_z : 0.01f;
-	if (far_eff <= nz + 0.001f) return 0; // degenerate → fall back to half-angles
-	ps_projection_from_fov(view->fov, nz, far_eff, out_mat);
 	return 1;
 }
 

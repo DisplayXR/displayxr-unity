@@ -71,18 +71,6 @@ namespace DisplayXR
         public static extern int dxr_prov_get_single_pass();
 
         /// <summary>
-        /// Enable/disable the BiRP provider foreground clip (#166): bake the per-eye
-        /// display-plane far into the provider's projection MATRIX (Unity's half-angles
-        /// projection uses a single cam.farClipPlane for both eyes, so a per-eye clip
-        /// can't be expressed that way). URP clips per-eye in the ForegroundClipURP
-        /// shader instead, so the driver enables this only on the BiRP path. Pushed each
-        /// frame alongside the tunables (a per-frame flag; harmless if the runtime path
-        /// doesn't consume it).
-        /// </summary>
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void dxr_prov_set_foreground_clip(int enable);
-
-        /// <summary>
         /// Request a transparent background BEFORE the session starts (#166 Phase A):
         /// 1 opts the session into ALPHA_BLEND + transparentBackgroundEnabled so the
         /// runtime's DComp overlay composites the woven 3D over the desktop with

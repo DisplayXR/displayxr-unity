@@ -61,6 +61,11 @@ namespace DisplayXR
         // True when running under URP/HDRP. BiRP fires Camera.onPreRender; SRP doesn't,
         // so we route through RenderPipelineManager.beginCameraRendering instead.
         private bool m_UsingSRP;
+        // BiRP provider foreground clip (#166): Unity fills the half-angles projection's
+        // depth range from the camera near/far under the provider, so the clip is
+        // delivered by shortening cam.farClipPlane to the convergence distance; original
+        // cached to restore when off. (URP clips per-eye in the ForegroundClipURP shader.)
+        private float m_CamFarCache = -1f;
         // URP foreground-clip globals consumed by DisplayXR/ForegroundClipURP (the opt-in
         // FullScreenPassRendererFeature). The off-axis projection itself is owned by
         // KooimaProjectionFixFeature on URP, not by this rig.
@@ -120,13 +125,14 @@ namespace DisplayXR
             // Provider mode (#166): DisplayXRFeature is inert (no Unity OpenXR loader),
             // so GetStereoMatrices can't feed the URP foreground clip. Publish the
             // ForegroundClipURP globals from the provider's per-eye clip data instead,
-            // mirroring DisplayXRDisplay. BiRP has no such shader pass — its foreground
-            // far is delivered natively (the provider bakes the per-eye far — here the
-            // convergence distance — into the projection matrix, driven by
-            // DisplayXRProviderDriver via dxr_prov_set_foreground_clip).
+            // mirroring DisplayXRDisplay. BiRP has no such shader pass — Unity fills the
+            // half-angles projection's depth range from the camera near/far under the
+            // provider, so the far (here the convergence distance) is delivered by
+            // shortening cam.farClipPlane (below).
             if (DisplayXRProviderDriver.IsActive)
             {
                 if (m_UsingSRP) PublishProviderForegroundClip();
+                else ApplyProviderForegroundClipBiRP(cam);
                 return;
             }
 
@@ -204,6 +210,29 @@ namespace DisplayXR
                 Shader.SetGlobalVector(s_EyePosLId, new Vector4(lx, ly, lz, 0f));
                 Shader.SetGlobalVector(s_EyePosRId, new Vector4(rx, ry, rz, 0f));
             }
+        }
+
+        // Provider mode, BiRP: deliver the foreground clip by shortening the camera's
+        // far clip plane to the convergence distance. Under the provider Unity builds
+        // each eye's projection from the runtime half-angles + the camera near/far, so
+        // cam.farClipPlane is the lever. Camera-centric shares one convergence for all
+        // views, so the per-eye fars match; averaging is exact here. Original far cached
+        // once and restored when the clip is off. #166.
+        void ApplyProviderForegroundClipBiRP(Camera cam)
+        {
+            if (foregroundOnlyClip)
+            {
+                DisplayXRProviderNative.dxr_prov_get_eye_clip(0, out float farL, out _, out _, out _);
+                DisplayXRProviderNative.dxr_prov_get_eye_clip(1, out float farR, out _, out _, out _);
+                float far = 0.5f * (farL + farR);
+                if (far > cam.nearClipPlane + 0.01f)
+                {
+                    if (m_CamFarCache < 0f) m_CamFarCache = cam.farClipPlane;
+                    cam.farClipPlane = far;
+                    return;
+                }
+            }
+            if (m_CamFarCache >= 0f) { cam.farClipPlane = m_CamFarCache; m_CamFarCache = -1f; }
         }
 
         /// <summary>Negate column 2 (Z) of a view matrix to convert OpenXR → Unity world handedness.</summary>
