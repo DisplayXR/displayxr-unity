@@ -338,6 +338,23 @@ static void destroy_extra_zone_texture(uint32_t i)
 	s_extra_tex_created[i] = false;
 }
 
+// Weave-target policy (#166). A Unity DisplayXR app owns its window like a native
+// handle app: the runtime weaves into a top-level overlay that tracks the app's
+// window (in-app, single-window UX, keyboard/mouse route to Unity via the focus
+// hook). This is the DEFAULT and the only supported shipping model.
+//
+// Self-host (runtime hosts its OWN window, windowHandle=NULL) is a bring-up /
+// diagnostic fallback only — opt in with DISPLAYXR_PROV_SELFHOST=1. Self-host has
+// no real window geometry (tracking origin floats to standing height) and leaves
+// Unity's window non-foreground (keyboard doesn't reach the Input System), so it
+// is NOT an app deployment mode. Returns 1 for the app-owned window, 0 for self-host.
+static int
+prov_want_app_window(void)
+{
+	const char *self_host = getenv("DISPLAYXR_PROV_SELFHOST");
+	return (self_host && self_host[0] == '1') ? 0 : 1;
+}
+
 // ============================================================================
 // Graphics-thread provider callbacks
 // ============================================================================
@@ -364,18 +381,16 @@ GfxStart(UnitySubsystemHandle handle, void *userData, UnityXRRenderingCapabiliti
 	ID3D12CommandQueue *q = nullptr;
 	if (!get_unity_d3d12(&dev, &q)) return kUnitySubsystemErrorCodeFailure;
 
-	// Weave target. Default = runtime self-hosts its own window (the M1b known-good
-	// baseline, validated on the panel). Set DISPLAYXR_PROV_OVERLAY=1 to instead
-	// bind to the WS_CHILD overlay over Unity's window (in-app weave) created on
-	// the main thread in LifecycleStart — that path's D3D12 swapchain present on a
-	// WS_CHILD is still being brought up (a child window doesn't composite a D3D12
-	// flip swapchain the way the hook path's top-level WS_POPUP does), so it is
-	// opt-in until that window-side issue is resolved.
-	const char *use_overlay = getenv("DISPLAYXR_PROV_OVERLAY");
-	void *overlay_hwnd = (use_overlay && use_overlay[0] == '1') ? s_overlay_hwnd : nullptr;
+	// Weave target. Default = the app-owned top-level WS_POPUP overlay over Unity's
+	// window (created on the main thread in LifecycleStart), so the runtime weaves
+	// into the app's own window like a native handle app. DISPLAYXR_PROV_SELFHOST=1
+	// falls back to the runtime self-hosting its own window (bring-up diagnostic).
+	// When the app owns the window but the overlay HWND failed to create, self-host
+	// is the safe fallback (overlay_hwnd stays NULL).
+	void *overlay_hwnd = prov_want_app_window() ? s_overlay_hwnd : nullptr;
 	prov_log(overlay_hwnd
-	             ? "[DisplayXR-PROV] weave target: top-level WS_POPUP overlay (in-app)\n"
-	             : "[DisplayXR-PROV] weave target: runtime self-hosted window\n");
+	             ? "[DisplayXR-PROV] weave target: app-owned top-level overlay (in-app)\n"
+	             : "[DisplayXR-PROV] weave target: runtime self-hosted window (SELFHOST diagnostic)\n");
 
 	// runtime_json = NULL -> resolve from XR_RUNTIME_JSON (sim_display bring-up).
 	if (!dxr_prov_session_start(nullptr, dev, q, overlay_hwnd)) {
@@ -685,15 +700,14 @@ UnitySubsystemErrorCode UNITY_INTERFACE_API
 LifecycleStart(UnitySubsystemHandle handle, void *userData)
 {
 	(void)handle; (void)userData;
-	// In-app weave (DISPLAYXR_PROV_OVERLAY=1): create a TOP-LEVEL WS_POPUP overlay
-	// over Unity's window HERE — this is the MAIN thread. (Creating it in GfxStart,
-	// the render thread, deadlocks: attaching to Unity's main-thread window joins
-	// the input queues while the main thread waits on GfxStart.) GfxStart binds the
-	// runtime to s_overlay_hwnd. Default (env unset) = runtime self-hosts its own
-	// window (the M1b baseline). The top-level popup composites the runtime's DComp
-	// weave; a WS_CHILD does not (#166).
-	const char *use_overlay = getenv("DISPLAYXR_PROV_OVERLAY");
-	if (use_overlay && use_overlay[0] == '1') {
+	// App-owned window (default): create a TOP-LEVEL WS_POPUP overlay over Unity's
+	// window HERE — this is the MAIN thread. (Creating it in GfxStart, the render
+	// thread, deadlocks: attaching to Unity's main-thread window joins the input
+	// queues while the main thread waits on GfxStart.) GfxStart binds the runtime to
+	// s_overlay_hwnd. DISPLAYXR_PROV_SELFHOST=1 opts out to the runtime self-hosting
+	// its own window (bring-up diagnostic). The top-level popup composites the
+	// runtime's DComp weave; a WS_CHILD does not (#166).
+	if (prov_want_app_window()) {
 		// Transparent apps take the UNOWNED transparent overlay path (created by
 		// displayxr_get_app_main_view because transparent_background_requested is set)
 		// + Unity cloak/off-screen (DisplayXRTransparentOverlay). Do NOT set
@@ -731,7 +745,7 @@ LifecycleStart(UnitySubsystemHandle handle, void *userData)
 		}
 	} else {
 		s_overlay_hwnd = nullptr;
-		prov_log("[DisplayXR-PROV] Lifecycle Start (no overlay; runtime self-hosts)\n");
+		prov_log("[DisplayXR-PROV] Lifecycle Start (DISPLAYXR_PROV_SELFHOST: runtime self-hosts its own window)\n");
 	}
 	return kUnitySubsystemErrorCodeSuccess;
 }

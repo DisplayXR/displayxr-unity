@@ -125,8 +125,8 @@ compositor-owned `ID3D12Resource`s on Unity's device"). Then:
 > (2) stereo separation needs a tracked face *or* app tunables — the bare scene's
 > view-rig defaults to `virtualDisplayHeight = display height`, and the raw eyes
 > read nominal when untracked; (3) wire `dxr_prov_set_tunables` from
-> `DisplayXRDisplay` (M2); (4) `WS_CHILD` overlay for in-app-window weave (M1 uses
-> `windowHandle=NULL` → runtime self-hosts).
+> `DisplayXRDisplay` (M2); (4) in-app-window weave — now the default via a top-level
+> `WS_POPUP` overlay (see "Weave target" below); M1 used `windowHandle=NULL` self-host.
 
 ## SPI render-pass setup
 
@@ -308,11 +308,23 @@ path (which has Unity render to its own RT and `Graphics.CopyTexture` into the
 bridge — a known-good content path the provider could adopt if the direct
 external-RT render proves problematic).
 
-**Weave target.** Self-host (runtime's own window, `windowHandle=NULL`) is the
-validated baseline. The in-app `WS_CHILD` overlay is env-gated opt-in
-(`DISPLAYXR_PROV_OVERLAY=1`) until its D3D12 swapchain-present on a child window
-is brought up (a child window doesn't composite a flip swapchain the way the
-hook path's top-level `WS_POPUP` does).
+**Weave target — the app owns its window (default).** A Unity DisplayXR app owns
+its window like a native handle app: the provider creates a **top-level `WS_POPUP`
+overlay** over Unity's client area (on the main thread in `LifecycleStart`) that
+tracks the app window's move/resize, and binds the runtime to it, so the runtime
+weaves into the app's own window (single-window UX). Keyboard/mouse route to Unity
+via the focus hook (`displayxr_install_focus_hook`; the Input System reads RawInput,
+delivered only to the foreground window). This is the **default and only supported
+shipping model**. A top-level popup is used (not `WS_CHILD`) because a child window
+doesn't composite the runtime's D3D12 DComp flip swapchain; the popup does.
+
+**Self-host is a diagnostic fallback, not an app mode.** `DISPLAYXR_PROV_SELFHOST=1`
+makes the runtime host its own window (`windowHandle=NULL`) — the M1b bring-up
+baseline. It is **not** a deployment mode: it produces a two-window experience,
+leaves Unity's window non-foreground (so keyboard doesn't reach the Input System),
+and has no real window geometry (the tracking origin floats to standing height).
+Use it only for bring-up/diagnostics. If the app-owned overlay HWND fails to
+create, GfxStart also falls back to self-host as a safety net.
 
 ## Porting hook-path features to provider mode — the inert-`DisplayXRFeature` rule
 
