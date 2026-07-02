@@ -61,6 +61,20 @@ namespace DisplayXR
             IsRunning && DisplayXRProviderNative.dxr_prov_set_eye_tracking_mode(manual ? 1 : 0) != 0;
 
         /// <summary>
+        /// Provider display geometry (XR_EXT_display_info) — the provider analog of
+        /// <see cref="DisplayXRFeature.DisplayInfo"/>, which is inert in provider mode.
+        /// Returns false if the provider isn't running or the runtime hasn't reported
+        /// valid geometry yet.
+        /// </summary>
+        public static bool TryGetDisplayInfo(out DisplayXRProviderNative.DisplayInfo info)
+        {
+            info = default;
+            if (!IsRunning) return false;
+            DisplayXRProviderNative.dxr_prov_get_display_info(out info);
+            return info.isValid != 0;
+        }
+
+        /// <summary>
         /// Request a transparent background for the provider session (#166 Phase A).
         /// Must be called BEFORE the session starts (e.g. from a transparent app's
         /// bootstrap, mirroring <see cref="DisplayXRTransparentOverlay.RequestTransparentSession"/>

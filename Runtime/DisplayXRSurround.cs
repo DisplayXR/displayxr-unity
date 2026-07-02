@@ -27,7 +27,15 @@ namespace DisplayXR
     /// allocates a SHARED RGBA8 texture + ID3D12Fence on Unity's device and
     /// registers it via xrSetSharedTextureSurround2DFenceEXT.
     /// </summary>
-    [AddComponentMenu("DisplayXR/2D Surround")]
+    /// <remarks>
+    /// DEPRECATED (#166): superseded by XR_EXT_display_zones (2D/3D zones) +
+    /// <see cref="DisplayXRLocal2D"/>. Zones give crisp in-canvas 2D bands over 3D
+    /// without the hook-only shared-surround-texture path, and work under the custom
+    /// display provider (which this component does not). No plugin sample or test app
+    /// uses it. Kept for the hook path only; do not build new content on it.
+    /// </remarks>
+    [System.Obsolete("2D Surround is deprecated (#166): use XR_EXT_display_zones (2D/3D zones) + DisplayXRLocal2D. Surround is hook-path-only and has no provider support.", false)]
+    [AddComponentMenu("DisplayXR/2D Surround (deprecated)")]
     [RequireComponent(typeof(Canvas))]
     [ExecuteAlways]
     public class DisplayXRSurround : MonoBehaviour

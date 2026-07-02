@@ -97,21 +97,37 @@ namespace DisplayXR
             if (subtitle == null)
                 subtitle = Resources.Load<Texture2D>("for_unity");
 
-            m_Feature = DisplayXRFeature.Instance;
-
             // Wait for the runtime to report display geometry so we can size the
-            // logo to the physical display. Fall back after ~2 s.
+            // logo to the physical display. Fall back after ~2 s. In provider mode
+            // (#166) DisplayXRFeature is inert (no Unity OpenXR loader), so read the
+            // provider's own XR_EXT_display_info instead.
             float t = 0f;
-            while ((m_Feature == null || !m_Feature.DisplayInfo.isValid) && t < 2f)
+            float displayH = 0.19f;
+            if (DisplayXRProviderDriver.IsActive)
             {
-                m_Feature = m_Feature ?? DisplayXRFeature.Instance;
-                t += Time.deltaTime;
-                yield return null;
+                while (t < 2f)
+                {
+                    if (DisplayXRProvider.TryGetDisplayInfo(out var di) && di.heightM > 0f)
+                    {
+                        displayH = di.heightM;
+                        break;
+                    }
+                    t += Time.deltaTime;
+                    yield return null;
+                }
             }
-
-            float displayH = (m_Feature != null && m_Feature.DisplayInfo.isValid)
-                ? m_Feature.DisplayInfo.displayHeightMeters
-                : 0.19f;
+            else
+            {
+                m_Feature = DisplayXRFeature.Instance;
+                while ((m_Feature == null || !m_Feature.DisplayInfo.isValid) && t < 2f)
+                {
+                    m_Feature = m_Feature ?? DisplayXRFeature.Instance;
+                    t += Time.deltaTime;
+                    yield return null;
+                }
+                if (m_Feature != null && m_Feature.DisplayInfo.isValid)
+                    displayH = m_Feature.DisplayInfo.displayHeightMeters;
+            }
 
             BuildArtwork(displayH);
 
