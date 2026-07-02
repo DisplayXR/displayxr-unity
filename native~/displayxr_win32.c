@@ -1898,6 +1898,17 @@ displayxr_set_overlay_hit_rect(int x, int y, int w, int h)
 // rects (alternating opaque/transparent every pixel of every row),
 // which would be ~580 KB of RECT data — fine but wasteful. Real
 // silhouettes RLE down to a few hundred to a few thousand rects.
+//
+// (#166) Multi-zone: when the provider advertises >1 3D zone, the full-window mask
+// is stamped into EACH zone's rect (union), not just the primary canvas rect — all
+// zones are portals of the same content, so the same silhouette belongs in every
+// zone. On the hook path / single zone the provider reports 1 zone and this falls
+// back to the canvas-rect mapping below. Provider getters (extern "C", defined in
+// displayxr_provider_session.cpp) are safe to call when the provider is inactive
+// (they read zero-initialized state → count 1).
+extern uint32_t dxr_prov_get_zone_count(void);
+extern int      dxr_prov_get_zone_rect_px(uint32_t zone, int *x, int *y, int *w, int *h);
+
 void
 displayxr_set_overlay_hit_mask(const uint8_t *mask, int mask_w, int mask_h,
                                int dst_w, int dst_h)
@@ -1924,46 +1935,62 @@ displayxr_set_overlay_hit_mask(const uint8_t *mask, int mask_w, int mask_h,
 	if (rects == NULL)
 		return;
 
-	// (#131) When a canvas sub-rect is active, the runtime shrinks the 3D weave
-	// into that sub-rect, so the displayed silhouette lives there too. Map the
-	// full-window mask into the sub-rect (same scale+offset the weave applies)
-	// instead of the full overlay client, so the click-through region matches the
-	// shrunk tiger. No sub-rect → leaves origin (0,0)/extent (dst_w,dst_h), i.e.
-	// the legacy whole-client mapping.
-	int32_t  cvx = 0, cvy = 0;
-	uint32_t cvw = (uint32_t)dst_w, cvh = (uint32_t)dst_h;
-	displayxr_get_canvas_rect_px(&cvx, &cvy, &cvw, &cvh);
+	// Target rect(s) the full-window mask is mapped into. (#131) A single canvas
+	// sub-rect: the runtime shrinks the 3D weave into it, so the silhouette lives
+	// there too — map the mask into it (same scale+offset the weave applies), not the
+	// full overlay. (#166) Multi-zone: the runtime weaves each zone into its own rect,
+	// so stamp the mask into EACH zone rect and union. dxr_prov_get_zone_count()>1
+	// selects multi-zone; otherwise fall back to the canvas rect (== full client when
+	// no sub-rect is set) — the legacy single-zone/hook mapping, unchanged.
+	int      zone_count = 1;
+	int      use_zones  = 0;
+	uint32_t pzc = dxr_prov_get_zone_count();
+	if (pzc > 1) { zone_count = (int)pzc; use_zones = 1; }
 
-	// Round each rect's edges OUTWARD when mapping mask cells → target pixels:
-	// leading edges (left/top) floor, trailing edges (right/bottom) ceil. A mask
-	// cell covers cvw/mask_w (cvh/mask_h) target px; with the canvas sub-rect this
-	// can be several px per cell, and plain truncation on the trailing edges would
-	// shrink the catch-region inside the silhouette and clip the tiger's edges.
-	// Outward rounding dilates by <1 cell so the region fully covers the silhouette.
-	for (int my = 0; my < mask_h; my++) {
-		const uint8_t *row = mask + (size_t)my * (size_t)mask_w;
-		int top    = (int)(cvy + (LONGLONG)my * cvh / mask_h);
-		int bottom = (int)(cvy + ((LONGLONG)(my + 1) * cvh + mask_h - 1) / mask_h);
-		int mx = 0;
-		while (mx < mask_w) {
-			while (mx < mask_w && row[mx] == 0) mx++;
-			if (mx >= mask_w) break;
-			int x0 = mx;
-			while (mx < mask_w && row[mx] != 0) mx++;
-			int x1 = mx;
-			if (n >= cap) {
-				int new_cap = cap * 2;
-				RECT *nr = (RECT *)realloc(rects,
-				                           (size_t)new_cap * sizeof(RECT));
-				if (nr == NULL) { free(rects); return; }
-				rects = nr;
-				cap = new_cap;
+	for (int zi = 0; zi < zone_count; zi++) {
+		int32_t  cvx = 0, cvy = 0;
+		uint32_t cvw = (uint32_t)dst_w, cvh = (uint32_t)dst_h;
+		if (use_zones) {
+			int rx = 0, ry = 0, rw = 0, rh = 0;
+			if (!dxr_prov_get_zone_rect_px((uint32_t)zi, &rx, &ry, &rw, &rh)
+			    || rw <= 0 || rh <= 0)
+				continue;
+			cvx = rx; cvy = ry; cvw = (uint32_t)rw; cvh = (uint32_t)rh;
+		} else {
+			displayxr_get_canvas_rect_px(&cvx, &cvy, &cvw, &cvh);
+		}
+
+		// Round each rect's edges OUTWARD when mapping mask cells → target pixels:
+		// leading edges (left/top) floor, trailing edges (right/bottom) ceil. A mask
+		// cell covers cvw/mask_w (cvh/mask_h) target px; with a sub-rect this can be
+		// several px per cell, and plain truncation on the trailing edges would shrink
+		// the catch-region inside the silhouette and clip the tiger's edges. Outward
+		// rounding dilates by <1 cell so the region fully covers the silhouette.
+		for (int my = 0; my < mask_h; my++) {
+			const uint8_t *row = mask + (size_t)my * (size_t)mask_w;
+			int top    = (int)(cvy + (LONGLONG)my * cvh / mask_h);
+			int bottom = (int)(cvy + ((LONGLONG)(my + 1) * cvh + mask_h - 1) / mask_h);
+			int mx = 0;
+			while (mx < mask_w) {
+				while (mx < mask_w && row[mx] == 0) mx++;
+				if (mx >= mask_w) break;
+				int x0 = mx;
+				while (mx < mask_w && row[mx] != 0) mx++;
+				int x1 = mx;
+				if (n >= cap) {
+					int new_cap = cap * 2;
+					RECT *nr = (RECT *)realloc(rects,
+					                           (size_t)new_cap * sizeof(RECT));
+					if (nr == NULL) { free(rects); return; }
+					rects = nr;
+					cap = new_cap;
+				}
+				rects[n].left   = (LONG)(cvx + (LONGLONG)x0 * cvw / mask_w);
+				rects[n].top    = (LONG)top;
+				rects[n].right  = (LONG)(cvx + ((LONGLONG)x1 * cvw + mask_w - 1) / mask_w);
+				rects[n].bottom = (LONG)bottom;
+				n++;
 			}
-			rects[n].left   = (LONG)(cvx + (LONGLONG)x0 * cvw / mask_w);
-			rects[n].top    = (LONG)top;
-			rects[n].right  = (LONG)(cvx + ((LONGLONG)x1 * cvw + mask_w - 1) / mask_w);
-			rects[n].bottom = (LONG)bottom;
-			n++;
 		}
 	}
 

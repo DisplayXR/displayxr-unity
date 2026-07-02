@@ -116,6 +116,30 @@ namespace DisplayXR
         public static extern void dxr_prov_get_eye_clip(
             uint eye, out float outFar, out float outEx, out float outEy, out float outEz);
 
+        /// <summary>Per-zone per-eye foreground clip (#166 multi-zone). Zone 0 = primary,
+        /// i>=1 = extra zone i-1. Returns 1 on success.</summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int dxr_prov_get_zone_eye_clip(
+            uint zone, uint eye, out float outFar, out float outEx, out float outEy, out float outEz);
+
+        /// <summary>Number of 3D zones (1 primary + active extra zones). Multi-zone
+        /// transparent mask (#166): the overlay unions a per-zone silhouette.</summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern uint dxr_prov_get_zone_count();
+
+        /// <summary>Fill zone `zone`'s cyclopean L/R view+proj (float[16] each,
+        /// column-major). Returns 1 on success. Zone 0 = primary; i>=1 = extra i-1.</summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int dxr_prov_get_zone_stereo_matrices(
+            uint zone,
+            [Out] float[] lv, [Out] float[] lp, [Out] float[] rv, [Out] float[] rp);
+
+        /// <summary>Fill zone `zone`'s window-client pixel rect (top-left origin).
+        /// Returns 1 on success.</summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int dxr_prov_get_zone_rect_px(
+            uint zone, out int x, out int y, out int w, out int h);
+
         /// <summary>
         /// Push the stereo rig tunables (mirrors displayxr_set_tunables, minus the
         /// clipAtDisplayPlane flag the rig descriptor doesn't carry). Scale-as-zoom
