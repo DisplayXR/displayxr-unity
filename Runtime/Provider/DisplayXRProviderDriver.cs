@@ -120,6 +120,12 @@ namespace DisplayXR
 
             Vector3 p = cam.transform.position;
             Quaternion q = cam.transform.rotation;
+            // Stash the exact Unity-world rig pose we send the runtime as the display
+            // plane, so the URP foreground clip references the SAME pose (its plane
+            // origin/normal) rather than re-reading the transform independently (#166).
+            DisplayXRProvider.RigPlanePos     = p;
+            DisplayXRProvider.RigPlaneForward = cam.transform.forward;
+            DisplayXRProvider.RigPlaneValid   = true;
             DisplayXRProviderNative.dxr_prov_set_display_pose(p.x, p.y, p.z, q.x, q.y, q.z, q.w, 1);
         }
     }

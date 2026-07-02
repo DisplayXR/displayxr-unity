@@ -111,6 +111,51 @@ inline UnityXRVector4 oxr_to_unity_quat(const float q[4])
 	return UnityXRVector4{ -q[0], -q[1], q[2], q[3] };
 }
 
+// Fill deviceAnchorToEyePose (Unity frame) with the located view expressed RELATIVE
+// to the sent rig pose: rigPose^-1 * eyePose, computed in the OpenXR frame, then
+// converted. The located views already bake the rig pose in (the runtime owns the
+// Kooima math and we chain rig_pose onto xrLocateViews), and Unity re-composes the
+// SAME rig pose via the camera transform (deviceAnchor == cam.transform == the pose
+// we sent). Without subtracting it here the rig origin is applied TWICE — the render
+// eye drifts by the rig displacement, and the URP foreground-clip plane (built from
+// the single-application cam.transform) no longer matches, so the clip stops tracking
+// the moving display plane (#166). If no rig pose is set, pass the view through.
+inline void set_eye_pose_rig_relative(
+	UnityXRNextFrameDesc::UnityXRRenderPass::UnityXRRenderParams &rp, const DxrProvView &v)
+{
+	float rp_pos[3], rp_quat[4];
+	if (!dxr_prov_get_display_pose_oxr(rp_pos, rp_quat)) {
+		rp.deviceAnchorToEyePose.position = oxr_to_unity_pos(v.position);
+		rp.deviceAnchorToEyePose.rotation = oxr_to_unity_quat(v.orientation);
+		return;
+	}
+	// invRot = conjugate(rigRot)
+	const float qx = -rp_quat[0], qy = -rp_quat[1], qz = -rp_quat[2], qw = rp_quat[3];
+	// d = eyePos - rigPos
+	const float dx = v.position[0] - rp_pos[0];
+	const float dy = v.position[1] - rp_pos[1];
+	const float dz = v.position[2] - rp_pos[2];
+	// relPos = invRot * d  (rotate vector d by quaternion (qx,qy,qz,qw))
+	const float tx = 2.0f * (qy * dz - qz * dy);
+	const float ty = 2.0f * (qz * dx - qx * dz);
+	const float tz = 2.0f * (qx * dy - qy * dx);
+	float rel_pos[3] = {
+		dx + qw * tx + (qy * tz - qz * ty),
+		dy + qw * ty + (qz * tx - qx * tz),
+		dz + qw * tz + (qx * ty - qy * tx),
+	};
+	// relRot = invRot * eyeRot  (quaternion product)
+	const float ex = v.orientation[0], ey = v.orientation[1], ez = v.orientation[2], ew = v.orientation[3];
+	float rel_quat[4] = {
+		qw * ex + qx * ew + qy * ez - qz * ey, // x
+		qw * ey - qx * ez + qy * ew + qz * ex, // y
+		qw * ez + qx * ey - qy * ex + qz * ew, // z
+		qw * ew - qx * ex - qy * ey - qz * ez, // w
+	};
+	rp.deviceAnchorToEyePose.position = oxr_to_unity_pos(rel_pos);
+	rp.deviceAnchorToEyePose.rotation = oxr_to_unity_quat(rel_quat);
+}
+
 // ============================================================================
 // Acquire Unity's D3D12 device + command queue (graphics thread)
 // ============================================================================
@@ -377,8 +422,7 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 			DxrProvView v;
 			dxr_prov_get_view(eye, &v);
 			UnityXRNextFrameDesc::UnityXRRenderPass::UnityXRRenderParams &rp = pass.renderParams[eye];
-			rp.deviceAnchorToEyePose.position = oxr_to_unity_pos(v.position);
-			rp.deviceAnchorToEyePose.rotation = oxr_to_unity_quat(v.orientation);
+			set_eye_pose_rig_relative(rp, v);
 			rp.projection.type = kUnityXRProjectionTypeHalfAngles;
 			rp.projection.data.halfAngles.left   = tanf(v.fov[0]);
 			rp.projection.data.halfAngles.right  = tanf(v.fov[1]);
@@ -410,8 +454,7 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 			pass.cullingPassIndex = eye;
 			pass.renderParamsCount = 1;
 			UnityXRNextFrameDesc::UnityXRRenderPass::UnityXRRenderParams &rp = pass.renderParams[0];
-			rp.deviceAnchorToEyePose.position = oxr_to_unity_pos(v.position);
-			rp.deviceAnchorToEyePose.rotation = oxr_to_unity_quat(v.orientation);
+			set_eye_pose_rig_relative(rp, v);
 			rp.projection.type = kUnityXRProjectionTypeHalfAngles;
 			rp.projection.data.halfAngles.left   = tanf(v.fov[0]);
 			rp.projection.data.halfAngles.right  = tanf(v.fov[1]);
@@ -450,8 +493,7 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 				for (uint32_t eye = 0; eye < 2; eye++) {
 					DxrProvView v; dxr_prov_get_extra_zone_view(i, eye, &v);
 					UnityXRNextFrameDesc::UnityXRRenderPass::UnityXRRenderParams &rp = pass.renderParams[eye];
-					rp.deviceAnchorToEyePose.position = oxr_to_unity_pos(v.position);
-					rp.deviceAnchorToEyePose.rotation = oxr_to_unity_quat(v.orientation);
+					set_eye_pose_rig_relative(rp, v);
 					rp.projection.type = kUnityXRProjectionTypeHalfAngles;
 					rp.projection.data.halfAngles.left   = tanf(v.fov[0]);
 					rp.projection.data.halfAngles.right  = tanf(v.fov[1]);
@@ -475,8 +517,7 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 					pass.cullingPassIndex = pi;
 					pass.renderParamsCount = 1;
 					UnityXRNextFrameDesc::UnityXRRenderPass::UnityXRRenderParams &rp = pass.renderParams[0];
-					rp.deviceAnchorToEyePose.position = oxr_to_unity_pos(v.position);
-					rp.deviceAnchorToEyePose.rotation = oxr_to_unity_quat(v.orientation);
+					set_eye_pose_rig_relative(rp, v);
 					rp.projection.type = kUnityXRProjectionTypeHalfAngles;
 					rp.projection.data.halfAngles.left   = tanf(v.fov[0]);
 					rp.projection.data.halfAngles.right  = tanf(v.fov[1]);

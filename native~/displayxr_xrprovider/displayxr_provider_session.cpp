@@ -2436,6 +2436,24 @@ void dxr_prov_set_display_pose(float px, float py, float pz,
 	}
 }
 
+// Expose the sent rig pose in the OpenXR frame (as stored). Returns 1 if a pose is
+// set, 0 otherwise. Used by the render handoff to make deviceAnchorToEyePose
+// rig-RELATIVE — the located views already bake this rig pose in, and Unity
+// re-composes the same pose via the camera transform, so without subtracting it the
+// rig origin is applied twice (drifts the URP foreground-clip plane; #166).
+int dxr_prov_get_display_pose_oxr(float out_pos[3], float out_quat[4])
+{
+	if (!s_ps.display_pose_set) return 0;
+	out_pos[0] = s_ps.display_pose.position.x;
+	out_pos[1] = s_ps.display_pose.position.y;
+	out_pos[2] = s_ps.display_pose.position.z;
+	out_quat[0] = s_ps.display_pose.orientation.x;
+	out_quat[1] = s_ps.display_pose.orientation.y;
+	out_quat[2] = s_ps.display_pose.orientation.z;
+	out_quat[3] = s_ps.display_pose.orientation.w;
+	return 1;
+}
+
 void dxr_prov_get_display_info(DxrProvDisplayInfo *out_info)
 {
 	if (out_info) *out_info = s_ps.display_info;

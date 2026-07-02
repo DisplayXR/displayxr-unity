@@ -211,7 +211,13 @@ namespace DisplayXR
                 clip ? new Vector4(farL, farR, 1f, 1f) : Vector4.zero);
             if (clip)
             {
-                Vector3 rp = transform.position, fwd = transform.forward;
+                // Plane origin/normal = the exact rig pose the driver sends the runtime
+                // as the display plane. The provider now hands Unity a rig-RELATIVE
+                // deviceAnchorToEyePose, so the render eye (curEye = UNITY_MATRIX_I_V)
+                // carries the rig pose exactly once — matching this single-application
+                // cam.transform, so the clip plane tracks the moving rig (#166).
+                Vector3 rp  = DisplayXRProvider.RigPlaneValid ? DisplayXRProvider.RigPlanePos     : transform.position;
+                Vector3 fwd = DisplayXRProvider.RigPlaneValid ? DisplayXRProvider.RigPlaneForward : transform.forward;
                 Shader.SetGlobalVector(s_RigPosId, new Vector4(rp.x, rp.y, rp.z, 0f));
                 Shader.SetGlobalVector(s_RigFwdId, new Vector4(fwd.x, fwd.y, fwd.z, 0f));
                 Shader.SetGlobalVector(s_EyePosLId, new Vector4(lx, ly, lz, 0f));
