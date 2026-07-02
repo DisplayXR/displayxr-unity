@@ -10,7 +10,8 @@
     "3d-display",
     "stereo",
     "displayxr",
-    "light-field"
+    "light-field",
+    "xreditorsubsystem"
   ],
   "author": {
     "name": "DisplayXR contributors",
