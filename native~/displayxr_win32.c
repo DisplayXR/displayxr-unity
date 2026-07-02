@@ -1224,36 +1224,194 @@ displayxr_get_app_main_view(void)
 // switch). This third mode gives BOTH: a standalone, movable/resizable weave
 // window that does NOT track Unity, bound as win_binding.windowHandle.
 //
-// Recipe mirrors the proven standalone preview window (displayxr_standalone.cpp):
-// WS_OVERLAPPEDWINDOW (OS-native title-bar move + sizing-border resize; the SR
-// weaver subclass sees the OS modal-move WM_ENTERSIZEMOVE/EXITSIZEMOVE bracket
-// natively and phase-snaps — no synthetic #61 bracket needed) + WS_EX_NOACTIVATE
-// (never steals OS foreground, so the editor keeps focus and the Input System
-// keeps receiving input) + WS_EX_TOPMOST (stays visible on the Leia panel) +
-// Per-Monitor-Aware-V2 DPI (the SR weaver crashed on a DPI/activation message
-// when self-host handed focus to the per-monitor-aware editor).
+// Recipe mirrors the proven standalone preview window (displayxr_standalone.cpp
+// sa_wndproc): WS_OVERLAPPEDWINDOW + WS_EX_NOACTIVATE (never steals OS foreground,
+// so the editor keeps focus and Unity's Raw Input keeps flowing — Mouse.current
+// .delta for camera drag etc.) + WS_EX_TOPMOST (visible on the Leia panel) +
+// Per-Monitor-Aware-V2 DPI (the SR weaver crashed on a DPI/activation message when
+// self-host handed focus to the per-monitor-aware editor). CRITICAL: the wndproc
+// INTERCEPTS the OS SC_MOVE/SC_SIZE modal loops with a custom capture-based drag —
+// letting DefWindowProc run its modal move/resize loop BLOCKS Unity's main thread
+// (the message pump never returns to the PlayerLoop), so FrameTick stops and the
+// weave/Kooima freezes for the whole drag = the "no window-relative Kooima on drag"
+// symptom. The custom drag keeps the main thread pumping (real-time Kooima) and
+// #61-brackets the SR weaver so it phase-snaps to lenticular-aligned pixels.
 // ============================================================================
 
 static HWND s_dedicated_hwnd = NULL; // DEDICATED_CLASS_NAME declared at top (find_unity_hwnd skip)
 static int s_dedicated_class_registered = 0;
+// Custom SC_MOVE/SC_SIZE drag state (mirrors s_sa.dragging / sizing_edge).
+static int   s_ded_dragging     = 0;
+static int   s_ded_sizing_edge  = 0;   // WMSZ_* (1..8) while resizing, else 0
+static POINT s_ded_drag_cursor  = {0, 0};
+static RECT  s_ded_drag_rect    = {0, 0, 0, 0};
 
 static LRESULT CALLBACK
 dedicated_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
-	// Quit the whole app on close (X button / Alt+F4), mirroring the overlay
-	// path: swallow WM_CLOSE (so DefWindowProc doesn't DestroyWindow the weave
-	// target out from under the runtime) and raise the close-request flag for C#
-	// to poll (displayxr_consume_overlay_close_request → Application.Quit).
-	if (msg == WM_CLOSE) {
+	// Track mouse-button state in the shared s_vkey_state table so the app can read
+	// it via displayxr_get_overlay_pointer. The woven output is a SEPARATE window
+	// from Unity's Game View, so Unity's Input System doesn't see clicks here
+	// (Mouse.current.leftButton stays false) — same reason the SA preview window
+	// tracks buttons natively. Motion still comes from Mouse.current.delta (Raw
+	// Input reaches the foreground editor because the window is WS_EX_NOACTIVATE).
+	switch (msg) {
+	case WM_LBUTTONDOWN: case WM_LBUTTONDBLCLK:
+		s_vkey_state[VK_LBUTTON] = (SHORT)(0x8000 | 0x0001);
+		SetCapture(hwnd); // keep the matching UP even if the drag leaves the window
+		break;
+	case WM_LBUTTONUP:
+		s_vkey_state[VK_LBUTTON] = 0x0001;
+		// Release capture only if we're not in a custom window move/resize (those
+		// own the capture + release it in their own branches below).
+		if (!s_ded_dragging && !s_ded_sizing_edge && GetCapture() == hwnd)
+			ReleaseCapture();
+		break;
+	case WM_RBUTTONDOWN: s_vkey_state[VK_RBUTTON] = (SHORT)(0x8000 | 0x0001); break;
+	case WM_RBUTTONUP:   s_vkey_state[VK_RBUTTON] = 0x0001; break;
+	case WM_MBUTTONDOWN: s_vkey_state[VK_MBUTTON] = (SHORT)(0x8000 | 0x0001); break;
+	case WM_MBUTTONUP:   s_vkey_state[VK_MBUTTON] = 0x0001; break;
+	}
+
+	switch (msg) {
+	case WM_MOUSEACTIVATE:
+		// Don't become foreground on click (belt-and-braces with WS_EX_NOACTIVATE):
+		// keeps the editor foreground so Unity's Input System keeps getting Raw Input
+		// (mouse delta/buttons for camera drag). Without this, clicking the weave
+		// window to drag-rotate can steal focus and freeze Unity's mouse.
+		return MA_NOACTIVATE;
+
+	case WM_CLOSE:
+		// Quit the whole app on close (X / Alt+F4), mirroring the overlay path:
+		// swallow WM_CLOSE (don't DestroyWindow the live weave target) and raise the
+		// close-request flag for C# to poll (Application.Quit → Play stop → the
+		// subsystem's LifecycleStop destroys the window; see teardown below).
 		displayxr_log("[DisplayXR][DedWnd] WM_CLOSE -> quit request\n");
 		InterlockedExchange(&s_overlay_close_requested, 1);
 		return 0;
+
+	case WM_DESTROY:
+		// The window is going away (our own DestroyWindow on teardown, or an OS
+		// destroy). Clear the handle so a re-Play recreates it and the app-facing
+		// overlay helpers stop targeting a dead HWND.
+		if (s_overlay_hwnd == hwnd) { s_overlay_hwnd = NULL; s_overlay_is_toplevel = 0; }
+		s_dedicated_hwnd = NULL;
+		return 0;
+
+	// ----- #61 custom move/resize (bypass DefWindowProc's Unity-blocking modal loop) -----
+	case WM_SYSCOMMAND:
+		if ((wParam & 0xFFF0) == SC_MOVE) {
+			SetCapture(hwnd);
+			GetCursorPos(&s_ded_drag_cursor);
+			GetWindowRect(hwnd, &s_ded_drag_rect);
+			s_ded_dragging = 1;
+			SendMessageW(hwnd, WM_ENTERSIZEMOVE, 0, 0); // weaver phase-snap bracket
+			return 0;
+		}
+		if ((wParam & 0xFFF0) == SC_SIZE) {
+			UINT edge = (UINT)(wParam & 0xF); // WMSZ_* (1..8)
+			if (edge >= WMSZ_LEFT && edge <= WMSZ_BOTTOMRIGHT) {
+				SetCapture(hwnd);
+				GetCursorPos(&s_ded_drag_cursor);
+				GetWindowRect(hwnd, &s_ded_drag_rect);
+				s_ded_sizing_edge = (int)edge;
+				SendMessageW(hwnd, WM_ENTERSIZEMOVE, 0, 0);
+				return 0;
+			}
+		}
+		break;
+
+	case WM_SETCURSOR:
+		// Force the sizing cursor during a custom resize (we hold capture, so the OS
+		// would otherwise revert to the arrow).
+		if (s_ded_sizing_edge) {
+			LPCWSTR shape = (LPCWSTR)IDC_ARROW;
+			switch (s_ded_sizing_edge) {
+			case WMSZ_LEFT: case WMSZ_RIGHT:          shape = (LPCWSTR)IDC_SIZEWE;   break;
+			case WMSZ_TOP: case WMSZ_BOTTOM:          shape = (LPCWSTR)IDC_SIZENS;   break;
+			case WMSZ_TOPLEFT: case WMSZ_BOTTOMRIGHT: shape = (LPCWSTR)IDC_SIZENWSE; break;
+			case WMSZ_TOPRIGHT: case WMSZ_BOTTOMLEFT: shape = (LPCWSTR)IDC_SIZENESW; break;
+			}
+			SetCursor(LoadCursorW(NULL, shape));
+			return TRUE;
+		}
+		break;
+
+	case WM_MOUSEMOVE:
+		if (s_ded_dragging) {
+			POINT cur; GetCursorPos(&cur);
+			int dx = cur.x - s_ded_drag_cursor.x;
+			int dy = cur.y - s_ded_drag_cursor.y;
+			SetWindowPos(hwnd, NULL,
+			             s_ded_drag_rect.left + dx, s_ded_drag_rect.top + dy,
+			             0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+			return 0;
+		}
+		if (s_ded_sizing_edge) {
+			POINT cur; GetCursorPos(&cur);
+			int dx = cur.x - s_ded_drag_cursor.x;
+			int dy = cur.y - s_ded_drag_cursor.y;
+			RECT r = s_ded_drag_rect;
+			switch (s_ded_sizing_edge) {
+			case WMSZ_LEFT:        r.left   += dx; break;
+			case WMSZ_RIGHT:       r.right  += dx; break;
+			case WMSZ_TOP:         r.top    += dy; break;
+			case WMSZ_TOPLEFT:     r.top    += dy; r.left  += dx; break;
+			case WMSZ_TOPRIGHT:    r.top    += dy; r.right += dx; break;
+			case WMSZ_BOTTOM:      r.bottom += dy; break;
+			case WMSZ_BOTTOMLEFT:  r.bottom += dy; r.left  += dx; break;
+			case WMSZ_BOTTOMRIGHT: r.bottom += dy; r.right += dx; break;
+			}
+			int minW = GetSystemMetrics(SM_CXMINTRACK);
+			int minH = GetSystemMetrics(SM_CYMINTRACK);
+			if (r.right - r.left < minW) {
+				if (s_ded_sizing_edge == WMSZ_LEFT || s_ded_sizing_edge == WMSZ_TOPLEFT ||
+				    s_ded_sizing_edge == WMSZ_BOTTOMLEFT) r.left = r.right - minW;
+				else r.right = r.left + minW;
+			}
+			if (r.bottom - r.top < minH) {
+				if (s_ded_sizing_edge == WMSZ_TOP || s_ded_sizing_edge == WMSZ_TOPLEFT ||
+				    s_ded_sizing_edge == WMSZ_TOPRIGHT) r.top = r.bottom - minH;
+				else r.bottom = r.top + minH;
+			}
+			SetWindowPos(hwnd, NULL, r.left, r.top,
+			             r.right - r.left, r.bottom - r.top,
+			             SWP_NOZORDER | SWP_NOACTIVATE);
+			return 0;
+		}
+		break;
+
+	case WM_LBUTTONUP:
+		if (s_ded_dragging) {
+			s_ded_dragging = 0;
+			SendMessageW(hwnd, WM_EXITSIZEMOVE, 0, 0);
+			ReleaseCapture();
+			return 0;
+		}
+		if (s_ded_sizing_edge) {
+			s_ded_sizing_edge = 0;
+			SendMessageW(hwnd, WM_EXITSIZEMOVE, 0, 0);
+			ReleaseCapture();
+			return 0;
+		}
+		break;
+
+	case WM_CAPTURECHANGED: {
+		int was_active = s_ded_dragging || s_ded_sizing_edge;
+		s_ded_dragging = 0;
+		s_ded_sizing_edge = 0;
+		if (was_active)
+			SendMessageW(hwnd, WM_EXITSIZEMOVE, 0, 0);
+		break;
 	}
-	// Everything else — including the OS caption move and sizing-border resize
-	// modal loops (and WM_DPICHANGED for the Per-Monitor-V2 context) — is handled
-	// by DefWindowProc. Window-relative Kooima + #172 live realloc read the live
-	// HWND geometry directly (the runtime tracks the bound HWND's screen position;
-	// the provider polls GetClientRect), so no per-message viewport push is needed.
+
+	default:
+		break;
+	}
+	// WM_DPICHANGED (Per-Monitor-V2) and any non-intercepted message fall through to
+	// DefWindowProc. Window-relative Kooima + #172 realloc read the live HWND geometry
+	// directly (runtime tracks the bound HWND; provider polls GetClientRect); the
+	// custom drag above keeps that geometry updating in real time during the drag.
 	return DefWindowProcW(hwnd, msg, wParam, lParam);
 }
 
@@ -1324,6 +1482,25 @@ displayxr_create_provider_dedicated_window(void)
 	              "WS_OVERLAPPEDWINDOW + NOACTIVATE/TOPMOST, Per-Monitor-V2 DPI (#173)\n",
 	              (void *)s_dedicated_hwnd, def_w, def_h);
 	return (void *)s_dedicated_hwnd;
+}
+
+// (#173) Destroy the dedicated provider window on subsystem teardown (editor Play
+// stop). Called from the provider's LifecycleStop — which runs on the MAIN thread
+// (where the window was created, so DestroyWindow is valid) and AFTER GfxStop's
+// dxr_prov_session_stop (xrDestroySession unhooks the SR weaver's window subclass),
+// so the destroy is clean. Without this the window lingered visible + TOPMOST
+// showing a frozen last frame with a stale weaver subclass = the "stopping Play
+// freezes the window" report. Idempotent; a re-Play recreates it in LifecycleStart.
+void
+displayxr_destroy_provider_dedicated_window(void)
+{
+	HWND h = s_dedicated_hwnd;
+	s_dedicated_hwnd = NULL;
+	if (s_overlay_hwnd == h) { s_overlay_hwnd = NULL; s_overlay_is_toplevel = 0; }
+	if (h != NULL && IsWindow(h)) {
+		displayxr_log("[DisplayXR] Destroying dedicated provider window %p (#173 teardown)\n", (void *)h);
+		DestroyWindow(h);
+	}
 }
 
 void *
