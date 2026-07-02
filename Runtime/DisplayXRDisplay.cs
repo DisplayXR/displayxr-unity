@@ -67,6 +67,8 @@ namespace DisplayXR
         private static readonly int s_ForegroundFarId = Shader.PropertyToID("_DXRForegroundFar");
         private static readonly int s_EyePosLId = Shader.PropertyToID("_DXREyePosL");
         private static readonly int s_EyePosRId = Shader.PropertyToID("_DXREyePosR");
+        private static readonly int s_RigPosId = Shader.PropertyToID("_DXRRigPos");
+        private static readonly int s_RigFwdId = Shader.PropertyToID("_DXRRigFwd");
 
         // Set by DisplayXRSplash on the boot-splash rig. Such a rig does NOT join
         // the rig registry — so app scripts that bind to DisplayXRRigManager
@@ -200,10 +202,18 @@ namespace DisplayXR
             DisplayXRProviderNative.dxr_prov_get_eye_clip(1, out float farR, out float rx, out float ry, out float rz);
             float nz = m_Camera != null ? m_Camera.nearClipPlane : 0.3f;
             bool clip = farL > nz && farR > nz;
+            // Plane mode (w=1): the shader derives each eye's far as its perpendicular
+            // distance to the display plane (through the rig origin, normal = rig forward),
+            // straight from that eye's own render position — per-zone AND per-eye correct.
+            // The published-eye-pick fails in multi-zone because a zone's pair can shift
+            // more than half the IPD (#166), so its right eye gets the wrong (short) far.
             Shader.SetGlobalVector(s_ForegroundFarId,
-                clip ? new Vector4(farL, farR, 1f, 0f) : Vector4.zero);
+                clip ? new Vector4(farL, farR, 1f, 1f) : Vector4.zero);
             if (clip)
             {
+                Vector3 rp = transform.position, fwd = transform.forward;
+                Shader.SetGlobalVector(s_RigPosId, new Vector4(rp.x, rp.y, rp.z, 0f));
+                Shader.SetGlobalVector(s_RigFwdId, new Vector4(fwd.x, fwd.y, fwd.z, 0f));
                 Shader.SetGlobalVector(s_EyePosLId, new Vector4(lx, ly, lz, 0f));
                 Shader.SetGlobalVector(s_EyePosRId, new Vector4(rx, ry, rz, 0f));
             }

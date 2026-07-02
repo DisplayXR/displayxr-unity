@@ -177,6 +177,16 @@ namespace DisplayXR
         private int  m_HitMaskPendingDstW;
         private int  m_HitMaskPendingDstH;
 
+        // Debug: dump the readback hit-mask/silhouette to %TEMP%\displayxr_hitmask.png
+        // for inspection when DXR_DUMP_HIT_MASK=1. Throttled to ~every 15 readbacks.
+        private static readonly bool s_DumpHitMask =
+            System.Environment.GetEnvironmentVariable("DXR_DUMP_HIT_MASK") == "1";
+        private int m_HitMaskDumpCounter;
+
+        // Per-zone matrix scratch buffers for the multi-zone silhouette union (#166).
+        private readonly float[] m_ZoneLV = new float[16], m_ZoneLP = new float[16];
+        private readonly float[] m_ZoneRV = new float[16], m_ZoneRP = new float[16];
+
         /// <summary>Cursor position in window-client pixels (top-left origin).
         /// Only meaningful in standalone Windows build with transparent mode
         /// active. Updated each frame from native polling — works regardless
@@ -1055,6 +1065,8 @@ namespace DisplayXR
             return mat;
         }
 
+
+
         // The stereo viewport (overlay client px) the Kooima projection from
         // displayxr_get_stereo_matrices is computed for. Defaults to the full
         // overlay; when a 3D canvas sub-rect is active (#131) the projection is
@@ -1413,34 +1425,59 @@ namespace DisplayXR
             // back as CPU bytes and ship them to SetWindowRgn, where
             // row 0 = top of overlay (Win32 client coords). The Y-flip
             // would put row 0 at the bottom of the intended image.
-            Matrix4x4 leftViewUnity  = ConvertOpenXRViewToUnity(leftView);
-            Matrix4x4 rightViewUnity = ConvertOpenXRViewToUnity(rightView);
-            Matrix4x4 leftVP  = GL.GetGPUProjectionMatrix(leftProj,  false) * leftViewUnity;
-            Matrix4x4 rightVP = GL.GetGPUProjectionMatrix(rightProj, false) * rightViewUnity;
-
             m_HitMaskCB.Clear();
             m_HitMaskCB.SetRenderTarget(m_HitMaskRT);
             m_HitMaskCB.ClearRenderTarget(true, true, Color.clear);
 
-            // Pass 1: left eye.
-            m_HitMaskCB.SetGlobalMatrix("_DXRViewProj", leftVP);
-            for (int i = 0; i < clickableRenderers.Length; i++)
+            // Build a full-window silhouette union. Single zone / hook = just the primary
+            // eyes. Multi-zone (#166) = union EVERY zone's L+R silhouette (still full-window,
+            // NO sub-rect) so the mask covers all zones' per-eye extents — each zone's
+            // off-axis frustum gives its eyes a slightly different reach, and a primary-only
+            // mask falls short on the other zones' outer eye. The NATIVE side
+            // (displayxr_set_overlay_hit_mask) then stamps this union into each zone's rect;
+            // because every zone projects to ~the same window spot, the union is only
+            // marginally wider and lines up with each zone's woven content once stamped.
+            int zoneCount = 1;
+            if (DisplayXRProviderDriver.IsActive)
             {
-                var r = clickableRenderers[i];
-                if (r == null || !r.enabled || !r.gameObject.activeInHierarchy)
-                    continue;
-                DrawSilhouetteAllSubmeshes(r);
+                uint zc = DisplayXRProviderNative.dxr_prov_get_zone_count();
+                if (zc > 1) zoneCount = (int)zc;
             }
 
-            // Pass 2: right eye. Accumulates into the same RT — pixels
-            // covered by either eye end up at 1 (boolean union).
-            m_HitMaskCB.SetGlobalMatrix("_DXRViewProj", rightVP);
-            for (int i = 0; i < clickableRenderers.Length; i++)
+            for (int z = 0; z < zoneCount; z++)
             {
-                var r = clickableRenderers[i];
-                if (r == null || !r.enabled || !r.gameObject.activeInHierarchy)
-                    continue;
-                DrawSilhouetteAllSubmeshes(r);
+                Matrix4x4 lView, lProj, rView, rProj;
+                if (zoneCount > 1)
+                {
+                    if (DisplayXRProviderNative.dxr_prov_get_zone_stereo_matrices(
+                            (uint)z, m_ZoneLV, m_ZoneLP, m_ZoneRV, m_ZoneRP) == 0)
+                        continue;
+                    lView = FloatsToMatrix(m_ZoneLV); lProj = FloatsToMatrix(m_ZoneLP);
+                    rView = FloatsToMatrix(m_ZoneRV); rProj = FloatsToMatrix(m_ZoneRP);
+                }
+                else
+                {
+                    lView = leftView; lProj = leftProj; rView = rightView; rProj = rightProj;
+                }
+
+                Matrix4x4 lVP = GL.GetGPUProjectionMatrix(lProj, false) * ConvertOpenXRViewToUnity(lView);
+                Matrix4x4 rVP = GL.GetGPUProjectionMatrix(rProj, false) * ConvertOpenXRViewToUnity(rView);
+
+                // Left eye then right — accumulate the boolean union into the same RT.
+                m_HitMaskCB.SetGlobalMatrix("_DXRViewProj", lVP);
+                for (int i = 0; i < clickableRenderers.Length; i++)
+                {
+                    var r = clickableRenderers[i];
+                    if (r == null || !r.enabled || !r.gameObject.activeInHierarchy) continue;
+                    DrawSilhouetteAllSubmeshes(r);
+                }
+                m_HitMaskCB.SetGlobalMatrix("_DXRViewProj", rVP);
+                for (int i = 0; i < clickableRenderers.Length; i++)
+                {
+                    var r = clickableRenderers[i];
+                    if (r == null || !r.enabled || !r.gameObject.activeInHierarchy) continue;
+                    DrawSilhouetteAllSubmeshes(r);
+                }
             }
 
             // Dilate the union by ~2 mask pixels to absorb AA-edge
@@ -1483,7 +1520,39 @@ namespace DisplayXR
                     HIT_MASK_WIDTH, HIT_MASK_HEIGHT,
                     m_HitMaskPendingDstW, m_HitMaskPendingDstH);
             }
+            if (s_DumpHitMask && (m_HitMaskDumpCounter++ % 15) == 0)
+                DumpHitMaskPng(data);
 #endif
+        }
+
+        // Debug: encode the R8 hit-mask readback to a grayscale PNG so the silhouette
+        // coverage (which region SetWindowRgn keeps visible) can be inspected. The mask
+        // is HIT_MASK_WIDTH×HIT_MASK_HEIGHT, one byte per pixel, row 0 = top.
+        void DumpHitMaskPng(Unity.Collections.NativeArray<byte> data)
+        {
+            try
+            {
+                int n = HIT_MASK_WIDTH * HIT_MASK_HEIGHT;
+                if (data.Length < n) return;
+                var tex = new Texture2D(HIT_MASK_WIDTH, HIT_MASK_HEIGHT, TextureFormat.RGBA32, false);
+                var px = new Color32[n];
+                for (int i = 0; i < n; i++)
+                {
+                    byte v = data[i];
+                    // Flip vertically: PNG row 0 = bottom, mask row 0 = top.
+                    int x = i % HIT_MASK_WIDTH, y = i / HIT_MASK_WIDTH;
+                    px[(HIT_MASK_HEIGHT - 1 - y) * HIT_MASK_WIDTH + x] = new Color32(v, v, v, 255);
+                }
+                tex.SetPixels32(px);
+                tex.Apply(false);
+                byte[] png = tex.EncodeToPNG();
+                Destroy(tex);
+                string path = System.IO.Path.Combine(
+                    System.Environment.GetEnvironmentVariable("TEMP") ?? ".", "displayxr_hitmask.png");
+                System.IO.File.WriteAllBytes(path, png);
+                Debug.Log($"[DisplayXR] hit-mask dumped to {path} ({HIT_MASK_WIDTH}x{HIT_MASK_HEIGHT})");
+            }
+            catch (System.Exception e) { Debug.LogWarning($"[DisplayXR] hit-mask dump failed: {e.Message}"); }
         }
 
         void ReleaseHitMaskResources()

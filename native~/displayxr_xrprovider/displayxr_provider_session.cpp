@@ -2090,19 +2090,17 @@ static float ps_rig_local_eye_z(const XrPosef *rig, const float eye[3])
 	return dz + 2.0f * (qx * cy - qy * cx);
 }
 
-void dxr_prov_get_eye_clip(uint32_t eye, float *out_far,
-                           float *out_ex, float *out_ey, float *out_ez)
+// Compute the per-view foreground clip (far + Unity-space eye pos) for one eye world
+// position `p`. Eye pos in Unity coords (oxr_to_unity_pos = x, y, -z) — matches the
+// deviceAnchorToEyePose the provider hands Unity, aligning with the shader's
+// UNITY_MATRIX_I_V eye position (_DXREyePosL/R). Far = display-plane distance
+// (display rig = |rig-local eye Z|) or convergence distance (camera rig).
+static void ps_compute_eye_clip(const float *p, float *out_far,
+                                float *out_ex, float *out_ey, float *out_ez)
 {
-	if (eye >= DXR_PROV_MAX_VIEWS) eye = 0;
-	const float *p = s_ps.views[eye].position;
-	// Eye world position in Unity coords (oxr_to_unity_pos = x, y, -z) — matches the
-	// deviceAnchorToEyePose the provider hands Unity, so it aligns with the shader's
-	// UNITY_MATRIX_I_V eye position (_DXREyePosL/R).
 	if (out_ex) *out_ex = p[0];
 	if (out_ey) *out_ey = p[1];
 	if (out_ez) *out_ez = -p[2];
-	// Per-view foreground far = display-plane distance (display rig = |rig-local eye
-	// Z|) or the convergence distance (camera rig), matching the hook path's far_eff.
 	float far_eff = s_ps.far_z > 0.0f ? s_ps.far_z : 1000.0f;
 	float near_z = s_ps.near_z > 0.0f ? s_ps.near_z : 0.01f;
 	if (s_ps.camera_centric) {
@@ -2114,6 +2112,96 @@ void dxr_prov_get_eye_clip(uint32_t eye, float *out_far,
 		if (ez > near_z + 0.001f) far_eff = ez;
 	}
 	if (out_far) *out_far = far_eff;
+}
+
+void dxr_prov_get_eye_clip(uint32_t eye, float *out_far,
+                           float *out_ex, float *out_ey, float *out_ez)
+{
+	if (eye >= DXR_PROV_MAX_VIEWS) eye = 0;
+	ps_compute_eye_clip(s_ps.views[eye].position, out_far, out_ex, out_ey, out_ez);
+}
+
+// Per-zone per-eye foreground clip (#166). Zone 0 = primary; i>=1 = extra_zones[i-1].
+// Returns 1 on success. Lets the clip publisher diagnose / drive per-zone clip data.
+int dxr_prov_get_zone_eye_clip(uint32_t zone, uint32_t eye, float *out_far,
+                               float *out_ex, float *out_ey, float *out_ez)
+{
+	if (eye >= 2) eye = 0;
+	const float *p;
+	if (zone == 0) {
+		if (s_ps.view_count < 2) return 0;
+		p = s_ps.views[eye].position;
+	} else {
+		uint32_t ei = zone - 1;
+		if (ei >= s_ps.extra_zone_count) return 0;
+		ProviderExtraZone *z = &s_ps.extra_zones[ei];
+		if (!z->valid || z->view_count < 2) return 0;
+		p = z->views[eye].position;
+	}
+	ps_compute_eye_clip(p, out_far, out_ex, out_ey, out_ez);
+	return 1;
+}
+
+// ============================================================================
+// Per-zone stereo matrices + screen rect (#166 — multi-zone transparent mask).
+// The transparent overlay's SetWindowRgn silhouette must cover EVERY zone's
+// content, not just the primary — otherwise the OS clips non-primary zones to
+// see-through. Expose each zone's cyclopean view+proj (same math as
+// ps_publish_stereo_matrices) and its window-pixel rect so the overlay can
+// render the silhouette per-zone into that zone's sub-rect and union the result.
+// Zone 0 = primary (s_ps.views / primary zone rect); zone i>=1 = extra_zones[i-1].
+// ============================================================================
+uint32_t dxr_prov_get_zone_count(void)
+{
+	uint32_t n = 1; // primary always present
+	for (uint32_t i = 0; i < s_ps.extra_zone_count; i++)
+		if (s_ps.extra_zones[i].valid && s_ps.extra_zones[i].view_count >= 2) n++;
+	return n;
+}
+
+int dxr_prov_get_zone_stereo_matrices(uint32_t zone, float *lv, float *lp,
+                                      float *rv, float *rp)
+{
+	float nz = s_ps.near_z > 0.0f ? s_ps.near_z : 0.01f;
+	float fz = s_ps.far_z > nz ? s_ps.far_z : 1000.0f;
+	const DxrProvView *v;
+	if (zone == 0) {
+		if (s_ps.view_count < 2) return 0;
+		v = s_ps.views;
+	} else {
+		uint32_t ei = zone - 1;
+		if (ei >= s_ps.extra_zone_count) return 0;
+		ProviderExtraZone *z = &s_ps.extra_zones[ei];
+		if (!z->valid || z->view_count < 2) return 0;
+		v = z->views;
+	}
+	if (lv) ps_view_matrix_from_pose(v[0].position, v[0].orientation, lv);
+	if (rv) ps_view_matrix_from_pose(v[1].position, v[1].orientation, rv);
+	if (lp) ps_projection_from_fov(v[0].fov, nz, fz, lp);
+	if (rp) ps_projection_from_fov(v[1].fov, nz, fz, rp);
+	return 1;
+}
+
+int dxr_prov_get_zone_rect_px(uint32_t zone, int *x, int *y, int *w, int *h)
+{
+	if (zone == 0) {
+		if (ps_zone_active()) {
+			if (x) *x = s_ps.zone_x; if (y) *y = s_ps.zone_y;
+			if (w) *w = s_ps.zone_w; if (h) *h = s_ps.zone_h;
+		} else {
+			uint32_t ww = 0, wh = 0; ps_window_size(&ww, &wh);
+			if (x) *x = 0; if (y) *y = 0;
+			if (w) *w = (int)ww; if (h) *h = (int)wh;
+		}
+		return 1;
+	}
+	uint32_t ei = zone - 1;
+	if (ei >= s_ps.extra_zone_count) return 0;
+	ProviderExtraZone *z = &s_ps.extra_zones[ei];
+	if (!z->valid) return 0;
+	if (x) *x = z->rect_x; if (y) *y = z->rect_y;
+	if (w) *w = z->rect_w; if (h) *h = z->rect_h;
+	return 1;
 }
 
 int dxr_prov_submit_frame(uint32_t image_index)

@@ -184,6 +184,18 @@ void *dxr_prov_get_extra_zone_bridge_eye(uint32_t ei, uint32_t eye, uint32_t *w,
 /// Copy out extra zone `ei`'s render-ready view for `eye` (after begin_frame).
 void dxr_prov_get_extra_zone_view(uint32_t ei, uint32_t eye, DxrProvView *out_view);
 
+/// Per-zone stereo matrices + screen rect (#166 — multi-zone transparent mask).
+/// The transparent overlay renders its SetWindowRgn silhouette per-zone into each
+/// zone's rect so ALL zones stay visible (else non-primary zones clip to see-through).
+/// Zone 0 = primary; zone i>=1 = extra zone i-1. Count = 1 + active extra zones.
+DISPLAYXR_EXPORT uint32_t dxr_prov_get_zone_count(void);
+/// Fill 4 column-major float[16] matrices for `zone` (cyclopean L/R view+proj).
+/// Returns 1 on success (zone has >=2 valid views), 0 otherwise. Any out ptr may be NULL.
+DISPLAYXR_EXPORT int dxr_prov_get_zone_stereo_matrices(uint32_t zone, float *lv, float *lp,
+                                                       float *rv, float *rp);
+/// Fill `zone`'s window-client pixel rect (top-left origin). Returns 1 on success.
+DISPLAYXR_EXPORT int dxr_prov_get_zone_rect_px(uint32_t zone, int *x, int *y, int *w, int *h);
+
 /// Local2D layer (#166 Phase B): lazily create the provider's Local2D overlay
 /// swapchain + cross-device bridge sized to w×h and return the Unity-device handle
 /// of the bridge. C# (DisplayXRLocal2D) Graphics.CopyTexture's its canvas RT into it
@@ -219,6 +231,12 @@ void dxr_prov_get_view(uint32_t view_index, DxrProvView *out_view);
 /// the hook-path source — is inert in provider mode.
 DISPLAYXR_EXPORT void dxr_prov_get_eye_clip(uint32_t eye, float *out_far,
                                             float *out_ex, float *out_ey, float *out_ez);
+
+/// Per-zone per-eye foreground clip (#166 multi-zone). Zone 0 = primary; i>=1 =
+/// extra zone i-1. Returns 1 on success. Same data as dxr_prov_get_eye_clip but for
+/// a specific zone's views, so the clip publisher can diagnose / apply per-zone clip.
+DISPLAYXR_EXPORT int dxr_prov_get_zone_eye_clip(uint32_t zone, uint32_t eye, float *out_far,
+                                                float *out_ex, float *out_ey, float *out_ez);
 
 /// Submit the rendered frame: release the swapchain image + xrEndFrame a 2-view
 /// projection layer (per-eye subImage.imageArrayIndex 0/1).

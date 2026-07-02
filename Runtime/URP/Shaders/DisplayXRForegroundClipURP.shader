@@ -58,13 +58,19 @@ Shader "DisplayXR/ForegroundClipURP"
             // SampleSceneDepth + _CameraDepthTexture
             #include "Packages/com.unity.render-pipelines.universal/ShaderLibrary/DeclareDepthTexture.hlsl"
 
-            // x = left eye far_eff, y = right eye far_eff, z = enable (0/1), w = unused.
+            // x = left eye far_eff, y = right eye far_eff, z = enable (0/1),
+            // w = display-plane mode (1 = compute per-eye far from the plane below;
+            //     0 = camera-centric, single convergence far in .x).
             float4 _DXRForegroundFar;
-            // World positions of the two eyes (w unused), published by the rig from its
-            // FlipViewZ'd view matrices. Used to pick which eye's far applies in
-            // MULTIPASS, where unity_StereoEyeIndex is a compile-time 0 (see below).
+            // Legacy per-eye world positions (kept for compatibility; unused in plane mode).
             float4 _DXREyePosL;
             float4 _DXREyePosR;
+            // Display plane (display-centric): a point on the plane (rig origin) + its
+            // normal (rig forward). The per-eye foreground far is the perpendicular
+            // distance from THIS eye to this plane — computed from the render's own eye
+            // position, so it is correct for every zone AND eye with no L/R guessing.
+            float4 _DXRRigPos; // xyz = rig world position
+            float4 _DXRRigFwd; // xyz = rig forward (unit)
 
             half4 Frag(Varyings input) : SV_Target
             {
@@ -84,14 +90,30 @@ Shader "DisplayXR/ForegroundClipURP"
                 float eyeZ = LinearEyeDepth(rawDepth, _ZBufferParams);
 
                 // Per-eye far. unity_StereoEyeIndex is NOT usable: in multipass (forced
-                // by the Kooima path) URP's TextureXR.hlsl #defines it to a literal 0,
-                // so it can never select the right eye. UNITY_MATRIX_I_V *is* per-eye in
-                // multipass, so identify the current eye by its world position and pick
-                // the nearer of the rig's two published eye positions.
+                // by the Kooima path) URP's TextureXR.hlsl #defines it to a literal 0, so
+                // it can never select the right eye. The previous fix picked the nearer of
+                // two published eye positions, but that misclassifies in multi-zone (#166):
+                // a zone's pair can be shifted more than half the IPD, so its right eye
+                // lands nearer the primary's LEFT eye and gets the wrong (short) far.
+                // UNITY_MATRIX_I_V is per-eye AND per-zone correct, so compute the far
+                // straight from this eye: the perpendicular distance to the display plane
+                // (display-centric). No classification, correct for every zone+eye.
                 float3 curEye = mul(UNITY_MATRIX_I_V, float4(0.0, 0.0, 0.0, 1.0)).xyz;
-                float dL = dot(curEye - _DXREyePosL.xyz, curEye - _DXREyePosL.xyz);
-                float dR = dot(curEye - _DXREyePosR.xyz, curEye - _DXREyePosR.xyz);
-                float farEff = (dL <= dR) ? _DXRForegroundFar.x : _DXRForegroundFar.y;
+                float farEff;
+                if (_DXRForegroundFar.w > 0.5h)
+                {
+                    // Plane mode (#166 provider display-centric): far = perpendicular
+                    // distance from THIS eye to the display plane. Per-zone-per-eye correct.
+                    farEff = abs(dot(curEye - _DXRRigPos.xyz, _DXRRigFwd.xyz));
+                }
+                else
+                {
+                    // Legacy (single-zone hook / camera-centric): pick the nearer of the two
+                    // published eye positions. Correct when there is only one eye pair.
+                    float dL = dot(curEye - _DXREyePosL.xyz, curEye - _DXREyePosL.xyz);
+                    float dR = dot(curEye - _DXREyePosR.xyz, curEye - _DXREyePosR.xyz);
+                    farEff = (dL <= dR) ? _DXRForegroundFar.x : _DXRForegroundFar.y;
+                }
 
                 // Behind the virtual display plane → cut it away (color AND alpha
                 // zeroed; alpha-only left the geometry visible — the #129 failure).
