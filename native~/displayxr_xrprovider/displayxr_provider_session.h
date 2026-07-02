@@ -132,8 +132,10 @@ void *dxr_prov_get_bridge_unity_texture_eye(uint32_t eye, uint32_t *width, uint3
 /// pre-gating behavior. Preserved across the session_start reset.
 DISPLAYXR_EXPORT void dxr_prov_set_single_pass(int enable);
 
-/// Effective render mode: 1 = SPI, 0 = MultiPass.
-int  dxr_prov_get_single_pass(void);
+/// Effective render mode: 1 = SPI, 0 = MultiPass. Exported: DisplayXRPostAA reads
+/// it to gate the OnRenderImage FXAA pass (valid only in MultiPass, where each eye
+/// is its own single-slice RT; SPI's 2-slice array breaks the Blit — #166).
+DISPLAYXR_EXPORT int  dxr_prov_get_single_pass(void);
 
 /// Transparent-background request (#166 Phase A). Set from C# BEFORE the session
 /// starts: 1 = opt the session into a transparent background (ALPHA_BLEND env
@@ -249,6 +251,26 @@ DISPLAYXR_EXPORT void dxr_prov_get_eye_clip(uint32_t eye, float *out_far,
 /// a specific zone's views, so the clip publisher can diagnose / apply per-zone clip.
 DISPLAYXR_EXPORT int dxr_prov_get_zone_eye_clip(uint32_t zone, uint32_t eye, float *out_far,
                                                 float *out_ex, float *out_ey, float *out_ez);
+
+/// BiRP foreground clip (#166): enable baking the per-eye display-plane far into the
+/// provider's PROJECTION MATRIX. URP clips per-eye in the DisplayXR/ForegroundClipURP
+/// shader; BiRP has no such pass under the provider, and Unity's half-angles
+/// projection can't express a per-eye far (it uses cam.farClipPlane for both eyes),
+/// so the far is delivered by handing Unity a full matrix projection with the far
+/// baked in — mirroring the hook path's SetStereoProjectionMatrix(leftProj/rightProj).
+/// Set from C# (the provider driver) each frame, ONLY for the BiRP path. Cheap; a
+/// per-frame tunable (not preserved across session_start — re-pushed every frame).
+DISPLAYXR_EXPORT void dxr_prov_set_foreground_clip(int enable);
+
+/// Whether the BiRP foreground-clip projection bake is enabled.
+int dxr_prov_get_foreground_clip(void);
+
+/// Build the per-eye GL projection matrix (Matrix4x4.Frustum / Camera.projectionMatrix
+/// convention, column-major float[16]) with the foreground-clip far baked in, for the
+/// provider's render-pass projection. zone 0 = primary; >=1 = extra zone i-1. Returns 1
+/// (and fills out_mat) when the clip is enabled AND the far is valid; 0 otherwise (the
+/// caller keeps the half-angles projection). Internal to the native provider.
+int dxr_prov_get_clip_projection(uint32_t zone, uint32_t eye, float out_mat[16]);
 
 /// Submit the rendered frame: release the swapchain image + xrEndFrame a 2-view
 /// projection layer (per-eye subImage.imageArrayIndex 0/1).

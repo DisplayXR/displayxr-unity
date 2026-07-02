@@ -126,8 +126,10 @@ namespace DisplayXR
             // Provider mode (#166): DisplayXRFeature is inert (no Unity OpenXR loader),
             // so GetStereoMatrices can't feed the URP foreground clip. Publish the
             // ForegroundClipURP globals from the provider's per-eye clip data instead.
-            // (BiRP provider clip via SetStereoProjectionMatrix is a separate follow-up;
-            // the transparent demo is URP.)
+            // BiRP has no such shader pass — its foreground far is delivered natively
+            // (the provider bakes the per-eye far into the projection matrix, driven by
+            // DisplayXRProviderDriver via dxr_prov_set_foreground_clip), so this rig has
+            // nothing to publish for BiRP.
             if (DisplayXRProviderDriver.IsActive)
             {
                 if (m_UsingSRP) PublishProviderForegroundClip();

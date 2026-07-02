@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: BSL-1.0
 
 using UnityEngine;
+using UnityEngine.Rendering;
 
 namespace DisplayXR
 {
@@ -117,6 +118,17 @@ namespace DisplayXR
                 t.ipdFactor, t.parallaxFactor, t.perspectiveFactor,
                 vdh, invConv, t.fovOverride, t.nearZ, t.farZ,
                 t.cameraCentricMode ? 1 : 0);
+
+            // BiRP foreground clip (#166): URP delivers the per-eye clip through the
+            // ForegroundClipURP shader, but BiRP has no such pass under the provider —
+            // and Unity's half-angles projection can't carry a per-eye far. So on BiRP
+            // we ask the native provider to bake the per-eye display-plane far into the
+            // render-pass projection matrix (the provider analog of the hook path's
+            // SetStereoProjectionMatrix). Enable it only on Built-in RP; URP keeps the
+            // half-angles projection so KooimaProjectionFixFeature + the clip shader own it.
+            bool usingSRP = GraphicsSettings.currentRenderPipeline != null;
+            DisplayXRProviderNative.dxr_prov_set_foreground_clip(
+                (!usingSRP && t.clipAtDisplayPlane) ? 1 : 0);
 
             Vector3 p = cam.transform.position;
             Quaternion q = cam.transform.rotation;
