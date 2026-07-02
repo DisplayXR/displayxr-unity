@@ -136,27 +136,15 @@ namespace DisplayXR.Editor
         private void DrawFeatureStatus()
         {
             EditorGUILayout.BeginVertical(EditorStyles.helpBox);
-            EditorGUILayout.LabelField("Feature Status", EditorStyles.boldLabel);
+            EditorGUILayout.LabelField("Runtime Status", EditorStyles.boldLabel);
 
-            if (!Application.isPlaying)
+            // Status comes from whichever backend is live: the Display Provider
+            // (built app / Play Mode after #171), the standalone Preview session, or
+            // the OpenXR hook. DisplayXRFeature is null in provider mode, so this no
+            // longer keys off it directly (#166 gap #6).
+            if (DisplayXREditorStatus.TryGetDisplayInfo(out var info, out var source))
             {
-                EditorGUILayout.LabelField("Status", "Not running (enter Play mode to connect)");
-                return;
-            }
-
-            var feature = DisplayXRFeature.Instance;
-            if (feature == null)
-            {
-                EditorGUILayout.HelpBox(
-                    "DisplayXRFeature is not active. Enable it in:\n" +
-                    "Project Settings > XR Plug-in Management > OpenXR > Features",
-                    MessageType.Warning);
-                return;
-            }
-
-            var info = feature.DisplayInfo;
-            if (info.isValid)
-            {
+                EditorGUILayout.LabelField("Source", DisplayXREditorStatus.SourceLabel(source));
                 EditorGUILayout.LabelField("Connected", "Yes");
                 EditorGUILayout.LabelField("Display",
                     $"{info.displayPixelWidth}x{info.displayPixelHeight}");
@@ -167,12 +155,18 @@ namespace DisplayXR.Editor
                     $"{info.nominalViewerZ * 1000:F0}) mm");
                 EditorGUILayout.LabelField("View Scale",
                     $"{info.recommendedViewScaleX:F2} x {info.recommendedViewScaleY:F2}");
-                EditorGUILayout.LabelField("Eye Tracking",
-                    feature.IsEyeTracked ? "Active" : "Inactive");
+                if (DisplayXREditorStatus.TryGetEyeTracking(out bool tracked, out _, out _, out _))
+                    EditorGUILayout.LabelField("Eye Tracking", tracked ? "Active" : "Inactive");
             }
             else
             {
-                EditorGUILayout.LabelField("Connected", "No (display info not available)");
+                EditorGUILayout.LabelField("Status", "Not connected");
+                EditorGUILayout.HelpBox(
+                    "Connect a DisplayXR runtime to see live display info:\n" +
+                    "• Enter Play Mode with the DisplayXR Display provider (or the OpenXR " +
+                    "hook feature) enabled in XR Plug-in Management, or\n" +
+                    "• open Window > DisplayXR > Preview and click Start.",
+                    MessageType.Info);
             }
 
             EditorGUILayout.EndVertical();
