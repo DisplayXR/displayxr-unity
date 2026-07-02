@@ -230,10 +230,14 @@ typedef struct XrCocoaWindowBindingCreateInfoEXT {
 // alpha — DisplayXR/displayxr-runtime#425). Source of truth:
 // displayxr-runtime/src/external/openxr_includes/openxr/XR_EXT_atlas_capture.h
 #define XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME "XR_EXT_atlas_capture"
-#define XR_EXT_ATLAS_CAPTURE_SPEC_VERSION 2
+// SPEC_VERSION 3: XrStructureType values relocated 1000999120..121 ->
+// 1000999170..171 (the old block collided with XR_EXT_workspace_file_dialog,
+// which reserved it first). No struct/field/entry-point changes — header re-sync
+// only. Sending the stale type made the runtime reject with VALIDATION_FAILURE.
+#define XR_EXT_ATLAS_CAPTURE_SPEC_VERSION 3
 
-#define XR_TYPE_ATLAS_CAPTURE_INFO_EXT ((XrStructureType)1000999120)
-#define XR_TYPE_ATLAS_CAPTURE_RESULT_EXT ((XrStructureType)1000999121)
+#define XR_TYPE_ATLAS_CAPTURE_INFO_EXT ((XrStructureType)1000999170)
+#define XR_TYPE_ATLAS_CAPTURE_RESULT_EXT ((XrStructureType)1000999171)
 
 #define XR_ATLAS_CAPTURE_PATH_MAX_EXT 256
 

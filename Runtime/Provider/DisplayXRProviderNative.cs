@@ -206,6 +206,12 @@ namespace DisplayXR
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern int dxr_prov_set_eye_tracking_mode(int manual);
 
+        // ---- Atlas capture (XR_EXT_atlas_capture, #140) ----------------------
+
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int dxr_prov_capture_atlas(
+            [MarshalAs(UnmanagedType.LPStr)] string pathPrefix, int stage);
+
         // ---- Event consumption (atomic read-and-clear) -----------------------
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]

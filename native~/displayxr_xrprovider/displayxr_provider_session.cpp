@@ -159,6 +159,11 @@ typedef struct ProviderSession {
 
 	int has_view_rig;
 
+	// XR_EXT_atlas_capture (#140): app-facing atlas screenshot (the 'I' key /
+	// DisplayXRScreenshot). Detected in the probe, enabled on the instance, PFN
+	// soft-resolved. Re-derived each session create — no reset preservation needed.
+	int has_atlas_capture;
+
 	// XR_EXT_display_zones + XR_EXT_local_3d_zone (#166 Phase B). Detected in
 	// session_start (probe) and enabled on the instance. Caps queried lazily on the
 	// first frame a zone rect is set (needs a live session). zone_caps_ok: -1 untried,
@@ -354,6 +359,7 @@ typedef struct ProviderSession {
 	PFN_xrRequestDisplayRenderingModeEXT    pfn_request_rendering_mode;   // optional
 	PFN_xrRequestDisplayModeEXT             pfn_request_display_mode;     // optional
 	PFN_xrRequestEyeTrackingModeEXT         pfn_request_eye_tracking_mode;// optional
+	PFN_xrCaptureAtlasEXT                    pfn_capture_atlas;            // #140, optional
 } ProviderSession;
 
 static ProviderSession s_ps;
@@ -503,6 +509,10 @@ static int ps_resolve_functions(void)
 		_fn = NULL;
 		s_ps.gipa(s_ps.instance, "xrGetDisplayZoneRecommendedViewSizeEXT", &_fn);
 		s_ps.pfn_get_zone_view_size = (PFN_xrGetDisplayZoneRecommendedViewSizeEXT)_fn;
+		// Atlas capture (#140) — soft-resolve; inert if the runtime lacks it.
+		_fn = NULL;
+		s_ps.gipa(s_ps.instance, "xrCaptureAtlasEXT", &_fn);
+		s_ps.pfn_capture_atlas = (PFN_xrCaptureAtlasEXT)_fn;
 	}
 	return 1;
 }
@@ -1720,6 +1730,8 @@ int dxr_prov_session_start(const char *runtime_json_path,
 							s_ps.has_display_zones = 1;
 						else if (strcmp(props[i].extensionName, XR_EXT_LOCAL_3D_ZONE_EXTENSION_NAME) == 0)
 							s_ps.has_local_3d_zone = 1;
+						else if (strcmp(props[i].extensionName, XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME) == 0)
+							s_ps.has_atlas_capture = 1;
 					}
 				}
 				free(props);
@@ -1730,6 +1742,8 @@ int dxr_prov_session_start(const char *runtime_json_path,
 		       s_ps.has_local_3d_zone ? "AVAILABLE" : "no");
 		ps_log("[DisplayXR-PROV] XR_EXT_view_rig: %s\n",
 		       s_ps.has_view_rig ? "AVAILABLE" : "not found (no stereo)");
+		ps_log("[DisplayXR-PROV] XR_EXT_atlas_capture: %s\n",
+		       s_ps.has_atlas_capture ? "AVAILABLE" : "no (screenshot inert)");
 	}
 
 	// --- Create instance ---
@@ -1745,6 +1759,10 @@ int dxr_prov_session_start(const char *runtime_json_path,
 		extensions[ext_count++] = XR_EXT_DISPLAY_ZONES_EXTENSION_NAME;
 	if (s_ps.has_local_3d_zone)
 		extensions[ext_count++] = XR_EXT_LOCAL_3D_ZONE_EXTENSION_NAME;
+	// Atlas capture (#140): app-facing screenshot ('I' key). Enable
+	// unconditionally-if-advertised — independent of transparency/zones.
+	if (s_ps.has_atlas_capture)
+		extensions[ext_count++] = XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME;
 
 	PFN_xrVoidFunction fn_create = NULL;
 	s_ps.gipa(XR_NULL_HANDLE, "xrCreateInstance", &fn_create);
@@ -2801,6 +2819,35 @@ int dxr_prov_set_eye_tracking_mode(int manual)
 	        manual ? XR_EYE_TRACKING_MODE_MANUAL_EXT : XR_EYE_TRACKING_MODE_MANAGED_EXT);
 	ps_log("[DisplayXR-PROV] request eye-tracking mode %s -> %d\n", manual ? "MANUAL" : "MANAGED", r);
 	return XR_SUCCEEDED(r) ? 1 : 0;
+}
+
+// ---- Atlas capture (XR_EXT_atlas_capture, #140) -----------------------------
+
+// Provider-mode analog of displayxr_capture_atlas (hook path): hand the runtime a
+// path prefix + stage; it reads back its own compositor atlas and writes the PNG on
+// the next composed frame. Non-blocking — XR_SUCCESS means accepted, not on-disk.
+int dxr_prov_capture_atlas(const char *path_prefix, int stage)
+{
+	if (s_ps.pfn_capture_atlas == NULL || s_ps.session == XR_NULL_HANDLE) {
+		ps_log("[DisplayXR-PROV] capture_atlas: unavailable (pfn=%p session=%p)\n",
+		       (void *)s_ps.pfn_capture_atlas, (void *)(uintptr_t)s_ps.session);
+		return 0; // Extension not resolved or no live session
+	}
+
+	XrAtlasCaptureInfoEXT info = {};
+	info.type = XR_TYPE_ATLAS_CAPTURE_INFO_EXT;
+	info.next = NULL;
+	info.stage = (stage != 0) ? XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_EXT
+	                          : XR_ATLAS_CAPTURE_STAGE_POST_COMPOSE_EXT;
+	if (path_prefix != NULL) {
+		strncpy(info.pathPrefix, path_prefix, XR_ATLAS_CAPTURE_PATH_MAX_EXT - 1);
+		info.pathPrefix[XR_ATLAS_CAPTURE_PATH_MAX_EXT - 1] = '\0';
+	}
+
+	XrResult result = s_ps.pfn_capture_atlas(s_ps.session, &info, NULL);
+	ps_log("[DisplayXR-PROV] capture_atlas: stage=%d prefix='%s' result=%d\n",
+	       (int)info.stage, info.pathPrefix, (int)result);
+	return XR_SUCCEEDED(result) ? 1 : 0;
 }
 
 // ---- Event latches (read-and-clear) -----------------------------------------
