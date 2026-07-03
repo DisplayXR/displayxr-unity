@@ -5,6 +5,19 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.1] - 2026-07-02
+
+### Fixed
+- **Native provider now deploys into player builds (#166).** Unity's player build did not
+  auto-include this package's native library (`displayxr_unity`) or its
+  `UnitySubsystemsManifest.json` — unlike a first-party XR package, the custom
+  `IUnityXRDisplay` provider package isn't recognized by Unity's XR build pipeline, so a clean
+  consumer build shipped without the native provider and the app failed to weave. A new post-build
+  step (`DisplayXRProviderRuntimeDeploy`) copies the shipped native binary + subsystem manifest into
+  the player's data folder (Windows `_Data/Plugins/x86_64` + `_Data/UnitySubsystems/DisplayXR`; the
+  macOS `.app` equivalents), mirroring how the existing build processor deploys the macOS OpenXR
+  loader. Fixes clean `#upm` consumer builds (previously the bits had to be hand-copied).
+
 ## [1.24.0] - 2026-07-02
 
 The custom **`IUnityXRDisplay` display provider becomes the shipping rendering path** (epic #166). The provider drives the DisplayXR runtime directly — Single-Pass-Instanced on URP + Windows + D3D12, MultiPass elsewhere — replacing the legacy native OpenXR-hook path for the primary workflow. The old `DisplayXRFeature` hook is soft-deprecated (`[Obsolete]`) but still functional. The repository is relicensed to **Apache-2.0**.
