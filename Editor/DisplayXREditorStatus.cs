@@ -4,6 +4,10 @@
 using UnityEngine;
 using DisplayXR;
 
+// hook-path bridge: DisplayXRFeature is soft-deprecated (#166) but remains the active backend on the
+// legacy hook path. Suppress CS0618 for these intentional internal uses.
+#pragma warning disable 618
+
 namespace DisplayXR.Editor
 {
     /// <summary>
@@ -137,3 +141,4 @@ namespace DisplayXR.Editor
         }
     }
 }
+#pragma warning restore 618

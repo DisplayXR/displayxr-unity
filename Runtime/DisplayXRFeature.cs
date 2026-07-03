@@ -19,20 +19,34 @@ namespace DisplayXR
 {
 #if UNITY_EDITOR
     [OpenXRFeature(
-        UiName = "DisplayXR",
+        UiName = "DisplayXR (legacy hook — deprecated)",
         BuildTargetGroups = new[] {
             UnityEditor.BuildTargetGroup.Standalone
         },
         Company = "DisplayXR",
-        Desc = "Enables stereo rendering on 3D light field displays via DisplayXR OpenXR runtime. " +
-               "Provides Kooima asymmetric frustum projection, display-centric and camera-centric " +
-               "stereo rig modes, and 2D UI overlay support.",
+        Desc = "DEPRECATED (#166): the legacy OpenXR API-layer hook path. The shipping path is now " +
+               "the DisplayXR Display provider (IUnityXRDisplay) — enable \"DisplayXR Display\" under " +
+               "XR Plug-in Management > Standalone instead of this feature. Kept for legacy projects; " +
+               "removal is a later pass. Provides Kooima asymmetric frustum projection, display-centric " +
+               "and camera-centric stereo rig modes, and 2D UI overlay support via native OpenXR hooks.",
         DocumentationLink = "https://github.com/DisplayXR/displayxr-unity",
         OpenxrExtensionStrings = ExtensionStrings,
         Version = "0.1.0",
         FeatureId = FeatureId
     )]
 #endif
+    /// <summary>
+    /// DEPRECATED (epic #166): the legacy OpenXR API-layer hook backend. DisplayXR now ships as a
+    /// custom <c>IUnityXRDisplay</c> display provider (see <c>Runtime/Provider/</c> and
+    /// <c>docs~/architecture/xr-display-provider.md</c>) — enable "DisplayXR Display" under
+    /// XR Plug-in Management &gt; Standalone. This hook feature is retained so existing projects keep
+    /// working and will be removed in a future release. New projects should use the provider.
+    /// The plugin still uses this type internally on the legacy hook path; those uses suppress the
+    /// obsolete warning with <c>#pragma warning disable 618</c>.
+    /// </summary>
+    [System.Obsolete("The DisplayXR OpenXR-hook feature is deprecated (#166): use the DisplayXR Display " +
+        "provider (IUnityXRDisplay) — enable \"DisplayXR Display\" under XR Plug-in Management > Standalone. " +
+        "The hook path is retained for legacy projects and will be removed in a future release.", false)]
     public class DisplayXRFeature : OpenXRFeature
     {
         public const string FeatureId = "com.displayxr.unity.feature";

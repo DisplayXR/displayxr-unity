@@ -8,9 +8,10 @@
 ## For Contributors
 
 ### Architecture — How the system works
-- [Preview Session](architecture/preview-session.md) — SA session lifecycle, frame loop, Play Mode integration
-- [Hook Chain](architecture/hook-chain.md) — OpenXR interception, thread-safe state, deferred destruction
+- [XR Display Provider](architecture/xr-display-provider.md) — **the shipping path (#166):** the custom `IUnityXRDisplay` provider, its component map, Play Mode parity, and the inert-`DisplayXRFeature` rule
 - [Kooima Pipeline](architecture/kooima-pipeline.md) — Stereo projection math, transform chain, tunables
+- [Preview Session](architecture/preview-session.md) — SA session lifecycle, frame loop, Play Mode integration
+- [Hook Chain](architecture/hook-chain.md) — **legacy/deprecated (#166):** the OpenXR-interception hook path (`DisplayXRFeature`), retained for existing projects until removal
 
 ### Architecture Decision Records — Why things are the way they are
 - [ADR-001: Deferred Destruction](adr/ADR-001-deferred-destruction.md) — Why xrDestroySession/Instance is deferred
