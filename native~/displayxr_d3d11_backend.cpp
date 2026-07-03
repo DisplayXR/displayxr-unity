@@ -18,7 +18,7 @@
 
 #if defined(_WIN32)
 
-#include "displayxr_hooks_internal.h"
+#include "displayxr_backend.h"
 
 #define DISPLAYXR_MAX_RENDERING_MODES 16
 

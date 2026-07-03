@@ -23,7 +23,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include "displayxr_hooks.h"
+#include "displayxr_exports.h"
 #include "displayxr_shared_state.h"
 
 #pragma comment(lib, "dwmapi.lib")

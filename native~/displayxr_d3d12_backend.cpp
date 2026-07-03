@@ -5,7 +5,7 @@
 
 #if defined(_WIN32)
 
-#include "displayxr_hooks_internal.h"
+#include "displayxr_backend.h"
 #include <d3d12.h>
 
 // XR_KHR_D3D12_enable types — defined inline so this TU doesn't need

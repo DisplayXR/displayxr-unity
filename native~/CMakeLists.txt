@@ -69,8 +69,13 @@ if(WIN32)
 endif()
 
 # --- Plugin sources ---
+# Hook-removal pass: displayxr_hooks.cpp and the standalone (SA) session TUs are
+# no longer compiled — the custom IUnityXRDisplay provider (displayxr_xrprovider/)
+# is the shipping path. The handful of symbols surviving TUs still needed from the
+# hook TU were re-homed into displayxr_native_shared.cpp. The SA files remain on
+# disk (dormant quilt-render seed) but are not in SOURCES.
 set(SOURCES
-    displayxr_hooks.cpp
+    displayxr_native_shared.cpp
     displayxr_d3d11_backend.cpp
     displayxr_d3d12_backend.cpp
     displayxr_metal_backend.cpp
@@ -79,34 +84,25 @@ set(SOURCES
     displayxr_opengles_backend.cpp
     displayxr_shared_state.cpp
     displayxr_readback.cpp
-    displayxr_standalone.cpp
-    displayxr_standalone_d3d11.cpp
-    displayxr_standalone_d3d12.cpp
-    displayxr_standalone_metal_backend.cpp
-    displayxr_standalone_vulkan.cpp
-    displayxr_standalone_opengl.cpp
-    displayxr_standalone_opengles.cpp
     displayxr_vk_loader.cpp
     displayxr_window_space_ui.cpp
     displayxr_local2d.cpp
 )
 
 set(HEADERS
-    displayxr_hooks.h
-    displayxr_hooks_internal.h
+    displayxr_exports.h
+    displayxr_backend.h
     displayxr_shared_state.h
     displayxr_readback.h
     displayxr_extensions.h
-    displayxr_standalone.h
-    displayxr_standalone_internal.h
     displayxr_window_space_ui.h
     displayxr_local2d.h
 )
 
 # Apple-only: IOSurface helpers (Objective-C) + transparent-overlay NSWindow config
 if(APPLE)
-    list(APPEND SOURCES displayxr_metal.m displayxr_standalone_metal.m displayxr_macos.mm)
-    list(APPEND HEADERS displayxr_metal.h displayxr_standalone_metal.h)
+    list(APPEND SOURCES displayxr_metal.m displayxr_macos.mm)
+    list(APPEND HEADERS displayxr_metal.h)
 endif()
 
 # Windows-only: overlay child window + D3D11/DXGI + dGPU preference exports
@@ -180,7 +176,7 @@ if(APPLE)
         ${QUARTZCORE_FRAMEWORK}
     )
     # Enable ARC for Objective-C / Objective-C++ files
-    set_source_files_properties(displayxr_metal.m displayxr_standalone_metal.m displayxr_macos.mm PROPERTIES
+    set_source_files_properties(displayxr_metal.m displayxr_macos.mm PROPERTIES
         COMPILE_FLAGS "-fobjc-arc"
     )
 endif()

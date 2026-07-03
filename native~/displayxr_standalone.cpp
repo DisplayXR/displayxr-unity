@@ -1,6 +1,15 @@
 // Copyright 2024-2026, DisplayXR contributors
 // SPDX-License-Identifier: Apache-2.0
 //
+// PRESERVED (dormant): this render-to-atlas core is the SEED for the future
+// many-view "quilt" render path (>8 views, e.g. Looking Glass — see
+// docs~/adr/ADR-007-render-path-by-view-count.md). It is NOT compiled today
+// (removed from CMakeLists SOURCES in the hook-removal pass). NOTE: it still
+// references hook helpers (displayxr_get_hooked_backend/_get_hooked_session and
+// displayxr_hooked_* rendering-mode wrappers) that were removed with
+// displayxr_hooks.cpp — re-home those when promoting this to the built-app quilt
+// renderer.
+//
 // Standalone OpenXR session for editor preview.
 // Loads the DisplayXR runtime directly via xrNegotiateLoaderRuntimeInterface,
 // bypassing Unity's OpenXR loader entirely. This gives us full control over
