@@ -569,6 +569,29 @@ static void ps_enumerate_modes(void)
 		       (int)s_ps.modes[i].hardwareDisplay3D,
 		       (int)s_ps.modes[i].isActive, (int)s_ps.modes[i].isRequestable);
 	}
+
+	// Render-path selection by view count (ADR-007). Unity's IUnityXRDisplay caps
+	// at kUnityXRMaxNumRenderPasses(4) * kUnityXRMaxNumUnityXRRenderParams(2) = 8
+	// views/frame, so the provider path covers eye-tracked stereo + quad. A display
+	// advertising more (many-view light field, e.g. Looking Glass 45+) needs the
+	// app-side N-camera -> atlas "quilt" path, which is NOT yet implemented — the
+	// dormant displayxr_standalone render-to-atlas core is its seed. Until then we
+	// warn once and render up to 8 views via the provider. This is the branch point
+	// where the future quilt renderer slots in (keyed off max advertised view count).
+	{
+		const uint32_t PS_MAX_PROVIDER_VIEWS = 8; // Unity XR display cap (ADR-007)
+		uint32_t max_views = 0;
+		for (uint32_t i = 0; i < s_ps.mode_count; i++)
+			if (s_ps.modes[i].viewCount > max_views) max_views = s_ps.modes[i].viewCount;
+		static int s_warned_over_cap = 0;
+		if (max_views > PS_MAX_PROVIDER_VIEWS && !s_warned_over_cap) {
+			s_warned_over_cap = 1;
+			ps_log("[DisplayXR-PROV] WARN: display advertises %u views; the >%u-view "
+			       "quilt render path is not yet implemented (ADR-007) — provider "
+			       "renders up to %u.\n",
+			       max_views, PS_MAX_PROVIDER_VIEWS, PS_MAX_PROVIDER_VIEWS);
+		}
+	}
 }
 
 // Find an enumerated mode by modeIndex (NULL if absent).
