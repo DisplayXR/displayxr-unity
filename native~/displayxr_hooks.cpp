@@ -2191,17 +2191,23 @@ displayxr_set_viewport_size_native(uint32_t width, uint32_t height,
 
 // Custom display-provider session (#166) lives in the same DLL; route hook-path
 // hardware requests to it when it's the active session (Unity's OpenXR hook session
-// doesn't exist in provider mode, so the hook path is inert there).
+// doesn't exist in provider mode, so the hook path is inert there). The provider is
+// Windows-only (CMake builds displayxr_xrprovider under if(WIN32)), so these symbols
+// only exist on Windows — guard the decls + calls to keep macOS/Linux linking.
+#if defined(_WIN32)
 extern "C" int dxr_prov_session_is_running(void);
 extern "C" int dxr_prov_request_display_mode(int mode3d);
+#endif
 
 int
 displayxr_request_display_mode(int mode_3d)
 {
+#if defined(_WIN32)
 	// Provider mode: forward to the provider's own xrRequestDisplayModeEXT so the
 	// V-key 2D/3D hardware switch reaches the panel in provider apps too (#166).
 	if (dxr_prov_session_is_running())
 		return dxr_prov_request_display_mode(mode_3d);
+#endif
 
 	DisplayXRState *state = displayxr_get_state();
 	if (!state->has_display_mode_ext || state->pfn_request_display_mode == nullptr || s_session == XR_NULL_HANDLE) {
