@@ -1,10 +1,12 @@
 ---
-status: Accepted
+status: Superseded
 date: 2026-04-07
 source: "preview-own-window branch"
 ---
 
 # ADR-003: Plugin-Owned Native Window Instead of IOSurface/DXGI Sharing
+
+> **Status: Superseded (2026-07-03, #166).** The native editor preview window this ADR covers was removed in the hook-removal pass; the custom IUnityXRDisplay provider is now the sole backend. Kept for historical decision context. See [ADR-007](ADR-007-render-path-by-view-count.md) and [xr-display-provider.md](../architecture/xr-display-provider.md).
 
 ## Context
 

@@ -1,9 +1,11 @@
 ---
-status: Accepted
+status: Superseded
 date: 2025-03-01
 ---
 
 # ADR-002: Dual-Session Architecture (SA Preview vs Unity XR Loader)
+
+> **Status: Superseded (2026-07-03, #166).** The dual-session (SA session vs Unity XR loader) architecture this ADR covers was removed in the hook-removal pass; the custom IUnityXRDisplay provider is now the sole backend. Kept for historical decision context. See [ADR-007](ADR-007-render-path-by-view-count.md) and [xr-display-provider.md](../architecture/xr-display-provider.md).
 
 ## Context
 

@@ -101,14 +101,9 @@ This step is the same on both platforms:
 
 1. Go to **Edit > Project Settings > XR Plug-in Management**.
 
-2. Under the **Standalone** tab (desktop icon), check **OpenXR**.
-   - Unity will install the OpenXR package if not already present.
+2. Under the **Standalone** tab (desktop icon), check **DisplayXR** — the custom `IUnityXRDisplay` provider (subsystem id `DisplayXR Display`). It drives the DisplayXR runtime directly, so you do **not** enable Unity's OpenXR plugin.
 
-3. Under **OpenXR**, expand the **Features** list (or click the gear icon next to OpenXR).
-
-4. Check **DisplayXR**.
-
-5. Verify by scrolling to **Project Settings > XR Plug-in Management > OpenXR > DisplayXR** — you should see a status panel showing whether `XR_RUNTIME_JSON` is configured.
+3. That's the whole setup — the provider is a single toggle. The plugin's post-build processor auto-deploys the native library + `UnitySubsystemsManifest.json` into player builds, so no manual copying is needed.
 
 ---
 
@@ -264,55 +259,39 @@ Display-centric mode anchors a virtual display in the scene. The viewer looks "i
 
 ## Step 6: Test in the Editor
 
-There are two ways to preview DisplayXR output in the editor. Use whichever fits your workflow — or both.
+**Press Play.** The DisplayXR provider creates its runtime session and weaves the
+composited stereo output to a dedicated window on the DisplayXR display — Play Mode
+*is* the preview, there is no separate preview window. Your scene's
+`DisplayXRDisplay` / `DisplayXRCamera` rigs drive the stereo projection, and normal
+Unity input, physics, and game logic run alongside.
 
-### 6a. Standalone Preview (recommended for iteration)
+1. Verify the runtime is configured: the **DisplayXR** status panel (Project
+   Settings > XR Plug-in Management > DisplayXR) should show a connected display or
+   the sim_display info.
 
-The standalone preview creates its own OpenXR session — no Play Mode needed.
+2. Open one of the demo scenes and press **Play**.
 
-1. Verify the runtime is configured: **Project Settings > XR Plug-in Management > OpenXR > DisplayXR** should show either a connected display or the sim_display info.
+3. The sample `DisplayXRInputController` maps **V** to toggle 2D / 3D; add your own
+   input for anything else (keybindings are app policy, not plugin policy).
 
-2. Open one of the demo scenes.
-
-3. **Window > DisplayXR > Preview Window**.
-
-4. Click **Start** — the preview connects to the DisplayXR runtime and shows live composited output via zero-copy GPU texture sharing (IOSurface on macOS, shared DXGI on Windows).
-
-5. Use the **camera dropdown** to switch between scene cameras. Cameras are categorized by rig type (DisplayRig, CameraRig, Regular Camera). Switching rig types auto-requests the appropriate rendering mode.
-
-6. Press **V** to cycle rendering modes, or **0–8** to select a specific mode. Available modes depend on the connected display hardware (or sim_display configuration).
-
-7. **Enable Log Eye Tracking** on either component to see per-frame eye positions in the Console:
+4. **Enable Log Eye Tracking** on a rig component to see per-frame eye positions in
+   the Console:
    ```
    [DisplayXR] Eyes: L=(0.032, 0.001, 0.504), R=(-0.031, 0.001, 0.504), tracked=True
    ```
 
-### 6b. Game View Overlay (Play Mode)
-
-The Game View Overlay renders the composited stereo output directly in Unity's Game View during Play Mode. Use this when you need input, physics, or game logic running alongside the 3D preview.
-
-1. Add **DisplayXR > Game View Overlay** (`DisplayXRGameViewOverlay`) to any GameObject in the scene. Only one instance is needed — it manages all DisplayXR cameras automatically.
-
-2. Enter **Play Mode** — the overlay suppresses normal scene rendering and displays the composited output from the runtime, filling the entire Game View.
-
-3. Use Unity's **Display dropdown** (Display 1, Display 2, ...) in the Game View toolbar to switch between DisplayXR cameras. Each camera with a `DisplayXRDisplay` or `DisplayXRCamera` component is assigned a display index automatically.
-
-4. Press **V** to cycle rendering modes, **0–8** for a specific mode, **F11** for fullscreen.
-
-### When to use each
-
-| | Standalone Preview | Game View Overlay |
-|-|-------------------|-------------------|
-| **Best for** | Quick iteration, tweaking stereo parameters | Full Play Mode testing with game logic |
-| **Requires Play Mode** | No | Yes |
-| **Scene modification** | None needed | Add one component |
-| **Ships with builds** | No (editor-only) | Yes — required for standalone apps |
+> Displays advertising more than 8 views (many-view light fields, e.g. Looking
+> Glass) are not yet supported — the provider caps at 8 views and logs a one-shot
+> warning. See [ADR-007](adr/ADR-007-render-path-by-view-count.md).
 
 ---
 
 ## Step 7: Build a Standalone App
 
-> **Important:** Your scene must include a `DisplayXRGameViewOverlay` component for the composited 3D output to display in the built app's window. This is the same component from Step 6b — it works in both the editor and standalone builds.
+> **No scene component required.** With the DisplayXR provider enabled (Step 2), the
+> plugin's post-build processor auto-deploys the native library + subsystem manifest,
+> and the provider weaves the composited 3D output to the built app's window
+> automatically.
 
 ### Windows Build
 
@@ -323,8 +302,7 @@ The Game View Overlay renders the composited stereo output directly in Unity's G
    - **Architecture:** x86_64
 4. Add your demo scene(s) to the **Scenes In Build** list (drag from Project window or click **Add Open Scenes**).
 5. Click **Player Settings** and verify:
-   - **XR Plug-in Management > Standalone**: OpenXR is checked
-   - **OpenXR > Features**: DisplayXR is checked
+   - **XR Plug-in Management > Standalone**: DisplayXR is checked
 6. Click **Build**. Choose an output folder (e.g., `Builds/Windows/`).
 7. Unity produces:
    ```
@@ -435,7 +413,7 @@ Once the app is running, verify each stage:
 Search the Player.log for these key lines:
 
 ```
-[DisplayXR] Feature enabled, hooking OpenXR instance
+[DisplayXR-PROV] provider registered, subsystem 'DisplayXR Display' started
 [DisplayXR] Display info: 1920x1080, 27.0x15.2 cm, viewer at 500 mm
 [DisplayXR] Eye tracking active
 ```
@@ -463,6 +441,6 @@ If you see `[DisplayXR] Feature not active` or no DisplayXR lines at all, the fe
 
 - **Tune the stereo parameters** — see the [Stereo Tunables Reference](../README.md#stereo-tunables-reference) for what each parameter does physically.
 - **Add a 2D UI overlay** — see [2D UI Overlay](../README.md#2d-ui-overlay) for routing a Canvas to a compositor layer.
-- **Standalone preview** — see [Editor Preview](../README.md#editor-preview-standalone-session) for the full standalone preview workflow with camera selector and rendering modes.
+- **Preview in the editor** — just press Play; the provider weaves to a dedicated window on the DisplayXR display (there is no separate preview window).
 - **Deploy to end users** — see [Deploying to End Users](../README.md#deploying-to-end-users) for runtime installation on target machines.
 - **Build for both platforms** — the plugin includes both Windows and macOS binaries. Unity selects the correct one per build target.
