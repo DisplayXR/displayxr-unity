@@ -268,7 +268,11 @@ namespace DisplayXR
         public static void RequestSimpleWindow()
         {
 #if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
-            DisplayXRNative.displayxr_request_simple_window(1);
+            // The hook-era pre-session request is a no-op under the provider (it does
+            // its own window binding); the OnEnable set_simple_window styling path
+            // (win32) still applies. Guard so a missing hook export can't throw.
+            try { DisplayXRNative.displayxr_request_simple_window(1); }
+            catch (System.EntryPointNotFoundException) { }
 #endif
         }
 

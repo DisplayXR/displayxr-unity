@@ -206,3 +206,75 @@ displayxr_get_canvas_rect_px(int32_t *x, int32_t *y, uint32_t *w, uint32_t *h)
 	if (h) *h = s_canvas_rect_h;
 	return 1;
 }
+
+// --- Stereo-matrix readback (C# P/Invoke) ---
+// The provider publishes the per-eye view/projection into the shared state each
+// frame (displayxr_state_set_stereo_matrices, from the provider session). The URP
+// KooimaProjectionFixFeature reads them back through this export to re-push the
+// correct off-center projection (#127). Re-homed out of the deleted hook TU; the
+// state store (displayxr_shared_state.cpp) is written by the provider now.
+DISPLAYXR_EXPORT void
+displayxr_get_stereo_matrices(float *left_view, float *left_proj,
+                              float *right_view, float *right_proj,
+                              int *valid)
+{
+	DisplayXRStereoMatrices mats = displayxr_state_get_stereo_matrices();
+	memcpy(left_view, mats.left_view, sizeof(float) * 16);
+	memcpy(left_proj, mats.left_projection, sizeof(float) * 16);
+	memcpy(right_view, mats.right_view, sizeof(float) * 16);
+	memcpy(right_proj, mats.right_projection, sizeof(float) * 16);
+	*valid = mats.valid;
+}
+
+// --- Display-info / eye-position / render-target readback (C# P/Invoke) ---
+// Thin readers of the shared DisplayXRState / win32 window. Re-homed out of the
+// deleted hook TU so editor gizmos (DisplayXRGizmoHelpers) and 2D-surround sizing
+// don't hit a missing entry point. They read whatever the shared state holds
+// (defaults when no session has populated it), so they degrade gracefully.
+DISPLAYXR_EXPORT void
+displayxr_get_display_info(float *display_width_m, float *display_height_m,
+                           uint32_t *pixel_width, uint32_t *pixel_height,
+                           float *nominal_x, float *nominal_y, float *nominal_z,
+                           float *scale_x, float *scale_y, int *is_valid)
+{
+	DisplayXRState *state = displayxr_get_state();
+	DisplayXRDisplayInfo *di = &state->display_info;
+	*display_width_m = di->display_width_meters;
+	*display_height_m = di->display_height_meters;
+	*pixel_width = di->display_pixel_width;
+	*pixel_height = di->display_pixel_height;
+	*nominal_x = di->nominal_viewer_x;
+	*nominal_y = di->nominal_viewer_y;
+	*nominal_z = di->nominal_viewer_z;
+	*scale_x = di->recommended_view_scale_x;
+	*scale_y = di->recommended_view_scale_y;
+	*is_valid = di->is_valid;
+}
+
+DISPLAYXR_EXPORT void
+displayxr_get_eye_positions(float *lx, float *ly, float *lz,
+                            float *rx, float *ry, float *rz, int *is_tracked)
+{
+	DisplayXREyePositions eyes = displayxr_state_get_eye_positions();
+	*lx = eyes.left_eye.x;  *ly = eyes.left_eye.y;  *lz = eyes.left_eye.z;
+	*rx = eyes.right_eye.x; *ry = eyes.right_eye.y; *rz = eyes.right_eye.z;
+	*is_tracked = eyes.is_tracked;
+}
+
+DISPLAYXR_EXPORT void
+displayxr_get_render_target_size(uint32_t *out_w, uint32_t *out_h)
+{
+	uint32_t w = 0, h = 0;
+#if defined(_WIN32)
+	DisplayXRState *state = displayxr_get_state();
+	if (state && state->window_handle) {
+		RECT rc = {0, 0, 0, 0};
+		if (GetClientRect((HWND)state->window_handle, &rc)) {
+			w = (uint32_t)(rc.right - rc.left);
+			h = (uint32_t)(rc.bottom - rc.top);
+		}
+	}
+#endif
+	if (out_w) *out_w = w;
+	if (out_h) *out_h = h;
+}
