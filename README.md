@@ -34,14 +34,17 @@ Unity plugin for rendering on eye-tracked 3D light field displays via the Displa
 
 ## Overview
 
-The plugin intercepts Unity's OpenXR pipeline at the native layer to provide:
+DisplayXR ships as a custom **Unity display provider** (`IUnityXRDisplay`, the same integration route as Oculus/Varjo/Cardboard) that drives the DisplayXR OpenXR runtime directly while Unity keeps rendering the scene. It provides:
 
-- **Eye-tracked stereo rendering** — Kooima asymmetric frustum projection from real-time eye positions
+- **Eye-tracked stereo rendering** — runtime-owned Kooima asymmetric frustum projection from real-time eye positions (`XR_EXT_view_rig`)
 - **Two stereo rig modes** — Camera-centric (add to existing camera) or display-centric (place a virtual display in the scene)
-- **2D UI overlay** — Route any Canvas to a window-space composition layer with stereo disparity
-- **Standalone editor preview** — Live composited 3D output in a dedicated editor window, no Play Mode required. Camera selector dropdown, rendering mode switching, and zero-copy GPU texture sharing.
+- **2D/3D display zones + 2D UI overlay** — frame 3D content to window-pixel zones and route any Canvas to a window-space composition layer with stereo disparity
+- **BiRP and URP** — off-axis projection on both pipelines, plus Single-Pass-Instanced (SPI) on URP+Windows+D3D12 and Multi-Pass elsewhere
+- **In-editor Play Mode + standalone editor preview** — Play Mode runs the provider itself (parity with built apps, #171); a dedicated editor preview window is also available.
 
-The plugin works by hooking `xrLocateViews` before Unity sees the results, replacing the runtime's FOV data with Kooima-computed asymmetric frustums, and then pushing the full Kooima view + projection matrices to each stereo eye via `Camera.SetStereoProjectionMatrix` / `SetStereoViewMatrix`. Because Unity gates those APIs to MultiPass on every platform, DisplayXR force-enables MultiPass at OpenXR instance creation (Single-Pass-Instanced is incompatible — see issue #69 for the experiment that verified this).
+**How it works:** the provider registers a `DisplayXR Display` display subsystem, binds an OpenXR session to Unity's graphics device, chains the runtime's `XR_EXT_view_rig` descriptor onto `xrLocateViews`, and submits Unity's rendered eye textures back to the runtime compositor via `xrEndFrame`. Enable it under **XR Plug-in Management > Standalone > DisplayXR Display** (see [Enabling the Feature](#enabling-the-feature)).
+
+> **Legacy OpenXR-hook path (deprecated, #166).** Earlier versions worked by *hooking* Unity's OpenXR pipeline at the native layer (an `OpenXRFeature` named "DisplayXR" under **OpenXR > Features**) rather than acting as a display provider. That hook path (`DisplayXRFeature`, `[Obsolete]`) is retained for existing projects but is superseded by the provider and will be removed in a future release. New projects should use the provider. See [`docs~/architecture/xr-display-provider.md`](docs~/architecture/xr-display-provider.md) (provider) and [`docs~/architecture/hook-chain.md`](docs~/architecture/hook-chain.md) (legacy hook).
 
 ---
 
@@ -118,12 +121,16 @@ After installation, the package appears as **DisplayXR** in the Package Manager.
 
 ## Enabling the Feature
 
-1. Go to **Edit > Project Settings > XR Plug-in Management**
-2. Under the **Standalone** tab (Windows or macOS), check **OpenXR**
-3. Click the gear icon next to OpenXR (or expand **OpenXR > Features**)
-4. Enable **DisplayXR**
+DisplayXR is enabled as a display provider (the shipping path):
 
-You can verify the runtime connection under **Project Settings > XR Plug-in Management > OpenXR > DisplayXR** — a status panel shows whether `XR_RUNTIME_JSON` is set.
+1. Go to **Edit > Project Settings > XR Plug-in Management**
+2. Under the **Standalone** tab (Windows or macOS), check **DisplayXR Display**
+3. Make sure **OpenXR** is **not** also checked on the same tab (the provider drives the runtime itself; running both loaders conflicts)
+4. Check **Initialize XR on Startup** so the provider comes up in Play Mode and in built apps
+
+You can verify the runtime status in the **DisplayXR** rig inspectors and the **DisplayXR** settings panel (display resolution, eye-tracking state).
+
+> **Legacy hook path (deprecated, #166).** The old OpenXR-hook feature still works if a project depends on it: check **OpenXR** under Standalone, expand **OpenXR > Features**, and enable **DisplayXR (legacy hook — deprecated)**. This path is superseded by the provider above and will be removed in a future release — prefer the provider for new projects. Do not enable both at once.
 
 ---
 
@@ -292,7 +299,9 @@ The preview uses zero-copy GPU texture sharing (IOSurface on macOS, DXGI on Wind
 
 ### Play Mode Integration
 
-If you enter Play Mode while the preview is running, the plugin automatically removes Unity's OpenXR loader to prevent session conflicts, then restores it when you exit Play Mode. This means Play Mode runs without XR — useful for testing game logic — while the standalone preview handles all 3D display output.
+With the **DisplayXR Display provider** active (the shipping path), **Play Mode runs the provider itself** — the same backend as a built app, weaving to the display in a dedicated editor window (#171). No separate preview session is needed for parity testing.
+
+The dedicated edit-mode preview window described above uses the standalone session and is intended for the legacy hook path. If you are still on the legacy hook path and enter Play Mode while that preview is running, the plugin removes Unity's OpenXR loader to prevent session conflicts and restores it on exit (Play Mode then runs without XR).
 
 ---
 
@@ -303,7 +312,7 @@ If you enter Play Mode while the preview is running, the plugin automatically re
 1. **File > Build Settings**
 2. Select **Windows, Mac, Linux** platform
 3. Set **Target Platform** to **Windows** and **Architecture** to **x86_64**
-4. Verify in **Player Settings > XR Plug-in Management > Standalone** that OpenXR is enabled with the DisplayXR feature
+4. Verify in **Player Settings > XR Plug-in Management > Standalone** that **DisplayXR Display** is enabled (or, on the legacy hook path, that OpenXR is enabled with the DisplayXR feature)
 5. Click **Build** or **Build And Run**
 
 The build output includes `displayxr_unity.dll` in the `Plugins/` folder alongside your executable.
@@ -312,7 +321,7 @@ The build output includes `displayxr_unity.dll` in the `Plugins/` folder alongsi
 
 1. **File > Build Settings**
 2. Select **macOS** platform
-3. Verify OpenXR + DisplayXR feature enabled in Standalone XR settings
+3. Verify **DisplayXR Display** is enabled in Standalone XR settings (or, on the legacy hook path, OpenXR + the DisplayXR feature)
 4. Click **Build**
 
 The `.app` bundle includes `libdisplayxr_unity.dylib` in the plugins folder.
@@ -439,7 +448,7 @@ This lets you develop and test the full stereo pipeline on any machine.
 | Symptom | Cause | Fix |
 |---------|-------|-----|
 | "No OpenXR runtime found" | `XR_RUNTIME_JSON` not set or points to missing file | Set the env var to the DisplayXR runtime JSON path |
-| Black screen | DisplayXR feature not enabled | Check Project Settings > XR Plug-in Management > OpenXR > Features |
+| Black screen | DisplayXR not enabled | Check **Project Settings > XR Plug-in Management > Standalone > DisplayXR Display** (provider), and **Initialize XR on Startup**. On the legacy hook path: OpenXR > Features > DisplayXR. |
 | Scene renders 2D side-by-side on Leia hardware (no depth) | Leia plug-in not installed/registered | Install `DisplayXRLeiaSRSetup-*.exe` from [displayxr-leia-plugin](https://github.com/DisplayXR/displayxr-leia-plugin/releases). Verify `HKLM\Software\DisplayXR\DisplayProcessors\leia-sr` exists. Without the plug-in, the runtime falls back to `sim_display` (SBS output) on any hardware. |
 | No stereo (flat image) | Eye tracking not running | Verify the DisplayXR runtime is configured with a display that supports eye tracking, or use sim_display for testing |
 | Stereo looks wrong | Tunables misconfigured | Reset to defaults (IPD=1, Parallax=1, Scale=1) |
@@ -461,45 +470,46 @@ Enable **Log Eye Tracking** on the DisplayXRCamera or DisplayXRDisplay component
 
 ### Checking Runtime Status in Editor
 
-**Project Settings > XR Plug-in Management > OpenXR > DisplayXR** shows:
-- Runtime JSON path and whether the file exists
-- Runtime connection status
+With the provider active, the **DisplayXRCamera / DisplayXRDisplay inspectors** and the **DisplayXR settings panel** show runtime status (unified across provider, editor preview, and legacy hook):
 - Connected display properties (resolution, physical size, nominal viewer distance)
 - Eye tracking status
+
+(On the legacy hook path, the same status also appears under **Project Settings > XR Plug-in Management > OpenXR > DisplayXR**, including the `XR_RUNTIME_JSON` path/existence check.)
 
 ---
 
 ## Architecture
+
+DisplayXR ships as a custom **`IUnityXRDisplay` display provider** (the shipping path). The provider
+registers a `DisplayXR Display` subsystem, owns an OpenXR session on Unity's graphics device, and hands
+Unity's rendered eye textures to the runtime compositor — Unity keeps rendering the scene (BiRP/URP,
+SPI/Multi-Pass), the runtime owns the Kooima math (`XR_EXT_view_rig`).
 
 ```
 Unity Editor / Player
 ┌──────────────────────────────────────────────────────────┐
 │  C# Layer                                                │
 │                                                          │
-│  DisplayXRFeature : OpenXRFeature                         │
-│    HookGetInstanceProcAddr → install native hooks        │
-│    OnSystemChange → query XrDisplayInfoEXT               │
-│    API: SetTunables(), SetSceneTransform()               │
+│  DisplayXRDisplayLoader : XRLoaderHelper                 │
+│    starts the "DisplayXR Display" display subsystem      │
+│  DisplayXRProvider / DisplayXRProviderDriver             │
+│    push rig tunables, modes/zones, events (dxr_prov_*)   │
 │                                                          │
 │  DisplayXRCamera          DisplayXRDisplay                 │
 │  (camera-centric)        (display-centric)               │
-│  Attach to Camera        Place in scene                  │
 │                                                          │
-│  DisplayXRWindowSpaceUI   DisplayXRPreviewSession           │
-│  (2D overlay)            (standalone editor preview)     │
-│                          DisplayXRPreviewWindow           │
-│                          (editor UI + camera selector)   │
+│  DisplayXRWindowSpaceUI / DisplayXRLocal2D  (2D layers)   │
 └──────────────────────────────────────────────────────────┘
         │ P/Invoke (displayxr_unity.dll / .dylib)
         ▼
 ┌──────────────────────────────────────────────────────────┐
 │  Native Plugin (C/C++)                                   │
-│  Hook chain:                                             │
-│    xrLocateViews → scene transform → tunables → Kooima  │
-│    xrCreateSession → inject window binding               │
-│    xrGetSystemProperties → extract display info          │
-│    xrEndFrame → submit overlay layers                    │
-│  Thread-safe double-buffered shared state                │
+│  Display provider (IUnityXRDisplay):                     │
+│    session on Unity's device → render params (SPI/MP)   │
+│    xrLocateViews → chain XR_EXT_view_rig descriptor     │
+│    xrEndFrame → submit projection + zone + 2D layers    │
+│  (Legacy: an xrGetInstanceProcAddr hook chain — see     │
+│   docs~/architecture/hook-chain.md — is still present.) │
 └──────────────────────────────────────────────────────────┘
         │ Standard OpenXR API
         ▼
@@ -508,6 +518,11 @@ Unity Editor / Player
 │  Compositor → Display Processor → Output                 │
 └──────────────────────────────────────────────────────────┘
 ```
+
+See [`docs~/architecture/xr-display-provider.md`](docs~/architecture/xr-display-provider.md) for the full
+provider design. The **legacy OpenXR-hook path** (`DisplayXRFeature : OpenXRFeature`, `[Obsolete]` #166) is
+documented in [`docs~/architecture/hook-chain.md`](docs~/architecture/hook-chain.md) and retained for
+existing projects only.
 
 ### Transform Chain (per frame)
 
@@ -529,7 +544,9 @@ Unity builds projection matrices → renders stereo
 
 | Path | Purpose |
 |------|---------|
-| `Runtime/DisplayXRFeature.cs` | OpenXR Feature — lifecycle hooks, P/Invoke, public API |
+| `Runtime/Provider/` | **Display provider (shipping path):** `DisplayXRDisplayLoader` (XR Plug-in Management loader), `DisplayXRProvider`/`DisplayXRProviderDriver` (facade + per-frame driver), `DisplayXRProviderNative` (P/Invoke) |
+| `Editor/Provider/DisplayXRDisplayPackage.cs` | Registers the "DisplayXR Display" provider toggle in XR Plug-in Management |
+| `Runtime/DisplayXRFeature.cs` | **Legacy OpenXR-hook feature (`[Obsolete]`, #166)** — retained for existing projects; superseded by the provider |
 | `Runtime/DisplayXRCamera.cs` | Camera-centric stereo rig MonoBehaviour |
 | `Runtime/DisplayXRDisplay.cs` | Display-centric stereo rig MonoBehaviour |
 | `Runtime/DisplayXRDisplayInfo.cs` | Display properties data struct |

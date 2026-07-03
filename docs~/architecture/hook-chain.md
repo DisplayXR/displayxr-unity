@@ -1,4 +1,10 @@
-# OpenXR Hook Chain (built-app path)
+# OpenXR Hook Chain (built-app path) — LEGACY / DEPRECATED (#166)
+
+> **⚠️ Deprecated.** This hook path is the *legacy* backend. DisplayXR now ships as a custom
+> `IUnityXRDisplay` display provider — see [xr-display-provider.md](xr-display-provider.md). The
+> hook feature (`DisplayXRFeature : OpenXRFeature`) is marked `[Obsolete]` and retained only so
+> existing projects keep working; it will be removed in a future release. New work should target
+> the provider. This document is kept for reference and for maintaining the retained hook code.
 
 The native plugin (`displayxr_unity` DLL/bundle) is an **OpenXR API-layer hook**. Unity's
 own OpenXR loader still drives the session; the plugin intercepts a handful of calls via
