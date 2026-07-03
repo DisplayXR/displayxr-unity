@@ -10,7 +10,7 @@ DisplayXR-Unity renders through a custom `IUnityXRDisplay` display provider (epi
 (`native~/unity_pluginapi/IUnityXRDisplay.h`; the header explicitly lists "Quad
 pass wide FOV stereo rendering (4 RenderPass × 1 RenderParams)" as a supported
 config). This covers eye-tracked stereo (2 views) and quad (4 views) — the
-Leia-class displays DisplayXR targets today.
+eye-tracked light-field displays DisplayXR targets today.
 
 It **cannot** cover many-view light-field displays (Looking Glass: 45–100+ views),
 which fundamentally require rendering N camera views into an atlas/quilt and
