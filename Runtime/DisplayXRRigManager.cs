@@ -34,6 +34,34 @@ namespace DisplayXR
             {
                 s_ActiveCamera = value;
                 s_ActiveCameraName = value != null ? value.gameObject.name : null;
+                ApplyActiveCameraGate();
+            }
+        }
+
+        /// <summary>
+        /// Enforce single-active rendering: only the active rig camera stays enabled,
+        /// so only it renders into the XR eye textures. In provider mode (and the real
+        /// Unity-OpenXR hook path) Unity renders EVERY enabled camera with
+        /// stereoTargetEye=Both into the shared per-eye targets — but the provider is
+        /// handed ONE rig pose per frame (DisplayXRProviderDriver pushes the active
+        /// rig's pose, and the native eye pose is rig-RELATIVE). An inactive rig camera
+        /// at a different transform composes that rig-relative eye pose against its own
+        /// transform → a mismatched world eye, and at equal camera depth it overwrites
+        /// the correct render (e.g. switching from the display rig at z=0 to a camera
+        /// rig at z=-2 makes the still-enabled display camera render past the cube and
+        /// clear it away). Disabling the inactive rig cameras keeps the rendered set
+        /// matched to the single pushed pose. No-op outside Play Mode (rigs only
+        /// register via OnEnable in Play) — the edit-mode preview renders its own
+        /// dedicated eye-cams, not these source cameras, so it is unaffected.
+        /// </summary>
+        private static void ApplyActiveCameraGate()
+        {
+            if (!Application.isPlaying) return;
+            for (int i = 0; i < s_RegisteredCameras.Count; i++)
+            {
+                var cam = s_RegisteredCameras[i];
+                if (cam != null)
+                    cam.enabled = (cam == s_ActiveCamera);
             }
         }
 
@@ -52,9 +80,15 @@ namespace DisplayXR
             if (cam == null || s_RegisteredCameras.Contains(cam)) return;
             s_RegisteredCameras.Add(cam);
 
-            // Auto-elect first registered camera
+            // Auto-elect first registered camera (the setter applies the gate). For a
+            // later registration the active camera is unchanged, so apply the gate
+            // explicitly to disable the newly-registered (non-active) rig camera —
+            // otherwise it renders alongside the active one and corrupts the eye
+            // textures (see ApplyActiveCameraGate).
             if (s_ActiveCamera == null)
                 ActiveCamera = cam;
+            else
+                ApplyActiveCameraGate();
         }
 
         /// <summary>
