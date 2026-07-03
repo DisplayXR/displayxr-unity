@@ -1,5 +1,5 @@
 // Copyright 2024-2026, DisplayXR contributors
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // Runtime-facing OpenXR session for the custom Unity IUnityXRDisplay provider
 // (epic #166, M1). See displayxr_provider_session.h for the design rationale.
