@@ -5,6 +5,33 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.24.0] - 2026-07-02
+
+The custom **`IUnityXRDisplay` display provider becomes the shipping rendering path** (epic #166). The provider drives the DisplayXR runtime directly — Single-Pass-Instanced on URP + Windows + D3D12, MultiPass elsewhere — replacing the legacy native OpenXR-hook path for the primary workflow. The old `DisplayXRFeature` hook is soft-deprecated (`[Obsolete]`) but still functional. The repository is relicensed to **Apache-2.0**.
+
+### Added
+- **Custom `IUnityXRDisplay` display provider** (#166) — a Unity display provider that drives the DisplayXR runtime directly instead of intercepting Unity's OpenXR pipeline. Delivered across milestones M1 (provider skeleton), M1b (bridge — full stereo SPI weave on the Leia panel), and M2 (native-app parity control plane + cross-device handoff, in-app one-window weave).
+- **SPI-vs-MultiPass gating by render pipeline** (#166) — Single-Pass-Instanced on URP + Windows + D3D12, MultiPass elsewhere.
+- **Transparency + arbitrary-N 3D display zones + Local2D** under the provider (#166) — per-zone swapchain/bridge/locate/pass, multi-zone transparent mask, and LMB cyclopean hit-test.
+- **Per-eye foreground clip on both pipelines under the provider** (#166) — BiRP foreground clip shader + MultiPass post-process AA, and per-zone/per-eye URP foreground clip.
+- **Live tile reallocation** (#172) — zone-rect tile realloc for primary + extra zones and realloc on window resize.
+- **App-owned / dedicated / self-host weave targets** (#173) — provider defaults to an app-owned window; self-host behind `DISPLAYXR_PROV_SELFHOST`; a dedicated movable weave window for in-editor Play Mode.
+- **Provider runs in Play Mode** (#171) — provider-aware editor status; `xreditorsubsystem` keyword so the display subsystem is discoverable in-editor.
+- **App-facing atlas screenshot** (`I` key) via `XR_EXT_atlas_capture` — screenshot parity with the hook path (#140).
+- **Shared smooth 2D↔3D mode-switch sequencer** (`DisplayXRModeSwitch`) (#172).
+- **Window-space UI (HUD) composition layer** under the provider (#166).
+- **DLL code-signing** in the `.tgz` and `upm` branch (#167).
+
+### Fixed
+- **Provider hardware fixes** (#166): dedicated-window drag/input/teardown; keyboard input under the overlay via focus/raw-input hooks; Unity window-drag bracketing for SR phase-snap; single-application rig pose so the URP foreground clip tracks the moving display plane; URP `eye_world` view+proj for silhouette match; publish URP foreground-clip globals for the camera-centric rig; route hardware 2D/3D mode requests to the provider session; keep zones active in 2D so zoned content stays in its band; honor hardware 2D mode by submitting one full-res view; provider-aware boot splash.
+- **Multi-rig switch** (#166): render only the active rig camera so multi-rig switching is correct.
+- **Cross-platform link** (#166): guard provider mode-routing behind `_WIN32` so macOS/Linux link.
+- Doc correction: built apps are 2-view only (no view synthesis) (#165).
+
+### Changed
+- **Legacy OpenXR-hook `DisplayXRFeature` soft-deprecated** (`[Obsolete]`) (#166) — the provider is now the shipping path; the hook remains functional for compatibility.
+- **Repository relicensed to Apache-2.0** — vendor-neutral `NOTICE`; vendored OpenXR headers stay BSL-1.0.
+
 ## [1.23.0] - 2026-06-28
 
 ### Added
