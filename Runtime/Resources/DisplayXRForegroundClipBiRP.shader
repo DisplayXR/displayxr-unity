@@ -1,5 +1,5 @@
 // Copyright 2024-2026, DisplayXR contributors
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // Per-eye foreground-only clip for the Built-in RP under the custom display
 // provider (#166). BiRP analog of DisplayXR/ForegroundClipURP.

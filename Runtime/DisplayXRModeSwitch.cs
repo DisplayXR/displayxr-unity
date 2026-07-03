@@ -1,5 +1,5 @@
 // Copyright 2026, DisplayXR contributors
-// SPDX-License-Identifier: BSL-1.0
+// SPDX-License-Identifier: Apache-2.0
 //
 // C# port of displayxr-common/common/mode_switch.{h,cpp} — the smooth 2D<->3D
 // rendering-mode switch sequencer the native runtime test apps share. Provided as
