@@ -3,10 +3,6 @@
 
 using UnityEngine;
 
-// hook-path bridge: DisplayXRFeature is soft-deprecated (#166) but remains the active backend on the
-// legacy hook path. Suppress CS0618 for these intentional internal uses.
-#pragma warning disable 618
-
 namespace DisplayXR
 {
     /// <summary>
@@ -35,9 +31,10 @@ namespace DisplayXR
             // this runs); the splash rig's window/viewport push pulls that window
             // back on-screen, and an opaque branded splash over a click-through
             // desktop overlay is wrong anyway. The flag is set by
-            // DisplayXRTransparentOverlay.RequestTransparentSession() at
+            // DisplayXRTransparentOverlay.RequestTransparentSession() →
+            // DisplayXRProvider.RequestTransparentBackground() at
             // SubsystemRegistration, which always precedes BeforeSceneLoad.
-            if (DisplayXRFeature.s_TransparentBackgroundRequested)
+            if (DisplayXRProvider.s_TransparentBackgroundRequested)
                 return;
 
             // Built inactive so DisplayXRDisplay.bootSplashOverlay is set before
@@ -56,4 +53,3 @@ namespace DisplayXR
     }
 #endif
 }
-#pragma warning restore 618

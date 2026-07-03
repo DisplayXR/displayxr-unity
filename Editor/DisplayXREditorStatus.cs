@@ -4,32 +4,18 @@
 using UnityEngine;
 using DisplayXR;
 
-// hook-path bridge: DisplayXRFeature is soft-deprecated (#166) but remains the active backend on the
-// legacy hook path. Suppress CS0618 for these intentional internal uses.
-#pragma warning disable 618
-
 namespace DisplayXR.Editor
 {
     /// <summary>
-    /// Unifies "connected display" runtime status across the three DisplayXR session
-    /// backends so editor inspectors and the settings page show live info no matter
-    /// which one is driving (#166 gap #6):
-    ///
-    ///   1. Display Provider (<see cref="DisplayXRProvider"/>) — the built-app path,
-    ///      and Play Mode once it runs the provider (#171). <see cref="DisplayXRFeature"/>
-    ///      is NOT instantiated in provider mode, so the old
-    ///      <c>DisplayXRFeature.Instance.DisplayInfo</c> reads returned null there.
-    ///   2. Standalone editor preview (<see cref="DisplayXRPreviewSession"/>) — the
-    ///      edit-mode Preview window's own OpenXR session.
-    ///   3. OpenXR hook (<see cref="DisplayXRFeature"/>) — the legacy built-app / Play
-    ///      Mode path when the provider isn't the active loader.
-    ///
-    /// Provider is preferred, then the standalone preview, then the hook.
+    /// Surfaces "connected display" runtime status from the Display Provider
+    /// (<see cref="DisplayXRProvider"/>) so editor inspectors and the settings page
+    /// show live info in the built-app path and in Play Mode once it runs the
+    /// provider (#171).
     /// </summary>
     public static class DisplayXREditorStatus
     {
         /// <summary>Which backend currently supplies runtime status, if any.</summary>
-        public enum Source { None, Provider, StandalonePreview, OpenXRHook }
+        public enum Source { None, Provider }
 
         /// <summary>
         /// Fetch display geometry from whichever backend is live. Returns false (and
@@ -62,33 +48,15 @@ namespace DisplayXR.Editor
             }
 #endif
 
-            // 2. Standalone editor preview session.
-            if (DisplayXRPreviewSession.IsRunning && DisplayXRPreviewSession.DisplayInfo.isValid)
-            {
-                info = DisplayXRPreviewSession.DisplayInfo;
-                source = Source.StandalonePreview;
-                return true;
-            }
-
-            // 3. OpenXR hook (legacy path).
-            var feature = DisplayXRFeature.Instance;
-            if (feature != null && feature.DisplayInfo.isValid)
-            {
-                info = feature.DisplayInfo;
-                source = Source.OpenXRHook;
-                return true;
-            }
-
             info = default;
             source = Source.None;
             return false;
         }
 
         /// <summary>
-        /// Eye-tracking status from the live backend. <paramref name="hasPositions"/>
-        /// is true only for the standalone preview and the hook (the provider reports
-        /// tracked/not-tracked but no eye positions); when false, callers should show
-        /// only the tracked flag.
+        /// Eye-tracking status from the provider. <paramref name="hasPositions"/> is
+        /// always false (the provider reports tracked/not-tracked but no eye
+        /// positions); callers should show only the tracked flag.
         /// </summary>
         public static bool TryGetEyeTracking(out bool tracked, out Vector3 left,
                                              out Vector3 right, out bool hasPositions)
@@ -106,25 +74,6 @@ namespace DisplayXR.Editor
             }
 #endif
 
-            if (DisplayXRPreviewSession.IsRunning)
-            {
-                tracked = DisplayXRPreviewSession.IsEyeTracked;
-                left = DisplayXRPreviewSession.LeftEyePosition;
-                right = DisplayXRPreviewSession.RightEyePosition;
-                hasPositions = true;
-                return true;
-            }
-
-            var feature = DisplayXRFeature.Instance;
-            if (feature != null)
-            {
-                tracked = feature.IsEyeTracked;
-                left = feature.LeftEyePosition;
-                right = feature.RightEyePosition;
-                hasPositions = true;
-                return true;
-            }
-
             return false;
         }
 
@@ -133,12 +82,9 @@ namespace DisplayXR.Editor
         {
             switch (source)
             {
-                case Source.Provider:          return "Display Provider";
-                case Source.StandalonePreview: return "Standalone Preview";
-                case Source.OpenXRHook:        return "OpenXR Hook";
-                default:                       return "None";
+                case Source.Provider: return "Display Provider";
+                default:              return "None";
             }
         }
     }
 }
-#pragma warning restore 618

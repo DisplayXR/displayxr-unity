@@ -138,10 +138,8 @@ namespace DisplayXR.Editor
             EditorGUILayout.BeginVertical(EditorStyles.helpBox);
             EditorGUILayout.LabelField("Runtime Status", EditorStyles.boldLabel);
 
-            // Status comes from whichever backend is live: the Display Provider
-            // (built app / Play Mode after #171), the standalone Preview session, or
-            // the OpenXR hook. DisplayXRFeature is null in provider mode, so this no
-            // longer keys off it directly (#166 gap #6).
+            // Status comes from the Display Provider when it is live (built app /
+            // Play Mode after #171), surfaced via DisplayXREditorStatus (#166).
             if (DisplayXREditorStatus.TryGetDisplayInfo(out var info, out var source))
             {
                 EditorGUILayout.LabelField("Source", DisplayXREditorStatus.SourceLabel(source));

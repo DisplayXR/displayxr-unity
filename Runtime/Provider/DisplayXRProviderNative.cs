@@ -9,13 +9,12 @@ namespace DisplayXR
     /// P/Invoke bindings to the custom IUnityXRDisplay Display Provider's native
     /// session (epic #166). These are the <c>dxr_prov_*</c> exports from
     /// <c>native~/displayxr_xrprovider/displayxr_provider_session.cpp</c>, kept
-    /// separate from <see cref="DisplayXRNative"/> (the hook/standalone bindings)
+    /// separate from <see cref="DisplayXRNative"/> (the general native bindings)
     /// so the provider surface is grouped.
     ///
     /// The provider session runs WITHOUT Unity's OpenXR loader — it is the display
-    /// subsystem. So <see cref="DisplayXRFeature"/> is not instantiated in provider
-    /// mode; the provider driver reads display info / pushes tunables through here
-    /// instead. Windows / D3D12 only (the provider is gated to that platform).
+    /// subsystem. The provider driver reads display info / pushes tunables through
+    /// here. Windows / D3D12 only (the provider is gated to that platform).
     /// </summary>
     public static class DisplayXRProviderNative
     {

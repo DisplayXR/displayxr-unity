@@ -13,7 +13,7 @@ namespace DisplayXR
     /// WASD = move horizontally, QE = move up/down, left-mouse drag = rotate.
     /// Scroll wheel = zoom (scale). Space = reset to initial pose.
     /// Attach to the same GameObject as DisplayXRDisplay or DisplayXRCamera.
-    /// Works in Play Mode (including with the standalone preview via PlayModeIntegration).
+    /// Works in Play Mode and built players (the custom display provider drives rendering).
     /// </summary>
     [AddComponentMenu("DisplayXR/Input Controller")]
     public class DisplayXRInputController : MonoBehaviour
@@ -84,15 +84,14 @@ namespace DisplayXR
             if (m_IsCameraCentric)
                 m_InitialFov = m_Camera.fieldOfView;
 
-            // Push the initial rendering mode to the runtime so the C# state
+            // Push the initial display mode to the runtime so the C# state
             // (m_CurrentRenderingMode default = 1 / 3D) and the runtime's
-            // sim_display mode agree from frame 0. Without this the runtime
+            // hardware 2D/3D state agree from frame 0. Without this the runtime
             // can default to 2D (mono passthrough), and the first V keypress
             // re-requests the same mode the C# is about to leave (no visible
-            // effect), making users press V twice to reach 3D. Harmless to
-            // call early — the native side queues the request until the
-            // session is ready to handle it.
-            DisplayXRNative.displayxr_request_display_mode(m_CurrentRenderingMode);
+            // effect), making users press V twice to reach 3D. Inert until the
+            // provider session is running.
+            DisplayXRProvider.RequestDisplayMode(m_CurrentRenderingMode != 0);
         }
 
         // Rendering mode cycling
@@ -183,20 +182,20 @@ namespace DisplayXR
             }
 
 #if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
-            // Shell mode, editor SA preview, AND the provider (built-player overlay or
-            // #173 editor dedicated window) all present the woven output in a window
-            // SEPARATE from Unity's game/Game-View surface. Mouse.current.position does
-            // not track the cursor while it's over that window, so the position-based
+            // Shell mode AND the provider (built-player overlay or #173 editor
+            // dedicated window) present the woven output in a window SEPARATE from
+            // Unity's game/Game-View surface. Mouse.current.position does not track
+            // the cursor while it's over that window, so the position-based
             // drag-start threshold below never trips (rotation never engages). Drive
             // rotation from Mouse.current.delta (Raw Input — cursor-location-independent,
             // reaches Unity via the focus hook's RIDEV_INPUTSINK) and set the drag state
-            // directly on button-down. Button state: shell/SA read the native WndProc
+            // directly on button-down. Button state: shell reads the native WndProc
             // tracker; the provider reads Mouse.current.leftButton (also Raw Input).
-            bool providerMouse = IsProviderActive() && !IsShellMode() && !IsSAPreviewRunning();
-            if ((IsShellMode() || IsSAPreviewRunning() || providerMouse) && Mouse.current != null)
+            bool providerMouse = IsProviderActive() && !IsShellMode();
+            if ((IsShellMode() || providerMouse) && Mouse.current != null)
             {
-                // Button state comes from the native WndProc tracker for ALL three
-                // (shell/SA/provider) — Unity's Input System doesn't see clicks over
+                // Button state comes from the native WndProc tracker for both
+                // (shell/provider) — Unity's Input System doesn't see clicks over
                 // our separate weave window. UpdateShellMouse populated it above.
                 if (ShellGetMouseButtonDown(0)) m_Dragging = true;
                 if (ShellGetMouseButtonUp(0))   m_Dragging = false;
@@ -279,12 +278,6 @@ namespace DisplayXR
             return s_shellMode;
         }
 
-        private static bool IsSAPreviewRunning()
-        {
-            try { return DisplayXRNative.displayxr_standalone_is_running() != 0; }
-            catch { return false; }
-        }
-
         // True when the custom IUnityXRDisplay provider is driving rendering (built
         // player OR editor Play Mode, #166/#173). Used to route mouse rotation through
         // the Raw-Input delta path (the woven output is a separate window, so
@@ -304,7 +297,7 @@ namespace DisplayXR
 #endif
 
         /// Call once per frame (from Update) to snapshot mouse button state from
-        /// either the shell-mode tracker or the SA preview window's WndProc.
+        /// either the shell-mode tracker or the provider's window WndProc.
         private static void UpdateShellMouse()
         {
             s_shellButtonsPrev = s_shellButtonsCurr;
@@ -312,15 +305,6 @@ namespace DisplayXR
             {
                 DisplayXRNative.displayxr_get_shell_mouse_state(
                     out s_shellButtonsCurr, out _, out _);
-            }
-            else if (IsSAPreviewRunning())
-            {
-                try
-                {
-                    DisplayXRNative.displayxr_standalone_get_preview_mouse_state(
-                        out s_shellButtonsCurr, out _);
-                }
-                catch (System.EntryPointNotFoundException) { /* old binary */ }
             }
             else if (IsProviderActive())
             {
@@ -455,9 +439,9 @@ namespace DisplayXR
         {
             if (!GetKeyDown(KeyCode.V)) return;
 
-            // Toggle 2D/3D via the non-standalone API (works in built apps)
+            // Toggle 2D/3D via the provider facade (works in built apps)
             m_CurrentRenderingMode = m_CurrentRenderingMode == 0 ? 1 : 0;
-            DisplayXRNative.displayxr_request_display_mode(m_CurrentRenderingMode);
+            DisplayXRProvider.RequestDisplayMode(m_CurrentRenderingMode != 0);
             Debug.Log($"[DisplayXR] Display mode → {(m_CurrentRenderingMode == 0 ? "2D" : "3D")}");
         }
 
@@ -475,14 +459,6 @@ namespace DisplayXR
 
         private static bool ShouldIgnoreInput()
         {
-            // Ignore input while the mouse cursor is over the preview window.
-            try
-            {
-                if (DisplayXRNative.displayxr_standalone_window_is_interacting() != 0)
-                    return true;
-            }
-            catch (System.EntryPointNotFoundException) { }
-
             // Wsui composition layer: a slider drag or button click in flight
             // through DisplayXRWindowSpaceUI shouldn't double-route to scene
             // input. App-side router (e.g. DisplayXRWsuiMouseRouter) flips
@@ -494,21 +470,17 @@ namespace DisplayXR
             if (IsPointerOverUgui()) return true;
 
 #if UNITY_EDITOR
-            // When the SA preview is running, the user is interacting with the
-            // native preview window — which isn't an EditorWindow. Don't gate
-            // input on EditorWindow focus, otherwise clicking the Inspector
-            // or any other editor pane would freeze input until the user
-            // clicks back into Game View or the Preview Window.
-            bool saRunning = false;
-            try { saRunning = DisplayXRNative.displayxr_standalone_is_running() != 0; }
-            catch { }
-            if (!saRunning)
+            // With the custom display provider active, the user interacts with the
+            // provider's separate woven window (not an EditorWindow), so don't gate
+            // input on EditorWindow focus — otherwise clicking the Inspector or any
+            // other editor pane would freeze input.
+            if (!IsProviderActive())
             {
                 var focused = UnityEditor.EditorWindow.focusedWindow;
                 if (focused == null)
                     return true;
                 string typeName = focused.GetType().Name;
-                if (typeName != "GameView" && typeName != "DisplayXRPreviewWindow")
+                if (typeName != "GameView")
                     return true;
             }
 #endif

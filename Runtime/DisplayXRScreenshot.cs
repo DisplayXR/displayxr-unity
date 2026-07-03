@@ -7,10 +7,6 @@ using System.IO;
 using UnityEngine;
 using UnityEngine.Rendering;
 
-// hook-path bridge: DisplayXRFeature is soft-deprecated (#166) but remains the active backend on the
-// legacy hook path. Suppress CS0618 for these intentional internal uses.
-#pragma warning disable 618
-
 namespace DisplayXR
 {
     /// <summary>
@@ -24,17 +20,12 @@ namespace DisplayXR
     ///
     /// As of #140 (W6 of #396) the capture is runtime-owned: a live session calls
     /// <c>xrCaptureAtlasEXT</c> (XR_EXT_atlas_capture) via
-    /// <see cref="DisplayXRFeature.CaptureAtlas"/>, the runtime reads back the
+    /// <see cref="DisplayXRProvider.CaptureAtlas"/>, the runtime reads back the
     /// compositor's own atlas image and writes the PNG. The plugin no longer does
     /// an app-side <c>AsyncGPUReadback</c> or a hidden-camera Kooima re-render.
     ///
-    /// Two capture paths:
-    ///   - Editor with the standalone preview session running
-    ///     (<c>displayxr_standalone_is_running()</c>): reads the existing atlas RT
-    ///     before swapchain submit and encodes it app-side (there is no runtime
-    ///     OpenXR session in pure-editor preview, so xrCaptureAtlasEXT is N/A).
-    ///   - Live OpenXR session (built app, or editor running an OpenXR session):
-    ///     supplies a path prefix to xrCaptureAtlasEXT; the runtime writes the PNG.
+    /// A live provider session supplies a path prefix to xrCaptureAtlasEXT and the
+    /// runtime writes the PNG on its next composed frame.
     ///
     /// Bind <see cref="Capture"/> to any developer-chosen event (key, button,
     /// gamepad). The included sample <c>DisplayXRInputController</c> binds it
@@ -68,17 +59,15 @@ namespace DisplayXR
         // the runtime composites for xrCaptureAtlasEXT, and the runtime grabs its
         // next composed frame — so starting the flash immediately whites out the
         // saved atlas. Delaying it a few frames lets the clean atlas be captured
-        // first. (The editor-preview path has no such race: it captures the atlas
-        // RT before drawing the flash in _OnAtlasReady.)
+        // first.
         private const int kFlashStartDelayFrames = 3;
 
         private static string s_OutputDirectory;
-        private static volatile bool s_CapturePending;
         private static int s_FlashFramesRemaining;
         private static int s_FlashStartDelay;
 
-        // Background-thread results dispatched back to the main thread (editor-
-        // preview PNG-write path only; the live path's PNG is written by the runtime).
+        // Main-thread dispatch queue drained by the live flash overlay each frame
+        // (OnSaved/OnFailed callbacks marshalled back to the main thread).
         private static readonly ConcurrentQueue<Action> s_MainQueue = new ConcurrentQueue<Action>();
 
         // Cached material for the flash overlay (HideAndDontSave; reused across captures).
@@ -89,24 +78,13 @@ namespace DisplayXR
         // ================================================================
 
         /// <summary>
-        /// Request a screenshot. In editor with the SA preview session running, the
-        /// capture runs at the next frame's submit point (multiple calls in one
-        /// frame are coalesced). In a live OpenXR session (built app, or editor with
-        /// an OpenXR session) the capture is requested from the runtime via
+        /// Request a screenshot. The capture is requested from the runtime via
         /// xrCaptureAtlasEXT — the runtime reads back its own composited atlas and
         /// writes the PNG on the next composed frame.
         /// </summary>
         public static void Capture()
         {
             DrainMainQueue();
-
-            if (IsSessionRunning())
-            {
-                // Editor preview session: app-side readback path (unchanged).
-                s_CapturePending = true;
-                return;
-            }
-
             CaptureLive();
         }
 
@@ -116,21 +94,8 @@ namespace DisplayXR
 
         private static void CaptureLive()
         {
-            // Two live backends can own the capture: the custom display Provider
-            // (epic #166 — DisplayXRFeature.Instance is null in provider mode) and the
-            // legacy OpenXR hook. Both fulfil it runtime-side via xrCaptureAtlasEXT; the
-            // prefix / success / flash plumbing below is identical, only the call differs.
-            bool usingProvider = DisplayXRProviderDriver.IsActive;
-            DisplayXRFeature feature = null;
-            if (!usingProvider)
-            {
-                feature = DisplayXRFeature.Instance;
-                if (feature == null)
-                {
-                    Fail("DisplayXRFeature not active (enable DisplayXR in OpenXR settings)");
-                    return;
-                }
-            }
+            // The custom display Provider (epic #166) fulfils the capture runtime-side
+            // via xrCaptureAtlasEXT.
 
             // Built-app stereo is two-view (Unity SetStereoViewMatrix L/R); this
             // matches the cols x rows the runtime composes for a standard 3D mode.
@@ -163,9 +128,7 @@ namespace DisplayXR
             }
 
             // projectionOnly: true matches the native test apps / demos default.
-            bool ok = usingProvider
-                ? DisplayXRProvider.CaptureAtlas(prefix, projectionOnly: true)
-                : feature.CaptureAtlas(prefix, projectionOnly: true);
+            bool ok = DisplayXRProvider.CaptureAtlas(prefix, projectionOnly: true);
             if (!ok)
             {
                 Fail("xrCaptureAtlasEXT unavailable or rejected the request "
@@ -188,132 +151,7 @@ namespace DisplayXR
         }
 
         // ================================================================
-        // Editor preview session hook (called from DisplayXRPreviewSession after
-        // the eye render loop, before swapchain submit). Out of scope for #140 —
-        // there is no runtime OpenXR session in pure-editor preview, so this path
-        // still encodes the atlas app-side.
-        // ================================================================
-
-        internal static void _OnAtlasReady(RenderTexture atlas, uint tileCols, uint tileRows,
-                                           uint viewWidth, uint viewHeight)
-        {
-            DrainMainQueue();
-
-            if (atlas == null) return;
-
-            int contentW = (int)(tileCols * viewWidth);
-            int contentH = (int)(tileRows * viewHeight);
-
-            // Capture FIRST so the flash never appears in the saved PNG.
-            if (s_CapturePending)
-            {
-                s_CapturePending = false;
-                if (contentW <= 0 || contentH <= 0)
-                {
-                    Fail("Atlas content region is zero (mode info unavailable)");
-                }
-                else
-                {
-                    // SA atlas is Y-inverted (the SA path applies a proj-Y flip
-                    // when rendering each eye, see DisplayXRPreviewSession.RenderEyeToAtlas).
-                    BeginCapture(atlas, contentW, contentH, (int)tileCols, (int)tileRows, yFlip: true);
-                    s_FlashFramesRemaining = kFlashFrames;
-                }
-            }
-
-            if (s_FlashFramesRemaining > 0)
-            {
-                DrawFlash(atlas);
-                s_FlashFramesRemaining--;
-            }
-        }
-
-        // ================================================================
-        // Editor-preview capture pipeline (app-side readback). LIVE sessions use
-        // the runtime path above and never reach here.
-        // ================================================================
-
-        private static void BeginCapture(RenderTexture atlas, int contentW, int contentH,
-                                          int cols, int rows, bool yFlip)
-        {
-            // Crop the atlas to the rendered content region. yFlip=true also
-            // flips Y during the blit (used for the SA atlas, which is Y-inverted
-            // because the SA path applies a proj-Y flip during eye render).
-            var temp = RenderTexture.GetTemporary(contentW, contentH, 0, RenderTextureFormat.ARGB32);
-            float uMax = (float)contentW / atlas.width;
-            float vMax = (float)contentH / atlas.height;
-            Vector2 scale = yFlip ? new Vector2(uMax, -vMax) : new Vector2(uMax, vMax);
-            Vector2 offset = yFlip ? new Vector2(0f, vMax) : Vector2.zero;
-            Graphics.Blit(atlas, temp, scale, offset);
-
-            AsyncGPUReadback.Request(temp, 0, TextureFormat.RGBA32, req =>
-            {
-                RenderTexture.ReleaseTemporary(temp);
-
-                if (req.hasError)
-                {
-                    Fail("GPU readback failed");
-                    return;
-                }
-
-                Texture2D tex = null;
-                byte[] png;
-                try
-                {
-                    var data = req.GetData<byte>();
-                    tex = new Texture2D(contentW, contentH, TextureFormat.RGBA32, false);
-                    tex.LoadRawTextureData(data);
-                    tex.Apply();
-                    png = tex.EncodeToPNG();
-                }
-                catch (Exception ex)
-                {
-                    Fail($"PNG encode failed: {ex.Message}");
-                    if (tex != null) UnityEngine.Object.DestroyImmediate(tex);
-                    return;
-                }
-                if (tex != null) UnityEngine.Object.DestroyImmediate(tex);
-
-                if (png == null || png.Length == 0)
-                {
-                    Fail("PNG encoder returned no data");
-                    return;
-                }
-
-                string outDir = OutputDirectory;
-                string stem = SanitizeStem(Application.productName);
-                string fullPath;
-                try
-                {
-                    Directory.CreateDirectory(outDir);
-                    int n = NextSequenceNumber(outDir, stem, cols, rows);
-                    // Editor-preview writes app-side, but match the runtime-owned
-                    // name so both paths share one numbering space (#425).
-                    fullPath = Path.Combine(outDir, $"{stem}-{n}_atlas_{cols * rows}_{cols}x{rows}.png");
-                }
-                catch (Exception ex)
-                {
-                    Fail($"Could not prepare output directory: {ex.Message}");
-                    return;
-                }
-
-                System.Threading.Tasks.Task.Run(() =>
-                {
-                    try
-                    {
-                        File.WriteAllBytes(fullPath, png);
-                        s_MainQueue.Enqueue(() => Succeed(fullPath));
-                    }
-                    catch (Exception ex)
-                    {
-                        s_MainQueue.Enqueue(() => Fail($"File write failed: {ex.Message}"));
-                    }
-                });
-            });
-        }
-
-        // ================================================================
-        // Flash overlay (shared by both paths)
+        // Flash overlay (live path)
         // ================================================================
 
         private static void EnsureFlashOverlay()
@@ -356,15 +194,6 @@ namespace DisplayXR
         // ================================================================
         // White flash overlay
         // ================================================================
-
-        private static void DrawFlash(RenderTexture atlas)
-        {
-            // SA atlas path: redirect onto the atlas RT, then draw via shared helper.
-            var prev = RenderTexture.active;
-            RenderTexture.active = atlas;
-            _DrawFlashGL(s_FlashFramesRemaining);
-            RenderTexture.active = prev;
-        }
 
         // Used by the live path's DisplayXRFlashOverlay (Camera.onPostRender)
         // to draw into whatever RT the rig camera just wrote to (the OpenXR
@@ -452,12 +281,6 @@ namespace DisplayXR
         // Plumbing
         // ================================================================
 
-        private static bool IsSessionRunning()
-        {
-            try { return DisplayXRNative.displayxr_standalone_is_running() != 0; }
-            catch { return false; }
-        }
-
         private static void Succeed(string path)
         {
             LastSavedPath = path;
@@ -479,8 +302,7 @@ namespace DisplayXR
             }
         }
 
-        // Exposed so the live path's per-frame overlay can drain the queue
-        // even when the SA session isn't running (no _OnAtlasReady tick).
+        // Exposed so the live path's per-frame overlay can drain the queue.
         internal static void _DrainMainQueue() => DrainMainQueue();
     }
 
@@ -537,14 +359,9 @@ namespace DisplayXR
 
         void LateUpdate()
         {
-            // Drain main-thread results from background PNG writes so OnSaved/OnFailed
-            // fire and the success log appears, even when the SA session isn't running.
+            // Drain main-thread results so OnSaved/OnFailed fire and the success
+            // log appears.
             DisplayXRScreenshot._DrainMainQueue();
-
-            // SA session owns the flash via the atlas RT.
-            bool saRunning = false;
-            try { saRunning = DisplayXRNative.displayxr_standalone_is_running() != 0; }
-            catch { }
 
             bool decrementThisFrame = Time.frameCount != s_LastTickFrame;
             if (decrementThisFrame) s_LastTickFrame = Time.frameCount;
@@ -557,7 +374,7 @@ namespace DisplayXR
 
             int frames = DisplayXRScreenshot._GetFlashFramesRemaining();
 
-            if (frames <= 0 || saRunning || m_Cam == null)
+            if (frames <= 0 || m_Cam == null)
             {
                 DetachCB();
                 if (frames > 0 && decrementThisFrame) DisplayXRScreenshot._ConsumeFlashFrame();
@@ -620,4 +437,3 @@ namespace DisplayXR
         }
     }
 }
-#pragma warning restore 618

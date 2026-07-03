@@ -80,13 +80,6 @@ namespace DisplayXR
         private int m_Width, m_Height;
         private bool m_Registered;
 
-        // Editor (standalone session) path: the SA session runs on its own
-        // device, so we copy our RT into a SHARED bridge texture the native side
-        // registers with the runtime. In a built app (hooked path) the runtime
-        // shares Unity's device and reads our RT directly — no bridge.
-        private bool m_Editor;
-        private Texture2D m_BridgeTex;
-
         // The 3D canvas sub-rect in window pixels (defaults to centered half).
         private RectInt EffectiveCanvasRect()
         {
@@ -110,7 +103,6 @@ namespace DisplayXR
             if (SurroundTexture != null) return; // already set up
             if (m_Canvas == null) return;
 
-            m_Editor = Application.isEditor;
             ResolveResolution();
             if (m_Width <= 0 || m_Height <= 0)
                 return; // no valid dims yet — retry next LateUpdate
@@ -171,8 +163,7 @@ namespace DisplayXR
             m_Canvas.worldCamera = m_Camera;
 
             RegisterSurround();
-            Debug.Log($"[DisplayXR] Surround enabled: {m_Width}x{m_Height} " +
-                      $"(RGBA8, {(m_Editor ? "standalone/bridge" : "hooked")})");
+            Debug.Log($"[DisplayXR] Surround enabled: {m_Width}x{m_Height} (RGBA8, hooked)");
         }
 
         void OnDisable()
@@ -181,26 +172,12 @@ namespace DisplayXR
             {
                 try
                 {
-                    if (m_Editor)
-                        DisplayXRNative.displayxr_standalone_surround_clear();
-                    else
-                    {
-                        DisplayXRNative.displayxr_surround_clear();
-                        if (setCanvasRect)
-                            DisplayXRNative.displayxr_set_canvas_rect(0, 0, 0, 0);
-                    }
+                    DisplayXRNative.displayxr_surround_clear();
+                    if (setCanvasRect)
+                        DisplayXRNative.displayxr_set_canvas_rect(0, 0, 0, 0);
                 }
                 catch (System.EntryPointNotFoundException) { }
                 m_Registered = false;
-            }
-
-            if (m_BridgeTex != null)
-            {
-                // CreateExternalTexture'd handle doesn't own the native resource
-                // (the SA backend keeps it); just drop our wrapper.
-                if (Application.isPlaying) Destroy(m_BridgeTex);
-                else DestroyImmediate(m_BridgeTex);
-                m_BridgeTex = null;
             }
 
             if (m_StateSaved && m_Canvas != null)
@@ -242,15 +219,7 @@ namespace DisplayXR
             if (m_Camera == null) return;
             m_Camera.Render();
 
-            if (m_Editor)
-            {
-                // Standalone: copy our RT into the SHARED bridge the runtime reads.
-                if (m_BridgeTex == null) TryAcquireBridge();
-                if (m_BridgeTex != null)
-                    Graphics.CopyTexture(SurroundTexture, m_BridgeTex);
-            }
-
-            // Re-register cheaply each frame (robust to RT/bridge recreation).
+            // Re-register cheaply each frame (robust to RT recreation).
             if (!m_Registered) RegisterSurround();
         }
 
@@ -260,50 +229,18 @@ namespace DisplayXR
             RectInt r = EffectiveCanvasRect();
             try
             {
-                if (m_Editor)
-                {
-                    if (m_BridgeTex == null) TryAcquireBridge();
-                    if (m_BridgeTex == null) return; // SA session not up yet — retry
-                    if (setCanvasRect)
-                        DisplayXRNative.displayxr_standalone_surround_set_active(
-                            1, r.x, r.y, (uint)r.width, (uint)r.height);
-                    else
-                        DisplayXRNative.displayxr_standalone_surround_set_active(1, 0, 0, 0, 0);
-                    m_Registered = true;
-                }
-                else
-                {
-                    // Hooked path: the runtime shares Unity's device; register the
-                    // RT directly + set the canvas sub-rect.
-                    DisplayXRNative.displayxr_surround_set_texture(
-                        SurroundTexture.GetNativeTexturePtr(), (uint)m_Width, (uint)m_Height);
-                    if (setCanvasRect)
-                        DisplayXRNative.displayxr_set_canvas_rect(r.x, r.y, (uint)r.width, (uint)r.height);
-                    m_Registered = true;
-                }
+                // Hooked path: the runtime shares Unity's device; register the
+                // RT directly + set the canvas sub-rect.
+                DisplayXRNative.displayxr_surround_set_texture(
+                    SurroundTexture.GetNativeTexturePtr(), (uint)m_Width, (uint)m_Height);
+                if (setCanvasRect)
+                    DisplayXRNative.displayxr_set_canvas_rect(r.x, r.y, (uint)r.width, (uint)r.height);
+                m_Registered = true;
             }
             catch (System.EntryPointNotFoundException)
             {
                 // Older plugin without surround support — no-op.
             }
-        }
-
-        private void TryAcquireBridge()
-        {
-            if (m_BridgeTex != null) return;
-            try
-            {
-                DisplayXRNative.displayxr_standalone_get_surround_bridge_texture(
-                    (uint)m_Width, (uint)m_Height,
-                    out System.IntPtr ptr, out uint bw, out uint bh);
-                if (ptr != System.IntPtr.Zero && bw > 0 && bh > 0)
-                {
-                    m_BridgeTex = Texture2D.CreateExternalTexture(
-                        (int)bw, (int)bh, TextureFormat.RGBA32, false, true, ptr);
-                    m_BridgeTex.name = "DisplayXR_SurroundBridge";
-                }
-            }
-            catch (System.EntryPointNotFoundException) { }
         }
 
         private void ResolveResolution()
@@ -317,7 +254,7 @@ namespace DisplayXR
             // The surround texture MUST match the runtime's weave target (the
             // bound HWND client area), which on Leia SR differs from the display
             // panel dims — so use the render-target size, not display info.
-            if (TryGetTargetSize(m_Editor, out int w, out int h))
+            if (TryGetTargetSize(out int w, out int h))
             {
                 m_Width = w;
                 m_Height = h;
@@ -328,27 +265,15 @@ namespace DisplayXR
 
         /// <summary>
         /// The runtime's weave-target size (= bound HWND client area), which the
-        /// surround texture + canvas sub-rect must match. Editor (standalone) uses
-        /// the preview window; built apps (hooked) use the bound overlay HWND.
+        /// surround texture + canvas sub-rect must match.
         /// </summary>
-        public static bool TryGetTargetSize(bool editor, out int w, out int h)
+        public static bool TryGetTargetSize(out int w, out int h)
         {
             w = h = 0;
             try
             {
-                if (editor)
-                {
-                    if (DisplayXRNative.displayxr_standalone_get_preview_window_size(
-                            out uint pw, out uint ph) != 0 && pw > 0 && ph > 0)
-                    {
-                        w = (int)pw; h = (int)ph; return true;
-                    }
-                }
-                else
-                {
-                    DisplayXRNative.displayxr_get_render_target_size(out uint rw, out uint rh);
-                    if (rw > 0 && rh > 0) { w = (int)rw; h = (int)rh; return true; }
-                }
+                DisplayXRNative.displayxr_get_render_target_size(out uint rw, out uint rh);
+                if (rw > 0 && rh > 0) { w = (int)rw; h = (int)rh; return true; }
             }
             catch (System.EntryPointNotFoundException) { }
             return false;

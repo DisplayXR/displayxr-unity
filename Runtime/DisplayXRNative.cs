@@ -14,7 +14,7 @@ namespace DisplayXR
     /// the same native bindings the plugin uses internally. Method
     /// signatures track the underlying native exports — a native change
     /// is a binding change. Keep that contract in mind if you call these
-    /// from app code: prefer the high-level wrappers (DisplayXRFeature,
+    /// from app code: prefer the high-level wrappers (DisplayXRProvider,
     /// DisplayXRTransparentOverlay, DisplayXRRigManager) where they
     /// exist; reach for DisplayXRNative only when nothing higher-level
     /// is available.
@@ -22,13 +22,6 @@ namespace DisplayXR
     public static class DisplayXRNative
     {
         private const string LibName = "displayxr_unity";
-
-        /// <summary>
-        /// Install OpenXR hook chain. Called once with the next xrGetInstanceProcAddr.
-        /// Returns our hook function pointer.
-        /// </summary>
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern IntPtr displayxr_install_hooks(IntPtr nextGetInstanceProcAddr);
 
         /// <summary>
         /// Set stereo rig tunables from game thread.
@@ -87,13 +80,6 @@ namespace DisplayXR
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern void displayxr_set_window_handle(IntPtr handle);
-
-        /// <summary>
-        /// Set editor mode flag. When enabled, native code creates its own preview
-        /// window instead of auto-detecting the app's window.
-        /// </summary>
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void displayxr_set_editor_mode(int enabled);
 
         /// <summary>
         /// (runtime-pvt #191 / displayxr-unity #57) Request the runtime's
@@ -277,23 +263,6 @@ namespace DisplayXR
             out int buttons, out int mouseX, out int mouseY);
 
         /// <summary>
-        /// Set the viewport (window) size and screen position for window-relative
-        /// Kooima projection. Screen position is needed to compute the window-center
-        /// eye offset on the physical display.
-        /// </summary>
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void displayxr_set_viewport_size(uint width, uint height,
-            int screenX, int screenY);
-
-        /// <summary>
-        /// Request 2D or 3D display mode.
-        /// </summary>
-        /// <param name="mode3d">1 for 3D mode, 0 for 2D mode.</param>
-        /// <returns>1 on success, 0 on failure or not supported.</returns>
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern int displayxr_request_display_mode(int mode3d);
-
-        /// <summary>
         /// (#140 / #396 W6) Capture the runtime's composed multi-view atlas to a
         /// PNG via xrCaptureAtlasEXT (XR_EXT_atlas_capture). The runtime does the
         /// readback with the compositor's own atlas image and writes
@@ -339,13 +308,6 @@ namespace DisplayXR
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern void displayxr_stop_polling();
-
-        /// <summary>
-        /// Destroy the editor preview window. Call before XR teardown to
-        /// prevent the compositor from blocking on a stale window.
-        /// </summary>
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void displayxr_destroy_preview_window();
 
         // ====================================================================
         // Window-space UI overlay (issue #67)
@@ -408,266 +370,12 @@ namespace DisplayXR
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern void displayxr_local2d_clear();
 
-        // ====================================================================
-        // Native log callback (routes native messages to Debug.Log)
-        // ====================================================================
-
-        [UnmanagedFunctionPointer(CallingConvention.Cdecl)]
-        public delegate void LogCallback([MarshalAs(UnmanagedType.LPStr)] string message);
-
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void displayxr_standalone_set_log_callback(LogCallback callback);
-
-        // ====================================================================
-        // Standalone preview session (bypasses Unity's OpenXR loader)
-        // ====================================================================
-
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern int displayxr_standalone_window_was_closed();
-
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void displayxr_standalone_get_preview_mouse_state(
-            out int buttons, out int wheelDelta);
-
-        /// <summary>
-        /// (v1.2.10+) Cursor position in the runtime preview window's content
-        /// area as fractional coords (0..1, top-left origin). Returns 1 if
-        /// the cursor is inside the content area, 0 otherwise (fx/fy = -1).
-        /// Fractional convention matches wsui layer rects so callers can
-        /// hit-test directly without needing the window's pixel size.
-        /// Editor-preview only — built apps use Input.mousePosition.
-        /// </summary>
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern int displayxr_standalone_get_preview_mouse_position(
-            out float fx, out float fy);
-
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern int displayxr_standalone_window_is_interacting();
-
-        /// <summary>
-        /// (Windows only) Set Unity's D3D12 device for atlas bridge texture.
-        /// Must be called BEFORE displayxr_standalone_start().
-        /// </summary>
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void displayxr_standalone_set_unity_device(IntPtr unityNativeTex);
-
-        /// <summary>
-        /// (Windows only) Tell native which graphics API the editor runs so it
-        /// picks the matching standalone backend (Vulkan vs D3D12). Values are
-        /// UnityGfxRenderer ids (D3D11=2, D3D12=18, Vulkan=21). Call BEFORE
-        /// displayxr_standalone_set_unity_device and displayxr_standalone_start().
-        /// </summary>
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void displayxr_standalone_set_unity_graphics_api(int api);
-
-        /// <summary>
-        /// (Windows D3D12 only) Get the atlas bridge texture opened on Unity's device.
-        /// C# uses Graphics.CopyTexture to copy the atlas RT into this each frame.
-        /// </summary>
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void displayxr_standalone_get_atlas_bridge_texture(
-            out IntPtr nativePtr, out uint width, out uint height);
-
-        /// <summary>
-        /// (Windows D3D11/D3D12 only) Get the window-space UI bridge texture
-        /// opened on Unity's device. Native lazily creates a shared (NT handle)
-        /// texture matching the requested dimensions on the SA device + opens
-        /// it on Unity's device. Returns IntPtr.Zero when no standalone session
-        /// is running, when the backend doesn't need a bridge (Metal: unified
-        /// device), or when bridge creation failed. C# wraps via
-        /// Texture2D.CreateExternalTexture and Graphics.CopyTexture's the wsui
-        /// RT into it each frame; the per-frame xrEndFrame hook then copies
-        /// the SA-side bridge into the composition layer's swapchain image.
-        /// </summary>
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void displayxr_standalone_get_wsui_bridge_texture(
-            uint width, uint height,
-            out IntPtr nativePtr, out uint outWidth, out uint outHeight);
-
-        /// <summary>
-        /// (#131, Windows D3D12) Get the 2D surround bridge texture for the
-        /// standalone session (Editor Preview / Play Mode). Native creates a
-        /// SHARED RGBA8 surround texture + fence on the SA device and opens the
-        /// texture on Unity's device. C# wraps it (CreateExternalTexture) and
-        /// Graphics.CopyTexture's its 2D RT into it each frame; the submit path
-        /// signals + registers it. IntPtr.Zero if no SA session / not D3D12.
-        /// </summary>
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void displayxr_standalone_get_surround_bridge_texture(
-            uint width, uint height,
-            out IntPtr nativePtr, out uint outWidth, out uint outHeight);
-
-        /// <summary>
-        /// (#131) Enable/disable the 2D surround for the standalone session and
-        /// set the 3D canvas sub-rect (window-client pixels) it surrounds.
-        /// </summary>
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void displayxr_standalone_surround_set_active(
-            int active, int subrectX, int subrectY, uint subrectW, uint subrectH);
-
-        /// <summary>(#131) Clear the standalone 2D surround.</summary>
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void displayxr_standalone_surround_clear();
-
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern int displayxr_standalone_start(
-            [MarshalAs(UnmanagedType.LPStr)] string runtimeJsonPath);
-
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void displayxr_standalone_stop();
-
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern int displayxr_standalone_is_running();
-
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void displayxr_standalone_poll();
-
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void displayxr_standalone_get_display_info(
-            out float displayWidthM, out float displayHeightM,
-            out uint pixelWidth, out uint pixelHeight,
-            out float nominalX, out float nominalY, out float nominalZ,
-            out float scaleX, out float scaleY,
-            out int isValid);
-
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void displayxr_standalone_get_eye_positions(
-            out float lx, out float ly, out float lz,
-            out float rx, out float ry, out float rz,
-            out int isTracked);
-
         /// <summary>
         /// Get the display backing scale factor (Retina).
         /// Returns 2.0 on macOS Retina, 1.0 on non-Retina or non-macOS.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern float displayxr_get_backing_scale_factor();
-
-        // ====================================================================
-        // Standalone frame loop (split: poll → begin → render → submit)
-        // ====================================================================
-
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void displayxr_standalone_poll_events();
-
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern int displayxr_standalone_begin_frame(out int shouldRender);
-
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern int displayxr_standalone_submit_frame_atlas(IntPtr atlasTex);
-
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern int displayxr_standalone_submit_frame(IntPtr leftTex, IntPtr rightTex);
-
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void displayxr_standalone_end_frame_empty();
-
-        // ====================================================================
-        // Standalone stereo views (Kooima projection via display3d library)
-        // ====================================================================
-
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void displayxr_standalone_compute_views(
-            uint viewCount,
-            float nearZ, float farZ,
-            [MarshalAs(UnmanagedType.LPArray)] float[] viewMatrices,
-            [MarshalAs(UnmanagedType.LPArray)] float[] projMatrices,
-            out int valid);
-
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void displayxr_standalone_get_swapchain_size(
-            out uint width, out uint height);
-
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void displayxr_standalone_get_current_mode_info(
-            out uint viewCount,
-            out uint tileColumns, out uint tileRows,
-            out uint viewWidthPixels, out uint viewHeightPixels,
-            out float viewScaleX, out float viewScaleY,
-            out int hardwareDisplay3D);
-
-        /// <summary>
-        /// Per-view eye positions from the standalone preview's last
-        /// xrLocateViews call. Surfaces all N positions (2 for standard 3D,
-        /// 4 for quad / sim-display quad mode, 8 for lenticular, etc.) —
-        /// the 2-eye displayxr_standalone_get_eye_positions only returns
-        /// the first two.
-        ///
-        /// Positions packed as float[capacity*3] = (x0,y0,z0, x1,y1,z1, …)
-        /// in OpenXR display-relative space (right-hand, −Z forward).
-        /// </summary>
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void displayxr_standalone_get_n_eye_positions(
-            [MarshalAs(UnmanagedType.LPArray)] float[] outXyzArray,
-            uint capacity,
-            out uint outCount,
-            out int outTracked);
-
-        /// <summary>
-        /// Canvas rect last pushed to the standalone preview session.
-        /// Used by Scene-view gizmos to mirror the window-relative Kooima
-        /// shift the SA session applies (ADR-006). Returns isValid=0 until
-        /// the canvas has been polled at least once.
-        /// </summary>
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void displayxr_standalone_get_canvas_rect(
-            out int outX, out int outY,
-            out uint outW, out uint outH,
-            out int outIsValid);
-
-        // ====================================================================
-        // Standalone tunables + display pose
-        // ====================================================================
-
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void displayxr_standalone_set_tunables(
-            float ipdFactor, float parallaxFactor, float perspectiveFactor,
-            float virtualDisplayHeight, float invConvergenceDistance, float fovOverride,
-            float nearZ, float farZ, int cameraCentric);
-
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void displayxr_standalone_set_display_pose(
-            float posX, float posY, float posZ,
-            float oriX, float oriY, float oriZ, float oriW,
-            float scaleX, float scaleY, float scaleZ,
-            int enabled);
-
-        // ====================================================================
-        // Standalone display mode switching
-        // ====================================================================
-
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern int displayxr_standalone_request_display_mode(int mode3d);
-
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern int displayxr_standalone_request_rendering_mode(uint modeIndex);
-
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern int displayxr_standalone_get_rendering_mode_name(
-            uint arraySlot,
-            [MarshalAs(UnmanagedType.LPArray)] byte[] buffer,
-            uint bufferSize);
-
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern int displayxr_standalone_get_preview_window_size(
-            out uint width, out uint height);
-
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern int displayxr_standalone_is_key_pressed(int ascii);
-
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern int displayxr_standalone_enumerate_rendering_modes(
-            uint capacity, out uint count,
-            [MarshalAs(UnmanagedType.LPArray)] uint[] modeIndices,
-            IntPtr modeNames,
-            [MarshalAs(UnmanagedType.LPArray)] uint[] viewCounts,
-            [MarshalAs(UnmanagedType.LPArray)] uint[] tileColumns,
-            [MarshalAs(UnmanagedType.LPArray)] uint[] tileRows,
-            [MarshalAs(UnmanagedType.LPArray)] uint[] viewWidthPixels,
-            [MarshalAs(UnmanagedType.LPArray)] uint[] viewHeightPixels,
-            [MarshalAs(UnmanagedType.LPArray)] float[] viewScaleX,
-            [MarshalAs(UnmanagedType.LPArray)] float[] viewScaleY,
-            [MarshalAs(UnmanagedType.LPArray)] int[] hardwareDisplay3D);
 
         // ====================================================================
         // Transparent overlay mode (issue #57) — Windows only

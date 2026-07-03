@@ -11,10 +11,6 @@ using UnityEngine.InputSystem;
 using UnityEngine.InputSystem.LowLevel;
 #endif
 
-// hook-path bridge: DisplayXRFeature is soft-deprecated (#166) but remains the active backend on the
-// legacy hook path. Suppress CS0618 for these intentional internal uses.
-#pragma warning disable 618
-
 namespace DisplayXR
 {
     /// <summary>
@@ -98,7 +94,6 @@ namespace DisplayXR
         public PointerEvent onPointerClick = new PointerEvent();
 
         private Camera m_Camera;
-        private DisplayXRFeature m_Feature;
         private CameraClearFlags m_SavedClearFlags;
         private Color m_SavedBackgroundColor;
         private bool m_SavedRestore;
@@ -229,18 +224,12 @@ namespace DisplayXR
         public static void RequestTransparentSession()
         {
 #if UNITY_STANDALONE_WIN || UNITY_STANDALONE_OSX
-            DisplayXRNative.displayxr_set_transparent_background(1);
-            // DisplayXRFeature reads this in OnInstanceCreate to opt the
-            // session into AlphaBlend environment blend mode so Unity
-            // preserves alpha=0 in the swapchain (#85).
-            DisplayXRFeature.s_TransparentBackgroundRequested = true;
-#endif
-#if UNITY_STANDALONE_WIN
             // Provider mode (#166): the custom Display Provider drives its own
-            // session, so DisplayXRFeature's hook-path opt-in above is inert. Mirror
-            // the request on the provider so it sets ALPHA_BLEND +
-            // transparentBackgroundEnabled on ITS session. Harmless on the hook path
-            // (the native flag is only read when the provider session starts).
+            // session. Request a transparent background on the provider so it sets
+            // ALPHA_BLEND + transparentBackgroundEnabled on its session (only takes
+            // effect if the runtime advertises ALPHA_BLEND). This latches
+            // DisplayXRProvider.s_TransparentBackgroundRequested (read by the splash
+            // bootstrap) AND flips the native flag.
             DisplayXRProvider.RequestTransparentBackground(true);
 #endif
         }
@@ -288,10 +277,9 @@ namespace DisplayXR
             m_Camera = GetComponent<Camera>();
             if (m_Camera == null)
                 return;
-            m_Feature = DisplayXRFeature.Instance;
 
-            // Solid-color clear to fully transparent (alpha=0). The session
-            // is in ALPHA_BLEND mode (see DisplayXRFeature.OnInstanceCreate),
+            // Solid-color clear to fully transparent (alpha=0). The provider
+            // session is in ALPHA_BLEND mode when transparency was requested,
             // so this alpha=0 reaches the swapchain unmodified; the runtime
             // composes the desktop under each tile before weaving and alpha-
             // gates post-weave so anti-aliased silhouettes blend cleanly.
@@ -1025,9 +1013,6 @@ namespace DisplayXR
             }
         }
 
-        // Lazy-fetch the feature singleton — DisplayXRFeature.Instance may be
-        // null at OnEnable time if our OnEnable runs before the OpenXR loader
-        // initialises the feature.
         private readonly float[] m_SmLV = new float[16], m_SmLP = new float[16],
                                  m_SmRV = new float[16], m_SmRP = new float[16];
 
@@ -1036,29 +1021,18 @@ namespace DisplayXR
         {
             leftView = leftProj = rightView = rightProj = Matrix4x4.identity;
 
-            // Provider mode (#166): DisplayXRFeature is inert (no Unity OpenXR loader),
-            // but the provider publishes the same per-eye matrices to the shared state
-            // each frame — read them directly via the native getter so the cyclopean
+            // The provider publishes the per-eye matrices to the shared state each
+            // frame — read them directly via the native getter so the cyclopean
             // hit-test (LMB drag on the silhouette) works.
-            if (DisplayXRProviderDriver.IsActive)
-            {
-                DisplayXRNative.displayxr_get_stereo_matrices(
-                    m_SmLV, m_SmLP, m_SmRV, m_SmRP, out int pvalid);
-                if (pvalid == 0) return false;
-                leftView = FloatsToMatrix(m_SmLV); leftProj = FloatsToMatrix(m_SmLP);
-                rightView = FloatsToMatrix(m_SmRV); rightProj = FloatsToMatrix(m_SmRP);
-                return true;
-            }
-
-            if (m_Feature == null)
-                m_Feature = DisplayXRFeature.Instance;
-            if (m_Feature == null)
-                return false;
-            return m_Feature.GetStereoMatrices(out leftView, out leftProj,
-                                                out rightView, out rightProj);
+            DisplayXRNative.displayxr_get_stereo_matrices(
+                m_SmLV, m_SmLP, m_SmRV, m_SmRP, out int pvalid);
+            if (pvalid == 0) return false;
+            leftView = FloatsToMatrix(m_SmLV); leftProj = FloatsToMatrix(m_SmLP);
+            rightView = FloatsToMatrix(m_SmRV); rightProj = FloatsToMatrix(m_SmRP);
+            return true;
         }
 
-        // Column-major float[16] → Unity Matrix4x4 (mirrors DisplayXRFeature.FloatsToMatrix).
+        // Column-major float[16] → Unity Matrix4x4.
         private static Matrix4x4 FloatsToMatrix(float[] m)
         {
             var mat = new Matrix4x4();
@@ -1601,4 +1575,3 @@ namespace DisplayXR
         }
     }
 }
-#pragma warning restore 618

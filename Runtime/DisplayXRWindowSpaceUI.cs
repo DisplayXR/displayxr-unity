@@ -80,12 +80,12 @@ namespace DisplayXR
         private Canvas m_Canvas;
         private RectTransform m_CanvasRect;
         private Camera m_OverlayCamera;
-        // Windows D3D11/D3D12 standalone-preview path: a shared bridge texture
-        // (NT-handle) opened on Unity's device. We Graphics.CopyTexture our
-        // OverlayTexture into it each frame, then the plugin's native layer
-        // copies the SA-side bridge to the composition swapchain image. Null
-        // on Mac (Metal: unified device, direct path works) and in built apps
-        // / Play Mode (hooked path; no standalone session, native returns null).
+        // Windows D3D11/D3D12 provider path: a shared bridge texture (NT-handle)
+        // opened on Unity's device. We Graphics.CopyTexture our OverlayTexture
+        // into it each frame, then the plugin's native layer copies the
+        // provider-side bridge to the composition swapchain image. Null on Mac
+        // (Metal: unified device, direct path works) and when the provider isn't
+        // active (native returns null).
         private Texture2D m_BridgeTex;
 
         // Saved state, restored in OnDisable.
@@ -202,15 +202,14 @@ namespace DisplayXR
                 OverlayTexture.GetNativeTexturePtr(), resolution.x, resolution.y);
 
             // ---- Windows-only: query the cross-device bridge ----
-            // On Windows the standalone preview session runs on its own
-            // D3D12 device; a direct CopyResource from our RT to the
-            // swapchain image is invalid because the two are on different
-            // devices. Native lazily creates a SHARED (NT-handle) texture
-            // on the SA device + opens it on Unity's device; we wrap it
-            // here as a Texture2D and Graphics.CopyTexture our RT into it
-            // each frame in LateUpdate. Returns null on Mac (unified
-            // device) and in built apps (no standalone session) — both
-            // paths use the direct unity_tex path in native.
+            // On Windows the provider session runs on its own D3D12 device;
+            // a direct CopyResource from our RT to the swapchain image is
+            // invalid because the two are on different devices. Native lazily
+            // creates a SHARED (NT-handle) texture on the provider device +
+            // opens it on Unity's device; we wrap it here as a Texture2D and
+            // Graphics.CopyTexture our RT into it each frame in LateUpdate.
+            // Returns null on Mac (unified device) and when the provider isn't
+            // active — both paths use the direct unity_tex path in native.
             TryAcquireBridge();
 
             m_LastX = positionX; m_LastY = positionY;
@@ -226,20 +225,13 @@ namespace DisplayXR
             if (m_BridgeTex != null) return;
             try
             {
-                System.IntPtr bridgePtr;
-                uint bw, bh;
+                System.IntPtr bridgePtr = System.IntPtr.Zero;
+                uint bw = 0, bh = 0;
                 if (DisplayXRProviderDriver.IsActive)
                 {
                     // Custom display-provider mode: the provider owns a SEPARATE
-                    // D3D12 device (like the standalone), so it exposes its own
-                    // cross-device wsui bridge. (#166)
+                    // D3D12 device, so it exposes its own cross-device wsui bridge. (#166)
                     DisplayXRProviderNative.dxr_prov_get_wsui_bridge(
-                        (uint)resolution.x, (uint)resolution.y,
-                        out bridgePtr, out bw, out bh);
-                }
-                else
-                {
-                    DisplayXRNative.displayxr_standalone_get_wsui_bridge_texture(
                         (uint)resolution.x, (uint)resolution.y,
                         out bridgePtr, out bw, out bh);
                 }
@@ -350,11 +342,11 @@ namespace DisplayXR
             {
                 m_OverlayCamera.Render();
 
-                // Windows standalone preview: copy our RT into the shared
-                // cross-device bridge so the SA device can read it via the
-                // shared NT handle. No-op on Mac / hooked path (m_BridgeTex
-                // stays null). Retry bridge acquisition each frame in case
-                // the standalone session came up after our OnEnable.
+                // Provider mode: copy our RT into the shared cross-device bridge
+                // so the provider's separate device can read it via the shared NT
+                // handle. No-op elsewhere (m_BridgeTex stays null). Retry bridge
+                // acquisition each frame in case the provider session came up after
+                // our OnEnable.
                 if (m_BridgeTex == null) TryAcquireBridge();
                 if (m_BridgeTex != null)
                 {
@@ -376,23 +368,8 @@ namespace DisplayXR
 
         private bool TryGetPanelPixelSize(out float pw, out float ph)
         {
-            // Standalone preview path: use the runtime preview window's
-            // content size (Unity's Screen.width/height isn't right — that's
-            // the editor Game-view, not the runtime NSWindow/HWND).
-            try
-            {
-                if (DisplayXRNative.displayxr_standalone_get_preview_window_size(
-                        out uint ww, out uint wh) != 0 && ww > 0 && wh > 0)
-                {
-                    pw = ww * Mathf.Clamp01(width);
-                    ph = wh * Mathf.Clamp01(height);
-                    return true;
-                }
-            }
-            catch (System.EntryPointNotFoundException) { /* old plugin */ }
-
-            // Built-app / Play Mode fallback: the runtime composites into
-            // Unity's main window, so Screen.* is meaningful.
+            // Built-app / Play Mode: the runtime composites into Unity's main
+            // window, so Screen.* is meaningful.
             if (Screen.width > 0 && Screen.height > 0)
             {
                 pw = Screen.width * Mathf.Clamp01(width);

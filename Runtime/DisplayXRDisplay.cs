@@ -4,10 +4,6 @@
 using UnityEngine;
 using UnityEngine.Rendering;
 
-// hook-path bridge: DisplayXRFeature is soft-deprecated (#166) but remains the active backend on the
-// legacy hook path. Suppress CS0618 for these intentional internal uses.
-#pragma warning disable 618
-
 namespace DisplayXR
 {
     /// <summary>
@@ -59,7 +55,6 @@ namespace DisplayXR
         [Tooltip("Show eye tracking status in the console.")]
         public bool logEyeTracking;
 
-        private DisplayXRFeature m_Feature;
         private Camera m_Camera;
         private DisplayXRPostAA m_PostAA;
         // True when running under URP/HDRP. BiRP fires Camera.onPreRender; SRP doesn't,
@@ -90,7 +85,6 @@ namespace DisplayXR
         void OnEnable()
         {
             m_Camera = GetComponent<Camera>();
-            m_Feature = DisplayXRFeature.Instance;
             m_UsingSRP = GraphicsSettings.currentRenderPipeline != null;
             if (m_UsingSRP)
                 RenderPipelineManager.beginCameraRendering += OnSRPBeginCamera;
@@ -114,13 +108,6 @@ namespace DisplayXR
             // (hidden, rig-managed) FXAA pass and mirror the toggle onto it.
             m_PostAA = DisplayXRPostAA.Ensure(gameObject);
             m_PostAA.enabled = postProcessAntiAliasing && DisplayXRPostAA.SupportedForCurrentStereoMode();
-#if !UNITY_EDITOR
-            if (m_Feature == null)
-            {
-                Debug.LogWarning("[DisplayXR] DisplayXRFeature not active. " +
-                    "Enable it in Project Settings > XR Plug-in Management > OpenXR.");
-            }
-#endif
         }
 
         void OnDisable()
@@ -141,13 +128,12 @@ namespace DisplayXR
         {
             if (cam != m_Camera) return;
 
-            // Provider mode (#166): DisplayXRFeature is inert (no Unity OpenXR loader),
-            // so GetStereoMatrices can't feed the URP foreground clip. Publish the
-            // ForegroundClipURP globals from the provider's per-eye clip data instead.
-            // BiRP has no such shader pass built into URP — drive the dedicated per-eye
-            // OnRenderImage clip pass instead (DisplayXRForegroundClipBiRP), enabling it
-            // only while the clip is on. It reads each eye's native display-plane far in
-            // OnRenderImage, so both eyes clip exactly on the plane.
+            // Provider mode (#166): publish the URP ForegroundClipURP globals from
+            // the provider's per-eye clip data. BiRP has no such shader pass built
+            // into URP — drive the dedicated per-eye OnRenderImage clip pass instead
+            // (DisplayXRForegroundClipBiRP), enabling it only while the clip is on. It
+            // reads each eye's native display-plane far in OnRenderImage, so both eyes
+            // clip exactly on the plane.
             if (DisplayXRProviderDriver.IsActive)
             {
                 if (m_UsingSRP)
@@ -160,58 +146,6 @@ namespace DisplayXR
                     m_ClipBiRP.enabled = foregroundOnlyClip;
                 }
                 return;
-            }
-
-            if (m_Feature == null) return;
-
-            if (!m_Feature.GetStereoMatrices(out Matrix4x4 leftView, out Matrix4x4 leftProj,
-                                              out Matrix4x4 rightView, out Matrix4x4 rightProj))
-                return;
-
-            // Convert view matrices from OpenXR convention (right-hand, -Z forward) to
-            // Unity world convention (left-hand, +Z forward) by negating column 2.
-            // Without this, Unity objects at +Z end up behind the camera → black screen.
-            leftView = FlipViewZ(leftView);
-            rightView = FlipViewZ(rightView);
-
-            // The view matrix is always overridden: it carries the OpenXR→Unity
-            // handedness conversion (FlipViewZ) that BiRP's pose path doesn't apply.
-            cam.SetStereoViewMatrix(Camera.StereoscopicEye.Left, leftView);
-            cam.SetStereoViewMatrix(Camera.StereoscopicEye.Right, rightView);
-
-            // BiRP: always override the projection with the runtime's render-ready fov,
-            // built explicitly (native dxr_projection_from_fov). Unity's XR builds a
-            // correct projection from views[i].fov only for a CENTERED frustum; for
-            // window-relative off-center the frustum shears and Unity mishandles it,
-            // over-separating the eyes (#396 — the native cube app, which builds the
-            // projection itself, works off-center; Unity didn't until this override).
-            // Centered is unchanged (explicit == Unity's fov projection there, Probe A).
-            // The native projection also carries the foreground-clip per-view far (#57).
-            if (!m_UsingSRP)
-            {
-                cam.SetStereoProjectionMatrix(Camera.StereoscopicEye.Left, leftProj);
-                cam.SetStereoProjectionMatrix(Camera.StereoscopicEye.Right, rightProj);
-            }
-            // URP path: projection is owned by KooimaProjectionFixFeature (it re-pushes
-            // these same leftProj/rightProj per eye-pass — URP ignores
-            // SetStereoProjectionMatrix, #1328435). The rig no longer touches projection
-            // or farClipPlane here. It only publishes the per-eye foreground far + eye
-            // positions so the opt-in DisplayXR/ForegroundClipURP pass can clip per-eye
-            // in screen space (#57/#129). The global is inert if that pass isn't wired,
-            // so this is safe for every URP app. leftView/rightView are already
-            // FlipViewZ'd above, matching the shader's UNITY_MATRIX_I_V.
-            else
-            {
-                float farL = leftProj.m23 / (leftProj.m22 + 1f);
-                float farR = rightProj.m23 / (rightProj.m22 + 1f);
-                bool clip = foregroundOnlyClip && farL > cam.nearClipPlane && farR > cam.nearClipPlane;
-                Shader.SetGlobalVector(s_ForegroundFarId,
-                    clip ? new Vector4(farL, farR, 1f, 0f) : Vector4.zero); // z = enable
-                if (clip)
-                {
-                    Shader.SetGlobalVector(s_EyePosLId, leftView.inverse.GetColumn(3));
-                    Shader.SetGlobalVector(s_EyePosRId, rightView.inverse.GetColumn(3));
-                }
             }
         }
 
@@ -253,16 +187,6 @@ namespace DisplayXR
             }
         }
 
-        /// <summary>Negate column 2 (Z) of a view matrix to convert OpenXR → Unity world handedness.</summary>
-        static Matrix4x4 FlipViewZ(Matrix4x4 m)
-        {
-            m.m02 = -m.m02;
-            m.m12 = -m.m12;
-            m.m22 = -m.m22;
-            m.m32 = -m.m32;
-            return m;
-        }
-
 #if UNITY_EDITOR
         void OnValidate()
         {
@@ -289,70 +213,15 @@ namespace DisplayXR
                 var active = DisplayXRRigManager.ActiveCamera;
                 if (active != null && active != m_Camera) return;
             }
-
-            if (m_Feature == null)
-            {
-                m_Feature = DisplayXRFeature.Instance;
-                if (m_Feature == null) return;
-            }
-
-            // Resolve virtualDisplayHeight: 0 means use physical display height
-            float vdh = virtualDisplayHeight;
-            if (vdh <= 0f && m_Feature.DisplayInfo.isValid)
-            {
-                vdh = m_Feature.DisplayInfo.displayHeightMeters;
-            }
-
-            // Push tunables to native plugin — affects next xrLocateViews
-            var tunables = new DisplayXRTunables
-            {
-                ipdFactor = ipdFactor,
-                parallaxFactor = parallaxFactor,
-                perspectiveFactor = perspectiveFactor,
-                virtualDisplayHeight = vdh,
-                invConvergenceDistance = 0f,
-                fovOverride = 0f,
-                nearZ = m_Camera.nearClipPlane,
-                farZ = m_Camera.farClipPlane,
-                cameraCentricMode = false,
-                clipAtDisplayPlane = foregroundOnlyClip,
-            };
-
-            m_Feature.SetTunables(tunables);
-
-            // Push viewport size and screen position for window-relative Kooima.
-            // On Windows, native WM_SIZE handler overrides with accurate HWND position.
-            m_Feature.SetViewportSize(Screen.width, Screen.height, 0, 0);
-
-            // Push scene transform: parent camera's world pose is the display pose.
-            // Transform scale acts as zoom: scale > 1 zooms in (display appears bigger).
-            m_Feature.SetSceneTransform(
-                transform.position,
-                transform.rotation,
-                transform.lossyScale,
-                enabled: true);
-
-            // Refresh eye positions for debug/UI
-            m_Feature.RefreshEyePositions();
-
-            if (logEyeTracking)
-            {
-                Debug.Log($"[DisplayXR] Display: pos={transform.position} " +
-                          $"near={m_Camera.nearClipPlane} far={m_Camera.farClipPlane} " +
-                          $"camWorldPos={m_Camera.transform.position} " +
-                          $"Eyes: L={m_Feature.LeftEyePosition}, " +
-                          $"R={m_Feature.RightEyePosition}, tracked={m_Feature.IsEyeTracked}");
-            }
         }
 
         /// <summary>
         /// (epic #166 provider) The stereo tunables this display-centric rig would
-        /// push this frame, as raw rig fields — no <see cref="DisplayXRFeature"/>
-        /// dependency (the custom display provider runs without Unity's OpenXR
-        /// loader, so the feature singleton is null in that mode).
+        /// push this frame, as raw rig fields — no native dependency (the custom
+        /// display provider runs without Unity's OpenXR loader).
         /// virtualDisplayHeight is the raw field (0 = use the physical display
-        /// height); the provider driver resolves it and folds scene scale. Mirrors
-        /// the hook-path LateUpdate push. Read-only — does not touch native.
+        /// height); the provider driver resolves it and folds scene scale.
+        /// Read-only — does not touch native.
         /// </summary>
         public DisplayXRTunables GetProviderTunables()
         {
@@ -396,9 +265,7 @@ namespace DisplayXR
 
         void DrawGizmosImpl()
         {
-            DisplayXRDisplayInfo info = DisplayXRFeature.Instance != null
-                ? DisplayXRFeature.Instance.DisplayInfo
-                : DisplayXRGizmoHelpers.ReadDisplayInfoFromNative();
+            DisplayXRDisplayInfo info = DisplayXRGizmoHelpers.ReadDisplayInfoFromNative();
 
             // Window-relative Kooima: when the SA preview is rendering into
             // a sub-rect of the panel, the virtual display gizmo should
@@ -463,4 +330,3 @@ namespace DisplayXR
 #endif
     }
 }
-#pragma warning restore 618

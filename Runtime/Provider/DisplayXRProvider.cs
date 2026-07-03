@@ -70,9 +70,8 @@ namespace DisplayXR
             IsRunning && DisplayXRProviderNative.dxr_prov_set_eye_tracking_mode(manual ? 1 : 0) != 0;
 
         /// <summary>
-        /// App-facing atlas screenshot via XR_EXT_atlas_capture (#140) — the provider
-        /// analog of <see cref="DisplayXRFeature.CaptureAtlas"/>, which is inert in
-        /// provider mode. The runtime reads back its own compositor atlas and writes
+        /// App-facing atlas screenshot via XR_EXT_atlas_capture (#140). The runtime
+        /// reads back its own compositor atlas and writes
         /// "&lt;pathPrefix&gt;_atlas_&lt;viewCount&gt;_&lt;cols&gt;x&lt;rows&gt;.png" on the next composed
         /// frame (non-blocking). Only captures while weaving (3D). Returns true if the
         /// request was accepted (runtime advertises the extension and a session is live).
@@ -81,8 +80,7 @@ namespace DisplayXR
             IsRunning && DisplayXRProviderNative.dxr_prov_capture_atlas(pathPrefix, projectionOnly ? 1 : 0) != 0;
 
         /// <summary>
-        /// Provider display geometry (XR_EXT_display_info) — the provider analog of
-        /// <see cref="DisplayXRFeature.DisplayInfo"/>, which is inert in provider mode.
+        /// Provider display geometry (XR_EXT_display_info).
         /// Returns false if the provider isn't running or the runtime hasn't reported
         /// valid geometry yet.
         /// </summary>
@@ -103,8 +101,16 @@ namespace DisplayXR
         /// woven 3D over the desktop; only takes effect if the runtime advertises
         /// ALPHA_BLEND. Safe to call whether or not the provider ends up active.
         /// </summary>
-        public static void RequestTransparentBackground(bool enabled = true) =>
+        public static void RequestTransparentBackground(bool enabled = true)
+        {
+            s_TransparentBackgroundRequested = enabled;
             DisplayXRProviderNative.dxr_prov_set_transparent_background(enabled ? 1 : 0);
+        }
+
+        /// <summary>Latched by <see cref="RequestTransparentBackground"/>; read by the
+        /// splash bootstrap to pick a transparent-friendly clear. Set via
+        /// <see cref="DisplayXRTransparentOverlay.RequestTransparentSession"/>.</summary>
+        internal static bool s_TransparentBackgroundRequested;
 
         /// <summary>
         /// Set the single 3D-zone rect (client-window pixels) the runtime frames the
