@@ -224,12 +224,18 @@ namespace DisplayXR
         public static void RequestTransparentSession()
         {
 #if UNITY_STANDALONE_WIN || UNITY_STANDALONE_OSX
+            // Set the shared-state flag the native win32/macOS overlay reads
+            // (get_app_main_view → transparent_mode) so it builds the transparent
+            // overlay and keeps it on-screen while Unity's real HWND is cloaked/
+            // off-screen. Without this the overlay builds opaque/off-screen and the
+            // woven content isn't visible.
+            DisplayXRNative.displayxr_set_transparent_background(1);
             // Provider mode (#166): the custom Display Provider drives its own
             // session. Request a transparent background on the provider so it sets
-            // ALPHA_BLEND + transparentBackgroundEnabled on its session (only takes
+            // ALPHA_BLEND + transparentBackgroundEnabled on ITS session (only takes
             // effect if the runtime advertises ALPHA_BLEND). This latches
             // DisplayXRProvider.s_TransparentBackgroundRequested (read by the splash
-            // bootstrap) AND flips the native flag.
+            // bootstrap) AND flips the provider's transparent flag.
             DisplayXRProvider.RequestTransparentBackground(true);
 #endif
         }

@@ -278,3 +278,20 @@ displayxr_get_render_target_size(uint32_t *out_w, uint32_t *out_h)
 	if (out_w) *out_w = w;
 	if (out_h) *out_h = h;
 }
+
+// --- Transparent-background request (C# P/Invoke) ---
+// Sets the shared-state flag the win32 overlay reads (get_app_main_view →
+// transparent_mode) to build the transparent NOREDIRECTIONBITMAP overlay and
+// keep it on-screen while Unity's real HWND is cloaked/off-screen. This is
+// SEPARATE from the provider's own transparent flag (dxr_prov_set_transparent_
+// background, which drives ALPHA_BLEND on the provider session) — a transparent
+// app sets both. Re-homed out of the deleted hook TU; without it the overlay
+// builds opaque/off-screen and the woven content isn't visible (#166).
+DISPLAYXR_EXPORT void
+displayxr_set_transparent_background(int enabled)
+{
+	DisplayXRState *state = displayxr_get_state();
+	state->transparent_background_requested = (uint8_t)(enabled != 0);
+	displayxr_log("[DisplayXR] set_transparent_background: requested=%d\n",
+	              (int)state->transparent_background_requested);
+}
