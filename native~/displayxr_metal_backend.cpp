@@ -5,7 +5,7 @@
 
 #if defined(__APPLE__)
 
-#include "displayxr_hooks_internal.h"
+#include "displayxr_backend.h"
 
 // XR_KHR_metal_enable types — defined inline so this TU doesn't need
 // XR_USE_GRAPHICS_API_METAL globally. Mirrors the standalone copy in

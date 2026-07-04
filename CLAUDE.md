@@ -4,7 +4,7 @@ This file provides guidance to Claude Code when working with this repository.
 
 ## Project Overview
 
-Unity plugin for eye-tracked 3D light field displays via the **DisplayXR OpenXR runtime**. This is a Unity Package Manager (UPM) package that intercepts Unity's OpenXR pipeline at the native layer to provide Kooima asymmetric frustum projection for stereo rendering. The primary editor workflow is a **standalone preview window** that creates its own OpenXR session — no Play Mode needed.
+Unity plugin for eye-tracked 3D light field displays via the **DisplayXR runtime**. This is a Unity Package Manager (UPM) package that provides stereo via a custom **`IUnityXRDisplay` display provider** which drives the DisplayXR runtime for Kooima asymmetric frustum projection. The editor workflow is **Play Mode**: pressing Play runs the provider — that *is* the preview. There is no separate edit-mode preview window.
 
 The plugin works with the **DisplayXR runtime** ([DisplayXR/displayxr-runtime](https://github.com/DisplayXR/displayxr-runtime)) but has **no source dependency** on it — native code fetches OpenXR headers independently from Khronos.
 
@@ -16,7 +16,7 @@ This repo root IS the UPM package root (`package.json` is at the top level).
 displayxr-unity/               # repo root = UPM package root
 ├── package.json               # UPM manifest
 ├── Runtime/                   # C# runtime scripts + native plugin binaries
-│   ├── *.cs                   # MonoBehaviours and OpenXR Feature
+│   ├── *.cs                   # MonoBehaviours + IUnityXRDisplay provider (Provider/)
 │   └── Plugins/               # Built native binaries (Windows/macOS)
 ├── Editor/                    # C# editor-only scripts (inspectors, settings)
 ├── Samples~/                  # UPM samples (lazy-imported by user)
@@ -41,23 +41,22 @@ Raw CMake (`cd native~ && mkdir build && cd build && cmake .. -DCMAKE_BUILD_TYPE
 
 ### Three Layers
 
-1. **Runtime (C#)** — `DisplayXRFeature.cs` hooks into OpenXR lifecycle; `DisplayXRCamera.cs` and `DisplayXRDisplay.cs` are the two stereo rig modes; `DisplayXRRigManager.cs` coordinates multi-camera scenes; `DisplayXRPreview.cs` provides inline preview textures (SBS, readback, SharedTexture)
-2. **Editor (C#)** — Custom inspectors, settings page, and the standalone preview system (`DisplayXRPreviewSession.cs` manages an independent OpenXR session; `DisplayXRPreviewWindow.cs` provides the editor UI with camera selector and rendering mode controls)
-3. **Native (C/C++)** — Hook chain on `xrLocateViews`, `xrCreateSession`, `xrGetSystemProperties`, `xrEndFrame`; chains the runtime's view-rig descriptor (`XR_EXT_view_rig`) and consumes render-ready views — the runtime owns the Kooima math; thread-safe shared state
+1. **Runtime (C#)** — the **`IUnityXRDisplay` display provider** (`Runtime/Provider/`): `DisplayXRDisplayLoader` is the XR-Management loader/subsystem, `DisplayXRProvider` is the app-facing facade, `DisplayXRProviderDriver` runs the per-frame pump. `DisplayXRCamera.cs` and `DisplayXRDisplay.cs` are the two stereo rig modes; `DisplayXRRigManager.cs` coordinates multi-camera scenes.
+2. **Editor (C#)** — Custom inspectors and the settings/XR-Management page. (No standalone preview system — Play Mode runs the provider directly.)
+3. **Native (C/C++)** — the display provider (`native~/displayxr_xrprovider/`): opens the OpenXR session on **Unity's D3D12 device**, creates an `arraySize=2` swapchain (SPI or MultiPass), chains the runtime's view-rig descriptor (`XR_EXT_view_rig`) onto `xrLocateViews` and consumes render-ready `XrView{pose, fov}` — the runtime owns the Kooima math — and submits via `xrEndFrame`. The win32 overlay, wsui composition layer, and Local2D paths survive alongside it; thread-safe shared state. The SA render-to-atlas core (`displayxr_standalone*`) is kept on disk but **not compiled** (dormant), reserved as the seed for a future many-view "quilt" render path (see `docs~/adr/ADR-007-render-path-by-view-count.md`).
 
 ### Key Features
 
 - **Two stereo rig modes**: Camera-centric (`DisplayXRCamera` — inherits camera FOV, inv. convergence distance tunable) and display-centric (`DisplayXRDisplay` — physical display geometry, virtual display height, scale-as-zoom)
 - **Multi-camera support**: Multiple rigs coexist in one scene; `DisplayXRRigManager` coordinates which rig is active (see below)
-- **Standalone editor preview**: Own OpenXR session bypassing Unity XR. Camera selector dropdown, dynamic rendering mode enumeration, zero-copy SharedTexture output (IOSurface/DXGI). Replaces Play Mode for DisplayXR workflows.
-- **Play Mode conflict prevention**: Preview auto-removes Unity's OpenXR loader on Play entry, restores on exit (saved via SessionState)
+- **Play Mode == built app**: the `IUnityXRDisplay` provider runs identically in-editor and in a built player. Pressing Play *is* the preview — there is no separate preview window.
 - **2D UI overlay**: Canvas → `XrCompositionLayerWindowSpaceEXT` with stereo disparity
-- **Runtime-owned Kooima math (`XR_EXT_view_rig`, #396 W7)**: the plugin no longer computes Kooima. It chains an `XrDisplayRigEXT`/`XrCameraRigEXT` descriptor (the handful of tunables) onto `xrLocateViews` and consumes render-ready `XrView{pose, fov}` — on both the built-app hook path and the standalone preview session. **This requires a runtime that advertises `XR_EXT_view_rig` (SPEC_VERSION 2)**; against an older runtime the plugin emits a one-shot WARN and passes raw views through (no stereo). The former vendored/`displayxr::math` display3d/camera3d math is gone (do not re-add — see the `no-vendored-math` drift guard).
+- **Runtime-owned Kooima math (`XR_EXT_view_rig`, #396 W7)**: the plugin no longer computes Kooima. It chains an `XrDisplayRigEXT`/`XrCameraRigEXT` descriptor (the handful of tunables) onto `xrLocateViews` and consumes render-ready `XrView{pose, fov}` in the provider's per-frame pump (Play Mode and built player alike). **This requires a runtime that advertises `XR_EXT_view_rig` (SPEC_VERSION 2)**; against an older runtime the plugin emits a one-shot WARN and passes raw views through (no stereo). The former vendored/`displayxr::math` display3d/camera3d math is gone (do not re-add — see the `no-vendored-math` drift guard).
 
 ### Render Pipeline Support (BiRP vs URP)
 
-Both pipelines render from the **same source of truth** — the per-eye matrices from
-`DisplayXRFeature.GetStereoMatrices` (`leftProj`/`rightProj`) — but inject the projection through
+Both pipelines render from the **same source of truth** — the provider's per-eye matrices
+(`leftProj`/`rightProj`, exposed via `DisplayXRProvider`) — but inject the projection through
 **two thin, non-shared adapters** (the injection mechanism is pipeline-specific and cannot be shared):
 
 - **BiRP adapter**: the rig (`DisplayXRDisplay`/`DisplayXRCamera.OnCameraPreRender`) calls
@@ -98,7 +97,7 @@ Scenes can contain multiple cameras with different rig types (display-centric, c
 - `CycleNext()` advances to the next registered camera (used by Tab key)
 - `ActiveCamera` property is the single source of truth for rig gating and input
 
-**Rig gating**: `DisplayXRDisplay.LateUpdate()` and `DisplayXRCamera.LateUpdate()` check `DisplayXRRigManager.ActiveCamera` before pushing tunables to the native hook chain. Only the active rig pushes — prevents multi-rig conflicts (wrong projection, FOV feedback loops).
+**Rig gating**: `DisplayXRDisplay.LateUpdate()` and `DisplayXRCamera.LateUpdate()` check `DisplayXRRigManager.ActiveCamera` before pushing tunables to the native provider. Only the active rig pushes — prevents multi-rig conflicts (wrong projection, FOV feedback loops).
 
 **Input isolation**: `DisplayXRInputController.IsActiveCamera()` returns true only for the active camera's controller. Inactive controllers clear their drag state to prevent rotation jumps on reactivation.
 
@@ -110,41 +109,12 @@ Scenes can contain multiple cameras with different rig types (display-centric, c
 | `DisplayXRCamera` | One of | Camera-centric stereo rig (FOV-based) |
 | `DisplayXRRigManager` | Automatic | Static camera registry — no scene object, rigs self-register |
 | `DisplayXRInputController` | Optional | Sample WASD/mouse/scroll controller. Tab cycles cameras via `DisplayXRRigManager.CycleNext()`. Developers typically replace this with their own input. |
-| `DisplayXRGameViewOverlay` | Optional | Editor play-mode only: draws shared texture in Game View, suppresses scene rendering. Not needed in built apps. |
 
-### OpenXR Hook Chain
+### OpenXR path: the display provider
 
-The native plugin intercepts OpenXR calls via `xrGetInstanceProcAddr` hooking:
-- `xrLocateViews` → chains an `XR_EXT_view_rig` descriptor (built from scene transform + tunables) and consumes the runtime's render-ready `XrView{pose, fov}`. Also builds the BiRP view-matrix handedness shim and applies the URP head-pose comp (#115). Falls back to raw passthrough (one-shot WARN) if the runtime lacks `XR_EXT_view_rig`.
-- `xrCreateSession` → injects window binding extension
-- `xrGetSystemProperties` → extracts display info; detects `XR_EXT_view_rig`
-- `xrCreateSwapchain` → downgrades sRGB color swapchains to UNORM in Gamma-space projects (DXGI/Vulkan/Metal) so output isn't double-gamma-encoded
-- `xrEndFrame` → submits overlay composition layers
+The plugin drives OpenXR through the custom `IUnityXRDisplay` provider (`native~/displayxr_xrprovider/`) — it is the **sole** backend. The provider opens the session on Unity's D3D12 device, drives an `arraySize=2` swapchain (SPI/MultiPass), chains `XR_EXT_view_rig` onto `xrLocateViews` for runtime-owned Kooima, downgrades sRGB→UNORM swapchains in Gamma-space projects (so output isn't double-gamma-encoded), and submits overlay/wsui composition layers via `xrEndFrame`.
 
-### Shared Texture Architecture (IOSurface / DXGI)
-
-The compositor shares a GPU texture with the Unity plugin for preview and game overlay output. Two consumers display this texture:
-
-- **Standalone Preview Window** (`Editor/DisplayXRPreviewWindow.cs`) — EditorWindow, no Play Mode
-- **Game View Overlay** (`Runtime/DisplayXRGameViewOverlay.cs`) — MonoBehaviour, Play Mode
-
-**IOSurface / shared texture contract:**
-
-| Property | Value | Source |
-|----------|-------|--------|
-| Texture size | Display pixel dimensions (worst-case) | Created once at session start, never resized |
-| Content region | Top-left corner, canvas.w × canvas.h | App decides canvas, tells runtime |
-| UV crop | (canvasW / surfaceW, canvasH / surfaceH) | App computes from known dims |
-| Letterbox aspect | canvasW / canvasH | Canvas aspect, not surface aspect |
-
-**Flow each frame:**
-1. App computes canvas = view area in backing pixels (preview rect or Screen size)
-2. App calls `xrSetSharedTextureOutputRectEXT(session, x, y, w, h)` via `displayxr_standalone_set_canvas_rect()` — tells the runtime where to render and at what size
-3. Runtime/compositor writes interlaced output to IOSurface at (0, 0, canvasW, canvasH)
-4. App creates `Texture2D.CreateExternalTexture()` at full IOSurface dims, but samples only the canvas portion via UV scaling: `Rect(0, vMax, uMax, -vMax)` (Y-flipped for Metal)
-5. App letterboxes using canvas aspect ratio (since canvas = view size, typically no letterbox)
-
-**Screen position (x, y):** Required for pixel-precise interlacing alignment on lenticular displays. The runtime uses this internally in the Display Processor — the app doesn't need it back.
+> **The legacy OpenXR API-layer hook (`DisplayXRFeature` + `displayxr_hooks.cpp`) and the standalone (SA) editor-preview session/window were hard-removed in #166.** The provider replaced them. See `docs~/architecture/xr-display-provider.md`. Renamed native headers: `displayxr_hooks.h`→`displayxr_exports.h`, `displayxr_hooks_internal.h`→`displayxr_backend.h`; re-homed glue lives in `displayxr_native_shared.cpp`.
 
 ### Wire Protocol
 
@@ -156,18 +126,17 @@ Extension struct definitions in `native~/displayxr_extensions.h` must match the 
 
 1. Open any Unity 2022.3+ project
 2. Add this package via Package Manager (local path or git URL)
-3. Enable the feature: Project Settings > XR Plug-in Management > OpenXR > DisplayXR
+3. Enable **DisplayXR** in Project Settings > XR Plug-in Management (Standalone tab) — it's the `IUnityXRDisplay` provider toggle, **not** under OpenXR
 4. Set `XR_RUNTIME_JSON` environment variable to point to a DisplayXR runtime build (or use `SIM_DISPLAY_ENABLE=1 SIM_DISPLAY_OUTPUT=sbs` for testing without hardware)
-5. **Open Window > DisplayXR > Preview Window, click Start** — this is the primary workflow
-6. Play Mode still works but the standalone preview is preferred (avoids XR session conflicts)
+5. **Press Play** — Play Mode runs the provider and *is* the preview (identical to a built player); there is no separate preview window
 
-### Critical: OpenXR Package Version
+### OpenXR package dependency (provider does not use Unity's OpenXR loader)
 
-**You MUST use `com.unity.xr.openxr` version 1.16.1 or later.** The minimum version in `package.json` is 1.9.1 for broad compatibility, but versions before 1.16.1 ignore the `XR_RUNTIME_JSON` environment variable and the system `active_runtime.json` in editor play mode — they silently fall back to Unity's built-in Mock Runtime. This causes `0x0` display resolution, no IOSurface/shared texture, and no display info from the runtime. The failure is silent (no error logged, just mock runtime loaded). Always pin `1.16.1+` in your test project's `Packages/manifest.json`.
+`package.json` still depends on `com.unity.xr.openxr` (`DisplayXRLocal2D` references `OpenXRRuntime.IsExtensionEnabled`), but the provider is a custom **`IUnityXRDisplay`** subsystem — it drives the DisplayXR runtime directly and **does not enable Unity's OpenXR loader**. So the old hook-era caveat (pre-1.16.1 OpenXR silently ignoring `XR_RUNTIME_JSON` in editor play mode and falling back to the Mock Runtime → `0x0` resolution) no longer applies: the provider never routes through Unity's OpenXR loader. Enable **DisplayXR** (not OpenXR) in XR Plug-in Management.
 
 ### Resolved: window-drag phase-snap (#61)
 
-**Window-drag phase-snap is solved** (issue #61, closed 2026-05-09, hardware-verified on both paths). The SR SDK weaver only phase-snaps to lenticular-aligned positions when its WndProc subclass sees the OS in-drag flag. Rather than hand the OS the modal drag loop (which our `WS_POPUP` + cloaked + `WS_EX_NOREDIRECTIONBITMAP`/`WS_EX_NOACTIVATE` overlay can't do — synthesized `WM_NCLBUTTONDOWN`/`SC_MOVE` need a DWM redirection surface), we keep the capture-based custom drag and **bracket it** by synthesizing `WM_ENTERSIZEMOVE`/`WM_EXITSIZEMOVE` via `SendMessageW` around the drag. The weaver's subclass sees the bracket and phase-snaps; Kooima stays live throughout (no stutter, no update-only-on-release). Implemented in both `displayxr_win32.c` `overlay_wnd_proc` (transparent overlay right-drag, #57) and `displayxr_standalone.cpp` `sa_wndproc` (preview window). The runtime "external drag" API (`DisplayXR/displayxr-runtime#193`) is no longer needed for this.
+**Window-drag phase-snap is solved** (issue #61, closed 2026-05-09, hardware-verified on both paths). The SR SDK weaver only phase-snaps to lenticular-aligned positions when its WndProc subclass sees the OS in-drag flag. Rather than hand the OS the modal drag loop (which our `WS_POPUP` + cloaked + `WS_EX_NOREDIRECTIONBITMAP`/`WS_EX_NOACTIVATE` overlay can't do — synthesized `WM_NCLBUTTONDOWN`/`SC_MOVE` need a DWM redirection surface), we keep the capture-based custom drag and **bracket it** by synthesizing `WM_ENTERSIZEMOVE`/`WM_EXITSIZEMOVE` via `SendMessageW` around the drag. The weaver's subclass sees the bracket and phase-snaps; Kooima stays live throughout (no stutter, no update-only-on-release). Implemented in `displayxr_win32.c` `overlay_wnd_proc` (transparent overlay right-drag, #57). (The former `displayxr_standalone.cpp` `sa_wndproc` preview-window path is dormant/uncompiled after the #166 provider migration.) The runtime "external drag" API (`DisplayXR/displayxr-runtime#193`) is no longer needed for this.
 
 ### Code Style
 
@@ -272,13 +241,13 @@ Always include the related GitHub issue number in commit messages (e.g. `Fix lin
 
 For detailed architecture and design decisions, see `docs~/`:
 
-- Understand the preview system → `docs~/architecture/preview-session.md`
-- Understand OpenXR hooking → `docs~/architecture/hook-chain.md`
+- Understand the display provider → `docs~/architecture/xr-display-provider.md`
 - Understand stereo math → `docs~/architecture/kooima-pipeline.md`
-- Why deferred destruction? → `docs~/adr/ADR-001-deferred-destruction.md`
-- Why SA session vs XR loader? → `docs~/adr/ADR-002-dual-session.md`
-- Why native window? → `docs~/adr/ADR-003-native-preview-window.md`
+- Why render-path by view count (provider ≤8 vs quilt >8)? → `docs~/adr/ADR-007-render-path-by-view-count.md`
+- Why window-relative Kooima? → `docs~/adr/ADR-006-window-relative-kooima.md`
 - Why two rig modes? → `docs~/adr/ADR-004-camera-vs-display-mode.md`
+- Why deferred destruction? → `docs~/adr/ADR-001-deferred-destruction.md`
+- ADR-002 (dual-session) and ADR-003 (native preview window) are **superseded** by the #166 provider migration — historical only.
 - Full docs index → `docs~/README.md`
 
 ## Cross-Repo References

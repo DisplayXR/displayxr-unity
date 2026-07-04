@@ -11,7 +11,7 @@
 // the same graphics-API-agnostic helper as D3D11/D3D12.
 
 #if defined(ENABLE_VULKAN) || defined(__ANDROID__) || (defined(__linux__) && !defined(__ANDROID__) && !defined(__APPLE__))
-#include "displayxr_hooks_internal.h"
+#include "displayxr_backend.h"
 
 // Inline definition of XrGraphicsBindingVulkanKHR — uses opaque void* for the
 // Vulkan handles so this TU doesn't need <vulkan/vulkan.h> or

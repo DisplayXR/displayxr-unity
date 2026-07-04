@@ -15,7 +15,7 @@
 // draws.
 //
 // The correct per-eye projection is the SAME source of truth both pipelines use:
-// DisplayXRFeature.GetStereoMatrices (leftProj/rightProj) — the exact matrices BiRP
+// the provider's published per-eye leftProj/rightProj — the exact matrices BiRP
 // renders from (and that render correctly both sides). We keep URP's own (correct)
 // view matrix and replace only the projection. The current eye is identified by
 // matching the XRPass view position to the nearer of the two runtime eye positions
@@ -34,17 +34,12 @@
 // (always true for Unity's built-app PRIMARY_STEREO). It additionally requires a
 // DisplayXR runtime that samples per-view subImage.imageArrayIndex (the eyes live in
 // swapchain array layers 0/1). See docs~/experiments/spi-single-pass.md.
-// DisplayXRFeature only leaves SPI selected on URP + Windows + D3D12; elsewhere it
-// forces MultiPass.
+// SPI is only left selected on URP + Windows + D3D12; elsewhere MultiPass is forced.
 using UnityEngine;
 using UnityEngine.Rendering;
 using UnityEngine.Rendering.Universal;
 using UnityEngine.Rendering.RenderGraphModule;
 using DisplayXR;
-
-// hook-path bridge: DisplayXRFeature is soft-deprecated (#166) but remains the active backend on the
-// legacy hook path. Suppress CS0618 for these intentional internal uses.
-#pragma warning disable 618
 
 namespace DisplayXR.URP
 {
@@ -73,13 +68,12 @@ namespace DisplayXR.URP
             static readonly int s_StereoVP    = Shader.PropertyToID("unity_StereoMatrixVP");
             static readonly int s_StereoInvVP = Shader.PropertyToID("unity_StereoMatrixInvVP");
 
-            static DisplayXRFeature s_feature;
             static readonly int s_ForegroundFarId = Shader.PropertyToID("_DXRForegroundFar");
             int m_LogCount;
 
             // Provider-mode matrix read (#166): the provider publishes the per-eye
-            // view+proj to the same native shared state the silhouette reads, so we can
-            // fetch them here (DisplayXRFeature.GetStereoMatrices needs the inactive hook).
+            // view+proj to the same native shared state the silhouette reads, so we
+            // fetch them here.
             static readonly float[] s_pLV = new float[16], s_pLP = new float[16],
                                     s_pRV = new float[16], s_pRP = new float[16];
 
@@ -108,24 +102,14 @@ namespace DisplayXR.URP
                 var cameraData = frameData.Get<UniversalCameraData>();
                 if (cameraData == null || !cameraData.xr.enabled) return;
 
-                Matrix4x4 lv, lp, rv, rp;
-                if (DisplayXRProviderDriver.IsActive)
-                {
-                    // Provider mode (#166): DisplayXRFeature is inert, so this feature
-                    // would no-op and URP would render with its own head-pose-compensated
-                    // view (#115), diverging from the silhouette (which reads the
-                    // provider's published eye_world view+proj) — the #127 parallax
-                    // mismatch (tiger slides out from under its mask when popped out).
-                    // Read the provider's published matrices (the SAME ones the silhouette
-                    // uses) so URP renders identical to the silhouette.
-                    if (!ProviderStereoMatrices(out lv, out lp, out rv, out rp)) return;
-                }
-                else
-                {
-                    if (s_feature == null) s_feature = DisplayXRFeature.Instance;
-                    if (s_feature == null) return;
-                    if (!s_feature.GetStereoMatrices(out lv, out lp, out rv, out rp)) return;
-                }
+                // Provider mode (#166): read the provider's published eye_world
+                // view+proj (the SAME matrices the silhouette uses) so URP renders
+                // identical to the silhouette. Without this URP would use its own
+                // head-pose-compensated view (#115) and diverge from the silhouette —
+                // the #127 parallax mismatch (tiger slides out from under its mask when
+                // popped out).
+                if (!ProviderStereoMatrices(out Matrix4x4 lv, out Matrix4x4 lp,
+                                            out Matrix4x4 rv, out Matrix4x4 rp)) return;
 
                 // Startup guard: the first few frames GetStereoMatrices can return
                 // not-yet-ready (identity / NaN) matrices. Applying a NaN projection
@@ -294,4 +278,3 @@ namespace DisplayXR.URP
         }
     }
 }
-#pragma warning restore 618

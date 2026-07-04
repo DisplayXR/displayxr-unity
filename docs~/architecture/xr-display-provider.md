@@ -1,36 +1,25 @@
 # Custom IUnityXRDisplay Display Provider (epic #166)
 
-> **Status: M1 GO + M2 control plane & architecture validated on hardware;
-> final pixel-correctness (content) WIP.** M1/M1b proved the architecture. **M2**
-> makes the provider a first-class extension app: rig-EXT-driven per-frame
-> tunables (display- AND camera-centric), the adaptive render contract
-> (window×scaleXY), mode enumerate/request + mode/hardware/eye-tracking events,
-> and a proper `DisplayXRDisplayLoader : XRLoader` (XR Plug-in Management toggle,
-> no bootstrap / manifest hand-copy). On-panel validation (RTX 3080, Leia DP)
-> **proved the whole pipeline end-to-end** — provider registers via the XRLoader,
-> reaches FOCUSED, enumerates modes, fires events, adapts resolution, supplies
-> valid projections, and **Unity renders its scene directly into the provider's
-> bridge** (Unity eye-texture pointer == bridge pointer), carried cross-device to
-> the runtime weave. **Open:** the woven image is uniform white instead of the
-> scene — a rendering-correctness detail (what Unity draws into the eye texture;
-> color-space ruled out — project is Gamma, UNORM correct), to resolve with the
-> frame debugger. See **M2** + **M2 hardware validation** below.
+> **Status: Shipping (v1.24.x → v2.0.0).** The custom IUnityXRDisplay provider is the sole rendering backend — the legacy OpenXR hook and the standalone editor-preview session were removed (#166). See [ADR-007](../adr/ADR-007-render-path-by-view-count.md) for the >8-view (light-field/quilt) roadmap.
 
 ## Why this exists
 
-Today the plugin reaches the runtime via an **OpenXR API-layer hook**
-(`displayxr_hooks.cpp`) riding Unity's own OpenXR plugin. The runtime therefore
-treats Unity as a **fixed-resolution, always-2-view "legacy compromise" app**
+The plugin **used to** reach the runtime via an **OpenXR API-layer hook**
+(`displayxr_hooks.cpp`) riding Unity's own OpenXR plugin. In that model the runtime
+treated Unity as a **fixed-resolution, always-2-view "legacy compromise" app**
 (see `displayxr-runtime/docs/architecture/unity-d3d12-app-path.md`):
 `XR_EXT_display_info` off, mode keys disabled, per-view resolution fixed at session
 start, and the plugin coupled to Unity's OpenXR-stack internals.
 
-Epic #166 replaces the hook with a **custom `IUnityXRDisplay` Display Provider**
-(the route Oculus / Varjo / Google Cardboard use). We drive the session; Unity
-still renders (keeping **SPI + URP/HDRP**); we enable `XR_EXT_display_info` so the
-runtime treats us as a **first-class extension app** — the Unity analog of the UE
-plugin (`unreal-d3d12-app-path.md`). M1 proves the architecture end-to-end for
-**stereo (SPI)** and reports GO/NO-GO; M2–M6 build out parity.
+Epic #166 replaced that hook with a **custom `IUnityXRDisplay` Display Provider**
+(the route Oculus / Varjo / Google Cardboard use), and this provider is now the
+**sole shipping backend** — the hook and the standalone editor-preview session were
+removed. We drive the session; Unity still renders (keeping **SPI + URP/HDRP**); we
+enable `XR_EXT_display_info` so the runtime treats us as a **first-class extension
+app** — the Unity analog of the UE plugin (`unreal-d3d12-app-path.md`). The
+historical M1–M2 bring-up sections below document how the architecture was proven
+and hardened on hardware. For the >8-view (light-field/quilt) roadmap that layers on
+top of this provider, see [ADR-007](../adr/ADR-007-render-path-by-view-count.md).
 
 ## Component map
 
@@ -42,10 +31,13 @@ plugin (`unreal-d3d12-app-path.md`). M1 proves the architecture end-to-end for
 | `native~/displayxr_unity_plugin.cpp` | `UnityPluginLoad` calls `displayxr_register_xr_display_provider(ifaces)`. Single DLL — no second plugin. |
 | `native~/unity_pluginapi/` | Vendored Unity XR SDK headers (`IUnityXRDisplay.h`, `UnitySubsystemTypes.h`, `UnityXRTypes.h`, …) — Unity ships only graphics headers in the editor; the XR provider headers are sourced from the Unity XR SDK (Unity Companion License). |
 
-The provider compiles into the **existing** `displayxr_unity` target (Windows
-block in `CMakeLists.txt`) and registers from the **existing** `UnityPluginLoad`.
-The OpenXR hook path and the editor standalone path are untouched (they stay until
-M5).
+The provider compiles into the `displayxr_unity` target (Windows block in
+`CMakeLists.txt`) and registers from `UnityPluginLoad`. The OpenXR hook path and the
+editor standalone (SA) editor-preview session/window have since been **removed** —
+the provider is the only backend. The dormant `displayxr_standalone*`
+render-to-atlas core is **kept in-tree but out of the CMake build**, preserved as the
+seed for the future >8-view quilt/atlas render path (see
+[ADR-007](../adr/ADR-007-render-path-by-view-count.md)); it is not compiled.
 
 ## How the provider maps to the runtime session
 
@@ -228,10 +220,16 @@ is gone. Display-only (no input subsystem) by design.
 
 ## Play Mode runs the provider (#171)
 
-There are three DisplayXR session paths: the **OpenXR hook** (legacy built app), the
-**provider** (new built app), and the **standalone (SA)** session (the edit-mode
-Preview window, and — historically — Play Mode via `PlayModeIntegration`, which
-stripped Unity's OpenXR loader and auto-started the SA session).
+> **Historical (pre-#166 hook-removal).** This section describes the transition when
+> three session paths still coexisted. The OpenXR hook and the standalone (SA)
+> editor-preview session/window have since been removed — **the provider is the sole
+> backend, and pressing Play *is* the preview** (there is no edit-mode preview
+> window). The rationale below is retained for context.
+
+At the time there were three DisplayXR session paths: the **OpenXR hook** (legacy
+built app), the **provider** (new built app), and the **standalone (SA)** session (the
+edit-mode Preview window, and — historically — Play Mode via `PlayModeIntegration`,
+which stripped Unity's OpenXR loader and auto-started the SA session).
 
 Because the provider is a real `IUnityXRDisplay` subsystem, **Play Mode can run it
 directly** through Unity's standard XR Plug-in Management lifecycle — no loader

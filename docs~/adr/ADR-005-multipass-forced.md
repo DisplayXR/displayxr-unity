@@ -1,9 +1,11 @@
 ---
-status: Accepted
+status: Superseded
 date: 2025-05-01
 ---
 
 # ADR-005: Forced Multi-Pass Rendering
+
+> **Status: Superseded (2026-07-03, #166).** The forced-MultiPass decision (the provider now gates SPI-on-URP+D3D12 / MultiPass elsewhere) this ADR covers was removed in the hook-removal pass; the custom IUnityXRDisplay provider is now the sole backend. Kept for historical decision context. See [ADR-007](ADR-007-render-path-by-view-count.md) and [xr-display-provider.md](../architecture/xr-display-provider.md).
 
 ## Context
 

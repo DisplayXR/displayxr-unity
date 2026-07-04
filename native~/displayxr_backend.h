@@ -6,7 +6,7 @@
 
 #pragma once
 
-#include "displayxr_hooks.h"
+#include "displayxr_exports.h"
 #include "displayxr_extensions.h"
 #include "displayxr_shared_state.h"
 #include "displayxr_readback.h"
@@ -235,17 +235,6 @@ public:
 	// Release surround texture/fence/handles. Safe to call repeatedly.
 	virtual void surround_release() {}
 };
-
-// Internal accessor for the currently-active hooked backend. Returns nullptr
-// if no hooked session is running (e.g. inside the standalone preview path,
-// or before xrCreateSession). Used by the standalone C ABI's rendering-mode
-// shims so they can fall back to the hooked backend's enumerated modes when
-// no standalone session exists (built apps).
-GraphicsBackend *displayxr_get_hooked_backend();
-
-// Currently-active hooked session handle, or XR_NULL_HANDLE. Pairs with
-// displayxr_get_hooked_backend() for the fallback path.
-XrSession displayxr_get_hooked_session();
 
 // --- Factory functions for concrete backend classes ---
 // Implementations are in displayxr_d3d11_backend.cpp, displayxr_d3d12_backend.cpp,

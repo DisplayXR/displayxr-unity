@@ -24,19 +24,6 @@ extern "C" {
 /// Logging helper — writes to displayxr.log and OutputDebugString on Windows.
 void displayxr_log(const char *fmt, ...);
 
-/// Called by Unity's OpenXR Feature via HookGetInstanceProcAddr.
-/// Stores the next xrGetInstanceProcAddr in the chain and returns our interceptor.
-/// @param next The next xrGetInstanceProcAddr function pointer in the chain.
-/// @return Our interceptor function pointer (cast to PFN_xrVoidFunction for C# IntPtr).
-DISPLAYXR_EXPORT XrResult displayxr_hook_xrGetInstanceProcAddr(XrInstance instance,
-                                                             const char *name,
-                                                             PFN_xrVoidFunction *function);
-
-/// Install the hook chain. Called once from C# with the next-in-chain function pointer.
-/// @param next_gipa The next xrGetInstanceProcAddr in Unity's hook chain.
-/// @return Our hook function pointer as PFN_xrVoidFunction (for C# IntPtr).
-DISPLAYXR_EXPORT PFN_xrVoidFunction displayxr_install_hooks(PFN_xrGetInstanceProcAddr next_gipa);
-
 // --- P/Invoke exports for C# ---
 
 DISPLAYXR_EXPORT void displayxr_set_tunables(float ipd_factor,
@@ -254,10 +241,6 @@ DISPLAYXR_EXPORT void displayxr_clear_3d_zone(void);
 /// Kill xrPollEvent forwarding immediately. Call from C# before session/instance
 /// teardown to prevent use-after-free when the runtime is unloaded.
 DISPLAYXR_EXPORT void displayxr_stop_polling(void);
-
-/// Destroy the editor preview window (if one exists).
-/// Call from C# before XR teardown to prevent the compositor from blocking.
-DISPLAYXR_EXPORT void displayxr_destroy_preview_window(void);
 
 #ifdef _WIN32
 /// (issue #57) Toggle transparent overlay mode on the parent (Unity top-

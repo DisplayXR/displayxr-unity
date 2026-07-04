@@ -5,10 +5,6 @@ using System.Collections;
 using UnityEngine;
 using UnityEngine.SceneManagement;
 
-// hook-path bridge: DisplayXRFeature is soft-deprecated (#166) but remains the active backend on the
-// legacy hook path. Suppress CS0618 for these intentional internal uses.
-#pragma warning disable 618
-
 namespace DisplayXR
 {
     /// <summary>
@@ -81,7 +77,6 @@ namespace DisplayXR
 
         static readonly Bounds k_HugeBounds = new Bounds(Vector3.zero, Vector3.one * 1e4f);
 
-        private DisplayXRFeature m_Feature;
         private Material m_LogoMat;
         private Material m_SubMat;
 
@@ -102,35 +97,19 @@ namespace DisplayXR
                 subtitle = Resources.Load<Texture2D>("for_unity");
 
             // Wait for the runtime to report display geometry so we can size the
-            // logo to the physical display. Fall back after ~2 s. In provider mode
-            // (#166) DisplayXRFeature is inert (no Unity OpenXR loader), so read the
-            // provider's own XR_EXT_display_info instead.
+            // logo to the physical display. Fall back after ~2 s. Read the
+            // provider's own XR_EXT_display_info.
             float t = 0f;
             float displayH = 0.19f;
-            if (DisplayXRProviderDriver.IsActive)
+            while (t < 2f)
             {
-                while (t < 2f)
+                if (DisplayXRProvider.TryGetDisplayInfo(out var di) && di.heightM > 0f)
                 {
-                    if (DisplayXRProvider.TryGetDisplayInfo(out var di) && di.heightM > 0f)
-                    {
-                        displayH = di.heightM;
-                        break;
-                    }
-                    t += Time.deltaTime;
-                    yield return null;
+                    displayH = di.heightM;
+                    break;
                 }
-            }
-            else
-            {
-                m_Feature = DisplayXRFeature.Instance;
-                while ((m_Feature == null || !m_Feature.DisplayInfo.isValid) && t < 2f)
-                {
-                    m_Feature = m_Feature ?? DisplayXRFeature.Instance;
-                    t += Time.deltaTime;
-                    yield return null;
-                }
-                if (m_Feature != null && m_Feature.DisplayInfo.isValid)
-                    displayH = m_Feature.DisplayInfo.displayHeightMeters;
+                t += Time.deltaTime;
+                yield return null;
             }
 
             BuildArtwork(displayH);
@@ -285,4 +264,3 @@ namespace DisplayXR
         }
     }
 }
-#pragma warning restore 618

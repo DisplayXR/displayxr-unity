@@ -12,9 +12,8 @@ namespace DisplayXR
     /// (native~/display3d_view.c, display3d_apply_eye_factors_n) in C# so the
     /// drawn frustum origins match what the runtime actually consumes in
     /// xrLocateViews. Supports N views (Standard 3D = 2, quad = 4,
-    /// lenticular = 8, …) by reading the standalone preview's per-view
-    /// state through displayxr_standalone_get_n_eye_positions and the
-    /// active mode's viewCount through displayxr_standalone_get_current_mode_info.
+    /// lenticular = 8, …) by reading the runtime's per-view state through
+    /// the native display-info / eye-position getters.
     /// </summary>
     internal static class DisplayXRGizmoHelpers
     {
@@ -29,22 +28,10 @@ namespace DisplayXR
 
         public static bool IsSessionActive()
         {
-            if (Application.isPlaying) return true;
-            return IsStandaloneRunning();
-        }
-
-        // Direct native check. Previously this used reflection on
-        // DisplayXR.Editor.DisplayXRPreviewSession.IsRunning to avoid a
-        // Runtime→Editor compile-time dependency, but that path returned
-        // false in some Editor sessions even with the SA session running
-        // (assembly enumeration / domain reload timing). s_sa.running is
-        // the authoritative flag — it's true between session-start and
-        // session-stop regardless of who started it.
-        static bool IsStandaloneRunning()
-        {
-            try { return DisplayXRNative.displayxr_standalone_is_running() != 0; }
-            catch (System.DllNotFoundException) { return false; }
-            catch (System.EntryPointNotFoundException) { return false; }
+            // The provider (and thus a live session) only runs in Play Mode /
+            // built apps. In Edit Mode there is no session, so gizmos are
+            // selection-driven.
+            return Application.isPlaying;
         }
 
         // -----------------------------------------------------------------
@@ -59,20 +46,19 @@ namespace DisplayXR
         }
 
         /// <summary>
-        /// Canvas rect last pushed to the standalone preview session, in
-        /// physical-display pixel coords. isValid=false when no preview is
-        /// running or before the canvas has been polled. Used to mirror
-        /// the window-relative Kooima shift the SA session applies in
-        /// compute_views (ADR-006).
+        /// Active 3D canvas sub-rect (window-client pixels), used to mirror the
+        /// window-relative Kooima shift the runtime applies. isValid=false when no
+        /// sub-rect is set (full-window canvas). Returns invalid in Edit Mode (no
+        /// live session).
         /// </summary>
         public static CanvasRect TryGetCanvasRect()
         {
             var r = new CanvasRect();
             try
             {
-                DisplayXRNative.displayxr_standalone_get_canvas_rect(
-                    out r.x, out r.y, out r.w, out r.h, out int isValid);
-                r.isValid = isValid != 0;
+                int valid = DisplayXRNative.displayxr_get_canvas_rect_px(
+                    out r.x, out r.y, out r.w, out r.h);
+                r.isValid = valid != 0;
             }
             catch (System.DllNotFoundException) { r.isValid = false; }
             catch (System.EntryPointNotFoundException) { r.isValid = false; }
@@ -123,32 +109,8 @@ namespace DisplayXR
         public static DisplayXRDisplayInfo ReadDisplayInfoFromNative()
         {
             var info = new DisplayXRDisplayInfo();
-            // Try the standalone preview session first — in Edit Mode the
-            // hook chain isn't initialized, but the SA session has its own
-            // display info populated from the runtime.
-            try
-            {
-                DisplayXRNative.displayxr_standalone_get_display_info(
-                    out info.displayWidthMeters,
-                    out info.displayHeightMeters,
-                    out info.displayPixelWidth,
-                    out info.displayPixelHeight,
-                    out info.nominalViewerX,
-                    out info.nominalViewerY,
-                    out info.nominalViewerZ,
-                    out info.recommendedViewScaleX,
-                    out info.recommendedViewScaleY,
-                    out int saValid);
-                if (saValid != 0)
-                {
-                    info.isValid = true;
-                    return info;
-                }
-            }
-            catch (System.DllNotFoundException) { return info; }
-            catch (System.EntryPointNotFoundException) { /* fall through */ }
-
-            // Fall back to the hook chain (Play Mode XR loader path).
+            // Read the runtime's display info from native shared state (populated
+            // by the provider in Play Mode / built apps).
             try
             {
                 DisplayXRNative.displayxr_get_display_info(
@@ -169,76 +131,20 @@ namespace DisplayXR
         }
 
         /// <summary>
-        /// View count for the currently active rendering mode (Standard 3D = 2,
-        /// quad = 4, lenticular = 8, …). Falls back to 2 when no preview
-        /// session is running or the mode info is unavailable. Clamped to
-        /// [1, MAX_VIEWS].
-        /// </summary>
-        public static int QueryActiveViewCount()
-        {
-            uint vc = 0;
-            try
-            {
-                DisplayXRNative.displayxr_standalone_get_current_mode_info(
-                    out vc, out _, out _, out _, out _, out _, out _, out _);
-            }
-            catch (System.DllNotFoundException) { }
-            catch (System.EntryPointNotFoundException) { }
-            int n = vc > 0 ? (int)vc : 2;
-            if (n < 1) n = 1;
-            if (n > MAX_VIEWS) n = MAX_VIEWS;
-            return n;
-        }
-
-        // Reusable scratch buffer for the N-eye native marshalling. Editor-
-        // only, single-threaded gizmo callbacks, so a static instance is fine.
-        static float[] s_NEyeBuf;
-
-        /// <summary>
         /// Try to fill <paramref name="eyesOut"/> with the runtime's last
         /// per-view eye positions (OpenXR display-relative, right-hand,
-        /// −Z forward). Standalone preview path returns up to N; Unity
-        /// hook chain (Play Mode) returns 2. Returns the number written;
-        /// 0 if no live data is available or the data is degenerate
-        /// (all-zero, or L==R / all-same — head-center-only sessions).
-        ///
-        /// Does NOT gate on the tracked bit. sim_display is marked as
-        /// non-tracking but returns valid eye poses (runtime commit
-        /// e0cefdce0); gating on tracked would discard every gizmo update
-        /// in editor preview against sim_display. The degenerate-eye-set
-        /// check below catches all-zero / all-same fallbacks instead.
+        /// −Z forward). Returns the number written (2 eyes); 0 if no live data
+        /// is available or the data is degenerate (all-zero, or L==R / all-same —
+        /// head-center-only sessions).
         /// </summary>
         public static int TryGetLiveRawEyes(Vector3[] eyesOut)
         {
             if (eyesOut == null || eyesOut.Length == 0) return 0;
             int cap = eyesOut.Length;
 
-            // 1) Standalone preview (N-view): preferred when running.
-            if (s_NEyeBuf == null || s_NEyeBuf.Length < cap * 3)
-                s_NEyeBuf = new float[cap * 3];
-            try
-            {
-                DisplayXRNative.displayxr_standalone_get_n_eye_positions(
-                    s_NEyeBuf, (uint)cap, out uint outCount, out int _);
-                if (outCount > 0)
-                {
-                    int n = (int)outCount;
-                    for (int i = 0; i < n; i++)
-                    {
-                        eyesOut[i] = new Vector3(
-                            s_NEyeBuf[i * 3 + 0],
-                            s_NEyeBuf[i * 3 + 1],
-                            s_NEyeBuf[i * 3 + 2]);
-                    }
-                    if (!IsDegenerateEyeSet(eyesOut, n)) return n;
-                }
-            }
-            catch (System.DllNotFoundException) { }
-            catch (System.EntryPointNotFoundException) { }
-
-            // 2) Unity hook chain (Play Mode XR loader): 2 eyes only.
-            // Keep the tracked gate here — XR sessions can legitimately
-            // be in pre-tracked state and we don't want to draw stale data.
+            // Runtime eye positions from native shared state (Play Mode): 2 eyes.
+            // Keep the tracked gate here — XR sessions can legitimately be in a
+            // pre-tracked state and we don't want to draw stale data.
             if (cap >= 2)
             {
                 int tracked = 0;
@@ -540,37 +446,6 @@ namespace DisplayXR
 
         public static readonly Color EyeGlyphLive = new Color(1f, 1f, 0.2f, 1f);
         public static readonly Color EyeGlyphNominal = new Color(0.9f, 0.85f, 0.3f, 0.7f);
-    }
-
-    // Forces Scene View to repaint each editor frame while the SA preview
-    // is running in Edit Mode, so the gizmo (virtual display rect + frustum
-    // + eye glyphs) tracks window drag/resize in real time.
-    //
-    // Why: without this, Scene View only repaints on explicit invalidation
-    // or user interaction. During an SA preview drag/resize, the WndProc's
-    // capture-based SC_MOVE/SC_SIZE intercept floods Unity's main thread
-    // with WM_MOUSEMOVE messages, starving Scene View's repaint cycle —
-    // gizmo only catches up when the drag releases.
-    //
-    // Play Mode is intentionally excluded: Unity's play frame loop already
-    // drives continuous Scene View repaints, so the gizmo updates real-time
-    // there for free. Adding our own RepaintAll on top of that just adds
-    // contention with the teardown path (avoids re-entrant OnDrawGizmos
-    // triggering native reads while the SA session is mid-destroy).
-    [UnityEditor.InitializeOnLoad]
-    internal static class DisplayXRGizmoRepainter
-    {
-        static DisplayXRGizmoRepainter()
-        {
-            UnityEditor.EditorApplication.update += Tick;
-        }
-
-        static void Tick()
-        {
-            if (Application.isPlaying) return;
-            if (!DisplayXRGizmoHelpers.IsSessionActive()) return;
-            UnityEditor.SceneView.RepaintAll();
-        }
     }
 }
 #endif

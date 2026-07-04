@@ -14,7 +14,7 @@
 
 #include "displayxr_extensions.h"
 #include "displayxr_shared_state.h"
-#include "displayxr_hooks_internal.h"
+#include "displayxr_backend.h"
 #include "displayxr_standalone_internal.h"
 
 #include <stdio.h>

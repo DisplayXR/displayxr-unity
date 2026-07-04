@@ -16,7 +16,7 @@ Unity plugin for rendering on eye-tracked 3D light field displays via the Displa
   - [Display-Centric Mode](#display-centric-mode)
 - [Stereo Tunables Reference](#stereo-tunables-reference)
 - [2D UI Overlay](#2d-ui-overlay)
-- [Editor Preview (Standalone Session)](#editor-preview-standalone-session)
+- [Preview (Play Mode)](#preview-play-mode)
 - [Building Your App](#building-your-app)
   - [Windows Standalone](#windows-standalone)
   - [macOS Standalone](#macOS-standalone)
@@ -40,11 +40,9 @@ DisplayXR ships as a custom **Unity display provider** (`IUnityXRDisplay`, the s
 - **Two stereo rig modes** — Camera-centric (add to existing camera) or display-centric (place a virtual display in the scene)
 - **2D/3D display zones + 2D UI overlay** — frame 3D content to window-pixel zones and route any Canvas to a window-space composition layer with stereo disparity
 - **BiRP and URP** — off-axis projection on both pipelines, plus Single-Pass-Instanced (SPI) on URP+Windows+D3D12 and Multi-Pass elsewhere
-- **In-editor Play Mode + standalone editor preview** — Play Mode runs the provider itself (parity with built apps, #171); a dedicated editor preview window is also available.
+- **In-editor Play Mode preview** — pressing Play runs the provider itself, giving full parity with built apps (#171). Play Mode *is* the preview — there is no separate edit-mode preview window.
 
-**How it works:** the provider registers a `DisplayXR Display` display subsystem, binds an OpenXR session to Unity's graphics device, chains the runtime's `XR_EXT_view_rig` descriptor onto `xrLocateViews`, and submits Unity's rendered eye textures back to the runtime compositor via `xrEndFrame`. Enable it under **XR Plug-in Management > Standalone > DisplayXR Display** (see [Enabling the Feature](#enabling-the-feature)).
-
-> **Legacy OpenXR-hook path (deprecated, #166).** Earlier versions worked by *hooking* Unity's OpenXR pipeline at the native layer (an `OpenXRFeature` named "DisplayXR" under **OpenXR > Features**) rather than acting as a display provider. That hook path (`DisplayXRFeature`, `[Obsolete]`) is retained for existing projects but is superseded by the provider and will be removed in a future release. New projects should use the provider. See [`docs~/architecture/xr-display-provider.md`](docs~/architecture/xr-display-provider.md) (provider) and [`docs~/architecture/hook-chain.md`](docs~/architecture/hook-chain.md) (legacy hook).
+**How it works:** the provider registers a `DisplayXR Display` display subsystem, binds an OpenXR session to Unity's graphics device, chains the runtime's `XR_EXT_view_rig` descriptor onto `xrLocateViews`, and submits Unity's rendered eye textures back to the runtime compositor via `xrEndFrame`. Enable it under **XR Plug-in Management > Standalone > DisplayXR Display** (see [Enabling the Feature](#enabling-the-feature)). See [`docs~/architecture/xr-display-provider.md`](docs~/architecture/xr-display-provider.md) for the full provider design.
 
 ---
 
@@ -129,8 +127,6 @@ DisplayXR is enabled as a display provider (the shipping path):
 4. Check **Initialize XR on Startup** so the provider comes up in Play Mode and in built apps
 
 You can verify the runtime status in the **DisplayXR** rig inspectors and the **DisplayXR** settings panel (display resolution, eye-tracking state).
-
-> **Legacy hook path (deprecated, #166).** The old OpenXR-hook feature still works if a project depends on it: check **OpenXR** under Standalone, expand **OpenXR > Features**, and enable **DisplayXR (legacy hook — deprecated)**. This path is superseded by the provider above and will be removed in a future release — prefer the provider for new projects. Do not enable both at once.
 
 ---
 
@@ -270,38 +266,11 @@ The overlay is submitted as `XrCompositionLayerWindowSpaceEXT` and composited by
 
 ---
 
-## Editor Preview (Standalone Session)
+## Preview (Play Mode)
 
-The standalone preview is the primary editor workflow for DisplayXR. It creates its own OpenXR session directly against the DisplayXR runtime — no Play Mode needed. This bypasses Unity's XR subsystem entirely, eliminating session conflicts, crashes, and rendering artifacts.
+**Press Play — Play Mode is the preview.** With the **DisplayXR Display** provider active (the shipping path), Play Mode runs the provider itself: the same backend as a built app, weaving to the display in a dedicated editor window (#171). This gives true parity with built apps — provider behavior and bugs surface directly in the editor — with no separate preview session or Play/Stop-free workflow to manage.
 
-### Opening the Preview
-
-**Window > DisplayXR > Preview Window**
-
-### Toolbar
-
-| Control | Description |
-|---------|-------------|
-| **Start / Stop** | Connects to the DisplayXR runtime and begins rendering |
-| **Camera dropdown** | Lists all scene cameras, categorized by rig type: DisplayRig (`DisplayXRDisplay`), CameraRig (`DisplayXRCamera`), or Regular Camera. Switching rig types auto-requests the appropriate rendering mode. |
-| **Auto Refresh** | When enabled, continuously repaints the preview |
-| **Runtime status** | Shows "Connected" or "Not Connected" |
-
-### Rendering Modes
-
-Modes are dynamically enumerated from the runtime and depend on the connected display hardware. Controls:
-- **V** — cycle through available modes
-- **0–8** — select a specific mode directly
-
-### Output
-
-The preview uses zero-copy GPU texture sharing (IOSurface on macOS, DXGI on Windows) to display exactly what the physical display sees. The footer shows resolution, physical dimensions, eye tracking status, and current rendering mode.
-
-### Play Mode Integration
-
-With the **DisplayXR Display provider** active (the shipping path), **Play Mode runs the provider itself** — the same backend as a built app, weaving to the display in a dedicated editor window (#171). No separate preview session is needed for parity testing.
-
-The dedicated edit-mode preview window described above uses the standalone session and is intended for the legacy hook path. If you are still on the legacy hook path and enter Play Mode while that preview is running, the plugin removes Unity's OpenXR loader to prevent session conflicts and restores it on exit (Play Mode then runs without XR).
+Rendering modes are enumerated dynamically from the runtime and depend on the connected display hardware; mode switching is app policy (see `DisplayXRModeSwitch`). The runtime status (resolution, physical dimensions, eye-tracking state, current mode) is visible in the DisplayXR rig inspectors and settings panel.
 
 ---
 
@@ -312,7 +281,7 @@ The dedicated edit-mode preview window described above uses the standalone sessi
 1. **File > Build Settings**
 2. Select **Windows, Mac, Linux** platform
 3. Set **Target Platform** to **Windows** and **Architecture** to **x86_64**
-4. Verify in **Player Settings > XR Plug-in Management > Standalone** that **DisplayXR Display** is enabled (or, on the legacy hook path, that OpenXR is enabled with the DisplayXR feature)
+4. Verify in **Player Settings > XR Plug-in Management > Standalone** that **DisplayXR Display** is enabled
 5. Click **Build** or **Build And Run**
 
 The build output includes `displayxr_unity.dll` in the `Plugins/` folder alongside your executable.
@@ -321,7 +290,7 @@ The build output includes `displayxr_unity.dll` in the `Plugins/` folder alongsi
 
 1. **File > Build Settings**
 2. Select **macOS** platform
-3. Verify **DisplayXR Display** is enabled in Standalone XR settings (or, on the legacy hook path, OpenXR + the DisplayXR feature)
+3. Verify **DisplayXR Display** is enabled in Standalone XR settings
 4. Click **Build**
 
 The `.app` bundle includes `libdisplayxr_unity.dylib` in the plugins folder.
@@ -385,7 +354,7 @@ If you have a runtime symlink at `~/Library/Application Support/openxr/1/active_
 ```
 Loading OpenXR loader library at path: openxr_loader
 [XR] [FAILURE] xrCreateInstance: XR_ERROR_RUNTIME_UNAVAILABLE
-[DisplayXR] DisplayXRFeature not active.
+[DisplayXR] provider not active.
 ```
 
 Two ways around it:
@@ -411,11 +380,11 @@ xcrun stapler staple MyApp.app
 
 ### What Happens Without the Runtime
 
-If the DisplayXR runtime is not installed, Unity's OpenXR loader fails to find a runtime and logs:
+If the DisplayXR runtime is not installed, the provider fails to bind an OpenXR session and logs:
 ```
 [OpenXR] No OpenXR runtime found
 ```
-The `DisplayXRFeature` logs a warning but doesn't crash — your app runs in mono (non-stereo) mode. You can check `DisplayXRFeature.Instance` being null to detect this and show a user-facing message.
+The plugin logs a warning but doesn't crash — your app runs in mono (non-stereo) mode. Query the DisplayXR runtime status (via the rig components / `DisplayXRProvider`) to detect this and show a user-facing message.
 
 ---
 
@@ -448,7 +417,7 @@ This lets you develop and test the full stereo pipeline on any machine.
 | Symptom | Cause | Fix |
 |---------|-------|-----|
 | "No OpenXR runtime found" | `XR_RUNTIME_JSON` not set or points to missing file | Set the env var to the DisplayXR runtime JSON path |
-| Black screen | DisplayXR not enabled | Check **Project Settings > XR Plug-in Management > Standalone > DisplayXR Display** (provider), and **Initialize XR on Startup**. On the legacy hook path: OpenXR > Features > DisplayXR. |
+| Black screen | DisplayXR not enabled | Check **Project Settings > XR Plug-in Management > Standalone > DisplayXR Display**, and **Initialize XR on Startup**. |
 | Scene renders 2D side-by-side on Leia hardware (no depth) | Leia plug-in not installed/registered | Install `DisplayXRLeiaSRSetup-*.exe` from [displayxr-leia-plugin](https://github.com/DisplayXR/displayxr-leia-plugin/releases). Verify `HKLM\Software\DisplayXR\DisplayProcessors\leia-sr` exists. Without the plug-in, the runtime falls back to `sim_display` (SBS output) on any hardware. |
 | No stereo (flat image) | Eye tracking not running | Verify the DisplayXR runtime is configured with a display that supports eye tracking, or use sim_display for testing |
 | Stereo looks wrong | Tunables misconfigured | Reset to defaults (IPD=1, Parallax=1, Scale=1) |
@@ -457,8 +426,8 @@ This lets you develop and test the full stereo pipeline on any machine.
 | `DllNotFoundException: displayxr_unity` | Native plugin not found by Unity | Ensure the plugin binaries are in `Runtime/Plugins/Windows/x64/` or `Runtime/Plugins/macOS/` |
 | macOS: `XR_ERROR_RUNTIME_UNAVAILABLE` in built `.app` despite the symlink working in editor | Unsigned `.app` bundles can't read `~/Library/Application Support/openxr/` due to macOS sandbox protections | Either set `XR_RUNTIME_JSON` when launching, or ad-hoc sign with `codesign --deep --force --sign - MyApp.app`. See [macOS Deployment](#macos-deployment). |
 | HDRP stereo artifacts | Single-pass instanced issue | Verify both eye views have correct FOVs in Frame Debugger |
-| Preview shows "Not Connected" | `XR_RUNTIME_JSON` not set or runtime not running | Set the env var before launching Unity; verify the runtime process is active |
-| Preview shows black after Start | Runtime connected but no output | Check runtime logs; verify sim_display or hardware is configured |
+| Play Mode shows "Not Connected" | `XR_RUNTIME_JSON` not set or runtime not running | Set the env var before launching Unity; verify the runtime process is active |
+| Play Mode shows black | Runtime connected but no output | Check runtime logs; verify sim_display or hardware is configured |
 | `VK_ERROR_EXTENSION_NOT_PRESENT` on macOS | MoltenVK limitation | Known issue — use sim_display for testing |
 
 ### Debug Logging
@@ -470,11 +439,9 @@ Enable **Log Eye Tracking** on the DisplayXRCamera or DisplayXRDisplay component
 
 ### Checking Runtime Status in Editor
 
-With the provider active, the **DisplayXRCamera / DisplayXRDisplay inspectors** and the **DisplayXR settings panel** show runtime status (unified across provider, editor preview, and legacy hook):
+With the provider active, the **DisplayXRCamera / DisplayXRDisplay inspectors** and the **DisplayXR settings panel** show runtime status:
 - Connected display properties (resolution, physical size, nominal viewer distance)
 - Eye tracking status
-
-(On the legacy hook path, the same status also appears under **Project Settings > XR Plug-in Management > OpenXR > DisplayXR**, including the `XR_RUNTIME_JSON` path/existence check.)
 
 ---
 
@@ -508,8 +475,6 @@ Unity Editor / Player
 │    session on Unity's device → render params (SPI/MP)   │
 │    xrLocateViews → chain XR_EXT_view_rig descriptor     │
 │    xrEndFrame → submit projection + zone + 2D layers    │
-│  (Legacy: an xrGetInstanceProcAddr hook chain — see     │
-│   docs~/architecture/hook-chain.md — is still present.) │
 └──────────────────────────────────────────────────────────┘
         │ Standard OpenXR API
         ▼
@@ -520,9 +485,8 @@ Unity Editor / Player
 ```
 
 See [`docs~/architecture/xr-display-provider.md`](docs~/architecture/xr-display-provider.md) for the full
-provider design. The **legacy OpenXR-hook path** (`DisplayXRFeature : OpenXRFeature`, `[Obsolete]` #166) is
-documented in [`docs~/architecture/hook-chain.md`](docs~/architecture/hook-chain.md) and retained for
-existing projects only.
+provider design, and [`docs~/adr/ADR-007-render-path-by-view-count.md`](docs~/adr/ADR-007-render-path-by-view-count.md)
+for the roadmap to many-view (light-field / quilt) displays.
 
 ### Transform Chain (per frame)
 
@@ -546,19 +510,15 @@ Unity builds projection matrices → renders stereo
 |------|---------|
 | `Runtime/Provider/` | **Display provider (shipping path):** `DisplayXRDisplayLoader` (XR Plug-in Management loader), `DisplayXRProvider`/`DisplayXRProviderDriver` (facade + per-frame driver), `DisplayXRProviderNative` (P/Invoke) |
 | `Editor/Provider/DisplayXRDisplayPackage.cs` | Registers the "DisplayXR Display" provider toggle in XR Plug-in Management |
-| `Runtime/DisplayXRFeature.cs` | **Legacy OpenXR-hook feature (`[Obsolete]`, #166)** — retained for existing projects; superseded by the provider |
 | `Runtime/DisplayXRCamera.cs` | Camera-centric stereo rig MonoBehaviour |
 | `Runtime/DisplayXRDisplay.cs` | Display-centric stereo rig MonoBehaviour |
 | `Runtime/DisplayXRDisplayInfo.cs` | Display properties data struct |
 | `Runtime/DisplayXRTunables.cs` | Tunable parameters struct |
 | `Runtime/DisplayXRWindowSpaceUI.cs` | 2D UI overlay routing |
-| `Runtime/DisplayXRPreview.cs` | Inline preview textures (SBS, readback, SharedTexture) |
 | `Runtime/DisplayXRNative.cs` | P/Invoke bindings to native plugin |
 | `Runtime/Plugins/Windows/x64/` | Windows native plugin (DLL) |
 | `Runtime/Plugins/macOS/` | macOS native plugin (dylib) |
 | `Editor/DisplayXRDisplayEditor.cs` | Custom inspector for display-centric mode |
 | `Editor/DisplayXRCameraEditor.cs` | Custom inspector for camera-centric mode |
-| `Editor/DisplayXRPreviewSession.cs` | Standalone OpenXR session for editor preview (no Play Mode needed) |
-| `Editor/DisplayXRPreviewWindow.cs` | Editor preview window with camera selector and rendering mode controls |
 | `Editor/DisplayXRSettingsProvider.cs` | Project Settings page |
 | `native~/` | Native C/C++ plugin source + CMakeLists.txt |

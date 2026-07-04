@@ -13,10 +13,8 @@ namespace DisplayXR
     /// — the provider analog of the hook-path LateUpdate push), and (2) pumps the
     /// provider's mode/hardware/eye-tracking events into <see cref="DisplayXRProvider"/>.
     ///
-    /// The rigs (<see cref="DisplayXRDisplay"/> / <see cref="DisplayXRCamera"/>)
-    /// still call <see cref="DisplayXRFeature"/> in their own LateUpdate, but that
-    /// path is gated on the OpenXR hook being installed — inert in provider mode.
-    /// This driver is the provider's push path; it reuses the rigs' read-only
+    /// This driver is the provider's push path; it reuses the rigs'
+    /// (<see cref="DisplayXRDisplay"/> / <see cref="DisplayXRCamera"/>) read-only
     /// GetProviderTunables() so the tunable math stays in one place.
     ///
     /// Runs late (DefaultExecutionOrder) so the active rig's LateUpdate has settled.

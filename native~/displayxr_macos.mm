@@ -22,7 +22,7 @@
 #import <AppKit/AppKit.h>
 #import <QuartzCore/QuartzCore.h>
 
-#include "displayxr_hooks.h"
+#include "displayxr_exports.h"
 
 static NSWindow *s_configured_window     = nil;
 static BOOL      s_saved_window_opaque   = YES;

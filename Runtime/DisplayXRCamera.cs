@@ -4,10 +4,6 @@
 using UnityEngine;
 using UnityEngine.Rendering;
 
-// hook-path bridge: DisplayXRFeature is soft-deprecated (#166) but remains the active backend on the
-// legacy hook path. Suppress CS0618 for these intentional internal uses.
-#pragma warning disable 618
-
 namespace DisplayXR
 {
     /// <summary>
@@ -58,7 +54,6 @@ namespace DisplayXR
         [Tooltip("Show eye tracking status in the console.")]
         public bool logEyeTracking;
 
-        private DisplayXRFeature m_Feature;
         private float m_CachedCameraFov;
         private Camera m_Camera;
         private DisplayXRPostAA m_PostAA;
@@ -87,7 +82,6 @@ namespace DisplayXR
 
         void OnEnable()
         {
-            m_Feature = DisplayXRFeature.Instance;
             m_Camera = GetComponent<Camera>();
             // Cache the camera's FOV BEFORE XR overrides it. Once XR is active,
             // Camera.fieldOfView returns the Kooima FOV we set, creating a
@@ -126,7 +120,6 @@ namespace DisplayXR
             else
                 Camera.onPreRender -= OnCameraPreRender;
             DisplayXRRigManager.Unregister(m_Camera);
-            m_Feature = null;
         }
 
         void OnSRPBeginCamera(ScriptableRenderContext ctx, Camera cam) => OnCameraPreRender(cam);
@@ -135,13 +128,12 @@ namespace DisplayXR
         {
             if (cam != m_Camera) return;
 
-            // Provider mode (#166): DisplayXRFeature is inert (no Unity OpenXR loader),
-            // so GetStereoMatrices can't feed the URP foreground clip. Publish the
-            // ForegroundClipURP globals from the provider's per-eye clip data instead,
-            // mirroring DisplayXRDisplay. BiRP drives the dedicated per-eye OnRenderImage
-            // clip pass (DisplayXRForegroundClipBiRP), enabled only while the clip is on;
-            // it reads each eye's native convergence-plane far in OnRenderImage so both
-            // eyes clip on the plane (a single cam.farClipPlane can't).
+            // Provider mode (#166): publish the URP ForegroundClipURP globals from
+            // the provider's per-eye clip data, mirroring DisplayXRDisplay. BiRP drives
+            // the dedicated per-eye OnRenderImage clip pass (DisplayXRForegroundClipBiRP),
+            // enabled only while the clip is on; it reads each eye's native
+            // convergence-plane far in OnRenderImage so both eyes clip on the plane
+            // (a single cam.farClipPlane can't).
             if (DisplayXRProviderDriver.IsActive)
             {
                 if (m_UsingSRP)
@@ -154,57 +146,6 @@ namespace DisplayXR
                     m_ClipBiRP.enabled = foregroundOnlyClip;
                 }
                 return;
-            }
-
-            if (m_Feature == null) return;
-
-            if (!m_Feature.GetStereoMatrices(out Matrix4x4 leftView, out Matrix4x4 leftProj,
-                                              out Matrix4x4 rightView, out Matrix4x4 rightProj))
-                return;
-
-            // Convert view matrices from OpenXR convention (right-hand, -Z forward) to
-            // Unity world convention (left-hand, +Z forward) by negating column 2.
-            leftView = FlipViewZ(leftView);
-            rightView = FlipViewZ(rightView);
-
-            // The view matrix is always overridden: it carries the OpenXR→Unity
-            // handedness conversion (FlipViewZ) that BiRP's pose path doesn't apply.
-            cam.SetStereoViewMatrix(Camera.StereoscopicEye.Left, leftView);
-            cam.SetStereoViewMatrix(Camera.StereoscopicEye.Right, rightView);
-
-            // BiRP: always override the projection with the runtime's render-ready fov,
-            // built explicitly (native dxr_projection_from_fov). Unity's XR builds a
-            // correct projection from views[i].fov only for a CENTERED frustum; for
-            // window-relative off-center the frustum shears and Unity mishandles it,
-            // over-separating the eyes (#396 — the native cube app works off-center,
-            // Unity didn't until this override). Centered is unchanged (explicit ==
-            // Unity's fov projection there, Probe A). The native projection also carries
-            // the foreground-clip per-view far (camera rig = the convergence distance, #57).
-            if (!m_UsingSRP)
-            {
-                cam.SetStereoProjectionMatrix(Camera.StereoscopicEye.Left, leftProj);
-                cam.SetStereoProjectionMatrix(Camera.StereoscopicEye.Right, rightProj);
-            }
-            // URP path: projection is owned by KooimaProjectionFixFeature (it re-pushes
-            // these same leftProj/rightProj per eye-pass — URP ignores
-            // SetStereoProjectionMatrix, #1328435). The rig no longer touches projection
-            // or farClipPlane here. It only publishes the per-eye foreground far + eye
-            // positions so the opt-in DisplayXR/ForegroundClipURP pass can clip per-eye
-            // in screen space (#57/#129). The global is inert if that pass isn't wired,
-            // so this is safe for every URP app. leftView/rightView are already
-            // FlipViewZ'd above, matching the shader's UNITY_MATRIX_I_V.
-            else
-            {
-                float farL = leftProj.m23 / (leftProj.m22 + 1f);
-                float farR = rightProj.m23 / (rightProj.m22 + 1f);
-                bool clip = foregroundOnlyClip && farL > cam.nearClipPlane && farR > cam.nearClipPlane;
-                Shader.SetGlobalVector(s_ForegroundFarId,
-                    clip ? new Vector4(farL, farR, 1f, 0f) : Vector4.zero); // z = enable
-                if (clip)
-                {
-                    Shader.SetGlobalVector(s_EyePosLId, leftView.inverse.GetColumn(3));
-                    Shader.SetGlobalVector(s_EyePosRId, rightView.inverse.GetColumn(3));
-                }
             }
         }
 
@@ -232,16 +173,6 @@ namespace DisplayXR
             }
         }
 
-        /// <summary>Negate column 2 (Z) of a view matrix to convert OpenXR → Unity world handedness.</summary>
-        static Matrix4x4 FlipViewZ(Matrix4x4 m)
-        {
-            m.m02 = -m.m02;
-            m.m12 = -m.m12;
-            m.m22 = -m.m22;
-            m.m32 = -m.m32;
-            return m;
-        }
-
         void LateUpdate()
         {
             // Keep the post-process AA pass tracking the toggle (inspector or
@@ -255,61 +186,16 @@ namespace DisplayXR
             var active = DisplayXRRigManager.ActiveCamera;
             if (active != null && active != m_Camera) return;
 
-            if (m_Feature == null)
-            {
-                m_Feature = DisplayXRFeature.Instance;
-                if (m_Feature == null) return;
-            }
-
-            // In play mode, XR overwrites cam.fieldOfView with the Kooima FOV
-            // each frame — reading it back creates a feedback loop that blows
-            // up to ~180°.  Only sync from the camera in edit mode (inspector edits).
+            // In edit mode, sync the cached FOV from the camera (inspector edits).
+            // In play mode, XR overwrites cam.fieldOfView with the Kooima FOV each
+            // frame — reading it back would create a feedback loop that blows up to
+            // ~180°, so the cache is frozen at its OnEnable value. GetProviderTunables
+            // reads m_CachedCameraFov.
             if (!Application.isPlaying)
             {
                 float currentFov = m_Camera.fieldOfView;
                 if (currentFov >= 1.0f)
                     m_CachedCameraFov = currentFov;
-            }
-
-            // Compute half_tan_vfov from the cached camera FOV
-            float halfTanVfov = Mathf.Tan(m_CachedCameraFov * 0.5f * Mathf.Deg2Rad);
-
-            // Convert camera-centric params to native tunables
-            var tunables = new DisplayXRTunables
-            {
-                ipdFactor = ipdFactor,
-                parallaxFactor = parallaxFactor,
-                perspectiveFactor = 1.0f,
-                virtualDisplayHeight = 0f,
-                invConvergenceDistance = invConvergenceDistance,
-                fovOverride = halfTanVfov,
-                nearZ = m_Camera.nearClipPlane,
-                farZ = m_Camera.farClipPlane,
-                cameraCentricMode = true,
-                clipAtDisplayPlane = foregroundOnlyClip,
-            };
-
-            m_Feature.SetTunables(tunables);
-
-            // Push viewport size and screen position for window-relative Kooima.
-            // On Windows, native WM_SIZE handler overrides with accurate HWND position.
-            m_Feature.SetViewportSize(Screen.width, Screen.height, 0, 0);
-
-            // Send camera world pose + scale to native
-            m_Feature.SetSceneTransform(
-                transform.position,
-                transform.rotation,
-                transform.lossyScale,
-                enabled: true);
-
-            m_Feature.RefreshEyePositions();
-
-            if (logEyeTracking)
-            {
-                Debug.Log($"[DisplayXR] Eyes: L={m_Feature.LeftEyePosition}, " +
-                          $"R={m_Feature.RightEyePosition}, tracked={m_Feature.IsEyeTracked}" +
-                          $" camPos={transform.position} fov={m_CachedCameraFov:F1}" +
-                          $" invd={invConvergenceDistance:F4}");
             }
         }
 
@@ -361,9 +247,7 @@ namespace DisplayXR
 
         void DrawGizmosImpl()
         {
-            DisplayXRDisplayInfo info = DisplayXRFeature.Instance != null
-                ? DisplayXRFeature.Instance.DisplayInfo
-                : DisplayXRGizmoHelpers.ReadDisplayInfoFromNative();
+            DisplayXRDisplayInfo info = DisplayXRGizmoHelpers.ReadDisplayInfoFromNative();
 
             // Window-relative Kooima: convergence volume aspect should
             // match the WINDOW the runtime is rasterizing into, not the
@@ -440,4 +324,3 @@ namespace DisplayXR
 #endif
     }
 }
-#pragma warning restore 618

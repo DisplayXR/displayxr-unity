@@ -5,7 +5,7 @@
 // Active when ENABLE_OPENGL is defined on Android.
 
 #if defined(ENABLE_OPENGL) && defined(__ANDROID__)
-#include "displayxr_hooks_internal.h"
+#include "displayxr_backend.h"
 
 class OpenGLESBackend : public GraphicsBackend {
 public:
