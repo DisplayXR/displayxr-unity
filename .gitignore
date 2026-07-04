@@ -8,6 +8,11 @@ docs/**/*.meta
 docs/*.meta
 /docs.meta
 /*.md.meta
+# Root-level non-asset files Unity auto-generates metas for (NOTICE, release
+# scripts) — the files are tracked, the incidental metas are not (see /*.md.meta).
+/NOTICE.meta
+/Scripts.meta
+/Scripts/*.meta
 
 # OS files
 .DS_Store
@@ -27,6 +32,7 @@ displayxr-app.log.meta
 
 # Claude Code runtime scratch
 .claude/scheduled_tasks.lock
+.claude/plans/
 
 # Built plugin binaries (committed by CI, not manually)
 # Uncomment these if you want CI to commit binaries:
