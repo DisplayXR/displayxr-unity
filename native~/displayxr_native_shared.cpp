@@ -183,13 +183,37 @@ displayxr_set_viewport_size_native(uint32_t width, uint32_t height,
 	state->viewport_y = screen_y;
 }
 
-// Canvas sub-rect (#34 / #131): the only WRITER (displayxr_set_canvas_rect)
-// died with the hook TU, so in provider mode these stay zero → the accessor
-// returns 0 ("full-window canvas"), which is the correct provider-mode default
-// (DisplayXRTransparentOverlay/win32.c treat 0 as full window).
+// Canvas sub-rect (#34 / #131): the app sets this to the 3D-zone rect so the
+// Win32 overlay's click-through silhouette mask is stamped into the SAME sub-rect
+// the runtime weaves the zone into (get_canvas_rect_px, below, is read by
+// displayxr_set_overlay_hit_mask + the C# GetStereoViewport). The writer
+// (displayxr_set_canvas_rect) was re-homed out of the deleted hook TU — without it
+// the accessor returns 0 (full-window), the mask is stamped full-window while the
+// zone is woven into the sub-rect, and the mask CLIPS the woven content (#166).
+// The hook-era output-rect apply (xrSetSharedTextureOutputRectEXT) is dropped: the
+// provider drives the zone weave via XrDisplayZoneEXT (dxr_prov_set_3d_zone_rect),
+// so this setter only needs to update the shared canvas rect the mask path reads.
 static int s_canvas_rect_valid = 0;
 static int32_t s_canvas_rect_x = 0, s_canvas_rect_y = 0;
 static uint32_t s_canvas_rect_w = 0, s_canvas_rect_h = 0;
+
+DISPLAYXR_EXPORT void
+displayxr_set_canvas_rect(int32_t x, int32_t y, uint32_t w, uint32_t h)
+{
+	// w==0 || h==0 clears (full-window canvas). Otherwise cache the sub-rect
+	// so displayxr_get_canvas_rect_px reports it to the overlay mask path.
+	if (w == 0 || h == 0) {
+		s_canvas_rect_valid = 0;
+		displayxr_log("[DisplayXR] set_canvas_rect: cleared (full-window canvas)\n");
+		return;
+	}
+	s_canvas_rect_x = x;
+	s_canvas_rect_y = y;
+	s_canvas_rect_w = w;
+	s_canvas_rect_h = h;
+	s_canvas_rect_valid = 1;
+	displayxr_log("[DisplayXR] set_canvas_rect: (%d,%d) %ux%u\n", x, y, w, h);
+}
 
 DISPLAYXR_EXPORT int
 displayxr_get_canvas_rect_px(int32_t *x, int32_t *y, uint32_t *w, uint32_t *h)
