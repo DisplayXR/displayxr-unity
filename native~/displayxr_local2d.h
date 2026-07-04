@@ -6,19 +6,16 @@
 // Routes a Unity RenderTexture through to an XrCompositionLayerLocal2DEXT
 // composition layer so the runtime composites it "glass over 3D" — the woven
 // 3D under the layer's pixel rect goes flat 2D (implicit mask) and the 2D
-// content is alpha-composited on top. This is the modern, mask-based path the
-// native VK avatar uses for its speech bubble; it replaces the legacy 2D
-// surround handoff (xrSetSharedTextureSurround2DFenceEXT) for in-canvas 2D.
+// content is alpha-composited on top.
 //
-// Mirrors displayxr_window_space_ui's hooked path: own overlay swapchain, lazy
-// create, per-frame acquire/copy/release reusing the GraphicsBackend's wsui_*
-// methods. The difference is the emitted layer type + a client-window PIXEL
-// dest rect (vs the window-space layer's fractional coords + disparity).
+// C# registers the pending Unity texture + pixel rect via the C ABI setters
+// below. Under the custom IUnityXRDisplay provider the layer is submitted by the
+// provider itself (ps_submit_local2d in displayxr_provider_session.cpp). The
+// former hooked submission path was removed in the Task-3 hook-backend cleanup
+// (#166).
 
 #pragma once
 
-#include <openxr/openxr.h>
-#include "displayxr_extensions.h"
 #include <stdint.h>
 
 #ifndef DISPLAYXR_EXPORT
@@ -32,19 +29,6 @@
 #endif
 
 #ifdef __cplusplus
-
-// Forward declaration of the backend abstract base (same as wsui).
-class GraphicsBackend;
-
-// Called from hooked_xrEndFrame just before the window-space pre-end-frame.
-// Lazily creates the overlay swapchain (recreated when the Unity RT dims
-// change), then acquires + copies + releases one image and populates
-// state->local2d_layer so the hooked_xrEndFrame loop appends the layer.
-void local2d_hooked_pre_end_frame(XrSession session, GraphicsBackend *backend);
-
-// Called from hooked_xrDestroySession. Drops our cached swapchain handle.
-void local2d_hooked_on_session_destroyed(void);
-
 extern "C" {
 #endif
 

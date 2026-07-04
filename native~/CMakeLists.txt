@@ -74,16 +74,17 @@ endif()
 # is the shipping path. The handful of symbols surviving TUs still needed from the
 # hook TU were re-homed into displayxr_native_shared.cpp. The SA files remain on
 # disk (dormant quilt-render seed) but are not in SOURCES.
+#
+# Task 3 (#166): the 6 GraphicsBackend TUs (d3d11/d3d12/metal/vulkan/opengl/
+# opengles) were dropped — they were only ever instantiated by the deleted hook,
+# and the provider owns its D3D12 device + swapchains + wsui/Local2D layers
+# directly (displayxr_xrprovider/displayxr_provider_session.cpp). The readback
+# subsystem went with them (its only writers were the backends' window-binding
+# injector). wsui/local2d retain only their C# P/Invoke setters (the provider
+# reads the pending state); their dead hooked/standalone submission paths are gone.
 set(SOURCES
     displayxr_native_shared.cpp
-    displayxr_d3d11_backend.cpp
-    displayxr_d3d12_backend.cpp
-    displayxr_metal_backend.cpp
-    displayxr_vulkan_backend.cpp
-    displayxr_opengl_backend.cpp
-    displayxr_opengles_backend.cpp
     displayxr_shared_state.cpp
-    displayxr_readback.cpp
     displayxr_vk_loader.cpp
     displayxr_window_space_ui.cpp
     displayxr_local2d.cpp
@@ -91,9 +92,8 @@ set(SOURCES
 
 set(HEADERS
     displayxr_exports.h
-    displayxr_backend.h
+    displayxr_native_shared.h
     displayxr_shared_state.h
-    displayxr_readback.h
     displayxr_extensions.h
     displayxr_window_space_ui.h
     displayxr_local2d.h

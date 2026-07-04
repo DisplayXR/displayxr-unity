@@ -6,25 +6,22 @@
 // Routes a Unity Canvas RenderTexture through to a XrCompositionLayerWindowSpaceEXT
 // composition layer so the runtime composites it on top of the eye projection.
 //
-// Two xrEndFrame call sites need wiring:
-//   - hooked path (built apps with Unity's OpenXR loader)
-//   - standalone path (editor preview window + Play Mode with PlayModeIntegration)
-//
-// Each path owns its own overlay swapchain (different OpenXR sessions), but the
-// pending Unity texture pointer + layer placement is shared.
+// C# registers the pending Unity texture + fractional layer placement via the C
+// ABI setters below; the custom IUnityXRDisplay provider reads that state via
+// displayxr_window_space_ui_get_pending and drives its own overlay swapchain from
+// its own session/device (ps_submit_wsui in displayxr_provider_session.cpp). The
+// former hooked/standalone submission paths were removed in the Task-3
+// hook-backend cleanup (#166).
 
 #pragma once
 
-#include <openxr/openxr.h>
-#include "displayxr_extensions.h"
 #include <stdint.h>
 
-// Local definition of DISPLAYXR_EXPORT (same shape as displayxr_hooks.h /
-// displayxr_standalone.h). Defining it inline rather than including
-// displayxr_hooks.h here avoids dragging that header into translation units
-// that also include displayxr_win32.h — which redeclares some of
-// displayxr_hooks.h's exports without __declspec(dllexport), tripping
-// MSVC C2375 "redefinition; different linkage".
+// Local definition of DISPLAYXR_EXPORT (matches displayxr_exports.h). Defining
+// it inline rather than including displayxr_exports.h avoids dragging that header
+// into translation units that also include displayxr_win32.h, which redeclares
+// some exports without __declspec(dllexport) — tripping MSVC C2375 "redefinition;
+// different linkage".
 #ifndef DISPLAYXR_EXPORT
 # if defined(_WIN32)
 #  define DISPLAYXR_EXPORT __declspec(dllexport)
@@ -34,53 +31,6 @@
 #  define DISPLAYXR_EXPORT
 # endif
 #endif
-
-#ifdef __cplusplus
-
-// Forward declarations of backend abstract bases.
-class GraphicsBackend;
-class StandaloneGraphicsBackend;
-
-// --- Hooked path (Unity OpenXR loader) ----------------------------------------
-
-// Called from hooked_xrEndFrame just before the existing window_layers iteration.
-// Lazily creates the overlay swapchain (one-shot, on first call after session is
-// alive), then acquires + copies + releases one image and populates
-// state->window_layers[0] so the existing 836-880 loop submits the layer.
-void wsui_hooked_pre_end_frame(XrSession session, GraphicsBackend *backend);
-
-// Called from hooked_xrDestroySession. Drops our cached swapchain handle (the
-// runtime tears it down as part of session destruction).
-void wsui_hooked_on_session_destroyed(void);
-
-// --- Standalone path (preview / Play Mode integration) ------------------------
-
-// Function-pointer bag the standalone path passes in. Avoids dragging
-// StandaloneState into this header.
-struct WsuiStandaloneFns {
-	PFN_xrEnumerateSwapchainFormats pfn_enumerate_formats;
-	PFN_xrCreateSwapchain pfn_create_swapchain;
-	PFN_xrDestroySwapchain pfn_destroy_swapchain;
-	PFN_xrEnumerateSwapchainImages pfn_enumerate_images;
-	PFN_xrAcquireSwapchainImage pfn_acquire;
-	PFN_xrWaitSwapchainImage pfn_wait;
-	PFN_xrReleaseSwapchainImage pfn_release;
-};
-
-// Returns 1 if a window-space layer is active and was filled into out_layer.
-// Caller appends out_layer to its xrEndFrame layer array.
-int wsui_standalone_pre_end_frame(XrSession session,
-                                   const WsuiStandaloneFns *fns,
-                                   StandaloneGraphicsBackend *backend,
-                                   XrCompositionLayerWindowSpaceEXT *out_layer);
-
-// Called when the standalone session is being torn down. If
-// `pfn_destroy_swapchain` is non-null we explicitly destroy our cached
-// swapchain (matches how destroy_atlas_swapchain is called before
-// pfn_destroy_session in displayxr_standalone.cpp).
-void wsui_standalone_on_session_destroyed(PFN_xrDestroySwapchain destroy_fn);
-
-#endif // __cplusplus
 
 #ifdef __cplusplus
 extern "C" {
