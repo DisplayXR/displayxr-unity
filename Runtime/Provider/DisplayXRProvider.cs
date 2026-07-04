@@ -114,9 +114,8 @@ namespace DisplayXR
 
         /// <summary>
         /// Set the single 3D-zone rect (client-window pixels) the runtime frames the
-        /// Kooima 3D into (#166 Phase B) — the provider analog of
-        /// <see cref="DisplayXRNative.displayxr_set_3d_zone_rect"/> on the hook path.
-        /// Seed early (SubsystemRegistration) so the swapchain is born zone-sized.
+        /// Kooima 3D into (#166 Phase B). Seed early (SubsystemRegistration) so the
+        /// swapchain is born zone-sized.
         /// width&lt;=0||height&lt;=0 clears. Safe to call whether or not the provider is active.
         /// </summary>
         public static void SetZoneRect(int x, int y, int width, int height) =>
