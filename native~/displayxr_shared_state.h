@@ -78,7 +78,12 @@ typedef struct DisplayXRStereoMatrices {
     uint8_t valid;              // Set when matrices have been computed
 } DisplayXRStereoMatrices;
 
-// --- Window-space layer descriptor (set from game thread, read from render thread) ---
+// --- Window-space layer descriptor ---
+// Vestigial: formerly filled by the OpenXR-hook path's wsui pre-end-frame and
+// consumed in hooked_xrEndFrame. That path was removed in the Task-3 hook-backend
+// cleanup (#166); the provider builds its own XrCompositionLayerWindowSpaceEXT in
+// displayxr_provider_session.cpp (ps_submit_wsui). Retained for a possible future
+// follow-up removal (see the epic plan) — no live reader/writer today.
 
 #define DISPLAYXR_MAX_WINDOW_LAYERS 4
 
@@ -93,8 +98,10 @@ typedef struct DisplayXRWindowLayer {
 
 // --- Local2D layer descriptor (#439/#491). Post-weave 2D content at a
 // client-window PIXEL rect, composited "glass over 3D" via the runtime's
-// implicit mask. Filled by local2d_hooked_pre_end_frame, consumed in
-// hooked_xrEndFrame as an XrCompositionLayerLocal2DEXT.
+// implicit mask. Vestigial like DisplayXRWindowLayer above: formerly filled by
+// the removed hook path; the provider now submits its own
+// XrCompositionLayerLocal2DEXT (ps_submit_local2d). Retained pending a future
+// follow-up removal.
 typedef struct DisplayXRLocal2DLayer {
     XrSwapchain swapchain;      // Overlay swapchain handle
     uint32_t swapchain_width;
@@ -135,12 +142,6 @@ typedef struct DisplayXRState {
 
     // Local2D overlay layer (#439/#491) — single slot (one speech bubble etc.)
     DisplayXRLocal2DLayer local2d_layer;
-
-    // Readback state
-    uint8_t *readback_pixels;
-    uint32_t readback_width;
-    uint32_t readback_height;
-    volatile int readback_ready;
 
     // Editor mode flag: create own preview window instead of auto-detecting app window
     uint8_t editor_mode;

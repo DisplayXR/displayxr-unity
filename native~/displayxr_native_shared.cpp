@@ -2,13 +2,18 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Shared native glue re-homed out of the deleted OpenXR-hook TU
-// (displayxr_hooks.cpp) so the provider-only DLL links: logger,
-// real-fn-pointer storage (inert in provider mode), win32 window-binding
-// injector, viewport/canvas-rect accessors.
+// (displayxr_hooks.cpp) so the provider-only DLL links: logger + the C#
+// P/Invoke accessors (viewport/canvas-rect, stereo matrices, display info,
+// eye positions, render-target size, transparent-background request).
+//
+// The former real-fn-pointer storage (s_real_*/s_next_gipa) and the win32
+// window-binding injector were removed in the Task-3 hook-backend cleanup
+// (#166): the fn-pointers were only ever populated by the deleted hook and the
+// provider does its own session/window binding.
 
 #include <cstdlib>   // calloc/free — explicit; macOS clang/libc++ no longer pulls these in transitively
 #include <cstring>   // strcmp — same reason
-#include "displayxr_backend.h"
+#include "displayxr_native_shared.h"
 
 // --- Logging helper ---
 // On Windows built apps, fprintf(stderr) goes nowhere (no console).
@@ -108,62 +113,6 @@ void displayxr_log(const char *fmt, ...)
 #endif
 	va_end(args);
 }
-
-// --- Stored real function pointers (non-static — backends access via extern) ---
-// Populated only by the deleted OpenXR-hook path, so in provider mode they stay
-// nullptr — that is intended (the hooked-swapchain code paths in backends/wsui/
-// local2d become inert in provider mode).
-PFN_xrGetInstanceProcAddr s_next_gipa = nullptr;
-PFN_xrLocateViews s_real_locate_views = nullptr;
-PFN_xrGetSystemProperties s_real_get_system_properties = nullptr;
-PFN_xrCreateSession s_real_create_session = nullptr;
-PFN_xrDestroySession s_real_destroy_session = nullptr;
-PFN_xrEndFrame s_real_end_frame = nullptr;
-PFN_xrCreateReferenceSpace s_real_create_reference_space = nullptr;
-PFN_xrLocateSpace s_real_locate_space = nullptr; // URP head-pose comp (#115)
-volatile PFN_xrPollEvent s_real_poll_event = nullptr;
-PFN_xrDestroyInstance s_real_destroy_instance = nullptr;
-
-PFN_xrEnumerateViewConfigurationViews s_real_enumerate_view_configuration_views = nullptr;
-PFN_xrEnumerateSwapchainFormats s_real_enumerate_swapchain_formats = nullptr;
-PFN_xrCreateSwapchain s_real_create_swapchain = nullptr;
-PFN_xrEnumerateSwapchainImages s_real_enumerate_swapchain_images = nullptr;
-PFN_xrAcquireSwapchainImage s_real_acquire_swapchain_image = nullptr;
-PFN_xrWaitSwapchainImage s_real_wait_swapchain_image = nullptr;
-PFN_xrReleaseSwapchainImage s_real_release_swapchain_image = nullptr;
-#if defined(_WIN32)
-PFN_xrDestroySwapchain s_real_destroy_swapchain = nullptr;
-#endif
-
-// Win32 window binding helper (shared with D3D11Backend / D3D12Backend)
-#if defined(_WIN32)
-void win32_inject_window_binding(XrBaseOutStructure *last, DisplayXRState *state)
-{
-	static XrWin32WindowBindingCreateInfoEXT win_binding = {};
-	win_binding.type = XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT;
-	win_binding.next = nullptr;
-	win_binding.windowHandle = state->window_handle;
-	win_binding.readbackCallback = displayxr_readback_callback;
-	win_binding.readbackUserdata = nullptr;
-	win_binding.sharedTextureHandle = nullptr;
-	// runtime-pvt #191 / displayxr-unity#57: opt-in BitBlt (D3D11) / DComp
-	// (D3D12) swapchain. Only meaningful with a real HWND and outside shell
-	// mode.
-	win_binding.transparentBackgroundEnabled =
-	    (state->transparent_background_requested
-	     && state->window_handle != nullptr
-	     && !displayxr_is_shell_mode())
-	    ? XR_TRUE : XR_FALSE;
-	// Spec v5 chromaKeyColor: post-weave chroma-key conversion is disabled
-	// (runtime uses the compose-under-bg + alpha-gate DP path instead;
-	// Unity emits per-pixel alpha via ALPHA_BLEND environment blend mode).
-	win_binding.chromaKeyColor = 0;
-	displayxr_log("[DisplayXR] Injecting win32 window binding: windowHandle=%p, sharedTextureHandle=%p, transparentBackgroundEnabled=%d, chromaKeyColor=0 (alpha-native)\n",
-	              win_binding.windowHandle, win_binding.sharedTextureHandle,
-	              (int)win_binding.transparentBackgroundEnabled);
-	last->next = (XrBaseOutStructure *)&win_binding;
-}
-#endif
 
 // --- Viewport size (native WM_SIZE authority) ---
 // s_native_viewport_active was written by the C# push path in the deleted
