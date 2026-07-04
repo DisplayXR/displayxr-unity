@@ -85,19 +85,6 @@ DISPLAYXR_EXPORT void displayxr_set_editor_mode(int enabled);
 /// the end of the struct and is harmlessly ignored.
 DISPLAYXR_EXPORT void displayxr_set_transparent_background(int enabled);
 
-/// (#131) Register a Unity RenderTexture (R8G8B8A8_UNORM) as the 2D surround
-/// source. The runtime fills the non-canvas region (outside the canvas sub-rect
-/// set via displayxr_set_canvas_rect) from this texture each frame, post-weave,
-/// at full native panel resolution. The plugin copies the RT into a SHARED
-/// surround texture + signals a SHARED ID3D12Fence, then registers via
-/// xrSetSharedTextureSurround2DFenceEXT. Pass NULL to clear. D3D12 hooked path.
-DISPLAYXR_EXPORT void displayxr_surround_set_texture(void *unity_native_tex,
-                                                     uint32_t width, uint32_t height);
-
-/// (#131) Clear the registered 2D surround texture and unregister from the
-/// runtime. Releases the SHARED surround texture + fence.
-DISPLAYXR_EXPORT void displayxr_surround_clear(void);
-
 /// (#131) Get the runtime's weave-target size = the bound HWND client area, in
 /// physical pixels. On Leia SR this differs from the display panel dims (the SR
 /// weaver oversizes/crops the window). The 2D surround texture + canvas sub-rect

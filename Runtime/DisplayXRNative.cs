@@ -139,20 +139,6 @@ namespace DisplayXR
         public static extern void displayxr_clear_3d_zone();
 
         /// <summary>
-        /// (#131) Register a Unity RenderTexture (R8G8B8A8_UNORM) as the 2D
-        /// surround source. The runtime fills the non-canvas region (outside the
-        /// canvas sub-rect) from it each frame, post-weave, at full native panel
-        /// resolution. Pair with displayxr_set_canvas_rect. Pass IntPtr.Zero to
-        /// clear. D3D12 hooked path (built apps).
-        /// </summary>
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void displayxr_surround_set_texture(IntPtr unityNativeTex, uint width, uint height);
-
-        /// <summary>(#131) Clear the registered 2D surround texture.</summary>
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void displayxr_surround_clear();
-
-        /// <summary>
         /// (#131) Get the runtime's weave-target size = the bound HWND client
         /// area, in physical pixels. On Leia SR this differs from the display
         /// panel dims. The 2D surround texture + canvas sub-rect must use THESE
