@@ -260,28 +260,6 @@ namespace DisplayXR
 #endif
         }
 
-        /// <summary>
-        /// (avatar simple-window) Opt into binding the runtime to Unity's REAL
-        /// main HWND for the next OpenXR session — no off-screen overlay, no DWM
-        /// cloak, no off-screen move. MUST be called BEFORE the session is
-        /// created (from the SAME
-        /// [RuntimeInitializeOnLoadMethod(SubsystemRegistration)] bootstrap as
-        /// <see cref="RequestTransparentSession"/>). The component must also
-        /// have <see cref="useSimpleWindow"/> enabled so OnEnable styles the
-        /// real HWND; the two together pick the avatar-style window. Windows
-        /// only — inert elsewhere.
-        /// </summary>
-        public static void RequestSimpleWindow()
-        {
-#if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
-            // The hook-era pre-session request is a no-op under the provider (it does
-            // its own window binding); the OnEnable set_simple_window styling path
-            // (win32) still applies. Guard so a missing hook export can't throw.
-            try { DisplayXRNative.displayxr_request_simple_window(1); }
-            catch (System.EntryPointNotFoundException) { }
-#endif
-        }
-
         void OnEnable()
         {
             m_Camera = GetComponent<Camera>();
@@ -324,9 +302,10 @@ namespace DisplayXR
             m_SimpleWindow = useSimpleWindow;
             if (m_SimpleWindow)
             {
-                // Avatar-style: style Unity's REAL HWND borderless. The session
-                // must have bound the real HWND (RequestSimpleWindow() at
-                // SubsystemRegistration); if it didn't, this no-ops harmlessly.
+                // Avatar-style: style Unity's REAL HWND borderless. Dormant / not
+                // viable under the provider (see the useSimpleWindow tooltip) — the
+                // provider binds its own window; this no-ops harmlessly if the real
+                // HWND isn't the bound one.
                 DisplayXRNative.displayxr_set_simple_window(1, alwaysOnTop ? 1 : 0);
             }
             else

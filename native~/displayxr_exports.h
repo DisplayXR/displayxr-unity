@@ -85,14 +85,6 @@ DISPLAYXR_EXPORT void displayxr_set_editor_mode(int enabled);
 /// the end of the struct and is harmlessly ignored.
 DISPLAYXR_EXPORT void displayxr_set_transparent_background(int enabled);
 
-/// Opt into avatar-style "simple window" mode (Windows). When enabled the
-/// plugin binds the runtime to Unity's REAL main HWND directly — no off-screen
-/// overlay, no DWM cloak, no off-screen move. Click-through is region-based
-/// (SetWindowRgn on Unity's HWND) and decoration toggles via
-/// displayxr_toggle_window_decoration. Call from C# at SubsystemRegistration
-/// (before xrCreateSession), like displayxr_set_transparent_background.
-DISPLAYXR_EXPORT void displayxr_request_simple_window(int enabled);
-
 /// (#131) Register a Unity RenderTexture (R8G8B8A8_UNORM) as the 2D surround
 /// source. The runtime fills the non-canvas region (outside the canvas sub-rect
 /// set via displayxr_set_canvas_rect) from this texture each frame, post-weave,
@@ -179,8 +171,6 @@ DISPLAYXR_EXPORT void displayxr_set_viewport_size(uint32_t width, uint32_t heigh
 DISPLAYXR_EXPORT void displayxr_set_viewport_size_native(uint32_t width, uint32_t height,
                                                          int32_t screen_x, int32_t screen_y);
 
-DISPLAYXR_EXPORT int displayxr_request_display_mode(int mode_3d);
-
 /// (#140 / #396 W6) Capture the runtime's composed multi-view atlas to a PNG via
 /// xrCaptureAtlasEXT (XR_EXT_atlas_capture). The runtime does the readback with
 /// the compositor's own atlas image and writes
@@ -260,9 +250,8 @@ DISPLAYXR_EXPORT void displayxr_set_transparent_overlay(int enabled,
 /// runtime composites into). Click-through is region-based (SetWindowRgn via
 /// the existing hit-mask path, retargeted to this HWND); a borderless
 /// right-drag moves the window (#61-bracketed). Decoration toggles via
-/// displayxr_toggle_window_decoration. Pair with displayxr_request_simple_window
-/// (which selects the real HWND at session create). Mutually exclusive with
-/// shell mode and the transparent overlay. enabled=0 restores Unity's styles.
+/// displayxr_toggle_window_decoration. Mutually exclusive with shell mode and
+/// the transparent overlay. enabled=0 restores Unity's styles.
 /// @param enabled  Non-zero to enable, zero to restore.
 /// @param topmost  Non-zero to add WS_EX_TOPMOST while enabled.
 DISPLAYXR_EXPORT void displayxr_set_simple_window(int enabled, int topmost);

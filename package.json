@@ -23,7 +23,6 @@
     "url": "https://github.com/DisplayXR/displayxr-unity.git"
   },
   "dependencies": {
-    "com.unity.xr.openxr": "1.16.1",
     "com.unity.xr.management": "4.4.0"
   },
   "samples": [

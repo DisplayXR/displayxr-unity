@@ -4,7 +4,6 @@
 using UnityEngine;
 using UnityEngine.Experimental.Rendering;
 using UnityEngine.Rendering;
-using UnityEngine.XR.OpenXR;
 
 namespace DisplayXR
 {
@@ -123,18 +122,14 @@ namespace DisplayXR
             // doesn't support Local2D, stay inert (no RT, no submission) so the
             // rest of the scene renders normally.
             //
-            // Provider mode (#166): Unity's OpenXR loader isn't active, so
-            // OpenXRRuntime.IsExtensionEnabled is always false — gate on the provider
-            // instead (it enables XR_EXT_local_3d_zone on its own instance). Without
-            // this branch the component early-returns and the Canvas falls through to
-            // the main eye texture (the "bubble pollutes the 3D" symptom).
+            // The provider (the sole backend since #166) enables XR_EXT_local_3d_zone
+            // on its own OpenXR instance and is the only thing that submits the Local2D
+            // layer, so gate purely on the provider being active. When it isn't (edit
+            // mode, or XR not started) stay inert — no RT, no submission — so the rest
+            // of the scene renders normally.
             m_ProviderMode = DisplayXRProviderDriver.IsActive;
-            if (!m_ProviderMode && !OpenXRRuntime.IsExtensionEnabled("XR_EXT_local_3d_zone"))
-            {
-                Debug.LogWarning("[DisplayXR] Local2D: XR_EXT_local_3d_zone not enabled — " +
-                                 "bubble layer disabled (runtime lacks Local2D support).");
+            if (!m_ProviderMode)
                 return;
-            }
 
             m_Canvas = GetComponent<Canvas>();
             m_CanvasRect = m_Canvas.GetComponent<RectTransform>();
