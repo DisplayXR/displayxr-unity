@@ -10,6 +10,7 @@
 ### Architecture — How the system works
 - [XR Display Provider](architecture/xr-display-provider.md) — **the shipping path (#166):** the custom `IUnityXRDisplay` provider, its component map, and Play Mode parity
 - [Kooima Pipeline](architecture/kooima-pipeline.md) — Stereo projection math, transform chain, tunables
+- [Click-Through Silhouette Mask](architecture/click-through-mask.md) — transparent-overlay per-pixel click-through: the mask→`SetWindowRgn` pipeline, the mask/weave rect-alignment invariant, and the debugging pitfalls (the #166 clip)
 
 ### Architecture Decision Records — Why things are the way they are
 - [ADR-001: Deferred Destruction](adr/ADR-001-deferred-destruction.md) — Why xrDestroySession/Instance is deferred

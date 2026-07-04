@@ -243,6 +243,7 @@ For detailed architecture and design decisions, see `docs~/`:
 
 - Understand the display provider → `docs~/architecture/xr-display-provider.md`
 - Understand stereo math → `docs~/architecture/kooima-pipeline.md`
+- Transparent-overlay click-through mask (mask/weave rect-alignment invariant + debugging pitfalls) → `docs~/architecture/click-through-mask.md`
 - Why render-path by view count (provider ≤8 vs quilt >8)? → `docs~/adr/ADR-007-render-path-by-view-count.md`
 - Why window-relative Kooima? → `docs~/adr/ADR-006-window-relative-kooima.md`
 - Why two rig modes? → `docs~/adr/ADR-004-camera-vs-display-mode.md`
