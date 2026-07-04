@@ -5,6 +5,18 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0] - 2026-07-04
+
+Internal cleanup only — **no public API change**. Every C# P/Invoke export is preserved and the shipped Windows DLL is byte-identical in size. This release finishes Task 3 of the hook-removal epic (#166): the dead OpenXR-hook graphics-backend plumbing that survived the v2.0.0 hard-removal is now deleted.
+
+### Removed
+- **Dead hook graphics-backend plumbing** (#166, PR #183) — the six `GraphicsBackend` translation units and the readback subsystem (only ever driven by the removed OpenXR API-layer hook / SA preview) are deleted.
+- **Hook function-pointer trampolines** — `s_real_*` / `s_next_gipa` hooked `xrGetInstanceProcAddr` fn-pointers and `win32_inject_window_binding` removed.
+- **Dead hooked/standalone submission paths** — the hooked and standalone wsui + Local2D composition-layer submission code paths (unreachable under the provider) removed.
+
+### Changed
+- No behavioral change to the shipping provider path. The removal is confined to code that was already unreachable after the v2.0.0 hook hard-removal; provider rendering, transparency, zones, Local2D, and wsui are unaffected.
+
 ## [2.0.0] - 2026-07-03
 
 **Provider-only (breaking).** The custom **`IUnityXRDisplay` display provider** is now the *sole* rendering path. The legacy OpenXR API-layer hook and the standalone (SA) editor-preview session/window — soft-deprecated in v1.24.0 — are **hard-removed** (#166, PR #177). Play Mode runs the provider directly and *is* the preview; there is no separate preview window. Apps that referenced the removed hook/SA/preview symbols must migrate to the provider surface before upgrading.
