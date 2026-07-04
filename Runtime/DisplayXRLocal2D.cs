@@ -12,12 +12,12 @@ namespace DisplayXR
     /// composition layer (#439/#491) — the modern, mask-based 2D-over-3D path.
     /// The runtime composites this "glass over 3D": the woven 3D under the
     /// layer's pixel rect goes flat 2D (implicit mask) and the Canvas content is
-    /// alpha-composited on top. This is what the native VK avatar demo uses for
-    /// its speech bubble, and it replaces the legacy 2D-surround handoff
-    /// (<see cref="DisplayXRSurround"/>) for in-canvas 2D content — sidestepping
-    /// the surround path's stale-RenderTexture-pointer fragility (the bubble
-    /// vanishing when Unity reallocated the surround RT): this path recreates
-    /// its overlay swapchain whenever the RT changes.
+    /// alpha-composited on top. This is what the transparent demo uses for its
+    /// speech bubble (TigerSpeechBubble). It superseded the legacy 2D-surround
+    /// handoff (the removed DisplayXRSurround) for in-canvas 2D content —
+    /// sidestepping that path's stale-RenderTexture-pointer fragility (the bubble
+    /// vanishing when Unity reallocated the surround RT): this path recreates its
+    /// overlay swapchain whenever the RT changes.
     ///
     /// Like <see cref="DisplayXRWindowSpaceUI"/> this takes over the Canvas it's
     /// attached to and drives it as a private WorldSpace canvas rendered by a
@@ -26,8 +26,8 @@ namespace DisplayXR
     ///
     /// Position is authored in fractional window coords [0..1]; the component
     /// converts to the client-window pixel rect the Local2D layer requires using
-    /// the live panel pixel size. Scoped to the hooked path (built apps); the
-    /// editor/standalone-preview path is a follow-up (no cross-device bridge here).
+    /// the live panel pixel size. Runs under the provider (Play Mode and built
+    /// player alike) — it gates on <see cref="DisplayXRProviderDriver.IsActive"/>.
     /// </summary>
     [AddComponentMenu("DisplayXR/Local 2D")]
     [RequireComponent(typeof(Canvas))]
@@ -93,10 +93,10 @@ namespace DisplayXR
 
         private int m_LastRectX = int.MinValue, m_LastRectY, m_LastRectW, m_LastRectH;
 
-        // Provider mode (#166): the custom Display Provider owns a separate D3D12
-        // device, so it exposes its own cross-device Local2D bridge (like wsui). We
-        // Graphics.CopyTexture the overlay RT into it each frame instead of handing the
-        // RT pointer to the hook-path displayxr_local2d_set_texture.
+        // The provider owns a separate D3D12 device, so it exposes its own
+        // cross-device Local2D bridge (like wsui). We Graphics.CopyTexture the overlay
+        // RT into it each frame, because a raw same-device RT pointer handoff can't
+        // cross the provider's device boundary.
         private bool m_ProviderMode;
         private Texture2D m_BridgeTex;
 
