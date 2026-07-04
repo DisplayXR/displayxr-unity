@@ -5,6 +5,24 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0] - 2026-07-03
+
+**Provider-only (breaking).** The custom **`IUnityXRDisplay` display provider** is now the *sole* rendering path. The legacy OpenXR API-layer hook and the standalone (SA) editor-preview session/window — soft-deprecated in v1.24.0 — are **hard-removed** (#166, PR #177). Play Mode runs the provider directly and *is* the preview; there is no separate preview window. Apps that referenced the removed hook/SA/preview symbols must migrate to the provider surface before upgrading.
+
+### Removed (breaking)
+- **OpenXR API-layer hook** — `DisplayXRFeature` and `displayxr_hooks.cpp` deleted. Re-homed glue moved to `displayxr_native_shared.cpp`; native headers renamed (`displayxr_hooks.h`→`displayxr_exports.h`, `displayxr_hooks_internal.h`→`displayxr_backend.h`).
+- **Standalone (SA) editor-preview** session + preview window — `DisplayXRPreview*` / `GameViewOverlay` C# and the SA preview code paths removed.
+- **Removed public native exports** — `displayxr_request_display_mode`, `displayxr_standalone_*`, and the `DisplayXRPreviewInput` surface are gone. The SA render-to-atlas core (`displayxr_standalone*`) is kept **on disk but not compiled** (dormant), reserved as the seed for a future many-view "quilt" render path.
+
+### Added
+- **ADR-007 render-path-by-view-count guard** — documents the provider (≤8 views) vs future quilt (>8 views) split; the provider emits a one-shot WARN when a display advertises more than 8 views (Unity's `IUnityXRDisplay` caps at 8 views/frame).
+
+### Fixed
+- **Click-mask** — `displayxr_set_canvas_rect` re-homed (commit 0c3ee9b) after the hook translation unit was removed, restoring the canvas-rect / hit-mask path under the provider.
+
+### Changed
+- **Docs + `CLAUDE.md` are provider-only** — hook/SA/preview-window references retired; superseded ADRs marked historical. `docs~/architecture/xr-display-provider.md` is the current reference.
+
 ## [1.24.1] - 2026-07-02
 
 ### Fixed
