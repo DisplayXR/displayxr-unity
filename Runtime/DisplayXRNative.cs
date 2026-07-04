@@ -24,22 +24,6 @@ namespace DisplayXR
         private const string LibName = "displayxr_unity";
 
         /// <summary>
-        /// Set stereo rig tunables from game thread.
-        /// </summary>
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void displayxr_set_tunables(
-            float ipdFactor,
-            float parallaxFactor,
-            float perspectiveFactor,
-            float virtualDisplayHeight,
-            float invConvergenceDistance,
-            float fovOverride,
-            float nearZ,
-            float farZ,
-            int cameraCentric,
-            int clipAtDisplayPlane);
-
-        /// <summary>
         /// Get display info queried from runtime via XR_EXT_display_info.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
@@ -63,23 +47,6 @@ namespace DisplayXR
             out float lx, out float ly, out float lz,
             out float rx, out float ry, out float rz,
             out int isTracked);
-
-        /// <summary>
-        /// Set scene transform (parent camera pose + zoom) applied before Kooima.
-        /// Chain: raw eyes → scene transform → tunables → Kooima.
-        /// </summary>
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void displayxr_set_scene_transform(
-            float posX, float posY, float posZ,
-            float oriX, float oriY, float oriZ, float oriW,
-            float scaleX, float scaleY, float scaleZ,
-            int enabled);
-
-        /// <summary>
-        /// Set the window handle for session creation (HWND on Win32, NSView* on macOS).
-        /// </summary>
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void displayxr_set_window_handle(IntPtr handle);
 
         /// <summary>
         /// (runtime-pvt #191 / displayxr-unity #57) Request the runtime's
@@ -116,27 +83,6 @@ namespace DisplayXR
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern int displayxr_get_canvas_rect_px(
             out int x, out int y, out uint width, out uint height);
-
-        /// <summary>
-        /// (XR_EXT_display_zones) Define the 3D-zone rect (client-window pixels,
-        /// top-left origin) the runtime frames the Kooima 3D into. The locate
-        /// hook chains an XrDisplayZoneEXT in front of the view-rig (zone-scoped
-        /// projection) and the xrEndFrame hook chains the same zone on each
-        /// projection layer (binding its views into the rect). width&lt;=0 ||
-        /// height&lt;=0 clears. Inert unless the runtime advertises
-        /// XR_EXT_display_zones and reports caps.supported. Mutually exclusive
-        /// with displayxr_set_canvas_rect (a zones frame makes the output rect
-        /// inert). Hooked path (built apps) only.
-        /// </summary>
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void displayxr_set_3d_zone_rect(int x, int y, int width, int height);
-
-        /// <summary>
-        /// (XR_EXT_display_zones) Clear the 3D-zone rect (revert to full-window
-        /// framing). Hooked path (built apps) only.
-        /// </summary>
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void displayxr_clear_3d_zone();
 
         /// <summary>
         /// (#131) Get the runtime's weave-target size = the bound HWND client
@@ -191,14 +137,6 @@ namespace DisplayXR
         public static extern void displayxr_macos_set_window_borderless(int enabled);
 
         /// <summary>
-        /// Hint the typed-swapchain substitution about the project color space.
-        /// 1 = Linear (UNORM_SRGB siblings); 0 = Gamma (UNORM siblings).
-        /// Must be called BEFORE Unity creates its OpenXR swapchains.
-        /// </summary>
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void displayxr_set_use_srgb_swapchain(int enabled);
-
-        /// <summary>
         /// Check whether the plugin is running in shell/IPC mode.
         /// Detected via DISPLAYXR_WORKSPACE_SESSION=1 (legacy
         /// DISPLAYXR_SHELL_SESSION=1 is also honored) environment variable.
@@ -237,23 +175,6 @@ namespace DisplayXR
             out int buttons, out int mouseX, out int mouseY);
 
         /// <summary>
-        /// (#140 / #396 W6) Capture the runtime's composed multi-view atlas to a
-        /// PNG via xrCaptureAtlasEXT (XR_EXT_atlas_capture). The runtime does the
-        /// readback with the compositor's own atlas image and writes
-        /// "&lt;pathPrefix&gt;_atlas_&lt;viewCount&gt;_&lt;cols&gt;x&lt;rows&gt;.png"
-        /// (runtime owns the suffix; see DisplayXR/displayxr-runtime#425) — no
-        /// app-side AsyncGPUReadback or hidden-camera re-render. Non-blocking
-        /// (latches; PNG lands next composed frame).
-        /// </summary>
-        /// <param name="pathPrefix">Bare output path prefix (no layout tokens); the
-        /// runtime appends "_atlas_&lt;viewCount&gt;_&lt;cols&gt;x&lt;rows&gt;.png".</param>
-        /// <param name="stage">1 = projection-only, 0 = post-compose (includes chrome).</param>
-        /// <returns>1 on XR_SUCCEEDED, 0 if unresolved / no session / failed.</returns>
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern int displayxr_capture_atlas(
-            [MarshalAs(UnmanagedType.LPStr)] string pathPrefix, int stage);
-
-        /// <summary>
         /// Get the Kooima stereo view and projection matrices computed by the native library.
         /// These are the matched matrix pairs that should be applied directly, bypassing
         /// Unity's matrix reconstruction from (fov, position, orientation).
@@ -266,22 +187,6 @@ namespace DisplayXR
             [MarshalAs(UnmanagedType.LPArray, SizeConst = 16)] float[] rightView,
             [MarshalAs(UnmanagedType.LPArray, SizeConst = 16)] float[] rightProj,
             out int valid);
-
-        /// <summary>
-        /// Get readback pixel data from offscreen rendering.
-        /// </summary>
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void displayxr_get_readback(
-            out IntPtr pixels,
-            out uint width,
-            out uint height,
-            out int ready);
-
-        /// <summary>
-        /// Kill xrPollEvent forwarding. Call before session/instance teardown.
-        /// </summary>
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void displayxr_stop_polling();
 
         // ====================================================================
         // Window-space UI overlay (issue #67)

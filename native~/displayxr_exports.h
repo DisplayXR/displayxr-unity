@@ -26,17 +26,6 @@ void displayxr_log(const char *fmt, ...);
 
 // --- P/Invoke exports for C# ---
 
-DISPLAYXR_EXPORT void displayxr_set_tunables(float ipd_factor,
-                                           float parallax_factor,
-                                           float perspective_factor,
-                                           float virtual_display_height,
-                                           float inv_convergence_distance,
-                                           float fov_override,
-                                           float near_z,
-                                           float far_z,
-                                           int camera_centric,
-                                           int clip_at_display_plane);
-
 DISPLAYXR_EXPORT void displayxr_get_display_info(float *display_width_m,
                                                float *display_height_m,
                                                uint32_t *pixel_width,
@@ -55,20 +44,6 @@ DISPLAYXR_EXPORT void displayxr_get_eye_positions(float *lx,
                                                 float *ry,
                                                 float *rz,
                                                 int *is_tracked);
-
-DISPLAYXR_EXPORT void displayxr_set_scene_transform(float pos_x,
-                                                   float pos_y,
-                                                   float pos_z,
-                                                   float ori_x,
-                                                   float ori_y,
-                                                   float ori_z,
-                                                   float ori_w,
-                                                   float scale_x,
-                                                   float scale_y,
-                                                   float scale_z,
-                                                   int enabled);
-
-DISPLAYXR_EXPORT void displayxr_set_window_handle(void *handle);
 
 DISPLAYXR_EXPORT void displayxr_set_editor_mode(int enabled);
 
@@ -129,14 +104,6 @@ DISPLAYXR_EXPORT void displayxr_macos_end_window_drag(void);
 /// Save/restore is symmetric; set(0) restores. Idempotent.
 DISPLAYXR_EXPORT void displayxr_macos_set_window_borderless(int enabled);
 
-/// Hint the typed-swapchain substitution about Unity's project color space.
-/// Must be called BEFORE Unity creates its OpenXR swapchains (i.e. from the
-/// OpenXR feature's OnInstanceCreate).
-///   1 = Linear color space → UNORM_SRGB typed siblings.
-///   0 = Gamma color space  → UNORM typed siblings (no double gamma encoding).
-/// Default is 1 (sRGB) for backward compatibility.
-DISPLAYXR_EXPORT void displayxr_set_use_srgb_swapchain(int enabled);
-
 /// Check whether the plugin is running in shell/IPC mode.
 /// Detected via DISPLAYXR_WORKSPACE_SESSION=1 (legacy DISPLAYXR_SHELL_SESSION=1
 /// is also honored) environment variable.
@@ -158,27 +125,11 @@ DISPLAYXR_EXPORT void displayxr_set_viewport_size(uint32_t width, uint32_t heigh
 DISPLAYXR_EXPORT void displayxr_set_viewport_size_native(uint32_t width, uint32_t height,
                                                          int32_t screen_x, int32_t screen_y);
 
-/// (#140 / #396 W6) Capture the runtime's composed multi-view atlas to a PNG via
-/// xrCaptureAtlasEXT (XR_EXT_atlas_capture). The runtime does the readback with
-/// the compositor's own atlas image and writes
-/// "<path_prefix>_atlas_<viewCount>_<cols>x<rows>.png" (it owns the suffix —
-/// DisplayXR/displayxr-runtime#425) — the app passes a bare prefix and no longer
-/// needs an AsyncGPUReadback or hidden-camera re-render. Non-blocking
-/// (latches; PNG lands next composed frame). @param stage 1 = projection-only,
-/// 0 = post-compose (includes chrome/quad layers). Returns 1 on XR_SUCCEEDED, 0
-/// if the extension is unresolved, there is no live session, or the call failed.
-DISPLAYXR_EXPORT int displayxr_capture_atlas(const char *path_prefix, int stage);
-
 DISPLAYXR_EXPORT void displayxr_get_stereo_matrices(float *left_view,
                                                    float *left_proj,
                                                    float *right_view,
                                                    float *right_proj,
                                                    int *valid);
-
-DISPLAYXR_EXPORT void displayxr_get_readback(uint8_t **pixels,
-                                           uint32_t *width,
-                                           uint32_t *height,
-                                           int *ready);
 
 DISPLAYXR_EXPORT void *displayxr_create_shared_texture(uint32_t width, uint32_t height);
 
@@ -200,24 +151,6 @@ DISPLAYXR_EXPORT void displayxr_set_canvas_rect(
 /// into the same sub-rect the runtime weaves the 3D into. Out params may be NULL.
 DISPLAYXR_EXPORT int displayxr_get_canvas_rect_px(
     int32_t *x, int32_t *y, uint32_t *w, uint32_t *h);
-
-/// XR_EXT_display_zones: define the 3D-zone rect (client-window pixels, top-left
-/// origin) the runtime frames the Kooima 3D into. The locate hook chains an
-/// XrDisplayZoneEXT in front of the view-rig (zone-scoped projection) and the
-/// xrEndFrame hook chains the same zone on each projection layer (binding its
-/// views into the rect). w<=0 || h<=0 clears. Inert unless the runtime advertises
-/// XR_EXT_display_zones and reports caps.supported. Mutually exclusive with the
-/// canvas-rect/surround path (a zones frame makes the output rect inert). Hooked
-/// path (built apps) only.
-DISPLAYXR_EXPORT void displayxr_set_3d_zone_rect(
-    int32_t x, int32_t y, int32_t w, int32_t h);
-
-/// XR_EXT_display_zones: clear the 3D-zone rect (revert to full-window framing).
-DISPLAYXR_EXPORT void displayxr_clear_3d_zone(void);
-
-/// Kill xrPollEvent forwarding immediately. Call from C# before session/instance
-/// teardown to prevent use-after-free when the runtime is unloaded.
-DISPLAYXR_EXPORT void displayxr_stop_polling(void);
 
 #ifdef _WIN32
 /// (issue #57) Toggle transparent overlay mode on the parent (Unity top-

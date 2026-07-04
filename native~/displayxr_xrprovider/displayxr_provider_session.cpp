@@ -2883,9 +2883,9 @@ int dxr_prov_set_eye_tracking_mode(int manual)
 
 // ---- Atlas capture (XR_EXT_atlas_capture, #140) -----------------------------
 
-// Provider-mode analog of displayxr_capture_atlas (hook path): hand the runtime a
-// path prefix + stage; it reads back its own compositor atlas and writes the PNG on
-// the next composed frame. Non-blocking — XR_SUCCESS means accepted, not on-disk.
+// Atlas capture: hand the runtime a path prefix + stage; it reads back its own
+// compositor atlas and writes the PNG on the next composed frame. Non-blocking —
+// XR_SUCCESS means accepted, not on-disk.
 int dxr_prov_capture_atlas(const char *path_prefix, int stage)
 {
 	if (s_ps.pfn_capture_atlas == NULL || s_ps.session == XR_NULL_HANDLE) {

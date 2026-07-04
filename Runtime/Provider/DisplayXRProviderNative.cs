@@ -160,8 +160,8 @@ namespace DisplayXR
             uint zone, out int x, out int y, out int w, out int h);
 
         /// <summary>
-        /// Push the stereo rig tunables (mirrors displayxr_set_tunables, minus the
-        /// clipAtDisplayPlane flag the rig descriptor doesn't carry). Scale-as-zoom
+        /// Push the stereo rig tunables to the provider (minus the clipAtDisplayPlane
+        /// flag the rig descriptor doesn't carry). Scale-as-zoom
         /// must be folded into virtualDisplayHeight / invConvergenceDistance by the
         /// caller (the native side mirrors the standalone and ignores scale).
         /// </summary>
