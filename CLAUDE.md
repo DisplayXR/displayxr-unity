@@ -130,9 +130,16 @@ Extension struct definitions in `native~/displayxr_extensions.h` must match the 
 4. Set `XR_RUNTIME_JSON` environment variable to point to a DisplayXR runtime build (or use `SIM_DISPLAY_ENABLE=1 SIM_DISPLAY_OUTPUT=sbs` for testing without hardware)
 5. **Press Play** — Play Mode runs the provider and *is* the preview (identical to a built player); there is no separate preview window
 
-### OpenXR package dependency (provider does not use Unity's OpenXR loader)
+### No dependency on Unity's OpenXR package (the provider drives OpenXR itself)
 
-`package.json` still depends on `com.unity.xr.openxr` (`DisplayXRLocal2D` references `OpenXRRuntime.IsExtensionEnabled`), but the provider is a custom **`IUnityXRDisplay`** subsystem — it drives the DisplayXR runtime directly and **does not enable Unity's OpenXR loader**. So the old hook-era caveat (pre-1.16.1 OpenXR silently ignoring `XR_RUNTIME_JSON` in editor play mode and falling back to the Mock Runtime → `0x0` resolution) no longer applies: the provider never routes through Unity's OpenXR loader. Enable **DisplayXR** (not OpenXR) in XR Plug-in Management.
+The plugin has **no dependency on `com.unity.xr.openxr`** — it was dropped once the last
+consumer (`DisplayXRLocal2D`'s `OpenXRRuntime.IsExtensionEnabled` gate, always false in
+provider mode) was provider-ized. The provider is a custom **`IUnityXRDisplay`** subsystem
+that drives the DisplayXR runtime directly (its own OpenXR loader/instance in native) and
+**does not enable Unity's OpenXR loader**. So the old hook-era caveat (pre-1.16.1 OpenXR
+silently ignoring `XR_RUNTIME_JSON` in editor play mode and falling back to the Mock Runtime
+→ `0x0` resolution) does not apply. Enable **DisplayXR** (not OpenXR) in XR Plug-in
+Management. The package's only XR dependency is `com.unity.xr.management`.
 
 ### Resolved: window-drag phase-snap (#61)
 

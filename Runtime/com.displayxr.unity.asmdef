@@ -2,7 +2,6 @@
   "name": "com.displayxr.unity",
   "rootNamespace": "DisplayXR",
   "references": [
-    "Unity.XR.OpenXR",
     "Unity.XR.Management",
     "Unity.InputSystem"
   ],
