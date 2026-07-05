@@ -197,6 +197,12 @@ void *dxr_prov_get_extra_zone_bridge_eye(uint32_t ei, uint32_t eye, uint32_t *w,
 /// Copy out extra zone `ei`'s render-ready view for `eye` (after begin_frame).
 void dxr_prov_get_extra_zone_view(uint32_t ei, uint32_t eye, DxrProvView *out_view);
 
+/// Build a column-major GL-clip projection matrix from an XrFovf (DxrProvView.fov
+/// layout) using the provider's current near/far. Lets the display-provider frame
+/// desc hand Unity a full matrix (kUnityXRProjectionTypeMatrix) instead of half
+/// angles — URP-simplify experiment (#22). out16 = 16 floats.
+void dxr_prov_build_projection(const float fov[4], float *out16);
+
 /// Per-zone stereo matrices + screen rect (#166 — multi-zone transparent mask).
 /// The transparent overlay renders its SetWindowRgn silhouette per-zone into each
 /// zone's rect so ALL zones stay visible (else non-primary zones clip to see-through).
