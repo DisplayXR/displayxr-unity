@@ -343,7 +343,7 @@ needs to change *where it reads from*, not the downstream logic:
 
 | Hook-path source (inert under provider) | Provider-mode source | Consumers that needed a branch |
 |---|---|---|
-| `DisplayXRFeature.Instance.GetStereoMatrices(...)` | `displayxr_get_stereo_matrices` (provider-populated via `ps_publish_stereo_matrices`) | `DisplayXRTransparentOverlay` silhouette/hit-test; **`KooimaProjectionFixFeature`** (URP eye_world view+proj — the #127 fix, else the click-through silhouette truncates popped-out geometry, bc001ce) |
+| `DisplayXRFeature.Instance.GetStereoMatrices(...)` | `displayxr_get_stereo_matrices` (provider-populated via `ps_publish_stereo_matrices`) | `DisplayXRTransparentOverlay` silhouette/hit-test (URP eye_world view+proj — else the click-through silhouette truncates popped-out geometry, bc001ce). *(The former URP `KooimaProjectionFixFeature` also read this; it was removed in v2.2.0 once the provider began handing Unity a full projection matrix — see #22.)* |
 | hook `LateUpdate` push of `dxr_set_tunables` / display pose | `DisplayXRProviderDriver` per-frame `dxr_prov_set_tunables` / `dxr_prov_set_display_pose` | display/camera rig tunables |
 | `OpenXRRuntime.IsExtensionEnabled("XR_EXT_local_3d_zone")` gate | `DisplayXRProviderDriver.IsActive` | `DisplayXRLocal2D` bridge branch |
 | `SetEnvironmentBlendMode(AlphaBlend)` on the OpenXR feature | `dxr_prov_set_transparent_background` | `DisplayXRTransparentOverlay` |
