@@ -182,7 +182,7 @@ TGZ="com.displayxr.unity-[VERSION_NUMBER].tgz"
 gh release download [VERSION] --repo DisplayXR/displayxr-unity --pattern "$TGZ" --dir /tmp/usign
 mkdir -p /tmp/usign/x && tar -xzf "/tmp/usign/$TGZ" -C /tmp/usign/x
 DLL=$(find /tmp/usign/x -ipath '*Windows/x64/displayxr_unity.dll')
-powershell -NoProfile -ExecutionPolicy Bypass -File Scripts\\sign-release.ps1 -Path "$(dirname "$DLL")" -SignCmd "$SIGN_CMD"
+powershell -NoProfile -ExecutionPolicy Bypass -File Scripts~\\sign-release.ps1 -Path "$(dirname "$DLL")" -SignCmd "$SIGN_CMD"
 # repack with the same internal layout (npm packages root at 'package/')
 ( cd /tmp/usign/x && tar -czf "/tmp/usign/$TGZ" package )
 gh release upload [VERSION] "/tmp/usign/$TGZ" --clobber --repo DisplayXR/displayxr-unity
@@ -193,7 +193,7 @@ Users who install by git URL get the DLL from the `upm` orphan branch,
 not the `.tgz` — sign that copy as well.
 ```bash
 git fetch origin upm && git checkout upm
-powershell -NoProfile -ExecutionPolicy Bypass -File Scripts\\sign-release.ps1 \
+powershell -NoProfile -ExecutionPolicy Bypass -File Scripts~\\sign-release.ps1 \
   -Path "Runtime/Plugins/Windows/x64" -SignCmd "$SIGN_CMD"
 git commit -am "Sign displayxr_unity.dll for [VERSION]"
 git push origin upm
