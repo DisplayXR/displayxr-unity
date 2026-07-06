@@ -5,6 +5,12 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.1] - 2026-07-05
+
+### Fixed
+- Scene-view eye-position gizmos were frozen at nominal under the provider; the provider now
+  publishes live raw eye positions to shared state so the gizmo tracks head movement (#189).
+
 ## [2.2.0] - 2026-07-05
 
 **URP off-axis simplification + HDRP support, plus the two already-merged cleanups (#185 meta hygiene, #186 preview-close-stops-play).** The provider now hands Unity a **full per-eye projection matrix** instead of half-angle FOVs, so URP and HDRP both consume the off-center Kooima frustum correctly with no per-pipeline fix. The URP `KooimaProjectionFixFeature` is removed. No app-facing API change; the projection change is internal to the native provider. Hardware-verified on RTX 3080 across BiRP, URP (2D-UI + transparent w/ foreground clip + click-through), and HDRP (#22, #166 M3).
