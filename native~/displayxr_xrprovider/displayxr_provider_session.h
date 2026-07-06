@@ -51,6 +51,19 @@ extern "C" {
 // (max-mode count) but the provider submits only the 2 eyes for SPI.
 #define DXR_PROV_MAX_VIEWS 2
 
+/// Graphics backend the provider drives the runtime with, selected at session
+/// create from IUnityGraphics::GetRenderer() (#195). D3D12 is the original
+/// own-device + shared-texture-bridge path; D3D11 is a zero-copy path that binds
+/// the session on Unity's own ID3D11Device (the runtime's native D3D11 compositor
+/// creates + weaves swapchain images on that device — no bridge/copy/fence).
+/// VULKAN is reserved for a follow-up. Kept as an int across the C ABI.
+typedef enum DxrGfxKind {
+	DXR_GFX_NONE = 0,
+	DXR_GFX_D3D12,
+	DXR_GFX_D3D11,
+	DXR_GFX_VULKAN, // reserved (not implemented)
+} DxrGfxKind;
+
 /// One render-ready view consumed from xrLocateViews (XR_EXT_view_rig).
 typedef struct DxrProvView {
 	float position[3];    ///< Eye position, OpenXR LOCAL (display) space.
@@ -83,19 +96,36 @@ typedef struct DxrProvModeInfo {
 
 // ---- Lifecycle --------------------------------------------------------------
 
-/// Start the runtime-facing session on Unity's D3D12 device.
+/// Start the runtime-facing session on Unity's graphics device.
 /// @param runtime_json_path Path to the OpenXR runtime JSON manifest (or NULL to
 ///        resolve from XR_RUNTIME_JSON / the active-runtime registry).
-/// @param unity_d3d12_device Unity's ID3D12Device* (from IUnityGraphicsD3D12v*::GetDevice()).
-/// @param unity_d3d12_queue  Unity's ID3D12CommandQueue* (GetCommandQueue()).
+/// @param backend_kind      DxrGfxKind selected from IUnityGraphics::GetRenderer()
+///        (#195): DXR_GFX_D3D12 = own-device + shared-bridge path (device+queue),
+///        DXR_GFX_D3D11 = zero-copy on Unity's ID3D11Device (queue = NULL).
+/// @param unity_device      Unity's device: ID3D12Device* (D3D12) or ID3D11Device*
+///        (D3D11), from IUnityGraphicsD3D1*::GetDevice().
+/// @param unity_queue       Unity's ID3D12CommandQueue* (D3D12 only; NULL on D3D11 —
+///        D3D11's immediate context has no app-visible queue).
 /// @param overlay_hwnd       Plugin-created WS_CHILD overlay HWND over Unity's
 ///        window (DXGI one-swapchain-per-HWND forces an overlay), or NULL to let
 ///        the runtime self-host a window (sim_display bring-up).
 /// @return 1 on success, 0 on failure.
 int  dxr_prov_session_start(const char *runtime_json_path,
-                            void *unity_d3d12_device,
-                            void *unity_d3d12_queue,
+                            int backend_kind,
+                            void *unity_device,
+                            void *unity_queue,
                             void *overlay_hwnd);
+
+/// The graphics backend selected for the running session (DxrGfxKind as int).
+/// DXR_GFX_D3D11 → zero-copy path (no shared bridge to transition/copy). Read by
+/// the display-provider TU to gate the D3D12-only cross-device barrier + copy.
+DISPLAYXR_EXPORT int  dxr_prov_get_graphics_api(void);
+
+/// (D3D11 zero-copy) The runtime swapchain image `index`'s native ID3D11Texture2D*
+/// (a 2-slice SPI array), which lives on Unity's device — wrapped DIRECTLY via
+/// CreateTexture (no bridge). *out_array = 2. NULL for D3D12 or a bad index.
+void *dxr_prov_get_swapchain_image_texture(uint32_t index, uint32_t *out_w,
+                                           uint32_t *out_h, uint32_t *out_array);
 
 /// Stop the session and release all OpenXR resources. Safe if not running.
 void dxr_prov_session_stop(void);

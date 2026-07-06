@@ -94,11 +94,14 @@ namespace DisplayXR
 
         /// <summary>
         /// Whether to drive the provider in Single-Pass-Instanced mode. SPI is correct
-        /// only on URP + Windows + D3D12; elsewhere (notably BiRP, where Unity builds
-        /// each eye's off-center projection MultiPass-only) it renders opaque geometry
-        /// wrong, so we fall back to MultiPass. Mirrors the platform half of the hook
-        /// path's <c>DisplayXRFeature.IsUrpWindowsD3D12</c>; the runtime-version half is
-        /// already implied (the provider hard-requires a recent runtime). Dev overrides:
+        /// only on URP/HDRP + Windows; on BiRP (where Unity builds each eye's off-center
+        /// projection MultiPass-only) it renders opaque geometry wrong, so we fall back to
+        /// MultiPass. Both D3D12 and D3D11 use SPI here — D3D11 is a ZERO-COPY path
+        /// (#195) that binds the session on Unity's device and can ONLY render into the
+        /// runtime's arraySize=2 swapchain image via SPI (MultiPass D3D11 would need the
+        /// D3D12-only bridge copy). Mirrors the platform half of the hook path's
+        /// <c>DisplayXRFeature.IsUrpWindowsD3D12</c>; the runtime-version half is already
+        /// implied (the provider hard-requires a recent runtime). Dev overrides:
         /// <c>DISPLAYXR_FORCE_SPI=1</c> / <c>DISPLAYXR_FORCE_MULTIPASS=1</c>.
         /// </summary>
         static bool IsSinglePassEligible()
@@ -112,10 +115,21 @@ namespace DisplayXR
             bool isWindows = plat == RuntimePlatform.WindowsPlayer
                           || plat == RuntimePlatform.WindowsEditor;
             if (!isWindows) return false;
-            if (SystemInfo.graphicsDeviceType != GraphicsDeviceType.Direct3D12) return false;
+
             var rp = GraphicsSettings.currentRenderPipeline;
             var typeName = rp != null ? rp.GetType().FullName : null;
-            return typeName != null && typeName.Contains("Universal");
+            bool isUrp  = typeName != null && typeName.Contains("Universal");
+            bool isHdrp = typeName != null && typeName.Contains("HighDefinition");
+
+            var gdt = SystemInfo.graphicsDeviceType;
+            // D3D12 (own-device + bridge): unchanged — SPI only on URP; HDRP/BiRP MultiPass.
+            if (gdt == GraphicsDeviceType.Direct3D12) return isUrp;
+            // D3D11 (#195): ZERO-COPY binds the session on Unity's device and can only render
+            // into the runtime's arraySize=2 swapchain image via SPI (MultiPass D3D11 would
+            // need the D3D12-only bridge copy). SPI is correct on URP + HDRP; BiRP+D3D11 stays
+            // ineligible → the native provider WARNs + no-starts (use D3D12 for BiRP).
+            if (gdt == GraphicsDeviceType.Direct3D11) return isUrp || isHdrp;
+            return false;
         }
     }
 }

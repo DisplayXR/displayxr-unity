@@ -18,14 +18,20 @@
 
 #include <windows.h>
 #include <d3d12.h>
+#include <d3d11.h> // D3D11 zero-copy backend (#195)
 #include <dxgi1_4.h>
 
 #include "../unity_pluginapi/IUnityInterface.h"
 #include "../unity_pluginapi/IUnityGraphics.h"
 #include "../unity_pluginapi/IUnityGraphicsD3D12.h"
+#include "../unity_pluginapi/IUnityGraphicsD3D11.h" // #195
 #include "../unity_pluginapi/IUnityXRDisplay.h"
 
 #include "displayxr_provider_session.h"
+
+// Renderer id (IUnityGraphics::GetRenderer()) — defined in displayxr_unity_plugin.cpp.
+// -1 if IUnityGraphics isn't available. Used to select the graphics backend (#195).
+extern "C" int displayxr_unity_get_renderer(void);
 
 #include <math.h>
 #include <stdio.h>
@@ -204,6 +210,23 @@ bool get_unity_d3d12(ID3D12Device **out_device, ID3D12CommandQueue **out_queue)
 	return true;
 }
 
+// Acquire Unity's ID3D11Device for the zero-copy D3D11 backend (#195). There is no
+// versioned interface set and no command queue for D3D11 (immediate-context model) —
+// a single IUnityGraphicsD3D11::GetDevice() is all the runtime needs.
+bool get_unity_d3d11(ID3D11Device **out_device)
+{
+	*out_device = nullptr;
+	if (!s_ifaces) return false;
+	IUnityGraphicsD3D11 *d11 = s_ifaces->Get<IUnityGraphicsD3D11>();
+	ID3D11Device *dev = d11 ? d11->GetDevice() : nullptr;
+	if (!dev) {
+		prov_log("[DisplayXR-PROV] No IUnityGraphicsD3D11 device\n");
+		return false;
+	}
+	*out_device = dev;
+	return true;
+}
+
 // ============================================================================
 // CreateTexture: wrap each runtime swapchain image as a Unity render texture.
 // ============================================================================
@@ -259,6 +282,43 @@ void create_textures_if_ready()
 	if (!s_display || !s_handle) return;
 	// Extra zones can come up alongside / after the primary; keep trying until wrapped.
 	if (s_textures_created) { create_extra_zone_textures(); return; }
+
+	// D3D11 zero-copy (#195): wrap the runtime's swapchain images DIRECTLY (no bridge).
+	// Each image is a 2-slice SPI array on Unity's device; wrap ALL of them and
+	// PopulateNextFrameDesc selects s_tex_ids[acquired image index] each frame (the
+	// runtime rotates images, unlike the D3D12 path's single fixed bridge). D3D11 is
+	// always SPI (gated in session_start), so there is no MultiPass D3D11 branch.
+	if (dxr_prov_get_graphics_api() == DXR_GFX_D3D11) {
+		uint32_t sw = 0, sh = 0, sarr = 0, simgs = 0;
+		dxr_prov_get_swapchain_info(&sw, &sh, &sarr, &simgs);
+		if (simgs == 0 || sw == 0) return; // swapchain not created yet (await session-ready)
+		if (simgs > 8) simgs = 8;
+		for (uint32_t i = 0; i < simgs; i++) {
+			uint32_t w = 0, h = 0, arr = 0;
+			void *tex = dxr_prov_get_swapchain_image_texture(i, &w, &h, &arr);
+			if (!tex || w == 0) return; // image not ready
+			UnityXRRenderTextureDesc desc;
+			memset(&desc, 0, sizeof(desc));
+			desc.colorFormat = kUnityXRRenderTextureFormatRGBA32;
+			desc.color.nativePtr = tex;
+			desc.depthFormat = kUnityXRDepthTextureFormat24bitOrGreater;
+			desc.depth.nativePtr = (void *)(uintptr_t)kUnityXRRenderTextureIdDontCare;
+			desc.width = w;
+			desc.height = h;
+			desc.textureArrayLength = arr; // 2 -> SPI texture array
+			desc.flags = kUnityXRRenderTextureFlagsUVDirectionTopToBottom;
+			UnityXRRenderTextureId id = 0;
+			if (s_display->CreateTexture(s_handle, &desc, &id) != kUnitySubsystemErrorCodeSuccess) {
+				prov_log("[DisplayXR-PROV] CreateTexture (D3D11 zero-copy swapchain image) failed\n");
+				return;
+			}
+			s_tex_ids[i] = id;
+		}
+		s_tex_count = simgs;
+		s_textures_created = true;
+		prov_log("[DisplayXR-PROV] CreateTexture: wrapped D3D11 swapchain images directly (zero-copy SPI)\n");
+		return;
+	}
 
 	if (dxr_prov_get_single_pass()) {
 		// SPI: ONE Unity texture wrapping the shared 2-slice-array BRIDGE. Unity
@@ -398,9 +458,29 @@ GfxStart(UnitySubsystemHandle handle, void *userData, UnityXRRenderingCapabiliti
 	             ? "[DisplayXR-PROV] GfxStart: render mode = Single-Pass-Instanced\n"
 	             : "[DisplayXR-PROV] GfxStart: render mode = MultiPass (2 pass x 1)\n");
 
-	ID3D12Device *dev = nullptr;
-	ID3D12CommandQueue *q = nullptr;
-	if (!get_unity_d3d12(&dev, &q)) return kUnitySubsystemErrorCodeFailure;
+	// Select the graphics backend from Unity's renderer (#195): D3D12 (own-device +
+	// shared bridge) or D3D11 (zero-copy on Unity's device). Anything else → one clear
+	// WARN + graceful no-start (instead of the confusing "ID3D12Device is not created yet").
+	int renderer = displayxr_unity_get_renderer();
+	int backend_kind = DXR_GFX_NONE;
+	void *dev_ptr = nullptr;
+	void *queue_ptr = nullptr;
+	if (renderer == kUnityGfxRendererD3D12) {
+		ID3D12Device *dev = nullptr; ID3D12CommandQueue *q = nullptr;
+		if (!get_unity_d3d12(&dev, &q)) return kUnitySubsystemErrorCodeFailure;
+		backend_kind = DXR_GFX_D3D12; dev_ptr = dev; queue_ptr = q;
+	} else if (renderer == kUnityGfxRendererD3D11) {
+		ID3D11Device *dev = nullptr;
+		if (!get_unity_d3d11(&dev)) return kUnitySubsystemErrorCodeFailure;
+		backend_kind = DXR_GFX_D3D11; dev_ptr = dev; queue_ptr = nullptr;
+	} else {
+		char msg[192];
+		snprintf(msg, sizeof(msg),
+		         "[DisplayXR-PROV] WARN: unsupported graphics API (renderer=%d). The DisplayXR "
+		         "provider requires Direct3D11 or Direct3D12 — session not started (#195).\n", renderer);
+		prov_log(msg);
+		return kUnitySubsystemErrorCodeFailure;
+	}
 
 	// Weave target. Three modes (window created on the MAIN thread in LifecycleStart,
 	// which sets s_overlay_hwnd for the bound-HWND modes):
@@ -421,7 +501,7 @@ GfxStart(UnitySubsystemHandle handle, void *userData, UnityXRRenderingCapabiliti
 	             : "[DisplayXR-PROV] weave target: runtime self-hosted window (SELFHOST diagnostic)\n");
 
 	// runtime_json = NULL -> resolve from XR_RUNTIME_JSON (sim_display bring-up).
-	if (!dxr_prov_session_start(nullptr, dev, q, overlay_hwnd)) {
+	if (!dxr_prov_session_start(nullptr, backend_kind, dev_ptr, queue_ptr, overlay_hwnd)) {
 		prov_log("[DisplayXR-PROV] dxr_prov_session_start failed\n");
 		return kUnitySubsystemErrorCodeFailure;
 	}
@@ -472,9 +552,14 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 
 	if (dxr_prov_get_single_pass()) {
 		// Single-Pass-Instanced: 1 render pass, 2 render params over the 2-slice
-		// bridge array (slice 0 = left, slice 1 = right). Correct on URP+D3D12.
+		// array (slice 0 = left, slice 1 = right). Correct on URP/HDRP.
+		// D3D12: the single fixed bridge is s_tex_ids[0]. D3D11 zero-copy: Unity renders
+		// directly into the acquired runtime swapchain image, so pick the texture wrapping
+		// THIS frame's acquired image (s_current_image_index).
 		UnityXRNextFrameDesc::UnityXRRenderPass &pass = next->renderPasses[0];
-		pass.textureId = s_tex_ids[0];
+		pass.textureId = (dxr_prov_get_graphics_api() == DXR_GFX_D3D11)
+		                     ? s_tex_ids[s_current_image_index]
+		                     : s_tex_ids[0];
 		pass.cullingPassIndex = 0;
 		pass.renderParamsCount = 2;
 
@@ -593,6 +678,14 @@ GfxSubmitCurrentFrame(UnitySubsystemHandle handle, void *userData)
 	(void)handle; (void)userData;
 	if (!s_session_active || !s_frame_in_flight) return kUnitySubsystemErrorCodeSuccess;
 	s_frame_in_flight = false;
+
+	// D3D11 zero-copy (#195): Unity rendered straight into the runtime swapchain image
+	// on its own device — no shared bridge, no cross-device barrier. The runtime syncs
+	// internally on xrReleaseSwapchainImage. Skip the D3D12-only transition entirely.
+	if (dxr_prov_get_graphics_api() == DXR_GFX_D3D11) {
+		dxr_prov_submit_frame(s_current_image_index);
+		return kUnitySubsystemErrorCodeSuccess;
+	}
 
 	// Cross-device handoff: Unity just rendered both eyes into the shared bridge
 	// (leaving it in RENDER_TARGET on Unity's device). Ask Unity to transition it
