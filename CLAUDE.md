@@ -268,15 +268,16 @@ For detailed architecture and design decisions, see `docs~/`:
 
 ### Test repos
 
-Three sibling Unity projects exercise the plugin against different feature areas. Treat them as a regression net — when a plugin change risks affecting any of these, fetch and verify before tagging a release.
+Four sibling Unity projects exercise the plugin against different feature areas and render pipelines. Treat them as a regression net — when a plugin change risks affecting any of these, fetch and verify before tagging a release.
 
 | Repo | Focus | Notes |
 |------|-------|-------|
-| [`DisplayXR/displayxr-unity-test`](https://github.com/DisplayXR/displayxr-unity-test) | Baseline rendering / stereo correctness | Plain cube + camera-centric and display-centric rigs |
+| [`DisplayXR/displayxr-unity-test`](https://github.com/DisplayXR/displayxr-unity-test) | Baseline rendering / stereo correctness (**BiRP**) | Plain cube + camera-centric and display-centric rigs |
 | [`DisplayXR/displayxr-unity-test-transparent`](https://github.com/DisplayXR/displayxr-unity-test-transparent) | Transparent overlay + click-through (#57 family, alpha-native), now **URP + `XR_EXT_display_zones` / Local2D bubble** in a floating window | Tiger FBX clickable, foreground-only render. `main` = URP/zones (v2.0.0+); the Built-in (BiRP) baseline lives on the `legacy-birp` branch |
-| [`DisplayXR/displayxr-unity-test-2d-ui`](https://github.com/DisplayXR/displayxr-unity-test-2d-ui) | 2D UI window-space composition layer | Tuning panel built from `DisplayXRWindowSpaceUI` |
+| [`DisplayXR/displayxr-unity-test-2d-ui`](https://github.com/DisplayXR/displayxr-unity-test-2d-ui) | 2D UI window-space composition layer (**URP**) | Tuning panel built from `DisplayXRWindowSpaceUI` |
+| [`DisplayXR/displayxr-unity-test-hdrp`](https://github.com/DisplayXR/displayxr-unity-test-hdrp) | Off-axis correctness on **HDRP** (#22, #166 M3) | Textured crate; HDRP consumes the provider's projection matrix natively (no fix feature) |
 
-All three pin the plugin via `https://github.com/DisplayXR/displayxr-unity.git#upm` (floating; tracks latest release).
+All four pin the plugin via `https://github.com/DisplayXR/displayxr-unity.git#upm` (floating; tracks latest release).
 
 Each test repo also has its own `CLAUDE.md` describing its scene, scripts, and which plugin features it exercises — designed so an agent can work in the test repo without loading the plugin's context.
 
