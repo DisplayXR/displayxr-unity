@@ -65,6 +65,22 @@ typedef struct DisplayXREyePositions {
     uint8_t is_tracked;   // Whether eye tracking is active
 } DisplayXREyePositions;
 
+// --- Kooima canvas (#189) — the window as the runtime frames Kooima into it ---
+// The XR_EXT_view_rig raw channel (XrViewDisplayRawEXT) reports the effective
+// canvas the runtime uses for the window-relative off-axis projection each
+// frame: its rect ON THE PANEL (panel pixels, top-left origin) and its physical
+// size (meters). The provider publishes it so the editor Scene-view gizmo can
+// draw the window-relative eyes + the convergence-plane aspect Kooima actually
+// consumes (instead of the physical-panel dims). Set from render thread, read
+// from game thread.
+typedef struct DisplayXRKooimaCanvas {
+    int32_t rect_x, rect_y;   // Canvas offset on the panel (panel pixels)
+    int32_t rect_w, rect_h;   // Canvas size (pixels)
+    float   size_meters_w;    // Physical canvas width  (meters)
+    float   size_meters_h;    // Physical canvas height (meters)
+    uint8_t is_valid;         // Set once the runtime reports a canvas
+} DisplayXRKooimaCanvas;
+
 // --- Stereo matrices (set from render thread, read from game thread) ---
 // The Kooima library produces matched view+projection matrix pairs.
 // These are stored here so C# can apply them directly, bypassing Unity's
@@ -128,6 +144,10 @@ typedef struct DisplayXRState {
     // Eye positions (updated each frame from render thread)
     DisplayXREyePositions eye_positions[2];
     volatile int eyes_read_idx;
+
+    // Kooima canvas (window on the panel) — updated each frame from render thread (#189)
+    DisplayXRKooimaCanvas kooima_canvas[2];
+    volatile int kooima_canvas_read_idx;
 
     // Stereo matrices from Kooima (updated each frame from render thread)
     DisplayXRStereoMatrices stereo_matrices[2];
@@ -200,6 +220,12 @@ void displayxr_state_set_eye_positions(const XrVector3f *left, const XrVector3f 
 
 // Read eye positions from game thread.
 DisplayXREyePositions displayxr_state_get_eye_positions(void);
+
+// Update the Kooima canvas from render thread (#189).
+void displayxr_state_set_kooima_canvas(const DisplayXRKooimaCanvas *c);
+
+// Read the Kooima canvas from game thread (#189).
+DisplayXRKooimaCanvas displayxr_state_get_kooima_canvas(void);
 
 // Set scene transform from game thread (double-buffer swap).
 void displayxr_state_set_scene_transform(const DisplayXRSceneTransform *t);

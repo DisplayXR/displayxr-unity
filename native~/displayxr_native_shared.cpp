@@ -234,6 +234,20 @@ displayxr_get_eye_positions(float *lx, float *ly, float *lz,
 	*is_tracked = eyes.is_tracked;
 }
 
+DISPLAYXR_EXPORT int
+displayxr_get_kooima_canvas(int *rect_x, int *rect_y, int *rect_w, int *rect_h,
+                            float *size_w_m, float *size_h_m)
+{
+	DisplayXRKooimaCanvas c = displayxr_state_get_kooima_canvas();
+	if (rect_x)   *rect_x   = c.rect_x;
+	if (rect_y)   *rect_y   = c.rect_y;
+	if (rect_w)   *rect_w   = c.rect_w;
+	if (rect_h)   *rect_h   = c.rect_h;
+	if (size_w_m) *size_w_m = c.size_meters_w;
+	if (size_h_m) *size_h_m = c.size_meters_h;
+	return c.is_valid;
+}
+
 DISPLAYXR_EXPORT void
 displayxr_get_render_target_size(uint32_t *out_w, uint32_t *out_h)
 {

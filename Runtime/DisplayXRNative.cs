@@ -85,6 +85,20 @@ namespace DisplayXR
             out int x, out int y, out uint width, out uint height);
 
         /// <summary>
+        /// (#189) Read the Kooima canvas the runtime frames the window-relative
+        /// off-axis projection into: its rect ON THE PANEL (panel pixels,
+        /// top-left origin) and its physical size (meters). Returns 1 and fills
+        /// the out params when valid; returns 0 otherwise. Published each frame
+        /// by the provider from the XR_EXT_view_rig raw channel; used by the
+        /// editor Scene-view eye gizmo to draw window-relative eyes + the
+        /// convergence-plane aspect Kooima consumes.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int displayxr_get_kooima_canvas(
+            out int rectX, out int rectY, out int rectW, out int rectH,
+            out float sizeWMeters, out float sizeHMeters);
+
+        /// <summary>
         /// (#131) Get the runtime's weave-target size = the bound HWND client
         /// area, in physical pixels. On Leia SR this differs from the display
         /// panel dims. The 2D surround texture + canvas sub-rect must use THESE
