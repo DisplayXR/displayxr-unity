@@ -2326,6 +2326,23 @@ int dxr_prov_begin_frame(uint32_t *out_image_index, int *out_should_render)
 			// Ensure 2 views for stereo (duplicate if runtime returned 1).
 			if (n == 1) { s_ps.views[1] = s_ps.views[0]; n = 2; }
 			s_ps.view_count = n;
+
+			// Publish the RAW (pre-Kooima) display-space eyes to shared state so
+			// the editor Scene-view gizmo (DisplayXRGizmoHelpers.TryGetLiveRawEyes)
+			// tracks the head (#189). The gizmo re-applies Kooima itself, so it
+			// wants the raw eyes from the XR_EXT_view_rig raw channel (chained on
+			// vstate.next above), NOT the render-ready views[i].pose — matching the
+			// legacy SA contract (displayxr_standalone.cpp:1603-1618). Only valid
+			// when the rig is chained; otherwise `raw` is a zero-init struct and
+			// is_tracked stays 0 → the gizmo falls back to nominal (correct).
+			if (s_ps.has_view_rig) {
+				uint32_t raw_n = raw.eyeCountOutput;
+				if (raw_n == 0) raw_n = n; // tolerate a runtime that skipped the raw fill
+				if (raw_n > XR_VIEW_RIG_MAX_RAW_EYES_EXT) raw_n = XR_VIEW_RIG_MAX_RAW_EYES_EXT;
+				XrVector3f left  = raw.rawEyes[0];
+				XrVector3f right = raw.rawEyes[raw_n >= 2 ? 1 : 0];
+				displayxr_state_set_eye_positions(&left, &right, raw.isTracking ? 1 : 0);
+			}
 		}
 	}
 
