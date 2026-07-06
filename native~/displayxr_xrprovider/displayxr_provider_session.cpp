@@ -1857,6 +1857,26 @@ int dxr_prov_session_start(const char *runtime_json_path,
 		s_ps.display_info.scale_x = di.recommendedViewScaleX;
 		s_ps.display_info.scale_y = di.recommendedViewScaleY;
 		s_ps.display_info.is_valid = 1;
+
+		// Publish to shared state so the editor gizmos + 2D-surround sizing
+		// (displayxr_get_display_info) get valid display info under the provider.
+		// The provider previously kept only a local copy (s_ps.display_info),
+		// leaving the shared DisplayXRDisplayInfo.is_valid = 0 — which disabled
+		// the gizmo's window-relative Kooima math (#189: needs panel px + physical
+		// dims to rebase eyes / size the convergence plane). Written once at
+		// session start; display info is static.
+		DisplayXRDisplayInfo *sdi = &displayxr_get_state()->display_info;
+		sdi->display_width_meters = di.displaySizeMeters.width;
+		sdi->display_height_meters = di.displaySizeMeters.height;
+		sdi->display_pixel_width = di.displayPixelWidth;
+		sdi->display_pixel_height = di.displayPixelHeight;
+		sdi->nominal_viewer_x = di.nominalViewerPositionInDisplaySpace.x;
+		sdi->nominal_viewer_y = di.nominalViewerPositionInDisplaySpace.y;
+		sdi->nominal_viewer_z = di.nominalViewerPositionInDisplaySpace.z;
+		sdi->recommended_view_scale_x = di.recommendedViewScaleX;
+		sdi->recommended_view_scale_y = di.recommendedViewScaleY;
+		sdi->is_valid = 1;
+
 		ps_log("[DisplayXR-PROV] Display: %ux%u %.3fx%.3fm\n",
 		       di.displayPixelWidth, di.displayPixelHeight,
 		       di.displaySizeMeters.width, di.displaySizeMeters.height);
@@ -2342,6 +2362,23 @@ int dxr_prov_begin_frame(uint32_t *out_image_index, int *out_should_render)
 				XrVector3f left  = raw.rawEyes[0];
 				XrVector3f right = raw.rawEyes[raw_n >= 2 ? 1 : 0];
 				displayxr_state_set_eye_positions(&left, &right, raw.isTracking ? 1 : 0);
+
+				// Publish the Kooima canvas (window on the panel: panel-pixel rect
+				// + physical size in meters) so the editor Scene-view gizmo draws
+				// the window-relative eyes + the convergence-plane aspect the
+				// runtime's off-axis projection actually uses (#189). The raw
+				// channel fills these each frame — the rect offset tracks a window
+				// move, the extent + sizeMeters track a resize.
+				DisplayXRKooimaCanvas kc;
+				kc.rect_x = raw.canvasRectPx.offset.x;
+				kc.rect_y = raw.canvasRectPx.offset.y;
+				kc.rect_w = raw.canvasRectPx.extent.width;
+				kc.rect_h = raw.canvasRectPx.extent.height;
+				kc.size_meters_w = raw.canvasSizeMeters.width;
+				kc.size_meters_h = raw.canvasSizeMeters.height;
+				kc.is_valid = (kc.rect_w > 0 && kc.rect_h > 0 &&
+				               kc.size_meters_w > 0.0f && kc.size_meters_h > 0.0f) ? 1 : 0;
+				displayxr_state_set_kooima_canvas(&kc);
 			}
 		}
 	}

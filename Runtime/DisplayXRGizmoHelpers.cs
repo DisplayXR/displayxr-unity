@@ -66,12 +66,48 @@ namespace DisplayXR
         }
 
         /// <summary>
+        /// Live Kooima canvas (window on the panel) from the runtime's
+        /// XR_EXT_view_rig raw channel, published each frame by the provider
+        /// (#189). rect is in panel pixels (top-left origin) — used for the
+        /// window-relative eye rebase; size (meters) is the physical canvas —
+        /// used for the convergence-plane aspect. Invalid in Edit Mode / on
+        /// runtimes that don't fill the raw canvas fields.
+        /// </summary>
+        public struct KooimaCanvas
+        {
+            public int rectX, rectY, rectW, rectH; // panel pixels, top-left origin
+            public float widthMeters, heightMeters; // physical canvas size
+            public bool isValid;
+        }
+
+        public static KooimaCanvas TryGetKooimaCanvas()
+        {
+            var c = new KooimaCanvas();
+            try
+            {
+                int valid = DisplayXRNative.displayxr_get_kooima_canvas(
+                    out c.rectX, out c.rectY, out c.rectW, out c.rectH,
+                    out c.widthMeters, out c.heightMeters);
+                c.isValid = valid != 0 && c.rectW > 0 && c.rectH > 0
+                            && c.widthMeters > 0f && c.heightMeters > 0f;
+            }
+            catch (System.DllNotFoundException) { c.isValid = false; }
+            catch (System.EntryPointNotFoundException) { c.isValid = false; }
+            return c;
+        }
+
+        /// <summary>
         /// Mirrors the window-relative Kooima shift the runtime applies in
-        /// xrLocateViews (native: hooks.cpp:300-325, standalone.cpp:1545-1559).
-        /// Returns the virtual-display dims (meters) for sizing the gizmo
-        /// rect, and the eye-offset (meters) to subtract from raw eye
-        /// positions. When the canvas isn't valid or display info is missing,
-        /// returns physical-display dims and zero offset (pass-through).
+        /// xrLocateViews. Returns the virtual-display dims (meters) for sizing
+        /// the gizmo rect, and the eye-offset (meters) to subtract from raw eye
+        /// positions.
+        ///
+        /// Preferred source: the runtime's live Kooima canvas (#189) — its
+        /// physical size gives the convergence-plane dims directly and its
+        /// panel-pixel rect gives the exact window-relative recentering, so the
+        /// gizmo tracks window move/resize. Falls back to the app-set canvas
+        /// sub-rect (zone/2D-surround apps), then to pass-through (physical
+        /// panel dims, no shift) when neither is available.
         /// </summary>
         public static void ComputeWindowRelativeShift(
             DisplayXRDisplayInfo info, CanvasRect canvas,
@@ -83,6 +119,33 @@ namespace DisplayXR
             windowHeightMeters = info.isValid ? info.displayHeightMeters : 0f;
             eyeOffsetXMeters = 0f;
             eyeOffsetYMeters = 0f;
+
+            // Preferred: the runtime's live Kooima canvas. Its physical size is
+            // the convergence-plane dims; its panel-pixel rect recenters the
+            // eyes from panel-center to window-center. Needs display-info pixel
+            // + physical dims to convert panel pixels → meters.
+            var kc = TryGetKooimaCanvas();
+            if (kc.isValid && info.isValid
+                && info.displayPixelWidth > 0 && info.displayPixelHeight > 0
+                && info.displayWidthMeters > 0f && info.displayHeightMeters > 0f)
+            {
+                windowWidthMeters = kc.widthMeters;
+                windowHeightMeters = kc.heightMeters;
+
+                float kcPxX = info.displayWidthMeters / info.displayPixelWidth;
+                float kcPxY = info.displayHeightMeters / info.displayPixelHeight;
+                float kcWinCX = kc.rectX + kc.rectW * 0.5f;
+                float kcWinCY = kc.rectY + kc.rectH * 0.5f;
+                float kcDispCX = info.displayPixelWidth * 0.5f;
+                float kcDispCY = info.displayPixelHeight * 0.5f;
+                eyeOffsetXMeters = (kcWinCX - kcDispCX) * kcPxX;
+                eyeOffsetYMeters = (kcWinCY - kcDispCY) * kcPxY;
+#if UNITY_EDITOR_WIN
+                // Panel pixels are top-down; OpenXR eye coords are Y-up.
+                eyeOffsetYMeters = -eyeOffsetYMeters;
+#endif
+                return;
+            }
 
             if (!canvas.isValid || !info.isValid) return;
             if (info.displayPixelWidth == 0 || info.displayPixelHeight == 0) return;

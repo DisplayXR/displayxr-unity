@@ -45,6 +45,18 @@ DISPLAYXR_EXPORT void displayxr_get_eye_positions(float *lx,
                                                 float *rz,
                                                 int *is_tracked);
 
+/// (#189) Read the Kooima canvas the runtime frames the window-relative
+/// off-axis projection into: its rect ON THE PANEL (panel pixels, top-left
+/// origin) and its physical size (meters). Returns 1 and fills the out params
+/// when valid; returns 0 otherwise. Used by the editor Scene-view eye gizmo to
+/// draw window-relative eyes + the convergence-plane aspect Kooima consumes.
+DISPLAYXR_EXPORT int displayxr_get_kooima_canvas(int *rect_x,
+                                                 int *rect_y,
+                                                 int *rect_w,
+                                                 int *rect_h,
+                                                 float *size_w_m,
+                                                 float *size_h_m);
+
 DISPLAYXR_EXPORT void displayxr_set_editor_mode(int enabled);
 
 /// (issue runtime-pvt #191 / displayxr-unity #57) Request the runtime's

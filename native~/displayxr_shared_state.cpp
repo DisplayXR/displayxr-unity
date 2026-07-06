@@ -8,6 +8,7 @@
 static DisplayXRState s_state = {};
 static std::atomic<int> s_tunables_write_idx{1};
 static std::atomic<int> s_eyes_write_idx{1};
+static std::atomic<int> s_kooima_canvas_write_idx{1};
 static std::atomic<int> s_scene_transform_write_idx{1};
 static std::atomic<int> s_stereo_matrices_write_idx{1};
 
@@ -50,6 +51,9 @@ displayxr_state_init(void)
 
 	s_state.eyes_read_idx = 0;
 	s_eyes_write_idx.store(1, std::memory_order_relaxed);
+
+	s_state.kooima_canvas_read_idx = 0;
+	s_kooima_canvas_write_idx.store(1, std::memory_order_relaxed);
 
 	// Default scene transform: identity, no zoom, disabled
 	for (int i = 0; i < 2; i++) {
@@ -117,6 +121,25 @@ displayxr_state_get_eye_positions(void)
 {
 	int idx = s_state.eyes_read_idx;
 	return s_state.eye_positions[idx];
+}
+
+void
+displayxr_state_set_kooima_canvas(const DisplayXRKooimaCanvas *c)
+{
+	int write_idx = s_kooima_canvas_write_idx.load(std::memory_order_relaxed);
+	s_state.kooima_canvas[write_idx] = *c;
+
+	int old_read = write_idx;
+	int new_write = 1 - write_idx;
+	s_state.kooima_canvas_read_idx = old_read;
+	s_kooima_canvas_write_idx.store(new_write, std::memory_order_release);
+}
+
+DisplayXRKooimaCanvas
+displayxr_state_get_kooima_canvas(void)
+{
+	int idx = s_state.kooima_canvas_read_idx;
+	return s_state.kooima_canvas[idx];
 }
 
 void
