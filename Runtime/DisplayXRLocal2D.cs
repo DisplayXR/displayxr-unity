@@ -101,8 +101,7 @@ namespace DisplayXR
         private Texture2D m_BridgeTex;
 
         // The opt-in URP foreground clip (DisplayXR/ForegroundClipURP) is a built-in
-        // FullScreenPassRendererFeature with NO XR-camera guard (unlike
-        // KooimaProjectionFixFeature, which returns early on !cameraData.xr.enabled).
+        // FullScreenPassRendererFeature with NO XR-camera guard.
         // With a single default renderer it therefore also runs on THIS overlay
         // camera — clipping the bubble against the main rig's per-eye foreground far
         // (a different camera space), so the bubble vanishes when the 3D content

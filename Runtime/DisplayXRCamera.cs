@@ -66,8 +66,8 @@ namespace DisplayXR
         // ForegroundClipURP shader). Null under URP/HDRP.
         private DisplayXRForegroundClipBiRP m_ClipBiRP;
         // URP foreground-clip globals consumed by DisplayXR/ForegroundClipURP (the opt-in
-        // FullScreenPassRendererFeature). The off-axis projection itself is owned by
-        // KooimaProjectionFixFeature on URP, not by this rig.
+        // FullScreenPassRendererFeature). The off-axis projection itself comes from the
+        // provider's full per-eye projection matrix (type=Matrix), not from this rig.
         private static readonly int s_ForegroundFarId = Shader.PropertyToID("_DXRForegroundFar");
         private static readonly int s_EyePosLId = Shader.PropertyToID("_DXREyePosL");
         private static readonly int s_EyePosRId = Shader.PropertyToID("_DXREyePosR");

@@ -2410,6 +2410,21 @@ static void ps_projection_from_fov(const float fov[4], float nz, float fz, float
 	out[14] = -2.0f * fz * nz / (fz - nz);
 }
 
+// Build a column-major GL-clip projection matrix from an XrFovf using the provider's
+// current near/far. Lets the frame-desc builder hand Unity a FULL projection matrix
+// (kUnityXRProjectionTypeMatrix) instead of half-angle tangents — an experiment to
+// see whether URP then consumes the off-center projection correctly on its own
+// (bypassing URP's buggy fov->matrix rebuild), which would let us retire the URP
+// KooimaProjectionFixFeature. BiRP + HDRP already render the half-angles correctly;
+// this must not regress them. near/far come from the rig (same source as the
+// stereo-readback matrices) so the matrix matches Unity's camera frustum.
+void dxr_prov_build_projection(const float fov[4], float *out16)
+{
+	float nz = s_ps.near_z > 0.0f ? s_ps.near_z : 0.01f;
+	float fz = s_ps.far_z > nz ? s_ps.far_z : 1000.0f;
+	ps_projection_from_fov(fov, nz, fz, out16);
+}
+
 // Publish the per-eye view+proj to the hook's shared stereo-matrices state so the
 // transparent overlay's cyclopean hit-test (DisplayXRTransparentOverlay, via
 // displayxr_get_stereo_matrices) works in provider mode — DisplayXRFeature.

@@ -1,22 +1,19 @@
 // Copyright 2024-2026, DisplayXR contributors
 // SPDX-License-Identifier: Apache-2.0
 //
-// Editor wiring for the two URP renderer features (#127/#129):
+// Editor wiring for the opt-in URP Foreground Clip renderer feature (#57/#129).
 //
-//   1. Setup URP Projection Fix  — adds the always-on KooimaProjectionFixFeature
-//      (off-axis projection injection) to the project's UniversalRendererData. This
-//      is UNIVERSAL: every URP DisplayXR app needs it for correct off-center Kooima.
-//      Normally auto-wired by DisplayXRUrpAutoWire; this menu/headless entry point
-//      lets you (re)apply it explicitly or in a batch build.
+//   Setup URP Foreground Clip — OPT-IN, for transparent-overlay apps only.
+//   Creates a material from the DisplayXR/ForegroundClipURP shader and adds
+//   Unity's built-in FullScreenPassRendererFeature pointed at it. A normal 3D
+//   URP app should NOT run this.
 //
-//   2. Setup URP Foreground Clip — OPT-IN, for transparent-overlay apps only.
-//      Creates a material from the DisplayXR/ForegroundClipURP shader and adds
-//      Unity's built-in FullScreenPassRendererFeature pointed at it. A normal 3D
-//      URP app should NOT run this.
+// (There is no longer a "URP Projection Fix" feature to install: the provider now
+// hands Unity a full per-eye projection matrix, so URP consumes the off-center
+// Kooima frustum correctly with no RendererFeature — same as BiRP/HDRP.)
 //
-// Both entry points are idempotent and callable headlessly (interactive=false
-// suppresses dialogs) so a Player can be built with the features pre-attached:
-//   Unity.exe -batchmode -executeMethod DisplayXR.Editor.URP.DisplayXRUrpInstaller.SetupProjectionFixHeadless
+// The entry point is idempotent and callable headlessly (interactive=false
+// suppresses dialogs) so a Player can be built with the feature pre-attached:
 //   Unity.exe -batchmode -executeMethod DisplayXR.Editor.URP.DisplayXRUrpInstaller.SetupForegroundClipHeadless
 //
 // The renderer-asset edits mirror exactly what URP's "Add Renderer Feature" button
@@ -29,55 +26,14 @@ using UnityEditor;
 using UnityEngine;
 using UnityEngine.Rendering;
 using UnityEngine.Rendering.Universal;
-using DisplayXR.URP;
 
 namespace DisplayXR.Editor.URP
 {
     public static class DisplayXRUrpInstaller
     {
-        const string kProjFixName = "Kooima Projection Fix";
         const string kClipShaderName = "DisplayXR/ForegroundClipURP";
         const string kClipFeatureName = "DisplayXR Foreground Clip";
         const string kClipMaterialPath = "Assets/DisplayXR/DXRForegroundClip.mat";
-
-        // ---- Projection fix (universal) -------------------------------------
-
-        [MenuItem("DisplayXR/Setup URP Projection Fix")]
-        static void SetupProjectionFixMenu() => InstallProjectionFix(interactive: true);
-
-        /// <summary>Headless entry point for -batchmode -executeMethod.</summary>
-        public static void SetupProjectionFixHeadless() => InstallProjectionFix(interactive: false);
-
-        /// <summary>
-        /// Add KooimaProjectionFixFeature to the URP renderer if it isn't already
-        /// there. Returns true if present (newly added or already wired).
-        /// </summary>
-        public static bool InstallProjectionFix(bool interactive)
-        {
-            var rendererData = FindRendererData();
-            if (rendererData == null)
-            {
-                const string msg = "URP renderer asset (UniversalRendererData) not found. " +
-                    "Assign a URP pipeline asset in Project Settings > Graphics, then retry.";
-                Report(interactive, "Projection Fix", msg, error: true);
-                return false;
-            }
-
-            bool ok;
-            try { ok = EnsureFeature<KooimaProjectionFixFeature>(rendererData, kProjFixName, null); }
-            catch (Exception e)
-            {
-                Debug.LogWarning("[DisplayXRUrp] projection-fix wiring failed: " + e.Message);
-                ok = false;
-            }
-
-            Report(interactive, "Projection Fix",
-                ok ? "Kooima Projection Fix is wired into " + rendererData.name + "."
-                   : "Couldn't wire the projection fix automatically — add a "
-                     + "'Kooima Projection Fix (Render Feature)' to your URP renderer manually.",
-                error: !ok);
-            return ok;
-        }
 
         // ---- Foreground clip (opt-in) ---------------------------------------
 
@@ -164,52 +120,6 @@ namespace DisplayXR.Editor.URP
                 if (data != null) return data;
             }
             return null;
-        }
-
-        /// <summary>
-        /// True if the renderer already has a feature of type T. Cheap check used by
-        /// the auto-wire bootstrap so it doesn't re-add on every domain reload.
-        /// </summary>
-        internal static bool HasFeature<T>(ScriptableRendererData rendererData)
-            where T : ScriptableRendererFeature
-        {
-            foreach (var f in rendererData.rendererFeatures)
-                if (f is T) return true;
-            return false;
-        }
-
-        // Generic add for a DisplayXR-authored feature (no material). Mirrors URP's
-        // "Add Renderer Feature": instantiate, AddObjectToAsset, register in
-        // m_RendererFeatures + m_RendererFeatureMap. Idempotent.
-        static bool EnsureFeature<T>(ScriptableRendererData rendererData, string displayName,
-                                     Action<T> configure) where T : ScriptableRendererFeature
-        {
-            if (HasFeature<T>(rendererData)) return true;
-
-            var so = new SerializedObject(rendererData);
-            var features = so.FindProperty("m_RendererFeatures");
-            var map = so.FindProperty("m_RendererFeatureMap");
-            if (features == null || map == null) return false;
-
-            var feature = ScriptableObject.CreateInstance<T>();
-            if (feature == null) return false;
-            feature.name = displayName;
-            configure?.Invoke(feature);
-
-            AssetDatabase.AddObjectToAsset(feature, rendererData);
-
-            int idx = features.arraySize;
-            features.InsertArrayElementAtIndex(idx);
-            features.GetArrayElementAtIndex(idx).objectReferenceValue = feature;
-            map.InsertArrayElementAtIndex(idx);
-            if (AssetDatabase.TryGetGUIDAndLocalFileIdentifier(feature, out _, out long localId))
-                map.GetArrayElementAtIndex(idx).longValue = localId;
-
-            so.ApplyModifiedProperties();
-            EditorUtility.SetDirty(rendererData);
-            AssetDatabase.SaveAssets();
-            AssetDatabase.ImportAsset(AssetDatabase.GetAssetPath(rendererData));
-            return true;
         }
 
         static bool TryAddFullScreenFeature(ScriptableRendererData rendererData, Material mat)

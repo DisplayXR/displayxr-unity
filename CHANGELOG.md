@@ -5,6 +5,19 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0] - 2026-07-05
+
+**URP off-axis simplification + HDRP support, plus the two already-merged cleanups (#185 meta hygiene, #186 preview-close-stops-play).** The provider now hands Unity a **full per-eye projection matrix** instead of half-angle FOVs, so URP and HDRP both consume the off-center Kooima frustum correctly with no per-pipeline fix. The URP `KooimaProjectionFixFeature` is removed. No app-facing API change; the projection change is internal to the native provider. Hardware-verified on RTX 3080 across BiRP, URP (2D-UI + transparent w/ foreground clip + click-through), and HDRP (#22, #166 M3).
+
+### Changed
+- **Provider hands Unity a full projection matrix** (`kUnityXRProjectionTypeMatrix`) — all four frame-desc projection sites (SPI + Multi-Pass, primary + extra-zone) now build a column-major GL-clip matrix from `XrView.fov` via the new `dxr_prov_build_projection` helper (same matrix as the stereo-readback path), instead of `kUnityXRProjectionTypeHalfAngles` + `tanf`. This carries the off-center frustum shear in the matrix itself, which URP and HDRP consume correctly (previously URP re-derived a projection from the half-angles and mangled strongly off-center frustums — Unity #1328435).
+
+### Removed
+- **URP `KooimaProjectionFixFeature`** (#22/#127) — the `ScriptableRendererFeature` that re-pushed the correct per-eye projection on URP is deleted, along with `DisplayXRUrpAutoWire` and the `DisplayXR > Setup URP Projection Fix` / `Auto-Wire URP Projection Fix` menu items. It is no longer needed now that the provider delivers a full projection matrix. **Migration:** URP projects that previously had the "Kooima Projection Fix" renderer feature auto-wired will show a harmless *missing script* entry on their URP renderer after upgrading — remove that renderer-feature entry (the projection is correct without it). The opt-in `DisplayXR > Setup URP Foreground Clip` and the `DisplayXR/ForegroundClipURP` shader are unchanged.
+
+### Added
+- **HDRP off-axis support** (#22, #166 M3) — HDRP consumes the provider's projection matrix natively (no fix code, no URP package required). A new `displayxr-unity-test-hdrp` regression repo covers it.
+
 ## [2.1.0] - 2026-07-04
 
 Internal cleanup only — **no public API change**. Every C# P/Invoke export is preserved and the shipped Windows DLL is byte-identical in size. This release finishes Task 3 of the hook-removal epic (#166): the dead OpenXR-hook graphics-backend plumbing that survived the v2.0.0 hard-removal is now deleted.
