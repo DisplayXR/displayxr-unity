@@ -5,6 +5,11 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.2] - 2026-07-05
+
+### Fixed
+- Scene-view display-rig eye gizmo now tracks the window: the provider publishes display info + the runtime's Kooima canvas (window rect on the panel + physical size) to shared state, so the gizmo's eyes and convergence-plane aspect follow window move/resize instead of showing panel-relative fallbacks (follow-up to #189).
+
 ## [2.2.1] - 2026-07-05
 
 ### Fixed
