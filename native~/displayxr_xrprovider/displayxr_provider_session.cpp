@@ -16,6 +16,8 @@
 
 #include <windows.h>
 #include <d3d12.h>
+#include <d3d11.h>   // D3D11 zero-copy backend (#195)
+#include <d3d11_4.h> // ID3D11Multithread (shared-device weave protection, #195)
 #include <dxgi1_4.h>
 
 #pragma comment(lib, "advapi32.lib") // RegGetValueA — ActiveRuntime registry fallback (#173)
@@ -95,6 +97,46 @@ typedef struct XrGraphicsRequirementsD3D12KHR {
 typedef XrResult (XRAPI_PTR *PFN_xrGetD3D12GraphicsRequirementsKHR)(
     XrInstance instance, XrSystemId systemId,
     XrGraphicsRequirementsD3D12KHR *graphicsRequirements);
+
+// ============================================================================
+// XR_KHR_D3D11_enable types (inlined — same convention as the D3D12 block above;
+// avoids requiring XR_USE_GRAPHICS_API_D3D11). Used by the zero-copy D3D11 backend
+// (#195): the session binds on Unity's ID3D11Device and the runtime's native D3D11
+// compositor creates + weaves swapchain images on that device.
+// ============================================================================
+
+#ifndef XR_TYPE_GRAPHICS_BINDING_D3D11_KHR
+#define XR_TYPE_GRAPHICS_BINDING_D3D11_KHR      ((XrStructureType)1000027000)
+#endif
+#ifndef XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR
+#define XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR       ((XrStructureType)1000027001)
+#endif
+#ifndef XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR
+#define XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR ((XrStructureType)1000027002)
+#endif
+
+typedef struct XrGraphicsBindingD3D11KHR {
+	XrStructureType type;
+	const void *next;
+	ID3D11Device *device; // no queue — D3D11 uses the immediate context
+} XrGraphicsBindingD3D11KHR;
+
+typedef struct XrSwapchainImageD3D11KHR {
+	XrStructureType type;
+	void *next;
+	ID3D11Texture2D *texture;
+} XrSwapchainImageD3D11KHR;
+
+typedef struct XrGraphicsRequirementsD3D11KHR {
+	XrStructureType type;
+	void *next;
+	LUID adapterLuid;
+	D3D_FEATURE_LEVEL minFeatureLevel;
+} XrGraphicsRequirementsD3D11KHR;
+
+typedef XrResult (XRAPI_PTR *PFN_xrGetD3D11GraphicsRequirementsKHR)(
+    XrInstance instance, XrSystemId systemId,
+    XrGraphicsRequirementsD3D11KHR *graphicsRequirements);
 
 // ============================================================================
 // Size constants
@@ -194,9 +236,18 @@ typedef struct ProviderSession {
 	ProviderExtraZone extra_zones[PS_MAX_ZONES - 1];
 	uint32_t          extra_zone_count;
 
+	// Graphics backend for this session (#195). DXR_GFX_D3D12 = own-device + shared
+	// bridge; DXR_GFX_D3D11 = zero-copy on Unity's ID3D11Device (no own device, no
+	// bridge). Selected in dxr_prov_session_start; preserved across the memset there.
+	DxrGfxKind          graphics_api;
+
 	// Unity's D3D12 device — used ONLY to open the shared bridge (NOT to bind the
-	// session; see own_device below).
+	// session; see own_device below). NULL on the D3D11 path.
 	ID3D12Device       *unity_device;
+	// Unity's D3D11 device (zero-copy #195): the session binds DIRECTLY on this and
+	// the runtime allocates + weaves swapchain images on it. NULL on the D3D12 path.
+	ID3D11Device        *unity_d3d11_device;
+	ID3D11DeviceContext *unity_d3d11_context; // Unity's immediate context (flush before weave)
 	void               *overlay_hwnd;
 
 	// The session's OWN D3D12 device (matched to the runtime adapter LUID). The
@@ -274,6 +325,10 @@ typedef struct ProviderSession {
 	uint32_t    sc_view_count;   // views to SUBMIT (1=2D, 2=3D); arraySize stays 2
 	int64_t     sc_format;
 	XrSwapchainImageD3D12KHR sc_images[PS_MAX_SWAPCHAIN_IMAGES];
+	// D3D11 zero-copy (#195): the runtime creates these swapchain images (arraySize=2)
+	// on Unity's device; the provider wraps them DIRECTLY via CreateTexture (no bridge).
+	// Parallel to sc_images; only one array is populated per session (by graphics_api).
+	XrSwapchainImageD3D11KHR sc_images_d3d11[PS_MAX_SWAPCHAIN_IMAGES];
 	int         swapchain_created;
 
 	// Live tile realloc (#172): the primary swapchain+bridge are recreated to track
@@ -784,20 +839,77 @@ static int ps_create_swapchain(void)
 	s_ps.pfn_enumerate_swapchain_images(s_ps.swapchain, 0, &count, NULL);
 	if (count > PS_MAX_SWAPCHAIN_IMAGES) count = PS_MAX_SWAPCHAIN_IMAGES;
 	s_ps.sc_image_count = count;
-	for (uint32_t i = 0; i < count; i++) {
-		s_ps.sc_images[i].type = XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR;
-		s_ps.sc_images[i].next = NULL;
-		s_ps.sc_images[i].texture = NULL;
+	if (s_ps.graphics_api == DXR_GFX_D3D11) {
+		// D3D11 zero-copy: the runtime allocates these arraySize=2 images on Unity's
+		// device; the display-provider wraps them DIRECTLY via CreateTexture (no bridge).
+		for (uint32_t i = 0; i < count; i++) {
+			s_ps.sc_images_d3d11[i].type = XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR;
+			s_ps.sc_images_d3d11[i].next = NULL;
+			s_ps.sc_images_d3d11[i].texture = NULL;
+		}
+		r = s_ps.pfn_enumerate_swapchain_images(s_ps.swapchain, count, &count,
+		        (XrSwapchainImageBaseHeader *)s_ps.sc_images_d3d11);
+	} else {
+		for (uint32_t i = 0; i < count; i++) {
+			s_ps.sc_images[i].type = XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR;
+			s_ps.sc_images[i].next = NULL;
+			s_ps.sc_images[i].texture = NULL;
+		}
+		r = s_ps.pfn_enumerate_swapchain_images(s_ps.swapchain, count, &count,
+		        (XrSwapchainImageBaseHeader *)s_ps.sc_images);
 	}
-	r = s_ps.pfn_enumerate_swapchain_images(s_ps.swapchain, count, &count,
-	        (XrSwapchainImageBaseHeader *)s_ps.sc_images);
 	if (XR_FAILED(r)) { ps_log("[DisplayXR-PROV] enumerate swapchain images failed: %d\n", r); return 0; }
 
 	s_ps.swapchain_created = 1;
-	ps_log("[DisplayXR-PROV] swapchain: %ux%u arraySize=2 submit=%u-view (%s), %u images, fmt=%lld\n",
-	       w, h, s_ps.sc_view_count, s_ps.sc_view_count >= 2 ? "3D" : "2D", count, format);
+	ps_log("[DisplayXR-PROV] swapchain: %ux%u arraySize=2 submit=%u-view (%s), %u images, fmt=%lld, api=%s\n",
+	       w, h, s_ps.sc_view_count, s_ps.sc_view_count >= 2 ? "3D" : "2D", count, format,
+	       s_ps.graphics_api == DXR_GFX_D3D11 ? "D3D11(zero-copy)" : "D3D12");
 
-	ps_create_bridge(); // pair the cross-device bridge with the swapchain
+	if (s_ps.graphics_api != DXR_GFX_D3D11)
+		ps_create_bridge(); // D3D12: pair the cross-device bridge with the swapchain
+	return 1;
+}
+
+// D3D11 zero-copy (#195): call xrGetD3D11GraphicsRequirementsKHR (mandatory before
+// xrCreateSession) and verify Unity's D3D11 device sits on the runtime's required
+// adapter LUID. Returns 1 if OK (or the requirement PFN is absent → let the session
+// create decide), 0 with a clear WARN on an adapter mismatch (multi-GPU) so we fail
+// gracefully instead of the runtime's generic GRAPHICS_DEVICE_INVALID.
+static int ps_d3d11_check_requirements(void)
+{
+	PFN_xrVoidFunction fn = NULL;
+	s_ps.gipa(s_ps.instance, "xrGetD3D11GraphicsRequirementsKHR", &fn);
+	if (!fn) {
+		ps_log("[DisplayXR-PROV] xrGetD3D11GraphicsRequirementsKHR unresolved "
+		       "(runtime lacks XR_KHR_D3D11_enable?)\n");
+		return 0;
+	}
+	XrGraphicsRequirementsD3D11KHR req = {XR_TYPE_GRAPHICS_REQUIREMENTS_D3D11_KHR};
+	if (XR_FAILED(((PFN_xrGetD3D11GraphicsRequirementsKHR)fn)(s_ps.instance, s_ps.system_id, &req))) {
+		ps_log("[DisplayXR-PROV] xrGetD3D11GraphicsRequirementsKHR failed\n");
+		return 0;
+	}
+	// Compare Unity's device adapter LUID (IDXGIDevice→GetAdapter→GetDesc) to req.adapterLuid.
+	LUID unity_luid = {};
+	IDXGIDevice *dxgi = NULL;
+	if (SUCCEEDED(s_ps.unity_d3d11_device->QueryInterface(__uuidof(IDXGIDevice), (void **)&dxgi)) && dxgi) {
+		IDXGIAdapter *ad = NULL;
+		if (SUCCEEDED(dxgi->GetAdapter(&ad)) && ad) {
+			DXGI_ADAPTER_DESC ds = {};
+			if (SUCCEEDED(ad->GetDesc(&ds))) unity_luid = ds.AdapterLuid;
+			ad->Release();
+		}
+		dxgi->Release();
+	}
+	int match = (unity_luid.HighPart == req.adapterLuid.HighPart &&
+	             unity_luid.LowPart == req.adapterLuid.LowPart);
+	if (!match && (req.adapterLuid.HighPart != 0 || req.adapterLuid.LowPart != 0)) {
+		ps_log("[DisplayXR-PROV] WARN: Unity's D3D11 device is on a different adapter than the "
+		       "runtime requires (multi-GPU). DisplayXR needs Unity on the display's GPU — "
+		       "session not started (#195).\n");
+		return 0;
+	}
+	ps_log("[DisplayXR-PROV] D3D11 graphics requirements OK (zero-copy on Unity's device)\n");
 	return 1;
 }
 
@@ -863,6 +975,15 @@ static int ps_alloc_shared_tex(uint32_t w, uint32_t h, UINT16 arr,
                                ID3D12Resource **out_own, ID3D12Resource **out_unity,
                                HANDLE *out_handle, const char *label)
 {
+	// D3D11 zero-copy has no own device / shared bridge (#195). Secondary layers
+	// (wsui/Local2D/extra-zones) that lean on this are a D3D11 follow-up; skip cleanly.
+	if (!s_ps.own_device) {
+		static int warned = 0;
+		if (!warned) { warned = 1;
+			ps_log("[DisplayXR-PROV] NOTE: shared-bridge layers (wsui/Local2D/extra-zones) are "
+			       "not yet supported on D3D11 — skipping (#195).\n"); }
+		return 0;
+	}
 	D3D12_HEAP_PROPERTIES heap = {};
 	heap.Type = D3D12_HEAP_TYPE_DEFAULT;
 	D3D12_RESOURCE_DESC bd = {};
@@ -1678,10 +1799,13 @@ void dxr_prov_get_extra_zone_view(uint32_t ei, uint32_t eye, DxrProvView *out_vi
 // ============================================================================
 
 int dxr_prov_session_start(const char *runtime_json_path,
-                           void *unity_d3d12_device,
-                           void *unity_d3d12_queue,
+                           int backend_kind,
+                           void *unity_device,
+                           void *unity_queue,
                            void *overlay_hwnd)
 {
+	DxrGfxKind gfx = (DxrGfxKind)backend_kind;
+	int is_d3d11 = (gfx == DXR_GFX_D3D11);
 	// Preserve the C#-chosen render mode across the reset — it is pushed by the
 	// loader (dxr_prov_set_single_pass) BEFORE this start runs.
 	int saved_single_pass = s_ps.single_pass;
@@ -1713,15 +1837,56 @@ int dxr_prov_session_start(const char *runtime_json_path,
 		s_ps.extra_zones[i].rect_w = saved_extra[i].rect_w;
 		s_ps.extra_zones[i].rect_h = saved_extra[i].rect_h;
 	}
-	s_ps.unity_device = (ID3D12Device *)unity_d3d12_device; // for opening the bridge + shared fence
-	s_ps.unity_queue  = (ID3D12CommandQueue *)unity_d3d12_queue; // signals the cross-device sync fence
+	s_ps.graphics_api = gfx;
+	if (is_d3d11) {
+		s_ps.unity_d3d11_device = (ID3D11Device *)unity_device; // session binds directly on this
+		// The runtime's native D3D11 compositor weaves on THIS device (zero-copy). It may
+		// touch the immediate context from its own present/compositor thread, so mark the
+		// device multithread-protected (Unity doesn't guarantee it) to avoid a shared-context
+		// deadlock, and cache the immediate context so submit_frame can Flush Unity's render
+		// before the runtime reads it. (#195)
+		s_ps.unity_d3d11_context = NULL;
+		if (s_ps.unity_d3d11_device) {
+			s_ps.unity_d3d11_device->GetImmediateContext(&s_ps.unity_d3d11_context);
+			// EXPERIMENT (#195): ID3D11Multithread protection is now OPT-IN via
+			// DISPLAYXR_D3D11_MT_PROTECT=1 (default OFF). With it ON we saw the editor
+			// render ~77 frames then hard-deadlock (both threads idle) — isolating whether
+			// the shared-context lock is the culprit vs. a deeper shared-device issue.
+			if (getenv("DISPLAYXR_D3D11_MT_PROTECT")) {
+				ID3D11Multithread *mt = NULL;
+				if (s_ps.unity_d3d11_context &&
+				    SUCCEEDED(s_ps.unity_d3d11_context->QueryInterface(__uuidof(ID3D11Multithread), (void **)&mt)) && mt) {
+					BOOL was = mt->SetMultithreadProtected(TRUE);
+					ps_log("[DisplayXR-PROV] D3D11 immediate context multithread-protected (was=%d)\n", (int)was);
+					mt->Release();
+				} else {
+					ps_log("[DisplayXR-PROV] WARN: could not set ID3D11Multithread protection\n");
+				}
+			} else {
+				ps_log("[DisplayXR-PROV] D3D11 MT-protect OFF (set DISPLAYXR_D3D11_MT_PROTECT=1 to enable)\n");
+			}
+		}
+	} else {
+		s_ps.unity_device = (ID3D12Device *)unity_device;       // for opening the bridge + shared fence
+		s_ps.unity_queue  = (ID3D12CommandQueue *)unity_queue;  // signals the cross-device sync fence
+	}
 	s_ps.overlay_hwnd = overlay_hwnd;
 	s_ps.ipd_factor = s_ps.parallax_factor = s_ps.perspective_factor = 1.0f;
 	s_ps.fov_override = tanf(0.5f * 1.0471975512f); // tan(30°) — neutral ~60° vFOV default
 	s_ps.zone_caps_ok = -1; // untried (lazy caps query on first zone frame)
 
-	if (!s_ps.unity_device) {
-		ps_log("[DisplayXR-PROV] start: missing Unity D3D12 device (needed for bridge)\n");
+	if (is_d3d11 ? (s_ps.unity_d3d11_device == NULL) : (s_ps.unity_device == NULL)) {
+		ps_log("[DisplayXR-PROV] start: missing Unity %s device\n", is_d3d11 ? "D3D11" : "D3D12");
+		return 0;
+	}
+	// D3D11 is a ZERO-COPY path: Unity renders both eyes straight into the runtime's
+	// arraySize=2 swapchain image, which only works in Single-Pass-Instanced (one pass,
+	// textureArraySlice 0/1). MultiPass would need two single-slice textures merged by a
+	// copy — the D3D12-only bridge path. So D3D11 requires SPI (URP/HDRP). On BiRP+D3D11
+	// C# sends MultiPass; gate cleanly rather than render garbage. (Bridge fallback = #195 follow-up.)
+	if (is_d3d11 && !dxr_prov_get_single_pass()) {
+		ps_log("[DisplayXR-PROV] start: D3D11 requires Single-Pass-Instanced (URP/HDRP). "
+		       "BiRP-on-D3D11 (MultiPass) is not yet supported — use D3D12 for BiRP (#195).\n");
 		return 0;
 	}
 
@@ -1798,7 +1963,7 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	const char *extensions[8];
 	uint32_t ext_count = 0;
 	extensions[ext_count++] = XR_EXT_DISPLAY_INFO_EXTENSION_NAME;
-	extensions[ext_count++] = "XR_KHR_D3D12_enable";
+	extensions[ext_count++] = is_d3d11 ? "XR_KHR_D3D11_enable" : "XR_KHR_D3D12_enable";
 	extensions[ext_count++] = XR_EXT_WIN32_WINDOW_BINDING_EXTENSION_NAME;
 	if (s_ps.has_view_rig) extensions[ext_count++] = XR_EXT_VIEW_RIG_EXTENSION_NAME;
 	// Zones (#166 Phase B): display_zones needs view_rig (composes on top of it);
@@ -1837,9 +2002,16 @@ int dxr_prov_session_start(const char *runtime_json_path,
 		ps_log("[DisplayXR-PROV] xrGetSystem failed\n"); dxr_prov_session_stop(); return 0;
 	}
 
-	// --- Create the session's OWN D3D12 device (matched to runtime adapter LUID).
-	//     The runtime allocates its swapchain on this device; we bridge to Unity. ---
-	if (!ps_create_own_device()) { dxr_prov_session_stop(); return 0; }
+	if (is_d3d11) {
+		// D3D11 zero-copy: no own device. The runtime REQUIRES xrGetD3D11GraphicsRequirementsKHR
+		// to have been called before xrCreateSession, and enforces that Unity's device sits on
+		// the returned adapter LUID; pre-check it here for a provider-branded WARN.
+		if (!ps_d3d11_check_requirements()) { dxr_prov_session_stop(); return 0; }
+	} else {
+		// --- Create the session's OWN D3D12 device (matched to runtime adapter LUID).
+		//     The runtime allocates its swapchain on this device; we bridge to Unity. ---
+		if (!ps_create_own_device()) { dxr_prov_session_stop(); return 0; }
+	}
 
 	// --- Display info ---
 	XrDisplayInfoEXT di = {};
@@ -1907,7 +2079,7 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	}
 	int use_transparent = s_ps.transparent_requested && s_ps.alpha_blend_supported;
 
-	// --- Session: D3D12 binding on UNITY'S device + window binding (overlay HWND) ---
+	// --- Session: graphics binding on UNITY'S device + window binding (overlay HWND) ---
 	XrWin32WindowBindingCreateInfoEXT win_binding = {};
 	win_binding.type = XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT;
 	win_binding.windowHandle = s_ps.overlay_hwnd;
@@ -1920,19 +2092,32 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	win_binding.transparentBackgroundEnabled = use_transparent ? XR_TRUE : XR_FALSE;
 	win_binding.chromaKeyColor = 0;
 
+	// D3D11 (#195): bind DIRECTLY on Unity's ID3D11Device (no queue — the runtime's
+	// native D3D11 compositor uses the immediate context). D3D12: bind on our own device.
+	XrGraphicsBindingD3D11KHR d3d11 = {};
 	XrGraphicsBindingD3D12KHR d3d12 = {};
-	d3d12.type = XR_TYPE_GRAPHICS_BINDING_D3D12_KHR;
-	d3d12.device = s_ps.own_device;   // session runs on our own device
-	d3d12.queue = s_ps.own_queue;
-	d3d12.next = &win_binding;
+	const void *gfx_binding;
+	if (is_d3d11) {
+		d3d11.type = XR_TYPE_GRAPHICS_BINDING_D3D11_KHR;
+		d3d11.device = s_ps.unity_d3d11_device; // session runs on Unity's device (zero-copy)
+		d3d11.next = &win_binding;
+		gfx_binding = &d3d11;
+	} else {
+		d3d12.type = XR_TYPE_GRAPHICS_BINDING_D3D12_KHR;
+		d3d12.device = s_ps.own_device;   // session runs on our own device
+		d3d12.queue = s_ps.own_queue;
+		d3d12.next = &win_binding;
+		gfx_binding = &d3d12;
+	}
 
 	XrSessionCreateInfo sci = {XR_TYPE_SESSION_CREATE_INFO};
-	sci.next = &d3d12;
+	sci.next = gfx_binding;
 	sci.systemId = s_ps.system_id;
 	if (XR_FAILED(s_ps.pfn_create_session(s_ps.instance, &sci, &s_ps.session))) {
 		ps_log("[DisplayXR-PROV] xrCreateSession failed\n"); dxr_prov_session_stop(); return 0;
 	}
-	ps_log("[DisplayXR-PROV] Session created (own D3D12 device, overlay HWND=%p)\n", s_ps.overlay_hwnd);
+	ps_log("[DisplayXR-PROV] Session created (%s, overlay HWND=%p)\n",
+	       is_d3d11 ? "zero-copy on Unity's D3D11 device" : "own D3D12 device", s_ps.overlay_hwnd);
 
 	// --- LOCAL reference space ---
 	XrReferenceSpaceCreateInfo rsci = {XR_TYPE_REFERENCE_SPACE_CREATE_INFO};
@@ -1999,6 +2184,8 @@ void dxr_prov_session_stop(void)
 	if (s_ps.own_cmd_alloc)   s_ps.own_cmd_alloc->Release();
 	if (s_ps.own_queue)       s_ps.own_queue->Release();
 	if (s_ps.own_device)      s_ps.own_device->Release();
+	// D3D11 zero-copy (#195): we don't own Unity's device, but GetImmediateContext AddRef'd.
+	if (s_ps.unity_d3d11_context) s_ps.unity_d3d11_context->Release();
 
 	// Intentionally do NOT FreeLibrary(runtime_lib): background threads may still
 	// reference it (matches the standalone's deliberate leak).
@@ -2144,6 +2331,22 @@ void *dxr_prov_get_bridge_unity_texture_eye(uint32_t eye, uint32_t *width, uint3
 	return (void *)s_ps.bridge_unity_eye[eye]; // MultiPass mode; NULL in SPI mode
 }
 
+int dxr_prov_get_graphics_api(void)
+{
+	return (int)s_ps.graphics_api;
+}
+
+void *dxr_prov_get_swapchain_image_texture(uint32_t index, uint32_t *out_w,
+                                           uint32_t *out_h, uint32_t *out_array)
+{
+	if (out_w) *out_w = s_ps.sc_width;
+	if (out_h) *out_h = s_ps.sc_height;
+	if (out_array) *out_array = 2; // arraySize=2 (SPI: left=slice 0, right=slice 1)
+	// D3D11 zero-copy: the runtime swapchain image (an ID3D11Texture2D on Unity's device).
+	if (s_ps.graphics_api != DXR_GFX_D3D11 || index >= s_ps.sc_image_count) return NULL;
+	return (void *)s_ps.sc_images_d3d11[index].texture;
+}
+
 // ============================================================================
 // Frame loop
 // ============================================================================
@@ -2237,9 +2440,18 @@ int dxr_prov_begin_frame(uint32_t *out_image_index, int *out_should_render)
 	if (out_image_index) *out_image_index = 0;
 	if (!s_ps.running || !s_ps.session_ready) return 0;
 
+	// D3D11 zero-copy (#195): short startup trace of the begin stages (waitFrame /
+	// beginFrame / acquire+wait) to confirm the frame loop came up. Bump the gate to
+	// debug the editor Play-Mode deadlock (~75 frames; player is unaffected).
+	static unsigned d11_bframes = 0;
+	int bdiag = (s_ps.graphics_api == DXR_GFX_D3D11) && (d11_bframes < 3);
+	if (bdiag) ps_log("[DisplayXR-PROV] D3D11 begin[%u]: pre-waitFrame\n", d11_bframes);
+
 	XrFrameState fs = {XR_TYPE_FRAME_STATE};
 	if (XR_FAILED(s_ps.pfn_wait_frame(s_ps.session, NULL, &fs))) return 0;
+	if (bdiag) ps_log("[DisplayXR-PROV] D3D11 begin[%u]: waitFrame ok, pre-beginFrame\n", d11_bframes);
 	if (XR_FAILED(s_ps.pfn_begin_frame(s_ps.session, NULL))) return 0;
+	if (bdiag) ps_log("[DisplayXR-PROV] D3D11 begin[%u]: beginFrame ok\n", d11_bframes);
 	s_ps.predicted_display_time = fs.predictedDisplayTime;
 	s_ps.frame_begun = 1;
 
@@ -2398,10 +2610,13 @@ int dxr_prov_begin_frame(uint32_t *out_image_index, int *out_should_render)
 	if (s_ps.swapchain_created && !s_ps.image_acquired) {
 		uint32_t index = 0;
 		XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+		if (bdiag) ps_log("[DisplayXR-PROV] D3D11 begin[%u]: pre-acquire\n", d11_bframes);
 		if (XR_SUCCEEDED(s_ps.pfn_acquire_swapchain_image(s_ps.swapchain, &ai, &index))) {
+			if (bdiag) ps_log("[DisplayXR-PROV] D3D11 begin[%u]: acquired idx=%u, pre-wait\n", d11_bframes, index);
 			XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
 			wi.timeout = 1000000000;
 			s_ps.pfn_wait_swapchain_image(s_ps.swapchain, &wi);
+			if (bdiag) ps_log("[DisplayXR-PROV] D3D11 begin[%u]: wait done idx=%u\n", d11_bframes, index);
 			s_ps.image_acquired = 1;
 			s_ps.acquired_index = index;
 		}
@@ -2409,6 +2624,7 @@ int dxr_prov_begin_frame(uint32_t *out_image_index, int *out_should_render)
 	if (out_image_index) *out_image_index = s_ps.acquired_index;
 
 	if (out_should_render) *out_should_render = fs.shouldRender ? 1 : 0;
+	if (s_ps.graphics_api == DXR_GFX_D3D11 && d11_bframes < 100000) d11_bframes++;
 	return 1;
 }
 
@@ -2634,53 +2850,75 @@ int dxr_prov_submit_frame(uint32_t image_index)
 	}
 	s_ps.frame_begun = 0;
 
-	// Unity rendered both eyes into the shared BRIDGE on its device (topology is fixed
-	// at 2 views). Copy the SUBMITTED slices into the acquired runtime swapchain image
-	// on our own device, fence-synced against Unity's render (shared fence below). 3D:
-	// both slices. 2D (#172 P4): only slice 0 — submitting a single view avoids the two
+	uint32_t submit_n = s_ps.sc_view_count >= 2 ? 2 : 1;
+	// D3D12: Unity rendered both eyes into the shared BRIDGE on its device (topology is
+	// fixed at 2 views). Copy the SUBMITTED slices into the acquired runtime swapchain
+	// image on our own device, fence-synced against Unity's render (shared fence below).
+	// 3D: both slices. 2D (#172 P4): only slice 0 — submitting a single view avoids the two
 	// eyes weaving as a ghost on the flat screen. SPI: 2-slice array bridge; MultiPass:
 	// per-eye bridges.
-	uint32_t submit_n = s_ps.sc_view_count >= 2 ? 2 : 1;
-	int sp = dxr_prov_get_single_pass();
-	ID3D12Resource *copy_src = sp ? s_ps.bridge_own : s_ps.bridge_own_eye[0];
-	if (copy_src && image_index < s_ps.sc_image_count &&
-	    s_ps.sc_images[image_index].texture && s_ps.own_cmd_list) {
-		ID3D12Resource *dst = s_ps.sc_images[image_index].texture;
-		s_ps.own_cmd_alloc->Reset();
-		s_ps.own_cmd_list->Reset(s_ps.own_cmd_alloc, NULL);
-		for (UINT slice = 0; slice < submit_n; slice++) {
-			D3D12_TEXTURE_COPY_LOCATION dl = {};
-			dl.pResource = dst;
-			dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-			dl.SubresourceIndex = slice;
-			D3D12_TEXTURE_COPY_LOCATION sl = {};
-			// SPI: slice `slice` of the array bridge. MultiPass: subresource 0 of the
-			// per-eye bridge for this eye.
-			sl.pResource = sp ? s_ps.bridge_own : s_ps.bridge_own_eye[slice];
-			sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-			sl.SubresourceIndex = sp ? slice : 0;
-			s_ps.own_cmd_list->CopyTextureRegion(&dl, 0, 0, 0, &sl, NULL);
-		}
-		s_ps.own_cmd_list->Close();
+	// D3D11 (#195): ZERO-COPY — Unity rendered straight into the runtime's swapchain image
+	// on its own device; there is nothing to copy and no cross-device fence. Unity and the
+	// runtime share one device, so we Flush Unity's context before xrEndFrame (below) and
+	// the runtime's native D3D11 compositor syncs internally via its own ID3D11Fence keyed
+	// to xrReleaseSwapchainImage. Verified stable in a built player (~65fps, 2400+ frames);
+	// the editor Play-Mode deadlock (~75 frames) is editor-only (dedicated window #173 /
+	// GameView present) — a #195 follow-up. Skip the entire D3D12 bridge copy.
+	if (s_ps.graphics_api != DXR_GFX_D3D11) {
+		int sp = dxr_prov_get_single_pass();
+		ID3D12Resource *copy_src = sp ? s_ps.bridge_own : s_ps.bridge_own_eye[0];
+		if (copy_src && image_index < s_ps.sc_image_count &&
+		    s_ps.sc_images[image_index].texture && s_ps.own_cmd_list) {
+			ID3D12Resource *dst = s_ps.sc_images[image_index].texture;
+			s_ps.own_cmd_alloc->Reset();
+			s_ps.own_cmd_list->Reset(s_ps.own_cmd_alloc, NULL);
+			for (UINT slice = 0; slice < submit_n; slice++) {
+				D3D12_TEXTURE_COPY_LOCATION dl = {};
+				dl.pResource = dst;
+				dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+				dl.SubresourceIndex = slice;
+				D3D12_TEXTURE_COPY_LOCATION sl = {};
+				// SPI: slice `slice` of the array bridge. MultiPass: subresource 0 of the
+				// per-eye bridge for this eye.
+				sl.pResource = sp ? s_ps.bridge_own : s_ps.bridge_own_eye[slice];
+				sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+				sl.SubresourceIndex = sp ? slice : 0;
+				s_ps.own_cmd_list->CopyTextureRegion(&dl, 0, 0, 0, &sl, NULL);
+			}
+			s_ps.own_cmd_list->Close();
 
-		// Cross-device sync: signal a SHARED fence on Unity's queue (ordered after
-		// Unity's already-submitted render into the bridge — Unity's queue is FIFO)
-		// and GPU-wait on it on the own queue, so the copy reads the FINISHED render
-		// (not empty texels → black).
-		if (s_ps.shared_fence_unity && s_ps.shared_fence_own && s_ps.unity_queue) {
-			s_ps.sync_val++;
-			s_ps.unity_queue->Signal(s_ps.shared_fence_unity, s_ps.sync_val);
-			s_ps.own_queue->Wait(s_ps.shared_fence_own, s_ps.sync_val);
-		}
+			// Cross-device sync: signal a SHARED fence on Unity's queue (ordered after
+			// Unity's already-submitted render into the bridge — Unity's queue is FIFO)
+			// and GPU-wait on it on the own queue, so the copy reads the FINISHED render
+			// (not empty texels → black).
+			if (s_ps.shared_fence_unity && s_ps.shared_fence_own && s_ps.unity_queue) {
+				s_ps.sync_val++;
+				s_ps.unity_queue->Signal(s_ps.shared_fence_unity, s_ps.sync_val);
+				s_ps.own_queue->Wait(s_ps.shared_fence_own, s_ps.sync_val);
+			}
 
-		ID3D12CommandList *lists[] = { s_ps.own_cmd_list };
-		s_ps.own_queue->ExecuteCommandLists(1, lists);
-		s_ps.own_fence_value++;
-		s_ps.own_queue->Signal(s_ps.own_fence, s_ps.own_fence_value);
-		if (s_ps.own_fence->GetCompletedValue() < s_ps.own_fence_value) {
-			s_ps.own_fence->SetEventOnCompletion(s_ps.own_fence_value, s_ps.own_fence_event);
-			WaitForSingleObject(s_ps.own_fence_event, INFINITE);
+			ID3D12CommandList *lists[] = { s_ps.own_cmd_list };
+			s_ps.own_queue->ExecuteCommandLists(1, lists);
+			s_ps.own_fence_value++;
+			s_ps.own_queue->Signal(s_ps.own_fence, s_ps.own_fence_value);
+			if (s_ps.own_fence->GetCompletedValue() < s_ps.own_fence_value) {
+				s_ps.own_fence->SetEventOnCompletion(s_ps.own_fence_value, s_ps.own_fence_event);
+				WaitForSingleObject(s_ps.own_fence_event, INFINITE);
+			}
 		}
+	}
+
+	// D3D11 zero-copy (#195): Unity rendered into the swapchain image on the SAME device
+	// the runtime weaves from. Flush Unity's immediate context so the runtime's weave in
+	// xrEndFrame reads the FINISHED render (not mid-flight) — required for coherency on the
+	// shared device. Short startup trace of the submit stages; bump the gate to debug the
+	// editor Play-Mode deadlock (~75 frames).
+	static unsigned d11_frames = 0;
+	int d11_diag = (s_ps.graphics_api == DXR_GFX_D3D11) && (d11_frames < 3);
+	if (s_ps.graphics_api == DXR_GFX_D3D11) {
+		if (d11_diag) ps_log("[DisplayXR-PROV] D3D11 submit[%u]: pre-flush (img=%u)\n", d11_frames, image_index);
+		if (s_ps.unity_d3d11_context) s_ps.unity_d3d11_context->Flush();
+		if (d11_diag) ps_log("[DisplayXR-PROV] D3D11 submit[%u]: flushed, pre-release\n", d11_frames);
 	}
 
 	if (s_ps.image_acquired) {
@@ -2688,6 +2926,7 @@ int dxr_prov_submit_frame(uint32_t image_index)
 		s_ps.pfn_release_swapchain_image(s_ps.swapchain, &ri);
 		s_ps.image_acquired = 0;
 	}
+	if (d11_diag) ps_log("[DisplayXR-PROV] D3D11 submit[%u]: released, building layers\n", d11_frames);
 
 	// Build the projection layer. Submit sc_view_count views (#172 P4): 2 in stereo 3D
 	// (array layers 0/1), 1 in hardware 2D (layer 0 only = a single full-res tile). The
@@ -2811,7 +3050,10 @@ int dxr_prov_submit_frame(uint32_t image_index)
 	        : XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
 	ei.layerCount = lc;
 	ei.layers = layers;
+	if (d11_diag) ps_log("[DisplayXR-PROV] D3D11 submit[%u]: pre-xrEndFrame (layers=%u)\n", d11_frames, lc);
 	XrResult r = s_ps.pfn_end_frame(s_ps.session, &ei);
+	if (d11_diag) ps_log("[DisplayXR-PROV] D3D11 submit[%u]: post-xrEndFrame r=%d\n", d11_frames, r);
+	if (s_ps.graphics_api == DXR_GFX_D3D11 && d11_frames < 100000) d11_frames++;
 	if (XR_FAILED(r)) { ps_log("[DisplayXR-PROV] xrEndFrame failed: %d\n", r); return 0; }
 	return 1;
 }
