@@ -288,7 +288,9 @@ void create_textures_if_ready()
 	// PopulateNextFrameDesc selects s_tex_ids[acquired image index] each frame (the
 	// runtime rotates images, unlike the D3D12 path's single fixed bridge). D3D11 is
 	// always SPI (gated in session_start), so there is no MultiPass D3D11 branch.
-	if (dxr_prov_get_graphics_api() == DXR_GFX_D3D11) {
+	// EDITOR bridge (#195): the runtime images live on the OWN device — fall through to
+	// the SPI bridge arm below (wraps the single Unity-side bridge tex, like D3D12 SPI).
+	if (dxr_prov_get_graphics_api() == DXR_GFX_D3D11 && !dxr_prov_d3d11_bridge_active()) {
 		uint32_t sw = 0, sh = 0, sarr = 0, simgs = 0;
 		dxr_prov_get_swapchain_info(&sw, &sh, &sarr, &simgs);
 		if (simgs == 0 || sw == 0) return; // swapchain not created yet (await session-ready)
@@ -553,11 +555,11 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 	if (dxr_prov_get_single_pass()) {
 		// Single-Pass-Instanced: 1 render pass, 2 render params over the 2-slice
 		// array (slice 0 = left, slice 1 = right). Correct on URP/HDRP.
-		// D3D12: the single fixed bridge is s_tex_ids[0]. D3D11 zero-copy: Unity renders
-		// directly into the acquired runtime swapchain image, so pick the texture wrapping
-		// THIS frame's acquired image (s_current_image_index).
+		// D3D12 + D3D11 editor bridge: the single fixed bridge is s_tex_ids[0]. D3D11
+		// zero-copy (player): Unity renders directly into the acquired runtime swapchain
+		// image, so pick the texture wrapping THIS frame's acquired image.
 		UnityXRNextFrameDesc::UnityXRRenderPass &pass = next->renderPasses[0];
-		pass.textureId = (dxr_prov_get_graphics_api() == DXR_GFX_D3D11)
+		pass.textureId = (dxr_prov_get_graphics_api() == DXR_GFX_D3D11 && !dxr_prov_d3d11_bridge_active())
 		                     ? s_tex_ids[s_current_image_index]
 		                     : s_tex_ids[0];
 		pass.cullingPassIndex = 0;

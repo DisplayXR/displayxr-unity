@@ -121,6 +121,15 @@ int  dxr_prov_session_start(const char *runtime_json_path,
 /// the display-provider TU to gate the D3D12-only cross-device barrier + copy.
 DISPLAYXR_EXPORT int  dxr_prov_get_graphics_api(void);
 
+/// (#195 editor bridge) 1 when the D3D11 backend is running in OWN-DEVICE BRIDGE
+/// mode (editor Play Mode: the session binds on a separate ID3D11Device + shared
+/// bridge, so Unity's editor GameView present never shares the weaver's device →
+/// no Optimus cross-present deadlock). 0 = D3D11 zero-copy (built player) or D3D12.
+/// The display-provider TU reads it to pick the swapchain-image wrap: zero-copy
+/// wraps the runtime images directly; bridge wraps the single Unity-side bridge tex
+/// (like the D3D12 SPI bridge).
+DISPLAYXR_EXPORT int  dxr_prov_d3d11_bridge_active(void);
+
 /// (D3D11 zero-copy) The runtime swapchain image `index`'s native ID3D11Texture2D*
 /// (a 2-slice SPI array), which lives on Unity's device — wrapped DIRECTLY via
 /// CreateTexture (no bridge). *out_array = 2. NULL for D3D12 or a bad index.
