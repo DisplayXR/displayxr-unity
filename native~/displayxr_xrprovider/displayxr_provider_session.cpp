@@ -2257,12 +2257,17 @@ void dxr_prov_get_extra_zone_view(uint32_t ei, uint32_t eye, DxrProvView *out_vi
 // window stays blank while the probe runs — the .bmp is the success signal.
 // ============================================================================
 static int              s_probe_enabled = 0;    // DISPLAYXR_PROV_TEXTURE_PROBE
-static ID3D11Texture2D *s_probe_tex11   = NULL;  // shared texture (D3D11 bind)
+static ID3D11Texture2D *s_probe_tex11   = NULL;  // shared texture (D3D11 bind, own device)
 static ID3D12Resource  *s_probe_tex12   = NULL;  // shared texture (D3D12 bind)
 static HANDLE           s_probe_handle  = NULL;  // shared HANDLE handed to the runtime
 static unsigned         s_probe_frames  = 0;     // submit counter (dump gate)
 static int              s_probe_dumped  = 0;     // one-shot readback done
 static const unsigned   kProbeDumpFrame = 150;   // warmup gate (matches ref app)
+// GameView mirror (Task (a)): the woven shared texture opened on UNITY'S device so
+// the display-provider can wrap it via CreateTexture and mirror-blit it into the
+// editor Game window. Opened lazily on first request (graphics thread, session ready).
+static ID3D11Texture2D *s_probe_tex_unity = NULL;
+static uint32_t         s_probe_woven_w = 0, s_probe_woven_h = 0;
 
 static int ps_probe_env(void)
 {
@@ -2472,9 +2477,46 @@ static void ps_probe_dump_d3d12(const char *path)
 	rb->Release();
 }
 
+// GameView mirror (Task (a)): hand the display-provider the Unity-device view of the
+// woven shared texture. Opened lazily here (called from the graphics thread once the
+// session is up, so unity_d3d11_device is valid). The runtime writes the same
+// underlying resource on the own device via sharedTextureHandle; legacy MISC_SHARED
+// lets both devices open it (same adapter). NULL when the probe/texture mode is off.
+void *dxr_prov_get_woven_unity_texture(uint32_t *w, uint32_t *h)
+{
+	if (s_probe_enabled && s_probe_handle && !s_probe_tex_unity && s_ps.unity_d3d11_device) {
+		HRESULT hr = s_ps.unity_d3d11_device->OpenSharedResource(
+		        s_probe_handle, __uuidof(ID3D11Texture2D), (void **)&s_probe_tex_unity);
+		if (FAILED(hr) || !s_probe_tex_unity) {
+			s_probe_tex_unity = NULL;
+			ps_log("[DisplayXR-PROV] PROBE: OpenSharedResource(woven, Unity dev) failed 0x%08X\n", hr);
+		} else {
+			ps_log("[DisplayXR-PROV] PROBE: woven texture opened on Unity device for GameView mirror\n");
+		}
+	}
+	if (w) *w = s_probe_woven_w;
+	if (h) *h = s_probe_woven_h;
+	return s_probe_tex_unity;
+}
+
+// The woven content occupies the canvas (== forced zone) sub-rect of the shared
+// texture; report it (+ the full texture dims) so the mirror blit can normalize srcRect.
+void dxr_prov_get_woven_canvas(int32_t *x, int32_t *y, int32_t *cw, int32_t *ch,
+                               uint32_t *texw, uint32_t *texh)
+{
+	if (x)  *x  = s_ps.zone_valid ? s_ps.zone_x : 0;
+	if (y)  *y  = s_ps.zone_valid ? s_ps.zone_y : 0;
+	if (cw) *cw = s_ps.zone_valid ? s_ps.zone_w : (int32_t)s_probe_woven_w;
+	if (ch) *ch = s_ps.zone_valid ? s_ps.zone_h : (int32_t)s_probe_woven_h;
+	if (texw) *texw = s_probe_woven_w;
+	if (texh) *texh = s_probe_woven_h;
+}
+
 // Release probe resources (called from dxr_prov_session_stop and defensively at start).
 static void ps_probe_cleanup(void)
 {
+	if (s_probe_tex_unity) { s_probe_tex_unity->Release(); s_probe_tex_unity = NULL; }
+	s_probe_woven_w = 0; s_probe_woven_h = 0;
 	if (s_probe_tex11) { s_probe_tex11->Release(); s_probe_tex11 = NULL; }
 	if (s_probe_tex12) {
 		s_probe_tex12->Release(); s_probe_tex12 = NULL;
@@ -2812,6 +2854,7 @@ int dxr_prov_session_start(const char *runtime_json_path,
 		}
 		if (s_probe_handle) {
 			win_binding.sharedTextureHandle = s_probe_handle;
+			s_probe_woven_w = pw; s_probe_woven_h = ph; // for the GameView mirror srcRect
 			// The Leia DP's texture-mode weave is CANVAS-DRIVEN: a plain projection
 			// gives the DP canvas=(0,0 0x0) → it writes nothing into the shared
 			// texture (confirmed: runtime log leia_dp_d3d11_process_atlas canvas 0x0,

@@ -165,6 +165,17 @@ void *dxr_prov_get_bridge_unity_texture(uint32_t *width, uint32_t *height,
 /// NULL for eye>1 or in SPI mode (use dxr_prov_get_bridge_unity_texture instead).
 void *dxr_prov_get_bridge_unity_texture_eye(uint32_t eye, uint32_t *width, uint32_t *height);
 
+/// GameView weave-to-texture mirror (experiment, Task (a)). The runtime-woven shared
+/// texture opened on Unity's device — the display-provider wraps it via CreateTexture
+/// and mirror-blits it into the editor Game window. NULL unless texture mode is active
+/// (DISPLAYXR_PROV_TEXTURE_PROBE). Opened lazily; call from the graphics thread.
+void *dxr_prov_get_woven_unity_texture(uint32_t *width, uint32_t *height);
+
+/// The woven content's canvas (== forced zone) sub-rect within the shared texture,
+/// plus the full texture dims, so the mirror blit can build a normalized srcRect.
+void dxr_prov_get_woven_canvas(int32_t *x, int32_t *y, int32_t *cw, int32_t *ch,
+                               uint32_t *texw, uint32_t *texh);
+
 /// Render mode gate (#166 task #8). Set from C# BEFORE the session starts:
 /// 1 = Single-Pass-Instanced (URP+Win+D3D12), 0 = MultiPass (BiRP/other — SPI
 /// renders opaque geometry wrong on BiRP). Default (unset) = SPI, preserving the

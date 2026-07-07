@@ -91,6 +91,11 @@ void                   *s_overlay_hwnd = nullptr;
 UnityXRRenderTextureId  s_tex_ids[8] = {0};
 uint32_t                s_tex_count = 0;
 bool                    s_textures_created = false;
+// GameView weave-to-texture mirror (Task (a)): the runtime-woven shared texture wrapped
+// as a Unity texture, mirror-blitted into the editor Game window. Inert unless texture
+// mode is active (dxr_prov_get_woven_unity_texture returns NULL otherwise).
+static UnityXRRenderTextureId s_woven_tex_id = 0;
+static bool                   s_woven_tex_created = false;
 
 // Extra 3D zones (#166 Phase B2): each extra zone gets its own Unity texture(s)
 // (SPI: [i][0] = 2-slice array; MultiPass: [i][0/1] = per-eye) + render pass.
@@ -277,8 +282,37 @@ static void create_extra_zone_textures()
 	}
 }
 
+// GameView mirror (Task (a)): wrap the runtime-woven shared texture as a Unity texture
+// so MainQueryMirrorViewBlitDesc can blit it into the editor Game window. Independent of
+// the per-eye render textures; runs only when texture mode published a woven texture.
+static void create_woven_mirror_texture_if_ready()
+{
+	if (s_woven_tex_created || !s_display || !s_handle) return;
+	uint32_t ww = 0, wh = 0;
+	void *wov = dxr_prov_get_woven_unity_texture(&ww, &wh);
+	if (!wov || ww == 0 || wh == 0) return;
+	UnityXRRenderTextureDesc desc; memset(&desc, 0, sizeof(desc));
+	desc.colorFormat = kUnityXRRenderTextureFormatBGRA32; // woven tex is B8G8R8A8_UNORM (fmt 87)
+	desc.color.nativePtr = wov;
+	desc.depthFormat = kUnityXRDepthTextureFormatNone;    // blit source; no depth
+	desc.depth.nativePtr = (void *)(uintptr_t)kUnityXRRenderTextureIdDontCare;
+	desc.width = ww;
+	desc.height = wh;
+	desc.textureArrayLength = 1;
+	desc.flags = kUnityXRRenderTextureFlagsUVDirectionTopToBottom; // D3D top-left origin
+	UnityXRRenderTextureId id = 0;
+	if (s_display->CreateTexture(s_handle, &desc, &id) == kUnitySubsystemErrorCodeSuccess) {
+		s_woven_tex_id = id;
+		s_woven_tex_created = true;
+		prov_log("[DisplayXR-PROV] CreateTexture: wrapped WOVEN shared texture -> GameView mirror\n");
+	} else {
+		prov_log("[DisplayXR-PROV] CreateTexture (woven GameView mirror) failed\n");
+	}
+}
+
 void create_textures_if_ready()
 {
+	create_woven_mirror_texture_if_ready();
 	if (!s_display || !s_handle) return;
 	// Extra zones can come up alongside / after the primary; keep trying until wrapped.
 	if (s_textures_created) { create_extra_zone_textures(); return; }
@@ -397,6 +431,8 @@ void destroy_textures()
 	memset(s_tex_ids, 0, sizeof(s_tex_ids));
 	s_tex_count = 0;
 	s_textures_created = false;
+	if (s_woven_tex_id) { s_display->DestroyTexture(s_handle, s_woven_tex_id); s_woven_tex_id = 0; }
+	s_woven_tex_created = false;
 }
 
 // Drop one extra zone's Unity texture(s) after a live realloc (#172) so
@@ -768,11 +804,26 @@ MainQueryMirrorViewBlitDesc(UnitySubsystemHandle handle, void *userData,
                             const UnityXRMirrorViewBlitInfo info, UnityXRMirrorViewBlitDesc *desc)
 {
 	(void)handle; (void)userData; (void)info;
-	if (desc) {
-		desc->nativeBlitAvailable = false;
-		desc->nativeBlitInvalidStates = false;
-		desc->blitParamsCount = 0;   // no mirror blit; the runtime weaves to its window
+	if (!desc) return kUnitySubsystemErrorCodeSuccess;
+	desc->nativeBlitAvailable = false;
+	desc->nativeBlitInvalidStates = false;
+	// GameView weave-to-texture mirror (Task (a)): if texture mode published a woven
+	// texture, blit its canvas sub-rect into the Game window. Otherwise no mirror blit
+	// (the runtime weaves to its own window — the shipping default).
+	if (s_woven_tex_id != 0) {
+		int32_t cx = 0, cy = 0, cw = 0, ch = 0; uint32_t tw = 0, th = 0;
+		dxr_prov_get_woven_canvas(&cx, &cy, &cw, &ch, &tw, &th);
+		if (tw > 0 && th > 0 && cw > 0 && ch > 0) {
+			desc->blitParamsCount = 1;
+			desc->blitParams[0].srcTexId = s_woven_tex_id;
+			desc->blitParams[0].srcTexArraySlice = 0;
+			desc->blitParams[0].srcRect = { (float)cx / tw, (float)cy / th,
+			                                (float)cw / tw, (float)ch / th };
+			desc->blitParams[0].destRect = { 0.0f, 0.0f, 1.0f, 1.0f };
+			return kUnitySubsystemErrorCodeSuccess;
+		}
 	}
+	desc->blitParamsCount = 0;
 	return kUnitySubsystemErrorCodeSuccess;
 }
 
