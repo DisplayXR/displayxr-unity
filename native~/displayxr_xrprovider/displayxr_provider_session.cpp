@@ -2812,6 +2812,24 @@ int dxr_prov_session_start(const char *runtime_json_path,
 		}
 		if (s_probe_handle) {
 			win_binding.sharedTextureHandle = s_probe_handle;
+			// The Leia DP's texture-mode weave is CANVAS-DRIVEN: a plain projection
+			// gives the DP canvas=(0,0 0x0) → it writes nothing into the shared
+			// texture (confirmed: runtime log leia_dp_d3d11_process_atlas canvas 0x0,
+			// readback all-black). The cube_zones_texture_* reference apps work
+			// because they submit a display ZONE, which supplies the canvas. Force a
+			// full-window zone here so the DP has a canvas to weave into the shared
+			// texture. (DISPLAYXR_PROV_TEXTURE_PROBE_NOZONE=1 keeps the plain path for
+			// A/B.)
+			if (s_ps.has_display_zones && getenv("DISPLAYXR_PROV_TEXTURE_PROBE_NOZONE") == NULL) {
+				uint32_t ww = 0, wh = 0; ps_window_size(&ww, &wh);
+				if (ww == 0 || wh == 0) { ww = 1280; wh = 720; }
+				s_ps.zone_valid = 1;
+				s_ps.zone_id = 1;
+				s_ps.zone_x = 0; s_ps.zone_y = 0;
+				s_ps.zone_w = (int32_t)ww; s_ps.zone_h = (int32_t)wh;
+				ps_log("[DisplayXR-PROV] PROBE: forced full-window zone %dx%d as texture-mode canvas\n",
+				       s_ps.zone_w, s_ps.zone_h);
+			}
 			ps_log("[DisplayXR-PROV] PROBE: TEXTURE MODE active (%ux%u) — overlay window "
 			       "will NOT present; readback dumps once at frame %u.\n", pw, ph, kProbeDumpFrame);
 		} else {
@@ -3893,6 +3911,16 @@ int dxr_prov_submit_frame(uint32_t image_index)
 				ps_probe_dump_d3d11(dev, ctx, s_probe_tex11, path);
 			} else {
 				ps_probe_dump_d3d12(path);
+			}
+			// Localize the black: also dump the PRE-WEAVE eye texture (what Unity
+			// rendered into the bridge). Eye has content + shared black => lost in
+			// the weave/texture handoff. Eye also black => upstream (Unity render).
+			if (s_ps.graphics_api == DXR_GFX_D3D11 && s_ps.d3d11_bridge && s_ps.d3d11_bridge_own_eye[0]) {
+				const char *tmp = getenv("TEMP"); if (!tmp || !*tmp) tmp = ".";
+				char epath[512];
+				_snprintf_s(epath, sizeof(epath), _TRUNCATE, "%s\\displayxr_prov_eye0_preweave.bmp", tmp);
+				ps_probe_dump_d3d11(s_ps.own_d3d11_device, s_ps.own_d3d11_context,
+				                    s_ps.d3d11_bridge_own_eye[0], epath);
 			}
 			s_probe_dumped = 1;
 		}
