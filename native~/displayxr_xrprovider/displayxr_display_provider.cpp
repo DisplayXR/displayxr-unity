@@ -283,14 +283,17 @@ void create_textures_if_ready()
 	// Extra zones can come up alongside / after the primary; keep trying until wrapped.
 	if (s_textures_created) { create_extra_zone_textures(); return; }
 
-	// D3D11 zero-copy (#195): wrap the runtime's swapchain images DIRECTLY (no bridge).
+	// D3D11 zero-copy SPI (#195): wrap the runtime's swapchain images DIRECTLY (no bridge).
 	// Each image is a 2-slice SPI array on Unity's device; wrap ALL of them and
 	// PopulateNextFrameDesc selects s_tex_ids[acquired image index] each frame (the
-	// runtime rotates images, unlike the D3D12 path's single fixed bridge). D3D11 is
-	// always SPI (gated in session_start), so there is no MultiPass D3D11 branch.
+	// runtime rotates images, unlike the D3D12 path's single fixed bridge).
 	// EDITOR bridge (#195): the runtime images live on the OWN device — fall through to
 	// the SPI bridge arm below (wraps the single Unity-side bridge tex, like D3D12 SPI).
-	if (dxr_prov_get_graphics_api() == DXR_GFX_D3D11 && !dxr_prov_d3d11_bridge_active()) {
+	// D3D11 MultiPass (BiRP, #195): falls through to the MultiPass arm below, which wraps the
+	// two per-eye targets via dxr_prov_get_bridge_unity_texture_eye (D3D11-aware) — both
+	// sub-modes (zero-copy plain Unity textures / editor shared bridge).
+	if (dxr_prov_get_graphics_api() == DXR_GFX_D3D11 && !dxr_prov_d3d11_bridge_active()
+	    && dxr_prov_get_single_pass()) {
 		uint32_t sw = 0, sh = 0, sarr = 0, simgs = 0;
 		dxr_prov_get_swapchain_info(&sw, &sh, &sarr, &simgs);
 		if (simgs == 0 || sw == 0) return; // swapchain not created yet (await session-ready)

@@ -79,17 +79,20 @@ via `dxr_prov_set_single_pass` **before** the session starts:
 |----------|-------|-------|
 | **URP**  | **SPI** | **SPI** |
 | **HDRP** | **SPI** | **SPI** |
-| **BiRP** | *unsupported* (WARN + no-start) | **MultiPass** |
+| **BiRP** | **MultiPass** | **MultiPass** |
 
 - **URP and HDRP default to Single-Pass-Instanced (SPI) on both D3D11 and D3D12.** Both consume the
   full projection matrix above and render into the `arraySize=2` SPI swapchain (eyes = array slices
   0/1); the path is pipeline-agnostic. *(HDRP+D3D12 SPI was briefly gated off over a "washed-out
   splash" (#191); that washout is pipeline-wide — it repros on D3D12 MultiPass and D3D11 SPI too — so
   it's an HDRP lighting/exposure issue, not an SPI regression, and HDRP now defaults to SPI.)*
-- **BiRP → MultiPass** (SPI renders BiRP's off-center opaque geometry wrong). **MultiPass is a
-  D3D12-only path today** — the own-device bridge merges two single-slice per-eye textures into the
-  array swapchain; **there is no D3D11 MultiPass bridge yet, so BiRP+D3D11 no-starts with a WARN (use
-  D3D12 for BiRP).** Extending D3D11 to BiRP/MultiPass is a tracked follow-up.
+- **BiRP → MultiPass** (SPI renders BiRP's off-center opaque geometry wrong). **MultiPass runs on
+  both D3D11 and D3D12** (#195): each eye renders into its own single-slice texture, which the
+  provider copies (per slice) into the `arraySize=2` swapchain's slice 0/1. On **D3D12** the per-eye
+  textures are the own-device bridge; on **D3D11** they are plain Unity-device textures in a built
+  player (zero-copy, same-device `CopySubresourceRegion` + Flush) or the own-device shared bridge in
+  the editor (fence-ordered own-context copy). So **BiRP + D3D11 is fully supported** (editor +
+  player).
 - **D3D11 backend (#195):** built players use a **zero-copy** path (session bound on Unity's
   `ID3D11Device`); the **editor** uses an **own-device bridge** (separate `ID3D11Device` + NT-handle
   shared 2-slice bridge + shared `ID3D11Fence`) — Unity's editor GameView present would otherwise

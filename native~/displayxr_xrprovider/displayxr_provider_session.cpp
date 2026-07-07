@@ -337,10 +337,20 @@ typedef struct ProviderSession {
 	HANDLE               d3d11_fence_handle;
 	UINT64               d3d11_sync_val;
 	int                  d3d11_use_fence;      // 1 = ID3D11Device5 fence path, 0 = coarse flush
-	// Primary 2-slice shared bridge (legacy SHARED, own creates + Unity opens).
+	// Primary 2-slice shared bridge (SPI). own creates + Unity opens.
 	ID3D11Texture2D     *d3d11_bridge_own;     // own-device side (copy source)
 	ID3D11Texture2D     *d3d11_bridge_unity;   // Unity-device side (C# renders both eyes here)
 	HANDLE               d3d11_bridge_handle;
+	// MultiPass (BiRP) per-eye targets (#195): one single-slice texture per eye (one
+	// texture per render pass; textureArraySlice is SPI-only per the IUnityXRDisplay
+	// contract — mirrors the D3D12 bridge_*_eye[2] arrays). d3d11_bridge_unity_eye[e]
+	// is the render target Unity draws into in BOTH sub-modes (editor bridge = the
+	// Unity-opened shared side; zero-copy player = a plain Unity-device texture);
+	// d3d11_bridge_own_eye[e] is the editor bridge's own-device copy source (NULL in
+	// zero-copy). submit copies each eye into swapchain array slice 0/1.
+	ID3D11Texture2D     *d3d11_bridge_own_eye[2];
+	ID3D11Texture2D     *d3d11_bridge_unity_eye[2];
+	HANDLE               d3d11_bridge_handle_eye[2]; // closed at alloc; stays NULL
 
 	DxrProvDisplayInfo display_info;
 
@@ -917,8 +927,8 @@ static int ps_create_swapchain(void)
 
 	if (s_ps.graphics_api != DXR_GFX_D3D11)
 		ps_create_bridge();       // D3D12: pair the cross-device bridge with the swapchain
-	else if (s_ps.d3d11_bridge)
-		ps_create_bridge_d3d11(); // D3D11 editor bridge: own-device shared bridge (#195)
+	else
+		ps_create_bridge_d3d11(); // D3D11: per-sub-mode targets (SPI/MultiPass, bridge/zero-copy) (#195)
 	return 1;
 }
 
@@ -1213,19 +1223,53 @@ static int ps_alloc_shared_tex_d3d11(uint32_t w, uint32_t h, uint32_t arr,
 	return 1;
 }
 
-// The primary 2-slice shared bridge on the own D3D11 device, opened on Unity's device.
-// Unity renders both eyes into d3d11_bridge_unity; submit copies d3d11_bridge_own into
-// the acquired runtime swapchain image (both slices) on the own context. D3D11 is
-// always SPI (gated in session_start), so there are no per-eye MultiPass bridges.
+// Create the D3D11 render target(s) Unity draws into, sized to the swapchain. Handles
+// BOTH sub-modes (editor own-device bridge / zero-copy player) x BOTH render modes
+// (SPI / MultiPass), keyed on dxr_prov_get_single_pass(). Mirrors ps_create_bridge (D3D12).
+//   - EDITOR bridge: SPI = one shared 2-slice array (d3d11_bridge_own/unity); MultiPass =
+//     two shared single-slice per-eye textures (d3d11_bridge_*_eye[0/1]). own creates +
+//     Unity opens; submit copies the own side into the swapchain image on the own context.
+//   - ZERO-COPY player: SPI = nothing (Unity renders straight into the runtime swapchain
+//     image); MultiPass = two PLAIN Unity-device single-slice textures (d3d11_bridge_unity_
+//     eye[0/1], own side NULL); submit same-device-copies them into the image slices.
 static int ps_create_bridge_d3d11(void)
 {
-	if (!s_ps.own_d3d11_device || !s_ps.unity_d3d11_device) return 0;
+	if (!s_ps.unity_d3d11_device) return 0;
 	uint32_t w = s_ps.sc_width, h = s_ps.sc_height;
 	if (w == 0 || h == 0) return 0;
-	if (s_ps.d3d11_bridge_own) return 1; // already created (realloc releases first)
-	return ps_alloc_shared_tex_d3d11(w, h, 2, &s_ps.d3d11_bridge_own, &s_ps.d3d11_bridge_unity,
-	                                 &s_ps.d3d11_bridge_handle, s_ps.sc_format,
-	                                 "Bridge D3D11 (SPI 2-slice array)");
+	int sp = dxr_prov_get_single_pass();
+
+	if (s_ps.d3d11_bridge) {
+		if (!s_ps.own_d3d11_device) return 0;
+		if (sp) {
+			if (s_ps.d3d11_bridge_own) return 1; // already created (realloc releases first)
+			return ps_alloc_shared_tex_d3d11(w, h, 2, &s_ps.d3d11_bridge_own, &s_ps.d3d11_bridge_unity,
+			                                 &s_ps.d3d11_bridge_handle, s_ps.sc_format,
+			                                 "Bridge D3D11 (SPI 2-slice array)");
+		}
+		if (s_ps.d3d11_bridge_own_eye[0]) return 1; // already created
+		for (int e = 0; e < 2; e++) {
+			if (!ps_alloc_shared_tex_d3d11(w, h, 1, &s_ps.d3d11_bridge_own_eye[e],
+			                               &s_ps.d3d11_bridge_unity_eye[e], &s_ps.d3d11_bridge_handle_eye[e],
+			                               s_ps.sc_format,
+			                               e == 0 ? "Bridge D3D11 (MultiPass left)" : "Bridge D3D11 (MultiPass right)"))
+				return 0;
+		}
+		return 1;
+	}
+
+	// Zero-copy player.
+	if (sp) return 1; // Unity renders straight into the runtime images; nothing to allocate.
+	if (s_ps.d3d11_bridge_unity_eye[0]) return 1; // already created
+	for (int e = 0; e < 2; e++) {
+		s_ps.d3d11_bridge_unity_eye[e] = ps_alloc_unity_tex(w, h, 1, s_ps.sc_format);
+		if (!s_ps.d3d11_bridge_unity_eye[e]) {
+			ps_log("[DisplayXR-PROV] D3D11 zero-copy MultiPass eye %d target alloc failed\n", e);
+			return 0;
+		}
+	}
+	ps_log("[DisplayXR-PROV] D3D11 zero-copy MultiPass: 2 per-eye Unity targets %ux%u\n", w, h);
+	return 1;
 }
 
 // Cross-device copy sync helpers (#195 editor bridge). Signal after Unity's render;
@@ -1393,11 +1437,16 @@ static int ps_recreate_primary_swapchain(void)
 		if (s_ps.bridge_handle_eye[e]) { CloseHandle(s_ps.bridge_handle_eye[e]); s_ps.bridge_handle_eye[e] = NULL; }
 		if (s_ps.bridge_own_eye[e])   { s_ps.bridge_own_eye[e]->Release();   s_ps.bridge_own_eye[e] = NULL; }
 	}
-	// D3D11 editor bridge (#195): size-dependent shared bridge — release + recreate.
-	// (Keep own device + shared fence: size-independent, like the D3D12 shared fence.)
-	// The NT handle was already closed inside ps_alloc_shared_tex_d3d11 (field stays NULL).
+	// D3D11 size-dependent targets (#195): the SPI bridge (editor), the MultiPass per-eye
+	// targets (editor shared + zero-copy plain) — release + recreate. Keep own device +
+	// shared fence (size-independent, like the D3D12 shared fence). The NT handles were
+	// already closed inside ps_alloc_shared_tex_d3d11 (fields stay NULL).
 	if (s_ps.d3d11_bridge_unity) { s_ps.d3d11_bridge_unity->Release(); s_ps.d3d11_bridge_unity = NULL; }
 	if (s_ps.d3d11_bridge_own)   { s_ps.d3d11_bridge_own->Release();   s_ps.d3d11_bridge_own = NULL; }
+	for (int e = 0; e < 2; e++) {
+		if (s_ps.d3d11_bridge_unity_eye[e]) { s_ps.d3d11_bridge_unity_eye[e]->Release(); s_ps.d3d11_bridge_unity_eye[e] = NULL; }
+		if (s_ps.d3d11_bridge_own_eye[e])   { s_ps.d3d11_bridge_own_eye[e]->Release();   s_ps.d3d11_bridge_own_eye[e] = NULL; }
+	}
 
 	int ok = ps_create_swapchain(); // recomputes target size + re-pairs the bridge
 	ps_log("[DisplayXR-PROV] realloc: primary swapchain+bridge recreated -> %ux%u (%s)\n",
@@ -2279,16 +2328,11 @@ int dxr_prov_session_start(const char *runtime_json_path,
 		ps_log("[DisplayXR-PROV] start: missing Unity %s device\n", is_d3d11 ? "D3D11" : "D3D12");
 		return 0;
 	}
-	// D3D11 is a ZERO-COPY path: Unity renders both eyes straight into the runtime's
-	// arraySize=2 swapchain image, which only works in Single-Pass-Instanced (one pass,
-	// textureArraySlice 0/1). MultiPass would need two single-slice textures merged by a
-	// copy — the D3D12-only bridge path. So D3D11 requires SPI (URP/HDRP). On BiRP+D3D11
-	// C# sends MultiPass; gate cleanly rather than render garbage. (Bridge fallback = #195 follow-up.)
-	if (is_d3d11 && !dxr_prov_get_single_pass()) {
-		ps_log("[DisplayXR-PROV] start: D3D11 requires Single-Pass-Instanced (URP/HDRP). "
-		       "BiRP-on-D3D11 (MultiPass) is not yet supported — use D3D12 for BiRP (#195).\n");
-		return 0;
-	}
+	// D3D11 supports BOTH render modes (#195): SPI (URP/HDRP) renders both eyes into the
+	// arraySize=2 swapchain image directly (zero-copy) or via the editor bridge; MultiPass
+	// (BiRP) renders each eye into its own single-slice texture (per-eye zero-copy target
+	// or editor bridge) and submit copies each into swapchain slice 0/1 — the D3D11
+	// analogue of the D3D12 MultiPass bridge. No render-mode gate remains.
 
 	char *json = ps_resolve_runtime_json(runtime_json_path);
 	if (!json) { ps_log("[DisplayXR-PROV] No runtime JSON (set XR_RUNTIME_JSON)\n"); return 0; }
@@ -2603,10 +2647,16 @@ void dxr_prov_session_stop(void)
 	if (s_ps.own_queue)       s_ps.own_queue->Release();
 	if (s_ps.own_device)      s_ps.own_device->Release();
 
-	// D3D11 editor bridge (#195): primary bridge + shared fence + own device/context.
-	// (Texture NT handles were closed at alloc; the FENCE handle below IS still open.)
+	// D3D11 (#195): primary SPI bridge + MultiPass per-eye targets + shared fence + own
+	// device/context. (Texture NT handles were closed at alloc; the FENCE handle below IS
+	// still open.) The zero-copy MultiPass per-eye targets live in d3d11_bridge_unity_eye[]
+	// (own side NULL) and are released by the same loop.
 	if (s_ps.d3d11_bridge_unity)  s_ps.d3d11_bridge_unity->Release();
 	if (s_ps.d3d11_bridge_own)    s_ps.d3d11_bridge_own->Release();
+	for (int e = 0; e < 2; e++) {
+		if (s_ps.d3d11_bridge_unity_eye[e]) s_ps.d3d11_bridge_unity_eye[e]->Release();
+		if (s_ps.d3d11_bridge_own_eye[e])   s_ps.d3d11_bridge_own_eye[e]->Release();
+	}
 	if (s_ps.d3d11_fence_unity)   s_ps.d3d11_fence_unity->Release();
 	if (s_ps.d3d11_fence_handle)  CloseHandle(s_ps.d3d11_fence_handle); // fence handle IS an NT handle
 	if (s_ps.d3d11_fence_own)     s_ps.d3d11_fence_own->Release();
@@ -2760,6 +2810,10 @@ void *dxr_prov_get_bridge_unity_texture_eye(uint32_t eye, uint32_t *width, uint3
 	if (width) *width = s_ps.sc_width;
 	if (height) *height = s_ps.sc_height;
 	if (eye > 1) return NULL;
+	// D3D11 MultiPass (#195): the Unity-side per-eye render target (editor bridge = the
+	// Unity-opened shared side; zero-copy = a plain Unity texture). Else the D3D12 per-eye bridge.
+	if (s_ps.graphics_api == DXR_GFX_D3D11)
+		return (void *)s_ps.d3d11_bridge_unity_eye[eye];
 	return (void *)s_ps.bridge_unity_eye[eye]; // MultiPass mode; NULL in SPI mode
 }
 
@@ -3304,13 +3358,42 @@ int dxr_prov_submit_frame(uint32_t image_index)
 	// D3D11 EDITOR bridge (#195): the session is bound on our OWN device, so Unity's render
 	// lands in the shared bridge — copy it (own context) into the acquired swapchain image,
 	// ordered after Unity's render by the shared fence. Mirrors the D3D12 arm below.
-	if (s_ps.graphics_api == DXR_GFX_D3D11 && s_ps.d3d11_bridge) {
-		ps_d3d11_bridge_sync_before_copy(); // Unity signal + own wait (once/frame, before all copies)
-		if (s_ps.d3d11_bridge_own && image_index < s_ps.sc_image_count &&
-		    s_ps.sc_images_d3d11[image_index].texture && s_ps.own_d3d11_context) {
-			// CopyResource copies both array slices; 2D submits only slice 0 downstream.
-			s_ps.own_d3d11_context->CopyResource(s_ps.sc_images_d3d11[image_index].texture,
-			                                     s_ps.d3d11_bridge_own);
+	if (s_ps.graphics_api == DXR_GFX_D3D11) {
+		int sp = dxr_prov_get_single_pass();
+		ID3D11Texture2D *dst = (image_index < s_ps.sc_image_count)
+		                           ? s_ps.sc_images_d3d11[image_index].texture : NULL;
+		if (s_ps.d3d11_bridge) {
+			// EDITOR own-device bridge: own-context copy the shared own-side target(s) into the
+			// acquired swapchain image, ordered after Unity's render by the shared fence.
+			ps_d3d11_bridge_sync_before_copy(); // Unity signal + own wait (once/frame, before all copies)
+			if (dst && s_ps.own_d3d11_context) {
+				if (sp) {
+					// SPI: CopyResource copies both array slices; 2D submits only slice 0 downstream.
+					if (s_ps.d3d11_bridge_own)
+						s_ps.own_d3d11_context->CopyResource(dst, s_ps.d3d11_bridge_own);
+				} else {
+					// MultiPass: copy each per-eye texture into swapchain array slice 0/1.
+					for (UINT slice = 0; slice < submit_n; slice++) {
+						if (s_ps.d3d11_bridge_own_eye[slice])
+							s_ps.own_d3d11_context->CopySubresourceRegion(
+							        dst, D3D11CalcSubresource(0, slice, 1), 0, 0, 0,
+							        s_ps.d3d11_bridge_own_eye[slice], 0, NULL);
+					}
+				}
+			}
+		} else if (!sp) {
+			// ZERO-COPY player MultiPass: Unity rendered each eye into its own plain Unity-device
+			// texture; same-device-copy each into swapchain array slice 0/1 (no bridge/fence). SPI
+			// zero-copy rendered straight into the image — nothing to copy. The Flush below orders
+			// both against xrEndFrame.
+			if (dst && s_ps.unity_d3d11_context) {
+				for (UINT slice = 0; slice < submit_n; slice++) {
+					if (s_ps.d3d11_bridge_unity_eye[slice])
+						s_ps.unity_d3d11_context->CopySubresourceRegion(
+						        dst, D3D11CalcSubresource(0, slice, 1), 0, 0, 0,
+						        s_ps.d3d11_bridge_unity_eye[slice], 0, NULL);
+				}
+			}
 		}
 	} else if (s_ps.graphics_api != DXR_GFX_D3D11) {
 		int sp = dxr_prov_get_single_pass();
