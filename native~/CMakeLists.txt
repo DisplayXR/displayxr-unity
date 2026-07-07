@@ -106,7 +106,9 @@ set(HEADERS
 
 # Apple-only: IOSurface helpers (Objective-C) + transparent-overlay NSWindow config
 if(APPLE)
-    list(APPEND SOURCES displayxr_metal.m displayxr_macos.mm)
+    list(APPEND SOURCES displayxr_metal.m displayxr_macos.mm
+        displayxr_xrprovider/displayxr_provider_gfx_metal.mm)
+    list(APPEND HEADERS displayxr_xrprovider/displayxr_provider_gfx_metal.h)
     list(APPEND HEADERS displayxr_metal.h)
 endif()
 
@@ -180,7 +182,8 @@ if(APPLE)
         ${QUARTZCORE_FRAMEWORK}
     )
     # Enable ARC for Objective-C / Objective-C++ files
-    set_source_files_properties(displayxr_metal.m displayxr_macos.mm PROPERTIES
+    set_source_files_properties(displayxr_metal.m displayxr_macos.mm
+        displayxr_xrprovider/displayxr_provider_gfx_metal.mm PROPERTIES
         COMPILE_FLAGS "-fobjc-arc"
     )
 endif()
