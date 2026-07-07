@@ -5,6 +5,14 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.2] - 2026-07-07
+
+### Added
+- D3D11 provider now supports MultiPass (BiRP), mirroring the D3D12 own-device-bridge MultiPass path in both D3D11 sub-modes: built-player zero-copy (two plain Unity-device per-eye textures + same-device CopySubresourceRegion + Flush) and editor own-device bridge (two shared single-slice per-eye textures + fence-ordered own-context CopySubresourceRegion). BiRP + D3D11 is now fully supported (editor + player) — the previous no-start gate is removed. HW-verified on RTX 3080. (#195)
+
+### Changed
+- Render-path policy: BiRP → MultiPass on both D3D11 and D3D12 (was D3D12-only). URP/HDRP unchanged (SPI both APIs). Docs (CLAUDE.md render-path table + IsSinglePassEligible) updated.
+
 ## [2.3.1] - 2026-07-07
 
 ### Changed
