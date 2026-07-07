@@ -803,7 +803,17 @@ UnitySubsystemErrorCode UNITY_INTERFACE_API
 MainQueryMirrorViewBlitDesc(UnitySubsystemHandle handle, void *userData,
                             const UnityXRMirrorViewBlitInfo info, UnityXRMirrorViewBlitDesc *desc)
 {
-	(void)handle; (void)userData; (void)info;
+	(void)handle; (void)userData;
+	{
+		static bool q_logged = false;
+		if (!q_logged) { q_logged = true;
+			char buf[128];
+			_snprintf_s(buf, sizeof(buf), _TRUNCATE,
+			            "[DisplayXR-PROV] MainQueryMirrorViewBlitDesc CALLED (mode=%d)\n",
+			            info.mirrorBlitMode);
+			prov_log(buf);
+		}
+	}
 	if (!desc) return kUnitySubsystemErrorCodeSuccess;
 	desc->nativeBlitAvailable = false;
 	desc->nativeBlitInvalidStates = false;
@@ -820,6 +830,11 @@ MainQueryMirrorViewBlitDesc(UnitySubsystemHandle handle, void *userData,
 			desc->blitParams[0].srcRect = { (float)cx / tw, (float)cy / th,
 			                                (float)cw / tw, (float)ch / th };
 			desc->blitParams[0].destRect = { 0.0f, 0.0f, 1.0f, 1.0f };
+			{
+				static bool w_logged = false;
+				if (!w_logged) { w_logged = true;
+					prov_log("[DisplayXR-PROV] mirror blit: returning WOVEN texture blitParams (count=1)\n"); }
+			}
 			return kUnitySubsystemErrorCodeSuccess;
 		}
 	}

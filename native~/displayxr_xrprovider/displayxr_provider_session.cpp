@@ -3965,6 +3965,21 @@ int dxr_prov_submit_frame(uint32_t image_index)
 				ps_probe_dump_d3d11(s_ps.own_d3d11_device, s_ps.own_d3d11_context,
 				                    s_ps.d3d11_bridge_own_eye[0], epath);
 			}
+			// Cross-device coherence check: dump the UNITY-side view of the woven
+			// texture. If the own-side readback has content but this is black, the
+			// GameView blit reads black because Unity's device doesn't see the
+			// runtime's writes without a shared-fence sync.
+			if (s_probe_tex_unity && s_ps.unity_d3d11_device) {
+				ID3D11DeviceContext *uctx = NULL;
+				s_ps.unity_d3d11_device->GetImmediateContext(&uctx);
+				if (uctx) {
+					const char *tmp = getenv("TEMP"); if (!tmp || !*tmp) tmp = ".";
+					char upath[512];
+					_snprintf_s(upath, sizeof(upath), _TRUNCATE, "%s\\displayxr_prov_woven_unityside.bmp", tmp);
+					ps_probe_dump_d3d11(s_ps.unity_d3d11_device, uctx, s_probe_tex_unity, upath);
+					uctx->Release();
+				}
+			}
 			s_probe_dumped = 1;
 		}
 	}
