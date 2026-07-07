@@ -68,6 +68,34 @@ The rig also still calls `Camera.SetStereoProjectionMatrix(leftProj/rightProj)` 
 it; harmless/ignored on URP/HDRP), and exposes the per-eye matrices via `DisplayXRProvider` for any
 app that wants them.
 
+#### Render path (SPI vs MultiPass) × graphics API — the default policy
+
+The provider supports **D3D11 and D3D12** (selected at session create from
+`IUnityGraphics::GetRenderer()`; Vulkan/Metal are out of scope — the provider no-starts). The
+render-path decision is made in `DisplayXRDisplayLoader.IsSinglePassEligible()` and pushed to native
+via `dxr_prov_set_single_pass` **before** the session starts:
+
+| Pipeline | D3D11 | D3D12 |
+|----------|-------|-------|
+| **URP**  | **SPI** | **SPI** |
+| **HDRP** | **SPI** | **SPI** |
+| **BiRP** | *unsupported* (WARN + no-start) | **MultiPass** |
+
+- **URP and HDRP default to Single-Pass-Instanced (SPI) on both D3D11 and D3D12.** Both consume the
+  full projection matrix above and render into the `arraySize=2` SPI swapchain (eyes = array slices
+  0/1); the path is pipeline-agnostic. *(HDRP+D3D12 SPI was briefly gated off over a "washed-out
+  splash" (#191); that washout is pipeline-wide — it repros on D3D12 MultiPass and D3D11 SPI too — so
+  it's an HDRP lighting/exposure issue, not an SPI regression, and HDRP now defaults to SPI.)*
+- **BiRP → MultiPass** (SPI renders BiRP's off-center opaque geometry wrong). **MultiPass is a
+  D3D12-only path today** — the own-device bridge merges two single-slice per-eye textures into the
+  array swapchain; **there is no D3D11 MultiPass bridge yet, so BiRP+D3D11 no-starts with a WARN (use
+  D3D12 for BiRP).** Extending D3D11 to BiRP/MultiPass is a tracked follow-up.
+- **D3D11 backend (#195):** built players use a **zero-copy** path (session bound on Unity's
+  `ID3D11Device`); the **editor** uses an **own-device bridge** (separate `ID3D11Device` + NT-handle
+  shared 2-slice bridge + shared `ID3D11Fence`) — Unity's editor GameView present would otherwise
+  serialize with the in-process weaver on the shared device and deadlock (Optimus laptops).
+- Dev overrides (both APIs): `DISPLAYXR_FORCE_SPI=1` / `DISPLAYXR_FORCE_MULTIPASS=1`.
+
 The **only** pipeline-specific piece left is the opt-in URP foreground clip, which lives in a
 **URP-guarded sub-assembly** (`Runtime/URP/`, `Editor/URP/` — asmdefs gated by
 `defineConstraints: ["DISPLAYXR_URP"]` + a `versionDefines` that defines `DISPLAYXR_URP` only for

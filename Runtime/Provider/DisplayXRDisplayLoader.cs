@@ -93,16 +93,21 @@ namespace DisplayXR
         }
 
         /// <summary>
-        /// Whether to drive the provider in Single-Pass-Instanced mode. SPI is correct
-        /// only on URP/HDRP + Windows; on BiRP (where Unity builds each eye's off-center
-        /// projection MultiPass-only) it renders opaque geometry wrong, so we fall back to
-        /// MultiPass. Both D3D12 and D3D11 use SPI here — D3D11 is a ZERO-COPY path
-        /// (#195) that binds the session on Unity's device and can ONLY render into the
-        /// runtime's arraySize=2 swapchain image via SPI (MultiPass D3D11 would need the
-        /// D3D12-only bridge copy). Mirrors the platform half of the hook path's
-        /// <c>DisplayXRFeature.IsUrpWindowsD3D12</c>; the runtime-version half is already
-        /// implied (the provider hard-requires a recent runtime). Dev overrides:
-        /// <c>DISPLAYXR_FORCE_SPI=1</c> / <c>DISPLAYXR_FORCE_MULTIPASS=1</c>.
+        /// Whether to drive the provider in Single-Pass-Instanced (SPI) mode.
+        /// <para>
+        /// <b>Default render path:</b> <b>URP and HDRP both default to SPI on BOTH D3D11 and
+        /// D3D12.</b> They consume the provider's full per-eye projection matrix and render
+        /// into the arraySize=2 SPI swapchain (eyes = array slices 0/1), a pipeline-agnostic
+        /// path. <b>BiRP → MultiPass</b> (SPI renders BiRP's off-center opaque geometry wrong).
+        /// </para>
+        /// <para>
+        /// MultiPass is a <b>D3D12-only</b> path today (the own-device bridge merges two
+        /// single-slice eye textures into the array swapchain), so <b>BiRP+D3D11 is
+        /// unsupported</b> — the native provider WARNs and no-starts (use D3D12 for BiRP).
+        /// D3D11 itself is fully supported for URP/HDRP: zero-copy in built players, an
+        /// own-device bridge in the editor (#195).
+        /// </para>
+        /// Dev overrides: <c>DISPLAYXR_FORCE_SPI=1</c> / <c>DISPLAYXR_FORCE_MULTIPASS=1</c>.
         /// </summary>
         static bool IsSinglePassEligible()
         {
@@ -122,14 +127,26 @@ namespace DisplayXR
             bool isHdrp = typeName != null && typeName.Contains("HighDefinition");
 
             var gdt = SystemInfo.graphicsDeviceType;
-            // D3D12 (own-device + bridge): unchanged — SPI only on URP; HDRP/BiRP MultiPass.
-            if (gdt == GraphicsDeviceType.Direct3D12) return isUrp;
-            // D3D11 (#195): ZERO-COPY binds the session on Unity's device and can only render
-            // into the runtime's arraySize=2 swapchain image via SPI (MultiPass D3D11 would
-            // need the D3D12-only bridge copy). SPI is correct on URP + HDRP; BiRP+D3D11 stays
-            // ineligible → the native provider WARNs + no-starts (use D3D12 for BiRP).
-            if (gdt == GraphicsDeviceType.Direct3D11) return isUrp || isHdrp;
-            return false;
+            bool isD3D11 = gdt == GraphicsDeviceType.Direct3D11;
+            bool isD3D12 = gdt == GraphicsDeviceType.Direct3D12;
+            if (!isD3D11 && !isD3D12) return false; // provider is D3D11/D3D12 only
+
+            // DEFAULT RENDER-PATH POLICY:
+            //   URP  → Single-Pass-Instanced (SPI) on BOTH D3D11 and D3D12
+            //   HDRP → Single-Pass-Instanced (SPI) on BOTH D3D11 and D3D12
+            //   BiRP → MultiPass (SPI renders BiRP opaque geometry wrong)
+            // URP and HDRP both consume the provider's full per-eye projection matrix and
+            // render into the arraySize=2 SPI swapchain (the two eyes are array slices 0/1);
+            // that path is pipeline-agnostic, so SPI is the default for both APIs. HDRP+D3D12
+            // SPI was once gated off for a "washed-out splash" (#191), but that washout is
+            // pipeline-wide (it repros on D3D12 MultiPass and D3D11 SPI too) — an HDRP
+            // lighting/exposure issue, not an SPI regression — so HDRP now defaults to SPI too.
+            // BiRP falls back to MultiPass, which today is a D3D12-ONLY path (the own-device
+            // bridge merges two single-slice eye textures into the array swapchain). D3D11 has
+            // no MultiPass bridge yet, so BiRP+D3D11 is unsupported: the native provider WARNs
+            // and no-starts (use D3D12 for BiRP). Dev overrides: DISPLAYXR_FORCE_SPI /
+            // DISPLAYXR_FORCE_MULTIPASS (handled at the top of this method).
+            return isUrp || isHdrp;
         }
     }
 }
