@@ -51,6 +51,16 @@ namespace DisplayXR
         public static extern int dxr_prov_session_is_running();
 
         /// <summary>
+        /// Pump xrPollEvent (session-state machine + runtime event latches). On
+        /// Windows the native provider pumps from the graphics thread each frame;
+        /// on macOS the runtime's poll drains NSApp events + flushes CATransaction,
+        /// which are MAIN-thread-only (AppKit throws off-main) — so the driver calls
+        /// this every LateUpdate there instead (#204). No-op while no session runs.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void dxr_prov_poll_events();
+
+        /// <summary>
         /// Select the stereo render mode BEFORE the session starts (#166 task #8):
         /// 1 = Single-Pass-Instanced (URP+Win+D3D12 — 1 pass × 2 over a 2-slice array),
         /// 0 = MultiPass (BiRP/other — 2 pass × 1, one texture per eye). SPI renders

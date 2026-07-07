@@ -38,6 +38,12 @@ displayxr_metal_create_preview_window(uint32_t width, uint32_t height)
 		[s_preview_window setReleasedWhenClosed:NO];
 
 		s_preview_view = [[NSView alloc] initWithFrame:frame];
+		// Layer-HOSTING view with a CAMetalLayer (set layer BEFORE wantsLayer).
+		// The runtime's setup_external_window() takes the CAMetalLayer branch
+		// directly; the plain-backing-layer branch would dispatch_sync to the
+		// main queue — a deadlock when the session is created from Unity's
+		// render thread while the main thread blocks in GfxStart (#204).
+		[s_preview_view setLayer:[CAMetalLayer layer]];
 		[s_preview_view setWantsLayer:YES];
 		[s_preview_window setContentView:s_preview_view];
 

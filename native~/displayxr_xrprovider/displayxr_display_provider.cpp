@@ -29,6 +29,12 @@
 #include "../unity_pluginapi/IUnityGraphicsD3D12.h"
 #include "../unity_pluginapi/IUnityGraphicsD3D11.h" // #195
 #endif
+#ifdef __APPLE__
+#include "displayxr_provider_gfx_metal.h" // Metal device/queue glue (#204)
+#include "../displayxr_metal.h"           // provider weave window (SA-era preview window)
+// Zero-copy per-image per-eye slice view (defined in the session TU, #204).
+extern "C" void *dxr_prov_get_metal_eye_view(uint32_t image, uint32_t eye);
+#endif
 #include "../unity_pluginapi/IUnityXRDisplay.h"
 
 #include "displayxr_provider_session.h"
@@ -293,6 +299,50 @@ void create_textures_if_ready()
 	// Extra zones can come up alongside / after the primary; keep trying until wrapped.
 	if (s_textures_created) { create_extra_zone_textures(); return; }
 
+#ifdef __APPLE__
+	// Metal ZERO-COPY MultiPass (#204): wrap each swapchain image's per-eye
+	// slice views directly (image i, eye e → s_tex_ids[i*2+e]); Unity renders
+	// each eye straight into the acquired image's slice. No bridge, no blit —
+	// PopulateNextFrameDesc rotates to the acquired image index each frame,
+	// the Metal cousin of the D3D11 zero-copy image rotation below.
+	if (dxr_prov_get_graphics_api() == DXR_GFX_METAL) {
+		uint32_t sw = 0, sh = 0, sarr = 0, simgs = 0;
+		dxr_prov_get_swapchain_info(&sw, &sh, &sarr, &simgs);
+		if (simgs == 0 || sw == 0) return; // swapchain not created yet
+		if (simgs > 4) simgs = 4;          // s_tex_ids capacity: 4 images x 2 eyes
+		for (uint32_t i = 0; i < simgs; i++) {
+			for (uint32_t e = 0; e < 2; e++) {
+				void *view = dxr_prov_get_metal_eye_view(i, e);
+				if (!view) return; // views not ready yet
+				UnityXRRenderTextureDesc desc;
+				memset(&desc, 0, sizeof(desc));
+				desc.colorFormat = kUnityXRRenderTextureFormatRGBA32;
+				desc.color.nativePtr = view;
+				// DISPLAYXR_METAL_NO_DEPTH=1: crash-triage lever — skip the paired
+				// Unity depth allocation for the wrapped slice views (#204).
+				desc.depthFormat = getenv("DISPLAYXR_METAL_NO_DEPTH")
+				                       ? kUnityXRDepthTextureFormatNone
+				                       : kUnityXRDepthTextureFormat24bitOrGreater;
+				desc.depth.nativePtr = (void *)(uintptr_t)kUnityXRRenderTextureIdDontCare;
+				desc.width = sw;
+				desc.height = sh;
+				desc.textureArrayLength = 1; // single-slice view per eye
+				desc.flags = kUnityXRRenderTextureFlagsUVDirectionTopToBottom;
+				UnityXRRenderTextureId id = 0;
+				if (s_display->CreateTexture(s_handle, &desc, &id) != kUnitySubsystemErrorCodeSuccess) {
+					prov_log("[DisplayXR-PROV] CreateTexture (Metal slice view) failed\n");
+					return;
+				}
+				s_tex_ids[i * 2 + e] = id;
+			}
+		}
+		s_tex_count = simgs * 2;
+		s_textures_created = true;
+		prov_log("[DisplayXR-PROV] CreateTexture: wrapped swapchain slice views (Metal zero-copy MultiPass)\n");
+		return;
+	}
+#endif
+
 	// D3D11 zero-copy SPI (#195): wrap the runtime's swapchain images DIRECTLY (no bridge).
 	// Each image is a 2-slice SPI array on Unity's device; wrap ALL of them and
 	// PopulateNextFrameDesc selects s_tex_ids[acquired image index] each frame (the
@@ -402,6 +452,7 @@ void create_textures_if_ready()
 void destroy_textures()
 {
 	if (!s_display || !s_handle) return;
+	prov_log("[DisplayXR-PROV] destroy_textures: dropping wrapped Unity textures (rewrap)\n");
 	for (uint32_t i = 0; i < s_tex_count; i++)
 		if (s_tex_ids[i]) s_display->DestroyTexture(s_handle, s_tex_ids[i]);
 	memset(s_tex_ids, 0, sizeof(s_tex_ids));
@@ -466,8 +517,24 @@ GfxStart(UnitySubsystemHandle handle, void *userData, UnityXRRenderingCapabiliti
 		// wrong on BiRP). noSinglePassRenderingSupport=true tells Unity to use
 		// MultiPass; false allows the 1-pass-x-2 instanced path.
 		caps->noSinglePassRenderingSupport = dxr_prov_get_single_pass() ? false : true;
+#ifdef _WIN32
 		caps->invalidateRenderStateAfterEachCallback = true; // we touch D3D state
 		caps->skipPresentToMainScreen = false;
+#else
+		// macOS zero-copy touches NO Unity render state in the callbacks (no
+		// provider command buffers at all), and the invalidation path is what
+		// churns Metal render surfaces around each callback (#204 crash triage).
+		caps->invalidateRenderStateAfterEachCallback = false;
+		// macOS (#204): skip Unity's present-to-main-screen. With it on, Unity's
+		// Metal GameView drawable surfaces churn against the in-process weaver's
+		// presents and Unity SEGVs destroying a drawable-backed RenderSurface
+		// whose texture is nil (DestroyRenderSurfaceDesc, NULL vtable load —
+		// lldb-verified during Phase 2 bring-up; the Metal cousin of the D3D11
+		// GameView-present/weaver contention that forced the own-device bridge).
+		// The weave window is the preview surface; the GameView shows nothing
+		// XR-driven on macOS today (mirror blit is a Phase 4 topic, #206).
+		caps->skipPresentToMainScreen = true;
+#endif
 	}
 	prov_log(dxr_prov_get_single_pass()
 	             ? "[DisplayXR-PROV] GfxStart: render mode = Single-Pass-Instanced\n"
@@ -492,6 +559,19 @@ GfxStart(UnitySubsystemHandle handle, void *userData, UnityXRRenderingCapabiliti
 		if (!get_unity_d3d11(&dev)) return kUnitySubsystemErrorCodeFailure;
 		backend_kind = DXR_GFX_D3D11; dev_ptr = dev; queue_ptr = nullptr;
 	} else
+#elif defined(__APPLE__)
+	if (renderer == kUnityGfxRendererMetal) {
+		// Metal (#204): the session binds a provider-created MTLCommandQueue on
+		// UNITY'S MTLDevice (client-queue model — the runtime's in-process Metal
+		// compositor encodes on it, like the D3D11 zero-copy binding on Windows).
+		void *dev = dxr_prov_metal_unity_device();
+		void *q = dev ? dxr_prov_metal_create_session_queue() : nullptr;
+		if (!dev || !q) {
+			prov_log("[DisplayXR-PROV] Metal: no Unity MTLDevice/queue — session not started (#204)\n");
+			return kUnitySubsystemErrorCodeFailure;
+		}
+		backend_kind = DXR_GFX_METAL; dev_ptr = dev; queue_ptr = q;
+	} else
 #endif
 	{
 		char msg[256];
@@ -501,9 +581,8 @@ GfxStart(UnitySubsystemHandle handle, void *userData, UnityXRRenderingCapabiliti
 		         "provider requires Direct3D11 or Direct3D12 — session not started (#195).\n", renderer);
 #else
 		snprintf(msg, sizeof(msg),
-		         "[DisplayXR-PROV] WARN: unsupported graphics API (renderer=%d, Metal=%d). The "
-		         "macOS Metal backend is not implemented yet — session not started "
-		         "(macOS parity epic #202, Phase 2 = #204).\n", renderer, kUnityGfxRendererMetal);
+		         "[DisplayXR-PROV] WARN: unsupported graphics API (renderer=%d). The DisplayXR "
+		         "provider requires Metal on macOS — session not started (#202/#204).\n", renderer);
 #endif
 		prov_log(msg);
 		return kUnitySubsystemErrorCodeFailure;
@@ -549,7 +628,14 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 
 	if (!s_session_active) return kUnitySubsystemErrorCodeSuccess;
 
+#ifdef _WIN32
 	dxr_prov_poll_events();
+#else
+	// macOS (#204): xrPollEvent is pumped from the MAIN thread instead — the
+	// runtime's oxr_macos_pump_events drains NSApp events + flushes CATransaction,
+	// both main-thread-only (AppKit throws off-main). DisplayXRProviderDriver
+	// calls dxr_prov_poll_events() every LateUpdate on macOS.
+#endif
 	// Live tile realloc (#172): if the window/zone target size changed, the session
 	// recreates the swapchain+bridge here (between frames). Drop the stale Unity
 	// textures wrapping the old bridge so create_textures_if_ready rewraps the new one.
@@ -619,7 +705,17 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 			DxrProvView v;
 			dxr_prov_get_view(eye, &v);
 			UnityXRNextFrameDesc::UnityXRRenderPass &pass = next->renderPasses[eye];
+#ifdef __APPLE__
+			// Metal zero-copy: rotate to THIS frame's acquired image (i*2+eye);
+			// Unity renders each eye straight into the acquired slice view.
+			// DISPLAYXR_METAL_NO_ROTATE=1: bisection lever — always image 0.
+			uint32_t mimg = getenv("DISPLAYXR_METAL_NO_ROTATE") ? 0 : s_current_image_index;
+			pass.textureId = (dxr_prov_get_graphics_api() == DXR_GFX_METAL)
+			                     ? s_tex_ids[mimg * 2 + eye]
+			                     : s_tex_ids[eye];
+#else
 			pass.textureId = s_tex_ids[eye];
+#endif
 			pass.cullingPassIndex = eye;
 			pass.renderParamsCount = 1;
 			UnityXRNextFrameDesc::UnityXRRenderPass::UnityXRRenderParams &rp = pass.renderParams[0];
@@ -843,11 +939,18 @@ LifecycleStart(UnitySubsystemHandle handle, void *userData)
 	// thread, deadlocks: the input queues join while the main thread waits on
 	// GfxStart.) GfxStart binds the runtime to s_overlay_hwnd.
 #ifndef _WIN32
-	// macOS Phase 2 (#204) will decide the weave target here (runtime self-hosted
-	// NSWindow first, then displayxr_get_app_main_view()'s NSView). Until then the
-	// session never starts (GfxStart no-starts on Metal), so leave it self-host.
-	s_overlay_hwnd = nullptr;
-	prov_log("[DisplayXR-PROV] Lifecycle Start (macOS: runtime self-hosted window)\n");
+	// macOS (#204): create the provider's weave window HERE on the MAIN thread
+	// and bind its NSView via XrCocoaWindowBindingCreateInfoEXT. AppKit windows
+	// cannot be created off the main thread — the runtime's self-host NSWindow
+	// create inside xrCreateSession (GfxStart = render thread, while Unity's
+	// main thread is blocked waiting on GfxStart) deadlocks. The macOS analog
+	// of the Windows #173 lesson. Reuses the proven SA-era preview window
+	// (displayxr_metal.m); sized to a laptop-friendly default — the runtime
+	// tracks the live view size, and resize lands with the #172 reconcile.
+	s_overlay_hwnd = displayxr_metal_create_preview_window(1512, 982);
+	prov_log(s_overlay_hwnd
+	             ? "[DisplayXR-PROV] Lifecycle Start (macOS: provider weave window created on main thread)\n"
+	             : "[DisplayXR-PROV] Lifecycle Start (macOS: weave window FAILED; runtime offscreen)\n");
 #else
 	if (prov_want_dedicated_window()) {
 		// (#173) Editor Play Mode: a STANDALONE movable weave window that does NOT
@@ -935,6 +1038,12 @@ LifecycleStop(UnitySubsystemHandle handle, void *userData)
 		displayxr_destroy_provider_dedicated_window();
 		s_overlay_hwnd = nullptr;
 	}
+#else
+	// macOS (#204): destroy the provider weave window on the MAIN thread, after
+	// GfxStop already ran dxr_prov_session_stop (xrDestroySession released the
+	// runtime's references into the view) — mirrors the #173 teardown ordering.
+	displayxr_metal_destroy_preview_window();
+	s_overlay_hwnd = nullptr;
 #endif
 	prov_log("[DisplayXR-PROV] Lifecycle Stop\n");
 }

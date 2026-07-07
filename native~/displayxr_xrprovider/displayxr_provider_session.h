@@ -272,7 +272,10 @@ DISPLAYXR_EXPORT void dxr_prov_set_local2d_rect(int32_t x, int32_t y, int32_t w,
 // ---- Frame loop -------------------------------------------------------------
 
 /// Pump OpenXR session-state events (xrPollEvent). Drives the session to READY.
-void dxr_prov_poll_events(void);
+/// Exported for the macOS main-thread pump (#204): the runtime's poll drains
+/// NSApp events + flushes CATransaction (main-thread-only), so on macOS the C#
+/// driver calls this every LateUpdate instead of the graphics-thread pump.
+DISPLAYXR_EXPORT void dxr_prov_poll_events(void);
 
 /// Live tile realloc (#172): if the primary per-view target size (window×scaleXY,
 /// or the 3D-zone recommended view size) has changed and held stable, recreate the

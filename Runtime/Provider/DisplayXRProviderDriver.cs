@@ -59,6 +59,12 @@ namespace DisplayXR
 
         void LateUpdate()
         {
+#if UNITY_EDITOR_OSX || UNITY_STANDALONE_OSX
+            // macOS (#204): pump xrPollEvent from the MAIN thread — the runtime's
+            // poll drains NSApp events and flushes CATransaction (main-thread-only;
+            // AppKit throws off-main). Windows keeps the graphics-thread pump.
+            DisplayXRProviderNative.dxr_prov_poll_events();
+#endif
             if (DisplayXRProviderNative.dxr_prov_session_is_running() == 0)
             {
                 m_SessionStarted = false;

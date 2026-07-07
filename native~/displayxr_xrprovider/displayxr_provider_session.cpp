@@ -25,6 +25,7 @@
 #else
 #include <dlfcn.h> // dlopen/dlsym runtime load (macOS mirror of LoadLibraryExA)
 #define _strdup strdup
+#include "displayxr_provider_gfx_metal.h" // Metal blit/texture glue (#204)
 #endif
 
 #include <stdio.h>
@@ -405,6 +406,16 @@ typedef struct ProviderSession {
 	// in-process compositor is client-device, like the D3D11 zero-copy path).
 	// Parallel to sc_images/sc_images_d3d11 — only one array populated per session.
 	XrSwapchainImageMetalKHR sc_images_metal[PS_MAX_SWAPCHAIN_IMAGES];
+	// ZERO-COPY MultiPass (#204): per-image per-eye single-slice VIEWS of the
+	// arraySize=2 swapchain images (id<MTLTexture>, retained by the Metal glue).
+	// Unity renders each eye straight into its slice — NO provider blit: a
+	// provider blit CB touching session textures crashes the Unity editor's
+	// Metal GfxDeviceWorker (CreateMainTextureForRS/DestroyRenderSurfaceDesc
+	// NULL deref — lldb-verified, bring-up runs 7-18). Encoder-less signal/wait
+	// CBs are safe (run 19) and provide the render→weave order.
+	void *eye_view_metal[PS_MAX_SWAPCHAIN_IMAGES][2];
+	// Legacy blit-path per-eye targets (kept for DISPLAYXR_METAL_BLIT experiments).
+	void *eye_tex_metal[2];
 #endif
 	int         swapchain_created;
 
@@ -937,8 +948,13 @@ static int ps_create_swapchain(void)
 	s_ps.pfn_enumerate_swapchain_formats(s_ps.session, fmt_count, &fmt_count, formats);
 	int64_t format = formats[0];
 	for (uint32_t i = 0; i < fmt_count; i++) {
+#ifdef _WIN32
 		if (formats[i] == 28) { format = 28; break; } // DXGI_FORMAT_R8G8B8A8_UNORM
 		if (formats[i] == 87) { format = 87; }         // DXGI_FORMAT_B8G8R8A8_UNORM
+#else
+		if (formats[i] == 70) { format = 70; break; } // MTLPixelFormatRGBA8Unorm
+		if (formats[i] == 80) { format = 80; }         // MTLPixelFormatBGRA8Unorm
+#endif
 	}
 
 	XrSwapchainCreateInfo ci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
@@ -1013,10 +1029,37 @@ static int ps_create_swapchain(void)
 #else
 	ps_log("[DisplayXR-PROV] swapchain: %ux%u arraySize=2 submit=%u-view (%s), %u images, fmt=%lld, api=Metal\n",
 	       w, h, s_ps.sc_view_count, s_ps.sc_view_count >= 2 ? "3D" : "2D", count, (long long)format);
-	// Metal: no bridge — Phase 2 (#204) wires the per-eye MultiPass targets here.
+	// ZERO-COPY (#204): per-image per-eye slice views of the swapchain images —
+	// Unity renders straight into the slices; no provider blit (see the field
+	// comment on eye_view_metal). Realloc-safe: the glue parks replaced views
+	// in its graveyard (ADR-001 deferred destruction).
+	for (uint32_t i = 0; i < count; i++) {
+		for (uint32_t e = 0; e < 2; e++) {
+			s_ps.eye_view_metal[i][e] =
+			    dxr_prov_metal_slice_view(s_ps.sc_images_metal[i].texture, e);
+			if (!s_ps.eye_view_metal[i][e]) {
+				ps_log("[DisplayXR-PROV] Metal: slice view [%u][%u] failed\n", i, e);
+				return 0;
+			}
+		}
+	}
+	// Legacy blit-path targets, only when experimenting (DISPLAYXR_METAL_BLIT=1).
+	if (getenv("DISPLAYXR_METAL_BLIT")) {
+		for (uint32_t e = 0; e < 2; e++)
+			s_ps.eye_tex_metal[e] = dxr_prov_metal_alloc_eye_texture(w, h, format, e);
+	}
 #endif
 	return 1;
 }
+
+#ifdef __APPLE__
+// Internal (display-provider TU): the zero-copy per-image per-eye slice view.
+extern "C" void *dxr_prov_get_metal_eye_view(uint32_t image, uint32_t eye)
+{
+	if (image >= s_ps.sc_image_count || eye > 1) return NULL;
+	return s_ps.eye_view_metal[image][eye];
+}
+#endif
 
 #ifdef _WIN32
 // D3D11 zero-copy (#195): call xrGetD3D11GraphicsRequirementsKHR (mandatory before
@@ -2905,8 +2948,11 @@ void dxr_prov_session_stop(void)
 	// D3D11 zero-copy (#195): we don't own Unity's device, but GetImmediateContext AddRef'd.
 	if (s_ps.unity_d3d11_context) s_ps.unity_d3d11_context->Release();
 #endif // _WIN32
-	// Metal (#204): the session queue/device are retained+released by the Metal
-	// glue TU (dxr_prov_metal_teardown, Phase 2); nothing to release here yet.
+#ifdef __APPLE__
+	// Metal (#204): release everything the glue retained (session queue, shared
+	// event, per-eye targets). The device is Unity's — never released.
+	dxr_prov_metal_teardown();
+#endif
 
 	// Intentionally do NOT FreeLibrary(runtime_lib): background threads may still
 	// reference it (matches the standalone's deliberate leak).
@@ -3064,7 +3110,10 @@ void *dxr_prov_get_bridge_unity_texture_eye(uint32_t eye, uint32_t *width, uint3
 		return (void *)s_ps.d3d11_bridge_unity_eye[eye];
 	return (void *)s_ps.bridge_unity_eye[eye]; // MultiPass mode; NULL in SPI mode
 #else
-	return NULL; // Metal per-eye targets land in Phase 2 (#204)
+	// Metal MultiPass (#204): the per-eye render target (id<MTLTexture> on
+	// Unity's device, allocated in ps_create_swapchain). The display provider
+	// wraps it via CreateTexture exactly like the D3D per-eye targets.
+	return s_ps.eye_tex_metal[eye];
 #endif
 }
 
@@ -3717,11 +3766,26 @@ int dxr_prov_submit_frame(uint32_t image_index)
 		if (d11_diag) ps_log("[DisplayXR-PROV] D3D11 submit[%u]: flushed, pre-release\n", d11_frames);
 	}
 #else
-	// Metal (#204): the per-eye blit into the acquired swapchain image lands with
-	// the Metal backend (dxr_prov_metal_submit); Phase 1 never reaches here.
+	// Metal ZERO-COPY (#204): Unity already rendered each eye straight into the
+	// acquired image's slice views — nothing to copy. Order the compositor's
+	// weave (encoded on the session queue at xrEndFrame) after Unity's renders
+	// with encoder-less signal/wait CBs. DISPLAYXR_METAL_BLIT=1 revives the
+	// legacy per-eye blit path for experiments (known to crash the editor).
 	static unsigned d11_frames = 0;
 	int d11_diag = 0;
-	(void)image_index;
+	if (s_ps.graphics_api == DXR_GFX_METAL) {
+		static int use_blit = -1;
+		if (use_blit < 0) use_blit = getenv("DISPLAYXR_METAL_BLIT") ? 1 : 0;
+		if (use_blit && image_index < s_ps.sc_image_count &&
+		    s_ps.sc_images_metal[image_index].texture) {
+			if (!dxr_prov_metal_submit(s_ps.metal_queue,
+			                           s_ps.eye_tex_metal[0], s_ps.eye_tex_metal[1],
+			                           s_ps.sc_images_metal[image_index].texture, submit_n))
+				ps_log("[DisplayXR-PROV] Metal: submit blit failed\n");
+		} else {
+			dxr_prov_metal_order_weave(s_ps.metal_queue);
+		}
+	}
 #endif
 
 	if (s_ps.image_acquired) {
