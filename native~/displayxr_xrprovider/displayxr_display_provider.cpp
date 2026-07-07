@@ -16,15 +16,19 @@
 // Registered from displayxr_unity_plugin.cpp's UnityPluginLoad. Windows / D3D12,
 // M1 only. Does NOT touch the OpenXR hook path or the editor standalone path.
 
+#ifdef _WIN32
 #include <windows.h>
 #include <d3d12.h>
 #include <d3d11.h> // D3D11 zero-copy backend (#195)
 #include <dxgi1_4.h>
+#endif
 
 #include "../unity_pluginapi/IUnityInterface.h"
 #include "../unity_pluginapi/IUnityGraphics.h"
+#ifdef _WIN32
 #include "../unity_pluginapi/IUnityGraphicsD3D12.h"
 #include "../unity_pluginapi/IUnityGraphicsD3D11.h" // #195
+#endif
 #include "../unity_pluginapi/IUnityXRDisplay.h"
 
 #include "displayxr_provider_session.h"
@@ -35,15 +39,16 @@ extern "C" int displayxr_unity_get_renderer(void);
 
 #include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
-// Hook-path Win32 helper (displayxr_win32.c): finds Unity's main HWND and
-// creates a WS_CHILD overlay sized to its client area, subclassing Unity's
-// wndproc so the overlay tracks Unity's window on resize. In provider mode the
-// OpenXR hook is NOT installed, so the provider is the sole caller — the runtime
-// weaves into this overlay (in-app weave) and per-view resolution tracks the
-// overlay's live client size (displayxr_get_overlay_size).
+// Cross-platform weave-target helper: on Windows (displayxr_win32.c) it creates
+// the top-level overlay HWND tracking Unity's window; on macOS (displayxr_metal.m)
+// it returns a passthrough CAMetalLayer NSView added to Unity's window. In provider
+// mode the OpenXR hook is NOT installed, so the provider is the sole caller — the
+// runtime weaves into this surface (in-app weave).
 extern "C" void *displayxr_get_app_main_view(void);
+#ifdef _WIN32
 // (#166) Make the overlay a top-level WS_POPUP+NOREDIRECTIONBITMAP (composites the
 // runtime DComp weave) instead of a WS_CHILD. Call before displayxr_get_app_main_view().
 extern "C" void displayxr_set_provider_opaque_overlay(int enabled);
@@ -61,6 +66,7 @@ extern "C" void *displayxr_get_unity_main_hwnd(void);
 extern "C" void *displayxr_create_provider_dedicated_window(void);
 // (#173) Destroy that window on teardown so it doesn't linger frozen after Play stop.
 extern "C" void  displayxr_destroy_provider_dedicated_window(void);
+#endif
 
 // Must match Runtime/UnitySubsystemsManifest.json ("name" + display "id").
 static const char *k_plugin_name = "DisplayXR";
@@ -106,7 +112,9 @@ extern "C" void dxr_prov_file_log(const char *s); // defined in the session TU
 void prov_log(const char *msg)
 {
 	fprintf(stderr, "%s", msg);
+#ifdef _WIN32
 	OutputDebugStringA(msg);
+#endif
 	dxr_prov_file_log(msg);
 }
 
@@ -172,6 +180,7 @@ inline void set_eye_pose_rig_relative(
 // Acquire Unity's D3D12 device + command queue (graphics thread)
 // ============================================================================
 
+#ifdef _WIN32
 bool get_unity_d3d12(ID3D12Device **out_device, ID3D12CommandQueue **out_queue)
 {
 	*out_device = nullptr;
@@ -226,6 +235,7 @@ bool get_unity_d3d11(ID3D11Device **out_device)
 	*out_device = dev;
 	return true;
 }
+#endif // _WIN32
 
 // ============================================================================
 // CreateTexture: wrap each runtime swapchain image as a Unity render texture.
@@ -464,12 +474,15 @@ GfxStart(UnitySubsystemHandle handle, void *userData, UnityXRRenderingCapabiliti
 	             : "[DisplayXR-PROV] GfxStart: render mode = MultiPass (2 pass x 1)\n");
 
 	// Select the graphics backend from Unity's renderer (#195): D3D12 (own-device +
-	// shared bridge) or D3D11 (zero-copy on Unity's device). Anything else → one clear
-	// WARN + graceful no-start (instead of the confusing "ID3D12Device is not created yet").
+	// shared bridge) or D3D11 (zero-copy on Unity's device) on Windows. Anything else →
+	// one clear WARN + graceful no-start (instead of the confusing "ID3D12Device is not
+	// created yet"). macOS/Metal lands with the Metal backend (#204); until then Metal
+	// hits the WARN arm below with a pointer at the tracking issue.
 	int renderer = displayxr_unity_get_renderer();
 	int backend_kind = DXR_GFX_NONE;
 	void *dev_ptr = nullptr;
 	void *queue_ptr = nullptr;
+#ifdef _WIN32
 	if (renderer == kUnityGfxRendererD3D12) {
 		ID3D12Device *dev = nullptr; ID3D12CommandQueue *q = nullptr;
 		if (!get_unity_d3d12(&dev, &q)) return kUnitySubsystemErrorCodeFailure;
@@ -478,11 +491,20 @@ GfxStart(UnitySubsystemHandle handle, void *userData, UnityXRRenderingCapabiliti
 		ID3D11Device *dev = nullptr;
 		if (!get_unity_d3d11(&dev)) return kUnitySubsystemErrorCodeFailure;
 		backend_kind = DXR_GFX_D3D11; dev_ptr = dev; queue_ptr = nullptr;
-	} else {
-		char msg[192];
+	} else
+#endif
+	{
+		char msg[256];
+#ifdef _WIN32
 		snprintf(msg, sizeof(msg),
 		         "[DisplayXR-PROV] WARN: unsupported graphics API (renderer=%d). The DisplayXR "
 		         "provider requires Direct3D11 or Direct3D12 — session not started (#195).\n", renderer);
+#else
+		snprintf(msg, sizeof(msg),
+		         "[DisplayXR-PROV] WARN: unsupported graphics API (renderer=%d, Metal=%d). The "
+		         "macOS Metal backend is not implemented yet — session not started "
+		         "(macOS parity epic #202, Phase 2 = #204).\n", renderer, kUnityGfxRendererMetal);
+#endif
 		prov_log(msg);
 		return kUnitySubsystemErrorCodeFailure;
 	}
@@ -692,6 +714,7 @@ GfxSubmitCurrentFrame(UnitySubsystemHandle handle, void *userData)
 		return kUnitySubsystemErrorCodeSuccess;
 	}
 
+#ifdef _WIN32
 	// Cross-device handoff: Unity just rendered both eyes into the shared bridge
 	// (leaving it in RENDER_TARGET on Unity's device). Ask Unity to transition it
 	// to COMMON in its active command list so our SEPARATE device can read it
@@ -727,6 +750,7 @@ GfxSubmitCurrentFrame(UnitySubsystemHandle handle, void *userData)
 			}
 		}
 	}
+#endif // _WIN32
 
 	dxr_prov_submit_frame(s_current_image_index);
 	return kUnitySubsystemErrorCodeSuccess;
@@ -818,6 +842,13 @@ LifecycleStart(UnitySubsystemHandle handle, void *userData)
 	// attaches to / tracks Unity's main-thread window from GfxStart, the render
 	// thread, deadlocks: the input queues join while the main thread waits on
 	// GfxStart.) GfxStart binds the runtime to s_overlay_hwnd.
+#ifndef _WIN32
+	// macOS Phase 2 (#204) will decide the weave target here (runtime self-hosted
+	// NSWindow first, then displayxr_get_app_main_view()'s NSView). Until then the
+	// session never starts (GfxStart no-starts on Metal), so leave it self-host.
+	s_overlay_hwnd = nullptr;
+	prov_log("[DisplayXR-PROV] Lifecycle Start (macOS: runtime self-hosted window)\n");
+#else
 	if (prov_want_dedicated_window()) {
 		// (#173) Editor Play Mode: a STANDALONE movable weave window that does NOT
 		// track Unity's (whole-editor) window — coexists with the editor while still
@@ -886,6 +917,7 @@ LifecycleStart(UnitySubsystemHandle handle, void *userData)
 		s_overlay_hwnd = nullptr;
 		prov_log("[DisplayXR-PROV] Lifecycle Start (DISPLAYXR_PROV_SELFHOST: runtime self-hosts its own window)\n");
 	}
+#endif // _WIN32
 	return kUnitySubsystemErrorCodeSuccess;
 }
 
@@ -898,10 +930,12 @@ LifecycleStop(UnitySubsystemHandle handle, void *userData)
 	// ran dxr_prov_session_stop (xrDestroySession unhooked the SR weaver subclass) —
 	// so the destroy is clean. Built-player overlay/self-host paths don't create it
 	// (the call is a no-op there). A re-Play recreates it in LifecycleStart.
+#ifdef _WIN32
 	if (prov_want_dedicated_window()) {
 		displayxr_destroy_provider_dedicated_window();
 		s_overlay_hwnd = nullptr;
 	}
+#endif
 	prov_log("[DisplayXR-PROV] Lifecycle Stop\n");
 }
 

@@ -220,6 +220,43 @@ typedef struct XrCocoaWindowBindingCreateInfoEXT {
     XrBool32 transparentBackgroundEnabled; // SPEC_VERSION 5
 } XrCocoaWindowBindingCreateInfoEXT;
 
+// --- XR_KHR_metal_enable ---
+// Hand-defined: the fetched OpenXR-SDK release-1.0.34 headers predate the
+// Metal enable extension (it landed in the 1.1.x line), so openxr_platform.h
+// has no XrGraphicsBindingMetalKHR even with XR_USE_GRAPHICS_API_METAL set.
+// Struct-type values are the registry-assigned 1000029000..2. Canonical copy —
+// the dormant SA-era duplicate in displayxr_standalone_internal.h is not
+// included by any provider TU. The runtime also accepts the provisional alias
+// "XR_KHRX2_metal_enable"; the provider requests the plain name only.
+#ifndef XR_TYPE_GRAPHICS_BINDING_METAL_KHR
+#define XR_TYPE_GRAPHICS_BINDING_METAL_KHR ((XrStructureType)1000029000)
+#define XR_TYPE_SWAPCHAIN_IMAGE_METAL_KHR ((XrStructureType)1000029001)
+#define XR_TYPE_GRAPHICS_REQUIREMENTS_METAL_KHR ((XrStructureType)1000029002)
+#define XR_KHR_METAL_ENABLE_EXTENSION_NAME "XR_KHR_metal_enable"
+
+typedef struct XrGraphicsBindingMetalKHR {
+    XrStructureType type;
+    const void *next;
+    void *commandQueue; // id<MTLCommandQueue>, non-NULL required by the runtime
+} XrGraphicsBindingMetalKHR;
+
+typedef struct XrGraphicsRequirementsMetalKHR {
+    XrStructureType type;
+    void *next;
+    void *metalDevice; // id<MTLDevice> the runtime prefers
+} XrGraphicsRequirementsMetalKHR;
+
+typedef struct XrSwapchainImageMetalKHR {
+    XrStructureType type;
+    void *next;
+    void *texture; // id<MTLTexture>
+} XrSwapchainImageMetalKHR;
+
+typedef XrResult(XRAPI_PTR *PFN_xrGetMetalGraphicsRequirementsKHR)(
+    XrInstance instance, XrSystemId systemId,
+    XrGraphicsRequirementsMetalKHR *graphicsRequirements);
+#endif // XR_TYPE_GRAPHICS_BINDING_METAL_KHR
+
 // --- XR_EXT_atlas_capture ---
 // Vendor-neutral "snapshot the runtime's composed multi-view atlas to a PNG"
 // entry point. Replaces the app-side GPU readback (AsyncGPUReadback + hidden
