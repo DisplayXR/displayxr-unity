@@ -5,6 +5,11 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.1] - 2026-07-07
+
+### Changed
+- HDRP now defaults to Single-Pass-Instanced (SPI) on both D3D11 and D3D12 (was MultiPass on D3D12). URP + HDRP both default to SPI on both APIs; BiRP stays MultiPass (D3D12-only). The earlier HDRP+D3D12 SPI gate (#191, "washed-out splash") was dropped — that washout is a pipeline-wide HDRP lighting issue, not an SPI regression. Render-path policy documented in CLAUDE.md + IsSinglePassEligible. C#-only; native DLL unchanged.
+
 ## [2.3.0] - 2026-07-06
 
 ### Added
