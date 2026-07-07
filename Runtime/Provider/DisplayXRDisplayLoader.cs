@@ -52,9 +52,10 @@ namespace DisplayXR
             // the whole editor) and not self-host (no bound HWND → window-relative Kooima
             // dead + focus-switch crash). Opt into the dedicated standalone window (#173)
             // before the subsystem starts (LifecycleStart reads the flag). Built players
-            // keep the overlay default. Windows-only export, but the loader only runs on
-            // Windows (the provider is gated to Win+D3D12).
-            if (Application.isEditor)
+            // keep the overlay default. Windows-only behavior: on macOS the runtime
+            // self-hosts its NSWindow (the Metal bring-up shape, #204) — the dedicated
+            // flag also selects the D3D11 editor bridge, which doesn't exist there.
+            if (Application.platform == RuntimePlatform.WindowsEditor)
             {
                 DisplayXRProviderNative.dxr_prov_set_dedicated_window(1);
                 Debug.Log("[DisplayXR] Provider: editor Play Mode → dedicated weave window (#173)");
@@ -117,37 +118,38 @@ namespace DisplayXR
             if (System.Environment.GetEnvironmentVariable("DISPLAYXR_FORCE_SPI") == "1")
                 return true;
 
+            // EXPLICIT PLATFORM × GRAPHICS-API × PIPELINE POLICY TABLE (#202):
+            //
+            //   platform × API      | URP | HDRP | BiRP
+            //   --------------------|-----|------|------
+            //   Windows × D3D11     | SPI | SPI  | MultiPass
+            //   Windows × D3D12     | SPI | SPI  | MultiPass
+            //   macOS   × Metal     | MultiPass (all pipelines — bring-up policy, #204;
+            //                       |            SPI is a Phase 3 experiment, #205)
+            //   anything else       | MultiPass (moot — the native GfxStart no-starts)
+            //
+            // Windows rationale: URP and HDRP both consume the provider's full per-eye
+            // projection matrix and render into the arraySize=2 SPI swapchain (eyes =
+            // array slices 0/1) — pipeline-agnostic, so SPI on both APIs. HDRP+D3D12 SPI
+            // was once gated off for a "washed-out splash" (#191), but that washout is
+            // pipeline-wide (repros on D3D12 MultiPass and D3D11 SPI too) — an HDRP
+            // lighting/exposure issue, not an SPI regression. BiRP → MultiPass (SPI
+            // renders BiRP's off-center opaque geometry wrong); MultiPass runs on both
+            // D3D APIs (#195: per-eye single-slice textures copied into slices 0/1).
             var plat = Application.platform;
             bool isWindows = plat == RuntimePlatform.WindowsPlayer
                           || plat == RuntimePlatform.WindowsEditor;
-            if (!isWindows) return false;
+
+            var gdt = SystemInfo.graphicsDeviceType;
+            bool isD3D11 = gdt == GraphicsDeviceType.Direct3D11;
+            bool isD3D12 = gdt == GraphicsDeviceType.Direct3D12;
+            if (!isWindows || (!isD3D11 && !isD3D12))
+                return false; // macOS/Metal: MultiPass-first bring-up policy (#204)
 
             var rp = GraphicsSettings.currentRenderPipeline;
             var typeName = rp != null ? rp.GetType().FullName : null;
             bool isUrp  = typeName != null && typeName.Contains("Universal");
             bool isHdrp = typeName != null && typeName.Contains("HighDefinition");
-
-            var gdt = SystemInfo.graphicsDeviceType;
-            bool isD3D11 = gdt == GraphicsDeviceType.Direct3D11;
-            bool isD3D12 = gdt == GraphicsDeviceType.Direct3D12;
-            if (!isD3D11 && !isD3D12) return false; // provider is D3D11/D3D12 only
-
-            // DEFAULT RENDER-PATH POLICY:
-            //   URP  → Single-Pass-Instanced (SPI) on BOTH D3D11 and D3D12
-            //   HDRP → Single-Pass-Instanced (SPI) on BOTH D3D11 and D3D12
-            //   BiRP → MultiPass (SPI renders BiRP opaque geometry wrong)
-            // URP and HDRP both consume the provider's full per-eye projection matrix and
-            // render into the arraySize=2 SPI swapchain (the two eyes are array slices 0/1);
-            // that path is pipeline-agnostic, so SPI is the default for both APIs. HDRP+D3D12
-            // SPI was once gated off for a "washed-out splash" (#191), but that washout is
-            // pipeline-wide (it repros on D3D12 MultiPass and D3D11 SPI too) — an HDRP
-            // lighting/exposure issue, not an SPI regression — so HDRP now defaults to SPI too.
-            // BiRP falls back to MultiPass, which now runs on BOTH D3D11 and D3D12 (#195): each
-            // eye renders into its own single-slice texture that the provider copies into the
-            // array swapchain's slice 0/1 (D3D12 own-device bridge; D3D11 plain Unity textures
-            // in a built player / own-device bridge in the editor). So BiRP + D3D11 is fully
-            // supported. Dev overrides: DISPLAYXR_FORCE_SPI / DISPLAYXR_FORCE_MULTIPASS (handled
-            // at the top of this method).
             return isUrp || isHdrp;
         }
     }
