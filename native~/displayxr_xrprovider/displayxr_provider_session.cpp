@@ -2240,6 +2240,252 @@ void dxr_prov_get_extra_zone_view(uint32_t ei, uint32_t eye, DxrProvView *out_vi
 // Lifecycle
 // ============================================================================
 
+// ============================================================================
+// Weave-to-texture PROBE (experiment/provider-weave-to-texture)
+//
+// Env-gated diagnostic (DISPLAYXR_PROV_TEXTURE_PROBE=1). Binds the session in
+// TEXTURE MODE: passes a shared texture HANDLE on XrWin32WindowBindingCreateInfoEXT
+// so the runtime weaves the FINAL output into an app-provided texture instead of
+// presenting to the overlay window (windowHandle stays set for weaver position
+// tracking, mirroring test_apps/texture/cube_zones_texture_*). After a warmup gate
+// we read that texture back to a .bmp — proof the PLAIN (non-zones) projection
+// weave-to-texture is correct before building the GameView mirror-blit on top.
+//
+// Fully additive/reversible: with the env var unset every path is skipped and the
+// session binds exactly as before (windowHandle only). Windows/D3D-only TU.
+// NOTE: in texture mode the runtime does NOT present, so the overlay/dedicated
+// window stays blank while the probe runs — the .bmp is the success signal.
+// ============================================================================
+static int              s_probe_enabled = 0;    // DISPLAYXR_PROV_TEXTURE_PROBE
+static ID3D11Texture2D *s_probe_tex11   = NULL;  // shared texture (D3D11 bind)
+static ID3D12Resource  *s_probe_tex12   = NULL;  // shared texture (D3D12 bind)
+static HANDLE           s_probe_handle  = NULL;  // shared HANDLE handed to the runtime
+static unsigned         s_probe_frames  = 0;     // submit counter (dump gate)
+static int              s_probe_dumped  = 0;     // one-shot readback done
+static const unsigned   kProbeDumpFrame = 150;   // warmup gate (matches ref app)
+
+static int ps_probe_env(void)
+{
+	const char *e = getenv("DISPLAYXR_PROV_TEXTURE_PROBE");
+	return (e && *e && *e != '0') ? 1 : 0;
+}
+
+// Readback path: DISPLAYXR_PROV_TEXTURE_PROBE may carry a literal path (any value
+// other than "1"); otherwise default under %TEMP%.
+static void ps_probe_path(char *out, size_t n)
+{
+	const char *e = getenv("DISPLAYXR_PROV_TEXTURE_PROBE");
+	if (e && *e && strcmp(e, "1") != 0) { _snprintf_s(out, n, _TRUNCATE, "%s", e); return; }
+	const char *tmp = getenv("TEMP"); if (!tmp || !*tmp) tmp = ".";
+	_snprintf_s(out, n, _TRUNCATE, "%s\\displayxr_prov_texture_readback.bmp", tmp);
+}
+
+// Minimal uncompressed 24-bit BMP (bottom-up, BGR). src is B8G8R8A8_UNORM.
+static void ps_write_bmp_bgra(const char *path, uint32_t w, uint32_t h,
+                              const uint8_t *src, size_t rowPitch)
+{
+	if (!path || !*path || !src || w == 0 || h == 0) return;
+	const uint32_t rowBytes = w * 3;
+	const uint32_t pad = (4 - (rowBytes & 3)) & 3;
+	const uint32_t stride = rowBytes + pad;
+	const uint32_t imgSize = stride * h;
+	const uint32_t fileSize = 54 + imgSize;
+	uint8_t hdr[54] = {0};
+	hdr[0] = 'B'; hdr[1] = 'M';
+	hdr[2] = (uint8_t)fileSize; hdr[3] = (uint8_t)(fileSize >> 8);
+	hdr[4] = (uint8_t)(fileSize >> 16); hdr[5] = (uint8_t)(fileSize >> 24);
+	hdr[10] = 54;                          // pixel-data offset
+	hdr[14] = 40;                          // DIB header size
+	hdr[18] = (uint8_t)w; hdr[19] = (uint8_t)(w >> 8);
+	hdr[20] = (uint8_t)(w >> 16); hdr[21] = (uint8_t)(w >> 24);
+	hdr[22] = (uint8_t)h; hdr[23] = (uint8_t)(h >> 8);
+	hdr[24] = (uint8_t)(h >> 16); hdr[25] = (uint8_t)(h >> 24);
+	hdr[26] = 1;                           // planes
+	hdr[28] = 24;                          // bpp
+	hdr[34] = (uint8_t)imgSize; hdr[35] = (uint8_t)(imgSize >> 8);
+	hdr[36] = (uint8_t)(imgSize >> 16); hdr[37] = (uint8_t)(imgSize >> 24);
+	FILE *f = NULL; fopen_s(&f, path, "wb");
+	if (!f) { ps_log("[DisplayXR-PROV] PROBE: fopen failed for %s\n", path); return; }
+	fwrite(hdr, 1, 54, f);
+	uint8_t *row = (uint8_t *)malloc(stride);
+	if (row) {
+		memset(row, 0, stride);
+		for (int32_t y = (int32_t)h - 1; y >= 0; y--) {     // bottom-up
+			const uint8_t *s = src + (size_t)y * rowPitch;  // B,G,R,A
+			for (uint32_t x = 0; x < w; x++) {
+				row[x * 3 + 0] = s[x * 4 + 0]; // B
+				row[x * 3 + 1] = s[x * 4 + 1]; // G
+				row[x * 3 + 2] = s[x * 4 + 2]; // R
+			}
+			fwrite(row, 1, stride, f);
+		}
+		free(row);
+	}
+	fclose(f);
+	ps_log("[DisplayXR-PROV] PROBE: wrote readback %ux%u -> %s\n", w, h, path);
+}
+
+// Create a shared D3D11 texture (legacy MISC_SHARED → GetSharedHandle). Returns
+// the share HANDLE, or NULL. Stores the texture in s_probe_tex11.
+static HANDLE ps_probe_create_tex_d3d11(ID3D11Device *dev, uint32_t w, uint32_t h)
+{
+	if (!dev || w == 0 || h == 0) return NULL;
+	D3D11_TEXTURE2D_DESC td = {};
+	td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
+	td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+	td.SampleDesc.Count = 1;
+	td.Usage = D3D11_USAGE_DEFAULT;
+	td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+	td.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+	HRESULT hr = dev->CreateTexture2D(&td, NULL, &s_probe_tex11);
+	if (FAILED(hr) || !s_probe_tex11) {
+		ps_log("[DisplayXR-PROV] PROBE: D3D11 CreateTexture2D failed 0x%08X\n", hr);
+		return NULL;
+	}
+	IDXGIResource *dxgi = NULL;
+	hr = s_probe_tex11->QueryInterface(__uuidof(IDXGIResource), (void **)&dxgi);
+	if (FAILED(hr) || !dxgi) {
+		ps_log("[DisplayXR-PROV] PROBE: QI IDXGIResource failed 0x%08X\n", hr);
+		return NULL;
+	}
+	HANDLE sh = NULL;
+	hr = dxgi->GetSharedHandle(&sh);
+	dxgi->Release();
+	if (FAILED(hr) || !sh) {
+		ps_log("[DisplayXR-PROV] PROBE: GetSharedHandle failed 0x%08X\n", hr);
+		return NULL;
+	}
+	ps_log("[DisplayXR-PROV] PROBE: D3D11 shared texture %ux%u handle=%p\n", w, h, sh);
+	return sh;
+}
+
+// Create a shared D3D12 texture (HEAP_FLAG_SHARED → CreateSharedHandle NT handle).
+static HANDLE ps_probe_create_tex_d3d12(ID3D12Device *dev, uint32_t w, uint32_t h)
+{
+	if (!dev || w == 0 || h == 0) return NULL;
+	D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+	D3D12_RESOURCE_DESC rd = {};
+	rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+	rd.Width = w; rd.Height = h; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+	rd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+	rd.SampleDesc.Count = 1;
+	rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+	rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+	HRESULT hr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &rd,
+	        D3D12_RESOURCE_STATE_COMMON, NULL, __uuidof(ID3D12Resource), (void **)&s_probe_tex12);
+	if (FAILED(hr) || !s_probe_tex12) {
+		ps_log("[DisplayXR-PROV] PROBE: D3D12 CreateCommittedResource failed 0x%08X\n", hr);
+		return NULL;
+	}
+	HANDLE sh = NULL;
+	hr = dev->CreateSharedHandle(s_probe_tex12, NULL, GENERIC_ALL, NULL, &sh);
+	if (FAILED(hr) || !sh) {
+		ps_log("[DisplayXR-PROV] PROBE: D3D12 CreateSharedHandle failed 0x%08X\n", hr);
+		return NULL;
+	}
+	ps_log("[DisplayXR-PROV] PROBE: D3D12 shared texture %ux%u handle=%p\n", w, h, sh);
+	return sh;
+}
+
+// D3D11 readback: CopyResource shared→staging, Map, dump. The runtime weaves on
+// the SAME device/immediate context we use here, so a CopyResource after
+// xrEndFrame is naturally ordered (coherent).
+static void ps_probe_dump_d3d11(ID3D11Device *dev, ID3D11DeviceContext *ctx,
+                                ID3D11Texture2D *tex, const char *path)
+{
+	if (!dev || !ctx || !tex) return;
+	D3D11_TEXTURE2D_DESC d; tex->GetDesc(&d);
+	D3D11_TEXTURE2D_DESC sd = d;
+	sd.Usage = D3D11_USAGE_STAGING; sd.BindFlags = 0;
+	sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ; sd.MiscFlags = 0;
+	ID3D11Texture2D *staging = NULL;
+	if (FAILED(dev->CreateTexture2D(&sd, NULL, &staging)) || !staging) {
+		ps_log("[DisplayXR-PROV] PROBE: D3D11 staging create failed\n"); return;
+	}
+	ctx->CopyResource(staging, tex);
+	ctx->Flush();
+	D3D11_MAPPED_SUBRESOURCE m = {};
+	if (SUCCEEDED(ctx->Map(staging, 0, D3D11_MAP_READ, 0, &m))) {
+		ps_write_bmp_bgra(path, d.Width, d.Height, (const uint8_t *)m.pData, m.RowPitch);
+		ctx->Unmap(staging, 0);
+	} else {
+		ps_log("[DisplayXR-PROV] PROBE: D3D11 Map failed\n");
+	}
+	staging->Release();
+}
+
+// D3D12 readback: copy shared tex → READBACK buffer on the own queue, wait, map,
+// dump. Best-effort — there is no shared fence with the runtime's compositor
+// queue here, so a torn frame is possible; the static-ish scene keeps it legible.
+static void ps_probe_dump_d3d12(const char *path)
+{
+	if (!s_probe_tex12 || !s_ps.own_device || !s_ps.own_queue ||
+	    !s_ps.own_cmd_alloc || !s_ps.own_cmd_list || !s_ps.own_fence) return;
+	D3D12_RESOURCE_DESC rd = s_probe_tex12->GetDesc();
+	D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {}; UINT rows = 0; UINT64 rowBytes = 0, total = 0;
+	s_ps.own_device->GetCopyableFootprints(&rd, 0, 1, 0, &fp, &rows, &rowBytes, &total);
+	D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_READBACK;
+	D3D12_RESOURCE_DESC bd = {};
+	bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+	bd.Width = total; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+	bd.Format = DXGI_FORMAT_UNKNOWN; bd.SampleDesc.Count = 1;
+	bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+	ID3D12Resource *rb = NULL;
+	if (FAILED(s_ps.own_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd,
+	        D3D12_RESOURCE_STATE_COPY_DEST, NULL, __uuidof(ID3D12Resource), (void **)&rb)) || !rb) {
+		ps_log("[DisplayXR-PROV] PROBE: D3D12 readback buffer create failed\n"); return;
+	}
+	s_ps.own_cmd_alloc->Reset();
+	s_ps.own_cmd_list->Reset(s_ps.own_cmd_alloc, NULL);
+	D3D12_RESOURCE_BARRIER b = {};
+	b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	b.Transition.pResource = s_probe_tex12; b.Transition.Subresource = 0;
+	b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+	b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+	s_ps.own_cmd_list->ResourceBarrier(1, &b);
+	D3D12_TEXTURE_COPY_LOCATION dl = {};
+	dl.pResource = rb; dl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dl.PlacedFootprint = fp;
+	D3D12_TEXTURE_COPY_LOCATION sl = {};
+	sl.pResource = s_probe_tex12; sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; sl.SubresourceIndex = 0;
+	s_ps.own_cmd_list->CopyTextureRegion(&dl, 0, 0, 0, &sl, NULL);
+	D3D12_RESOURCE_BARRIER b2 = b;
+	b2.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+	b2.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+	s_ps.own_cmd_list->ResourceBarrier(1, &b2);
+	s_ps.own_cmd_list->Close();
+	ID3D12CommandList *lists[] = { s_ps.own_cmd_list };
+	s_ps.own_queue->ExecuteCommandLists(1, lists);
+	s_ps.own_fence_value++;
+	s_ps.own_queue->Signal(s_ps.own_fence, s_ps.own_fence_value);
+	if (s_ps.own_fence->GetCompletedValue() < s_ps.own_fence_value) {
+		s_ps.own_fence->SetEventOnCompletion(s_ps.own_fence_value, s_ps.own_fence_event);
+		WaitForSingleObject(s_ps.own_fence_event, INFINITE);
+	}
+	void *p = NULL; D3D12_RANGE range = {0, (SIZE_T)total};
+	if (SUCCEEDED(rb->Map(0, &range, &p)) && p) {
+		ps_write_bmp_bgra(path, (uint32_t)rd.Width, (uint32_t)rd.Height,
+		                  (const uint8_t *)p, fp.Footprint.RowPitch);
+		rb->Unmap(0, NULL);
+	} else {
+		ps_log("[DisplayXR-PROV] PROBE: D3D12 readback Map failed\n");
+	}
+	rb->Release();
+}
+
+// Release probe resources (called from dxr_prov_session_stop and defensively at start).
+static void ps_probe_cleanup(void)
+{
+	if (s_probe_tex11) { s_probe_tex11->Release(); s_probe_tex11 = NULL; }
+	if (s_probe_tex12) {
+		s_probe_tex12->Release(); s_probe_tex12 = NULL;
+		if (s_probe_handle) { CloseHandle(s_probe_handle); } // D3D12 CreateSharedHandle → NT handle
+	}
+	// D3D11 MISC_SHARED GetSharedHandle is owned by the resource — do NOT CloseHandle.
+	s_probe_handle = NULL;
+	s_probe_frames = 0;
+	s_probe_dumped = 0;
+}
+
 int dxr_prov_session_start(const char *runtime_json_path,
                            int backend_kind,
                            void *unity_device,
@@ -2544,6 +2790,31 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	win_binding.transparentBackgroundEnabled = use_transparent ? XR_TRUE : XR_FALSE;
 	win_binding.chromaKeyColor = 0;
 
+	// Weave-to-texture PROBE (experiment): bind in TEXTURE MODE so the runtime
+	// weaves into our shared texture instead of presenting to the overlay window.
+	// windowHandle stays set (weaver position tracking), mirroring the ref app.
+	s_probe_enabled = ps_probe_env();
+	ps_probe_cleanup(); // clears counters + any leftover texture from a prior session
+	if (s_probe_enabled) {
+		DisplayXRDisplayInfo *pdi = &displayxr_get_state()->display_info;
+		uint32_t pw = pdi->display_pixel_width  ? pdi->display_pixel_width  : 1920;
+		uint32_t ph = pdi->display_pixel_height ? pdi->display_pixel_height : 1080;
+		if (is_d3d11) {
+			ID3D11Device *bindDev = s_ps.d3d11_bridge ? s_ps.own_d3d11_device
+			                                          : s_ps.unity_d3d11_device;
+			s_probe_handle = ps_probe_create_tex_d3d11(bindDev, pw, ph);
+		} else {
+			s_probe_handle = ps_probe_create_tex_d3d12(s_ps.own_device, pw, ph);
+		}
+		if (s_probe_handle) {
+			win_binding.sharedTextureHandle = s_probe_handle;
+			ps_log("[DisplayXR-PROV] PROBE: TEXTURE MODE active (%ux%u) — overlay window "
+			       "will NOT present; readback dumps once at frame %u.\n", pw, ph, kProbeDumpFrame);
+		} else {
+			ps_log("[DisplayXR-PROV] PROBE: shared-texture create FAILED — window mode.\n");
+		}
+	}
+
 	// D3D11 (#195): bind DIRECTLY on Unity's ID3D11Device (no queue — the runtime's
 	// native D3D11 compositor uses the immediate context). D3D12: bind on our own device.
 	XrGraphicsBindingD3D11KHR d3d11 = {};
@@ -2623,6 +2894,7 @@ void dxr_prov_session_stop(void)
 			if (z->bridge_own_eye[e]) z->bridge_own_eye[e]->Release();
 		}
 	}
+	ps_probe_cleanup(); // weave-to-texture PROBE shared texture + handle (experiment)
 	if (s_ps.swapchain && s_ps.pfn_destroy_swapchain) s_ps.pfn_destroy_swapchain(s_ps.swapchain);
 	if (s_ps.session && s_ps.session_ready && s_ps.pfn_end_session) s_ps.pfn_end_session(s_ps.session);
 	if (s_ps.session && s_ps.pfn_destroy_session) s_ps.pfn_destroy_session(s_ps.session);
@@ -3603,6 +3875,24 @@ int dxr_prov_submit_frame(uint32_t image_index)
 	if (d11_diag) ps_log("[DisplayXR-PROV] D3D11 submit[%u]: post-xrEndFrame r=%d\n", d11_frames, r);
 	if (s_ps.graphics_api == DXR_GFX_D3D11 && d11_frames < 100000) d11_frames++;
 	if (XR_FAILED(r)) { ps_log("[DisplayXR-PROV] xrEndFrame failed: %d\n", r); return 0; }
+
+	// Weave-to-texture PROBE: one-shot readback of the runtime-woven shared texture
+	// after the warmup gate. The runtime wove into it during xrEndFrame above.
+	if (s_probe_enabled && s_probe_handle && !s_probe_dumped) {
+		if (++s_probe_frames >= kProbeDumpFrame) {
+			char path[512]; ps_probe_path(path, sizeof(path));
+			if (s_ps.graphics_api == DXR_GFX_D3D11) {
+				ID3D11Device *dev = s_ps.d3d11_bridge ? s_ps.own_d3d11_device
+				                                      : s_ps.unity_d3d11_device;
+				ID3D11DeviceContext *ctx = s_ps.d3d11_bridge ? s_ps.own_d3d11_context
+				                                             : s_ps.unity_d3d11_context;
+				ps_probe_dump_d3d11(dev, ctx, s_probe_tex11, path);
+			} else {
+				ps_probe_dump_d3d12(path);
+			}
+			s_probe_dumped = 1;
+		}
+	}
 	return 1;
 }
 
