@@ -5,6 +5,15 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.0] - 2026-07-06
+
+### Added
+- D3D11 graphics backend for the provider: zero-copy in built players; editor own-device bridge (separate ID3D11Device + NT-handle shared 2-slice bridge + shared ID3D11Fence) that resolves the Optimus editor Play-Mode deadlock. SPI-only (URP/HDRP); BiRP+D3D11 warns and no-starts.
+- wsui HUD / Local2D / extra-zone secondary layers render on D3D11 (both zero-copy and bridge sub-modes).
+
+### Changed
+- Provider backend selected from IUnityGraphics renderer (D3D11 or D3D12); D3D12 path unchanged (byte-identical).
+
 ## [2.2.2] - 2026-07-05
 
 ### Fixed
