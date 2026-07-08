@@ -114,8 +114,8 @@ namespace DisplayXR
         /// <summary>
         /// Whether to drive the provider in Single-Pass-Instanced (SPI) mode.
         /// <para>
-        /// <b>Default render path:</b> <b>URP and HDRP both default to SPI on BOTH D3D11 and
-        /// D3D12.</b> They consume the provider's full per-eye projection matrix and render
+        /// <b>Default render path:</b> <b>URP and HDRP both default to SPI on D3D11, D3D12,
+        /// and Metal.</b> They consume the provider's full per-eye projection matrix and render
         /// into the arraySize=2 SPI swapchain (eyes = array slices 0/1), a pipeline-agnostic
         /// path. <b>BiRP → MultiPass</b> (SPI renders BiRP's off-center opaque geometry wrong).
         /// </para>
@@ -142,33 +142,41 @@ namespace DisplayXR
             //   --------------------|-----|------|------
             //   Windows × D3D11     | SPI | SPI  | MultiPass
             //   Windows × D3D12     | SPI | SPI  | MultiPass
-            //   macOS   × Metal     | MultiPass (all pipelines — bring-up policy, #204;
-            //                       |            SPI is a Phase 3 experiment, #205)
+            //   macOS   × Metal     | SPI | SPI  | MultiPass
             //   anything else       | MultiPass (moot — the native GfxStart no-starts)
             //
-            // Windows rationale: URP and HDRP both consume the provider's full per-eye
+            // Rationale: URP and HDRP both consume the provider's full per-eye
             // projection matrix and render into the arraySize=2 SPI swapchain (eyes =
-            // array slices 0/1) — pipeline-agnostic, so SPI on both APIs. HDRP+D3D12 SPI
-            // was once gated off for a "washed-out splash" (#191), but that washout is
+            // array slices 0/1) — pipeline-agnostic, so SPI regardless of API. On
+            // Metal the whole arraySize=2 swapchain image is wrapped as one 2-slice
+            // Unity texture and Unity renders both eyes into it (#205, hardware-
+            // verified: correct off-center stereo, no regression). HDRP+D3D12 SPI was
+            // once gated off for a "washed-out splash" (#191), but that washout is
             // pipeline-wide (repros on D3D12 MultiPass and D3D11 SPI too) — an HDRP
             // lighting/exposure issue, not an SPI regression. BiRP → MultiPass (SPI
-            // renders BiRP's off-center opaque geometry wrong); MultiPass runs on both
-            // D3D APIs (#195: per-eye single-slice textures copied into slices 0/1).
+            // renders BiRP's off-center opaque geometry wrong); MultiPass runs on all
+            // three APIs (per-eye single-slice textures woven into slices 0/1: D3D
+            // #195, Metal zero-copy slice views #204).
             var plat = Application.platform;
             bool isWindows = plat == RuntimePlatform.WindowsPlayer
                           || plat == RuntimePlatform.WindowsEditor;
+            bool isMac = plat == RuntimePlatform.OSXPlayer
+                      || plat == RuntimePlatform.OSXEditor;
 
             var gdt = SystemInfo.graphicsDeviceType;
             bool isD3D11 = gdt == GraphicsDeviceType.Direct3D11;
             bool isD3D12 = gdt == GraphicsDeviceType.Direct3D12;
-            if (!isWindows || (!isD3D11 && !isD3D12))
-                return false; // macOS/Metal: MultiPass-first bring-up policy (#204)
+            bool isMetal = gdt == GraphicsDeviceType.Metal;
+            bool apiEligible = (isWindows && (isD3D11 || isD3D12))
+                            || (isMac && isMetal);
+            if (!apiEligible)
+                return false; // unsupported platform/API: MultiPass (native no-starts)
 
             var rp = GraphicsSettings.currentRenderPipeline;
             var typeName = rp != null ? rp.GetType().FullName : null;
             bool isUrp  = typeName != null && typeName.Contains("Universal");
             bool isHdrp = typeName != null && typeName.Contains("HighDefinition");
-            return isUrp || isHdrp;
+            return isUrp || isHdrp; // BiRP (rp == null) → MultiPass
         }
     }
 }

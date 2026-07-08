@@ -309,6 +309,37 @@ void create_textures_if_ready()
 		uint32_t sw = 0, sh = 0, sarr = 0, simgs = 0;
 		dxr_prov_get_swapchain_info(&sw, &sh, &sarr, &simgs);
 		if (simgs == 0 || sw == 0) return; // swapchain not created yet
+		// SPI experiment (#205): wrap each WHOLE arraySize=2 swapchain image as
+		// one 2-slice Unity texture (the Metal cousin of the D3D11 zero-copy SPI
+		// arm below); PopulateNextFrameDesc rotates to the acquired image.
+		if (dxr_prov_get_single_pass()) {
+			if (simgs > 8) simgs = 8;
+			for (uint32_t i = 0; i < simgs; i++) {
+				uint32_t w = 0, h = 0, arr = 0;
+				void *tex = dxr_prov_get_swapchain_image_texture(i, &w, &h, &arr);
+				if (!tex || w == 0) return; // image not ready
+				UnityXRRenderTextureDesc desc;
+				memset(&desc, 0, sizeof(desc));
+				desc.colorFormat = kUnityXRRenderTextureFormatRGBA32;
+				desc.color.nativePtr = tex;
+				desc.depthFormat = kUnityXRDepthTextureFormat24bitOrGreater;
+				desc.depth.nativePtr = (void *)(uintptr_t)kUnityXRRenderTextureIdDontCare;
+				desc.width = w;
+				desc.height = h;
+				desc.textureArrayLength = arr; // 2 -> SPI texture array
+				desc.flags = kUnityXRRenderTextureFlagsUVDirectionTopToBottom;
+				UnityXRRenderTextureId id = 0;
+				if (s_display->CreateTexture(s_handle, &desc, &id) != kUnitySubsystemErrorCodeSuccess) {
+					prov_log("[DisplayXR-PROV] CreateTexture (Metal SPI array) failed\n");
+					return;
+				}
+				s_tex_ids[i] = id;
+			}
+			s_tex_count = simgs;
+			s_textures_created = true;
+			prov_log("[DisplayXR-PROV] CreateTexture: wrapped Metal swapchain arrays (zero-copy SPI, #205)\n");
+			return;
+		}
 		if (simgs > 4) simgs = 4;          // s_tex_ids capacity: 4 images x 2 eyes
 		for (uint32_t i = 0; i < simgs; i++) {
 			for (uint32_t e = 0; e < 2; e++) {
@@ -663,12 +694,13 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 		// Single-Pass-Instanced: 1 render pass, 2 render params over the 2-slice
 		// array (slice 0 = left, slice 1 = right). Correct on URP/HDRP.
 		// D3D12 + D3D11 editor bridge: the single fixed bridge is s_tex_ids[0]. D3D11
-		// zero-copy (player): Unity renders directly into the acquired runtime swapchain
-		// image, so pick the texture wrapping THIS frame's acquired image.
+		// zero-copy (player) and Metal zero-copy SPI (#205): Unity renders directly
+		// into the acquired runtime swapchain image, so pick the texture wrapping
+		// THIS frame's acquired image.
+		bool rotate = (dxr_prov_get_graphics_api() == DXR_GFX_D3D11 && !dxr_prov_d3d11_bridge_active())
+		              || dxr_prov_get_graphics_api() == DXR_GFX_METAL;
 		UnityXRNextFrameDesc::UnityXRRenderPass &pass = next->renderPasses[0];
-		pass.textureId = (dxr_prov_get_graphics_api() == DXR_GFX_D3D11 && !dxr_prov_d3d11_bridge_active())
-		                     ? s_tex_ids[s_current_image_index]
-		                     : s_tex_ids[0];
+		pass.textureId = rotate ? s_tex_ids[s_current_image_index] : s_tex_ids[0];
 		pass.cullingPassIndex = 0;
 		pass.renderParamsCount = 2;
 
