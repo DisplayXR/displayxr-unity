@@ -26,19 +26,62 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Short-circuit doc-only / empty pushes so the required checks
+  # (Windows x64, macOS (Universal)) report success in seconds without a
+  # native compile. An EMPTY diff also counts as docs_only: the only
+  # zero-file pushes to main are /dxr-release's empty "Release vX.Y.Z"
+  # marker commits — their real build runs on the v* tag push (forced
+  # docs_only=false below). Mirrors displayxr-runtime's build-windows.yml.
+  DetectChanges:
+    runs-on: ubuntu-latest
+    outputs:
+      docs_only: ${{ steps.filter.outputs.docs_only }}
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0
+      - id: filter
+        run: |
+          # Tag pushes are releases — always build.
+          if [ "${{ github.ref_type }}" = "tag" ]; then
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+            echo "Tag push — forcing docs_only=false"
+            exit 0
+          fi
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BASE=${{ github.event.pull_request.base.sha }}
+          else
+            BASE=${{ github.event.before }}
+          fi
+          CHANGED=$(git diff --name-only "$BASE" HEAD)
+          # Every changed file matches a doc/boilerplate pattern → docs_only.
+          # Empty diff (marker commit) → docs_only too. Runs under bash -e,
+          # so a bad BASE object fails the job rather than faking empty.
+          NON_DOC=$(echo "$CHANGED" | grep -vE '^(docs/|.*\.md$|LICENSE$|\.github/ISSUE_TEMPLATE/)' || true)
+          if [ -z "$NON_DOC" ]; then
+            echo "docs_only=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "docs_only=false" >> "$GITHUB_OUTPUT"
+          fi
+          echo "docs_only=$(grep ^docs_only= "$GITHUB_OUTPUT" | cut -d= -f2)"
+
   build-windows:
     name: Windows x64
+    needs: DetectChanges
     runs-on: windows-latest
     steps:
       - uses: actions/checkout@v5
 
       - name: Configure CMake
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         run: cmake -S native~ -B native~/build -A x64 -DCMAKE_BUILD_TYPE=Release
 
       - name: Build
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         run: cmake --build native~/build --config Release
 
       - name: Verify output
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
           if (!(Test-Path "Runtime/Plugins/Windows/x64/displayxr_unity.dll")) {
             Write-Error "DLL not found at expected path"
@@ -48,6 +91,7 @@ jobs:
           Get-Item "Runtime/Plugins/Windows/x64/displayxr_unity.dll" | Select-Object Name, Length
 
       - name: Upload artifact
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         uses: actions/upload-artifact@v6
         with:
           name: displayxr_unity-windows-x64
@@ -55,17 +99,21 @@ jobs:
 
   build-macos:
     name: macOS (Universal)
+    needs: DetectChanges
     runs-on: macos-latest
     steps:
       - uses: actions/checkout@v5
 
       - name: Configure CMake
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         run: cmake -S native~ -B native~/build -DCMAKE_BUILD_TYPE=Release -DCMAKE_OSX_ARCHITECTURES="x86_64;arm64"
 
       - name: Build
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         run: cmake --build native~/build --config Release
 
       - name: Verify output
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
           BUNDLE="Runtime/Plugins/macOS/displayxr_unity.bundle"
           if [ ! -d "$BUNDLE" ]; then
@@ -77,6 +125,7 @@ jobs:
           file "$BUNDLE/displayxr_unity" 2>/dev/null || file "$BUNDLE/Contents/MacOS/displayxr_unity" 2>/dev/null || echo "Binary location varies by CMake version"
 
       - name: Upload artifact
+        if: needs.DetectChanges.outputs.docs_only != 'true'
         uses: actions/upload-artifact@v6
         with:
           name: displayxr_unity-macos
@@ -227,9 +276,11 @@ jobs:
   # ── Package job: runs on main push (non-tag) ─────────────────────────
   package:
     name: Package Plugin Binaries
-    needs: [build-windows, build-macos]
+    needs: [DetectChanges, build-windows, build-macos]
     runs-on: ubuntu-latest
-    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    # Skip on docs-only / empty (marker) main pushes — the build jobs
+    # short-circuit and upload no artifacts, so there's nothing to package.
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push' && needs.DetectChanges.outputs.docs_only != 'true'
     steps:
       - uses: actions/checkout@v5
 
