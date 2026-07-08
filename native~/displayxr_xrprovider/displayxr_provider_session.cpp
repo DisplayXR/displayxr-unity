@@ -2271,6 +2271,7 @@ static int s_init_gv_x = 0, s_init_gv_y = 0, s_init_gv_w = 0, s_init_gv_h = 0;
 // the display-provider can wrap it via CreateTexture and mirror-blit it into the
 // editor Game window. Opened lazily on first request (graphics thread, session ready).
 static ID3D11Texture2D *s_probe_tex_unity = NULL;
+static ID3D12Resource  *s_probe_tex12_unity = NULL; // D3D12 Unity-device view of the woven shared tex
 static uint32_t         s_probe_woven_w = 0, s_probe_woven_h = 0;
 
 static int ps_probe_env(void)
@@ -2498,9 +2499,25 @@ void *dxr_prov_get_woven_unity_texture(uint32_t *w, uint32_t *h)
 			ps_log("[DisplayXR-PROV] PROBE: woven texture opened on Unity device for GameView mirror\n");
 		}
 	}
+	// D3D12: open the NT-shared handle on Unity's ID3D12Device (mirrors the per-eye
+	// bridge's OpenSharedHandle in ps_alloc_shared_bridge). On the D3D12 path
+	// unity_d3d11_device is NULL (only unity_device is set), so the D3D11 branch above
+	// is skipped. Unity accepts an ID3D12Resource* in desc.color.nativePtr on a D3D12
+	// device — create_woven_mirror_texture_if_ready wraps whatever we return here.
+	if (s_probe_enabled && s_probe_handle && !s_probe_tex12_unity &&
+	    s_ps.graphics_api == DXR_GFX_D3D12 && s_ps.unity_device) {
+		HRESULT hr = s_ps.unity_device->OpenSharedHandle(
+		        s_probe_handle, __uuidof(ID3D12Resource), (void **)&s_probe_tex12_unity);
+		if (FAILED(hr) || !s_probe_tex12_unity) {
+			s_probe_tex12_unity = NULL;
+			ps_log("[DisplayXR-PROV] PROBE: OpenSharedHandle(woven, Unity D3D12 dev) failed 0x%08X\n", hr);
+		} else {
+			ps_log("[DisplayXR-PROV] PROBE: woven texture opened on Unity D3D12 device for GameView mirror\n");
+		}
+	}
 	if (w) *w = s_probe_woven_w;
 	if (h) *h = s_probe_woven_h;
-	return s_probe_tex_unity;
+	return s_probe_tex_unity ? (void *)s_probe_tex_unity : (void *)s_probe_tex12_unity;
 }
 
 // The woven content occupies the canvas sub-rect of the shared texture; report it
@@ -2538,6 +2555,9 @@ void dxr_prov_get_woven_canvas(int32_t *x, int32_t *y, int32_t *cw, int32_t *ch,
 static void ps_probe_cleanup(void)
 {
 	if (s_probe_tex_unity) { s_probe_tex_unity->Release(); s_probe_tex_unity = NULL; }
+	// D3D12 Unity-device view: Release only — the NT handle it was opened from
+	// (s_probe_handle) is CloseHandle'd once in the s_probe_tex12 block below.
+	if (s_probe_tex12_unity) { s_probe_tex12_unity->Release(); s_probe_tex12_unity = NULL; }
 	s_probe_woven_w = 0; s_probe_woven_h = 0;
 	if (s_probe_tex11) { s_probe_tex11->Release(); s_probe_tex11 = NULL; }
 	if (s_probe_tex12) {
