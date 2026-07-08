@@ -1243,12 +1243,23 @@ static int s_dedicated_class_registered = 0;
 // Custom SC_MOVE/SC_SIZE drag state (mirrors s_sa.dragging / sizing_edge).
 static int   s_ded_dragging     = 0;
 static int   s_ded_sizing_edge  = 0;   // WMSZ_* (1..8) while resizing, else 0
+static int   s_ded_clickthrough = 0;   // glued probe window: pass ALL mouse to the editor below
 static POINT s_ded_drag_cursor  = {0, 0};
 static RECT  s_ded_drag_rect    = {0, 0, 0, 0};
 
 static LRESULT CALLBACK
 dedicated_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
+	// Glued probe window (Task (a)): the window is parked exactly over the editor Game
+	// view as an invisible geometry proxy for the weaver/Kooima. Report EVERY point as
+	// transparent so ALL mouse (buttons AND motion) falls through to Unity's Game view
+	// underneath — otherwise this window swallows the button (Mouse.current.leftButton
+	// stays false) and the in-game drag controller never activates (motion via raw-input
+	// delta still works, which is why it looked like "moves then resets" while the window
+	// jittered on/off the panel). More reliable than WS_EX_TRANSPARENT alone.
+	if (s_ded_clickthrough && msg == WM_NCHITTEST)
+		return HTTRANSPARENT;
+
 	// Track mouse-button state in the shared s_vkey_state table so the app can read
 	// it via displayxr_get_overlay_pointer. The woven output is a SEPARATE window
 	// from Unity's Game View, so Unity's Input System doesn't see clicks here
@@ -1462,12 +1473,13 @@ displayxr_create_provider_dedicated_window(void)
 	int have_init = dxr_prov_get_initial_gameview_rect(&igx, &igy, &igw, &igh);
 
 	// In the glued probe path the window is parked exactly over the editor Game view (it's
-	// only a geometry proxy for the weaver/Kooima — texture mode never presents to it). Make
-	// it CLICK-THROUGH (WS_EX_TRANSPARENT | WS_EX_LAYERED) so mouse messages pass through to
-	// the Game view underneath; otherwise it swallows them and the in-game mouse controller
-	// goes dead (keyboard still works — the window is NOACTIVATE, never focused).
+	// only a geometry proxy for the weaver/Kooima — texture mode never presents to it).
+	// WS_EX_LAYERED (+ alpha 0 below) keeps it invisible; the WM_NCHITTEST → HTTRANSPARENT
+	// handler (gated on s_ded_clickthrough) passes ALL mouse through to the Game view
+	// underneath so the in-game mouse controller keeps working.
 	DWORD ex_style = WS_EX_NOACTIVATE | WS_EX_TOPMOST;
-	if (have_init) ex_style |= WS_EX_TRANSPARENT | WS_EX_LAYERED;
+	if (have_init) { ex_style |= WS_EX_LAYERED; s_ded_clickthrough = 1; }
+	else s_ded_clickthrough = 0;
 
 	s_dedicated_hwnd = CreateWindowExW(
 		ex_style,
@@ -2673,14 +2685,28 @@ displayxr_get_overlay_pointer(int *clientX, int *clientY, int *buttons)
 	}
 
 	if (buttons != NULL) {
-		// s_vkey_state is updated by shell_subclass_proc on Unity's HWND
-		// (installed via displayxr_install_focus_hook from the transparent
-		// path). PostMessage'd left/right/middle clicks from overlay_wnd_proc
-		// flow through Unity's wndproc → subclass → here.
 		int b = 0;
-		if (s_vkey_state[VK_LBUTTON] & 0x8000) b |= 1;
-		if (s_vkey_state[VK_RBUTTON] & 0x8000) b |= 2;
-		if (s_vkey_state[VK_MBUTTON] & 0x8000) b |= 4;
+		if (s_ded_clickthrough) {
+			// GameView weave-to-texture probe (Task (a)): the weave window is
+			// click-through (WM_NCHITTEST → HTTRANSPARENT) so it never receives
+			// WM_LBUTTONDOWN, and the focus-hook subclass is skipped in this path —
+			// so s_vkey_state is never populated. The editor Game view is the
+			// clickable surface here, so read the physical button state globally
+			// (GetAsyncKeyState). Motion comes from Mouse.current.delta (raw input to
+			// the foreground editor). This lets the sample controller's provider-mode
+			// button path (displayxr_get_overlay_pointer) drive left-drag rotate.
+			if (GetAsyncKeyState(VK_LBUTTON) & 0x8000) b |= 1;
+			if (GetAsyncKeyState(VK_RBUTTON) & 0x8000) b |= 2;
+			if (GetAsyncKeyState(VK_MBUTTON) & 0x8000) b |= 4;
+		} else {
+			// s_vkey_state is updated by shell_subclass_proc on Unity's HWND
+			// (installed via displayxr_install_focus_hook from the transparent
+			// path). PostMessage'd left/right/middle clicks from overlay_wnd_proc
+			// flow through Unity's wndproc → subclass → here.
+			if (s_vkey_state[VK_LBUTTON] & 0x8000) b |= 1;
+			if (s_vkey_state[VK_RBUTTON] & 0x8000) b |= 2;
+			if (s_vkey_state[VK_MBUTTON] & 0x8000) b |= 4;
+		}
 		*buttons = b;
 	}
 }

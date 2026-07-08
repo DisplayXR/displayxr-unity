@@ -2861,7 +2861,7 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	// Unconditional build marker: if this line is ABSENT from the log, the editor is
 	// running a STALE DLL (restart Unity). If present with env_probe=0, the env var
 	// DISPLAYXR_PROV_TEXTURE_PROBE=1 did not reach the editor process.
-	ps_log("[DisplayXR-PROV] PROBE build=weave-to-texture-clickthrough env_probe=%d\n", s_probe_enabled);
+	ps_log("[DisplayXR-PROV] PROBE build=weave-to-texture-asyncbtn env_probe=%d\n", s_probe_enabled);
 	ps_probe_cleanup(); // clears counters + any leftover texture from a prior session
 	if (s_probe_enabled) {
 		DisplayXRDisplayInfo *pdi = &displayxr_get_state()->display_info;

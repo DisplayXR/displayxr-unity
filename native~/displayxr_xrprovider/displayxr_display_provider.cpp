@@ -994,10 +994,21 @@ LifecycleStart(UnitySubsystemHandle handle, void *userData)
 		// WS_EX_NOACTIVATE so it should not steal foreground from the editor in the
 		// first place (that alone keeps input alive, like the standalone preview) —
 		// the hook is belt-and-braces / parity with the overlay path.
+		//
+		// EXCEPTION — GameView weave-to-texture probe (Task (a)): the weave window is
+		// glued OVER the editor Game view and the editor IS the foreground app, so the
+		// hook is not needed here. Worse, its main-window subclass reclaims focus on
+		// WM_KILLFOCUS (SetFocus) and suppresses WM_ACTIVATE — meant for a cloaked/
+		// off-screen Unity — which FIGHTS the Game view taking focus for a mouse drag
+		// (keyboard still works via the raw-input sink, so it looked like "mouse dead,
+		// keyboard fine"). Skip it in the probe path.
 		void *unity_hwnd = displayxr_get_unity_main_hwnd();
-		if (unity_hwnd != nullptr) {
+		bool probe_texture = (getenv("DISPLAYXR_PROV_TEXTURE_PROBE") != nullptr);
+		if (unity_hwnd != nullptr && !probe_texture) {
 			displayxr_install_focus_hook(unity_hwnd);
 			prov_log("[DisplayXR-PROV] Lifecycle Start: installed keyboard focus/raw-input hooks (dedicated window)\n");
+		} else if (probe_texture) {
+			prov_log("[DisplayXR-PROV] Lifecycle Start: SKIPPED focus hook (texture probe — editor is foreground; hook fights GameView mouse focus)\n");
 		}
 	} else if (prov_want_app_window()) {
 		// App-owned window (default, built players): create a TOP-LEVEL WS_POPUP

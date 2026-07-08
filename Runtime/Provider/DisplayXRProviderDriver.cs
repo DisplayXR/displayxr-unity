@@ -91,7 +91,10 @@ namespace DisplayXR
         static FieldInfo    s_parentField;       // EditorWindow.m_Parent (HostView)
         static PropertyInfo s_screenPosProp;     // GUIView.screenPosition (Rect, LOGICAL points)
         static PropertyInfo s_pppProp;           // EditorGUIUtility.pixelsPerPoint (DPI scale)
-        static MemberInfo   s_targetSizeMember;  // GameView.targetSize (Vector2, PHYSICAL px)
+        static MethodInfo   s_mainTargetSizeMethod; // static GetMainGameViewTargetSize (Vector2 px)
+        static float        s_cachedPpp;         // stable DPI scale, cached once (>0 = valid)
+        static bool         s_haveLastGood;      // last sane render rect (replay fallback)
+        static int          s_lgX, s_lgY, s_lgW, s_lgH;
         static bool         s_loggedGlueOnce;
         static bool         s_loggedInitOnce;
 
@@ -104,11 +107,15 @@ namespace DisplayXR
             return s_probeGate == 1;
         }
 
-        // Compute the visible Game view's RENDER-area rect in physical px. Size comes from
-        // GameView.targetSize (the render-target pixel size — DPI-independent, excludes the
-        // toolbar); position from the HostView screenPosition (points) × pixelsPerPoint,
-        // offset down by the toolbar (= host physical height − render height). Returns false
-        // outside the editor / before a GameView exists.
+        // Compute the visible Game view's RENDER-area rect in physical px. SIZE comes from
+        // Unity's own GetMainGameViewTargetSize() (the render-target pixel size it uses to
+        // allocate the main Game view — one stable value, no instance juggling). POSITION
+        // comes from the HostView screenPosition of the GameView instance whose width MATCHES
+        // that size (× a cached stable ppp, offset down by the toolbar). Insane readings are
+        // rejected and the last-good rect returned instead, so a transient (0x0 / full-screen)
+        // reading during a play/layout transition never borns a wrong-size zone (low-res
+        // replay) or jumps the window over the editor (mouse-block). Returns false only if
+        // nothing usable is available yet. Editor + probe only.
         static bool TryGetGameViewRenderRect(out int px, out int py, out int pw, out int ph,
                                              out string dbg)
         {
@@ -122,58 +129,11 @@ namespace DisplayXR
                 for (var t = s_gvType; t != null && s_parentField == null; t = t.BaseType)
                     s_parentField = t.GetField("m_Parent",
                         BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
-            if (s_parentField == null) return false;
 
-            var wins = Resources.FindObjectsOfTypeAll(s_gvType);
-            if (wins == null || wins.Length == 0) return false;
-
-            // Pick the largest-area GameView (the visible panel).
-            object best = null; Rect host = default; float bestArea = -1f;
-            foreach (var w in wins)
-            {
-                var pr = s_parentField.GetValue(w);
-                if (pr == null) continue;
-                if (s_screenPosProp == null)
-                    for (var t = pr.GetType(); t != null && s_screenPosProp == null; t = t.BaseType)
-                        s_screenPosProp = t.GetProperty("screenPosition",
-                            BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
-                if (s_screenPosProp == null) return false;
-                var wr = (Rect)s_screenPosProp.GetValue(pr, null);
-                float area = wr.width * wr.height;
-                if (area > bestArea) { bestArea = area; host = wr; best = w; }
-            }
-            if (best == null) return false;
-
-            // Render size from GameView.targetSize (physical px, excludes toolbar). Property
-            // or field depending on Unity version.
-            if (s_targetSizeMember == null)
-            {
-                for (var t = s_gvType; t != null && s_targetSizeMember == null; t = t.BaseType)
-                {
-                    s_targetSizeMember = (MemberInfo)t.GetProperty("targetSize",
-                        BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public)
-                        ?? t.GetField("targetSize",
-                        BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
-                }
-            }
-            Vector2 target = Vector2.zero;
-            if (s_targetSizeMember is PropertyInfo tp) { if (tp.GetValue(best, null) is Vector2 v) target = v; }
-            else if (s_targetSizeMember is FieldInfo tf) { if (tf.GetValue(best) is Vector2 v) target = v; }
-            bool haveTarget = target.x > 1f && target.y > 1f;
-
-            // DPI scale (points -> physical px). EditorGUIUtility.pixelsPerPoint is UNRELIABLE
-            // here — it depends on the current GUI context and flip-flops between the true DPI
-            // and 1.0 across frames, which made the glued window's POSITION jump every frame
-            // (weaver phase / pointer reference jitter → the drag fought itself). Derive it
-            // instead from the stable ratio targetSize.x / host.width (both describe the same
-            // render width, one in px one in points), falling back to pixelsPerPoint only if
-            // targetSize is unavailable.
-            float ppp = 1f;
-            if (haveTarget && host.width > 1f)
-            {
-                ppp = target.x / host.width;
-            }
-            else
+            // Stable DPI scale, cached once. EditorGUIUtility.pixelsPerPoint flip-flops between
+            // the true DPI and 1.0 across frames (context-dependent), so latch the first sane
+            // value (>1.1) and reuse it — the editor DPI doesn't change during a session.
+            if (s_cachedPpp <= 0f)
             {
                 if (s_pppProp == null)
                 {
@@ -182,19 +142,98 @@ namespace DisplayXR
                         s_pppProp = egui.GetProperty("pixelsPerPoint",
                             BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
                 }
-                if (s_pppProp != null && s_pppProp.GetValue(null, null) is float f && f > 0f) ppp = f;
+                if (s_pppProp != null && s_pppProp.GetValue(null, null) is float f && f > 1.1f)
+                    s_cachedPpp = f;
             }
+            float ppp = s_cachedPpp > 0f ? s_cachedPpp : 1f;
 
-            int hostPhysH = Mathf.RoundToInt(host.height * ppp);
-            pw = haveTarget ? Mathf.RoundToInt(target.x) : Mathf.RoundToInt(host.width * ppp);
-            ph = haveTarget ? Mathf.RoundToInt(target.y) : hostPhysH;
-            int toolbar = Mathf.Max(0, hostPhysH - ph);
-            px = Mathf.RoundToInt(host.x * ppp);
-            py = Mathf.RoundToInt(host.y * ppp) + toolbar;
+            // SIZE: Unity's main Game view render-target size (physical px, excludes toolbar).
+            if (s_mainTargetSizeMethod == null)
+                for (var t = s_gvType; t != null && s_mainTargetSizeMethod == null; t = t.BaseType)
+                    s_mainTargetSizeMethod = t.GetMethod("GetMainGameViewTargetSize",
+                        BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public,
+                        null, System.Type.EmptyTypes, null)
+                        ?? t.GetMethod("GetMainPlayModeViewTargetSize",
+                        BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public,
+                        null, System.Type.EmptyTypes, null);
+            Vector2 size = Vector2.zero;
+            if (s_mainTargetSizeMethod != null && s_mainTargetSizeMethod.Invoke(null, null) is Vector2 sv)
+                size = sv;
 
-            dbg = $"host(points)=({host.x},{host.y} {host.width}x{host.height}) ppp={ppp:F3} " +
-                  $"targetSize=({target.x}x{target.y}) toolbar={toolbar} -> render=({px},{py} {pw}x{ph})";
-            return pw > 0 && ph > 0;
+            // POSITION: the GameView instance whose physical width best matches `size` (ties
+            // position to the same panel the size came from), else the largest-area instance.
+            Rect host = default; bool haveHost = false; float bestScore = float.MaxValue, bestArea = -1f;
+            Rect fallbackHost = default;
+            var wins = (s_parentField != null) ? Resources.FindObjectsOfTypeAll(s_gvType) : null;
+            if (wins != null)
+                foreach (var w in wins)
+                {
+                    var pr = s_parentField.GetValue(w);
+                    if (pr == null) continue;
+                    // screenPosition lives on GUIView (the m_Parent/HostView type), not GameView.
+                    if (s_screenPosProp == null)
+                        for (var t = pr.GetType(); t != null && s_screenPosProp == null; t = t.BaseType)
+                            s_screenPosProp = t.GetProperty("screenPosition",
+                                BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+                    if (s_screenPosProp == null) continue;
+                    var wr = (Rect)s_screenPosProp.GetValue(pr, null);
+                    float area = wr.width * wr.height;
+                    if (area > bestArea) { bestArea = area; fallbackHost = wr; }
+                    // GetMainGameViewTargetSize is in LOGICAL points, same units as
+                    // screenPosition, so match panel width to it directly (ppp-independent).
+                    if (size.x > 1f)
+                    {
+                        float score = Mathf.Abs(wr.width - size.x);
+                        if (score < bestScore) { bestScore = score; host = wr; haveHost = true; }
+                    }
+                }
+            if (!haveHost) { host = fallbackHost; haveHost = bestArea >= 0f; }
+
+            // Compose the PHYSICAL render rect. GetMainGameViewTargetSize returns the render
+            // area in LOGICAL points (excludes the toolbar), so multiply by ppp for physical
+            // px — the mirror RT (== our swapchain) is presented 1:1 into the panel, so it must
+            // be the panel's physical size to fill. Toolbar height = (host - render) in points,
+            // scaled; it offsets the window's top below the Game view toolbar.
+            int rw, rh, rx, ry, toolbar;
+            if (size.x > 1f && size.y > 1f)
+            {
+                rw = Mathf.RoundToInt(size.x * ppp);
+                rh = Mathf.RoundToInt(size.y * ppp);
+                toolbar = Mathf.Max(0, Mathf.RoundToInt((host.height - size.y) * ppp));
+            }
+            else
+            {
+                rw = Mathf.RoundToInt(host.width * ppp);
+                rh = Mathf.RoundToInt(host.height * ppp);
+                toolbar = 0;
+            }
+            rx = Mathf.Max(0, Mathf.RoundToInt(host.x * ppp));
+            ry = Mathf.Max(0, Mathf.RoundToInt(host.y * ppp) + toolbar);
+
+            // Sanity: reject implausible SIZE readings (transient 0x0 during a play/layout
+            // transition) and reuse the last-good rect so the zone never borns wrong-size.
+            // The zone size comes from GetMainGameViewTargetSize (ppp-independent), so a
+            // not-yet-latched ppp only offsets the initial POSITION (the per-frame glue
+            // corrects it once ppp latches) — don't gate the zone on ppp.
+            bool sane = haveHost && size.x > 1f && size.y > 1f
+                        && rw >= 256 && rh >= 256 && rw <= 8192 && rh <= 8192;
+            if (sane)
+            {
+                s_haveLastGood = true; s_lgX = rx; s_lgY = ry; s_lgW = rw; s_lgH = rh;
+                px = rx; py = ry; pw = rw; ph = rh;
+                dbg = $"mainSize=({size.x}x{size.y}) host(points)=({host.x},{host.y} {host.width}x{host.height}) " +
+                      $"ppp={ppp:F3} toolbar={toolbar} -> render=({px},{py} {pw}x{ph})";
+                return true;
+            }
+            if (s_haveLastGood)
+            {
+                px = s_lgX; py = s_lgY; pw = s_lgW; ph = s_lgH;
+                dbg = $"INSANE reading (mainSize={size.x}x{size.y} render={rx},{ry} {rw}x{rh} ppp={ppp:F3}) " +
+                      $"-> reuse last-good ({px},{py} {pw}x{ph})";
+                return true;
+            }
+            dbg = $"no sane rect yet (mainSize={size.x}x{size.y} host={host.width}x{host.height} ppp={ppp:F3})";
+            return false;
         }
 
         // Called by the loader BEFORE the subsystem starts: stash the render rect so
@@ -209,12 +248,19 @@ namespace DisplayXR
             }
         }
 
+        int m_LastGlueX = int.MinValue, m_LastGlueY, m_LastGlueW, m_LastGlueH;
+
         void PushGameViewRectEditorProbe()
         {
             if (!ProbeEnabled()) return;
             if (!TryGetGameViewRenderRect(out int px, out int py, out int pw, out int ph, out string dbg))
                 return;
             if (!s_loggedGlueOnce) { s_loggedGlueOnce = true; Debug.Log($"[DisplayXR] GameView glue: {dbg}"); }
+            // Debounce: only reposition the weave window when the rect actually changes, so a
+            // steady Game view doesn't get SetWindowPos'd every frame (churn / weaver jitter).
+            if (px == m_LastGlueX && py == m_LastGlueY && pw == m_LastGlueW && ph == m_LastGlueH)
+                return;
+            m_LastGlueX = px; m_LastGlueY = py; m_LastGlueW = pw; m_LastGlueH = ph;
             DisplayXRProviderNative.dxr_prov_set_gameview_rect(px, py, pw, ph);
         }
 
