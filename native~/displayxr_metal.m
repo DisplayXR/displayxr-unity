@@ -17,6 +17,27 @@
 
 static NSWindow *s_preview_window = nil;
 static NSView *s_preview_view = nil;
+static NSView *s_overlay_view = nil; // built-player in-app weave overlay (#205)
+
+// The largest content rect with the main display's aspect that fits the
+// screen's usable area (visible frame minus title bar). A hardcoded size gets
+// clamped by AppKit to the visible frame, silently changing the aspect — the
+// runtime then weaves a stretched canvas (VIEW SIZE MISMATCH, #204).
+static NSSize
+dxr_metal_aspect_fit_content(NSWindowStyleMask style)
+{
+	NSScreen *screen = [NSScreen mainScreen];
+	NSRect vis = screen ? [screen visibleFrame] : NSMakeRect(0, 0, 1280, 800);
+	NSRect max_content = [NSWindow contentRectForFrameRect:vis styleMask:style];
+	CGFloat aspect = (screen && screen.frame.size.height > 0)
+	    ? screen.frame.size.width / screen.frame.size.height
+	    : (16.0 / 10.0);
+	CGFloat cw = max_content.size.width;
+	CGFloat ch = max_content.size.height;
+	if (cw / ch > aspect) cw = floor(ch * aspect);
+	else                  ch = floor(cw / aspect);
+	return NSMakeSize(cw, ch);
+}
 
 void *
 displayxr_metal_create_preview_window(uint32_t width, uint32_t height)
@@ -29,25 +50,11 @@ displayxr_metal_create_preview_window(uint32_t width, uint32_t height)
 		                          NSWindowStyleMaskResizable |
 		                          NSWindowStyleMaskMiniaturizable;
 
-		// width/height == 0 → auto-size: the largest content rect with the
-		// main display's aspect that fits the screen's usable area (visible
-		// frame minus title bar). A hardcoded size gets clamped by AppKit to
-		// the visible frame, silently changing the aspect — the runtime then
-		// weaves a stretched canvas (VIEW SIZE MISMATCH, #204).
-		NSScreen *screen = [NSScreen mainScreen];
-		NSRect vis = screen ? [screen visibleFrame]
-		                    : NSMakeRect(0, 0, 1280, 800);
-		NSRect max_content = [NSWindow contentRectForFrameRect:vis
-		                                             styleMask:style];
+		// width/height == 0 → auto-size to the display aspect (see helper).
 		CGFloat cw = width, ch = height;
 		if (cw == 0 || ch == 0) {
-			CGFloat aspect = (screen && screen.frame.size.height > 0)
-			    ? screen.frame.size.width / screen.frame.size.height
-			    : (16.0 / 10.0);
-			cw = max_content.size.width;
-			ch = max_content.size.height;
-			if (cw / ch > aspect) cw = floor(ch * aspect);
-			else                  ch = floor(cw / aspect);
+			NSSize fit = dxr_metal_aspect_fit_content(style);
+			cw = fit.width; ch = fit.height;
 		}
 		NSRect frame = NSMakeRect(0, 0, cw, ch);
 
@@ -55,7 +62,15 @@ displayxr_metal_create_preview_window(uint32_t width, uint32_t height)
 		                                              styleMask:style
 		                                                backing:NSBackingStoreBuffered
 		                                                  defer:NO];
-		[s_preview_window setTitle:@"DisplayXR Preview"];
+		// Title = the host app's name in a built player (this window IS the app's
+		// display output); "DisplayXR Preview" only in the editor, where the main
+		// bundle is Unity.app (CFBundleName == "Unity") and it genuinely is a
+		// Play-Mode preview.
+		NSString *appName = [[NSBundle mainBundle]
+		    objectForInfoDictionaryKey:@"CFBundleName"];
+		if (appName.length == 0 || [appName isEqualToString:@"Unity"])
+			appName = @"DisplayXR Preview";
+		[s_preview_window setTitle:appName];
 		[s_preview_window setReleasedWhenClosed:NO];
 		[s_preview_window center];
 
@@ -102,6 +117,19 @@ displayxr_metal_destroy_preview_window(void)
 			dispatch_sync(dispatch_get_main_queue(), close);
 		}
 	}
+}
+
+void
+displayxr_metal_destroy_app_overlay(void)
+{
+	if (!s_overlay_view) return;
+	dispatch_block_t remove = ^{
+		[s_overlay_view removeFromSuperview];
+		s_overlay_view = nil;
+		fprintf(stderr, "[DisplayXR] App weave overlay removed\n");
+	};
+	if ([NSThread isMainThread]) remove();
+	else dispatch_sync(dispatch_get_main_queue(), remove);
 }
 
 int
@@ -198,8 +226,6 @@ displayxr_metal_blit_textures(void *queue_ptr, void *src_ptr, void *dst_ptr)
 
 @end
 
-static NSView *s_overlay_view = nil;
-
 void *
 displayxr_get_app_main_view(void)
 {
@@ -223,13 +249,31 @@ displayxr_get_app_main_view(void)
 		if (window == nil)
 			return NULL;
 
+		// Size the app window to the display aspect (a Unity player defaults to a
+		// small/off-aspect window; this window IS the light-field output). Only
+		// grow toward the aspect-fit size — never shrink a window the app made
+		// bigger on purpose. ps_window_size then tracks the live backing size and
+		// the #172 reconcile sizes the swapchain to match.
+		if (![window styleMask] || ([window styleMask] & NSWindowStyleMaskTitled)) {
+			NSSize fit = dxr_metal_aspect_fit_content([window styleMask]);
+			NSRect cur = [window contentRectForFrameRect:[window frame]];
+			if (fit.width > cur.size.width || fit.height > cur.size.height) {
+				[window setContentSize:fit];
+				[window center];
+			}
+		}
+
 		NSView *contentView = [window contentView];
 
-		// Create overlay view with its own CAMetalLayer
+		// Create overlay view with its own CAMetalLayer. Layer-HOSTING: set the
+		// CAMetalLayer BEFORE wantsLayer so the runtime's setup_external_window()
+		// takes the CAMetalLayer branch directly (the plain-backing-layer branch
+		// dispatch_syncs to the main queue — a deadlock when the session is created
+		// from Unity's render thread while the main thread blocks in GfxStart, #204).
 		DisplayXROverlayView *overlay = [[DisplayXROverlayView alloc]
 		    initWithFrame:[contentView bounds]];
-		overlay.wantsLayer = YES;
-		overlay.layer = [CAMetalLayer layer];
+		[overlay setLayer:[CAMetalLayer layer]];
+		[overlay setWantsLayer:YES];
 		overlay.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
 
 		[contentView addSubview:overlay];

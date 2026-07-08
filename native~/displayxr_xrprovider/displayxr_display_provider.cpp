@@ -965,19 +965,32 @@ LifecycleStart(UnitySubsystemHandle handle, void *userData)
 	// thread, deadlocks: the input queues join while the main thread waits on
 	// GfxStart.) GfxStart binds the runtime to s_overlay_hwnd.
 #ifndef _WIN32
-	// macOS (#204): create the provider's weave window HERE on the MAIN thread
-	// and bind its NSView via XrCocoaWindowBindingCreateInfoEXT. AppKit windows
-	// cannot be created off the main thread — the runtime's self-host NSWindow
-	// create inside xrCreateSession (GfxStart = render thread, while Unity's
-	// main thread is blocked waiting on GfxStart) deadlocks. The macOS analog
-	// of the Windows #173 lesson. Reuses the proven SA-era preview window
-	// (displayxr_metal.m); auto-sized to the display aspect within the
-	// screen's usable area — ps_window_size tracks the live NSView backing
-	// size, and resize lands with the #172 reconcile.
-	s_overlay_hwnd = displayxr_metal_create_preview_window(0, 0);
-	prov_log(s_overlay_hwnd
-	             ? "[DisplayXR-PROV] Lifecycle Start (macOS: provider weave window created on main thread)\n"
-	             : "[DisplayXR-PROV] Lifecycle Start (macOS: weave window FAILED; runtime offscreen)\n");
+	// macOS: bind the runtime's weave to an NSView (via XrCocoaWindowBindingCreateInfoEXT).
+	// Two shapes, both on the MAIN thread (AppKit windows can't be created off-main; and
+	// the runtime's own self-host NSWindow-create inside xrCreateSession — GfxStart =
+	// render thread while the main thread blocks in GfxStart — deadlocks; the macOS
+	// analog of the Windows #173 lesson):
+	//   - Built player (#205): weave into UNITY'S OWN game window via an input-transparent
+	//     overlay NSView (displayxr_get_app_main_view; hitTest→nil passes mouse/keyboard
+	//     through to Unity). One window, native input — mirrors the Windows app-owned
+	//     overlay. The window is grown to the display aspect.
+	//   - Editor Play Mode (#204, opt-in): a SEPARATE preview window that coexists with
+	//     the editor (binding Unity's editor window would track the whole editor).
+	if (prov_want_dedicated_window()) {
+		s_overlay_hwnd = displayxr_metal_create_preview_window(0, 0);
+		prov_log(s_overlay_hwnd
+		             ? "[DisplayXR-PROV] Lifecycle Start (macOS editor: dedicated preview window)\n"
+		             : "[DisplayXR-PROV] Lifecycle Start (macOS editor: preview window FAILED)\n");
+	} else {
+		s_overlay_hwnd = displayxr_get_app_main_view();
+		if (!s_overlay_hwnd) {
+			// Unity's window not ready yet — fall back to a standalone weave window.
+			s_overlay_hwnd = displayxr_metal_create_preview_window(0, 0);
+			prov_log("[DisplayXR-PROV] Lifecycle Start (macOS player: no app window yet; standalone weave window)\n");
+		} else {
+			prov_log("[DisplayXR-PROV] Lifecycle Start (macOS player: in-app weave overlay on Unity's window)\n");
+		}
+	}
 #else
 	if (prov_want_dedicated_window()) {
 		// (#173) Editor Play Mode: a STANDALONE movable weave window that does NOT
@@ -1066,10 +1079,12 @@ LifecycleStop(UnitySubsystemHandle handle, void *userData)
 		s_overlay_hwnd = nullptr;
 	}
 #else
-	// macOS (#204): destroy the provider weave window on the MAIN thread, after
+	// macOS (#204/#205): tear down the weave target on the MAIN thread, after
 	// GfxStop already ran dxr_prov_session_stop (xrDestroySession released the
 	// runtime's references into the view) — mirrors the #173 teardown ordering.
-	displayxr_metal_destroy_preview_window();
+	// Both are safe no-ops if the other shape was used this session.
+	displayxr_metal_destroy_app_overlay();     // built-player in-app overlay
+	displayxr_metal_destroy_preview_window();  // editor / fallback window
 	s_overlay_hwnd = nullptr;
 #endif
 	prov_log("[DisplayXR-PROV] Lifecycle Stop\n");

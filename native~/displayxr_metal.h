@@ -21,6 +21,9 @@ void *displayxr_metal_create_preview_window(uint32_t width, uint32_t height);
 /// Destroy the editor Play Mode preview window.
 void displayxr_metal_destroy_preview_window(void);
 
+/// Remove the built-player in-app weave overlay from Unity's window (teardown).
+void displayxr_metal_destroy_app_overlay(void);
+
 /// Live backing-pixel size of an NSView (bounds converted to backing pixels).
 /// Safe to poll from the render thread; matches the runtime's per-frame
 /// canvas source so provider and compositor agree on the per-view size.
