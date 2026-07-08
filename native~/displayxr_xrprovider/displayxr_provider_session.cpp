@@ -3798,6 +3798,75 @@ int dxr_prov_get_zone_rect_px(uint32_t zone, int *x, int *y, int *w, int *h)
 	return 1;
 }
 
+// DIAGNOSTIC (DISPLAYXR_PROV_SLICE_COLORS=1): record clears of the acquired swapchain image's
+// array slice 0 = solid BLUE and slice 1 = solid RED onto the own command list (caller has
+// already Reset it and will Close + execute). Used to test whether the runtime's texture-mode
+// weave reads BOTH array slices (→ a blue/red interlace) or samples slice 0 for both views
+// (→ a flat all-blue field, the "sliced swapchain mishandled in shared-texture case"
+// hypothesis). RTV heap created lazily on the own device; never freed (diagnostic-only).
+static void ps_diag_fill_slice_colors(ID3D12Resource *dst, UINT n)
+{
+	if (!dst || !s_ps.own_device || !s_ps.own_cmd_list) return;
+	static ID3D12DescriptorHeap *rtv_heap = NULL;
+	static UINT rtv_size = 0;
+	if (!rtv_heap) {
+		D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+		hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+		hd.NumDescriptors = 2;
+		hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+		if (FAILED(s_ps.own_device->CreateDescriptorHeap(&hd, __uuidof(ID3D12DescriptorHeap),
+		        (void **)&rtv_heap)) || !rtv_heap) {
+			ps_log("[DisplayXR-PROV] PROBE: slice-colors RTV heap create failed\n"); return;
+		}
+		rtv_size = s_ps.own_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+	}
+	D3D12_RESOURCE_DESC rd = dst->GetDesc();
+	// The runtime creates the swapchain image TYPELESS (fmt 27); an RTV needs a CONCRETE
+	// format, so use the swapchain's typed format (s_ps.sc_format, e.g. 28 = R8G8B8A8_UNORM),
+	// NOT rd.Format. Passing TYPELESS to CreateRenderTargetView faults the GPU (the crash).
+	DXGI_FORMAT rtvFmt = (DXGI_FORMAT)s_ps.sc_format;
+	if (rtvFmt == DXGI_FORMAT_UNKNOWN || rtvFmt == DXGI_FORMAT_R8G8B8A8_TYPELESS)
+		rtvFmt = DXGI_FORMAT_R8G8B8A8_UNORM;
+	// Safety: never RTV/clear an image that wasn't created render-target-capable (would fault).
+	if (!(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) {
+		static int warned = 0;
+		if (!warned) { warned = 1;
+			ps_log("[DisplayXR-PROV] PROBE: slice-colors SKIPPED — swapchain image not ALLOW_RENDER_TARGET (flags=0x%x)\n",
+			       (unsigned)rd.Flags); }
+		return;
+	}
+	const float colors[2][4] = { {0.0f, 0.0f, 1.0f, 1.0f},   // slice 0 = BLUE (left)
+	                             {1.0f, 0.0f, 0.0f, 1.0f} };  // slice 1 = RED  (right)
+	D3D12_CPU_DESCRIPTOR_HANDLE base = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+	for (UINT slice = 0; slice < n && slice < 2; slice++) {
+		D3D12_RENDER_TARGET_VIEW_DESC rv = {};
+		rv.Format = rtvFmt;
+		rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+		rv.Texture2DArray.MipSlice = 0;
+		rv.Texture2DArray.FirstArraySlice = slice;
+		rv.Texture2DArray.ArraySize = 1;
+		rv.Texture2DArray.PlaneSlice = 0;
+		D3D12_CPU_DESCRIPTOR_HANDLE h = base; h.ptr += (SIZE_T)slice * rtv_size;
+		s_ps.own_device->CreateRenderTargetView(dst, &rv, h);
+		D3D12_RESOURCE_BARRIER b = {};
+		b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		b.Transition.pResource = dst;
+		b.Transition.Subresource = slice; // mip 0, array slice = slice
+		b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+		b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+		s_ps.own_cmd_list->ResourceBarrier(1, &b);
+		s_ps.own_cmd_list->ClearRenderTargetView(h, colors[slice], 0, NULL);
+		D3D12_RESOURCE_BARRIER b2 = b;
+		b2.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+		b2.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+		s_ps.own_cmd_list->ResourceBarrier(1, &b2);
+	}
+	static int logged = 0;
+	if (!logged) { logged = 1;
+		ps_log("[DisplayXR-PROV] PROBE: SLICE COLORS active — slice0=BLUE slice1=RED (n=%u fmt=%d)\n",
+		       n, (int)rd.Format); }
+}
+
 int dxr_prov_submit_frame(uint32_t image_index)
 {
 	if (!s_ps.frame_begun || !s_ps.swapchain_created) {
@@ -3866,6 +3935,15 @@ int dxr_prov_submit_frame(uint32_t image_index)
 			ID3D12Resource *dst = s_ps.sc_images[image_index].texture;
 			s_ps.own_cmd_alloc->Reset();
 			s_ps.own_cmd_list->Reset(s_ps.own_cmd_alloc, NULL);
+			// DIAGNOSTIC: instead of the real eye copies, paint slice 0 = BLUE, slice 1 = RED
+			// so the woven output reveals whether the runtime's texture-mode weave reads both
+			// array slices (blue/red interlace) or only slice 0 (flat all-blue). See helper.
+			static int s_slice_colors = -1;
+			if (s_slice_colors < 0) { const char *e = getenv("DISPLAYXR_PROV_SLICE_COLORS");
+			                          s_slice_colors = (e && e[0] && e[0] != '0') ? 1 : 0; }
+			if (s_slice_colors) {
+				ps_diag_fill_slice_colors(dst, submit_n);
+			} else
 			for (UINT slice = 0; slice < submit_n; slice++) {
 				D3D12_TEXTURE_COPY_LOCATION dl = {};
 				dl.pResource = dst;
