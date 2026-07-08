@@ -24,6 +24,7 @@
 #pragma comment(lib, "advapi32.lib") // RegGetValueA — ActiveRuntime registry fallback (#173)
 #else
 #include <dlfcn.h> // dlopen/dlsym runtime load (macOS mirror of LoadLibraryExA)
+#include "../displayxr_metal.h" // weave-window NSView backing size (#204)
 #define _strdup strdup
 #include "displayxr_provider_gfx_metal.h" // Metal blit/texture glue (#204)
 #endif
@@ -834,9 +835,13 @@ static void ps_window_size(uint32_t *w, uint32_t *h)
 			hh = (uint32_t)(rc.bottom - rc.top);
 		}
 	}
+#else
+	// macOS (#204): the bound weave NSView's live backing size — the same
+	// per-frame source the runtime's compositor derives its canvas from, so
+	// the per-view sizes agree and live resize lands via the #172 reconcile.
+	if (s_ps.overlay_hwnd)
+		displayxr_metal_view_backing_size(s_ps.overlay_hwnd, &ww, &hh);
 #endif
-	// macOS: no bound-window client-rect query yet (Phase 2 #204 wires the NSView
-	// weave target); until then fall through to the display pixel dims below.
 	if (ww == 0 || hh == 0) {
 		ww = s_ps.display_info.is_valid ? s_ps.display_info.pixel_width : 1920;
 		hh = s_ps.display_info.is_valid ? s_ps.display_info.pixel_height : 1080;

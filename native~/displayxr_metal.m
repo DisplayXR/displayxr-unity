@@ -24,11 +24,32 @@ displayxr_metal_create_preview_window(uint32_t width, uint32_t height)
 	displayxr_metal_destroy_preview_window();
 
 	dispatch_block_t create = ^{
-		NSRect frame = NSMakeRect(100, 100, width, height);
 		NSWindowStyleMask style = NSWindowStyleMaskTitled |
 		                          NSWindowStyleMaskClosable |
 		                          NSWindowStyleMaskResizable |
 		                          NSWindowStyleMaskMiniaturizable;
+
+		// width/height == 0 → auto-size: the largest content rect with the
+		// main display's aspect that fits the screen's usable area (visible
+		// frame minus title bar). A hardcoded size gets clamped by AppKit to
+		// the visible frame, silently changing the aspect — the runtime then
+		// weaves a stretched canvas (VIEW SIZE MISMATCH, #204).
+		NSScreen *screen = [NSScreen mainScreen];
+		NSRect vis = screen ? [screen visibleFrame]
+		                    : NSMakeRect(0, 0, 1280, 800);
+		NSRect max_content = [NSWindow contentRectForFrameRect:vis
+		                                             styleMask:style];
+		CGFloat cw = width, ch = height;
+		if (cw == 0 || ch == 0) {
+			CGFloat aspect = (screen && screen.frame.size.height > 0)
+			    ? screen.frame.size.width / screen.frame.size.height
+			    : (16.0 / 10.0);
+			cw = max_content.size.width;
+			ch = max_content.size.height;
+			if (cw / ch > aspect) cw = floor(ch * aspect);
+			else                  ch = floor(cw / aspect);
+		}
+		NSRect frame = NSMakeRect(0, 0, cw, ch);
 
 		s_preview_window = [[NSWindow alloc] initWithContentRect:frame
 		                                              styleMask:style
@@ -36,6 +57,7 @@ displayxr_metal_create_preview_window(uint32_t width, uint32_t height)
 		                                                  defer:NO];
 		[s_preview_window setTitle:@"DisplayXR Preview"];
 		[s_preview_window setReleasedWhenClosed:NO];
+		[s_preview_window center];
 
 		s_preview_view = [[NSView alloc] initWithFrame:frame];
 		// Layer-HOSTING view with a CAMetalLayer (set layer BEFORE wantsLayer).
@@ -50,7 +72,8 @@ displayxr_metal_create_preview_window(uint32_t width, uint32_t height)
 		// Show without stealing keyboard focus from Unity
 		[s_preview_window orderFront:nil];
 
-		fprintf(stderr, "[DisplayXR] Preview window created: %ux%u\n", width, height);
+		fprintf(stderr, "[DisplayXR] Preview window created: %ux%u pt\n",
+		        (unsigned)cw, (unsigned)ch);
 	};
 
 	if ([NSThread isMainThread]) {
@@ -79,6 +102,22 @@ displayxr_metal_destroy_preview_window(void)
 			dispatch_sync(dispatch_get_main_queue(), close);
 		}
 	}
+}
+
+int
+displayxr_metal_view_backing_size(void *view_ptr, uint32_t *out_w, uint32_t *out_h)
+{
+	NSView *view = (__bridge NSView *)view_ptr;
+	if (!view || !out_w || !out_h) return 0;
+	// Polled per frame from the render thread — same convention as the
+	// runtime's metal_window_backing_dims(), so both sides derive the canvas
+	// from the identical source and the per-view sizes agree (#204).
+	NSRect backing = [view convertRectToBacking:[view bounds]];
+	uint32_t w = (uint32_t)backing.size.width;
+	uint32_t h = (uint32_t)backing.size.height;
+	if (w == 0 || h == 0) return 0;
+	*out_w = w; *out_h = h;
+	return 1;
 }
 
 // ============================================================================
