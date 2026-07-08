@@ -28,7 +28,7 @@ Unity plugin for rendering on eye-tracked 3D light field displays via the Displa
 
 > **New to the plugin?** Start with the [Quick Start Guide](docs~/quick-start-guide.md) — a step-by-step walkthrough that covers installation, demo scenes for both stereo modes, building standalone apps, and end-to-end testing on Windows and macOS.
 
-> **Want a ready-to-open Unity project?** Clone [displayxr-unity-test](https://github.com/DisplayXR/displayxr-unity-test) — a minimal Unity 6 project that depends on this plugin via UPM. Open it in Unity, hit Play, and you're rendering on a spatial display.
+> **Want a ready-to-open Unity project?** Clone [displayxr-unity-samples](https://github.com/DisplayXR/displayxr-unity-samples) and open `samples/birp-multipass/` — a minimal Unity 6 project that depends on this plugin via UPM. Open it in Unity, hit Play, and you're rendering on a spatial display. (The repo also holds URP, HDRP, and Desktop Avatar samples.)
 
 ---
 

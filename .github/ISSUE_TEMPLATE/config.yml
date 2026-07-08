@@ -6,6 +6,6 @@ contact_links:
   - name: DisplayXR Shell issues
     url: https://github.com/DisplayXR/displayxr-shell-releases/issues
     about: Bugs in the spatial workspace controller belong here.
-  - name: Unity sample project
-    url: https://github.com/DisplayXR/displayxr-unity-test
-    about: Try the ready-to-open sample scene to confirm the plugin works in a clean project before filing.
+  - name: Unity sample projects
+    url: https://github.com/DisplayXR/displayxr-unity-samples
+    about: Try a ready-to-open sample (samples/*) to confirm the plugin works in a clean project before filing.

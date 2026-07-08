@@ -301,24 +301,29 @@ For detailed architecture and design decisions, see `docs~/`:
 - The runtime provides the OpenXR compositor, display drivers, and eye tracking; this plugin provides the Unity-side stereo rendering pipeline.
 - **Decoupled from the runtime's `versions.json` bundle matrix** — this UPM package is a downstream consumer of the runtime's OpenXR wire protocol, not part of the co-released installer bundle (runtime/shell/leia-plugin/mcp/demos). The two ship on independent cadences. Spec: [`versions-json-autobump.md`](https://github.com/DisplayXR/displayxr-runtime/blob/main/docs/specs/runtime/versions-json-autobump.md).
 
-### Test repos
+### Sample projects
 
-Four sibling Unity projects exercise the plugin against different feature areas and render pipelines. Treat them as a regression net — when a plugin change risks affecting any of these, fetch and verify before tagging a release.
+The plugin's sample Unity projects live in one monorepo,
+[`DisplayXR/displayxr-unity-samples`](https://github.com/DisplayXR/displayxr-unity-samples),
+under `samples/`. Treat them as a regression net — when a plugin change risks
+affecting any of these, build and verify before tagging a release.
+(They were consolidated from the former `displayxr-unity-test*` repos, which are
+now archived and redirect here.)
 
-| Repo | Focus | Notes |
+| Sample (folder) | Focus | Notes |
 |------|-------|-------|
-| [`DisplayXR/displayxr-unity-test`](https://github.com/DisplayXR/displayxr-unity-test) | Baseline rendering / stereo correctness (**BiRP**) | Plain cube + camera-centric and display-centric rigs |
-| [`DisplayXR/displayxr-unity-test-transparent`](https://github.com/DisplayXR/displayxr-unity-test-transparent) | Transparent overlay + click-through (#57 family, alpha-native), now **URP + `XR_EXT_display_zones` / Local2D bubble** in a floating window | Tiger FBX clickable, foreground-only render. `main` = URP/zones (v2.0.0+); the Built-in (BiRP) baseline lives on the `legacy-birp` branch |
-| [`DisplayXR/displayxr-unity-test-2d-ui`](https://github.com/DisplayXR/displayxr-unity-test-2d-ui) | 2D UI window-space composition layer (**URP**) | Tuning panel built from `DisplayXRWindowSpaceUI` |
-| [`DisplayXR/displayxr-unity-test-hdrp`](https://github.com/DisplayXR/displayxr-unity-test-hdrp) | Off-axis correctness on **HDRP** (#22, #166 M3) | Textured crate; HDRP consumes the provider's projection matrix natively (no fix feature) |
+| `samples/birp-multipass` | Baseline rendering / stereo correctness (**BiRP**, multi-pass) | Plain cube + camera-centric and display-centric rigs |
+| `samples/urp-singlepass-ui` | 2D UI window-space composition layer (**URP**, single-pass) | Tuning panel built from `DisplayXRWindowSpaceUI` |
+| `samples/hdrp-singlepass-ui` | Off-axis correctness on **HDRP** (single-pass) | Textured crate; HDRP consumes the provider's projection matrix natively (no fix feature) |
+| `samples/desktop-avatar` | Desktop avatar showcase (**URP**): alpha-native transparency, click-through, per-eye foreground clip, `XR_EXT_display_zones` + Local2D bubble | Tiger FBX (Git LFS), foreground-only render |
 
-All four pin the plugin via `https://github.com/DisplayXR/displayxr-unity.git#upm` (floating; tracks latest release).
+All pin the plugin via `https://github.com/DisplayXR/displayxr-unity.git#upm/vX.Y.Z`.
 
-Each test repo also has its own `CLAUDE.md` describing its scene, scripts, and which plugin features it exercises — designed so an agent can work in the test repo without loading the plugin's context.
+Each sample has its own `README.md`/`CLAUDE.md`. **Installer/build logic is shared** in the monorepo's `installer/common/SampleInstaller.nsh` — a per-sample `.nsi` is just a stub setting five `SAMPLE_*` defines, so install dir / regkeys / ARP / manifest slug all derive from one key and can't drift. See the monorepo's root `CLAUDE.md`.
 
-**Test-repo releases ship as NSIS installers, not zips** (#108). Each test repo's `installer/` dir (`.nsi` + `build-installer.bat`) mirrors the [`displayxr-demo-gaussiansplat`](https://github.com/DisplayXR/displayxr-demo-gaussiansplat) pattern: hard-prereqs the runtime, installs the Unity Player under `Program Files\DisplayXR\Unity\<Variant>\`, and drops a registered-mode `.displayxr.json` manifest under `%ProgramData%\DisplayXR\apps\` (renamed `icon_unity_test*.png` per variant) so the Shell launcher discovers it as a tile. Build flow is manual today (build Player → `installer\build-installer.bat` → `gh release create`); CI automation is blocked on Unity license activation.
+**Sample releases ship as NSIS installers.** Each installs the Unity Player under `Program Files\DisplayXR\Unity\<Key>\` and drops a registered-mode `.displayxr.json` manifest + slug-scoped icons under `%ProgramData%\DisplayXR\apps\` so the Shell launcher discovers it as a tile. Build flow is manual (build Player → `installer\build-installer.bat`); CI is lint-only (Unity license/runner not wired).
 
-#### Where to launch Claude Code when working on the test repos
+#### Where to launch Claude Code
 
-- **Test-only work** (tweak a scene, polish a test-repo script, fix a test-repo bug) → launch from the test repo directly. Its `CLAUDE.md` auto-loads with focused context, git ops target the right repo by default, smaller context is cheaper and faster. The plugin's installed source is still readable at `Library/PackageCache/com.displayxr.unity@<hash>/` if a grep into plugin internals is needed.
-- **Plugin work that also touches a test repo** (new plugin API + test repo update to consume it) → launch from `displayxr-unity`. The plugin is the primary surface; the test repos are reachable via adjacent `../displayxr-unity-test*` paths. Land the plugin change first, let CI publish `#upm`, then update the test repo.
+- **Sample-only work** (tweak a scene, fix a sample bug) → launch from `displayxr-unity-samples` (or a `samples/<name>` subdir); its `CLAUDE.md` auto-loads focused context. The plugin's installed source is readable at `Library/PackageCache/com.displayxr.unity@<hash>/`.
+- **Plugin work that also updates a sample** → launch from `displayxr-unity`; land the plugin change first, let CI publish `#upm`, then update the sample in the monorepo.
