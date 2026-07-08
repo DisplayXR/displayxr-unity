@@ -34,6 +34,24 @@ namespace DisplayXR
 
         public override bool Initialize()
         {
+            // macOS EDITOR gate (#204): built players run the full zero-copy Metal
+            // pipeline, but the Unity EDITOR SEGVs in its Metal GfxDeviceWorker
+            // (CreateColorRenderSurface NULL deref) whenever it allocates a new
+            // color RenderSurface while XR passes are active — reproduced on
+            // 6000.3 + 6000.4 with zero provider command buffers in flight (a
+            // Unity editor defect; full bisection on #204). Until a Unity fix or
+            // workaround lands, macOS editor Play Mode declines cleanly instead
+            // of crashing the editor. DISPLAYXR_METAL_EDITOR=1 opts back in for
+            // the workaround hunt. Built players (OSXPlayer) are unaffected.
+            if (Application.platform == RuntimePlatform.OSXEditor &&
+                System.Environment.GetEnvironmentVariable("DISPLAYXR_METAL_EDITOR") != "1")
+            {
+                Debug.LogWarning("[DisplayXR] macOS editor Play Mode is disabled pending a Unity " +
+                    "editor Metal fix (see displayxr-unity#204) — build & run a macOS player to " +
+                    "test stereo, or set DISPLAYXR_METAL_EDITOR=1 to opt in anyway.");
+                return false;
+            }
+
             // Pick the stereo render mode BEFORE creating/starting the subsystem so
             // the native GfxStart (which reads it) sees the right value (#166 task #8).
             // SPI is correct only on URP+Windows+D3D12; on BiRP it renders opaque
