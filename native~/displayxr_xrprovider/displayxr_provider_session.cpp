@@ -450,6 +450,12 @@ typedef struct ProviderSession {
 	ID3D11Texture2D *wsui_unity_tex;
 	ID3D11Texture2D *wsui_unity_tex_own;   // own-device side (editor bridge)
 	HANDLE           wsui_unity_tex_handle;
+#else
+	// Metal (#206): arraySize=1 overlay swapchain images (id<MTLTexture> in .texture).
+	// No cross-device bridge — the runtime compositor is on Unity's OWN MTLDevice, so
+	// submit blits the C#-registered Unity id<MTLTexture> straight into the acquired
+	// image (same device, session queue). Cousin of the projection sc_images_metal.
+	XrSwapchainImageMetalKHR wsui_images_metal[PS_MAX_SWAPCHAIN_IMAGES];
 #endif // _WIN32
 
 	// Local2D layer (#166 Phase B, XR_EXT_local_3d_zone) — post-weave 2D content at a
@@ -1675,10 +1681,58 @@ extern "C" int displayxr_window_space_ui_get_pending(void **out_tex, int *out_te
 static int ps_create_wsui(uint32_t w, uint32_t h)
 {
 #ifndef _WIN32
-	// Metal wsui texture path lands in Phase 4 (#206). Returning 0 keeps the
-	// exported bridge getter on the NULL/inert contract C# already handles.
-	(void)w; (void)h;
-	return 0;
+	// Metal (#206): an arraySize=1 overlay swapchain on Unity's device. No bridge —
+	// submit blits the C#-registered Unity id<MTLTexture> straight in (same device).
+	if (w == 0 || h == 0) return 0;
+	if (s_ps.graphics_api != DXR_GFX_METAL || !s_ps.metal_queue) return 0;
+	if (s_ps.wsui_swapchain_created && s_ps.wsui_registered_w == w && s_ps.wsui_registered_h == h)
+		return 1; // already sized for this RT
+
+	if (s_ps.wsui_swapchain && s_ps.pfn_destroy_swapchain) s_ps.pfn_destroy_swapchain(s_ps.wsui_swapchain);
+	s_ps.wsui_swapchain = XR_NULL_HANDLE;
+	s_ps.wsui_swapchain_created = 0;
+	s_ps.wsui_image_acquired = 0;
+
+	// Prefer BGRA8Unorm (80) to match Unity's B8G8R8A8_UNorm OverlayTexture so the
+	// submit blit is same-format; fall back to the first enumerated format.
+	uint32_t fmt_count = 0;
+	s_ps.pfn_enumerate_swapchain_formats(s_ps.session, 0, &fmt_count, NULL);
+	if (fmt_count == 0) { ps_log("[DisplayXR-PROV] wsui: no swapchain formats\n"); return 0; }
+	int64_t formats[32];
+	if (fmt_count > 32) fmt_count = 32;
+	s_ps.pfn_enumerate_swapchain_formats(s_ps.session, fmt_count, &fmt_count, formats);
+	int64_t format = formats[0];
+	for (uint32_t i = 0; i < fmt_count; i++) { if (formats[i] == 80) { format = 80; break; } }
+
+	XrSwapchainCreateInfo ci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+	ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
+	                XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT |
+	                XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+	ci.format = format;
+	ci.sampleCount = 1;
+	ci.width = w; ci.height = h;
+	ci.faceCount = 1; ci.arraySize = 1; ci.mipCount = 1;
+	if (XR_FAILED(s_ps.pfn_create_swapchain(s_ps.session, &ci, &s_ps.wsui_swapchain))) {
+		ps_log("[DisplayXR-PROV] wsui: xrCreateSwapchain failed\n"); s_ps.wsui_swapchain = XR_NULL_HANDLE; return 0;
+	}
+	uint32_t count = 0;
+	s_ps.pfn_enumerate_swapchain_images(s_ps.wsui_swapchain, 0, &count, NULL);
+	if (count > PS_MAX_SWAPCHAIN_IMAGES) count = PS_MAX_SWAPCHAIN_IMAGES;
+	for (uint32_t i = 0; i < count; i++) {
+		s_ps.wsui_images_metal[i].type = XR_TYPE_SWAPCHAIN_IMAGE_METAL_KHR;
+		s_ps.wsui_images_metal[i].next = NULL; s_ps.wsui_images_metal[i].texture = NULL;
+	}
+	if (XR_FAILED(s_ps.pfn_enumerate_swapchain_images(s_ps.wsui_swapchain, count, &count,
+	        (XrSwapchainImageBaseHeader *)s_ps.wsui_images_metal))) {
+		ps_log("[DisplayXR-PROV] wsui: enumerate images (Metal) failed\n"); return 0;
+	}
+	s_ps.wsui_w = w; s_ps.wsui_h = h; s_ps.wsui_format = format;
+	s_ps.wsui_image_count = count;
+	s_ps.wsui_registered_w = w; s_ps.wsui_registered_h = h;
+	s_ps.wsui_swapchain_created = 1;
+	ps_log("[DisplayXR-PROV] wsui: Metal swapchain %ux%u (%u imgs, fmt=%lld)\n",
+	       w, h, count, (long long)format);
+	return 1;
 #else
 	int is_d3d11 = (s_ps.graphics_api == DXR_GFX_D3D11);
 	if (w == 0 || h == 0) return 0;
@@ -1814,7 +1868,46 @@ static int ps_submit_wsui(XrCompositionLayerWindowSpaceEXT *out_layer)
 	if (!out_layer) return 0;
 	memset(out_layer, 0, sizeof(*out_layer));
 #ifndef _WIN32
-	return 0; // Metal wsui path lands in Phase 4 (#206)
+	// Metal (#206): blit the C#-registered Unity id<MTLTexture> into the acquired
+	// overlay swapchain image (same device, session queue), then submit the layer.
+	if (s_ps.graphics_api != DXR_GFX_METAL) return 0;
+	void *tex = NULL; int tw = 0, th = 0;
+	float lx = 0, ly = 0, lw = 0, lh = 0, ldisp = 0;
+	if (!displayxr_window_space_ui_get_pending(&tex, &tw, &th, &lx, &ly, &lw, &lh, &ldisp))
+		return 0; // no UI texture registered this frame
+	if (!ps_create_wsui((uint32_t)tw, (uint32_t)th)) return 0;
+	if (!s_ps.wsui_swapchain_created || s_ps.wsui_image_count == 0) return 0;
+
+	uint32_t idx = 0;
+	XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+	if (XR_FAILED(s_ps.pfn_acquire_swapchain_image(s_ps.wsui_swapchain, &ai, &idx)) ||
+	    idx >= s_ps.wsui_image_count)
+		return 0;
+	XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+	wi.timeout = 1000000000;
+	s_ps.pfn_wait_swapchain_image(s_ps.wsui_swapchain, &wi);
+
+	// Same-device blit Unity UI texture -> acquired image on the session queue.
+	// Ordered after Unity's OverlayCamera render by the frame's order_weave wait
+	// CB (session-queue FIFO — order_weave is committed earlier in submit); the
+	// compositor's weave at xrEndFrame is FIFO after this blit on the same queue.
+	if (s_ps.wsui_images_metal[idx].texture)
+		displayxr_metal_blit_textures(s_ps.metal_queue, tex, s_ps.wsui_images_metal[idx].texture);
+
+	XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+	s_ps.pfn_release_swapchain_image(s_ps.wsui_swapchain, &ri);
+
+	out_layer->type = XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT;
+	out_layer->next = NULL;
+	out_layer->layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+	out_layer->subImage.swapchain = s_ps.wsui_swapchain;
+	out_layer->subImage.imageRect.offset = {0, 0};
+	out_layer->subImage.imageRect.extent = {(int32_t)s_ps.wsui_w, (int32_t)s_ps.wsui_h};
+	out_layer->subImage.imageArrayIndex = 0;
+	out_layer->x = lx; out_layer->y = ly;
+	out_layer->width = lw; out_layer->height = lh;
+	out_layer->disparity = ldisp;
+	return 1;
 #else
 
 	void *tex = NULL; int tw = 0, th = 0;
