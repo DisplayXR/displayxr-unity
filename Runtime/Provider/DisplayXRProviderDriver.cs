@@ -1,6 +1,7 @@
 // Copyright 2024-2026, DisplayXR contributors
 // SPDX-License-Identifier: Apache-2.0
 
+using System.Reflection;
 using UnityEngine;
 
 namespace DisplayXR
@@ -75,6 +76,104 @@ namespace DisplayXR
 
             DisplayXRProvider.PumpEvents();
             PushActiveRigTunables();
+            PushGameViewRectEditorProbe();
+        }
+
+        // --- GameView-glue (Task (a), editor + texture probe only) ---------------
+        // Push the Unity Game view's on-screen rect to native each frame so the dedicated
+        // weave window is glued to it → window-relative Kooima + weaver phase track where
+        // the mirror-blit shows the woven output. Pure reflection into UnityEditor.GameView
+        // so the Runtime asmdef needs no UnityEditor reference (Type resolves to null in a
+        // built player → the whole path is inert there and gated to editor + probe anyway).
+        static int  s_probeGate = -1;   // -1 unknown, 0 off, 1 on
+        System.Type m_GameViewType;
+        FieldInfo   m_ParentField;      // EditorWindow.m_Parent (HostView)
+        PropertyInfo m_ScreenPosProp;   // GUIView.screenPosition (Rect, LOGICAL points)
+        PropertyInfo m_PixelsPerPointProp; // EditorGUIUtility.pixelsPerPoint (DPI scale)
+        bool        m_LoggedGlueOnce;
+
+        void PushGameViewRectEditorProbe()
+        {
+            if (!Application.isEditor) return;
+            if (s_probeGate < 0)
+            {
+                s_probeGate = System.Environment.GetEnvironmentVariable(
+                    "DISPLAYXR_PROV_TEXTURE_PROBE") == "1" ? 1 : 0;
+            }
+            if (s_probeGate == 0) return;
+
+            if (m_GameViewType == null)
+            {
+                m_GameViewType = System.Type.GetType("UnityEditor.GameView,UnityEditor");
+                if (m_GameViewType == null) { s_probeGate = 0; return; } // not in editor
+            }
+
+            // Resolve EditorWindow.m_Parent (HostView) from the type (walk the hierarchy
+            // for the non-public base field).
+            if (m_ParentField == null)
+            {
+                for (var t = m_GameViewType; t != null && m_ParentField == null; t = t.BaseType)
+                    m_ParentField = t.GetField("m_Parent",
+                        BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+                if (m_ParentField == null) return;
+            }
+
+            // Enumerate ALL GameView instances and pick the LARGEST-area one — the visible
+            // panel. FindObjectsOfTypeAll can also return smaller/background game views, and
+            // gluing to the wrong (small) one makes Unity size the mirror RT smaller than the
+            // visible panel → the woven output shows at a fraction of the tab.
+            var wins = Resources.FindObjectsOfTypeAll(m_GameViewType);
+            if (wins == null || wins.Length == 0) return;
+            Rect r = default; float bestArea = -1f; bool found = false;
+            foreach (var w in wins)
+            {
+                var pr = m_ParentField.GetValue(w);
+                if (pr == null) continue;
+                if (m_ScreenPosProp == null)
+                {
+                    for (var t = pr.GetType(); t != null && m_ScreenPosProp == null; t = t.BaseType)
+                        m_ScreenPosProp = t.GetProperty("screenPosition",
+                            BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+                    if (m_ScreenPosProp == null) return;
+                }
+                var wr = (Rect)m_ScreenPosProp.GetValue(pr, null);
+                float area = wr.width * wr.height;
+                if (!m_LoggedGlueOnce)
+                    Debug.Log($"[DisplayXR] GameView candidate: screenPos(points)=({wr.x},{wr.y} {wr.width}x{wr.height}) area={area}");
+                if (area > bestArea) { bestArea = area; r = wr; found = true; }
+            }
+            if (!found) return;
+
+            // screenPosition is in LOGICAL points; the weave window + runtime want PHYSICAL
+            // pixels. Scale by the editor's DPI (EditorGUIUtility.pixelsPerPoint) — e.g. 2.5
+            // at 250% Windows scaling, where the raw 836x422 points → 2090x1055 px.
+            float ppp = 1f;
+            if (m_PixelsPerPointProp == null)
+            {
+                var eguiType = System.Type.GetType("UnityEditor.EditorGUIUtility,UnityEditor");
+                if (eguiType != null)
+                    m_PixelsPerPointProp = eguiType.GetProperty("pixelsPerPoint",
+                        BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+            }
+            if (m_PixelsPerPointProp != null)
+            {
+                object v = m_PixelsPerPointProp.GetValue(null, null);
+                if (v is float f && f > 0f) ppp = f;
+            }
+
+            int px = Mathf.RoundToInt(r.x * ppp);
+            int py = Mathf.RoundToInt(r.y * ppp);
+            int pw = Mathf.RoundToInt(r.width * ppp);
+            int ph = Mathf.RoundToInt(r.height * ppp);
+
+            if (!m_LoggedGlueOnce)
+            {
+                m_LoggedGlueOnce = true;
+                Debug.Log($"[DisplayXR] GameView glue: screenPos(points)=({r.x},{r.y} {r.width}x{r.height}) " +
+                          $"ppp={ppp} -> physical=({px},{py} {pw}x{ph})");
+            }
+
+            DisplayXRProviderNative.dxr_prov_set_gameview_rect(px, py, pw, ph);
         }
 
         void PushActiveRigTunables()

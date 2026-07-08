@@ -2499,15 +2499,21 @@ void *dxr_prov_get_woven_unity_texture(uint32_t *w, uint32_t *h)
 	return s_probe_tex_unity;
 }
 
-// The woven content occupies the canvas (== forced zone) sub-rect of the shared
-// texture; report it (+ the full texture dims) so the mirror blit can normalize srcRect.
+// The woven content occupies the canvas sub-rect of the shared texture; report it
+// (+ full texture dims) so the mirror blit can normalize srcRect. The canvas tracks the
+// LIVE window client (the runtime re-weaves into ps_window_size each frame via the size
+// reconcile), so read it live here — NOT the frozen forced-zone dims cached in
+// s_ps.zone_w/h at session start. When the window is glued to the Game view rect and
+// then resized, the stale cached value would over-report the canvas → the mirror samples
+// past the woven content into black (right/bottom truncation, Task (a) glue).
 void dxr_prov_get_woven_canvas(int32_t *x, int32_t *y, int32_t *cw, int32_t *ch,
                                uint32_t *texw, uint32_t *texh)
 {
-	if (x)  *x  = s_ps.zone_valid ? s_ps.zone_x : 0;
-	if (y)  *y  = s_ps.zone_valid ? s_ps.zone_y : 0;
-	if (cw) *cw = s_ps.zone_valid ? s_ps.zone_w : (int32_t)s_probe_woven_w;
-	if (ch) *ch = s_ps.zone_valid ? s_ps.zone_h : (int32_t)s_probe_woven_h;
+	uint32_t ww = 0, wh = 0; ps_window_size(&ww, &wh);
+	if (x)  *x  = 0;
+	if (y)  *y  = 0;
+	if (cw) *cw = ww ? (int32_t)ww : (int32_t)s_probe_woven_w;
+	if (ch) *ch = wh ? (int32_t)wh : (int32_t)s_probe_woven_h;
 	if (texw) *texw = s_probe_woven_w;
 	if (texh) *texh = s_probe_woven_h;
 }
@@ -2839,7 +2845,7 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	// Unconditional build marker: if this line is ABSENT from the log, the editor is
 	// running a STALE DLL (restart Unity). If present with env_probe=0, the env var
 	// DISPLAYXR_PROV_TEXTURE_PROBE=1 did not reach the editor process.
-	ps_log("[DisplayXR-PROV] PROBE build=weave-to-texture env_probe=%d\n", s_probe_enabled);
+	ps_log("[DisplayXR-PROV] PROBE build=weave-to-texture-mirror-fill env_probe=%d\n", s_probe_enabled);
 	ps_probe_cleanup(); // clears counters + any leftover texture from a prior session
 	if (s_probe_enabled) {
 		DisplayXRDisplayInfo *pdi = &displayxr_get_state()->display_info;
@@ -3037,6 +3043,58 @@ void dxr_prov_set_dedicated_window(int enable)
 	ps_log("[DisplayXR-PROV] dedicated window (editor): %d\n", s_prov_dedicated_window);
 }
 int dxr_prov_get_dedicated_window(void) { return s_prov_dedicated_window; }
+
+// Glue-to-GameView (Task (a)): reposition the dedicated editor weave window so its
+// client rect exactly covers the Unity Game view's on-screen region. In texture mode
+// the runtime derives BOTH window-relative Kooima framing AND the weaver's lenticular
+// phase from this window's screen geometry (win_binding.windowHandle) — but the woven
+// output is now shown by the mirror-blit inside the Game tab, not in this window. By
+// gluing the window's client rect to the Game view rect, that geometry becomes correct
+// with zero runtime change, and the forced full-window zone (client-sized) makes the
+// weave canvas == the Game view size so the mirror srcRect follows.
+//
+// The window never presents in texture mode, so we make it invisible-in-practice:
+// strip the chrome (WS_POPUP → client rect == window rect == Game view rect), drop
+// WS_EX_TOPMOST, and push it to the BOTTOM of the z-order so the editor window (which
+// always contains the Game view region) fully occludes it. It stays a normal visible
+// window to the OS, so the runtime's position tracking is unaffected.
+// Called each frame from C# (editor + probe only). x,y = screen px (top-left origin),
+// w,h = Game view size in px. w<=0||h<=0 is ignored.
+void dxr_prov_set_gameview_rect(int x, int y, int w, int h)
+{
+	HWND hwnd = (HWND)s_ps.overlay_hwnd;
+	if (!hwnd || !IsWindow(hwnd)) return;
+	if (w <= 0 || h <= 0) return;
+
+	static int s_glued = 0;
+	if (!s_glued) {
+		s_glued = 1;
+		// Strip chrome (client == window) + topmost so the client rect the runtime
+		// reads equals the Game view rect and the window sits behind the editor.
+		LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+		style = (style & ~(LONG_PTR)WS_OVERLAPPEDWINDOW) | WS_POPUP;
+		SetWindowLongPtrW(hwnd, GWL_STYLE, style);
+		LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+		ex &= ~(LONG_PTR)WS_EX_TOPMOST;
+		SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex);
+		ps_log("[DisplayXR-PROV] gameview-glue: stripped chrome + topmost on weave window\n");
+	}
+
+	// Reposition to the Game view rect, behind the editor, without stealing focus.
+	SetWindowPos(hwnd, HWND_BOTTOM, x, y, w, h,
+	             SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
+
+	// Diagnostic: log the pushed rect + resulting client size when it changes, so the
+	// glue geometry (and any DPI/toolbar offset) is visible in the log without guessing.
+	static int px = 0, py = 0, pw = 0, ph = 0;
+	if (x != px || y != py || w != pw || h != ph) {
+		px = x; py = y; pw = w; ph = h;
+		RECT rc = {0};
+		GetClientRect(hwnd, &rc);
+		ps_log("[DisplayXR-PROV] gameview-glue: pushed screen=(%d,%d %dx%d) -> client=%dx%d\n",
+		       x, y, w, h, (int)(rc.right - rc.left), (int)(rc.bottom - rc.top));
+	}
+}
 
 // Transparent-background request (#166 Phase A). Set from C# BEFORE the session
 // starts; the actual ALPHA_BLEND opt-in also requires the runtime to advertise it

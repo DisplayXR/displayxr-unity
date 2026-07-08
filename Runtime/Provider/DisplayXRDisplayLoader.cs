@@ -75,6 +75,17 @@ namespace DisplayXR
         public override bool Start()
         {
             StartSubsystem<XRDisplaySubsystem>();
+            // GameView weave-to-texture (Task (a), editor + probe): the editor XR game view
+            // only displays the XR mirror-blit (IMGUI/overlay UI don't composite into it), so
+            // presentation goes through the mirror-blit. Select the RESERVED LeftEye mode
+            // app-side so QueryMirrorViewBlitDesc is invoked (custom mode ids threw Unity's
+            // "Invalide XRSDK BlitMode" assertion). Complements the native frame-desc mode.
+            if (Application.isEditor && DisplaySubsystem != null
+                && System.Environment.GetEnvironmentVariable("DISPLAYXR_PROV_TEXTURE_PROBE") == "1")
+            {
+                DisplaySubsystem.SetPreferredMirrorBlitMode((int)XRMirrorViewBlitMode.LeftEye);
+                Debug.Log("[DisplayXR] Provider: editor probe → preferred mirror blit mode = LeftEye (Task a)");
+            }
             DisplayXRProviderDriver.EnsureInstance();
             return true;
         }

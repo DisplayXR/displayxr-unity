@@ -81,6 +81,33 @@ namespace DisplayXR
         public static extern void dxr_prov_set_dedicated_window(int enable);
 
         /// <summary>
+        /// Glue-to-GameView (Task (a), editor + texture probe): reposition the dedicated
+        /// weave window so its client rect covers the Unity Game view's on-screen region,
+        /// so window-relative Kooima + the weaver's lenticular phase track where the
+        /// mirror-blit shows the woven output. x,y = screen px (top-left origin), w,h =
+        /// Game view size in px. Pushed each frame by <see cref="DisplayXRProviderDriver"/>.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void dxr_prov_set_gameview_rect(int x, int y, int w, int h);
+
+        /// <summary>
+        /// GameView weave-to-texture presentation (Task (a), editor + texture probe): the
+        /// runtime-woven shared texture opened on Unity's D3D device. C# wraps it as an
+        /// external Texture2D and draws it into the Game view (DisplayXRGameViewPresenter).
+        /// Returns IntPtr.Zero until texture mode publishes it.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern System.IntPtr dxr_prov_get_woven_unity_texture(out uint width, out uint height);
+
+        /// <summary>
+        /// The woven content's canvas sub-rect within the shared texture (top-left origin px)
+        /// plus the full texture dims, so the presenter can build a normalized texCoords rect.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void dxr_prov_get_woven_canvas(
+            out int x, out int y, out int cw, out int ch, out uint texw, out uint texh);
+
+        /// <summary>
         /// Request a transparent background BEFORE the session starts (#166 Phase A):
         /// 1 opts the session into ALPHA_BLEND + transparentBackgroundEnabled so the
         /// runtime's DComp overlay composites the woven 3D over the desktop with

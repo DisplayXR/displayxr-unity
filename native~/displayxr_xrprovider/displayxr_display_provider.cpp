@@ -572,6 +572,17 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 	for (uint32_t z = 0; z < PROV_MAX_EXTRA_ZONES; z++)
 		if (dxr_prov_consume_zone_rewrap(z)) destroy_extra_zone_texture(z);
 	create_textures_if_ready();
+
+	// GameView weave-to-texture mirror (Task (a)): the editor XR game view ONLY displays the
+	// XR mirror-blit — normal Unity rendering (IMGUI, overlay UI) does NOT composite into it
+	// (verified: an IMGUI overlay's sentinels never appeared though OnGUI fired). So the
+	// mirror-blit is the sole path. Request a RESERVED mode (LeftEye, in the manifest) once
+	// the woven texture is up so QueryMirrorViewBlitDesc fires; it returns the woven canvas
+	// with a compose-fill destRect (see MainQueryMirrorViewBlitDesc). Shipping window path is
+	// untouched: with no woven texture this stays kUnityXRMirrorBlitNone.
+	if (s_woven_tex_id != 0)
+		next->mirrorBlitMode = kUnityXRMirrorBlitLeftEye;
+
 	if (!s_textures_created) return kUnitySubsystemErrorCodeSuccess; // not session-ready yet
 
 	uint32_t img = 0;
@@ -829,11 +840,44 @@ MainQueryMirrorViewBlitDesc(UnitySubsystemHandle handle, void *userData,
 			desc->blitParams[0].srcTexArraySlice = 0;
 			desc->blitParams[0].srcRect = { (float)cx / tw, (float)cy / th,
 			                                (float)cw / tw, (float)ch / th };
-			desc->blitParams[0].destRect = { 0.0f, 0.0f, 1.0f, 1.0f };
+			// Unity's game-view mirror COMPOSES srcRect within destRect: it maps the whole
+			// source texture to destRect, then insets by srcRect (rather than stretching
+			// srcRect to fill destRect). So the woven canvas (a sub-rect of the 3840x2160
+			// texture) lands at srcRect.size × destRect.size — hence a fractional fill with
+			// destRect=(0,0,1,1). To make the canvas fill the mirror RT, scale destRect up by
+			// the inverse of srcRect (and offset to cancel srcRect's origin); the oversized
+			// destRect simply clips to the RT, leaving the canvas filling it. Verified: the
+			// (0.25,0.25,0.5,0.5) diagnostic put the canvas at srcRect.size×0.5, top-left of it.
 			{
-				static bool w_logged = false;
-				if (!w_logged) { w_logged = true;
-					prov_log("[DisplayXR-PROV] mirror blit: returning WOVEN texture blitParams (count=1)\n"); }
+				float sx = desc->blitParams[0].srcRect.x,  sy = desc->blitParams[0].srcRect.y;
+				float sw = desc->blitParams[0].srcRect.width, sh = desc->blitParams[0].srcRect.height;
+				if (sw > 0.0f && sh > 0.0f)
+					desc->blitParams[0].destRect = { -sx / sw, -sy / sh, 1.0f / sw, 1.0f / sh };
+				else
+					desc->blitParams[0].destRect = { 0.0f, 0.0f, 1.0f, 1.0f };
+			}
+			{
+				// Throttled diagnostic (~every 120 calls): the live canvas + tex dims +
+				// normalized srcRect, so a truncation (canvas/srcRect desync) is visible.
+				static int q_count = 0;
+				if ((q_count++ % 120) == 0) {
+					int rtSW = 0, rtSH = 0;
+					if (info.mirrorRtDesc) {
+						rtSW = info.mirrorRtDesc->rtScaledWidth;
+						rtSH = info.mirrorRtDesc->rtScaledHeight;
+					}
+					char buf[256];
+					_snprintf_s(buf, sizeof(buf), _TRUNCATE,
+					            "[DisplayXR-PROV] mirror blit: canvas=(%d,%d %dx%d) tex=%ux%u "
+					            "srcRect=(%.3f,%.3f %.3f,%.3f) destRect=(%.3f,%.3f %.3f,%.3f) mirrorRT scaled=%dx%d\n",
+					            cx, cy, cw, ch, tw, th,
+					            desc->blitParams[0].srcRect.x, desc->blitParams[0].srcRect.y,
+					            desc->blitParams[0].srcRect.width, desc->blitParams[0].srcRect.height,
+					            desc->blitParams[0].destRect.x, desc->blitParams[0].destRect.y,
+					            desc->blitParams[0].destRect.width, desc->blitParams[0].destRect.height,
+					            rtSW, rtSH);
+					prov_log(buf);
+				}
 			}
 			return kUnitySubsystemErrorCodeSuccess;
 		}

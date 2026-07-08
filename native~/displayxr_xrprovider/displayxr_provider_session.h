@@ -165,15 +165,16 @@ void *dxr_prov_get_bridge_unity_texture(uint32_t *width, uint32_t *height,
 /// NULL for eye>1 or in SPI mode (use dxr_prov_get_bridge_unity_texture instead).
 void *dxr_prov_get_bridge_unity_texture_eye(uint32_t eye, uint32_t *width, uint32_t *height);
 
-/// GameView weave-to-texture mirror (experiment, Task (a)). The runtime-woven shared
-/// texture opened on Unity's device — the display-provider wraps it via CreateTexture
-/// and mirror-blits it into the editor Game window. NULL unless texture mode is active
-/// (DISPLAYXR_PROV_TEXTURE_PROBE). Opened lazily; call from the graphics thread.
-void *dxr_prov_get_woven_unity_texture(uint32_t *width, uint32_t *height);
+/// GameView weave-to-texture (experiment, Task (a)). The runtime-woven shared texture
+/// opened on Unity's device — presented into the editor Game view. NULL unless texture
+/// mode is active (DISPLAYXR_PROV_TEXTURE_PROBE). Opened lazily. Exported so C# can wrap
+/// it as an external Texture2D on a RawImage overlay (deterministic presentation).
+DISPLAYXR_EXPORT void *dxr_prov_get_woven_unity_texture(uint32_t *width, uint32_t *height);
 
 /// The woven content's canvas (== forced zone) sub-rect within the shared texture,
-/// plus the full texture dims, so the mirror blit can build a normalized srcRect.
-void dxr_prov_get_woven_canvas(int32_t *x, int32_t *y, int32_t *cw, int32_t *ch,
+/// plus the full texture dims, so the presenter can build a normalized uvRect. Exported
+/// for the C# RawImage overlay.
+DISPLAYXR_EXPORT void dxr_prov_get_woven_canvas(int32_t *x, int32_t *y, int32_t *cw, int32_t *ch,
                                uint32_t *texw, uint32_t *texh);
 
 /// Render mode gate (#166 task #8). Set from C# BEFORE the session starts:
@@ -197,6 +198,14 @@ DISPLAYXR_EXPORT int  dxr_prov_get_single_pass(void);
 /// so it survives the session_start reset without special handling.
 DISPLAYXR_EXPORT void dxr_prov_set_dedicated_window(int enable);
 DISPLAYXR_EXPORT int  dxr_prov_get_dedicated_window(void);
+
+/// Glue-to-GameView (Task (a), editor + texture probe): reposition the dedicated
+/// weave window so its client rect exactly covers the Unity Game view's on-screen
+/// region, so window-relative Kooima + the weaver's lenticular phase track where the
+/// mirror-blit actually shows the woven output. Strips the window chrome + topmost
+/// and parks it behind the editor (occluded). Called each frame from C#; x,y = screen
+/// px (top-left origin), w,h = Game view size in px. w<=0||h<=0 is ignored. Windows-only.
+DISPLAYXR_EXPORT void dxr_prov_set_gameview_rect(int x, int y, int w, int h);
 
 /// Transparent-background request (#166 Phase A). Set from C# BEFORE the session
 /// starts: 1 = opt the session into a transparent background (ALPHA_BLEND env
