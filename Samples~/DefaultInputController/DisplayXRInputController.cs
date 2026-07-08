@@ -538,7 +538,11 @@ namespace DisplayXR
         private static Vector2 GetMousePosition() =>
             Mouse.current != null ? Mouse.current.position.ReadValue() : Vector2.zero;
         private static float GetScrollDelta() =>
-            Mouse.current != null ? Mouse.current.scroll.ReadValue().y / 120f : 0f;
+            // Unity's Input System returns Mouse.scroll ~1 per wheel notch (NOT the old Win32
+            // WHEEL_DELTA of 120), so do NOT divide by 120 — that shrank a full notch to ~0.008
+            // and made scroll-zoom imperceptible. Matches the old-Input path below
+            // (Input.mouseScrollDelta.y, also ~1 per notch).
+            Mouse.current != null ? Mouse.current.scroll.ReadValue().y : 0f;
 
         private static Key ToKey(KeyCode k)
         {
