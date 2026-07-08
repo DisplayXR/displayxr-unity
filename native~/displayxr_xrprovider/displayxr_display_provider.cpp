@@ -945,9 +945,10 @@ LifecycleStart(UnitySubsystemHandle handle, void *userData)
 	// create inside xrCreateSession (GfxStart = render thread, while Unity's
 	// main thread is blocked waiting on GfxStart) deadlocks. The macOS analog
 	// of the Windows #173 lesson. Reuses the proven SA-era preview window
-	// (displayxr_metal.m); sized to a laptop-friendly default — the runtime
-	// tracks the live view size, and resize lands with the #172 reconcile.
-	s_overlay_hwnd = displayxr_metal_create_preview_window(1512, 982);
+	// (displayxr_metal.m); auto-sized to the display aspect within the
+	// screen's usable area — ps_window_size tracks the live NSView backing
+	// size, and resize lands with the #172 reconcile.
+	s_overlay_hwnd = displayxr_metal_create_preview_window(0, 0);
 	prov_log(s_overlay_hwnd
 	             ? "[DisplayXR-PROV] Lifecycle Start (macOS: provider weave window created on main thread)\n"
 	             : "[DisplayXR-PROV] Lifecycle Start (macOS: weave window FAILED; runtime offscreen)\n");
