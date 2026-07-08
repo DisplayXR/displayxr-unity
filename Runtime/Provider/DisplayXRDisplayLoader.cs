@@ -73,7 +73,12 @@ namespace DisplayXR
             // keep the overlay default. Windows-only behavior: on macOS the runtime
             // self-hosts its NSWindow (the Metal bring-up shape, #204) — the dedicated
             // flag also selects the D3D11 editor bridge, which doesn't exist there.
-            if (Application.platform == RuntimePlatform.WindowsEditor)
+            // macOS parity (#205): the flag also tells the Metal provider to weave
+            // into a dedicated preview window in the editor, vs. Unity's own game
+            // window (the input-transparent in-app overlay) in a built player — so
+            // built-player mouse/keyboard reach Unity's window, not a detached one.
+            if (Application.platform == RuntimePlatform.WindowsEditor
+             || Application.platform == RuntimePlatform.OSXEditor)
             {
                 DisplayXRProviderNative.dxr_prov_set_dedicated_window(1);
                 Debug.Log("[DisplayXR] Provider: editor Play Mode → dedicated weave window (#173)");
