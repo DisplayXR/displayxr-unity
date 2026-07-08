@@ -207,6 +207,21 @@ DISPLAYXR_EXPORT int  dxr_prov_get_dedicated_window(void);
 /// px (top-left origin), w,h = Game view size in px. w<=0||h<=0 is ignored. Windows-only.
 DISPLAYXR_EXPORT void dxr_prov_set_gameview_rect(int x, int y, int w, int h);
 
+/// Initial GameView render rect (Task (a) fill): stash the Game view's render-area
+/// rect (physical px) BEFORE the session starts. session_start sizes the dedicated
+/// weave window to it before capturing the forced full-window zone, so the zone (and
+/// therefore the rendered tile size + the runtime's woven region in the shared texture)
+/// is born at the panel's native resolution instead of the window's creation default.
+/// Without this the zone freezes tiny (~1248x632) and the mirror srcRect over-samples
+/// into black. w<=0||h<=0 clears. Windows-only; editor + probe path.
+DISPLAYXR_EXPORT void dxr_prov_set_initial_gameview_rect(int x, int y, int w, int h);
+
+/// Read the stashed initial GameView render rect (physical px). Returns 1 and fills the
+/// out-params if a valid rect (w>0 && h>0) was stashed, else 0. Used by the dedicated
+/// weave-window creation (displayxr_win32.c) to born the window at the panel size so the
+/// forced full-window zone is captured at native resolution. NULL out-params are allowed.
+DISPLAYXR_EXPORT int dxr_prov_get_initial_gameview_rect(int *x, int *y, int *w, int *h);
+
 /// Transparent-background request (#166 Phase A). Set from C# BEFORE the session
 /// starts: 1 = opt the session into a transparent background (ALPHA_BLEND env
 /// blend mode + transparentBackgroundEnabled on the win32 binding) so the runtime's

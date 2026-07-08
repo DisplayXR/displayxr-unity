@@ -91,6 +91,16 @@ namespace DisplayXR
         public static extern void dxr_prov_set_gameview_rect(int x, int y, int w, int h);
 
         /// <summary>
+        /// Stash the GameView render rect (physical px) BEFORE the session starts (Task (a)
+        /// fill). session_start sizes the weave window to it and borns the forced full-window
+        /// zone at that size, so the rendered tile size + the runtime's woven region fill the
+        /// panel at native resolution (otherwise the zone freezes at the window creation
+        /// default and the mirror srcRect over-samples into black).
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void dxr_prov_set_initial_gameview_rect(int x, int y, int w, int h);
+
+        /// <summary>
         /// GameView weave-to-texture presentation (Task (a), editor + texture probe): the
         /// runtime-woven shared texture opened on Unity's D3D device. C# wraps it as an
         /// external Texture2D and draws it into the Game view (DisplayXRGameViewPresenter).

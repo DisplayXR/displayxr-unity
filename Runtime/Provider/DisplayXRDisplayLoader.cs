@@ -74,6 +74,11 @@ namespace DisplayXR
 
         public override bool Start()
         {
+            // GameView weave-to-texture fill (Task (a)): stash the Game view's render rect
+            // BEFORE the subsystem (→ native session_start) so the forced full-window zone
+            // is born at the panel's native resolution (otherwise it freezes at the weave
+            // window's creation default and the mirror srcRect over-samples into black).
+            DisplayXRProviderDriver.TryPushInitialGameViewRect();
             StartSubsystem<XRDisplaySubsystem>();
             // GameView weave-to-texture (Task (a), editor + probe): the editor XR game view
             // only displays the XR mirror-blit (IMGUI/overlay UI don't composite into it), so

@@ -2263,6 +2263,10 @@ static HANDLE           s_probe_handle  = NULL;  // shared HANDLE handed to the 
 static unsigned         s_probe_frames  = 0;     // submit counter (dump gate)
 static int              s_probe_dumped  = 0;     // one-shot readback done
 static const unsigned   kProbeDumpFrame = 150;   // warmup gate (matches ref app)
+// Initial GameView render rect, stashed from C# BEFORE session_start so the forced
+// full-window zone (and thus the rendered tile size + the runtime's woven region) is
+// born at the panel's native resolution. See dxr_prov_set_initial_gameview_rect docs.
+static int s_init_gv_x = 0, s_init_gv_y = 0, s_init_gv_w = 0, s_init_gv_h = 0;
 // GameView mirror (Task (a)): the woven shared texture opened on UNITY'S device so
 // the display-provider can wrap it via CreateTexture and mirror-blit it into the
 // editor Game window. Opened lazily on first request (graphics thread, session ready).
@@ -2509,11 +2513,23 @@ void *dxr_prov_get_woven_unity_texture(uint32_t *w, uint32_t *h)
 void dxr_prov_get_woven_canvas(int32_t *x, int32_t *y, int32_t *cw, int32_t *ch,
                                uint32_t *texw, uint32_t *texh)
 {
-	uint32_t ww = 0, wh = 0; ps_window_size(&ww, &wh);
+	// The runtime weaves the ZONE-sized region at the shared texture's top-left (verified
+	// by readback: content bbox == s_ps.zone_w/h). The mirror srcRect must match that
+	// woven region — NOT the live window client, which can exceed the frozen zone if the
+	// GameView was resized after the session started (→ srcRect would sample past the
+	// woven content into black, the Task (a) truncation). Fall back to the live window
+	// only when no zone is active.
+	int32_t rw = s_ps.zone_valid ? s_ps.zone_w : 0;
+	int32_t rh = s_ps.zone_valid ? s_ps.zone_h : 0;
+	if (rw <= 0 || rh <= 0) {
+		uint32_t ww = 0, wh = 0; ps_window_size(&ww, &wh);
+		rw = ww ? (int32_t)ww : (int32_t)s_probe_woven_w;
+		rh = wh ? (int32_t)wh : (int32_t)s_probe_woven_h;
+	}
 	if (x)  *x  = 0;
 	if (y)  *y  = 0;
-	if (cw) *cw = ww ? (int32_t)ww : (int32_t)s_probe_woven_w;
-	if (ch) *ch = wh ? (int32_t)wh : (int32_t)s_probe_woven_h;
+	if (cw) *cw = rw;
+	if (ch) *ch = rh;
 	if (texw) *texw = s_probe_woven_w;
 	if (texh) *texh = s_probe_woven_h;
 }
@@ -2845,7 +2861,7 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	// Unconditional build marker: if this line is ABSENT from the log, the editor is
 	// running a STALE DLL (restart Unity). If present with env_probe=0, the env var
 	// DISPLAYXR_PROV_TEXTURE_PROBE=1 did not reach the editor process.
-	ps_log("[DisplayXR-PROV] PROBE build=weave-to-texture-mirror-fill env_probe=%d\n", s_probe_enabled);
+	ps_log("[DisplayXR-PROV] PROBE build=weave-to-texture-clickthrough env_probe=%d\n", s_probe_enabled);
 	ps_probe_cleanup(); // clears counters + any leftover texture from a prior session
 	if (s_probe_enabled) {
 		DisplayXRDisplayInfo *pdi = &displayxr_get_state()->display_info;
@@ -2870,14 +2886,29 @@ int dxr_prov_session_start(const char *runtime_json_path,
 			// texture. (DISPLAYXR_PROV_TEXTURE_PROBE_NOZONE=1 keeps the plain path for
 			// A/B.)
 			if (s_ps.has_display_zones && getenv("DISPLAYXR_PROV_TEXTURE_PROBE_NOZONE") == NULL) {
-				uint32_t ww = 0, wh = 0; ps_window_size(&ww, &wh);
+				// Task (a) fill: born the forced zone at the GameView RENDER size (stashed
+				// from C# before the session started, and the dedicated weave window is
+				// created at that same size in displayxr_create_provider_dedicated_window)
+				// so the rendered tile size + the runtime's woven region fill the panel at
+				// native resolution. Without this the window is at its creation default
+				// (~1248x632) and the zone freezes tiny → the mirror srcRect over-samples
+				// into black. Take the zone dims from the stashed values (deterministic);
+				// do NOT restyle/move the window here — the window is fragile mid-start
+				// (raw-input hooks installed, device setup in flight); the per-frame glue
+				// repositions it after the session is up.
+				uint32_t ww = 0, wh = 0;
+				if (s_init_gv_w > 0 && s_init_gv_h > 0) {
+					ww = (uint32_t)s_init_gv_w; wh = (uint32_t)s_init_gv_h;
+				} else {
+					ps_window_size(&ww, &wh);
+				}
 				if (ww == 0 || wh == 0) { ww = 1280; wh = 720; }
 				s_ps.zone_valid = 1;
 				s_ps.zone_id = 1;
 				s_ps.zone_x = 0; s_ps.zone_y = 0;
 				s_ps.zone_w = (int32_t)ww; s_ps.zone_h = (int32_t)wh;
-				ps_log("[DisplayXR-PROV] PROBE: forced full-window zone %dx%d as texture-mode canvas\n",
-				       s_ps.zone_w, s_ps.zone_h);
+				ps_log("[DisplayXR-PROV] PROBE: forced full-window zone %dx%d as texture-mode canvas (init_gv=%dx%d)\n",
+				       s_ps.zone_w, s_ps.zone_h, s_init_gv_w, s_init_gv_h);
 			}
 			ps_log("[DisplayXR-PROV] PROBE: TEXTURE MODE active (%ux%u) — overlay window "
 			       "will NOT present; readback dumps once at frame %u.\n", pw, ph, kProbeDumpFrame);
@@ -3060,6 +3091,23 @@ int dxr_prov_get_dedicated_window(void) { return s_prov_dedicated_window; }
 // window to the OS, so the runtime's position tracking is unaffected.
 // Called each frame from C# (editor + probe only). x,y = screen px (top-left origin),
 // w,h = Game view size in px. w<=0||h<=0 is ignored.
+void dxr_prov_set_initial_gameview_rect(int x, int y, int w, int h)
+{
+	s_init_gv_x = x; s_init_gv_y = y;
+	s_init_gv_w = (w > 0) ? w : 0;
+	s_init_gv_h = (h > 0) ? h : 0;
+	ps_log("[DisplayXR-PROV] initial gameview rect stashed: (%d,%d %dx%d)\n", x, y, w, h);
+}
+
+int dxr_prov_get_initial_gameview_rect(int *x, int *y, int *w, int *h)
+{
+	if (x) *x = s_init_gv_x;
+	if (y) *y = s_init_gv_y;
+	if (w) *w = s_init_gv_w;
+	if (h) *h = s_init_gv_h;
+	return (s_init_gv_w > 0 && s_init_gv_h > 0) ? 1 : 0;
+}
+
 void dxr_prov_set_gameview_rect(int x, int y, int w, int h)
 {
 	HWND hwnd = (HWND)s_ps.overlay_hwnd;

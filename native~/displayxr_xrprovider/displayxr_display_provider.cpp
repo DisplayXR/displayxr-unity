@@ -835,47 +835,95 @@ MainQueryMirrorViewBlitDesc(UnitySubsystemHandle handle, void *userData,
 		int32_t cx = 0, cy = 0, cw = 0, ch = 0; uint32_t tw = 0, th = 0;
 		dxr_prov_get_woven_canvas(&cx, &cy, &cw, &ch, &tw, &th);
 		if (tw > 0 && th > 0 && cw > 0 && ch > 0) {
+			// --- Calibration mode (Task (a) fill, env DISPLAYXR_PROV_MIRROR_CALIB) -------
+			// Instead of the compose-fill math, emit FIXED, KNOWN blitParams so a single
+			// screenshot pins Unity's mirror mapping empirically. The woven texture is itself
+			// a known asymmetric pattern: the canvas is a filled rect in the TOP-LEFT of an
+			// otherwise-black tw×th field. CALIB=1: whole tex → whole RT (reveals RT→panel
+			// present + UV origin/Y-flip). CALIB=2: shrunk copies of the whole tex at known
+			// destRects incl. one out-of-range (reveals the destRect coordinate system +
+			// clip-vs-clamp past [0,1]).
+			static int s_calib = -1;
+			if (s_calib < 0) {
+				const char *e = getenv("DISPLAYXR_PROV_MIRROR_CALIB");
+				s_calib = (e && e[0]) ? atoi(e) : 0;
+			}
+			int rtSW0 = 0, rtSH0 = 0, rtOW0 = 0, rtOH0 = 0;
+			if (info.mirrorRtDesc) {
+				rtSW0 = info.mirrorRtDesc->rtScaledWidth;
+				rtSH0 = info.mirrorRtDesc->rtScaledHeight;
+				rtOW0 = info.mirrorRtDesc->rtOriginalWidth;
+				rtOH0 = info.mirrorRtDesc->rtOriginalHeight;
+			}
+			if (s_calib != 0) {
+				UnityXRRectf full = { 0.0f, 0.0f, 1.0f, 1.0f };
+				if (s_calib == 2) {
+					// Corner + center + out-of-range marker tiles, whole tex each.
+					const UnityXRRectf dests[5] = {
+						{ 0.00f, 0.00f, 0.25f, 0.25f }, // top-left in dest-space
+						{ 0.75f, 0.00f, 0.25f, 0.25f }, // top-right
+						{ 0.00f, 0.75f, 0.25f, 0.25f }, // bottom-left
+						{ 0.375f, 0.375f, 0.25f, 0.25f }, // center
+						{ 0.90f, 0.90f, 0.40f, 0.40f }, // deliberately past [0,1] (clip vs clamp)
+					};
+					desc->blitParamsCount = 5;
+					for (int i = 0; i < 5; i++) {
+						desc->blitParams[i].srcTexId = s_woven_tex_id;
+						desc->blitParams[i].srcTexArraySlice = 0;
+						desc->blitParams[i].srcRect = full;
+						desc->blitParams[i].destRect = dests[i];
+					}
+				} else {
+					// CALIB=1 (and any other nonzero): whole tex → whole RT, 1:1.
+					desc->blitParamsCount = 1;
+					desc->blitParams[0].srcTexId = s_woven_tex_id;
+					desc->blitParams[0].srcTexArraySlice = 0;
+					desc->blitParams[0].srcRect = full;
+					desc->blitParams[0].destRect = full;
+				}
+				static int c_count = 0;
+				if ((c_count++ % 120) == 0) {
+					char buf[256];
+					_snprintf_s(buf, sizeof(buf), _TRUNCATE,
+					            "[DisplayXR-PROV] mirror CALIB=%d: params=%d canvas=(%dx%d) tex=%ux%u "
+					            "mirrorRT scaled=%dx%d original=%dx%d\n",
+					            s_calib, desc->blitParamsCount, cw, ch, tw, th,
+					            rtSW0, rtSH0, rtOW0, rtOH0);
+					prov_log(buf);
+				}
+				return kUnitySubsystemErrorCodeSuccess;
+			}
+			// --------------------------------------------------------------------------
 			desc->blitParamsCount = 1;
 			desc->blitParams[0].srcTexId = s_woven_tex_id;
 			desc->blitParams[0].srcTexArraySlice = 0;
 			desc->blitParams[0].srcRect = { (float)cx / tw, (float)cy / th,
 			                                (float)cw / tw, (float)ch / th };
-			// Unity's game-view mirror COMPOSES srcRect within destRect: it maps the whole
-			// source texture to destRect, then insets by srcRect (rather than stretching
-			// srcRect to fill destRect). So the woven canvas (a sub-rect of the 3840x2160
-			// texture) lands at srcRect.size × destRect.size — hence a fractional fill with
-			// destRect=(0,0,1,1). To make the canvas fill the mirror RT, scale destRect up by
-			// the inverse of srcRect (and offset to cancel srcRect's origin); the oversized
-			// destRect simply clips to the RT, leaving the canvas filling it. Verified: the
-			// (0.25,0.25,0.5,0.5) diagnostic put the canvas at srcRect.size×0.5, top-left of it.
-			{
-				float sx = desc->blitParams[0].srcRect.x,  sy = desc->blitParams[0].srcRect.y;
-				float sw = desc->blitParams[0].srcRect.width, sh = desc->blitParams[0].srcRect.height;
-				if (sw > 0.0f && sh > 0.0f)
-					desc->blitParams[0].destRect = { -sx / sw, -sy / sh, 1.0f / sw, 1.0f / sh };
-				else
-					desc->blitParams[0].destRect = { 0.0f, 0.0f, 1.0f, 1.0f };
-			}
+			// Unity's game-view mirror blit is a STANDARD stretch: it maps the srcRect
+			// region of the source texture onto the destRect region of the mirror RT
+			// (verified by CALIB=1 — srcRect=(0,0,1,1)/destRect=(0,0,1,1) maps the whole
+			// texture 1:1 to the RT — and by the over-zoom observed when destRect was set
+			// to 1/srcRect, which scaled the content by exactly that factor). So to fill
+			// the RT with the woven region, the destRect is simply the full RT. The zone is
+			// born at the panel's render size (== the mirror RT), so this stretch is ~1:1
+			// (no resample of the woven lenticular pixels).
+			desc->blitParams[0].destRect = { 0.0f, 0.0f, 1.0f, 1.0f };
 			{
 				// Throttled diagnostic (~every 120 calls): the live canvas + tex dims +
 				// normalized srcRect, so a truncation (canvas/srcRect desync) is visible.
 				static int q_count = 0;
 				if ((q_count++ % 120) == 0) {
-					int rtSW = 0, rtSH = 0;
-					if (info.mirrorRtDesc) {
-						rtSW = info.mirrorRtDesc->rtScaledWidth;
-						rtSH = info.mirrorRtDesc->rtScaledHeight;
-					}
-					char buf[256];
+					char buf[288];
 					_snprintf_s(buf, sizeof(buf), _TRUNCATE,
 					            "[DisplayXR-PROV] mirror blit: canvas=(%d,%d %dx%d) tex=%ux%u "
-					            "srcRect=(%.3f,%.3f %.3f,%.3f) destRect=(%.3f,%.3f %.3f,%.3f) mirrorRT scaled=%dx%d\n",
+					            "srcRect=(%.3f,%.3f %.3f,%.3f) destRect=(%.3f,%.3f %.3f,%.3f) "
+					            "mirrorRT scaled=%dx%d original=%dx%d\n",
 					            cx, cy, cw, ch, tw, th,
 					            desc->blitParams[0].srcRect.x, desc->blitParams[0].srcRect.y,
 					            desc->blitParams[0].srcRect.width, desc->blitParams[0].srcRect.height,
 					            desc->blitParams[0].destRect.x, desc->blitParams[0].destRect.y,
 					            desc->blitParams[0].destRect.width, desc->blitParams[0].destRect.height,
-					            rtSW, rtSH);
+					            rtSW0, rtSH0, rtOW0, rtOH0);
 					prov_log(buf);
 				}
 			}

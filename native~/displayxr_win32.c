@@ -1451,12 +1451,31 @@ displayxr_create_provider_dedicated_window(void)
 	// track the editor.
 	const int def_w = 1280, def_h = 720;
 
+	// Task (a) GameView weave-to-texture fill: if C# stashed the Game view render rect
+	// before the session started, born the window as a WS_POPUP (client == window) at
+	// that rect so its client is EXACTLY the panel size when session_start captures the
+	// forced full-window zone → the runtime renders tiles + weaves at the panel's native
+	// resolution (no tiny-zone freeze / mirror over-sample). The per-frame glue keeps it
+	// tracking afterwards. Shipping (non-probe) path keeps the movable default window.
+	extern int dxr_prov_get_initial_gameview_rect(int *x, int *y, int *w, int *h);
+	int igx = 0, igy = 0, igw = 0, igh = 0;
+	int have_init = dxr_prov_get_initial_gameview_rect(&igx, &igy, &igw, &igh);
+
+	// In the glued probe path the window is parked exactly over the editor Game view (it's
+	// only a geometry proxy for the weaver/Kooima — texture mode never presents to it). Make
+	// it CLICK-THROUGH (WS_EX_TRANSPARENT | WS_EX_LAYERED) so mouse messages pass through to
+	// the Game view underneath; otherwise it swallows them and the in-game mouse controller
+	// goes dead (keyboard still works — the window is NOACTIVATE, never focused).
+	DWORD ex_style = WS_EX_NOACTIVATE | WS_EX_TOPMOST;
+	if (have_init) ex_style |= WS_EX_TRANSPARENT | WS_EX_LAYERED;
+
 	s_dedicated_hwnd = CreateWindowExW(
-		WS_EX_NOACTIVATE | WS_EX_TOPMOST,
+		ex_style,
 		DEDICATED_CLASS_NAME,
 		L"DisplayXR (Provider)",
-		WS_OVERLAPPEDWINDOW,
-		CW_USEDEFAULT, CW_USEDEFAULT, def_w, def_h,
+		have_init ? WS_POPUP : WS_OVERLAPPEDWINDOW,
+		have_init ? igx : CW_USEDEFAULT, have_init ? igy : CW_USEDEFAULT,
+		have_init ? igw : def_w,          have_init ? igh : def_h,
 		NULL, NULL, GetModuleHandleW(NULL), NULL);
 
 	if (s_dedicated_hwnd == NULL) {
@@ -1464,6 +1483,12 @@ displayxr_create_provider_dedicated_window(void)
 		        GetLastError());
 		return NULL;
 	}
+
+	// Glued probe path: the window is WS_EX_LAYERED — make it fully transparent (alpha 0)
+	// so the invisible geometry proxy never paints a black rect over the Game view. Also
+	// belt-and-braces click-through pairing with WS_EX_TRANSPARENT.
+	if (have_init)
+		SetLayeredWindowAttributes(s_dedicated_hwnd, 0, 0, LWA_ALPHA);
 
 	// Show WITHOUT activating so the editor keeps OS foreground (input stays live).
 	ShowWindow(s_dedicated_hwnd, SW_SHOWNOACTIVATE);
