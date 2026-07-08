@@ -415,8 +415,6 @@ typedef struct ProviderSession {
 	// NULL deref — lldb-verified, bring-up runs 7-18). Encoder-less signal/wait
 	// CBs are safe (run 19) and provide the render→weave order.
 	void *eye_view_metal[PS_MAX_SWAPCHAIN_IMAGES][2];
-	// Legacy blit-path per-eye targets (kept for DISPLAYXR_METAL_BLIT experiments).
-	void *eye_tex_metal[2];
 #endif
 	int         swapchain_created;
 
@@ -1047,11 +1045,6 @@ static int ps_create_swapchain(void)
 				return 0;
 			}
 		}
-	}
-	// Legacy blit-path targets, only when experimenting (DISPLAYXR_METAL_BLIT=1).
-	if (getenv("DISPLAYXR_METAL_BLIT")) {
-		for (uint32_t e = 0; e < 2; e++)
-			s_ps.eye_tex_metal[e] = dxr_prov_metal_alloc_eye_texture(w, h, format, e);
 	}
 #endif
 	return 1;
@@ -3115,10 +3108,9 @@ void *dxr_prov_get_bridge_unity_texture_eye(uint32_t eye, uint32_t *width, uint3
 		return (void *)s_ps.d3d11_bridge_unity_eye[eye];
 	return (void *)s_ps.bridge_unity_eye[eye]; // MultiPass mode; NULL in SPI mode
 #else
-	// Metal MultiPass (#204): the per-eye render target (id<MTLTexture> on
-	// Unity's device, allocated in ps_create_swapchain). The display provider
-	// wraps it via CreateTexture exactly like the D3D per-eye targets.
-	return s_ps.eye_tex_metal[eye];
+	// Metal (#204): no bridge — zero-copy MultiPass wraps the swapchain slice
+	// views directly (dxr_prov_get_metal_eye_view); NULL keeps callers inert.
+	return NULL;
 #endif
 }
 
@@ -3774,23 +3766,11 @@ int dxr_prov_submit_frame(uint32_t image_index)
 	// Metal ZERO-COPY (#204): Unity already rendered each eye straight into the
 	// acquired image's slice views — nothing to copy. Order the compositor's
 	// weave (encoded on the session queue at xrEndFrame) after Unity's renders
-	// with encoder-less signal/wait CBs. DISPLAYXR_METAL_BLIT=1 revives the
-	// legacy per-eye blit path for experiments (known to crash the editor).
+	// with encoder-less signal/wait CBs.
 	static unsigned d11_frames = 0;
 	int d11_diag = 0;
-	if (s_ps.graphics_api == DXR_GFX_METAL) {
-		static int use_blit = -1;
-		if (use_blit < 0) use_blit = getenv("DISPLAYXR_METAL_BLIT") ? 1 : 0;
-		if (use_blit && image_index < s_ps.sc_image_count &&
-		    s_ps.sc_images_metal[image_index].texture) {
-			if (!dxr_prov_metal_submit(s_ps.metal_queue,
-			                           s_ps.eye_tex_metal[0], s_ps.eye_tex_metal[1],
-			                           s_ps.sc_images_metal[image_index].texture, submit_n))
-				ps_log("[DisplayXR-PROV] Metal: submit blit failed\n");
-		} else {
-			dxr_prov_metal_order_weave(s_ps.metal_queue);
-		}
-	}
+	if (s_ps.graphics_api == DXR_GFX_METAL)
+		dxr_prov_metal_order_weave(s_ps.metal_queue);
 #endif
 
 	if (s_ps.image_acquired) {

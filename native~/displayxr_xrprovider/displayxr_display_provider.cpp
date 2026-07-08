@@ -318,11 +318,7 @@ void create_textures_if_ready()
 				memset(&desc, 0, sizeof(desc));
 				desc.colorFormat = kUnityXRRenderTextureFormatRGBA32;
 				desc.color.nativePtr = view;
-				// DISPLAYXR_METAL_NO_DEPTH=1: crash-triage lever — skip the paired
-				// Unity depth allocation for the wrapped slice views (#204).
-				desc.depthFormat = getenv("DISPLAYXR_METAL_NO_DEPTH")
-				                       ? kUnityXRDepthTextureFormatNone
-				                       : kUnityXRDepthTextureFormat24bitOrGreater;
+				desc.depthFormat = kUnityXRDepthTextureFormat24bitOrGreater;
 				desc.depth.nativePtr = (void *)(uintptr_t)kUnityXRRenderTextureIdDontCare;
 				desc.width = sw;
 				desc.height = sh;
@@ -708,10 +704,8 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 #ifdef __APPLE__
 			// Metal zero-copy: rotate to THIS frame's acquired image (i*2+eye);
 			// Unity renders each eye straight into the acquired slice view.
-			// DISPLAYXR_METAL_NO_ROTATE=1: bisection lever — always image 0.
-			uint32_t mimg = getenv("DISPLAYXR_METAL_NO_ROTATE") ? 0 : s_current_image_index;
 			pass.textureId = (dxr_prov_get_graphics_api() == DXR_GFX_METAL)
-			                     ? s_tex_ids[mimg * 2 + eye]
+			                     ? s_tex_ids[s_current_image_index * 2 + eye]
 			                     : s_tex_ids[eye];
 #else
 			pass.textureId = s_tex_ids[eye];
