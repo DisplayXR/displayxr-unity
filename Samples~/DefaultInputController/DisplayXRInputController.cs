@@ -537,12 +537,16 @@ namespace DisplayXR
         }
         private static Vector2 GetMousePosition() =>
             Mouse.current != null ? Mouse.current.position.ReadValue() : Vector2.zero;
-        private static float GetScrollDelta() =>
-            // Unity's Input System returns Mouse.scroll ~1 per wheel notch (NOT the old Win32
-            // WHEEL_DELTA of 120), so do NOT divide by 120 — that shrank a full notch to ~0.008
-            // and made scroll-zoom imperceptible. Matches the old-Input path below
-            // (Input.mouseScrollDelta.y, also ~1 per notch).
-            Mouse.current != null ? Mouse.current.scroll.ReadValue().y : 0f;
+        private static float GetScrollDelta()
+        {
+            if (Mouse.current == null) return 0f;
+            float raw = Mouse.current.scroll.ReadValue().y;
+            // Unity's Input System reports Mouse.scroll in Win32 WHEEL_DELTA units (~120 per
+            // notch) in a standalone player, but a normalized ~1 per notch in the editor.
+            // Normalize BOTH to ~1 per notch by magnitude so scroll-zoom is neither
+            // imperceptible in-editor (the /120 bug) nor 120x too sensitive in a player.
+            return Mathf.Abs(raw) >= 10f ? raw / 120f : raw;
+        }
 
         private static Key ToKey(KeyCode k)
         {
