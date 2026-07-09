@@ -47,6 +47,11 @@ DISPLAYXR_EXPORT void displayxr_local2d_set_rect(int x, int y, int width, int he
 // Disable the layer (stops submitting it this frame onward).
 DISPLAYXR_EXPORT void displayxr_local2d_clear(void);
 
+// Read the pending Unity texture (provider Metal Local2D path; mirrors
+// displayxr_window_space_ui_get_pending). Returns 1 iff a non-zero-size texture is
+// registered. The destination pixel rect comes from provider state, not from here.
+DISPLAYXR_EXPORT int displayxr_local2d_get_pending(void **out_tex, int *out_w, int *out_h);
+
 #ifdef __cplusplus
 } // extern "C"
 #endif

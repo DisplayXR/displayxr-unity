@@ -207,11 +207,16 @@ namespace DisplayXR
 
             m_Canvas.worldCamera = m_OverlayCamera;
 
+            // Register the raw native texture unconditionally (mirrors
+            // DisplayXRWindowSpaceUI). On Metal the provider reads this pending texture
+            // directly (no cross-device bridge — the compositor is on Unity's own
+            // MTLDevice) and blits it into its Local2D swapchain image. On Windows the
+            // D3D provider path uses the cross-device bridge below and never reads the
+            // pending texture, so this registration is inert there.
+            DisplayXRNative.displayxr_local2d_set_texture(
+                OverlayTexture.GetNativeTexturePtr(), resolution.x, resolution.y);
             if (m_ProviderMode)
-                TryAcquireBridge(); // provider owns its own cross-device Local2D bridge
-            else
-                DisplayXRNative.displayxr_local2d_set_texture(
-                    OverlayTexture.GetNativeTexturePtr(), resolution.x, resolution.y);
+                TryAcquireBridge(); // Windows: provider owns its own cross-device Local2D bridge
 
             // Scope the URP foreground clip out of our overlay camera (see field doc).
             RenderPipelineManager.beginCameraRendering += OnBeginOverlayCamera;
