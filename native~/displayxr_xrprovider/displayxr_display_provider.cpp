@@ -34,6 +34,11 @@
 #include "../displayxr_metal.h"           // provider weave window (SA-era preview window)
 // Zero-copy per-image per-eye slice view (defined in the session TU, #204).
 extern "C" void *dxr_prov_get_metal_eye_view(uint32_t image, uint32_t eye);
+// Extra 3D zones (#206): per-zone zero-copy slice views + acquired-image rotation.
+extern "C" void *dxr_prov_get_extra_zone_metal_eye_view(uint32_t ei, uint32_t img, uint32_t eye);
+extern "C" void *dxr_prov_get_extra_zone_metal_image(uint32_t ei, uint32_t img);
+extern "C" uint32_t dxr_prov_get_extra_zone_image_count(uint32_t ei);
+extern "C" uint32_t dxr_prov_get_extra_zone_acquired_index(uint32_t ei);
 #endif
 #include "../unity_pluginapi/IUnityXRDisplay.h"
 
@@ -109,6 +114,14 @@ bool                    s_textures_created = false;
 #define PROV_MAX_EXTRA_ZONES 3   // PS_MAX_ZONES - 1
 UnityXRRenderTextureId  s_extra_tex_ids[PROV_MAX_EXTRA_ZONES][2] = {};
 bool                    s_extra_tex_created[PROV_MAX_EXTRA_ZONES] = {};
+#ifdef __APPLE__
+// Metal zero-copy extra zones (#206): unlike D3D's single fixed bridge, the runtime
+// rotates zone images each frame, so we wrap ALL image slice views up front (SPI: one
+// 2-slice texture per image; MultiPass: image×eye) and rotate in PopulateNextFrameDesc.
+// [i][img*2+eye] for MultiPass, [i][img] for SPI (4 images × 2 eyes).
+UnityXRRenderTextureId  s_extra_tex_ids_metal[PROV_MAX_EXTRA_ZONES][8] = {};
+uint32_t                s_extra_tex_count_metal[PROV_MAX_EXTRA_ZONES] = {};
+#endif
 
 uint32_t                s_current_image_index = 0;  // acquired this frame
 bool                    s_frame_in_flight = false;
@@ -252,6 +265,62 @@ static void create_extra_zone_textures()
 {
 	uint32_t ez = dxr_prov_get_extra_zone_count();
 	bool sp = dxr_prov_get_single_pass();
+#ifdef __APPLE__
+	// Metal zero-copy (#206): wrap ALL of each zone's image slice views up front (the
+	// runtime rotates zone images; PopulateNextFrameDesc picks the acquired index). SPI:
+	// each image's whole arraySize=2 texture -> s_extra_tex_ids_metal[i][img] (arr=2).
+	// MultiPass: each image×eye slice view -> s_extra_tex_ids_metal[i][img*2+eye] (arr=1).
+	if (dxr_prov_get_graphics_api() == DXR_GFX_METAL) {
+		for (uint32_t i = 0; i < ez && i < PROV_MAX_EXTRA_ZONES; i++) {
+			if (s_extra_tex_created[i]) continue;
+			uint32_t imgs = dxr_prov_get_extra_zone_image_count(i);
+			if (imgs == 0) continue; // zone swapchain not created yet
+			uint32_t w = 0, h = 0;
+			dxr_prov_get_extra_zone_bridge(i, &w, &h); // NULL bridge on Metal, but fills w/h
+			if (w == 0 || h == 0) continue;
+			if (sp) {
+				if (imgs > 8) imgs = 8;
+				bool ok = true;
+				for (uint32_t img = 0; img < imgs; img++) {
+					void *tex = dxr_prov_get_extra_zone_metal_image(i, img);
+					if (!tex) { ok = false; break; }
+					UnityXRRenderTextureDesc desc; memset(&desc, 0, sizeof(desc));
+					desc.colorFormat = kUnityXRRenderTextureFormatRGBA32;
+					desc.color.nativePtr = tex;
+					desc.depthFormat = kUnityXRDepthTextureFormat24bitOrGreater;
+					desc.depth.nativePtr = (void *)(uintptr_t)kUnityXRRenderTextureIdDontCare;
+					desc.width = w; desc.height = h; desc.textureArrayLength = 2;
+					desc.flags = kUnityXRRenderTextureFlagsUVDirectionTopToBottom;
+					UnityXRRenderTextureId id = 0;
+					if (s_display->CreateTexture(s_handle, &desc, &id) != kUnitySubsystemErrorCodeSuccess) { ok = false; break; }
+					s_extra_tex_ids_metal[i][img] = id;
+				}
+				if (ok) { s_extra_tex_count_metal[i] = imgs; s_extra_tex_created[i] = true; prov_log("[DisplayXR-PROV] extra zone: CreateTexture (Metal SPI 2-slice arrays) OK\n"); }
+			} else {
+				if (imgs > 4) imgs = 4; // 4 images x 2 eyes = 8 slots
+				bool ok = true;
+				for (uint32_t img = 0; img < imgs && ok; img++) {
+					for (uint32_t eye = 0; eye < 2; eye++) {
+						void *view = dxr_prov_get_extra_zone_metal_eye_view(i, img, eye);
+						if (!view) { ok = false; break; }
+						UnityXRRenderTextureDesc desc; memset(&desc, 0, sizeof(desc));
+						desc.colorFormat = kUnityXRRenderTextureFormatRGBA32;
+						desc.color.nativePtr = view;
+						desc.depthFormat = kUnityXRDepthTextureFormat24bitOrGreater;
+						desc.depth.nativePtr = (void *)(uintptr_t)kUnityXRRenderTextureIdDontCare;
+						desc.width = w; desc.height = h; desc.textureArrayLength = 1;
+						desc.flags = kUnityXRRenderTextureFlagsUVDirectionTopToBottom;
+						UnityXRRenderTextureId id = 0;
+						if (s_display->CreateTexture(s_handle, &desc, &id) != kUnitySubsystemErrorCodeSuccess) { ok = false; break; }
+						s_extra_tex_ids_metal[i][img * 2 + eye] = id;
+					}
+				}
+				if (ok) { s_extra_tex_count_metal[i] = imgs * 2; s_extra_tex_created[i] = true; prov_log("[DisplayXR-PROV] extra zone: CreateTexture (Metal MP slice views) OK\n"); }
+			}
+		}
+		return;
+	}
+#endif
 	for (uint32_t i = 0; i < ez && i < PROV_MAX_EXTRA_ZONES; i++) {
 		if (s_extra_tex_created[i]) continue;
 		if (sp) {
@@ -494,6 +563,11 @@ static void destroy_extra_zone_texture(uint32_t i)
 	if (!s_display || !s_handle || i >= PROV_MAX_EXTRA_ZONES) return;
 	for (int e = 0; e < 2; e++)
 		if (s_extra_tex_ids[i][e]) { s_display->DestroyTexture(s_handle, s_extra_tex_ids[i][e]); s_extra_tex_ids[i][e] = 0; }
+#ifdef __APPLE__
+	for (uint32_t k = 0; k < s_extra_tex_count_metal[i]; k++)
+		if (s_extra_tex_ids_metal[i][k]) { s_display->DestroyTexture(s_handle, s_extra_tex_ids_metal[i][k]); s_extra_tex_ids_metal[i][k] = 0; }
+	s_extra_tex_count_metal[i] = 0;
+#endif
 	s_extra_tex_created[i] = false;
 }
 
@@ -776,6 +850,11 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 				if (pi >= (uint32_t)kUnityXRMaxNumRenderPasses) { prov_log("[DisplayXR-PROV] zone pass cap hit (SPI)\n"); break; }
 				UnityXRNextFrameDesc::UnityXRRenderPass &pass = next->renderPasses[pi];
 				pass.textureId = s_extra_tex_ids[i][0];
+#ifdef __APPLE__
+				// Metal zero-copy: pick the texture wrapping THIS zone's acquired image.
+				if (dxr_prov_get_graphics_api() == DXR_GFX_METAL)
+					pass.textureId = s_extra_tex_ids_metal[i][dxr_prov_get_extra_zone_acquired_index(i)];
+#endif
 				pass.cullingPassIndex = pi;
 				pass.renderParamsCount = 2;
 				for (uint32_t eye = 0; eye < 2; eye++) {
@@ -799,6 +878,11 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 					DxrProvView v; dxr_prov_get_extra_zone_view(i, eye, &v);
 					UnityXRNextFrameDesc::UnityXRRenderPass &pass = next->renderPasses[pi];
 					pass.textureId = s_extra_tex_ids[i][eye];
+#ifdef __APPLE__
+					// Metal zero-copy: this zone's acquired image, per-eye slice view.
+					if (dxr_prov_get_graphics_api() == DXR_GFX_METAL)
+						pass.textureId = s_extra_tex_ids_metal[i][dxr_prov_get_extra_zone_acquired_index(i) * 2 + eye];
+#endif
 					pass.cullingPassIndex = pi;
 					pass.renderParamsCount = 1;
 					UnityXRNextFrameDesc::UnityXRRenderPass::UnityXRRenderParams &rp = pass.renderParams[0];

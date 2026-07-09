@@ -182,6 +182,12 @@ typedef struct ProviderExtraZone {
 	ID3D11Texture2D *unity_tex;
 	ID3D11Texture2D *unity_tex_own;   // own-device side (editor bridge; copy source)
 	HANDLE           unity_tex_handle;
+#else
+	// Metal (#206): zero-copy per-eye slice views of each arraySize=2 image (Unity
+	// renders straight into them, no bridge/blit). Per-zone cousins of the primary's
+	// sc_images_metal / eye_view_metal; PopulateNextFrameDesc rotates to acquired_index.
+	XrSwapchainImageMetalKHR sc_images_metal[PS_MAX_SWAPCHAIN_IMAGES];
+	void *eye_view_metal[PS_MAX_SWAPCHAIN_IMAGES][2];
 #endif
 	int         image_acquired;
 	uint32_t    acquired_index;
@@ -477,6 +483,12 @@ typedef struct ProviderSession {
 	ID3D11Texture2D *l2d_unity_tex;
 	ID3D11Texture2D *l2d_unity_tex_own;   // own-device side (editor bridge)
 	HANDLE           l2d_unity_tex_handle;
+#else
+	// Metal (#206): arraySize=1 overlay swapchain images (id<MTLTexture> in .texture).
+	// No cross-device bridge — the compositor is on Unity's OWN MTLDevice, so submit
+	// blits the C#-registered Unity id<MTLTexture> straight into the acquired image
+	// (same device, session queue). Cousin of wsui_images_metal.
+	XrSwapchainImageMetalKHR l2d_images_metal[PS_MAX_SWAPCHAIN_IMAGES];
 #endif // _WIN32
 	int32_t         l2d_rect_x, l2d_rect_y, l2d_rect_w, l2d_rect_h; // dest, client px
 	int             l2d_rect_set;
@@ -1674,6 +1686,11 @@ extern "C" int displayxr_window_space_ui_get_pending(void **out_tex, int *out_te
                                                      float *out_x, float *out_y,
                                                      float *out_lw, float *out_lh, float *out_disp);
 
+// s_pending getter exported by the Local2D module (displayxr_local2d.cpp). The Metal
+// Local2D arm blits this Unity id<MTLTexture> straight into its overlay swapchain image
+// (same device); the destination pixel rect comes from provider state (l2d_rect_*).
+extern "C" int displayxr_local2d_get_pending(void **out_tex, int *out_w, int *out_h);
+
 // Create (or recreate) the wsui overlay swapchain + cross-device bridge sized to
 // w×h. Format = B8G8R8A8_UNORM (87) to match Unity's URP wsui RT — CopyTextureRegion
 // is invalid across formats and the runtime's DComp path turns a mismatch into a
@@ -1986,8 +2003,58 @@ static int ps_submit_wsui(XrCompositionLayerWindowSpaceEXT *out_layer)
 static int ps_create_local2d(uint32_t w, uint32_t h)
 {
 #ifndef _WIN32
-	(void)w; (void)h;
-	return 0; // Metal Local2D path lands in Phase 4 (#206)
+	// Metal (#206): an arraySize=1 overlay swapchain on Unity's device. No bridge —
+	// submit blits the C#-registered Unity id<MTLTexture> straight in (same device).
+	// Twin of the wsui Metal arm (ps_create_wsui); the only difference downstream is
+	// a pixel rect at submit (XrCompositionLayerLocal2DEXT) rather than fractional.
+	if (w == 0 || h == 0) return 0;
+	if (s_ps.graphics_api != DXR_GFX_METAL || !s_ps.metal_queue) return 0;
+	if (s_ps.l2d_swapchain_created && s_ps.l2d_registered_w == w && s_ps.l2d_registered_h == h)
+		return 1; // already sized for this RT
+
+	if (s_ps.l2d_swapchain && s_ps.pfn_destroy_swapchain) s_ps.pfn_destroy_swapchain(s_ps.l2d_swapchain);
+	s_ps.l2d_swapchain = XR_NULL_HANDLE;
+	s_ps.l2d_swapchain_created = 0;
+
+	// Prefer BGRA8Unorm (80) to match Unity's B8G8R8A8_UNorm OverlayTexture so the
+	// submit blit is same-format; fall back to the first enumerated format.
+	uint32_t fmt_count = 0;
+	s_ps.pfn_enumerate_swapchain_formats(s_ps.session, 0, &fmt_count, NULL);
+	if (fmt_count == 0) { ps_log("[DisplayXR-PROV] local2d: no swapchain formats\n"); return 0; }
+	int64_t formats[32];
+	if (fmt_count > 32) fmt_count = 32;
+	s_ps.pfn_enumerate_swapchain_formats(s_ps.session, fmt_count, &fmt_count, formats);
+	int64_t format = formats[0];
+	for (uint32_t i = 0; i < fmt_count; i++) { if (formats[i] == 80) { format = 80; break; } }
+
+	XrSwapchainCreateInfo ci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+	ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
+	                XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT |
+	                XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+	ci.format = format;
+	ci.sampleCount = 1; ci.width = w; ci.height = h;
+	ci.faceCount = 1; ci.arraySize = 1; ci.mipCount = 1;
+	if (XR_FAILED(s_ps.pfn_create_swapchain(s_ps.session, &ci, &s_ps.l2d_swapchain))) {
+		ps_log("[DisplayXR-PROV] local2d: xrCreateSwapchain failed\n"); s_ps.l2d_swapchain = XR_NULL_HANDLE; return 0;
+	}
+	uint32_t count = 0;
+	s_ps.pfn_enumerate_swapchain_images(s_ps.l2d_swapchain, 0, &count, NULL);
+	if (count > PS_MAX_SWAPCHAIN_IMAGES) count = PS_MAX_SWAPCHAIN_IMAGES;
+	for (uint32_t i = 0; i < count; i++) {
+		s_ps.l2d_images_metal[i].type = XR_TYPE_SWAPCHAIN_IMAGE_METAL_KHR;
+		s_ps.l2d_images_metal[i].next = NULL; s_ps.l2d_images_metal[i].texture = NULL;
+	}
+	if (XR_FAILED(s_ps.pfn_enumerate_swapchain_images(s_ps.l2d_swapchain, count, &count,
+	        (XrSwapchainImageBaseHeader *)s_ps.l2d_images_metal))) {
+		ps_log("[DisplayXR-PROV] local2d: enumerate images (Metal) failed\n"); return 0;
+	}
+	s_ps.l2d_w = w; s_ps.l2d_h = h; s_ps.l2d_format = format;
+	s_ps.l2d_image_count = count;
+	s_ps.l2d_registered_w = w; s_ps.l2d_registered_h = h;
+	s_ps.l2d_swapchain_created = 1;
+	ps_log("[DisplayXR-PROV] local2d: Metal swapchain %ux%u (%u imgs, fmt=%lld)\n",
+	       w, h, count, (long long)format);
+	return 1;
 #else
 	int is_d3d11 = (s_ps.graphics_api == DXR_GFX_D3D11);
 	if (w == 0 || h == 0) return 0;
@@ -2114,7 +2181,50 @@ static int ps_submit_local2d(XrCompositionLayerLocal2DEXT *out_layer)
 	if (!out_layer) return 0;
 	memset(out_layer, 0, sizeof(*out_layer));
 #ifndef _WIN32
-	return 0; // Metal Local2D path lands in Phase 4 (#206)
+	// Metal (#206): blit the C#-registered Unity id<MTLTexture> into the acquired
+	// Local2D swapchain image (same device, session queue), then submit the layer at
+	// the client-window PIXEL rect. Twin of ps_submit_wsui; the rect comes from
+	// provider state (dxr_prov_set_local2d_rect), not the pending reader.
+	if (s_ps.graphics_api != DXR_GFX_METAL) return 0;
+	if (!s_ps.l2d_rect_set) return 0; // no destination rect pushed this frame
+	void *tex = NULL; int tw = 0, th = 0;
+	if (!displayxr_local2d_get_pending(&tex, &tw, &th))
+		return 0; // no Local2D texture registered
+	if (!ps_create_local2d((uint32_t)tw, (uint32_t)th)) return 0;
+	if (!s_ps.l2d_swapchain_created || s_ps.l2d_image_count == 0) return 0;
+
+	uint32_t idx = 0;
+	XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+	if (XR_FAILED(s_ps.pfn_acquire_swapchain_image(s_ps.l2d_swapchain, &ai, &idx)) ||
+	    idx >= s_ps.l2d_image_count)
+		return 0;
+	XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+	wi.timeout = 1000000000;
+	s_ps.pfn_wait_swapchain_image(s_ps.l2d_swapchain, &wi);
+
+	// Same-device blit Unity Local2D texture -> acquired image on the session queue.
+	// Ordered after Unity's overlay-camera render by the frame's order_weave wait CB
+	// (session-queue FIFO); the compositor's weave at xrEndFrame is FIFO after it.
+	if (s_ps.l2d_images_metal[idx].texture)
+		displayxr_metal_blit_textures(s_ps.metal_queue, tex, s_ps.l2d_images_metal[idx].texture);
+
+	XrSwapchainImageReleaseInfo ri_mtl = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+	s_ps.pfn_release_swapchain_image(s_ps.l2d_swapchain, &ri_mtl);
+
+	out_layer->type = XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT;
+	out_layer->next = NULL;
+	// Unity Canvas is straight (unpremultiplied) alpha — flag it so the runtime
+	// doesn't double-darken (matches the D3D arm below).
+	out_layer->layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT |
+	                        XR_COMPOSITION_LAYER_UNPREMULTIPLIED_ALPHA_BIT;
+	out_layer->subImage.swapchain = s_ps.l2d_swapchain;
+	out_layer->subImage.imageRect.offset = {0, 0};
+	out_layer->subImage.imageRect.extent = {(int32_t)s_ps.l2d_w, (int32_t)s_ps.l2d_h};
+	out_layer->subImage.imageArrayIndex = 0;
+	// Destination is a client-window PIXEL rect (XrRect2Di), NOT fractional.
+	out_layer->rect.offset = {s_ps.l2d_rect_x, s_ps.l2d_rect_y};
+	out_layer->rect.extent = {s_ps.l2d_rect_w, s_ps.l2d_rect_h};
+	return 1;
 #else
 	int is_d3d11 = (s_ps.graphics_api == DXR_GFX_D3D11);
 	if (!s_ps.l2d_rect_set || !s_ps.l2d_swapchain_created || s_ps.l2d_image_count == 0 ||
@@ -2200,10 +2310,49 @@ static void ps_query_extra_zone_rec(ProviderExtraZone *z)
 static int ps_create_extra_zone(ProviderExtraZone *z)
 {
 #ifndef _WIN32
-	// Extra 3D zones port with the Metal backend's Phase 4 (#206) — the per-zone
-	// bridge/copy machinery below is D3D-only today.
-	(void)z;
-	return 0;
+	// Metal (#206): zero-copy extra zone — an arraySize=2 swapchain whose per-eye slice
+	// views Unity renders straight into (no bridge, no blit). Mirrors the primary Metal
+	// swapchain arm in ps_create_swapchain. PopulateNextFrameDesc rotates to acquired_index.
+	if (z->swapchain_created) return 1;
+	if (!z->valid || !s_ps.session_ready) return 0;
+	if (s_ps.graphics_api != DXR_GFX_METAL || !s_ps.metal_queue) return 0;
+	ps_query_extra_zone_rec(z);
+	uint32_t w = z->rec_w, h = z->rec_h;
+	if (w == 0 || h == 0) return 0;
+
+	uint32_t fmt_count = 0;
+	s_ps.pfn_enumerate_swapchain_formats(s_ps.session, 0, &fmt_count, NULL);
+	if (fmt_count == 0) return 0;
+	int64_t formats[32]; if (fmt_count > 32) fmt_count = 32;
+	s_ps.pfn_enumerate_swapchain_formats(s_ps.session, fmt_count, &fmt_count, formats);
+	int64_t format = formats[0];
+	for (uint32_t i = 0; i < fmt_count; i++) { if (formats[i] == 70) { format = 70; break; } if (formats[i] == 80) format = 80; }
+
+	XrSwapchainCreateInfo ci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+	ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+	ci.format = format; ci.sampleCount = 1; ci.width = w; ci.height = h;
+	ci.faceCount = 1; ci.arraySize = 2; ci.mipCount = 1;
+	if (XR_FAILED(s_ps.pfn_create_swapchain(s_ps.session, &ci, &z->swapchain))) { z->swapchain = XR_NULL_HANDLE; return 0; }
+	z->sc_width = w; z->sc_height = h; z->sc_format = format;
+	uint32_t count = 0;
+	s_ps.pfn_enumerate_swapchain_images(z->swapchain, 0, &count, NULL);
+	if (count > PS_MAX_SWAPCHAIN_IMAGES) count = PS_MAX_SWAPCHAIN_IMAGES;
+	z->sc_image_count = count;
+	for (uint32_t i = 0; i < count; i++) { z->sc_images_metal[i].type = XR_TYPE_SWAPCHAIN_IMAGE_METAL_KHR; z->sc_images_metal[i].next = NULL; z->sc_images_metal[i].texture = NULL; }
+	if (XR_FAILED(s_ps.pfn_enumerate_swapchain_images(z->swapchain, count, &count, (XrSwapchainImageBaseHeader *)z->sc_images_metal))) return 0;
+
+	// Zero-copy slice views (id<MTLTexture> view per image×eye). The glue parks retired
+	// generations in its graveyard (ADR-001), so recreate just re-enumerates.
+	for (uint32_t i = 0; i < count; i++) {
+		for (uint32_t e = 0; e < 2; e++) {
+			z->eye_view_metal[i][e] = dxr_prov_metal_slice_view(z->sc_images_metal[i].texture, e);
+			if (!z->eye_view_metal[i][e]) { ps_log("[DisplayXR-PROV] extra zone id=%u: Metal slice view [%u][%u] failed\n", z->zone_id, i, e); return 0; }
+		}
+	}
+	z->swapchain_created = 1;
+	ps_log("[DisplayXR-PROV] extra zone id=%u: Metal swapchain %ux%u (%u imgs, fmt=%lld, zero-copy slice views)\n",
+	       z->zone_id, w, h, count, (long long)format);
+	return 1;
 #else
 	if (z->swapchain_created) return 1;
 	if (!z->valid || !s_ps.session_ready) return 0;
@@ -2299,6 +2448,12 @@ static int ps_recreate_extra_zone(ProviderExtraZone *z)
 		if (z->bridge_handle_eye[e]) { CloseHandle(z->bridge_handle_eye[e]); z->bridge_handle_eye[e] = NULL; }
 		if (z->bridge_own_eye[e])   { z->bridge_own_eye[e]->Release();   z->bridge_own_eye[e] = NULL; }
 	}
+#else
+	// Metal: no bridges to release. The retired slice views are parked in the glue's
+	// graveyard by the next dxr_prov_metal_slice_view call (ADR-001 deferred destruction);
+	// zero them so ps_create_extra_zone repopulates cleanly.
+	for (uint32_t i = 0; i < PS_MAX_SWAPCHAIN_IMAGES; i++)
+		for (uint32_t e = 0; e < 2; e++) z->eye_view_metal[i][e] = NULL;
 #endif
 	int ok = ps_create_extra_zone(z);
 	z->needs_rewrap = 1;
@@ -2515,6 +2670,33 @@ void dxr_prov_get_extra_zone_view(uint32_t ei, uint32_t eye, DxrProvView *out_vi
 	if (ei >= PS_MAX_ZONES - 1 || eye > 1) { memset(out_view, 0, sizeof(*out_view)); return; }
 	*out_view = s_ps.extra_zones[ei].views[eye];
 }
+
+#ifdef __APPLE__
+// Metal zero-copy extra-zone getters (display-provider TU). Cousins of the primary's
+// dxr_prov_get_metal_eye_view — the display provider wraps each image×eye slice view and
+// PopulateNextFrameDesc rotates to the zone's acquired image index each frame.
+extern "C" void *dxr_prov_get_extra_zone_metal_eye_view(uint32_t ei, uint32_t img, uint32_t eye)
+{
+	if (ei >= PS_MAX_ZONES - 1 || img >= PS_MAX_SWAPCHAIN_IMAGES || eye > 1) return NULL;
+	return s_ps.extra_zones[ei].eye_view_metal[img][eye];
+}
+// The whole arraySize=2 image (SPI wraps it as one 2-slice Unity texture, like the primary).
+extern "C" void *dxr_prov_get_extra_zone_metal_image(uint32_t ei, uint32_t img)
+{
+	if (ei >= PS_MAX_ZONES - 1 || img >= PS_MAX_SWAPCHAIN_IMAGES) return NULL;
+	return s_ps.extra_zones[ei].sc_images_metal[img].texture;
+}
+extern "C" uint32_t dxr_prov_get_extra_zone_image_count(uint32_t ei)
+{
+	if (ei >= PS_MAX_ZONES - 1) return 0;
+	return s_ps.extra_zones[ei].sc_image_count;
+}
+extern "C" uint32_t dxr_prov_get_extra_zone_acquired_index(uint32_t ei)
+{
+	if (ei >= PS_MAX_ZONES - 1) return 0;
+	return s_ps.extra_zones[ei].acquired_index;
+}
+#endif // __APPLE__
 
 // ============================================================================
 // Lifecycle
