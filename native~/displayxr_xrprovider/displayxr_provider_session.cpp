@@ -3128,40 +3128,21 @@ int dxr_prov_get_initial_gameview_rect(int *x, int *y, int *w, int *h)
 	return (s_init_gv_w > 0 && s_init_gv_h > 0) ? 1 : 0;
 }
 
+// The dedicated weave window is BORN WS_POPUP at the Game-view rect
+// (dxr_prov_set_initial_gameview_rect, before session start). It must NOT be
+// repositioned or restyled while the Dimenco SR weaver is live: any
+// SetWindowPos(..., SWP_FRAMECHANGED) on the bound HWND fires a WM_NCCALCSIZE that
+// trips the weaver's WndProc subclass and permanently collapses the weave to a single
+// view (view0) — the "stereo for one frame then flat mono" bug (#727). Root-caused with
+// a fence-synced post-weave / post-composite dual tap: the post-weave stage was already
+// mono, i.e. the weave call itself, and an A/B on this push proved zero window ops = stereo
+// on every frame while a single push = mono from that frame on. So the former per-frame
+// glue push is intentionally a NO-OP; the window stays at its born rect for the session.
+// (Weaver-safe dynamic re-glue for a Game view MOVED/RESIZED mid-session — e.g. pausing the
+// weaver around the move, or a reposition that avoids the frame recalc — is a follow-up.)
 void dxr_prov_set_gameview_rect(int x, int y, int w, int h)
 {
-	HWND hwnd = (HWND)s_ps.overlay_hwnd;
-	if (!hwnd || !IsWindow(hwnd)) return;
-	if (w <= 0 || h <= 0) return;
-
-	static int s_glued = 0;
-	if (!s_glued) {
-		s_glued = 1;
-		// Strip chrome (client == window) + topmost so the client rect the runtime
-		// reads equals the Game view rect and the window sits behind the editor.
-		LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
-		style = (style & ~(LONG_PTR)WS_OVERLAPPEDWINDOW) | WS_POPUP;
-		SetWindowLongPtrW(hwnd, GWL_STYLE, style);
-		LONG_PTR ex = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
-		ex &= ~(LONG_PTR)WS_EX_TOPMOST;
-		SetWindowLongPtrW(hwnd, GWL_EXSTYLE, ex);
-		ps_log("[DisplayXR-PROV] gameview-glue: stripped chrome + topmost on weave window\n");
-	}
-
-	// Reposition to the Game view rect, behind the editor, without stealing focus.
-	SetWindowPos(hwnd, HWND_BOTTOM, x, y, w, h,
-	             SWP_NOACTIVATE | SWP_FRAMECHANGED | SWP_NOOWNERZORDER);
-
-	// Diagnostic: log the pushed rect + resulting client size when it changes, so the
-	// glue geometry (and any DPI/toolbar offset) is visible in the log without guessing.
-	static int px = 0, py = 0, pw = 0, ph = 0;
-	if (x != px || y != py || w != pw || h != ph) {
-		px = x; py = y; pw = w; ph = h;
-		RECT rc = {0};
-		GetClientRect(hwnd, &rc);
-		ps_log("[DisplayXR-PROV] gameview-glue: pushed screen=(%d,%d %dx%d) -> client=%dx%d\n",
-		       x, y, w, h, (int)(rc.right - rc.left), (int)(rc.bottom - rc.top));
-	}
+	(void)x; (void)y; (void)w; (void)h;
 }
 
 // Transparent-background request (#166 Phase A). Set from C# BEFORE the session
