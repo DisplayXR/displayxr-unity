@@ -2267,6 +2267,12 @@ static const unsigned   kProbeDumpFrame = 150;   // warmup gate (matches ref app
 // full-window zone (and thus the rendered tile size + the runtime's woven region) is
 // born at the panel's native resolution. See dxr_prov_set_initial_gameview_rect docs.
 static int s_init_gv_x = 0, s_init_gv_y = 0, s_init_gv_w = 0, s_init_gv_h = 0;
+// GameView panel physical px, captured each frame from info.mirrorRtDesc (the
+// authoritative Game-view render size — logical-vs-physical unambiguous, unlike the
+// C# GetMainGameViewTargetSize path). The per-frame pump converges the forced zone to
+// this so the compositor canvas == render viewport pixel-exact (Phase 1, #727 follow-up).
+// Written by dxr_prov_set_panel_px (mirror callback), read by dxr_prov_converge_gameview_zone.
+static int s_gv_panel_w = 0, s_gv_panel_h = 0;
 // GameView mirror (Task (a)): the woven shared texture opened on UNITY'S device so
 // the display-provider can wrap it via CreateTexture and mirror-blit it into the
 // editor Game window. Opened lazily on first request (graphics thread, session ready).
@@ -2881,7 +2887,7 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	// Unconditional build marker: if this line is ABSENT from the log, the editor is
 	// running a STALE DLL (restart Unity). If present with env_probe=0, the env var
 	// DISPLAYXR_PROV_TEXTURE_PROBE=1 did not reach the editor process.
-	ps_log("[DisplayXR-PROV] PROBE build=weave-to-texture-asyncbtn env_probe=%d\n", s_probe_enabled);
+	ps_log("[DisplayXR-PROV] PROBE build=weave-to-texture-panelconverge2-csharpsrc env_probe=%d\n", s_probe_enabled);
 	ps_probe_cleanup(); // clears counters + any leftover texture from a prior session
 	if (s_probe_enabled) {
 		DisplayXRDisplayInfo *pdi = &displayxr_get_state()->display_info;
@@ -3187,6 +3193,41 @@ void dxr_prov_clear_3d_zone(void)
 {
 	s_ps.zone_valid = 0;
 	ps_log("[DisplayXR-PROV] clear_3d_zone\n");
+}
+
+// --- GameView zone convergence (Phase 1, #727 follow-up) --------------------
+// C# publishes the authoritative Game-view panel PHYSICAL px here each frame
+// (GetMainGameViewTargetSize x ppp). This is the ONLY reliable physical-px source:
+// info.mirrorRtDesc reports LOGICAL px on a HiDPI display (879x374 at ppp=2.5), which
+// wrongly shrinks the zone. The per-frame pump (dxr_prov_converge_gameview_zone)
+// re-drives the forced full-window zone to it so the compositor canvas == render
+// viewport pixel-exact. NO window op — the value is Scale-independent (mainSize is the
+// target size, not the zoom), so magnify (absorbed by the mirror-blit downscale) drives
+// no change; this converges the born size and adapts on a real tab resize.
+void dxr_prov_set_panel_px(int w, int h)
+{
+	s_gv_panel_w = (w > 0) ? w : 0;
+	s_gv_panel_h = (h > 0) ? h : 0;
+}
+
+// Called from the per-frame pump BEFORE dxr_prov_reconcile_size. If the published panel
+// px differs from the live zone, re-drive the zone (clamped to the shared woven texture
+// dims) via the existing change-detected path → reconcile reallocs the swapchain/bridge,
+// the submit re-chains the new zone, and the mirror srcRect remaps. Probe-mode + active
+// zone only; a no-op once converged (so a steady panel triggers no realloc).
+void dxr_prov_converge_gameview_zone(void)
+{
+	if (!s_probe_enabled || !s_ps.zone_valid) return;
+	if (s_gv_panel_w <= 0 || s_gv_panel_h <= 0) return;
+	int w = s_gv_panel_w, h = s_gv_panel_h;
+	// Clamp to the shared woven texture (the runtime cannot weave past it).
+	if (s_probe_woven_w > 0 && (uint32_t)w > s_probe_woven_w) w = (int)s_probe_woven_w;
+	if (s_probe_woven_h > 0 && (uint32_t)h > s_probe_woven_h) h = (int)s_probe_woven_h;
+	if (w == s_ps.zone_w && h == s_ps.zone_h) return; // already converged — no realloc
+	ps_log("[DisplayXR-PROV] gameview zone converge: %dx%d -> %dx%d (panel=%dx%d tex=%ux%u)\n",
+	       s_ps.zone_w, s_ps.zone_h, w, h, s_gv_panel_w, s_gv_panel_h,
+	       s_probe_woven_w, s_probe_woven_h);
+	dxr_prov_set_3d_zone_rect(s_ps.zone_x, s_ps.zone_y, w, h);
 }
 
 // Multi-zone (#166 Phase B2). total_3d_zones = number of 3D zones (index 0 =

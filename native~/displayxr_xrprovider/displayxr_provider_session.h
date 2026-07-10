@@ -313,6 +313,16 @@ void dxr_prov_poll_events(void);
 /// textures). Runs only between frames (no-op mid-frame).
 int  dxr_prov_reconcile_size(void);
 
+/// GameView zone convergence (Phase 1, #727 follow-up). C# publishes the authoritative
+/// Game-view panel PHYSICAL px (GetMainGameViewTargetSize x ppp) via dxr_prov_set_panel_px
+/// — info.mirrorRtDesc is LOGICAL px on a HiDPI display so it can't be used. The per-frame
+/// pump calls dxr_prov_converge_gameview_zone (BEFORE dxr_prov_reconcile_size) to re-drive
+/// the forced full-window zone to it so the compositor canvas == render viewport pixel-exact.
+/// Clamped to the shared woven texture; no window op (magnify is absorbed by the mirror-blit
+/// downscale, and the value is Scale-independent). Probe/editor path only.
+DISPLAYXR_EXPORT void dxr_prov_set_panel_px(int w, int h);
+void dxr_prov_converge_gameview_zone(void);
+
 /// Consume the per-extra-zone realloc latch (0-based index). Returns 1 (and clears)
 /// if that extra zone was just reallocated by dxr_prov_reconcile_size and its Unity
 /// texture(s) must be dropped + re-wrapped. Call for each extra zone each frame.

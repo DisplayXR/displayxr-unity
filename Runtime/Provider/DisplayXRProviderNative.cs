@@ -101,6 +101,16 @@ namespace DisplayXR
         public static extern void dxr_prov_set_initial_gameview_rect(int x, int y, int w, int h);
 
         /// <summary>
+        /// Publish the authoritative Game-view panel PHYSICAL px (Phase 1 zone convergence,
+        /// #727 follow-up). This is the ONLY reliable physical-px source — info.mirrorRtDesc
+        /// reports LOGICAL px on a HiDPI display. The per-frame pump re-drives the forced
+        /// full-window zone to this so the compositor canvas == render viewport pixel-exact,
+        /// and adapts on a real tab resize (Scale-independent: magnify drives no change).
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void dxr_prov_set_panel_px(int w, int h);
+
+        /// <summary>
         /// GameView weave-to-texture presentation (Task (a), editor + texture probe): the
         /// runtime-woven shared texture opened on Unity's D3D device. C# wraps it as an
         /// external Texture2D and draws it into the Game view (DisplayXRGameViewPresenter).

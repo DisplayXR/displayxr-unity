@@ -97,6 +97,79 @@ namespace DisplayXR
         static int          s_lgX, s_lgY, s_lgW, s_lgH;
         static bool         s_loggedGlueOnce;
         static bool         s_loggedInitOnce;
+        static PropertyInfo s_lowResProp;         // GameView "*lowResolution*" writable bool property
+        static FieldInfo    s_lowResField;        // GameView "*lowResolution*"/"m_LowResolution*" bool field
+        static bool         s_lowResResolved;     // member lookup done (found or not)
+        static bool         s_loggedLowResOnce;
+
+        // Force the editor Game view to render its mirror RT at FULL (physical) resolution
+        // rather than the HiDPI "Low Resolution Aspect Ratios" mode. That toggle (ON by default
+        // on a scaled display) makes Unity render the Game view at LOGICAL px (panel_physical /
+        // ppp — e.g. 879x374 on a 250% 3840x2160 panel) and upscale for display; the woven
+        // lenticular image then gets downsampled 1/ppp and re-upsampled, scrambling the per-
+        // column L/R phase → wrong/soft 3D. OFF renders at physical px so the woven canvas maps
+        // 1:1 to the panel (no resample). Pure reflection (Runtime asmdef has no UnityEditor ref);
+        // inert in a built player. Editor + probe only. Member name varies by Unity version, so
+        // it's found by substring; if none matches, the bool members are logged for diagnosis.
+        static void ForceGameViewFullResolution()
+        {
+            if (!ProbeEnabled() || s_gvType == null) return;
+            var wins = Resources.FindObjectsOfTypeAll(s_gvType);
+            if (wins == null) return;
+            if (!s_lowResResolved)
+            {
+                s_lowResResolved = true;
+                var flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+                var boolMembers = new System.Collections.Generic.List<string>();
+                for (var t = s_gvType; t != null && s_lowResProp == null && s_lowResField == null; t = t.BaseType)
+                {
+                    foreach (var pr in t.GetProperties(flags | BindingFlags.DeclaredOnly))
+                        if (pr.PropertyType == typeof(bool))
+                        {
+                            if (pr.CanWrite) boolMembers.Add("prop " + pr.Name);
+                            if (pr.CanWrite && pr.Name.ToLowerInvariant().Contains("lowresolution")) { s_lowResProp = pr; break; }
+                        }
+                    if (s_lowResProp != null) break;
+                    foreach (var fi in t.GetFields(flags | BindingFlags.DeclaredOnly))
+                        if (fi.FieldType == typeof(bool))
+                        {
+                            boolMembers.Add("field " + fi.Name);
+                            if (fi.Name.ToLowerInvariant().Contains("lowresolution")) { s_lowResField = fi; break; }
+                        }
+                    if (s_lowResField != null) break;
+                }
+                if (s_lowResProp == null && s_lowResField == null)
+                    Debug.LogWarning("[DisplayXR] GameView: no 'lowResolution' member found on " +
+                        s_gvType.FullName + " — bool members: " + string.Join(", ", boolMembers));
+                else
+                    Debug.Log("[DisplayXR] GameView: low-res member = " +
+                        (s_lowResProp != null ? "prop " + s_lowResProp.Name : "field " + s_lowResField.Name));
+            }
+            if (s_lowResProp == null && s_lowResField == null) return;
+            foreach (var w in wins)
+            {
+                try
+                {
+                    bool cur = s_lowResProp != null ? (bool)s_lowResProp.GetValue(w, null) : (bool)s_lowResField.GetValue(w);
+                    if (!cur) continue; // already full-res
+                    if (s_lowResProp != null) s_lowResProp.SetValue(w, false, null);
+                    else s_lowResField.SetValue(w, false);
+                    // Repaint via reflection (EditorWindow is a UnityEditor type the Runtime
+                    // asmdef can't reference directly) so the RT is reallocated at full res.
+                    var repaint = w.GetType().GetMethod("Repaint",
+                        BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic,
+                        null, System.Type.EmptyTypes, null);
+                    if (repaint != null) repaint.Invoke(w, null);
+                    if (!s_loggedLowResOnce)
+                    {
+                        s_loggedLowResOnce = true;
+                        Debug.Log("[DisplayXR] GameView: forced Low Resolution Aspect Ratios OFF " +
+                                  "(mirror renders at physical px so the woven lenticular maps 1:1).");
+                    }
+                }
+                catch { /* member shape varies by Unity version; best-effort */ }
+            }
+        }
 
         static bool ProbeEnabled()
         {
@@ -190,16 +263,27 @@ namespace DisplayXR
             if (!haveHost) { host = fallbackHost; haveHost = bestArea >= 0f; }
 
             // Compose the PHYSICAL render rect. GetMainGameViewTargetSize returns the render
-            // area in LOGICAL points (excludes the toolbar), so multiply by ppp for physical
-            // px — the mirror RT (== our swapchain) is presented 1:1 into the panel, so it must
-            // be the panel's physical size to fill. Toolbar height = (host - render) in points,
-            // scaled; it offsets the window's top below the Game view toolbar.
+            // area (excludes the toolbar) but its UNITS vary by project: LOGICAL points in
+            // some, physical px in others (memory "GAP A") — a blind ×ppp is 2.5x wrong for the
+            // physical-px projects. Disambiguate against the host rect (always LOGICAL points):
+            // if size.x is closer to host.width it's logical (×ppp); if closer to
+            // host.width*ppp it's already physical (×1). At ppp≈1 the two coincide. This is only
+            // the BORN size; native converges to the authoritative mirror-RT panel px on frame 1.
             int rw, rh, rx, ry, toolbar;
             if (size.x > 1f && size.y > 1f)
             {
-                rw = Mathf.RoundToInt(size.x * ppp);
-                rh = Mathf.RoundToInt(size.y * ppp);
-                toolbar = Mathf.Max(0, Mathf.RoundToInt((host.height - size.y) * ppp));
+                float sizeScale = ppp; // bring `size` to physical px; default = treat as points
+                if (haveHost && host.width > 1f && ppp > 1.1f)
+                {
+                    float dLogical  = Mathf.Abs(size.x - host.width);       // size already in points
+                    float dPhysical = Mathf.Abs(size.x - host.width * ppp); // size already in px
+                    sizeScale = (dLogical <= dPhysical) ? ppp : 1f;
+                }
+                rw = Mathf.RoundToInt(size.x * sizeScale);
+                rh = Mathf.RoundToInt(size.y * sizeScale);
+                // Toolbar = full panel height − render height, both in physical px (units-safe
+                // regardless of `size`'s original units, unlike the old (host−size)×ppp).
+                toolbar = Mathf.Max(0, Mathf.RoundToInt(host.height * ppp) - rh);
             }
             else
             {
@@ -241,8 +325,10 @@ namespace DisplayXR
         public static void TryPushInitialGameViewRect()
         {
             if (!ProbeEnabled()) return;
+            // Full-res the Game view BEFORE the zone is born so the mirror RT == panel physical px.
             if (TryGetGameViewRenderRect(out int px, out int py, out int pw, out int ph, out string dbg))
             {
+                ForceGameViewFullResolution();
                 DisplayXRProviderNative.dxr_prov_set_initial_gameview_rect(px, py, pw, ph);
                 if (!s_loggedInitOnce) { s_loggedInitOnce = true; Debug.Log($"[DisplayXR] GameView initial rect: {dbg}"); }
             }
@@ -253,9 +339,18 @@ namespace DisplayXR
         void PushGameViewRectEditorProbe()
         {
             if (!ProbeEnabled()) return;
+            // Keep the Game view at full (physical) resolution — re-enforce in case the user
+            // (or a layout change) flips "Low Resolution Aspect Ratios" back on mid-session.
+            ForceGameViewFullResolution();
             if (!TryGetGameViewRenderRect(out int px, out int py, out int pw, out int ph, out string dbg))
                 return;
             if (!s_loggedGlueOnce) { s_loggedGlueOnce = true; Debug.Log($"[DisplayXR] GameView glue: {dbg}"); }
+            // Phase 1: publish the authoritative panel PHYSICAL px to the native zone-convergence
+            // path every frame (the native side no-ops once converged). This is the ONLY reliable
+            // physical-px source — info.mirrorRtDesc is LOGICAL px on a HiDPI display. Scale-
+            // independent (mainSize is the target, not the zoom), so magnify drives no zone churn;
+            // a real tab resize changes pw/ph → native re-drives the zone + reallocs the swapchain.
+            DisplayXRProviderNative.dxr_prov_set_panel_px(pw, ph);
             // Debounce: only reposition the weave window when the rect actually changes, so a
             // steady Game view doesn't get SetWindowPos'd every frame (churn / weaver jitter).
             if (px == m_LastGlueX && py == m_LastGlueY && pw == m_LastGlueW && ph == m_LastGlueH)

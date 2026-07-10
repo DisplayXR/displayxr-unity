@@ -564,6 +564,11 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 	if (!s_session_active) return kUnitySubsystemErrorCodeSuccess;
 
 	dxr_prov_poll_events();
+	// GameView zone convergence (Phase 1, #727 follow-up): re-drive the forced full-window
+	// zone to the authoritative panel px the mirror callback published, so the compositor
+	// canvas == Game-view render viewport pixel-exact. A no-op once converged; when it does
+	// change the zone, the reconcile below reallocs the swapchain/bridge to match.
+	dxr_prov_converge_gameview_zone();
 	// Live tile realloc (#172): if the window/zone target size changed, the session
 	// recreates the swapchain+bridge here (between frames). Drop the stale Unity
 	// textures wrapping the old bridge so create_textures_if_ready rewraps the new one.
@@ -848,6 +853,12 @@ MainQueryMirrorViewBlitDesc(UnitySubsystemHandle handle, void *userData,
 				const char *e = getenv("DISPLAYXR_PROV_MIRROR_CALIB");
 				s_calib = (e && e[0]) ? atoi(e) : 0;
 			}
+			// NOTE: info.mirrorRtDesc reports the Game-view render RT in LOGICAL px on a
+			// HiDPI display (e.g. 879x374 at ppp=2.5), NOT the physical panel px — so it is
+			// UNUSABLE as the zone/canvas size (proven on the 3840x2160@250% dev display: it
+			// forces a 2.5x min Game-view Scale, and both rtScaled and rtOriginal come back
+			// 879x374 = the logical size). The authoritative physical panel px is supplied by
+			// C# (mainSize x ppp) via dxr_prov_set_panel_px instead. Kept here for diagnostics.
 			int rtSW0 = 0, rtSH0 = 0, rtOW0 = 0, rtOH0 = 0;
 			if (info.mirrorRtDesc) {
 				rtSW0 = info.mirrorRtDesc->rtScaledWidth;
