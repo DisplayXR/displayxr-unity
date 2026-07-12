@@ -259,6 +259,138 @@ namespace DisplayXR
         [DllImport("user32.dll")] static extern bool GetClientRect(System.IntPtr hWnd, out Win32Rect r);
         [DllImport("user32.dll")] static extern bool IsWindowVisible(System.IntPtr hWnd);
 
+        // --- GameView zoom-area sub-pixel fit: THE maximize/resize seam fix (#727 f-up) ---
+        // Root cause (measured 2026-07-12, ~50 instrumented captures): the GameView
+        // allocates its mirror RT at ceil(dest_px) rows, where dest_px is fractional —
+        // the 21pt GameView toolbar at ppp 2.5 makes every render area X.5 px tall — and
+        // draws the RT onto that 0.5-px-shorter dest. The resample's nearest-sampling
+        // rounding tie crosses at ~50% of the height = a 1..3-row phase break at the RT
+        // midline (the lenticular seam). Only docked layouts with client height ≡ 2
+        // (mod 5) happened to align cleanly — which is why the default layout looked
+        // fine and everything else seamed. FIX: set GameView.m_ZoomArea.m_Scale.y =
+        // RTh/(RTh-0.5) each frame so dest rows == RT rows — an exact 1:1 vertical map
+        // (x untouched). Verified clean (<1° interlace-phase anomaly, from 113°) in
+        // docked (all five height residues), maximized, and floating, with reproducible
+        // on/off/on toggles. DEFAULT ON in texture-probe mode. Env overrides
+        // (DISPLAYXR_PROV_GV_FIT): "off" disables; "nudge:<pt>" sets m_Translation.y
+        // instead; "file" re-reads the knob from %TEMP%\dxr_gv_fit.txt every 30 frames
+        // (sweep values without relaunching).
+        static string s_fitEnv;          // null = unresolved; default (unset env) = "scale"
+        static string s_fitSpec;         // active spec ("scale" / "nudge:0.1" / "off")
+        static int    s_fitFrame;
+        static FieldInfo s_zoomScaleField, s_zoomTransField;
+        static bool   s_zoomFieldsResolved;
+        static string s_lastFitLog;
+
+        static void ApplyGameViewFit()
+        {
+            if (!ProbeEnabled() || s_gvType == null) return;
+            if (s_fitEnv == null)
+            {
+                s_fitEnv = System.Environment.GetEnvironmentVariable("DISPLAYXR_PROV_GV_FIT");
+                if (string.IsNullOrEmpty(s_fitEnv)) s_fitEnv = "scale"; // default ON — the seam fix
+            }
+
+            // Resolve the active spec (file mode re-reads periodically).
+            if (s_fitEnv == "file")
+            {
+                if ((s_fitFrame++ % 30) == 0)
+                {
+                    try
+                    {
+                        string p = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "dxr_gv_fit.txt");
+                        s_fitSpec = System.IO.File.Exists(p) ? System.IO.File.ReadAllText(p).Trim() : "off";
+                    }
+                    catch { s_fitSpec = "off"; }
+                }
+            }
+            else s_fitSpec = s_fitEnv;
+            if (string.IsNullOrEmpty(s_fitSpec)) return;
+
+            var wins = Resources.FindObjectsOfTypeAll(s_gvType);
+            if (wins == null) return;
+            foreach (var w in wins)
+            {
+                try
+                {
+                    if (s_zoomAreaField == null)
+                        for (var t = s_gvType; t != null && s_zoomAreaField == null; t = t.BaseType)
+                            foreach (var fi in t.GetFields(BindingFlags.Instance | BindingFlags.Public |
+                                                           BindingFlags.NonPublic | BindingFlags.DeclaredOnly))
+                                if (fi.Name.ToLowerInvariant().Contains("zoomarea")) { s_zoomAreaField = fi; break; }
+                    if (s_zoomAreaField == null) return;
+                    var za = s_zoomAreaField.GetValue(w);
+                    if (za == null) continue;
+                    if (!s_zoomFieldsResolved)
+                    {
+                        s_zoomFieldsResolved = true;
+                        for (var t = za.GetType(); t != null; t = t.BaseType)
+                            foreach (var fi in t.GetFields(BindingFlags.Instance | BindingFlags.Public |
+                                                           BindingFlags.NonPublic | BindingFlags.DeclaredOnly))
+                            {
+                                if (fi.FieldType != typeof(Vector2)) continue;
+                                if (s_zoomScaleField == null && fi.Name.ToLowerInvariant().Contains("scale"))
+                                    s_zoomScaleField = fi;
+                                if (s_zoomTransField == null && fi.Name.ToLowerInvariant().Contains("translation"))
+                                    s_zoomTransField = fi;
+                            }
+                        Debug.Log("[DisplayXR] GVFIT zoom fields: scale=" +
+                                  (s_zoomScaleField != null ? s_zoomScaleField.Name : "MISSING") +
+                                  " trans=" + (s_zoomTransField != null ? s_zoomTransField.Name : "MISSING"));
+                    }
+
+                    string applied = null;
+                    if (s_fitSpec == "scale" && s_zoomScaleField != null)
+                    {
+                        // dest is 0.5 px short of the RT: stretch y so dest rows == RT rows.
+                        RenderTexture rt = null;
+                        if (s_rtFields != null)
+                            foreach (var rfi in s_rtFields)
+                                if (rfi.GetValue(w) is RenderTexture r && r != null) { rt = r; break; }
+                        if (rt == null || rt.height <= 1) continue;
+                        float target = rt.height / (rt.height - 0.5f);
+                        var sc = (Vector2)s_zoomScaleField.GetValue(za);
+                        if (Mathf.Abs(sc.y - target) > 1e-6f)
+                        { sc.y = target; s_zoomScaleField.SetValue(za, sc); }
+                        applied = $"scale.y={target:F7} (rt={rt.width}x{rt.height})";
+                    }
+                    else if (s_fitSpec.StartsWith("nudge:") && s_zoomTransField != null)
+                    {
+                        float pt = float.Parse(s_fitSpec.Substring(6),
+                            System.Globalization.CultureInfo.InvariantCulture);
+                        var tr = (Vector2)s_zoomTransField.GetValue(za);
+                        if (Mathf.Abs(tr.y - pt) > 1e-6f)
+                        { tr.y = pt; s_zoomTransField.SetValue(za, tr); }
+                        applied = $"trans.y={pt:F3}pt";
+                    }
+                    else if (s_fitSpec == "off")
+                    {
+                        if (s_zoomScaleField != null)
+                        {
+                            var sc = (Vector2)s_zoomScaleField.GetValue(za);
+                            if (Mathf.Abs(sc.y - 1f) > 1e-6f) { sc.y = 1f; s_zoomScaleField.SetValue(za, sc); }
+                        }
+                        if (s_zoomTransField != null)
+                        {
+                            var tr = (Vector2)s_zoomTransField.GetValue(za);
+                            if (Mathf.Abs(tr.y) > 1e-6f) { tr.y = 0f; s_zoomTransField.SetValue(za, tr); }
+                        }
+                        applied = "off (restored)";
+                    }
+                    if (applied != null && applied != s_lastFitLog)
+                    {
+                        s_lastFitLog = applied;
+                        Debug.Log("[DisplayXR] GVFIT applied: " + applied);
+                    }
+                }
+                catch (System.Exception e)
+                {
+                    if (s_lastFitLog != "err")
+                    { s_lastFitLog = "err"; Debug.LogWarning("[DisplayXR] GVFIT error: " + e.Message); }
+                }
+            }
+        }
+
         static void LogGameViewGeometryOnChange()
         {
             if (!GvGeomEnabled() || s_gvType == null || s_parentField == null || s_screenPosProp == null) return;
@@ -556,6 +688,7 @@ namespace DisplayXR
             ForceGameViewFullResolution();
             LogGameViewInstancesOnChange();
             LogGameViewGeometryOnChange();
+            ApplyGameViewFit();
             if (!TryGetGameViewRenderRect(out int px, out int py, out int pw, out int ph, out string dbg))
                 return;
             if (!s_loggedGlueOnce) { s_loggedGlueOnce = true; Debug.Log($"[DisplayXR] GameView glue: {dbg}"); }
