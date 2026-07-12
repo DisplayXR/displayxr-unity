@@ -3154,17 +3154,15 @@ int dxr_prov_get_initial_gameview_rect(int *x, int *y, int *w, int *h)
 //   DISPLAYXR_PROV_GV_TRACK=0     → off (born-once no-op, the pre-follow behavior)
 //   DISPLAYXR_PROV_GV_TRACK=move  → move only (SWP_NOSIZE) — isolation diagnostic
 //
-// #61 drag bracket: the SR weaver only phase-snaps to lenticular-aligned positions
-// while its WndProc subclass sees the OS in-size-move flag. These follow pushes are
-// silent per-rect-change SetWindowPos calls (no OS modal loop), so the weaver never
-// phase-tracks during a drag of the hosting editor window → 3D stutter. Bracket the
-// burst: WM_ENTERSIZEMOVE before the first follow move, WM_EXITSIZEMOVE once the rect
-// has been stable ~200ms (expiry checked in dxr_prov_set_panel_px, which C# calls
-// every frame on the same thread). Messages only — no restyle → weaver-safe per #61.
-static int s_gv_track_in_bracket = 0;
-static ULONGLONG s_gv_track_last_move_tick = 0;
-#define GV_TRACK_BRACKET_SETTLE_MS 200
-
+// NO #61 drag bracket here (tried 2026-07-12, REGRESSED steady-state phase — do not
+// re-add): synthesizing WM_ENTERSIZEMOVE/WM_EXITSIZEMOVE around the follow pushes made
+// the weaver's exit phase-snap re-anchor the bound window onto lenticular-aligned
+// pixels — correct for a window that presents its own content (#61 overlay drag), but
+// it UN-GLUES this hidden reference window from the Game-view rect by a position-
+// dependent few px → wrong, position-dependent phase at settle in every state except
+// coincidentally-aligned ones. Silent pushes settle phase-correct (HW-verified);
+// mid-drag phase tracking (drag stutter) is an open follow-up needing a different
+// mechanism than the bracket.
 void dxr_prov_set_gameview_rect(int x, int y, int w, int h)
 {
 	if (w <= 0 || h <= 0 || !s_ps.overlay_hwnd) return;
@@ -3184,12 +3182,6 @@ void dxr_prov_set_gameview_rect(int x, int y, int w, int h)
 	if (!s_have_last) { s_have_last = 1; lx = s_init_gv_x; ly = s_init_gv_y; lw = s_init_gv_w; lh = s_init_gv_h; }
 	if (x == lx && y == ly && w == lw && h == lh) return; // only on actual change from born/last
 	lx = x; ly = y; lw = w; lh = h;
-
-	if (!s_gv_track_in_bracket) {
-		s_gv_track_in_bracket = 1;
-		SendMessageW((HWND)s_ps.overlay_hwnd, WM_ENTERSIZEMOVE, 0, 0); // #61 phase-snap bracket
-	}
-	s_gv_track_last_move_tick = GetTickCount64();
 
 	UINT flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER; // NO SWP_FRAMECHANGED
 	if (s_track == 2) flags |= SWP_NOSIZE; // move only
@@ -3255,17 +3247,6 @@ void dxr_prov_set_panel_px(int w, int h)
 {
 	s_gv_panel_w = (w > 0) ? w : 0;
 	s_gv_panel_h = (h > 0) ? h : 0;
-
-	// #61 drag-bracket close (see dxr_prov_set_gameview_rect): C# calls this every
-	// frame on the same thread as the follow pushes, so it doubles as the burst-end
-	// tick — once the glue rect has been stable GV_TRACK_BRACKET_SETTLE_MS, send
-	// WM_EXITSIZEMOVE so the weaver's subclass leaves in-drag state and phase-snaps.
-	if (s_gv_track_in_bracket && s_ps.overlay_hwnd &&
-	    GetTickCount64() - s_gv_track_last_move_tick >= GV_TRACK_BRACKET_SETTLE_MS) {
-		s_gv_track_in_bracket = 0;
-		SendMessageW((HWND)s_ps.overlay_hwnd, WM_EXITSIZEMOVE, 0, 0);
-		ps_log("[DisplayXR-PROV] gameview track: settle -> WM_EXITSIZEMOVE (phase-snap)\n");
-	}
 }
 
 // Called from the per-frame pump BEFORE dxr_prov_reconcile_size. If the published panel

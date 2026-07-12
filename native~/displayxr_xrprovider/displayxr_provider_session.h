@@ -204,9 +204,10 @@ DISPLAYXR_EXPORT int  dxr_prov_get_dedicated_window(void);
 /// on-screen region as it moves/resizes/docks, so window-relative Kooima + the weaver's
 /// lenticular phase track where the mirror-blit shows the woven output. DEFAULT ON;
 /// env DISPLAYXR_PROV_GV_TRACK=0 disables (born-once), =move for move-only. Plain
-/// SetWindowPos on change only — never SWP_FRAMECHANGED (#727 mono collapse) — with a
-/// #61 WM_ENTERSIZEMOVE/WM_EXITSIZEMOVE bracket around move bursts so the weaver
-/// phase-snaps. Called each frame from C#; x,y = screen px (top-left origin),
+/// SILENT SetWindowPos on change only — never SWP_FRAMECHANGED (#727 mono collapse),
+/// and never a #61 ENTER/EXITSIZEMOVE bracket (the weaver's exit phase-snap re-anchors
+/// the window off the glue rect → position-dependent phase error; tried + reverted).
+/// Called each frame from C#; x,y = screen px (top-left origin),
 /// w,h = Game view size in px. w<=0||h<=0 is ignored. Windows-only.
 DISPLAYXR_EXPORT void dxr_prov_set_gameview_rect(int x, int y, int w, int h);
 
