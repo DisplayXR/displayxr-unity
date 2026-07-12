@@ -96,6 +96,9 @@ bool                    s_textures_created = false;
 // mode is active (dxr_prov_get_woven_unity_texture returns NULL otherwise).
 static UnityXRRenderTextureId s_woven_tex_id = 0;
 static bool                   s_woven_tex_created = false;
+// Native mirror blit command objects (Unity device) — reused; released in GfxStop.
+static ID3D12CommandAllocator   *s_mblit_alloc = nullptr;
+static ID3D12GraphicsCommandList *s_mblit_list = nullptr;
 
 // Extra 3D zones (#166 Phase B2): each extra zone gets its own Unity texture(s)
 // (SPI: [i][0] = 2-slice array; MultiPass: [i][0/1] = per-eye) + render pass.
@@ -789,6 +792,8 @@ GfxStop(UnitySubsystemHandle handle, void *userData)
 {
 	(void)handle; (void)userData;
 	destroy_textures();
+	if (s_mblit_list)  { s_mblit_list->Release();  s_mblit_list  = nullptr; }
+	if (s_mblit_alloc) { s_mblit_alloc->Release(); s_mblit_alloc = nullptr; }
 	if (s_session_active) {
 		dxr_prov_session_stop();
 		s_session_active = false;
@@ -815,6 +820,88 @@ MainUpdateDisplayState(UnitySubsystemHandle handle, void *userData, UnityXRDispl
 	return kUnitySubsystemErrorCodeSuccess;
 }
 
+// Native mirror blit (maximize seam fix, gated by DISPLAYXR_PROV_NATIVE_MIRROR=1). Unity's
+// default mirror blit tiles a large RT into top/bottom halves, which breaks the woven
+// lenticular interlace phase at the RT midline (a seam only visible for tall maximized RTs;
+// proven: the woven shared texture is phase-continuous, the on-screen present is not). Doing
+// the blit ourselves — one CopyTextureRegion of the woven canvas into the whole RT — bypasses
+// Unity's tiling. Falls back to blitParams if the env is unset, the interface/handles are
+// missing, or the formats aren't copy-compatible (logged; would need a shader blit).
+static int s_native_mirror_env = -1;
+static bool native_mirror_enabled()
+{
+	if (s_native_mirror_env < 0) {
+		const char *e = getenv("DISPLAYXR_PROV_NATIVE_MIRROR");
+		s_native_mirror_env = (e && e[0] == '1') ? 1 : 0;
+	}
+	return s_native_mirror_env == 1;
+}
+
+static UnitySubsystemErrorCode UNITY_INTERFACE_API
+MainBlitToMirrorViewRenderTarget(UnitySubsystemHandle handle, void *userData,
+                                 const UnityXRMirrorViewBlitInfo info)
+{
+	(void)handle; (void)userData;
+	if (!native_mirror_enabled() || s_woven_tex_id == 0) return kUnitySubsystemErrorCodeSuccess;
+	if (!info.mirrorRtDesc || !info.mirrorRtDesc->rtNative || !s_ifaces) return kUnitySubsystemErrorCodeSuccess;
+	IUnityGraphicsD3D12v8 *v8 = s_ifaces->Get<IUnityGraphicsD3D12v8>();
+	if (!v8) return kUnitySubsystemErrorCodeSuccess;
+	ID3D12Device *dev = v8->GetDevice();
+	ID3D12Resource *rt = v8->TextureFromRenderBuffer(info.mirrorRtDesc->rtNative);
+	uint32_t ww = 0, wh = 0;
+	ID3D12Resource *src = (ID3D12Resource *)dxr_prov_get_woven_unity_texture(&ww, &wh);
+	if (!dev || !rt || !src) return kUnitySubsystemErrorCodeSuccess;
+
+	int32_t cx = 0, cy = 0, cw = 0, ch = 0; uint32_t tw = 0, th = 0;
+	dxr_prov_get_woven_canvas(&cx, &cy, &cw, &ch, &tw, &th);
+	D3D12_RESOURCE_DESC rd = rt->GetDesc();
+	D3D12_RESOURCE_DESC sd = src->GetDesc();
+	if (rd.Format != sd.Format) {
+		static bool fmt_logged = false;
+		if (!fmt_logged) { fmt_logged = true; char b[160];
+			_snprintf_s(b, sizeof(b), _TRUNCATE,
+			            "[DisplayXR-PROV] native mirror: format mismatch rt=%d src=%d -> need shader blit; leaving RT (blitParams fallback)\n",
+			            (int)rd.Format, (int)sd.Format);
+			prov_log(b); }
+		return kUnitySubsystemErrorCodeSuccess; // Unity keeps blitParams result
+	}
+	// 1:1 copy of the woven canvas region into the RT top-left. Clamp to both extents.
+	UINT cpw = (UINT)cw, cph = (UINT)ch;
+	if (cpw > (UINT)rd.Width)  cpw = (UINT)rd.Width;
+	if (cph > (UINT)rd.Height) cph = (UINT)rd.Height;
+	if ((UINT)cx + cpw > (UINT)sd.Width)  cpw = (UINT)sd.Width  - (UINT)cx;
+	if ((UINT)cy + cph > (UINT)sd.Height) cph = (UINT)sd.Height - (UINT)cy;
+	if (cpw == 0 || cph == 0) return kUnitySubsystemErrorCodeSuccess;
+
+	if (!s_mblit_alloc)
+		dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&s_mblit_alloc));
+	if (!s_mblit_list && s_mblit_alloc) {
+		dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, s_mblit_alloc, nullptr, IID_PPV_ARGS(&s_mblit_list));
+		if (s_mblit_list) s_mblit_list->Close();
+	}
+	if (!s_mblit_alloc || !s_mblit_list) return kUnitySubsystemErrorCodeSuccess;
+	s_mblit_alloc->Reset();
+	s_mblit_list->Reset(s_mblit_alloc, nullptr);
+
+	D3D12_TEXTURE_COPY_LOCATION dst = {}; dst.pResource = rt;  dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dst.SubresourceIndex = 0;
+	D3D12_TEXTURE_COPY_LOCATION srl = {}; srl.pResource = src; srl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; srl.SubresourceIndex = 0;
+	D3D12_BOX box = { (UINT)cx, (UINT)cy, 0, (UINT)cx + cpw, (UINT)cy + cph, 1 };
+	s_mblit_list->CopyTextureRegion(&dst, 0, 0, 0, &srl, &box); // src COMMON->COPY_SOURCE via implicit promotion
+	s_mblit_list->Close();
+
+	// RT is a Unity-tracked resource: declare expected/after so Unity brackets the transition.
+	UnityGraphicsD3D12ResourceState st = {};
+	st.resource = rt; st.expected = D3D12_RESOURCE_STATE_COPY_DEST; st.current = D3D12_RESOURCE_STATE_COPY_DEST;
+	v8->ExecuteCommandList(s_mblit_list, 1, &st);
+	static bool ok_logged = false;
+	if (!ok_logged) { ok_logged = true; char b[160];
+		_snprintf_s(b, sizeof(b), _TRUNCATE,
+		            "[DisplayXR-PROV] native mirror blit ACTIVE: copy %ux%u canvas -> RT %llux%u (fmt=%d) — no Unity tiling\n",
+		            cpw, cph, (unsigned long long)rd.Width, (unsigned)rd.Height, (int)rd.Format);
+		prov_log(b); }
+	return kUnitySubsystemErrorCodeSuccess;
+}
+
 UnitySubsystemErrorCode UNITY_INTERFACE_API
 MainQueryMirrorViewBlitDesc(UnitySubsystemHandle handle, void *userData,
                             const UnityXRMirrorViewBlitInfo info, UnityXRMirrorViewBlitDesc *desc)
@@ -831,7 +918,10 @@ MainQueryMirrorViewBlitDesc(UnitySubsystemHandle handle, void *userData,
 		}
 	}
 	if (!desc) return kUnitySubsystemErrorCodeSuccess;
-	desc->nativeBlitAvailable = false;
+	// When the native mirror blit is enabled and a woven texture exists, tell Unity we'll do
+	// the blit ourselves (MainBlitToMirrorViewRenderTarget) — avoids Unity's tiling seam. The
+	// blitParams below are still filled as a fallback (Unity may skip the native callback).
+	desc->nativeBlitAvailable = (native_mirror_enabled() && s_woven_tex_id != 0);
 	desc->nativeBlitInvalidStates = false;
 	// GameView weave-to-texture mirror (Task (a)): if texture mode published a woven
 	// texture, blit its canvas sub-rect into the Game window. Otherwise no mirror blit
@@ -859,12 +949,15 @@ MainQueryMirrorViewBlitDesc(UnitySubsystemHandle handle, void *userData,
 			// forces a 2.5x min Game-view Scale, and both rtScaled and rtOriginal come back
 			// 879x374 = the logical size). The authoritative physical panel px is supplied by
 			// C# (mainSize x ppp) via dxr_prov_set_panel_px instead. Kept here for diagnostics.
-			int rtSW0 = 0, rtSH0 = 0, rtOW0 = 0, rtOH0 = 0;
+			int rtSW0 = 0, rtSH0 = 0, rtOW0 = 0, rtOH0 = 0, rtArr0 = 0, rtSamp0 = 0, rtMip0 = 0;
 			if (info.mirrorRtDesc) {
 				rtSW0 = info.mirrorRtDesc->rtScaledWidth;
 				rtSH0 = info.mirrorRtDesc->rtScaledHeight;
 				rtOW0 = info.mirrorRtDesc->rtOriginalWidth;
 				rtOH0 = info.mirrorRtDesc->rtOriginalHeight;
+				rtArr0 = info.mirrorRtDesc->rtDepthOrArraySize;
+				rtSamp0 = info.mirrorRtDesc->rtSamples;
+				rtMip0 = info.mirrorRtDesc->rtMipCount;
 			}
 			if (s_calib != 0) {
 				UnityXRRectf full = { 0.0f, 0.0f, 1.0f, 1.0f };
@@ -905,6 +998,36 @@ MainQueryMirrorViewBlitDesc(UnitySubsystemHandle handle, void *userData,
 				return kUnitySubsystemErrorCodeSuccess;
 			}
 			// --------------------------------------------------------------------------
+			// Two-tile mirror (DISPLAYXR_PROV_MIRROR_2TILE=1): the phase seam was localized to
+			// the RT vertical MIDLINE (RT-geometric, not content) — Unity splits our single
+			// full-RT blit into a top/bottom half with a ~few-px offset. Hand it the two halves
+			// pre-split (contiguous source regions → contiguous dest halves) so Unity blits each
+			// as-is with no internal midline split. If the seam persists it's downstream of the
+			// blit (RT->panel present), which we can't reach.
+			static int s_2tile = -1;
+			if (s_2tile < 0) { const char *e = getenv("DISPLAYXR_PROV_MIRROR_2TILE"); s_2tile = (e && e[0] == '1') ? 1 : 0; }
+			if (s_2tile) {
+				float sx = (float)cx / tw, sw = (float)cw / tw;
+				float shTop = (float)ch * 0.5f / th;      // half the content height, normalized
+				float syTop = (float)cy / th;
+				float syBot = ((float)cy + (float)ch * 0.5f) / th;
+				desc->blitParamsCount = 2;
+				desc->blitParams[0].srcTexId = s_woven_tex_id;
+				desc->blitParams[0].srcTexArraySlice = 0;
+				desc->blitParams[0].srcRect = { sx, syTop, sw, shTop };
+				desc->blitParams[0].destRect = { 0.0f, 0.0f, 1.0f, 0.5f };
+				desc->blitParams[1].srcTexId = s_woven_tex_id;
+				desc->blitParams[1].srcTexArraySlice = 0;
+				desc->blitParams[1].srcRect = { sx, syBot, sw, shTop };
+				desc->blitParams[1].destRect = { 0.0f, 0.5f, 1.0f, 0.5f };
+				static bool t_logged = false;
+				if (!t_logged) { t_logged = true; char b[192];
+					_snprintf_s(b, sizeof(b), _TRUNCATE,
+					            "[DisplayXR-PROV] mirror 2-tile: top src=(%.3f,%.3f %.3f,%.3f) bot src y=%.3f -> dest halves\n",
+					            sx, syTop, sw, shTop, syBot);
+					prov_log(b); }
+				return kUnitySubsystemErrorCodeSuccess;
+			}
 			desc->blitParamsCount = 1;
 			desc->blitParams[0].srcTexId = s_woven_tex_id;
 			desc->blitParams[0].srcTexArraySlice = 0;
@@ -928,13 +1051,13 @@ MainQueryMirrorViewBlitDesc(UnitySubsystemHandle handle, void *userData,
 					_snprintf_s(buf, sizeof(buf), _TRUNCATE,
 					            "[DisplayXR-PROV] mirror blit: canvas=(%d,%d %dx%d) tex=%ux%u "
 					            "srcRect=(%.3f,%.3f %.3f,%.3f) destRect=(%.3f,%.3f %.3f,%.3f) "
-					            "mirrorRT scaled=%dx%d original=%dx%d\n",
+					            "mirrorRT scaled=%dx%d original=%dx%d arraySize=%d samples=%d mips=%d\n",
 					            cx, cy, cw, ch, tw, th,
 					            desc->blitParams[0].srcRect.x, desc->blitParams[0].srcRect.y,
 					            desc->blitParams[0].srcRect.width, desc->blitParams[0].srcRect.height,
 					            desc->blitParams[0].destRect.x, desc->blitParams[0].destRect.y,
 					            desc->blitParams[0].destRect.width, desc->blitParams[0].destRect.height,
-					            rtSW0, rtSH0, rtOW0, rtOH0);
+					            rtSW0, rtSH0, rtOW0, rtOH0, rtArr0, rtSamp0, rtMip0);
 					prov_log(buf);
 				}
 			}
@@ -963,7 +1086,7 @@ LifecycleInitialize(UnitySubsystemHandle handle, void *userData)
 	gfx.PopulateNextFrameDesc = GfxPopulateNextFrameDesc;
 	gfx.SubmitCurrentFrame = GfxSubmitCurrentFrame;
 	gfx.Stop = GfxStop;
-	gfx.BlitToMirrorViewRenderTarget = nullptr;
+	gfx.BlitToMirrorViewRenderTarget = MainBlitToMirrorViewRenderTarget; // gated by nativeBlitAvailable
 	if (s_display->RegisterProviderForGraphicsThread(handle, &gfx) != kUnitySubsystemErrorCodeSuccess)
 		return kUnitySubsystemErrorCodeFailure;
 

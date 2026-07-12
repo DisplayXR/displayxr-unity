@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 using System.Reflection;
+using System.Runtime.InteropServices;
 using UnityEngine;
 
 namespace DisplayXR
@@ -171,6 +172,41 @@ namespace DisplayXR
             }
         }
 
+        // Diagnostic: log every GameView instance's maximized flag + host screenPosition +
+        // the static GetMainGameViewTargetSize, but only when the combined signature changes.
+        // Used to understand why a double-click maximize doesn't grow the mirror RT (the
+        // maximized view is a separate instance the "main" target-size query doesn't report).
+        static string s_lastGvSig;
+        static PropertyInfo s_maximizedProp;
+        static void LogGameViewInstancesOnChange()
+        {
+            if (!ProbeEnabled() || s_gvType == null) return;
+            var wins = Resources.FindObjectsOfTypeAll(s_gvType);
+            if (wins == null) return;
+            Vector2 mainSize = Vector2.zero;
+            if (s_mainTargetSizeMethod != null && s_mainTargetSizeMethod.Invoke(null, null) is Vector2 sv) mainSize = sv;
+            if (s_maximizedProp == null)
+                for (var t = s_gvType; t != null && s_maximizedProp == null; t = t.BaseType)
+                    s_maximizedProp = t.GetProperty("maximized", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            var sb = new System.Text.StringBuilder();
+            sb.Append($"mainTargetSize=({mainSize.x}x{mainSize.y}) instances={wins.Length}: ");
+            foreach (var w in wins)
+            {
+                bool maxed = false;
+                try { if (s_maximizedProp != null) maxed = (bool)s_maximizedProp.GetValue(w, null); } catch { }
+                Rect sp = default; bool haveSp = false;
+                try
+                {
+                    var pr = s_parentField != null ? s_parentField.GetValue(w) : null;
+                    if (pr != null && s_screenPosProp != null) { sp = (Rect)s_screenPosProp.GetValue(pr, null); haveSp = true; }
+                }
+                catch { }
+                sb.Append(haveSp ? $"[max={maxed} pos=({sp.x},{sp.y} {sp.width}x{sp.height})] " : $"[max={maxed} pos=?] ");
+            }
+            string sig = sb.ToString();
+            if (sig != s_lastGvSig) { s_lastGvSig = sig; Debug.Log("[DisplayXR] GameView instances: " + sig); }
+        }
+
         static bool ProbeEnabled()
         {
             if (!Application.isEditor) return false;
@@ -178,6 +214,182 @@ namespace DisplayXR
                 s_probeGate = System.Environment.GetEnvironmentVariable(
                     "DISPLAYXR_PROV_TEXTURE_PROBE") == "1" ? 1 : 0;
             return s_probeGate == 1;
+        }
+
+        // --- Stage-B seam diagnosis: geometry logging (env DISPLAYXR_PROV_GVGEOM=1) ---
+        // One "GVGEOM" line whenever any watched value changes. Purpose: quantify the
+        // point→pixel rounding disagreement suspected behind the maximize/resize midline
+        // phase seam (#727 follow-up). Unity mixes TWO rounding rules on the same HiDPI
+        // chain — DockArea RoundToPixelGrid = floor(v*ppp+0.48) vs GameView
+        // Mathf.Round(v*ppp) — which can disagree by 1 physical px on non-default
+        // (resized/floating/maximized) layout rects at fractional ppp (2.5). A 1-px
+        // swapchain-vs-client-height mismatch engages the DirectFlip/MPO panel-fitter
+        // stretch, which drops/duplicates one row at ~50% height = the observed seam.
+        // Logged per GameView: host rect (logical points), BOTH rounding rules applied,
+        // every RenderTexture field's size, zoom-area draw rect / targetInView, and the
+        // Win32 truth: the best-matching editor child HWND (the GUIView swapchain
+        // window) with its GetWindowRect/GetClientRect, plus deltaH = win32 client
+        // height − each rounded host height. deltaH == ±1 only in seamed geometries
+        // confirms the model; the fix must drive it to 0.
+        static int s_gvGeomGate = -1;
+        static string s_lastGeomSig;
+        static FieldInfo s_zoomAreaField;
+        static PropertyInfo s_zoomDrawRectProp;
+        static System.Collections.Generic.List<FieldInfo> s_rtFields;
+        static System.Collections.Generic.List<PropertyInfo> s_geomRectProps;
+        static bool s_geomMembersResolved;
+
+        static bool GvGeomEnabled()
+        {
+            if (!ProbeEnabled()) return false;
+            if (s_gvGeomGate < 0)
+                s_gvGeomGate = System.Environment.GetEnvironmentVariable(
+                    "DISPLAYXR_PROV_GVGEOM") == "1" ? 1 : 0;
+            return s_gvGeomGate == 1;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct Win32Rect { public int left, top, right, bottom; }
+        delegate bool Win32EnumProc(System.IntPtr hWnd, System.IntPtr lParam);
+        [DllImport("user32.dll")] static extern bool EnumWindows(Win32EnumProc cb, System.IntPtr lParam);
+        [DllImport("user32.dll")] static extern bool EnumChildWindows(System.IntPtr parent, Win32EnumProc cb, System.IntPtr lParam);
+        [DllImport("user32.dll")] static extern uint GetWindowThreadProcessId(System.IntPtr hWnd, out uint pid);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)] static extern int GetClassName(System.IntPtr hWnd, System.Text.StringBuilder name, int max);
+        [DllImport("user32.dll")] static extern bool GetWindowRect(System.IntPtr hWnd, out Win32Rect r);
+        [DllImport("user32.dll")] static extern bool GetClientRect(System.IntPtr hWnd, out Win32Rect r);
+        [DllImport("user32.dll")] static extern bool IsWindowVisible(System.IntPtr hWnd);
+
+        static void LogGameViewGeometryOnChange()
+        {
+            if (!GvGeomEnabled() || s_gvType == null || s_parentField == null || s_screenPosProp == null) return;
+            if (Application.platform != RuntimePlatform.WindowsEditor) return;
+            var wins = Resources.FindObjectsOfTypeAll(s_gvType);
+            if (wins == null || wins.Length == 0) return;
+
+            if (!s_geomMembersResolved)
+            {
+                s_geomMembersResolved = true;
+                var flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+                s_rtFields = new System.Collections.Generic.List<FieldInfo>();
+                s_geomRectProps = new System.Collections.Generic.List<PropertyInfo>();
+                for (var t = s_gvType; t != null; t = t.BaseType)
+                {
+                    foreach (var fi in t.GetFields(flags | BindingFlags.DeclaredOnly))
+                    {
+                        if (fi.FieldType == typeof(RenderTexture)) s_rtFields.Add(fi);
+                        if (s_zoomAreaField == null && fi.Name.ToLowerInvariant().Contains("zoomarea"))
+                            s_zoomAreaField = fi;
+                    }
+                    foreach (var pr in t.GetProperties(flags | BindingFlags.DeclaredOnly))
+                        if (pr.PropertyType == typeof(Rect))
+                        {
+                            var n = pr.Name.ToLowerInvariant();
+                            if (n.Contains("targetinview") || n.Contains("viewinwindow"))
+                                s_geomRectProps.Add(pr);
+                        }
+                }
+            }
+
+            float ppp = s_cachedPpp > 0f ? s_cachedPpp : 1f;
+            float livePpp = 0f;
+            try { if (s_pppProp != null && s_pppProp.GetValue(null, null) is float lf) livePpp = lf; } catch { }
+
+            // Win32 truth: every visible window (top-level + descendants) of this process.
+            var hwnds = new System.Collections.Generic.List<(System.IntPtr h, string cls, Win32Rect wr, Win32Rect cr)>();
+            uint myPid = (uint)System.Diagnostics.Process.GetCurrentProcess().Id;
+            Win32EnumProc collect = (h, l) =>
+            {
+                if (!IsWindowVisible(h)) return true;
+                var nameSb = new System.Text.StringBuilder(64);
+                GetClassName(h, nameSb, 64);
+                GetWindowRect(h, out var wr);
+                GetClientRect(h, out var cr);
+                hwnds.Add((h, nameSb.ToString(), wr, cr));
+                return true;
+            };
+            Win32EnumProc top = (h, l) =>
+            {
+                GetWindowThreadProcessId(h, out uint pid);
+                if (pid != myPid) return true;
+                collect(h, l);
+                EnumChildWindows(h, collect, System.IntPtr.Zero);
+                return true;
+            };
+            try { EnumWindows(top, System.IntPtr.Zero); } catch { }
+
+            var sb = new System.Text.StringBuilder();
+            sb.Append($"ppp={ppp:F3} live={livePpp:F3} xrMode={UnityEngine.XR.XRSettings.gameViewRenderMode}");
+            foreach (var w in wins)
+            {
+                Rect sp = default; bool haveSp = false;
+                try
+                {
+                    var pr = s_parentField.GetValue(w);
+                    if (pr != null) { sp = (Rect)s_screenPosProp.GetValue(pr, null); haveSp = true; }
+                }
+                catch { }
+                if (!haveSp) { sb.Append(" | host=?"); continue; }
+
+                // The two rounding rules Unity mixes (GameView vs DockArea).
+                int rndH = Mathf.RoundToInt(sp.height * ppp);
+                int rndW = Mathf.RoundToInt(sp.width * ppp);
+                int f48H = Mathf.FloorToInt(sp.height * ppp + 0.48f);
+                int f48W = Mathf.FloorToInt(sp.width * ppp + 0.48f);
+                sb.Append($" | host=({sp.x:F2},{sp.y:F2} {sp.width:F2}x{sp.height:F2})pt " +
+                          $"px(round)={rndW}x{rndH} px(f48)={f48W}x{f48H}");
+
+                foreach (var fi in s_rtFields)
+                {
+                    try
+                    {
+                        if (fi.GetValue(w) is RenderTexture rt && rt != null)
+                            sb.Append($" {fi.Name}={rt.width}x{rt.height}");
+                    }
+                    catch { }
+                }
+                try
+                {
+                    if (s_zoomAreaField != null)
+                    {
+                        var za = s_zoomAreaField.GetValue(w);
+                        if (za != null)
+                        {
+                            if (s_zoomDrawRectProp == null)
+                                for (var t = za.GetType(); t != null && s_zoomDrawRectProp == null; t = t.BaseType)
+                                    s_zoomDrawRectProp = t.GetProperty("drawRect",
+                                        BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                            if (s_zoomDrawRectProp != null && s_zoomDrawRectProp.GetValue(za, null) is Rect dr)
+                                sb.Append($" zoomDraw=({dr.x:F2},{dr.y:F2} {dr.width:F2}x{dr.height:F2})");
+                        }
+                    }
+                    foreach (var rp in s_geomRectProps)
+                        if (rp.GetValue(w, null) is Rect rr)
+                            sb.Append($" {rp.Name}=({rr.x:F2},{rr.y:F2} {rr.width:F2}x{rr.height:F2})");
+                }
+                catch { }
+
+                // Best-matching HWND for this GameView's host rect (physical px).
+                float exX = sp.x * ppp, exY = sp.y * ppp, exW = sp.width * ppp, exH = sp.height * ppp;
+                float bestScore = float.MaxValue;
+                (System.IntPtr h, string cls, Win32Rect wr, Win32Rect cr) best = default;
+                foreach (var e in hwnds)
+                {
+                    float score = Mathf.Abs(e.wr.left - exX) + Mathf.Abs(e.wr.top - exY)
+                                + Mathf.Abs((e.wr.right - e.wr.left) - exW)
+                                + Mathf.Abs((e.wr.bottom - e.wr.top) - exH);
+                    if (score < bestScore) { bestScore = score; best = e; }
+                }
+                if (best.h != System.IntPtr.Zero)
+                {
+                    int winW = best.wr.right - best.wr.left, winH = best.wr.bottom - best.wr.top;
+                    int cliW = best.cr.right - best.cr.left, cliH = best.cr.bottom - best.cr.top;
+                    sb.Append($" hwnd[{best.cls}]=({best.wr.left},{best.wr.top} {winW}x{winH}) client={cliW}x{cliH}" +
+                              $" deltaH(round)={cliH - rndH} deltaH(f48)={cliH - f48H} score={bestScore:F1}");
+                }
+            }
+
+            string sig = sb.ToString();
+            if (sig != s_lastGeomSig) { s_lastGeomSig = sig; Debug.Log("[DisplayXR] GVGEOM " + sig); }
         }
 
         // Compute the visible Game view's RENDER-area rect in physical px. SIZE comes from
@@ -342,6 +554,8 @@ namespace DisplayXR
             // Keep the Game view at full (physical) resolution — re-enforce in case the user
             // (or a layout change) flips "Low Resolution Aspect Ratios" back on mid-session.
             ForceGameViewFullResolution();
+            LogGameViewInstancesOnChange();
+            LogGameViewGeometryOnChange();
             if (!TryGetGameViewRenderRect(out int px, out int py, out int pw, out int ph, out string dbg))
                 return;
             if (!s_loggedGlueOnce) { s_loggedGlueOnce = true; Debug.Log($"[DisplayXR] GameView glue: {dbg}"); }

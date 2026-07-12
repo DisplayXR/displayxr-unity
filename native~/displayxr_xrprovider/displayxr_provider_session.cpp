@@ -2887,7 +2887,7 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	// Unconditional build marker: if this line is ABSENT from the log, the editor is
 	// running a STALE DLL (restart Unity). If present with env_probe=0, the env var
 	// DISPLAYXR_PROV_TEXTURE_PROBE=1 did not reach the editor process.
-	ps_log("[DisplayXR-PROV] PROBE build=weave-to-texture-panelconverge2-csharpsrc env_probe=%d\n", s_probe_enabled);
+	ps_log("[DisplayXR-PROV] PROBE build=weave-to-texture-2tile env_probe=%d\n", s_probe_enabled);
 	ps_probe_cleanup(); // clears counters + any leftover texture from a prior session
 	if (s_probe_enabled) {
 		DisplayXRDisplayInfo *pdi = &displayxr_get_state()->display_info;
@@ -3146,9 +3146,37 @@ int dxr_prov_get_initial_gameview_rect(int *x, int *y, int *w, int *h)
 // glue push is intentionally a NO-OP; the window stays at its born rect for the session.
 // (Weaver-safe dynamic re-glue for a Game view MOVED/RESIZED mid-session — e.g. pausing the
 // weaver around the move, or a reposition that avoids the frame recalc — is a follow-up.)
+//
+// EXPERIMENT (maximize/resize follow, gated): when the Game tab is maximized/resized the zone
+// grows but the weave window's GetClientRect stays 2198 → the runtime weaves only 2198 (black
+// right/bottom). To follow, the window must move+resize. That is the #727-risky op (a size
+// change sends WM_NCCALCSIZE). Gated so the DEFAULT stays the proven born-once no-op:
+//   DISPLAYXR_PROV_GV_TRACK=1     → move + resize (no SWP_FRAMECHANGED) — the real test
+//   DISPLAYXR_PROV_GV_TRACK=move  → move only (SWP_NOSIZE, no frame recalc) — Phase-2 isolation
+// Verify with the fence-synced dual tap: if the weave stays stereo after a maximize, the op is
+// weaver-safe; if it collapses to mono, the resize trips the subclass and we escalate.
 void dxr_prov_set_gameview_rect(int x, int y, int w, int h)
 {
-	(void)x; (void)y; (void)w; (void)h;
+	if (w <= 0 || h <= 0 || !s_ps.overlay_hwnd) return;
+	static int s_track = -1;      // -1 unknown, 0 off, 1 move+resize, 2 move-only
+	if (s_track < 0) {
+		const char *e = getenv("DISPLAYXR_PROV_GV_TRACK");
+		s_track = (e && e[0]) ? (e[0] == 'm' ? 2 : (atoi(e) == 1 ? 1 : 0)) : 0;
+	}
+	if (s_track == 0) return; // default: no-op (born-once, #727-safe)
+
+	// Seed the last-rect from the BORN rect so a docked steady state (incoming == born) never
+	// fires a spurious SetWindowPos — only a genuine move/resize away from born touches the HWND.
+	static int s_have_last = 0, lx = 0, ly = 0, lw = 0, lh = 0;
+	if (!s_have_last) { s_have_last = 1; lx = s_init_gv_x; ly = s_init_gv_y; lw = s_init_gv_w; lh = s_init_gv_h; }
+	if (x == lx && y == ly && w == lw && h == lh) return; // only on actual change from born/last
+	lx = x; ly = y; lw = w; lh = h;
+
+	UINT flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER; // NO SWP_FRAMECHANGED
+	if (s_track == 2) flags |= SWP_NOSIZE; // move only
+	SetWindowPos((HWND)s_ps.overlay_hwnd, NULL, x, y, w, h, flags);
+	ps_log("[DisplayXR-PROV] gameview window track (%s): (%d,%d) %dx%d\n",
+	       s_track == 2 ? "move" : "move+resize", x, y, w, h);
 }
 
 // Transparent-background request (#166 Phase A). Set from C# BEFORE the session
@@ -4166,6 +4194,29 @@ int dxr_prov_submit_frame(uint32_t image_index)
 	if (d11_diag) ps_log("[DisplayXR-PROV] D3D11 submit[%u]: post-xrEndFrame r=%d\n", d11_frames, r);
 	if (s_ps.graphics_api == DXR_GFX_D3D11 && d11_frames < 100000) d11_frames++;
 	if (XR_FAILED(r)) { ps_log("[DisplayXR-PROV] xrEndFrame failed: %d\n", r); return 0; }
+
+	// Weave-to-texture PROBE: ON-DEMAND readback of the runtime-woven shared texture.
+	// Touch %TEMP%\displayxr_woven_trigger to dump the CURRENT woven output (any frame,
+	// e.g. while the Game tab is maximized) → displayxr_prov_woven_ondemand.bmp. Lets us
+	// FFT the interlace phase top-vs-bottom to localize the maximize seam. Own-device,
+	// coherent (same path as the one-shot below).
+	if (s_probe_enabled && s_probe_handle) {
+		const char *tmp = getenv("TEMP"); if (!tmp || !*tmp) tmp = ".";
+		char trig[512];
+		_snprintf_s(trig, sizeof(trig), _TRUNCATE, "%s\\displayxr_woven_trigger", tmp);
+		if (GetFileAttributesA(trig) != INVALID_FILE_ATTRIBUTES) {
+			DeleteFileA(trig);
+			char opath[512];
+			_snprintf_s(opath, sizeof(opath), _TRUNCATE, "%s\\displayxr_prov_woven_ondemand.bmp", tmp);
+			if (s_ps.graphics_api == DXR_GFX_D3D11) {
+				ID3D11Device *dev = s_ps.d3d11_bridge ? s_ps.own_d3d11_device : s_ps.unity_d3d11_device;
+				ID3D11DeviceContext *ctx = s_ps.d3d11_bridge ? s_ps.own_d3d11_context : s_ps.unity_d3d11_context;
+				ps_probe_dump_d3d11(dev, ctx, s_probe_tex11, opath);
+			} else {
+				ps_probe_dump_d3d12(opath);
+			}
+		}
+	}
 
 	// Weave-to-texture PROBE: one-shot readback of the runtime-woven shared texture
 	// after the warmup gate. The runtime wove into it during xrEndFrame above.
