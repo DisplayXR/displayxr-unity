@@ -36,13 +36,13 @@ Unity plugin for rendering on eye-tracked 3D light field displays via the Displa
 
 DisplayXR ships as a custom **Unity display provider** (`IUnityXRDisplay`, the same integration route as Oculus/Varjo/Cardboard) that drives the DisplayXR OpenXR runtime directly while Unity keeps rendering the scene. It provides:
 
-- **Eye-tracked stereo rendering** — runtime-owned Kooima asymmetric frustum projection from real-time eye positions (`XR_EXT_view_rig`)
+- **Eye-tracked stereo rendering** — runtime-owned Kooima asymmetric frustum projection from real-time eye positions (`XR_DXR_view_rig`)
 - **Two stereo rig modes** — Camera-centric (add to existing camera) or display-centric (place a virtual display in the scene)
 - **2D/3D display zones + 2D UI overlay** — frame 3D content to window-pixel zones and route any Canvas to a window-space composition layer with stereo disparity
 - **BiRP, URP, and HDRP** — off-axis projection on all three pipelines (the provider hands Unity a full per-eye projection matrix, so no per-pipeline fix is needed), plus Single-Pass-Instanced (SPI) on URP+Windows+D3D12 and Multi-Pass elsewhere
 - **In-editor Play Mode preview** — pressing Play runs the provider itself, giving full parity with built apps (#171). Play Mode *is* the preview — there is no separate edit-mode preview window.
 
-**How it works:** the provider registers a `DisplayXR Display` display subsystem, binds an OpenXR session to Unity's graphics device, chains the runtime's `XR_EXT_view_rig` descriptor onto `xrLocateViews`, and submits Unity's rendered eye textures back to the runtime compositor via `xrEndFrame`. Enable it under **XR Plug-in Management > Standalone > DisplayXR Display** (see [Enabling the Feature](#enabling-the-feature)). See [`docs~/architecture/xr-display-provider.md`](docs~/architecture/xr-display-provider.md) for the full provider design.
+**How it works:** the provider registers a `DisplayXR Display` display subsystem, binds an OpenXR session to Unity's graphics device, chains the runtime's `XR_DXR_view_rig` descriptor onto `xrLocateViews`, and submits Unity's rendered eye textures back to the runtime compositor via `xrEndFrame`. Enable it under **XR Plug-in Management > Standalone > DisplayXR Display** (see [Enabling the Feature](#enabling-the-feature)). See [`docs~/architecture/xr-display-provider.md`](docs~/architecture/xr-display-provider.md) for the full provider design.
 
 ---
 
@@ -262,7 +262,7 @@ Route a Canvas to a window-space composition layer that the DisplayXR compositor
 | Disparity | 0.0 | Stereo disparity in pixels. 0 = at screen plane, positive = in front |
 | Resolution | 512 | Render texture resolution (square) |
 
-The overlay is submitted as `XrCompositionLayerWindowSpaceEXT` and composited by DisplayXR before display processing. This means 2D UI text stays sharp and is not interlaced — ideal for HUDs, menus, and status displays.
+The overlay is submitted as `XrCompositionLayerWindowSpaceDXR` and composited by DisplayXR before display processing. This means 2D UI text stays sharp and is not interlaced — ideal for HUDs, menus, and status displays.
 
 ---
 
@@ -450,7 +450,7 @@ With the provider active, the **DisplayXRCamera / DisplayXRDisplay inspectors** 
 DisplayXR ships as a custom **`IUnityXRDisplay` display provider** (the shipping path). The provider
 registers a `DisplayXR Display` subsystem, owns an OpenXR session on Unity's graphics device, and hands
 Unity's rendered eye textures to the runtime compositor — Unity keeps rendering the scene (BiRP/URP/HDRP,
-SPI/Multi-Pass), the runtime owns the Kooima math (`XR_EXT_view_rig`).
+SPI/Multi-Pass), the runtime owns the Kooima math (`XR_DXR_view_rig`).
 
 ```
 Unity Editor / Player
@@ -473,7 +473,7 @@ Unity Editor / Player
 │  Native Plugin (C/C++)                                   │
 │  Display provider (IUnityXRDisplay):                     │
 │    session on Unity's device → render params (SPI/MP)   │
-│    xrLocateViews → chain XR_EXT_view_rig descriptor     │
+│    xrLocateViews → chain XR_DXR_view_rig descriptor     │
 │    xrEndFrame → submit projection + zone + 2D layers    │
 └──────────────────────────────────────────────────────────┘
         │ Standard OpenXR API

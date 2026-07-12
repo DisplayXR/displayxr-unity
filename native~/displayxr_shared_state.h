@@ -66,7 +66,7 @@ typedef struct DisplayXREyePositions {
 } DisplayXREyePositions;
 
 // --- Kooima canvas (#189) — the window as the runtime frames Kooima into it ---
-// The XR_EXT_view_rig raw channel (XrViewDisplayRawEXT) reports the effective
+// The XR_DXR_view_rig raw channel (XrViewDisplayRawDXR) reports the effective
 // canvas the runtime uses for the window-relative off-axis projection each
 // frame: its rect ON THE PANEL (panel pixels, top-left origin) and its physical
 // size (meters). The provider publishes it so the editor Scene-view gizmo can
@@ -97,7 +97,7 @@ typedef struct DisplayXRStereoMatrices {
 // --- Window-space layer descriptor ---
 // Vestigial: formerly filled by the OpenXR-hook path's wsui pre-end-frame and
 // consumed in hooked_xrEndFrame. That path was removed in the Task-3 hook-backend
-// cleanup (#166); the provider builds its own XrCompositionLayerWindowSpaceEXT in
+// cleanup (#166); the provider builds its own XrCompositionLayerWindowSpaceDXR in
 // displayxr_provider_session.cpp (ps_submit_wsui). Retained for a possible future
 // follow-up removal (see the epic plan) — no live reader/writer today.
 
@@ -116,7 +116,7 @@ typedef struct DisplayXRWindowLayer {
 // client-window PIXEL rect, composited "glass over 3D" via the runtime's
 // implicit mask. Vestigial like DisplayXRWindowLayer above: formerly filled by
 // the removed hook path; the provider now submits its own
-// XrCompositionLayerLocal2DEXT (ps_submit_local2d). Retained pending a future
+// XrCompositionLayerLocal2DDXR (ps_submit_local2d). Retained pending a future
 // follow-up removal.
 typedef struct DisplayXRLocal2DLayer {
     XrSwapchain swapchain;      // Overlay swapchain handle
@@ -168,7 +168,7 @@ typedef struct DisplayXRState {
 
     // Transparent background opt-in (issue runtime-pvt #191, displayxr-unity#57).
     // Set from C# at SubsystemRegistration before xrCreateSession; consumed
-    // when constructing XrWin32WindowBindingCreateInfoEXT to request the
+    // when constructing XrWin32WindowBindingCreateInfoDXR to request the
     // runtime's BitBlt (D3D11) or DComp (D3D12) swapchain path.
     uint8_t transparent_background_requested;
 
@@ -200,7 +200,7 @@ typedef struct DisplayXRState {
     uint8_t has_display_mode_ext;
 
     // Function pointers for display mode switching
-    PFN_xrRequestDisplayModeEXT pfn_request_display_mode;
+    PFN_xrRequestDisplayModeDXR pfn_request_display_mode;
 } DisplayXRState;
 
 // Get the global shared state singleton.

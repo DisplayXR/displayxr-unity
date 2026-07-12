@@ -24,7 +24,7 @@ namespace DisplayXR
         private const string LibName = "displayxr_unity";
 
         /// <summary>
-        /// Get display info queried from runtime via XR_EXT_display_info.
+        /// Get display info queried from runtime via XR_DXR_display_info.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern void displayxr_get_display_info(
@@ -51,8 +51,8 @@ namespace DisplayXR
         /// <summary>
         /// (runtime-pvt #191 / displayxr-unity #57) Request the runtime's
         /// transparent-background mode for the next OpenXR session. Sets
-        /// transparentBackgroundEnabled on XrWin32WindowBindingCreateInfoEXT
-        /// (XR_EXT_win32_window_binding spec_version 4) so the runtime opts the
+        /// transparentBackgroundEnabled on XrWin32WindowBindingCreateInfoDXR
+        /// (XR_DXR_win32_window_binding spec_version 4) so the runtime opts the
         /// bound HWND's swapchain into BitBlt (D3D11) or DComp (D3D12)
         /// presentation.
         ///
@@ -89,7 +89,7 @@ namespace DisplayXR
         /// off-axis projection into: its rect ON THE PANEL (panel pixels,
         /// top-left origin) and its physical size (meters). Returns 1 and fills
         /// the out params when valid; returns 0 otherwise. Published each frame
-        /// by the provider from the XR_EXT_view_rig raw channel; used by the
+        /// by the provider from the XR_DXR_view_rig raw channel; used by the
         /// editor Scene-view eye gizmo to draw window-relative eyes + the
         /// convergence-plane aspect Kooima consumes.
         /// </summary>
@@ -205,7 +205,7 @@ namespace DisplayXR
         // ====================================================================
         // Window-space UI overlay (issue #67)
         //
-        // Routes a Canvas RenderTexture to a XrCompositionLayerWindowSpaceEXT
+        // Routes a Canvas RenderTexture to a XrCompositionLayerWindowSpaceDXR
         // composition layer. The native side mirrors the Unity texture into
         // an OpenXR overlay swapchain each frame; the runtime composites it
         // on top of the eye projection.
@@ -235,7 +235,7 @@ namespace DisplayXR
 
         // ====================================================================
         // Local2D overlay (#439/#491) — modern mask-based 2D-over-3D layer
-        // (XrCompositionLayerLocal2DEXT, "glass over 3D"). Replaces the legacy
+        // (XrCompositionLayerLocal2DDXR, "glass over 3D"). Replaces the legacy
         // 2D-surround handoff for in-canvas 2D content (e.g. a speech bubble).
         // ====================================================================
 
@@ -250,7 +250,7 @@ namespace DisplayXR
 
         /// <summary>
         /// Set the destination rect in client-window PIXELS (post-DPI) — the
-        /// XrCompositionLayerLocal2DEXT::rect / mask-tier coordinate space.
+        /// XrCompositionLayerLocal2DDXR::rect / mask-tier coordinate space.
         /// Cheap; safe to call every frame.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]

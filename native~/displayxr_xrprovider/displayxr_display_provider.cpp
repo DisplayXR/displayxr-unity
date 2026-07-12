@@ -1049,7 +1049,7 @@ LifecycleStart(UnitySubsystemHandle handle, void *userData)
 	// thread, deadlocks: the input queues join while the main thread waits on
 	// GfxStart.) GfxStart binds the runtime to s_overlay_hwnd.
 #ifndef _WIN32
-	// macOS: bind the runtime's weave to an NSView (via XrCocoaWindowBindingCreateInfoEXT).
+	// macOS: bind the runtime's weave to an NSView (via XrCocoaWindowBindingCreateInfoDXR).
 	// Two shapes, both on the MAIN thread (AppKit windows can't be created off-main; and
 	// the runtime's own self-host NSWindow-create inside xrCreateSession — GfxStart =
 	// render thread while the main thread blocks in GfxStart — deadlocks; the macOS

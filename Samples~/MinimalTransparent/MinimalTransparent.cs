@@ -20,7 +20,7 @@ namespace DisplayXR.Samples
         // PHASE 1: BEFORE xrCreateSession.
         // SubsystemRegistration runs earlier than the OpenXR loader's session
         // creation, so the runtime sees the transparent-background flag when
-        // constructing XrWin32WindowBindingCreateInfoEXT. OnEnable on a scene
+        // constructing XrWin32WindowBindingCreateInfoDXR. OnEnable on a scene
         // component would be too late — the session is already up.
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
         static void Bootstrap()

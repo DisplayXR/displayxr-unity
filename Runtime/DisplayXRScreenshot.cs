@@ -19,12 +19,12 @@ namespace DisplayXR
     /// visual feedback.
     ///
     /// As of #140 (W6 of #396) the capture is runtime-owned: a live session calls
-    /// <c>xrCaptureAtlasEXT</c> (XR_EXT_atlas_capture) via
+    /// <c>xrCaptureAtlasDXR</c> (XR_DXR_atlas_capture) via
     /// <see cref="DisplayXRProvider.CaptureAtlas"/>, the runtime reads back the
     /// compositor's own atlas image and writes the PNG. The plugin no longer does
     /// an app-side <c>AsyncGPUReadback</c> or a hidden-camera Kooima re-render.
     ///
-    /// A live provider session supplies a path prefix to xrCaptureAtlasEXT and the
+    /// A live provider session supplies a path prefix to xrCaptureAtlasDXR and the
     /// runtime writes the PNG on its next composed frame.
     ///
     /// Bind <see cref="Capture"/> to any developer-chosen event (key, button,
@@ -56,7 +56,7 @@ namespace DisplayXR
 
         // Frames to wait after issuing a live (runtime-owned) capture before
         // starting the feedback flash. The flash draws into the same eye buffers
-        // the runtime composites for xrCaptureAtlasEXT, and the runtime grabs its
+        // the runtime composites for xrCaptureAtlasDXR, and the runtime grabs its
         // next composed frame — so starting the flash immediately whites out the
         // saved atlas. Delaying it a few frames lets the clean atlas be captured
         // first.
@@ -79,7 +79,7 @@ namespace DisplayXR
 
         /// <summary>
         /// Request a screenshot. The capture is requested from the runtime via
-        /// xrCaptureAtlasEXT — the runtime reads back its own composited atlas and
+        /// xrCaptureAtlasDXR — the runtime reads back its own composited atlas and
         /// writes the PNG on the next composed frame.
         /// </summary>
         public static void Capture()
@@ -89,13 +89,13 @@ namespace DisplayXR
         }
 
         // ================================================================
-        // Live OpenXR session: runtime-owned capture via xrCaptureAtlasEXT
+        // Live OpenXR session: runtime-owned capture via xrCaptureAtlasDXR
         // ================================================================
 
         private static void CaptureLive()
         {
             // The custom display Provider (epic #166) fulfils the capture runtime-side
-            // via xrCaptureAtlasEXT.
+            // via xrCaptureAtlasDXR.
 
             // Built-app stereo is two-view (Unity SetStereoViewMatrix L/R); this
             // matches the cols x rows the runtime composes for a standard 3D mode.
@@ -131,8 +131,8 @@ namespace DisplayXR
             bool ok = DisplayXRProvider.CaptureAtlas(prefix, projectionOnly: true);
             if (!ok)
             {
-                Fail("xrCaptureAtlasEXT unavailable or rejected the request "
-                     + "(runtime missing XR_EXT_atlas_capture or no live session)");
+                Fail("xrCaptureAtlasDXR unavailable or rejected the request "
+                     + "(runtime missing XR_DXR_atlas_capture or no live session)");
                 return;
             }
 

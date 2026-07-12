@@ -43,15 +43,15 @@ Raw CMake (`cd native~ && mkdir build && cd build && cmake .. -DCMAKE_BUILD_TYPE
 
 1. **Runtime (C#)** — the **`IUnityXRDisplay` display provider** (`Runtime/Provider/`): `DisplayXRDisplayLoader` is the XR-Management loader/subsystem, `DisplayXRProvider` is the app-facing facade, `DisplayXRProviderDriver` runs the per-frame pump. `DisplayXRCamera.cs` and `DisplayXRDisplay.cs` are the two stereo rig modes; `DisplayXRRigManager.cs` coordinates multi-camera scenes.
 2. **Editor (C#)** — Custom inspectors and the settings/XR-Management page. (No standalone preview system — Play Mode runs the provider directly.)
-3. **Native (C/C++)** — the display provider (`native~/displayxr_xrprovider/`): opens the OpenXR session on **Unity's D3D12 device**, creates an `arraySize=2` swapchain (SPI or MultiPass), chains the runtime's view-rig descriptor (`XR_EXT_view_rig`) onto `xrLocateViews` and consumes render-ready `XrView{pose, fov}` — the runtime owns the Kooima math — and submits via `xrEndFrame`. The win32 overlay, wsui composition layer, and Local2D paths survive alongside it; thread-safe shared state. The SA render-to-atlas core (`displayxr_standalone*`) is kept on disk but **not compiled** (dormant), reserved as the seed for a future many-view "quilt" render path (see `docs~/adr/ADR-007-render-path-by-view-count.md`).
+3. **Native (C/C++)** — the display provider (`native~/displayxr_xrprovider/`): opens the OpenXR session on **Unity's D3D12 device**, creates an `arraySize=2` swapchain (SPI or MultiPass), chains the runtime's view-rig descriptor (`XR_DXR_view_rig`) onto `xrLocateViews` and consumes render-ready `XrView{pose, fov}` — the runtime owns the Kooima math — and submits via `xrEndFrame`. The win32 overlay, wsui composition layer, and Local2D paths survive alongside it; thread-safe shared state. The SA render-to-atlas core (`displayxr_standalone*`) is kept on disk but **not compiled** (dormant), reserved as the seed for a future many-view "quilt" render path (see `docs~/adr/ADR-007-render-path-by-view-count.md`).
 
 ### Key Features
 
 - **Two stereo rig modes**: Camera-centric (`DisplayXRCamera` — inherits camera FOV, inv. convergence distance tunable) and display-centric (`DisplayXRDisplay` — physical display geometry, virtual display height, scale-as-zoom)
 - **Multi-camera support**: Multiple rigs coexist in one scene; `DisplayXRRigManager` coordinates which rig is active (see below)
 - **Play Mode == built app**: the `IUnityXRDisplay` provider runs identically in-editor and in a built player. Pressing Play *is* the preview — there is no separate preview window.
-- **2D UI overlay**: Canvas → `XrCompositionLayerWindowSpaceEXT` with stereo disparity
-- **Runtime-owned Kooima math (`XR_EXT_view_rig`, #396 W7)**: the plugin no longer computes Kooima. It chains an `XrDisplayRigEXT`/`XrCameraRigEXT` descriptor (the handful of tunables) onto `xrLocateViews` and consumes render-ready `XrView{pose, fov}` in the provider's per-frame pump (Play Mode and built player alike). **This requires a runtime that advertises `XR_EXT_view_rig` (SPEC_VERSION 2)**; against an older runtime the plugin emits a one-shot WARN and passes raw views through (no stereo). The former vendored/`displayxr::math` display3d/camera3d math is gone (do not re-add — see the `no-vendored-math` drift guard).
+- **2D UI overlay**: Canvas → `XrCompositionLayerWindowSpaceDXR` with stereo disparity
+- **Runtime-owned Kooima math (`XR_DXR_view_rig`, #396 W7)**: the plugin no longer computes Kooima. It chains an `XrDisplayRigDXR`/`XrCameraRigDXR` descriptor (the handful of tunables) onto `xrLocateViews` and consumes render-ready `XrView{pose, fov}` in the provider's per-frame pump (Play Mode and built player alike). **This requires a runtime that advertises `XR_DXR_view_rig` (SPEC_VERSION 2)**; against an older runtime the plugin emits a one-shot WARN and passes raw views through (no stereo). The former vendored/`displayxr::math` display3d/camera3d math is gone (do not re-add — see the `no-vendored-math` drift guard).
 
 ### Render Pipeline Support (BiRP / URP / HDRP)
 
@@ -149,7 +149,7 @@ Scenes can contain multiple cameras with different rig types (display-centric, c
 
 ### OpenXR path: the display provider
 
-The plugin drives OpenXR through the custom `IUnityXRDisplay` provider (`native~/displayxr_xrprovider/`) — it is the **sole** backend. The provider opens the session on Unity's D3D12 device, drives an `arraySize=2` swapchain (SPI/MultiPass), chains `XR_EXT_view_rig` onto `xrLocateViews` for runtime-owned Kooima, downgrades sRGB→UNORM swapchains in Gamma-space projects (so output isn't double-gamma-encoded), and submits overlay/wsui composition layers via `xrEndFrame`.
+The plugin drives OpenXR through the custom `IUnityXRDisplay` provider (`native~/displayxr_xrprovider/`) — it is the **sole** backend. The provider opens the session on Unity's D3D12 device, drives an `arraySize=2` swapchain (SPI/MultiPass), chains `XR_DXR_view_rig` onto `xrLocateViews` for runtime-owned Kooima, downgrades sRGB→UNORM swapchains in Gamma-space projects (so output isn't double-gamma-encoded), and submits overlay/wsui composition layers via `xrEndFrame`.
 
 > **The legacy OpenXR API-layer hook (`DisplayXRFeature` + `displayxr_hooks.cpp`) and the standalone (SA) editor-preview session/window were hard-removed in #166.** The provider replaced them. See `docs~/architecture/xr-display-provider.md`. Renamed native headers: `displayxr_hooks.h`→`displayxr_exports.h`, `displayxr_hooks_internal.h`→`displayxr_backend.h`; re-homed glue lives in `displayxr_native_shared.cpp`.
 
@@ -315,7 +315,7 @@ now archived and redirect here.)
 | `samples/birp-multipass` | Baseline rendering / stereo correctness (**BiRP**, multi-pass) | Plain cube + camera-centric and display-centric rigs |
 | `samples/urp-singlepass-ui` | 2D UI window-space composition layer (**URP**, single-pass) | Tuning panel built from `DisplayXRWindowSpaceUI` |
 | `samples/hdrp-singlepass-ui` | Off-axis correctness on **HDRP** (single-pass) | Textured crate; HDRP consumes the provider's projection matrix natively (no fix feature) |
-| `samples/desktop-avatar` | Desktop avatar showcase (**URP**): alpha-native transparency, click-through, per-eye foreground clip, `XR_EXT_display_zones` + Local2D bubble | Tiger FBX (Git LFS), foreground-only render |
+| `samples/desktop-avatar` | Desktop avatar showcase (**URP**): alpha-native transparency, click-through, per-eye foreground clip, `XR_DXR_display_zones` + Local2D bubble | Tiger FBX (Git LFS), foreground-only render |
 
 All pin the plugin via `https://github.com/DisplayXR/displayxr-unity.git#upm/vX.Y.Z`.
 

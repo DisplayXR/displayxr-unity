@@ -12,7 +12,7 @@
 
 #include <openxr/openxr.h>
 
-// XR_EXT_view_rig (#396 W7): the SA session delegates Kooima to the runtime, so it
+// XR_DXR_view_rig (#396 W7): the SA session delegates Kooima to the runtime, so it
 // no longer links displayxr::math. These local containers replace the former
 // Display3DTunables / Display3DView (data only — no math).
 typedef struct SaTunables {
