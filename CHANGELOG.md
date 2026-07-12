@@ -5,6 +5,14 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.0] - 2026-07-12
+- 6acc285 feat!: rename DisplayXR extensions XR_EXT_* -> XR_DXR_* (DisplayXR/displayxr-runtime#734)
+- 85d3afb chore: bump package.json version to 2.4.0 to match released v2.4.0 tag
+- 5287e39 Provider: Metal Local2D + extra 3D display-zones composition layers (#206)
+- f9c4b88 Release v2.4.0
+- a5138d4 docs: point samples at the displayxr-unity-samples monorepo
+- 1f50a08 ci: docs_only short-circuit for empty/marker pushes
+
 ## [2.3.2] - 2026-07-07
 
 ### Added
