@@ -199,12 +199,15 @@ DISPLAYXR_EXPORT int  dxr_prov_get_single_pass(void);
 DISPLAYXR_EXPORT void dxr_prov_set_dedicated_window(int enable);
 DISPLAYXR_EXPORT int  dxr_prov_get_dedicated_window(void);
 
-/// Glue-to-GameView (Task (a), editor + texture probe): reposition the dedicated
-/// weave window so its client rect exactly covers the Unity Game view's on-screen
-/// region, so window-relative Kooima + the weaver's lenticular phase track where the
-/// mirror-blit actually shows the woven output. Strips the window chrome + topmost
-/// and parks it behind the editor (occluded). Called each frame from C#; x,y = screen
-/// px (top-left origin), w,h = Game view size in px. w<=0||h<=0 is ignored. Windows-only.
+/// Glue-to-GameView follow (editor + texture probe, #727 follow-up): move+resize the
+/// dedicated weave window so its client rect keeps covering the Unity Game view's
+/// on-screen region as it moves/resizes/docks, so window-relative Kooima + the weaver's
+/// lenticular phase track where the mirror-blit shows the woven output. DEFAULT ON;
+/// env DISPLAYXR_PROV_GV_TRACK=0 disables (born-once), =move for move-only. Plain
+/// SetWindowPos on change only — never SWP_FRAMECHANGED (#727 mono collapse) — with a
+/// #61 WM_ENTERSIZEMOVE/WM_EXITSIZEMOVE bracket around move bursts so the weaver
+/// phase-snaps. Called each frame from C#; x,y = screen px (top-left origin),
+/// w,h = Game view size in px. w<=0||h<=0 is ignored. Windows-only.
 DISPLAYXR_EXPORT void dxr_prov_set_gameview_rect(int x, int y, int w, int h);
 
 /// Initial GameView render rect (Task (a) fill): stash the Game view's render-area

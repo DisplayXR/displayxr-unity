@@ -524,6 +524,77 @@ namespace DisplayXR
             if (sig != s_lastGeomSig) { s_lastGeomSig = sig; Debug.Log("[DisplayXR] GVGEOM " + sig); }
         }
 
+        // Docked-layout glue POSITION correction (#727 f-up, task 0B). In a DOCKED layout
+        // `m_Parent.screenPosition × ppp` is NOT the true screen rect — the docked HostView
+        // chain carries a border/coordinate-space discrepancy (measured 13 px in x at ppp 2.5)
+        // — so the weave window was glued off the displayed pixels → a constant lenticular
+        // phase error that changes as the editor window moves. Floating and maximized match
+        // exactly. Win32 is the truth: find this process's visible HWND whose window rect
+        // best matches the expected host rect (the GUIView swapchain child window, same
+        // matcher GVGEOM validated) and take POSITION from it; SIZE stays mainSize-derived.
+        // The enumeration reruns only when the reflection-derived host rect changes (a
+        // steady layout costs nothing; a drag re-reads the moving truth each frame).
+        static Rect   s_hwndCorrHostKey;
+        static float  s_hwndCorrPppKey;
+        static bool   s_hwndCorrValid;
+        static int    s_hwndCorrX, s_hwndCorrY;
+        static string s_lastHwndCorrLog;
+
+        static void ApplyWin32HostPositionCorrection(Rect host, float ppp, int toolbar,
+                                                     ref int rx, ref int ry)
+        {
+            if (Application.platform != RuntimePlatform.WindowsEditor) return;
+            if (host != s_hwndCorrHostKey || ppp != s_hwndCorrPppKey)
+            {
+                s_hwndCorrHostKey = host; s_hwndCorrPppKey = ppp;
+                s_hwndCorrValid = false;
+                float exX = host.x * ppp, exY = host.y * ppp;
+                float exW = host.width * ppp, exH = host.height * ppp;
+                float bestScore = float.MaxValue; Win32Rect bestWr = default; string bestCls = null;
+                uint myPid = (uint)System.Diagnostics.Process.GetCurrentProcess().Id;
+                Win32EnumProc collect = (h, l) =>
+                {
+                    if (!IsWindowVisible(h)) return true;
+                    var nameSb = new System.Text.StringBuilder(64);
+                    GetClassName(h, nameSb, 64);
+                    string cls = nameSb.ToString();
+                    // Never match our own weave window (it is glued to this very rect).
+                    if (cls.StartsWith("DisplayXR")) return true;
+                    GetWindowRect(h, out var wr);
+                    float score = Mathf.Abs(wr.left - exX) + Mathf.Abs(wr.top - exY)
+                                + Mathf.Abs((wr.right - wr.left) - exW)
+                                + Mathf.Abs((wr.bottom - wr.top) - exH);
+                    if (score < bestScore) { bestScore = score; bestWr = wr; bestCls = cls; }
+                    return true;
+                };
+                Win32EnumProc top = (h, l) =>
+                {
+                    GetWindowThreadProcessId(h, out uint pid);
+                    if (pid != myPid) return true;
+                    collect(h, l);
+                    EnumChildWindows(h, collect, System.IntPtr.Zero);
+                    return true;
+                };
+                try { EnumWindows(top, System.IntPtr.Zero); } catch { return; }
+                // Accept only an unambiguous near match — the docked discrepancy is ~13 px;
+                // anything further off is a different panel, so keep the reflection rect.
+                if (bestCls != null && bestScore < 150f)
+                {
+                    s_hwndCorrValid = true;
+                    s_hwndCorrX = bestWr.left; s_hwndCorrY = bestWr.top;
+                    string log = $"hwnd[{bestCls}]=({bestWr.left},{bestWr.top}) " +
+                                 $"reflected=({exX:F0},{exY:F0}) score={bestScore:F1}";
+                    if (log != s_lastHwndCorrLog)
+                    { s_lastHwndCorrLog = log; Debug.Log("[DisplayXR] GameView glue Win32 position: " + log); }
+                }
+            }
+            if (s_hwndCorrValid)
+            {
+                rx = Mathf.Max(0, s_hwndCorrX);
+                ry = Mathf.Max(0, s_hwndCorrY + toolbar);
+            }
+        }
+
         // Compute the visible Game view's RENDER-area rect in physical px. SIZE comes from
         // Unity's own GetMainGameViewTargetSize() (the render-target pixel size it uses to
         // allocate the main Game view — one stable value, no instance juggling). POSITION
@@ -637,6 +708,7 @@ namespace DisplayXR
             }
             rx = Mathf.Max(0, Mathf.RoundToInt(host.x * ppp));
             ry = Mathf.Max(0, Mathf.RoundToInt(host.y * ppp) + toolbar);
+            ApplyWin32HostPositionCorrection(host, ppp, toolbar, ref rx, ref ry);
 
             // Sanity: reject implausible SIZE readings (transient 0x0 during a play/layout
             // transition) and reuse the last-good rect so the zone never borns wrong-size.

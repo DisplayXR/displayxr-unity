@@ -3136,34 +3136,47 @@ int dxr_prov_get_initial_gameview_rect(int *x, int *y, int *w, int *h)
 
 // The dedicated weave window is BORN WS_POPUP at the Game-view rect
 // (dxr_prov_set_initial_gameview_rect, before session start). It must NOT be
-// repositioned or restyled while the Dimenco SR weaver is live: any
-// SetWindowPos(..., SWP_FRAMECHANGED) on the bound HWND fires a WM_NCCALCSIZE that
-// trips the weaver's WndProc subclass and permanently collapses the weave to a single
-// view (view0) — the "stereo for one frame then flat mono" bug (#727). Root-caused with
-// a fence-synced post-weave / post-composite dual tap: the post-weave stage was already
-// mono, i.e. the weave call itself, and an A/B on this push proved zero window ops = stereo
-// on every frame while a single push = mono from that frame on. So the former per-frame
-// glue push is intentionally a NO-OP; the window stays at its born rect for the session.
-// (Weaver-safe dynamic re-glue for a Game view MOVED/RESIZED mid-session — e.g. pausing the
-// weaver around the move, or a reposition that avoids the frame recalc — is a follow-up.)
+// RESTYLED while the Dimenco SR weaver is live: any SetWindowPos(..., SWP_FRAMECHANGED)
+// on the bound HWND fires a WM_NCCALCSIZE that trips the weaver's WndProc subclass and
+// permanently collapses the weave to a single view (view0) — the "stereo for one frame
+// then flat mono" bug (#727). Root-caused with a fence-synced post-weave/post-composite
+// dual tap + an A/B on this push (zero window ops = stereo every frame; a single
+// SWP_FRAMECHANGED push = mono from that frame on). PLAIN move/resize (no frame recalc)
+// is weaver-safe — proven across dozens of scripted mid-session re-glues — so the
+// follow below moves/resizes on change but never passes SWP_FRAMECHANGED.
 //
-// EXPERIMENT (maximize/resize follow, gated): when the Game tab is maximized/resized the zone
-// grows but the weave window's GetClientRect stays 2198 → the runtime weaves only 2198 (black
-// right/bottom). To follow, the window must move+resize. That is the #727-risky op (a size
-// change sends WM_NCCALCSIZE). Gated so the DEFAULT stays the proven born-once no-op:
-//   DISPLAYXR_PROV_GV_TRACK=1     → move + resize (no SWP_FRAMECHANGED) — the real test
-//   DISPLAYXR_PROV_GV_TRACK=move  → move only (SWP_NOSIZE, no frame recalc) — Phase-2 isolation
-// Verify with the fence-synced dual tap: if the weave stays stereo after a maximize, the op is
-// weaver-safe; if it collapses to mono, the resize trips the subclass and we escalate.
+// GameView follow (DEFAULT ON in texture-probe mode, #727 follow-up): when the Game
+// view moves/resizes (drag, dock/undock, maximize) the weave window follows with a
+// plain move+resize — SWP_FRAMECHANGED is NEVER used (a frame recalc on the SR-weaver-
+// bound HWND permanently collapses the weave to mono, #727); plain move/resize is
+// weaver-proven safe (slice-color captures across dozens of scripted re-glues).
+//   (unset)                       → move + resize follow (default)
+//   DISPLAYXR_PROV_GV_TRACK=0     → off (born-once no-op, the pre-follow behavior)
+//   DISPLAYXR_PROV_GV_TRACK=move  → move only (SWP_NOSIZE) — isolation diagnostic
+//
+// #61 drag bracket: the SR weaver only phase-snaps to lenticular-aligned positions
+// while its WndProc subclass sees the OS in-size-move flag. These follow pushes are
+// silent per-rect-change SetWindowPos calls (no OS modal loop), so the weaver never
+// phase-tracks during a drag of the hosting editor window → 3D stutter. Bracket the
+// burst: WM_ENTERSIZEMOVE before the first follow move, WM_EXITSIZEMOVE once the rect
+// has been stable ~200ms (expiry checked in dxr_prov_set_panel_px, which C# calls
+// every frame on the same thread). Messages only — no restyle → weaver-safe per #61.
+static int s_gv_track_in_bracket = 0;
+static ULONGLONG s_gv_track_last_move_tick = 0;
+#define GV_TRACK_BRACKET_SETTLE_MS 200
+
 void dxr_prov_set_gameview_rect(int x, int y, int w, int h)
 {
 	if (w <= 0 || h <= 0 || !s_ps.overlay_hwnd) return;
 	static int s_track = -1;      // -1 unknown, 0 off, 1 move+resize, 2 move-only
 	if (s_track < 0) {
 		const char *e = getenv("DISPLAYXR_PROV_GV_TRACK");
-		s_track = (e && e[0]) ? (e[0] == 'm' ? 2 : (atoi(e) == 1 ? 1 : 0)) : 0;
+		s_track = (e && e[0]) ? (e[0] == 'm' ? 2 : (atoi(e) == 1 ? 1 : 0)) : 1;
+		ps_log("[DisplayXR-PROV] gameview track mode: %s%s\n",
+		       s_track == 0 ? "OFF" : s_track == 2 ? "move-only" : "move+resize",
+		       (e && e[0]) ? " (env)" : " (default)");
 	}
-	if (s_track == 0) return; // default: no-op (born-once, #727-safe)
+	if (s_track == 0) return; // env off-switch: born-once no-op (#727-safe baseline)
 
 	// Seed the last-rect from the BORN rect so a docked steady state (incoming == born) never
 	// fires a spurious SetWindowPos — only a genuine move/resize away from born touches the HWND.
@@ -3171,6 +3184,12 @@ void dxr_prov_set_gameview_rect(int x, int y, int w, int h)
 	if (!s_have_last) { s_have_last = 1; lx = s_init_gv_x; ly = s_init_gv_y; lw = s_init_gv_w; lh = s_init_gv_h; }
 	if (x == lx && y == ly && w == lw && h == lh) return; // only on actual change from born/last
 	lx = x; ly = y; lw = w; lh = h;
+
+	if (!s_gv_track_in_bracket) {
+		s_gv_track_in_bracket = 1;
+		SendMessageW((HWND)s_ps.overlay_hwnd, WM_ENTERSIZEMOVE, 0, 0); // #61 phase-snap bracket
+	}
+	s_gv_track_last_move_tick = GetTickCount64();
 
 	UINT flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER; // NO SWP_FRAMECHANGED
 	if (s_track == 2) flags |= SWP_NOSIZE; // move only
@@ -3236,6 +3255,17 @@ void dxr_prov_set_panel_px(int w, int h)
 {
 	s_gv_panel_w = (w > 0) ? w : 0;
 	s_gv_panel_h = (h > 0) ? h : 0;
+
+	// #61 drag-bracket close (see dxr_prov_set_gameview_rect): C# calls this every
+	// frame on the same thread as the follow pushes, so it doubles as the burst-end
+	// tick — once the glue rect has been stable GV_TRACK_BRACKET_SETTLE_MS, send
+	// WM_EXITSIZEMOVE so the weaver's subclass leaves in-drag state and phase-snaps.
+	if (s_gv_track_in_bracket && s_ps.overlay_hwnd &&
+	    GetTickCount64() - s_gv_track_last_move_tick >= GV_TRACK_BRACKET_SETTLE_MS) {
+		s_gv_track_in_bracket = 0;
+		SendMessageW((HWND)s_ps.overlay_hwnd, WM_EXITSIZEMOVE, 0, 0);
+		ps_log("[DisplayXR-PROV] gameview track: settle -> WM_EXITSIZEMOVE (phase-snap)\n");
+	}
 }
 
 // Called from the per-frame pump BEFORE dxr_prov_reconcile_size. If the published panel
