@@ -231,12 +231,12 @@ typedef struct ProviderSession {
 
 	int has_view_rig;
 
-	// XR_EXT_atlas_capture (#140): app-facing atlas screenshot (the 'I' key /
+	// XR_DXR_atlas_capture (#140): app-facing atlas screenshot (the 'I' key /
 	// DisplayXRScreenshot). Detected in the probe, enabled on the instance, PFN
 	// soft-resolved. Re-derived each session create — no reset preservation needed.
 	int has_atlas_capture;
 
-	// XR_EXT_display_zones + XR_EXT_local_3d_zone (#166 Phase B). Detected in
+	// XR_DXR_display_zones + XR_DXR_local_3d_zone (#166 Phase B). Detected in
 	// session_start (probe) and enabled on the instance. Caps queried lazily on the
 	// first frame a zone rect is set (needs a live session). zone_caps_ok: -1 untried,
 	// 0 unsupported, 1 supported (maxZones3D>=1).
@@ -244,11 +244,11 @@ typedef struct ProviderSession {
 	int has_local_3d_zone;
 	int zone_caps_ok;
 	uint32_t zone_max_3d;
-	PFN_xrGetDisplayZoneCapabilitiesEXT       pfn_get_zone_caps;
-	PFN_xrGetDisplayZoneRecommendedViewSizeEXT pfn_get_zone_view_size;
+	PFN_xrGetDisplayZoneCapabilitiesDXR       pfn_get_zone_caps;
+	PFN_xrGetDisplayZoneRecommendedViewSizeDXR pfn_get_zone_view_size;
 
 	// App-supplied single 3D-zone rect (client-window px, top-left origin). When
-	// valid + caps OK, the locate hook chains XrDisplayZoneEXT before the rig
+	// valid + caps OK, the locate hook chains XrDisplayZoneDXR before the rig
 	// (zone-scoped Kooima) and submit chains the same zone on the projection layer,
 	// and the swapchain is sized to the zone's recommended view size. w<=0||h<=0
 	// clears (full-window framing = the Phase A path). (Single-zone first;
@@ -389,7 +389,7 @@ typedef struct ProviderSession {
 	DxrProvDisplayInfo display_info;
 
 	// Rendering modes
-	XrDisplayRenderingModeInfoEXT modes[PS_MAX_RENDERING_MODES];
+	XrDisplayRenderingModeInfoDXR modes[PS_MAX_RENDERING_MODES];
 	uint32_t mode_count;
 
 	// SPI swapchain. arraySize is ALWAYS 2 (Unity's stereo topology is fixed at
@@ -464,9 +464,9 @@ typedef struct ProviderSession {
 	XrSwapchainImageMetalKHR wsui_images_metal[PS_MAX_SWAPCHAIN_IMAGES];
 #endif // _WIN32
 
-	// Local2D layer (#166 Phase B, XR_EXT_local_3d_zone) — post-weave 2D content at a
+	// Local2D layer (#166 Phase B, XR_DXR_local_3d_zone) — post-weave 2D content at a
 	// client-window PIXEL rect (the 2D band). Same cross-device-bridge shape as wsui,
-	// but submitted as XrCompositionLayerLocal2DEXT with a pixel rect (not fractional).
+	// but submitted as XrCompositionLayerLocal2DDXR with a pixel rect (not fractional).
 	XrSwapchain l2d_swapchain;
 	uint32_t    l2d_w, l2d_h, l2d_image_count;
 	int64_t     l2d_format;
@@ -536,11 +536,11 @@ typedef struct ProviderSession {
 	PFN_xrEndSession                  pfn_end_session;
 	PFN_xrDestroyInstance             pfn_destroy_instance;
 	PFN_xrEnumerateEnvironmentBlendModes    pfn_enumerate_blend_modes;    // transparency
-	PFN_xrEnumerateDisplayRenderingModesEXT pfn_enumerate_modes;          // optional
-	PFN_xrRequestDisplayRenderingModeEXT    pfn_request_rendering_mode;   // optional
-	PFN_xrRequestDisplayModeEXT             pfn_request_display_mode;     // optional
-	PFN_xrRequestEyeTrackingModeEXT         pfn_request_eye_tracking_mode;// optional
-	PFN_xrCaptureAtlasEXT                    pfn_capture_atlas;            // #140, optional
+	PFN_xrEnumerateDisplayRenderingModesDXR pfn_enumerate_modes;          // optional
+	PFN_xrRequestDisplayRenderingModeDXR    pfn_request_rendering_mode;   // optional
+	PFN_xrRequestDisplayModeDXR             pfn_request_display_mode;     // optional
+	PFN_xrRequestEyeTrackingModeDXR         pfn_request_eye_tracking_mode;// optional
+	PFN_xrCaptureAtlasDXR                    pfn_capture_atlas;            // #140, optional
 } ProviderSession;
 
 static ProviderSession s_ps;
@@ -714,32 +714,32 @@ static int ps_resolve_functions(void)
 	PS_RESOLVE("xrEndSession", pfn_end_session, PFN_xrEndSession);
 	PS_RESOLVE("xrDestroyInstance", pfn_destroy_instance, PFN_xrDestroyInstance);
 	PS_RESOLVE("xrEnumerateEnvironmentBlendModes", pfn_enumerate_blend_modes, PFN_xrEnumerateEnvironmentBlendModes);
-	// Optional EXT (XR_EXT_display_info mode/eye-tracking control) — soft-resolve;
+	// Optional EXT (XR_DXR_display_info mode/eye-tracking control) — soft-resolve;
 	// OK if absent (older runtime → the C# mode UI/events simply stay inert).
 	{
 		PFN_xrVoidFunction _fn = NULL;
-		s_ps.gipa(s_ps.instance, "xrEnumerateDisplayRenderingModesEXT", &_fn);
-		s_ps.pfn_enumerate_modes = (PFN_xrEnumerateDisplayRenderingModesEXT)_fn;
+		s_ps.gipa(s_ps.instance, "xrEnumerateDisplayRenderingModesDXR", &_fn);
+		s_ps.pfn_enumerate_modes = (PFN_xrEnumerateDisplayRenderingModesDXR)_fn;
 		_fn = NULL;
-		s_ps.gipa(s_ps.instance, "xrRequestDisplayRenderingModeEXT", &_fn);
-		s_ps.pfn_request_rendering_mode = (PFN_xrRequestDisplayRenderingModeEXT)_fn;
+		s_ps.gipa(s_ps.instance, "xrRequestDisplayRenderingModeDXR", &_fn);
+		s_ps.pfn_request_rendering_mode = (PFN_xrRequestDisplayRenderingModeDXR)_fn;
 		_fn = NULL;
-		s_ps.gipa(s_ps.instance, "xrRequestDisplayModeEXT", &_fn);
-		s_ps.pfn_request_display_mode = (PFN_xrRequestDisplayModeEXT)_fn;
+		s_ps.gipa(s_ps.instance, "xrRequestDisplayModeDXR", &_fn);
+		s_ps.pfn_request_display_mode = (PFN_xrRequestDisplayModeDXR)_fn;
 		_fn = NULL;
-		s_ps.gipa(s_ps.instance, "xrRequestEyeTrackingModeEXT", &_fn);
-		s_ps.pfn_request_eye_tracking_mode = (PFN_xrRequestEyeTrackingModeEXT)_fn;
+		s_ps.gipa(s_ps.instance, "xrRequestEyeTrackingModeDXR", &_fn);
+		s_ps.pfn_request_eye_tracking_mode = (PFN_xrRequestEyeTrackingModeDXR)_fn;
 		// Zones (#166 Phase B) — soft-resolve; inert on older runtimes.
 		_fn = NULL;
-		s_ps.gipa(s_ps.instance, "xrGetDisplayZoneCapabilitiesEXT", &_fn);
-		s_ps.pfn_get_zone_caps = (PFN_xrGetDisplayZoneCapabilitiesEXT)_fn;
+		s_ps.gipa(s_ps.instance, "xrGetDisplayZoneCapabilitiesDXR", &_fn);
+		s_ps.pfn_get_zone_caps = (PFN_xrGetDisplayZoneCapabilitiesDXR)_fn;
 		_fn = NULL;
-		s_ps.gipa(s_ps.instance, "xrGetDisplayZoneRecommendedViewSizeEXT", &_fn);
-		s_ps.pfn_get_zone_view_size = (PFN_xrGetDisplayZoneRecommendedViewSizeEXT)_fn;
+		s_ps.gipa(s_ps.instance, "xrGetDisplayZoneRecommendedViewSizeDXR", &_fn);
+		s_ps.pfn_get_zone_view_size = (PFN_xrGetDisplayZoneRecommendedViewSizeDXR)_fn;
 		// Atlas capture (#140) — soft-resolve; inert if the runtime lacks it.
 		_fn = NULL;
-		s_ps.gipa(s_ps.instance, "xrCaptureAtlasEXT", &_fn);
-		s_ps.pfn_capture_atlas = (PFN_xrCaptureAtlasEXT)_fn;
+		s_ps.gipa(s_ps.instance, "xrCaptureAtlasDXR", &_fn);
+		s_ps.pfn_capture_atlas = (PFN_xrCaptureAtlasDXR)_fn;
 	}
 	return 1;
 }
@@ -757,7 +757,7 @@ static void ps_enumerate_modes(void)
 		return;
 	if (total > PS_MAX_RENDERING_MODES) total = PS_MAX_RENDERING_MODES;
 	for (uint32_t i = 0; i < total; i++)
-		s_ps.modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT;
+		s_ps.modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR;
 	if (XR_SUCCEEDED(s_ps.pfn_enumerate_modes(s_ps.session, total, &total, s_ps.modes)))
 		s_ps.mode_count = total;
 	for (uint32_t i = 0; i < s_ps.mode_count; i++) {
@@ -797,7 +797,7 @@ static void ps_enumerate_modes(void)
 }
 
 // Find an enumerated mode by modeIndex (NULL if absent).
-static const XrDisplayRenderingModeInfoEXT *ps_find_mode(uint32_t mode_index)
+static const XrDisplayRenderingModeInfoDXR *ps_find_mode(uint32_t mode_index)
 {
 	for (uint32_t i = 0; i < s_ps.mode_count; i++)
 		if (s_ps.modes[i].modeIndex == mode_index) return &s_ps.modes[i];
@@ -809,7 +809,7 @@ static const XrDisplayRenderingModeInfoEXT *ps_find_mode(uint32_t mode_index)
 // startup comes up in 3D. (#172 P4)
 static uint32_t ps_active_view_count(void)
 {
-	const XrDisplayRenderingModeInfoEXT *m = ps_find_mode(s_ps.active_mode_index);
+	const XrDisplayRenderingModeInfoDXR *m = ps_find_mode(s_ps.active_mode_index);
 	if (m && m->viewCount >= 1) return m->viewCount >= 2 ? 2 : 1;
 	return 2;
 }
@@ -822,7 +822,7 @@ static uint32_t ps_active_view_count(void)
 // half-res instead of full-res (#172 P4).
 static void ps_active_view_scale(float *sx, float *sy)
 {
-	const XrDisplayRenderingModeInfoEXT *m = ps_find_mode(s_ps.active_mode_index);
+	const XrDisplayRenderingModeInfoDXR *m = ps_find_mode(s_ps.active_mode_index);
 	if (!m) {
 		for (uint32_t i = 0; i < s_ps.mode_count; i++)
 			if (s_ps.modes[i].hardwareDisplay3D && s_ps.modes[i].viewCount == 2)
@@ -866,7 +866,7 @@ static void ps_window_size(uint32_t *w, uint32_t *h)
 }
 
 // ============================================================================
-// Zones (XR_EXT_display_zones) — #166 Phase B
+// Zones (XR_DXR_display_zones) — #166 Phase B
 // ============================================================================
 
 // Lazy caps query: zones are usable iff the runtime advertised the extension,
@@ -878,7 +878,7 @@ static int ps_zones_ready(void)
 		return 0;
 	if (s_ps.zone_caps_ok < 0) {
 		if (s_ps.session == XR_NULL_HANDLE) return 0;
-		XrDisplayZoneCapabilitiesEXT caps = {XR_TYPE_DISPLAY_ZONE_CAPABILITIES_EXT};
+		XrDisplayZoneCapabilitiesDXR caps = {XR_TYPE_DISPLAY_ZONE_CAPABILITIES_DXR};
 		XrResult cr = s_ps.pfn_get_zone_caps(s_ps.session, &caps);
 		s_ps.zone_caps_ok = (XR_SUCCEEDED(cr) && caps.supported && caps.maxZones3D >= 1) ? 1 : 0;
 		s_ps.zone_max_3d = caps.maxZones3D;
@@ -1880,7 +1880,7 @@ void dxr_prov_get_wsui_bridge(uint32_t w, uint32_t h,
 // out_layer. Returns 1 if the layer should be submitted, else 0. Called from
 // dxr_prov_submit_frame AFTER the projection bridge copy (own_cmd_list is free and
 // the shared-fence wait already ordered the own queue after Unity's writes).
-static int ps_submit_wsui(XrCompositionLayerWindowSpaceEXT *out_layer)
+static int ps_submit_wsui(XrCompositionLayerWindowSpaceDXR *out_layer)
 {
 	if (!out_layer) return 0;
 	memset(out_layer, 0, sizeof(*out_layer));
@@ -1914,7 +1914,7 @@ static int ps_submit_wsui(XrCompositionLayerWindowSpaceEXT *out_layer)
 	XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
 	s_ps.pfn_release_swapchain_image(s_ps.wsui_swapchain, &ri);
 
-	out_layer->type = XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT;
+	out_layer->type = XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR;
 	out_layer->next = NULL;
 	out_layer->layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
 	out_layer->subImage.swapchain = s_ps.wsui_swapchain;
@@ -1981,7 +1981,7 @@ static int ps_submit_wsui(XrCompositionLayerWindowSpaceEXT *out_layer)
 	XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
 	s_ps.pfn_release_swapchain_image(s_ps.wsui_swapchain, &ri);
 
-	out_layer->type = XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_EXT;
+	out_layer->type = XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR;
 	out_layer->next = NULL;
 	out_layer->layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
 	out_layer->subImage.swapchain = s_ps.wsui_swapchain;
@@ -2006,7 +2006,7 @@ static int ps_create_local2d(uint32_t w, uint32_t h)
 	// Metal (#206): an arraySize=1 overlay swapchain on Unity's device. No bridge —
 	// submit blits the C#-registered Unity id<MTLTexture> straight in (same device).
 	// Twin of the wsui Metal arm (ps_create_wsui); the only difference downstream is
-	// a pixel rect at submit (XrCompositionLayerLocal2DEXT) rather than fractional.
+	// a pixel rect at submit (XrCompositionLayerLocal2DDXR) rather than fractional.
 	if (w == 0 || h == 0) return 0;
 	if (s_ps.graphics_api != DXR_GFX_METAL || !s_ps.metal_queue) return 0;
 	if (s_ps.l2d_swapchain_created && s_ps.l2d_registered_w == w && s_ps.l2d_registered_h == h)
@@ -2174,9 +2174,9 @@ void dxr_prov_set_local2d_rect(int32_t x, int32_t y, int32_t w, int32_t h)
 }
 
 // Per-frame: copy the Local2D bridge into its overlay swapchain image and fill the
-// layer (XrCompositionLayerLocal2DEXT, dest = client-window pixel rect). Returns 1
+// layer (XrCompositionLayerLocal2DDXR, dest = client-window pixel rect). Returns 1
 // if the layer should be submitted. Called from submit after the projection copy.
-static int ps_submit_local2d(XrCompositionLayerLocal2DEXT *out_layer)
+static int ps_submit_local2d(XrCompositionLayerLocal2DDXR *out_layer)
 {
 	if (!out_layer) return 0;
 	memset(out_layer, 0, sizeof(*out_layer));
@@ -2211,7 +2211,7 @@ static int ps_submit_local2d(XrCompositionLayerLocal2DEXT *out_layer)
 	XrSwapchainImageReleaseInfo ri_mtl = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
 	s_ps.pfn_release_swapchain_image(s_ps.l2d_swapchain, &ri_mtl);
 
-	out_layer->type = XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT;
+	out_layer->type = XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_DXR;
 	out_layer->next = NULL;
 	// Unity Canvas is straight (unpremultiplied) alpha — flag it so the runtime
 	// doesn't double-darken (matches the D3D arm below).
@@ -2273,7 +2273,7 @@ static int ps_submit_local2d(XrCompositionLayerLocal2DEXT *out_layer)
 	XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
 	s_ps.pfn_release_swapchain_image(s_ps.l2d_swapchain, &ri);
 
-	out_layer->type = XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_EXT;
+	out_layer->type = XR_TYPE_COMPOSITION_LAYER_LOCAL_2D_DXR;
 	out_layer->next = NULL;
 	// Unity Canvas is straight (unpremultiplied) alpha — flag it so the runtime
 	// doesn't double-darken (matches the hook path's Local2D + avatar bubble).
@@ -2501,7 +2501,7 @@ int dxr_prov_consume_zone_rewrap(uint32_t index)
 	return 1;
 }
 
-// Locate each extra zone (zone-scoped, XrDisplayZoneEXT chained) → z->views, and
+// Locate each extra zone (zone-scoped, XrDisplayZoneDXR chained) → z->views, and
 // acquire its swapchain image. Mirrors the primary locate in dxr_prov_begin_frame.
 static void ps_locate_extra_zones(XrTime display_time)
 {
@@ -2517,9 +2517,9 @@ static void ps_locate_extra_zones(XrTime display_time)
 		li.displayTime = display_time; li.space = s_ps.local_space;
 		XrView views[PS_MAX_VIEWS]; for (int k = 0; k < PS_MAX_VIEWS; k++) views[k] = {XR_TYPE_VIEW};
 		XrViewState vstate = {XR_TYPE_VIEW_STATE};
-		XrDisplayRigEXT display_rig = {XR_TYPE_DISPLAY_RIG_EXT};
-		XrCameraRigEXT  camera_rig  = {XR_TYPE_CAMERA_RIG_EXT};
-		XrDisplayZoneEXT zone = {XR_TYPE_DISPLAY_ZONE_EXT};
+		XrDisplayRigDXR display_rig = {XR_TYPE_DISPLAY_RIG_DXR};
+		XrCameraRigDXR  camera_rig  = {XR_TYPE_CAMERA_RIG_DXR};
+		XrDisplayZoneDXR zone = {XR_TYPE_DISPLAY_ZONE_DXR};
 		XrPosef rig_pose = s_ps.display_pose_set ? s_ps.display_pose : XrPosef{{0, 0, 0, 1}, {0, 0, 0}};
 		if (s_ps.has_view_rig) {
 			if (s_ps.camera_centric) {
@@ -2865,7 +2865,7 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	}
 	s_ps.gipa = rr.getInstanceProcAddr;
 
-	// --- Probe XR_EXT_view_rig before requesting it (older runtimes reject unknown) ---
+	// --- Probe XR_DXR_view_rig before requesting it (older runtimes reject unknown) ---
 	{
 		PFN_xrVoidFunction fn = NULL;
 		s_ps.gipa(XR_NULL_HANDLE, "xrEnumerateInstanceExtensionProperties", &fn);
@@ -2878,13 +2878,13 @@ int dxr_prov_session_start(const char *runtime_json_path,
 				for (uint32_t i = 0; i < avail; i++) props[i].type = XR_TYPE_EXTENSION_PROPERTIES;
 				if (XR_SUCCEEDED(enum_ext(NULL, avail, &avail, props))) {
 					for (uint32_t i = 0; i < avail; i++) {
-						if (strcmp(props[i].extensionName, XR_EXT_VIEW_RIG_EXTENSION_NAME) == 0)
+						if (strcmp(props[i].extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0)
 							s_ps.has_view_rig = 1;
-						else if (strcmp(props[i].extensionName, XR_EXT_DISPLAY_ZONES_EXTENSION_NAME) == 0)
+						else if (strcmp(props[i].extensionName, XR_DXR_DISPLAY_ZONES_EXTENSION_NAME) == 0)
 							s_ps.has_display_zones = 1;
-						else if (strcmp(props[i].extensionName, XR_EXT_LOCAL_3D_ZONE_EXTENSION_NAME) == 0)
+						else if (strcmp(props[i].extensionName, XR_DXR_LOCAL_3D_ZONE_EXTENSION_NAME) == 0)
 							s_ps.has_local_3d_zone = 1;
-						else if (strcmp(props[i].extensionName, XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME) == 0)
+						else if (strcmp(props[i].extensionName, XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME) == 0)
 							s_ps.has_atlas_capture = 1;
 					}
 				}
@@ -2894,34 +2894,34 @@ int dxr_prov_session_start(const char *runtime_json_path,
 		ps_log("[DisplayXR-PROV] display_zones: %s; local_3d_zone: %s\n",
 		       s_ps.has_display_zones ? "AVAILABLE" : "no",
 		       s_ps.has_local_3d_zone ? "AVAILABLE" : "no");
-		ps_log("[DisplayXR-PROV] XR_EXT_view_rig: %s\n",
+		ps_log("[DisplayXR-PROV] XR_DXR_view_rig: %s\n",
 		       s_ps.has_view_rig ? "AVAILABLE" : "not found (no stereo)");
-		ps_log("[DisplayXR-PROV] XR_EXT_atlas_capture: %s\n",
+		ps_log("[DisplayXR-PROV] XR_DXR_atlas_capture: %s\n",
 		       s_ps.has_atlas_capture ? "AVAILABLE" : "no (screenshot inert)");
 	}
 
 	// --- Create instance ---
 	const char *extensions[8];
 	uint32_t ext_count = 0;
-	extensions[ext_count++] = XR_EXT_DISPLAY_INFO_EXTENSION_NAME;
+	extensions[ext_count++] = XR_DXR_DISPLAY_INFO_EXTENSION_NAME;
 #ifdef _WIN32
 	extensions[ext_count++] = is_d3d11 ? "XR_KHR_D3D11_enable" : "XR_KHR_D3D12_enable";
-	extensions[ext_count++] = XR_EXT_WIN32_WINDOW_BINDING_EXTENSION_NAME;
+	extensions[ext_count++] = XR_DXR_WIN32_WINDOW_BINDING_EXTENSION_NAME;
 #else
 	extensions[ext_count++] = XR_KHR_METAL_ENABLE_EXTENSION_NAME;
-	extensions[ext_count++] = XR_EXT_COCOA_WINDOW_BINDING_EXTENSION_NAME;
+	extensions[ext_count++] = XR_DXR_COCOA_WINDOW_BINDING_EXTENSION_NAME;
 #endif
-	if (s_ps.has_view_rig) extensions[ext_count++] = XR_EXT_VIEW_RIG_EXTENSION_NAME;
+	if (s_ps.has_view_rig) extensions[ext_count++] = XR_DXR_VIEW_RIG_EXTENSION_NAME;
 	// Zones (#166 Phase B): display_zones needs view_rig (composes on top of it);
 	// local_3d_zone is required to submit Local2D layers for the 2D bands.
 	if (s_ps.has_display_zones && s_ps.has_view_rig)
-		extensions[ext_count++] = XR_EXT_DISPLAY_ZONES_EXTENSION_NAME;
+		extensions[ext_count++] = XR_DXR_DISPLAY_ZONES_EXTENSION_NAME;
 	if (s_ps.has_local_3d_zone)
-		extensions[ext_count++] = XR_EXT_LOCAL_3D_ZONE_EXTENSION_NAME;
+		extensions[ext_count++] = XR_DXR_LOCAL_3D_ZONE_EXTENSION_NAME;
 	// Atlas capture (#140): app-facing screenshot ('I' key). Enable
 	// unconditionally-if-advertised — independent of transparency/zones.
 	if (s_ps.has_atlas_capture)
-		extensions[ext_count++] = XR_EXT_ATLAS_CAPTURE_EXTENSION_NAME;
+		extensions[ext_count++] = XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME;
 
 	PFN_xrVoidFunction fn_create = NULL;
 	s_ps.gipa(XR_NULL_HANDLE, "xrCreateInstance", &fn_create);
@@ -2989,8 +2989,8 @@ int dxr_prov_session_start(const char *runtime_json_path,
 #endif
 
 	// --- Display info ---
-	XrDisplayInfoEXT di = {};
-	di.type = XR_TYPE_DISPLAY_INFO_EXT;
+	XrDisplayInfoDXR di = {};
+	di.type = XR_TYPE_DISPLAY_INFO_DXR;
 	XrSystemProperties sp = {XR_TYPE_SYSTEM_PROPERTIES};
 	sp.next = &di;
 	if (XR_SUCCEEDED(s_ps.pfn_get_system_properties(s_ps.instance, s_ps.system_id, &sp))) {
@@ -3056,8 +3056,8 @@ int dxr_prov_session_start(const char *runtime_json_path,
 
 #ifdef _WIN32
 	// --- Session: graphics binding on UNITY'S device + window binding (overlay HWND) ---
-	XrWin32WindowBindingCreateInfoEXT win_binding = {};
-	win_binding.type = XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT;
+	XrWin32WindowBindingCreateInfoDXR win_binding = {};
+	win_binding.type = XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_DXR;
 	win_binding.windowHandle = s_ps.overlay_hwnd;
 	win_binding.readbackCallback = NULL;
 	win_binding.readbackUserdata = NULL;
@@ -3092,8 +3092,8 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	// viewHandle == NULL → the runtime self-hosts its NSWindow + CAMetalLayer (the
 	// SELFHOST shape); Phase 2 (#204) switches to displayxr_get_app_main_view()'s
 	// NSView for in-app weave once frames are correct.
-	XrCocoaWindowBindingCreateInfoEXT cocoa_binding = {};
-	cocoa_binding.type = XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_EXT;
+	XrCocoaWindowBindingCreateInfoDXR cocoa_binding = {};
+	cocoa_binding.type = XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_DXR;
 	cocoa_binding.viewHandle = s_ps.overlay_hwnd;
 	cocoa_binding.readbackCallback = NULL;
 	cocoa_binding.readbackUserdata = NULL;
@@ -3276,7 +3276,7 @@ int dxr_prov_wants_transparent(void) { return s_ps.transparent_requested; }
 
 // --- Zones (#166 Phase B) ---------------------------------------------------
 // Define the single 3D-zone rect (client-window px, top-left origin). The locate
-// chains XrDisplayZoneEXT in front of the rig and submit chains it on the
+// chains XrDisplayZoneDXR in front of the rig and submit chains it on the
 // projection layer; the swapchain is (re)sized to the zone's recommended view
 // size. w<=0||h<=0 clears (full-window framing). Seed BEFORE the session starts
 // (demo SubsystemRegistration) so the swapchain is born zone-sized — a later
@@ -3457,8 +3457,8 @@ void dxr_prov_poll_events(void)
 				break;
 			default: break;
 			}
-		} else if (ev.type == XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_EXT) {
-			XrEventDataRenderingModeChangedEXT *mc = (XrEventDataRenderingModeChangedEXT *)&ev;
+		} else if (ev.type == XR_TYPE_EVENT_DATA_RENDERING_MODE_CHANGED_DXR) {
+			XrEventDataRenderingModeChangedDXR *mc = (XrEventDataRenderingModeChangedDXR *)&ev;
 			// Re-enumerate so active_mode_index + per-mode tiling/scale refresh;
 			// the per-frame render rect (dxr_prov_get_render_rect) then adapts with
 			// NO swapchain realloc (worst-case sized). Latch for C#.
@@ -3469,8 +3469,8 @@ void dxr_prov_poll_events(void)
 			s_ps.ev_mode_changed = 1;
 			ps_log("[DisplayXR-PROV] event: rendering mode %u -> %u\n",
 			       mc->previousModeIndex, mc->currentModeIndex);
-		} else if (ev.type == XR_TYPE_EVENT_DATA_HARDWARE_DISPLAY_STATE_CHANGED_EXT) {
-			XrEventDataHardwareDisplayStateChangedEXT *hc = (XrEventDataHardwareDisplayStateChangedEXT *)&ev;
+		} else if (ev.type == XR_TYPE_EVENT_DATA_HARDWARE_DISPLAY_STATE_CHANGED_DXR) {
+			XrEventDataHardwareDisplayStateChangedDXR *hc = (XrEventDataHardwareDisplayStateChangedDXR *)&ev;
 			s_ps.ev_hw3d = hc->hardwareDisplay3D ? 1 : 0;
 			s_ps.ev_hw_changed = 1;
 			ps_log("[DisplayXR-PROV] event: hardware 3D -> %d\n", s_ps.ev_hw3d);
@@ -3483,7 +3483,7 @@ void dxr_prov_poll_events(void)
 			// the runtime sends RENDERING_MODE_CHANGED and the provider flips submit count
 			// (and reallocs the tile to full-res 2D).
 			if (s_ps.pfn_request_rendering_mode) {
-				const XrDisplayRenderingModeInfoEXT *cur = ps_find_mode(s_ps.active_mode_index);
+				const XrDisplayRenderingModeInfoDXR *cur = ps_find_mode(s_ps.active_mode_index);
 				int cur_is3d = cur ? (cur->hardwareDisplay3D ? 1 : 0) : 1;
 				if (cur_is3d != s_ps.ev_hw3d) {
 					for (uint32_t i = 0; i < s_ps.mode_count; i++) {
@@ -3498,8 +3498,8 @@ void dxr_prov_poll_events(void)
 					}
 				}
 			}
-		} else if (ev.type == XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_EXT) {
-			XrEventDataEyeTrackingStateChangedEXT *tc = (XrEventDataEyeTrackingStateChangedEXT *)&ev;
+		} else if (ev.type == XR_TYPE_EVENT_DATA_EYE_TRACKING_STATE_CHANGED_DXR) {
+			XrEventDataEyeTrackingStateChangedDXR *tc = (XrEventDataEyeTrackingStateChangedDXR *)&ev;
 			s_ps.ev_track_is_tracking = tc->isTracking ? 1 : 0;
 			s_ps.ev_track_mode = (int)tc->activeMode;
 			s_ps.ev_track_changed = 1;
@@ -3550,7 +3550,7 @@ int dxr_prov_begin_frame(uint32_t *out_image_index, int *out_should_render)
 		s_ps.render_h = rh;
 	}
 
-	// --- Locate views (XR_EXT_view_rig chained → render-ready pose+fov) ---
+	// --- Locate views (XR_DXR_view_rig chained → render-ready pose+fov) ---
 	s_ps.view_count = 0;
 	if (s_ps.local_space != XR_NULL_HANDLE && s_ps.pfn_locate_views) {
 		XrViewLocateInfo li = {XR_TYPE_VIEW_LOCATE_INFO};
@@ -3563,14 +3563,14 @@ int dxr_prov_begin_frame(uint32_t *out_image_index, int *out_should_render)
 		XrViewState vstate = {XR_TYPE_VIEW_STATE};
 		uint32_t vcount = 0;
 
-		// XR_EXT_view_rig: chain the rig descriptor matching the active rig mode
-		// (mirrors displayxr_standalone.cpp). Camera-centric → XrCameraRigEXT;
-		// display-centric → XrDisplayRigEXT. The runtime returns render-ready
+		// XR_DXR_view_rig: chain the rig descriptor matching the active rig mode
+		// (mirrors displayxr_standalone.cpp). Camera-centric → XrCameraRigDXR;
+		// display-centric → XrDisplayRigDXR. The runtime returns render-ready
 		// XrView{pose,fov}; the raw channel recovers the raw display-space eyes.
-		XrDisplayRigEXT display_rig = {XR_TYPE_DISPLAY_RIG_EXT};
-		XrCameraRigEXT  camera_rig  = {XR_TYPE_CAMERA_RIG_EXT};
-		XrDisplayZoneEXT locate_zone = {XR_TYPE_DISPLAY_ZONE_EXT};
-		XrViewDisplayRawEXT raw = {XR_TYPE_VIEW_DISPLAY_RAW_EXT};
+		XrDisplayRigDXR display_rig = {XR_TYPE_DISPLAY_RIG_DXR};
+		XrCameraRigDXR  camera_rig  = {XR_TYPE_CAMERA_RIG_DXR};
+		XrDisplayZoneDXR locate_zone = {XR_TYPE_DISPLAY_ZONE_DXR};
+		XrViewDisplayRawDXR raw = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
 		XrPosef rig_pose = s_ps.display_pose_set ? s_ps.display_pose
 		                                         : XrPosef{{0, 0, 0, 1}, {0, 0, 0}};
 		if (s_ps.has_view_rig) {
@@ -3601,7 +3601,7 @@ int dxr_prov_begin_frame(uint32_t *out_image_index, int *out_should_render)
 				display_rig.perspectiveFactor = s_ps.tunables_set ? s_ps.perspective_factor : 1.0f;
 				li.next = &display_rig;
 			}
-			// Zones (#166 Phase B): chain XrDisplayZoneEXT in FRONT of the rig so the
+			// Zones (#166 Phase B): chain XrDisplayZoneDXR in FRONT of the rig so the
 			// runtime frames the Kooima into the zone rect (the rect IS the canvas).
 			// Same instance is chained on the projection layer at submit.
 			if (ps_zone_active()) {
@@ -3638,7 +3638,7 @@ int dxr_prov_begin_frame(uint32_t *out_image_index, int *out_should_render)
 			// Publish the RAW (pre-Kooima) display-space eyes to shared state so
 			// the editor Scene-view gizmo (DisplayXRGizmoHelpers.TryGetLiveRawEyes)
 			// tracks the head (#189). The gizmo re-applies Kooima itself, so it
-			// wants the raw eyes from the XR_EXT_view_rig raw channel (chained on
+			// wants the raw eyes from the XR_DXR_view_rig raw channel (chained on
 			// vstate.next above), NOT the render-ready views[i].pose — matching the
 			// legacy SA contract (displayxr_standalone.cpp:1603-1618). Only valid
 			// when the rig is chained; otherwise `raw` is a zero-init struct and
@@ -3646,7 +3646,7 @@ int dxr_prov_begin_frame(uint32_t *out_image_index, int *out_should_render)
 			if (s_ps.has_view_rig) {
 				uint32_t raw_n = raw.eyeCountOutput;
 				if (raw_n == 0) raw_n = n; // tolerate a runtime that skipped the raw fill
-				if (raw_n > XR_VIEW_RIG_MAX_RAW_EYES_EXT) raw_n = XR_VIEW_RIG_MAX_RAW_EYES_EXT;
+				if (raw_n > XR_VIEW_RIG_MAX_RAW_EYES_DXR) raw_n = XR_VIEW_RIG_MAX_RAW_EYES_DXR;
 				XrVector3f left  = raw.rawEyes[0];
 				XrVector3f right = raw.rawEyes[raw_n >= 2 ? 1 : 0];
 				displayxr_state_set_eye_positions(&left, &right, raw.isTracking ? 1 : 0);
@@ -4088,7 +4088,7 @@ int dxr_prov_submit_frame(uint32_t image_index)
 
 	// Zones (#166 Phase B): bind the projection layer's views into the zone rect.
 	// SAME instance/values as the locate chain; the submit values are authoritative.
-	XrDisplayZoneEXT submit_zone = {XR_TYPE_DISPLAY_ZONE_EXT};
+	XrDisplayZoneDXR submit_zone = {XR_TYPE_DISPLAY_ZONE_DXR};
 	int zone_frame = ps_zone_active();
 	if (zone_frame) {
 		submit_zone.zoneId = s_ps.zone_id ? s_ps.zone_id : 1;
@@ -4116,7 +4116,7 @@ int dxr_prov_submit_frame(uint32_t image_index)
 	// zone-chained projection layer. Structs persist until xrEndFrame below.
 	XrCompositionLayerProjectionView extra_pv[PS_MAX_ZONES - 1][2] = {};
 	XrCompositionLayerProjection     extra_layer[PS_MAX_ZONES - 1] = {};
-	XrDisplayZoneEXT                 extra_zone_struct[PS_MAX_ZONES - 1] = {};
+	XrDisplayZoneDXR                 extra_zone_struct[PS_MAX_ZONES - 1] = {};
 	int extra_has[PS_MAX_ZONES - 1] = {};
 	for (uint32_t i = 0; i < s_ps.extra_zone_count; i++) {
 		ProviderExtraZone *z = &s_ps.extra_zones[i];
@@ -4135,7 +4135,7 @@ int dxr_prov_submit_frame(uint32_t image_index)
 			extra_pv[i][eye].subImage.imageRect.extent = {(int32_t)z->sc_width, (int32_t)z->sc_height};
 			extra_pv[i][eye].subImage.imageArrayIndex = eye;
 		}
-		extra_zone_struct[i].type = XR_TYPE_DISPLAY_ZONE_EXT;
+		extra_zone_struct[i].type = XR_TYPE_DISPLAY_ZONE_DXR;
 		extra_zone_struct[i].zoneId = z->zone_id;
 		extra_zone_struct[i].rect.offset = {z->rect_x, z->rect_y};
 		extra_zone_struct[i].rect.extent = {z->rect_w, z->rect_h};
@@ -4152,11 +4152,11 @@ int dxr_prov_submit_frame(uint32_t image_index)
 	// Local2D band(s): post-weave 2D content at a client-window pixel rect,
 	// composited over the woven 3D (the "glass over 3D" 2D zone). Inactive when no
 	// rect/bridge is registered.
-	XrCompositionLayerLocal2DEXT l2d_layer = {};
+	XrCompositionLayerLocal2DDXR l2d_layer = {};
 	int has_l2d = ps_submit_local2d(&l2d_layer);
 
 	// Window-space UI (HUD). Composites over everything (fractional coords + disparity).
-	XrCompositionLayerWindowSpaceEXT wsui_layer = {};
+	XrCompositionLayerWindowSpaceDXR wsui_layer = {};
 	int has_wsui = ps_submit_wsui(&wsui_layer);
 
 	// Order: 3D projections (primary + extra zones) under, Local2D bands over the 3D,
@@ -4283,7 +4283,7 @@ void dxr_prov_get_render_rect(uint32_t *out_w, uint32_t *out_h)
 }
 
 // ============================================================================
-// Rendering modes (XR_EXT_display_info)
+// Rendering modes (XR_DXR_display_info)
 // ============================================================================
 
 uint32_t dxr_prov_get_mode_count(void) { return s_ps.mode_count; }
@@ -4291,7 +4291,7 @@ uint32_t dxr_prov_get_mode_count(void) { return s_ps.mode_count; }
 int dxr_prov_get_mode_info(uint32_t index, DxrProvModeInfo *out_info)
 {
 	if (!out_info || index >= s_ps.mode_count) return 0;
-	const XrDisplayRenderingModeInfoEXT *m = &s_ps.modes[index];
+	const XrDisplayRenderingModeInfoDXR *m = &s_ps.modes[index];
 	out_info->mode_index = m->modeIndex;
 	out_info->view_count = m->viewCount;
 	out_info->tile_columns = m->tileColumns;
@@ -4322,7 +4322,7 @@ int dxr_prov_request_display_mode(int mode3d)
 {
 	if (!s_ps.session || !s_ps.pfn_request_display_mode) return 0;
 	XrResult r = s_ps.pfn_request_display_mode(s_ps.session,
-	        mode3d ? XR_DISPLAY_MODE_3D_EXT : XR_DISPLAY_MODE_2D_EXT);
+	        mode3d ? XR_DISPLAY_MODE_3D_DXR : XR_DISPLAY_MODE_2D_DXR);
 	ps_log("[DisplayXR-PROV] request display mode %s -> %d\n", mode3d ? "3D" : "2D", r);
 	return XR_SUCCEEDED(r) ? 1 : 0;
 }
@@ -4331,12 +4331,12 @@ int dxr_prov_set_eye_tracking_mode(int manual)
 {
 	if (!s_ps.session || !s_ps.pfn_request_eye_tracking_mode) return 0;
 	XrResult r = s_ps.pfn_request_eye_tracking_mode(s_ps.session,
-	        manual ? XR_EYE_TRACKING_MODE_MANUAL_EXT : XR_EYE_TRACKING_MODE_MANAGED_EXT);
+	        manual ? XR_EYE_TRACKING_MODE_MANUAL_DXR : XR_EYE_TRACKING_MODE_MANAGED_DXR);
 	ps_log("[DisplayXR-PROV] request eye-tracking mode %s -> %d\n", manual ? "MANUAL" : "MANAGED", r);
 	return XR_SUCCEEDED(r) ? 1 : 0;
 }
 
-// ---- Atlas capture (XR_EXT_atlas_capture, #140) -----------------------------
+// ---- Atlas capture (XR_DXR_atlas_capture, #140) -----------------------------
 
 // Atlas capture: hand the runtime a path prefix + stage; it reads back its own
 // compositor atlas and writes the PNG on the next composed frame. Non-blocking —
@@ -4349,14 +4349,14 @@ int dxr_prov_capture_atlas(const char *path_prefix, int stage)
 		return 0; // Extension not resolved or no live session
 	}
 
-	XrAtlasCaptureInfoEXT info = {};
-	info.type = XR_TYPE_ATLAS_CAPTURE_INFO_EXT;
+	XrAtlasCaptureInfoDXR info = {};
+	info.type = XR_TYPE_ATLAS_CAPTURE_INFO_DXR;
 	info.next = NULL;
-	info.stage = (stage != 0) ? XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_EXT
-	                          : XR_ATLAS_CAPTURE_STAGE_POST_COMPOSE_EXT;
+	info.stage = (stage != 0) ? XR_ATLAS_CAPTURE_STAGE_PROJECTION_ONLY_DXR
+	                          : XR_ATLAS_CAPTURE_STAGE_POST_COMPOSE_DXR;
 	if (path_prefix != NULL) {
-		strncpy(info.pathPrefix, path_prefix, XR_ATLAS_CAPTURE_PATH_MAX_EXT - 1);
-		info.pathPrefix[XR_ATLAS_CAPTURE_PATH_MAX_EXT - 1] = '\0';
+		strncpy(info.pathPrefix, path_prefix, XR_ATLAS_CAPTURE_PATH_MAX_DXR - 1);
+		info.pathPrefix[XR_ATLAS_CAPTURE_PATH_MAX_DXR - 1] = '\0';
 	}
 
 	XrResult result = s_ps.pfn_capture_atlas(s_ps.session, &info, NULL);

@@ -12,7 +12,7 @@ Thanks for your interest in the DisplayXR Unity plugin.
 
 ## What Lives Where
 
-This repo contains the Unity plugin only — the OpenXR runtime, native compositors, and extension headers are in [`displayxr-runtime`](https://github.com/DisplayXR/displayxr-runtime). The plugin talks to the runtime over standard OpenXR plus the `XR_EXT_display_info` / window-binding extensions published in [`displayxr-extensions`](https://github.com/DisplayXR/displayxr-extensions).
+This repo contains the Unity plugin only — the OpenXR runtime, native compositors, and extension headers are in [`displayxr-runtime`](https://github.com/DisplayXR/displayxr-runtime). The plugin talks to the runtime over standard OpenXR plus the `XR_DXR_display_info` / window-binding extensions published in [`displayxr-extensions`](https://github.com/DisplayXR/displayxr-extensions).
 
 Ready-to-open sample projects live in [`displayxr-unity-samples`](https://github.com/DisplayXR/displayxr-unity-samples) (`samples/*`) — use `samples/birp-multipass` to verify plugin changes against a working scene before opening a PR.
 

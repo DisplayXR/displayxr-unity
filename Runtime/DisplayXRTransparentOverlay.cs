@@ -319,7 +319,7 @@ namespace DisplayXR
 #elif UNITY_STANDALONE_OSX
             // (#85 Phase 1) Flip Unity's NSWindow opaque flag so the desktop
             // shows through alpha=0 regions. Runtime handles its own
-            // CAMetalLayer + NSWindow via XR_EXT_cocoa_window_binding v5; the
+            // CAMetalLayer + NSWindow via XR_DXR_cocoa_window_binding v5; the
             // Unity-owned NSWindow is the app's responsibility. Skip in the
             // editor unless we're in Play Mode — at edit time the game-view
             // hasn't been built and we'd mutate the wrong window.

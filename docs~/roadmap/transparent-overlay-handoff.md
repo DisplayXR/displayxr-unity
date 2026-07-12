@@ -219,10 +219,10 @@ Unity rendering ───► OpenXR eye swapchains ───► Runtime weaver �
 
 ### Wire format (`native~/displayxr_extensions.h`)
 
-`XR_EXT_win32_window_binding` `SPEC_VERSION = 5`. Field-at-end struct:
+`XR_DXR_win32_window_binding` `SPEC_VERSION = 5`. Field-at-end struct:
 
 ```c
-typedef struct XrWin32WindowBindingCreateInfoEXT {
+typedef struct XrWin32WindowBindingCreateInfoDXR {
     XrStructureType        type;
     const void            *next;
     void                  *windowHandle;          // HWND
@@ -231,7 +231,7 @@ typedef struct XrWin32WindowBindingCreateInfoEXT {
     void                  *sharedTextureHandle;
     XrBool32               transparentBackgroundEnabled;  // v4: opt-in BitBlt (D3D11) / DComp (D3D12)
     uint32_t               chromaKeyColor;                // v5: COLORREF, post-weave alpha conversion
-} XrWin32WindowBindingCreateInfoEXT;
+} XrWin32WindowBindingCreateInfoDXR;
 ```
 
 Plugin populates both fields in two construction sites in `displayxr_hooks.cpp` (the `win32_inject_window_binding` helper used by D3D11/D3D12 backends, and the `xrCreateSession` chain-walking fallback).
@@ -277,7 +277,7 @@ We tried each of these first and they all failed for documented reasons — don'
 |------|---------|
 | `Runtime/DisplayXRTransparentOverlay.cs` | The user-facing component |
 | `Runtime/DisplayXRNative.cs` | DllImport bindings — search for `transparent` |
-| `native~/displayxr_extensions.h` | Embedded `XR_EXT_win32_window_binding` v5 header |
+| `native~/displayxr_extensions.h` | Embedded `XR_DXR_win32_window_binding` v5 header |
 | `native~/displayxr_hooks.cpp` | Window-binding struct construction (two sites — both populate v5 fields). Also `displayxr_set_transparent_background` and `displayxr_set_transparent_chroma_key` C-side setters. |
 | `native~/displayxr_shared_state.{h,cpp}` | `transparent_background_requested` + `transparent_chroma_key_color` flags; preserved across `displayxr_state_init` memset |
 | `native~/displayxr_win32.c` | All the Windows-specific window magic. `displayxr_get_app_main_view` (top-level vs child branch), `displayxr_set_transparent_overlay` (style flip + cloak), `parent_subclass_proc` (WM_NCHITTEST hit-rect, WM_SIZE/MOVE tracking), `find_unity_hwnd` (skip overlay class) |

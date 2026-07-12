@@ -5,7 +5,7 @@
 //
 // The standalone session renders on its OWN Vulkan device (matching the Unity
 // editor's Vulkan API) and the runtime composites the woven 3D into the native
-// preview HWND via XR_EXT_win32_window_binding. The Unity->SA atlas upload uses
+// preview HWND via XR_DXR_win32_window_binding. The Unity->SA atlas upload uses
 // a cross-device external-memory bridge:
 //
 //   eye cameras -> s_AtlasRT (Unity VkDevice)

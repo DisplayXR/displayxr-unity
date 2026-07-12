@@ -7,7 +7,7 @@ using UnityEngine.Experimental.Rendering;
 namespace DisplayXR
 {
     /// <summary>
-    /// Submits a Unity UI Canvas as an OpenXR XrCompositionLayerWindowSpaceEXT
+    /// Submits a Unity UI Canvas as an OpenXR XrCompositionLayerWindowSpaceDXR
     /// composition layer.
     ///
     /// IMPORTANT API: this component takes over the Canvas it's attached to and

@@ -73,7 +73,7 @@ two ways (`displayxr_win32.c`):
 weaves the 3D into. The app is responsible for keeping them equal:
 
 - **Weave placement** ← the provider zone: `DisplayXRProvider.SetZoneRect(…)` →
-  `dxr_prov_set_3d_zone_rect` → `XrDisplayZoneEXT`.
+  `dxr_prov_set_3d_zone_rect` → `XrDisplayZoneDXR`.
 - **Mask placement** ← the canvas rect: `DisplayXRNative.displayxr_set_canvas_rect(zoneRect)`
   → `s_canvas_rect` (in `displayxr_native_shared.cpp`), read back by
   `displayxr_get_canvas_rect_px`.

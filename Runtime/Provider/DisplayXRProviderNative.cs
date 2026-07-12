@@ -20,7 +20,7 @@ namespace DisplayXR
     {
         private const string LibName = "displayxr_unity";
 
-        /// <summary>Display geometry surfaced from XR_EXT_display_info (mirrors DxrProvDisplayInfo).</summary>
+        /// <summary>Display geometry surfaced from XR_DXR_display_info (mirrors DxrProvDisplayInfo).</summary>
         [StructLayout(LayoutKind.Sequential)]
         public struct DisplayInfo
         {
@@ -226,7 +226,7 @@ namespace DisplayXR
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern int dxr_prov_set_eye_tracking_mode(int manual);
 
-        // ---- Atlas capture (XR_EXT_atlas_capture, #140) ----------------------
+        // ---- Atlas capture (XR_DXR_atlas_capture, #140) ----------------------
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern int dxr_prov_capture_atlas(

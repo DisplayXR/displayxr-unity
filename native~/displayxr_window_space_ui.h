@@ -3,7 +3,7 @@
 //
 // Window-space UI overlay (issue #67).
 //
-// Routes a Unity Canvas RenderTexture through to a XrCompositionLayerWindowSpaceEXT
+// Routes a Unity Canvas RenderTexture through to a XrCompositionLayerWindowSpaceDXR
 // composition layer so the runtime composites it on top of the eye projection.
 //
 // C# registers the pending Unity texture + fractional layer placement via the C

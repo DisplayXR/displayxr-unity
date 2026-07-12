@@ -61,8 +61,8 @@ DISPLAYXR_EXPORT void displayxr_set_editor_mode(int enabled);
 
 /// (issue runtime-pvt #191 / displayxr-unity #57) Request the runtime's
 /// transparent-background mode for the next OpenXR session. Sets the
-/// transparentBackgroundEnabled field on XrWin32WindowBindingCreateInfoEXT
-/// (XR_EXT_win32_window_binding spec_version 4) when the next session is
+/// transparentBackgroundEnabled field on XrWin32WindowBindingCreateInfoDXR
+/// (XR_DXR_win32_window_binding spec_version 4) when the next session is
 /// created, opting the bound HWND's swapchain into BitBlt (D3D11) or DComp
 /// (D3D12) presentation.
 ///
@@ -153,7 +153,7 @@ DISPLAYXR_EXPORT void displayxr_get_shared_texture(void **native_ptr,
                                                   int *ready);
 
 /// Set the canvas output rect for shared texture compositing (play mode).
-/// Calls xrSetSharedTextureOutputRectEXT on the runtime session.
+/// Calls xrSetSharedTextureOutputRectDXR on the runtime session.
 DISPLAYXR_EXPORT void displayxr_set_canvas_rect(
     int32_t x, int32_t y, uint32_t w, uint32_t h);
 

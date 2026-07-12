@@ -83,7 +83,7 @@ DisplayXR is an OpenXR runtime that implements the standard Khronos API
 plus a few **vendor extensions** for 3D-display-specific concerns. The
 transparent overlay relies on:
 
-### `XR_EXT_win32_window_binding` (spec v5) and `XR_EXT_cocoa_window_binding`
+### `XR_DXR_win32_window_binding` (spec v5) and `XR_DXR_cocoa_window_binding`
 
 The app passes the application's `HWND` (or `NSView*`) to the runtime via
 these extensions, chained off `XrSessionCreateInfo.next` at
@@ -99,7 +99,7 @@ field for transparency:
 The struct definition lives in `native~/displayxr_extensions.h`. v5 is what
 the plugin and runtime both implement.
 
-### `XR_EXT_display_info`
+### `XR_DXR_display_info`
 
 Not used directly by this sample, but every DisplayXR scene depends on it.
 The runtime sends back the physical display dimensions, supported eye
@@ -167,7 +167,7 @@ PLUGIN  (DisplayXR Unity package — C# in Runtime/, native in native~/)
  ├─ DisplayXRFeature.OnInstanceCreate:
  │   └─ SetEnvironmentBlendMode(AlphaBlend) so Unity preserves alpha
  └─ Native:
-     ├─ Hooks xrCreateSession; fills XrWin32WindowBindingCreateInfoEXT
+     ├─ Hooks xrCreateSession; fills XrWin32WindowBindingCreateInfoDXR
      │   with transparentBackgroundEnabled=1, chromaKeyColor=0
      ├─ Creates top-level WS_EX_NOREDIRECTIONBITMAP overlay HWND
      ├─ Cloaks + moves Unity main HWND off-screen for click-through
@@ -219,7 +219,7 @@ OS / DWM (Windows) / Cocoa (macOS)
   `docs~/adr/ADR-004-camera-vs-display-mode.md`
 - Runtime extension specs: see the [DisplayXR runtime
   repo](https://github.com/DisplayXR/displayxr-runtime), `docs/specs/`
-  directory — `XR_EXT_display_info.md`, `XR_EXT_win32_window_binding.md`
+  directory — `XR_DXR_display_info.md`, `XR_DXR_win32_window_binding.md`
 - Issue #57 on `DisplayXR/displayxr-unity` — the original feature request
   with the full problem framing.
 - Issue #103 on `DisplayXR/displayxr-unity` — the tracking ticket for

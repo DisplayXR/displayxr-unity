@@ -39,7 +39,7 @@ endif()
 
 # --- displayxr::math removed (#396 W7) ---
 # The plugin no longer computes Kooima locally — the DisplayXR runtime owns the
-# view-rig math via XR_EXT_view_rig, and the plugin consumes render-ready
+# view-rig math via XR_DXR_view_rig, and the plugin consumes render-ready
 # XrView{pose,fov}. The former displayxr-common (display3d/camera3d) dependency
 # is gone; do NOT re-add it (see the no-vendored-math drift guard).
 

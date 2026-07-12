@@ -7,7 +7,7 @@ Metal XR probe is deferred to Phase 2 first light (it needs a compiling provider
 ## TL;DR
 
 The runtime's macOS build is **already provider-ready** — every extension the provider
-needs is advertised on macOS, including `XR_EXT_view_rig` at SPEC_VERSION 3 and the
+needs is advertised on macOS, including `XR_DXR_view_rig` at SPEC_VERSION 3 and the
 Metal graphics binding. The gap is entirely plugin-side: the provider is compiled only
 under `if(WIN32)` and the shipped macOS bundle exports zero `dxr_prov_*` symbols, so
 the C# loader throws `EntryPointNotFoundException` before subsystem creation. The
@@ -20,16 +20,16 @@ core is backend-agnostic and ports unchanged.
 | Extension | SPEC_VERSION | Windows | macOS |
 |---|---|---|---|
 | `XR_KHR_metal_enable` (+ `XR_KHRX2_metal_enable` alias) | 2 | n/a | **yes** |
-| `XR_EXT_view_rig` | **3** (provider needs ≥2) | yes | **yes** (no platform gate) |
-| `XR_EXT_display_info` | 15 | yes | yes |
-| `XR_EXT_atlas_capture` | 3 | yes | yes |
-| `XR_EXT_display_zones` | 1 | yes | yes |
-| `XR_EXT_local_3d_zone` | 4 | yes | yes |
-| `XR_EXT_cocoa_window_binding` | 6 (incl. `transparentBackgroundEnabled`) | n/a | yes |
-| `XR_EXT_win32_window_binding` | — | yes | n/a |
-| `XR_EXT_weave` | — | yes | **no — Win32-gated** |
-| `XR_EXT_workspace_file_dialog` | — | yes | no — Win32-gated |
-| `XR_EXT_mcp_tools` | — | yes | yes |
+| `XR_DXR_view_rig` | **3** (provider needs ≥2) | yes | **yes** (no platform gate) |
+| `XR_DXR_display_info` | 15 | yes | yes |
+| `XR_DXR_atlas_capture` | 3 | yes | yes |
+| `XR_DXR_display_zones` | 1 | yes | yes |
+| `XR_DXR_local_3d_zone` | 4 | yes | yes |
+| `XR_DXR_cocoa_window_binding` | 6 (incl. `transparentBackgroundEnabled`) | n/a | yes |
+| `XR_DXR_win32_window_binding` | — | yes | n/a |
+| `XR_DXR_weave` | — | yes | **no — Win32-gated** |
+| `XR_DXR_workspace_file_dialog` | — | yes | no — Win32-gated |
+| `XR_DXR_mcp_tools` | — | yes | yes |
 
 Local2D and the window-space-UI HUD are **compositor-layer features, not separate
 extensions** — they ride the standard layer path, and the runtime's Metal compositor
@@ -76,7 +76,7 @@ already has the Local2D flatten pipeline (`oxr_session_gfx_metal_native.c`).
   stale — there is no IOSurface-backed texture creation and no `MTLSharedEvent` code
   anywhere in the repo. Any own-device bridge would be new code. (The IOSurface
   framework is linked, unused.)
-- **`XR_EXT_view_rig` is at SPEC_VERSION 3** (the epic notes said "needs 2") and is
+- **`XR_DXR_view_rig` is at SPEC_VERSION 3** (the epic notes said "needs 2") and is
   advertised unconditionally — no runtime work needed for macOS Kooima.
 - The SA-era Metal backend (`displayxr_standalone_metal_backend.cpp`) never needed a
   bridge: all its cross-device methods are stubs, because Metal's unified device model

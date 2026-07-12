@@ -67,7 +67,7 @@ namespace DisplayXR
 
         /// <summary>
         /// Live Kooima canvas (window on the panel) from the runtime's
-        /// XR_EXT_view_rig raw channel, published each frame by the provider
+        /// XR_DXR_view_rig raw channel, published each frame by the provider
         /// (#189). rect is in panel pixels (top-left origin) — used for the
         /// window-relative eye rebase; size (meters) is the physical canvas —
         /// used for the convergence-plane aspect. Invalid in Edit Mode / on
