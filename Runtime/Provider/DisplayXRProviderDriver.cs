@@ -402,6 +402,18 @@ namespace DisplayXR
                     if (s_fitSpec == "scale" && s_zoomScaleField != null)
                     {
                         // dest is 0.5 px short of the RT: stretch y so dest rows == RT rows.
+                        // Resolve the GameView's RenderTexture fields here if the GVGEOM
+                        // logger (which also builds this list) isn't enabled — the seam fix
+                        // must not depend on a diagnostic env (it silently no-ops otherwise:
+                        // rt stays null and the seam returns on maximized/floating layouts).
+                        if (s_rtFields == null)
+                        {
+                            s_rtFields = new System.Collections.Generic.List<FieldInfo>();
+                            var rtFlags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+                            for (var t = s_gvType; t != null; t = t.BaseType)
+                                foreach (var fi in t.GetFields(rtFlags | BindingFlags.DeclaredOnly))
+                                    if (fi.FieldType == typeof(RenderTexture)) s_rtFields.Add(fi);
+                        }
                         RenderTexture rt = null;
                         if (s_rtFields != null)
                             foreach (var rfi in s_rtFields)
