@@ -3746,8 +3746,17 @@ int dxr_prov_get_initial_gameview_rect(int *x, int *y, int *w, int *h)
 // coincidentally-aligned ones. Silent pushes settle phase-correct (HW-verified);
 // mid-drag phase tracking (drag stutter) is an open follow-up needing a different
 // mechanism than the bracket.
+// BINDPANE experiment (#740): when set, the session binds UNITY'S OWN Game-view pane
+// window (GUIView child) instead of the dedicated proxy window — the SR SDK then
+// tracks the real content window natively (GA_ROOT = Unity's container, the normal
+// windowed-SR-app shape) and the zone carries the render-area offset within the
+// pane's client. The plugin must NEVER SetWindowPos / restyle this window (it is
+// Unity's) — dxr_prov_set_gameview_rect below guards on it.
+static void *s_ext_weave_hwnd = NULL;
+
 void dxr_prov_set_gameview_rect(int x, int y, int w, int h)
 {
+	if (s_ext_weave_hwnd) return; // BINDPANE: the bound window is UNITY'S — never touch it
 	if (w <= 0 || h <= 0 || !s_ps.overlay_hwnd) return;
 	static int s_track = -1;      // -1 unknown, 0 off, 1 move+resize, 2 move-only
 	if (s_track < 0) {
@@ -3831,6 +3840,16 @@ void dxr_prov_set_panel_px(int w, int h)
 	s_gv_panel_w = (w > 0) ? w : 0;
 	s_gv_panel_h = (h > 0) ? h : 0;
 }
+
+// BINDPANE (#740): setter/getter for s_ext_weave_hwnd (declared above with the
+// GV_TRACK statics — dxr_prov_set_gameview_rect guards on it). Set from C# BEFORE the
+// session starts; LifecycleStart consumes it instead of creating the dedicated window.
+void dxr_prov_set_external_weave_hwnd(void *hwnd)
+{
+	s_ext_weave_hwnd = hwnd;
+	ps_log("[DisplayXR-PROV] BINDPANE: external weave HWND set: %p\n", hwnd);
+}
+void *dxr_prov_get_external_weave_hwnd(void) { return s_ext_weave_hwnd; }
 
 // Zone-glue arrangement (#740/#742): publish the Game view pane's FULL screen rect.
 // The weave window sits at the monitor origin (born once, never moved — no #727

@@ -239,6 +239,24 @@ namespace DisplayXR
             return s_zoneGlueGate == 1;
         }
 
+        // BINDPANE experiment (#740, env DISPLAYXR_PROV_GV_BINDPANE=1; takes precedence
+        // over zone-glue): bind UNITY'S OWN Game-view pane window (the matched GUIView
+        // child) as the weave HWND — the SR SDK then tracks the real content window
+        // natively (GA_ROOT = Unity's container, the normal windowed-SR-app shape) and
+        // the zone carries the render area's offset within the pane's CLIENT rect.
+        // The plugin never moves/restyles the pane (guarded natively too). Known limits
+        // (experiment-grade): tab maximize/undock re-host the view in a DIFFERENT
+        // GUIView HWND mid-session — the binding can't follow; docked-only test.
+        static int s_bindPaneGate = -1;
+        static bool BindPaneEnabled()
+        {
+            if (!ProbeEnabled()) return false;
+            if (s_bindPaneGate < 0)
+                s_bindPaneGate = System.Environment.GetEnvironmentVariable(
+                    "DISPLAYXR_PROV_GV_BINDPANE") == "1" ? 1 : 0;
+            return s_bindPaneGate == 1;
+        }
+
         [StructLayout(LayoutKind.Sequential)]
         struct Win32Point { public int x, y; }
         [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
@@ -609,6 +627,7 @@ namespace DisplayXR
         static float  s_hwndCorrPppKey;
         static bool   s_hwndCorrValid;
         static int    s_hwndCorrX, s_hwndCorrY;
+        static System.IntPtr s_hwndCorrHwnd;   // the matched pane GUIView (BINDPANE binds it)
         static string s_lastHwndCorrLog;
 
         static void ApplyWin32HostPositionCorrection(Rect host, float ppp, int toolbar,
@@ -622,6 +641,7 @@ namespace DisplayXR
                 float exX = host.x * ppp, exY = host.y * ppp;
                 float exW = host.width * ppp, exH = host.height * ppp;
                 float bestScore = float.MaxValue; Win32Rect bestWr = default; string bestCls = null;
+                System.IntPtr bestH = System.IntPtr.Zero;
                 uint myPid = (uint)System.Diagnostics.Process.GetCurrentProcess().Id;
                 Win32EnumProc collect = (h, l) =>
                 {
@@ -635,7 +655,7 @@ namespace DisplayXR
                     float score = Mathf.Abs(wr.left - exX) + Mathf.Abs(wr.top - exY)
                                 + Mathf.Abs((wr.right - wr.left) - exW)
                                 + Mathf.Abs((wr.bottom - wr.top) - exH);
-                    if (score < bestScore) { bestScore = score; bestWr = wr; bestCls = cls; }
+                    if (score < bestScore) { bestScore = score; bestWr = wr; bestCls = cls; bestH = h; }
                     return true;
                 };
                 Win32EnumProc top = (h, l) =>
@@ -653,6 +673,7 @@ namespace DisplayXR
                 {
                     s_hwndCorrValid = true;
                     s_hwndCorrX = bestWr.left; s_hwndCorrY = bestWr.top;
+                    s_hwndCorrHwnd = bestH;
                     string log = $"hwnd[{bestCls}]=({bestWr.left},{bestWr.top}) " +
                                  $"reflected=({exX:F0},{exY:F0}) score={bestScore:F1}";
                     if (log != s_lastHwndCorrLog)
@@ -819,6 +840,21 @@ namespace DisplayXR
             if (TryGetGameViewRenderRect(out int px, out int py, out int pw, out int ph, out string dbg))
             {
                 ForceGameViewFullResolution();
+                // BINDPANE: hand the runtime Unity's own pane window; the zone rect is the
+                // render area's offset within the pane's client (client==window rect for the
+                // borderless GUIView child, so screen-space subtraction is exact).
+                if (BindPaneEnabled() && s_hwndCorrValid && s_hwndCorrHwnd != System.IntPtr.Zero)
+                {
+                    DisplayXRProviderNative.dxr_prov_set_external_weave_hwnd(s_hwndCorrHwnd);
+                    DisplayXRProviderNative.dxr_prov_set_panel_rect(px - s_hwndCorrX, py - s_hwndCorrY, pw, ph);
+                    if (!s_loggedInitOnce)
+                    {
+                        s_loggedInitOnce = true;
+                        Debug.Log($"[DisplayXR] GameView BINDPANE init: pane=0x{s_hwndCorrHwnd.ToInt64():X} " +
+                                  $"at ({s_hwndCorrX},{s_hwndCorrY}) zone=({px - s_hwndCorrX},{py - s_hwndCorrY} {pw}x{ph}) | {dbg}");
+                    }
+                    return;
+                }
                 if (ZoneGlueEnabled() &&
                     TryGetMonitorRect(px + pw / 2, py + ph / 2, out int mx, out int my, out int mw, out int mh))
                 {
@@ -853,6 +889,15 @@ namespace DisplayXR
             if (!TryGetGameViewRenderRect(out int px, out int py, out int pw, out int ph, out string dbg))
                 return;
             if (!s_loggedGlueOnce) { s_loggedGlueOnce = true; Debug.Log($"[DisplayXR] GameView glue: {dbg}"); }
+            // BINDPANE: the bound window IS the pane — publish only the render area's
+            // client-relative offset (the pane moves itself; zone x/y stay put unless the
+            // in-pane layout changes). Never any window op.
+            if (BindPaneEnabled())
+            {
+                if (s_hwndCorrValid && s_hwndCorrHwnd != System.IntPtr.Zero)
+                    DisplayXRProviderNative.dxr_prov_set_panel_rect(px - s_hwndCorrX, py - s_hwndCorrY, pw, ph);
+                return;
+            }
             // Zone-glue (default, #740/#742): the window is parked at the monitor origin —
             // publish the pane's monitor-local rect to the zone-convergence path every frame
             // (native no-ops once converged; moves = pure zone x/y updates, no window op at

@@ -131,6 +131,15 @@ namespace DisplayXR
         public static extern void dxr_prov_set_panel_rect(int x, int y, int w, int h);
 
         /// <summary>
+        /// BINDPANE experiment (#740): bind Unity's OWN Game-view pane window (GUIView
+        /// child) as the weave HWND — set BEFORE the subsystem starts; the zone rect
+        /// (dxr_prov_set_panel_rect) then carries the render area's offset within that
+        /// window's client. The plugin never moves/restyles it. Editor + probe only.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void dxr_prov_set_external_weave_hwnd(System.IntPtr hwnd);
+
+        /// <summary>
         /// GameView weave-to-texture presentation (Task (a), editor + texture probe): the
         /// runtime-woven shared texture opened on Unity's D3D device. C# wraps it as an
         /// external Texture2D and draws it into the Game view (DisplayXRGameViewPresenter).

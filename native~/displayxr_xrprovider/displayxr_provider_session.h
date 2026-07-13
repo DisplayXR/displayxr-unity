@@ -342,6 +342,14 @@ DISPLAYXR_EXPORT void dxr_prov_set_panel_px(int w, int h);
 DISPLAYXR_EXPORT void dxr_prov_set_panel_rect(int x, int y, int w, int h);
 void dxr_prov_converge_gameview_zone(void);
 
+/// BINDPANE experiment (#740): bind Unity's OWN Game-view pane window (GUIView child)
+/// as the weave HWND instead of the dedicated proxy window. Set from C# BEFORE the
+/// subsystem starts; the zone rect (dxr_prov_set_panel_rect) then carries the render
+/// area's offset within that window's CLIENT rect. The plugin never moves/restyles
+/// this window (it is Unity's). NULL = default (dedicated window). Editor+probe only.
+DISPLAYXR_EXPORT void dxr_prov_set_external_weave_hwnd(void *hwnd);
+void *dxr_prov_get_external_weave_hwnd(void);
+
 /// Consume the per-extra-zone realloc latch (0-based index). Returns 1 (and clears)
 /// if that extra zone was just reallocated by dxr_prov_reconcile_size and its Unity
 /// texture(s) must be dropped + re-wrapped. Call for each extra zone each frame.

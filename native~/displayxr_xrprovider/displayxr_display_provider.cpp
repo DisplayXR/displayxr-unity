@@ -1369,6 +1369,15 @@ LifecycleStart(UnitySubsystemHandle handle, void *userData)
 	}
 #else
 	if (prov_want_dedicated_window()) {
+		// BINDPANE experiment (#740): C# supplied Unity's own Game-view pane HWND —
+		// bind THAT (the SR SDK tracks the real content window natively; the zone
+		// carries the render-area offset within its client). No dedicated window.
+		// (dxr_prov_get_external_weave_hwnd is declared in displayxr_provider_session.h.)
+		void *ext = dxr_prov_get_external_weave_hwnd();
+		if (ext) {
+			s_overlay_hwnd = ext;
+			prov_log("[DisplayXR-PROV] Lifecycle Start (BINDPANE: bound Unity pane HWND — no dedicated window)\n");
+		} else {
 		// (#173) Editor Play Mode: a STANDALONE movable weave window that does NOT
 		// track Unity's (whole-editor) window — coexists with the editor while still
 		// binding a real HWND (window-relative Kooima + #172 realloc). See
@@ -1378,6 +1387,7 @@ LifecycleStart(UnitySubsystemHandle handle, void *userData)
 		prov_log(s_overlay_hwnd
 		             ? "[DisplayXR-PROV] Lifecycle Start (dedicated provider window created, #173)\n"
 		             : "[DisplayXR-PROV] Lifecycle Start (dedicated window FAILED; runtime self-hosts)\n");
+		}
 
 		// Keyboard/mouse input (#166 task #9): install the same focus / raw-input
 		// hooks the app-owned overlay uses, so Unity's Input System keeps receiving
