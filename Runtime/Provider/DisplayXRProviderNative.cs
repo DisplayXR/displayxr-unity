@@ -121,6 +121,16 @@ namespace DisplayXR
         public static extern void dxr_prov_set_panel_px(int w, int h);
 
         /// <summary>
+        /// Zone-glue arrangement (#740/#742): publish the Game view pane's FULL screen rect
+        /// (position + size, physical px). The weave window stays parked at the monitor
+        /// origin; the ZONE rect carries the pane's screen offset (the desktop-avatar-proven
+        /// contract for placing woven content at a screen sub-rect). Seed BEFORE session
+        /// start and push every frame.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void dxr_prov_set_panel_rect(int x, int y, int w, int h);
+
+        /// <summary>
         /// GameView weave-to-texture presentation (Task (a), editor + texture probe): the
         /// runtime-woven shared texture opened on Unity's D3D device. C# wraps it as an
         /// external Texture2D and draws it into the Game view (DisplayXRGameViewPresenter).

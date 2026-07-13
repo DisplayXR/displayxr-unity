@@ -331,6 +331,15 @@ int  dxr_prov_reconcile_size(void);
 /// Clamped to the shared woven texture; no window op (magnify is absorbed by the mirror-blit
 /// downscale, and the value is Scale-independent). Probe/editor path only.
 DISPLAYXR_EXPORT void dxr_prov_set_panel_px(int w, int h);
+
+/// Zone-glue arrangement (#740/#742, the desktop-avatar-proven contract): publish the
+/// Game view pane's FULL screen rect (position + size, physical px). The weave window
+/// is born ONCE at the monitor origin covering the panel and never moved (no #727
+/// exposure, no drag re-snap churn); the ZONE rect carries the pane's true screen
+/// offset, so the weave phase is computed for the right pixels and a Game view move is
+/// a pure zone x/y data update. Seed BEFORE session start (borns the zone at the pane
+/// rect) and push every frame (converge follows moves/resizes). Editor + probe only.
+DISPLAYXR_EXPORT void dxr_prov_set_panel_rect(int x, int y, int w, int h);
 void dxr_prov_converge_gameview_zone(void);
 
 /// Consume the per-extra-zone realloc latch (0-based index). Returns 1 (and clears)

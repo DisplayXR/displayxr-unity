@@ -222,6 +222,59 @@ namespace DisplayXR
             return s_probeGate == 1;
         }
 
+        // Zone-glue arrangement (#740/#742, DEFAULT ON; env DISPLAYXR_PROV_GV_ZONEGLUE=0
+        // restores the legacy window-glue): the weave window is born ONCE at the monitor
+        // rect (origin-anchored, never moved — no #727 exposure, no drag re-snap churn) and
+        // the ZONE rect carries the Game view pane's true screen offset — the contract the
+        // desktop-avatar multi-zone sample proves correct for weaving at a screen sub-rect.
+        // Fixes the docked-layout phase error where the window-origin channel broke down
+        // (pane parked mid-host: phase off by a position-dependent amount, #740).
+        static int s_zoneGlueGate = -1;
+        static bool ZoneGlueEnabled()
+        {
+            if (!ProbeEnabled()) return false;
+            if (s_zoneGlueGate < 0)
+                s_zoneGlueGate = System.Environment.GetEnvironmentVariable(
+                    "DISPLAYXR_PROV_GV_ZONEGLUE") == "0" ? 0 : 1;
+            return s_zoneGlueGate == 1;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        struct Win32Point { public int x, y; }
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+        struct Win32MonitorInfo
+        {
+            public int cbSize;
+            public Win32Rect rcMonitor;
+            public Win32Rect rcWork;
+            public uint dwFlags;
+        }
+        [DllImport("user32.dll")] static extern System.IntPtr MonitorFromPoint(Win32Point pt, uint flags);
+        [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+        static extern bool GetMonitorInfoW(System.IntPtr hMonitor, ref Win32MonitorInfo info);
+
+        // The monitor rect (physical px) containing the given screen point — the panel the
+        // Game view lives on, i.e. where the zone-glue weave window is born. Falls back to
+        // (0,0,3840x2160)-style primary via MONITOR_DEFAULTTONEAREST semantics.
+        static bool TryGetMonitorRect(int px, int py, out int mx, out int my, out int mw, out int mh)
+        {
+            mx = my = mw = mh = 0;
+            if (Application.platform != RuntimePlatform.WindowsEditor) return false;
+            try
+            {
+                var pt = new Win32Point { x = px, y = py };
+                var mon = MonitorFromPoint(pt, 2 /* MONITOR_DEFAULTTONEAREST */);
+                if (mon == System.IntPtr.Zero) return false;
+                var mi = new Win32MonitorInfo { cbSize = Marshal.SizeOf<Win32MonitorInfo>() };
+                if (!GetMonitorInfoW(mon, ref mi)) return false;
+                mx = mi.rcMonitor.left; my = mi.rcMonitor.top;
+                mw = mi.rcMonitor.right - mi.rcMonitor.left;
+                mh = mi.rcMonitor.bottom - mi.rcMonitor.top;
+                return mw > 0 && mh > 0;
+            }
+            catch { return false; }
+        }
+
         // --- Stage-B seam diagnosis: geometry logging (env DISPLAYXR_PROV_GVGEOM=1) ---
         // One "GVGEOM" line whenever any watched value changes. Purpose: quantify the
         // point→pixel rounding disagreement suspected behind the maximize/resize midline
@@ -742,8 +795,11 @@ namespace DisplayXR
             return false;
         }
 
-        // Called by the loader BEFORE the subsystem starts: stash the render rect so
-        // session_start borns the forced zone at the panel's native resolution.
+        // Called by the loader BEFORE the subsystem starts. Zone-glue (default): born the
+        // weave window at the MONITOR rect (parked there for the whole session) and seed
+        // the ZONE at the pane's screen rect — the zone, not the window origin, carries
+        // the position (#740/#742). Legacy window-glue (DISPLAYXR_PROV_GV_ZONEGLUE=0):
+        // born the window at the pane rect; zone at (0,0) window-sized.
         public static void TryPushInitialGameViewRect()
         {
             if (!ProbeEnabled()) return;
@@ -751,6 +807,21 @@ namespace DisplayXR
             if (TryGetGameViewRenderRect(out int px, out int py, out int pw, out int ph, out string dbg))
             {
                 ForceGameViewFullResolution();
+                if (ZoneGlueEnabled() &&
+                    TryGetMonitorRect(px + pw / 2, py + ph / 2, out int mx, out int my, out int mw, out int mh))
+                {
+                    DisplayXRProviderNative.dxr_prov_set_initial_gameview_rect(mx, my, mw, mh);
+                    // Pane rect relative to the monitor origin: window client (0,0) == monitor
+                    // (mx,my), so the zone rect is monitor-local (== screen when mx,my == 0,0).
+                    DisplayXRProviderNative.dxr_prov_set_panel_rect(px - mx, py - my, pw, ph);
+                    if (!s_loggedInitOnce)
+                    {
+                        s_loggedInitOnce = true;
+                        Debug.Log($"[DisplayXR] GameView ZONE-GLUE init: monitor=({mx},{my} {mw}x{mh}) " +
+                                  $"zone=({px - mx},{py - my} {pw}x{ph}) | {dbg}");
+                    }
+                    return;
+                }
                 DisplayXRProviderNative.dxr_prov_set_initial_gameview_rect(px, py, pw, ph);
                 if (!s_loggedInitOnce) { s_loggedInitOnce = true; Debug.Log($"[DisplayXR] GameView initial rect: {dbg}"); }
             }
@@ -770,6 +841,18 @@ namespace DisplayXR
             if (!TryGetGameViewRenderRect(out int px, out int py, out int pw, out int ph, out string dbg))
                 return;
             if (!s_loggedGlueOnce) { s_loggedGlueOnce = true; Debug.Log($"[DisplayXR] GameView glue: {dbg}"); }
+            // Zone-glue (default, #740/#742): the window is parked at the monitor origin —
+            // publish the pane's monitor-local rect to the zone-convergence path every frame
+            // (native no-ops once converged; moves = pure zone x/y updates, no window op at
+            // all). NEVER call dxr_prov_set_gameview_rect here in this mode.
+            if (ZoneGlueEnabled())
+            {
+                if (TryGetMonitorRect(px + pw / 2, py + ph / 2, out int mx, out int my, out _, out _))
+                { px -= mx; py -= my; }
+                DisplayXRProviderNative.dxr_prov_set_panel_rect(px, py, pw, ph);
+                return;
+            }
+            // Legacy window-glue path (DISPLAYXR_PROV_GV_ZONEGLUE=0):
             // Phase 1: publish the authoritative panel PHYSICAL px to the native zone-convergence
             // path every frame (the native side no-ops once converged). This is the ONLY reliable
             // physical-px source — info.mirrorRtDesc is LOGICAL px on a HiDPI display. Scale-

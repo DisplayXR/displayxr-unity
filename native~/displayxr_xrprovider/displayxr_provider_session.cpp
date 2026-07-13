@@ -2733,8 +2733,14 @@ static int s_init_gv_x = 0, s_init_gv_y = 0, s_init_gv_w = 0, s_init_gv_h = 0;
 // authoritative Game-view render size — logical-vs-physical unambiguous, unlike the
 // C# GetMainGameViewTargetSize path). The per-frame pump converges the forced zone to
 // this so the compositor canvas == render viewport pixel-exact (Phase 1, #727 follow-up).
-// Written by dxr_prov_set_panel_px (mirror callback), read by dxr_prov_converge_gameview_zone.
+// Written by dxr_prov_set_panel_px / dxr_prov_set_panel_rect, read by
+// dxr_prov_converge_gameview_zone. x/y = the pane's SCREEN position (zone-glue
+// arrangement, #740/#742: the weave window is born at the MONITOR origin covering the
+// panel and never moves; the ZONE rect carries the pane's true screen offset — the
+// desktop-avatar-proven contract for placing woven content at a screen sub-rect).
+// INT32_MIN = position not published (legacy window-glue arrangement, zone at 0,0).
 static int s_gv_panel_w = 0, s_gv_panel_h = 0;
+static int s_gv_panel_x = INT32_MIN, s_gv_panel_y = INT32_MIN;
 // GameView mirror (Task (a)): the woven shared texture opened on UNITY'S device so
 // the display-provider can wrap it via CreateTexture and mirror-blit it into the
 // editor Game window. Opened lazily on first request (graphics thread, session ready).
@@ -2998,21 +3004,24 @@ void *dxr_prov_get_woven_unity_texture(uint32_t *w, uint32_t *h)
 void dxr_prov_get_woven_canvas(int32_t *x, int32_t *y, int32_t *cw, int32_t *ch,
                                uint32_t *texw, uint32_t *texh)
 {
-	// The runtime weaves the ZONE-sized region at the shared texture's top-left (verified
-	// by readback: content bbox == s_ps.zone_w/h). The mirror srcRect must match that
-	// woven region — NOT the live window client, which can exceed the frozen zone if the
-	// GameView was resized after the session started (→ srcRect would sample past the
-	// woven content into black, the Task (a) truncation). Fall back to the live window
-	// only when no zone is active.
+	// The runtime weaves the ZONE region into the shared texture at the ZONE's rect
+	// (zone-glue: content lands at (zone_x,zone_y), matching where the zone sits inside
+	// the panel-origin weave window; legacy window-glue: zone at (0,0) = texture
+	// top-left, verified by readback). The mirror srcRect must match that woven
+	// region — NOT the live window client. Fall back to the live window only when no
+	// zone is active.
+	int32_t rx = 0, ry = 0;
 	int32_t rw = s_ps.zone_valid ? s_ps.zone_w : 0;
 	int32_t rh = s_ps.zone_valid ? s_ps.zone_h : 0;
-	if (rw <= 0 || rh <= 0) {
+	if (rw > 0 && rh > 0) {
+		rx = s_ps.zone_x; ry = s_ps.zone_y;
+	} else {
 		uint32_t ww = 0, wh = 0; ps_window_size(&ww, &wh);
 		rw = ww ? (int32_t)ww : (int32_t)s_probe_woven_w;
 		rh = wh ? (int32_t)wh : (int32_t)s_probe_woven_h;
 	}
-	if (x)  *x  = 0;
-	if (y)  *y  = 0;
+	if (x)  *x  = rx;
+	if (y)  *y  = ry;
 	if (cw) *cw = rw;
 	if (ch) *ch = rh;
 	if (texw) *texw = s_probe_woven_w;
@@ -3446,19 +3455,31 @@ int dxr_prov_session_start(const char *runtime_json_path,
 				// do NOT restyle/move the window here — the window is fragile mid-start
 				// (raw-input hooks installed, device setup in flight); the per-frame glue
 				// repositions it after the session is up.
-				uint32_t ww = 0, wh = 0;
-				if (s_init_gv_w > 0 && s_init_gv_h > 0) {
-					ww = (uint32_t)s_init_gv_w; wh = (uint32_t)s_init_gv_h;
-				} else {
-					ps_window_size(&ww, &wh);
-				}
-				if (ww == 0 || wh == 0) { ww = 1280; wh = 720; }
+				// Zone-glue arrangement (#740/#742, desktop-avatar contract): when C# has
+				// published the pane's full screen rect pre-session (dxr_prov_set_panel_rect),
+				// the window is born at the MONITOR origin and the ZONE carries the pane's
+				// position — so seed the zone at that rect. Legacy window-glue: zone at
+				// (0,0) window-sized (the window origin carries the position).
 				s_ps.zone_valid = 1;
 				s_ps.zone_id = 1;
-				s_ps.zone_x = 0; s_ps.zone_y = 0;
-				s_ps.zone_w = (int32_t)ww; s_ps.zone_h = (int32_t)wh;
-				ps_log("[DisplayXR-PROV] PROBE: forced full-window zone %dx%d as texture-mode canvas (init_gv=%dx%d)\n",
-				       s_ps.zone_w, s_ps.zone_h, s_init_gv_w, s_init_gv_h);
+				if (s_gv_panel_x != INT32_MIN && s_gv_panel_w > 0 && s_gv_panel_h > 0) {
+					s_ps.zone_x = s_gv_panel_x; s_ps.zone_y = s_gv_panel_y;
+					s_ps.zone_w = s_gv_panel_w; s_ps.zone_h = s_gv_panel_h;
+					ps_log("[DisplayXR-PROV] PROBE: forced ZONE-GLUE zone (%d,%d %dx%d) as texture-mode canvas\n",
+					       s_ps.zone_x, s_ps.zone_y, s_ps.zone_w, s_ps.zone_h);
+				} else {
+					uint32_t ww = 0, wh = 0;
+					if (s_init_gv_w > 0 && s_init_gv_h > 0) {
+						ww = (uint32_t)s_init_gv_w; wh = (uint32_t)s_init_gv_h;
+					} else {
+						ps_window_size(&ww, &wh);
+					}
+					if (ww == 0 || wh == 0) { ww = 1280; wh = 720; }
+					s_ps.zone_x = 0; s_ps.zone_y = 0;
+					s_ps.zone_w = (int32_t)ww; s_ps.zone_h = (int32_t)wh;
+					ps_log("[DisplayXR-PROV] PROBE: forced full-window zone %dx%d as texture-mode canvas (init_gv=%dx%d)\n",
+					       s_ps.zone_w, s_ps.zone_h, s_init_gv_w, s_init_gv_h);
+				}
 			}
 			ps_log("[DisplayXR-PROV] PROBE: TEXTURE MODE active (%ux%u) — overlay window "
 			       "will NOT present; readback dumps once at frame %u.\n", pw, ph, kProbeDumpFrame);
@@ -3811,6 +3832,19 @@ void dxr_prov_set_panel_px(int w, int h)
 	s_gv_panel_h = (h > 0) ? h : 0;
 }
 
+// Zone-glue arrangement (#740/#742): publish the Game view pane's FULL screen rect.
+// The weave window sits at the monitor origin (born once, never moved — no #727
+// exposure, no drag re-snaps); the zone rect carries the pane position, so a Game view
+// move is a pure zone x/y data update (no realloc — size unchanged) and a resize is the
+// existing converge/realloc path. Called every frame from C# (editor + probe only).
+void dxr_prov_set_panel_rect(int x, int y, int w, int h)
+{
+	s_gv_panel_x = x;
+	s_gv_panel_y = y;
+	s_gv_panel_w = (w > 0) ? w : 0;
+	s_gv_panel_h = (h > 0) ? h : 0;
+}
+
 // Called from the per-frame pump BEFORE dxr_prov_reconcile_size. If the published panel
 // px differs from the live zone, re-drive the zone (clamped to the shared woven texture
 // dims) via the existing change-detected path → reconcile reallocs the swapchain/bridge,
@@ -3821,14 +3855,23 @@ void dxr_prov_converge_gameview_zone(void)
 	if (!s_probe_enabled || !s_ps.zone_valid) return;
 	if (s_gv_panel_w <= 0 || s_gv_panel_h <= 0) return;
 	int w = s_gv_panel_w, h = s_gv_panel_h;
+	// Zone-glue: the zone rect also carries the pane's screen POSITION (weave window is
+	// parked at the monitor origin). Legacy window-glue publishes no position → keep 0,0.
+	int x = (s_gv_panel_x != INT32_MIN) ? s_gv_panel_x : s_ps.zone_x;
+	int y = (s_gv_panel_y != INT32_MIN) ? s_gv_panel_y : s_ps.zone_y;
 	// Clamp to the shared woven texture (the runtime cannot weave past it).
-	if (s_probe_woven_w > 0 && (uint32_t)w > s_probe_woven_w) w = (int)s_probe_woven_w;
-	if (s_probe_woven_h > 0 && (uint32_t)h > s_probe_woven_h) h = (int)s_probe_woven_h;
-	if (w == s_ps.zone_w && h == s_ps.zone_h) return; // already converged — no realloc
-	ps_log("[DisplayXR-PROV] gameview zone converge: %dx%d -> %dx%d (panel=%dx%d tex=%ux%u)\n",
-	       s_ps.zone_w, s_ps.zone_h, w, h, s_gv_panel_w, s_gv_panel_h,
+	if (x < 0) x = 0;
+	if (y < 0) y = 0;
+	if (s_probe_woven_w > 0 && (uint32_t)(x + w) > s_probe_woven_w) w = (int)s_probe_woven_w - x;
+	if (s_probe_woven_h > 0 && (uint32_t)(y + h) > s_probe_woven_h) h = (int)s_probe_woven_h - y;
+	if (w <= 0 || h <= 0) return;
+	if (x == s_ps.zone_x && y == s_ps.zone_y && w == s_ps.zone_w && h == s_ps.zone_h)
+		return; // already converged — no zone churn
+	ps_log("[DisplayXR-PROV] gameview zone converge: (%d,%d %dx%d) -> (%d,%d %dx%d) (panel=(%d,%d %dx%d) tex=%ux%u)\n",
+	       s_ps.zone_x, s_ps.zone_y, s_ps.zone_w, s_ps.zone_h, x, y, w, h,
+	       s_gv_panel_x, s_gv_panel_y, s_gv_panel_w, s_gv_panel_h,
 	       s_probe_woven_w, s_probe_woven_h);
-	dxr_prov_set_3d_zone_rect(s_ps.zone_x, s_ps.zone_y, w, h);
+	dxr_prov_set_3d_zone_rect(x, y, w, h);
 }
 
 // Multi-zone (#166 Phase B2). total_3d_zones = number of 3D zones (index 0 =
