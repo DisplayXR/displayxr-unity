@@ -38,7 +38,7 @@ extern "C" int dxr_prov_request_rendering_mode(uint32_t mode_index);
 // Accessors on the GraphicsBackend opaque class — defined as a thin wrapper
 // in displayxr_hooks.cpp so we don't need the full class definition here.
 uint32_t displayxr_hooked_get_rendering_mode_count(GraphicsBackend *b);
-const XrDisplayRenderingModeInfoEXT *displayxr_hooked_get_rendering_modes(GraphicsBackend *b);
+const XrDisplayRenderingModeInfoDXR *displayxr_hooked_get_rendering_modes(GraphicsBackend *b);
 XrResult displayxr_hooked_request_rendering_mode(GraphicsBackend *b, XrSession s, uint32_t mode_index);
 
 // ============================================================================
@@ -115,8 +115,8 @@ typedef struct StandaloneState {
 	SASwapchain atlas;
 	int atlas_created;
 
-	// Rendering mode metadata (from xrEnumerateDisplayRenderingModesEXT)
-	XrDisplayRenderingModeInfoEXT rendering_modes[SA_MAX_RENDERING_MODES];
+	// Rendering mode metadata (from xrEnumerateDisplayRenderingModesDXR)
+	XrDisplayRenderingModeInfoDXR rendering_modes[SA_MAX_RENDERING_MODES];
 	uint32_t rendering_mode_count;
 	uint32_t current_rendering_mode_index;
 
@@ -124,11 +124,11 @@ typedef struct StandaloneState {
 	float eye_positions[SA_MAX_VIEWS][3];
 	uint32_t located_view_count;
 
-	// XR_EXT_view_rig (#396): when the runtime advertises the extension, the
+	// XR_DXR_view_rig (#396): when the runtime advertises the extension, the
 	// frame locate chains a rig descriptor and the runtime returns render-ready
 	// per-view pose+fov (Kooima done runtime-side). compute_views then builds
 	// matrices from these instead of running display3d/camera3d locally.
-	int has_view_rig;                    // runtime advertises XR_EXT_view_rig
+	int has_view_rig;                    // runtime advertises XR_DXR_view_rig
 	int rig_views_valid;                 // begin_frame filled rig_view_* this frame
 	XrPosef rig_view_pose[SA_MAX_VIEWS]; // render-ready per-view pose
 	XrFovf rig_view_fov[SA_MAX_VIEWS];   // render-ready per-view fov
@@ -166,10 +166,10 @@ typedef struct StandaloneState {
 	PFN_xrReleaseSwapchainImage pfn_release_swapchain_image;
 
 	// Display mode extensions (optional — resolved after instance creation)
-	PFN_xrRequestDisplayModeEXT pfn_request_display_mode;
-	PFN_xrRequestDisplayRenderingModeEXT pfn_request_rendering_mode;
-	PFN_xrEnumerateDisplayRenderingModesEXT pfn_enumerate_rendering_modes;
-	PFN_xrSetSharedTextureOutputRectEXT pfn_set_output_rect;
+	PFN_xrRequestDisplayModeDXR pfn_request_display_mode;
+	PFN_xrRequestDisplayRenderingModeDXR pfn_request_rendering_mode;
+	PFN_xrEnumerateDisplayRenderingModesDXR pfn_enumerate_rendering_modes;
+	PFN_xrSetSharedTextureOutputRectDXR pfn_set_output_rect;
 	PFN_xrSetSharedTextureSurround2DFenceEXT pfn_set_surround_fence;
 	uint32_t canvas_width;
 	uint32_t canvas_height;
@@ -371,25 +371,25 @@ resolve_functions(void)
 	// Optional display mode extensions (don't fail if missing)
 	{
 		PFN_xrVoidFunction fn = NULL;
-		if (XR_SUCCEEDED(s_sa.gipa(s_sa.instance, "xrRequestDisplayModeEXT", &fn)) && fn) {
-			s_sa.pfn_request_display_mode = (PFN_xrRequestDisplayModeEXT)fn;
+		if (XR_SUCCEEDED(s_sa.gipa(s_sa.instance, "xrRequestDisplayModeDXR", &fn)) && fn) {
+			s_sa.pfn_request_display_mode = (PFN_xrRequestDisplayModeDXR)fn;
 			s_sa.has_display_mode_ext = 1;
-			sa_log("[DisplayXR-SA] Resolved xrRequestDisplayModeEXT\n");
+			sa_log("[DisplayXR-SA] Resolved xrRequestDisplayModeDXR\n");
 		}
 		fn = NULL;
-		if (XR_SUCCEEDED(s_sa.gipa(s_sa.instance, "xrRequestDisplayRenderingModeEXT", &fn)) && fn) {
-			s_sa.pfn_request_rendering_mode = (PFN_xrRequestDisplayRenderingModeEXT)fn;
-			sa_log("[DisplayXR-SA] Resolved xrRequestDisplayRenderingModeEXT\n");
+		if (XR_SUCCEEDED(s_sa.gipa(s_sa.instance, "xrRequestDisplayRenderingModeDXR", &fn)) && fn) {
+			s_sa.pfn_request_rendering_mode = (PFN_xrRequestDisplayRenderingModeDXR)fn;
+			sa_log("[DisplayXR-SA] Resolved xrRequestDisplayRenderingModeDXR\n");
 		}
 		fn = NULL;
-		if (XR_SUCCEEDED(s_sa.gipa(s_sa.instance, "xrEnumerateDisplayRenderingModesEXT", &fn)) && fn) {
-			s_sa.pfn_enumerate_rendering_modes = (PFN_xrEnumerateDisplayRenderingModesEXT)fn;
-			sa_log("[DisplayXR-SA] Resolved xrEnumerateDisplayRenderingModesEXT\n");
+		if (XR_SUCCEEDED(s_sa.gipa(s_sa.instance, "xrEnumerateDisplayRenderingModesDXR", &fn)) && fn) {
+			s_sa.pfn_enumerate_rendering_modes = (PFN_xrEnumerateDisplayRenderingModesDXR)fn;
+			sa_log("[DisplayXR-SA] Resolved xrEnumerateDisplayRenderingModesDXR\n");
 		}
 		fn = NULL;
-		if (XR_SUCCEEDED(s_sa.gipa(s_sa.instance, "xrSetSharedTextureOutputRectEXT", &fn)) && fn) {
-			s_sa.pfn_set_output_rect = (PFN_xrSetSharedTextureOutputRectEXT)fn;
-			sa_log("[DisplayXR-SA] Resolved xrSetSharedTextureOutputRectEXT\n");
+		if (XR_SUCCEEDED(s_sa.gipa(s_sa.instance, "xrSetSharedTextureOutputRectDXR", &fn)) && fn) {
+			s_sa.pfn_set_output_rect = (PFN_xrSetSharedTextureOutputRectDXR)fn;
+			sa_log("[DisplayXR-SA] Resolved xrSetSharedTextureOutputRectDXR\n");
 		}
 		fn = nullptr;
 		if (XR_SUCCEEDED(s_sa.gipa(s_sa.instance, "xrSetSharedTextureSurround2DFenceEXT", &fn)) && fn) {
@@ -419,7 +419,7 @@ enumerate_and_store_modes(void)
 
 	if (total > SA_MAX_RENDERING_MODES) total = SA_MAX_RENDERING_MODES;
 	for (uint32_t i = 0; i < total; i++) {
-		s_sa.rendering_modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_EXT;
+		s_sa.rendering_modes[i].type = XR_TYPE_DISPLAY_RENDERING_MODE_INFO_DXR;
 		s_sa.rendering_modes[i].next = NULL;
 	}
 
@@ -443,7 +443,7 @@ enumerate_and_store_modes(void)
 }
 
 /// Get the current rendering mode info. Returns NULL if no modes enumerated.
-static const XrDisplayRenderingModeInfoEXT *
+static const XrDisplayRenderingModeInfoDXR *
 get_current_mode(void)
 {
 	for (uint32_t i = 0; i < s_sa.rendering_mode_count; i++) {
@@ -455,7 +455,7 @@ get_current_mode(void)
 
 /// Get tiling parameters for a rendering mode (or defaults if NULL).
 static void
-get_mode_tiling(const XrDisplayRenderingModeInfoEXT *mode,
+get_mode_tiling(const XrDisplayRenderingModeInfoDXR *mode,
                 uint32_t *view_count, uint32_t *tile_cols, uint32_t *tile_rows,
                 uint32_t *view_w, uint32_t *view_h)
 {
@@ -485,7 +485,7 @@ get_mode_tiling(const XrDisplayRenderingModeInfoEXT *mode,
 // if canvas is not set. Used for actual rendering; get_mode_tiling (above)
 // is used for worst-case atlas/swapchain sizing.
 static void
-get_render_tiling(const XrDisplayRenderingModeInfoEXT *mode,
+get_render_tiling(const XrDisplayRenderingModeInfoDXR *mode,
                   uint32_t *view_count, uint32_t *tile_cols, uint32_t *tile_rows,
                   uint32_t *view_w, uint32_t *view_h)
 {
@@ -660,7 +660,7 @@ destroy_atlas_swapchain(void)
 
 
 #if defined(_WIN32)
-// Push the canvas rect to the runtime via xrSetSharedTextureOutputRectEXT.
+// Push the canvas rect to the runtime via xrSetSharedTextureOutputRectDXR.
 // canvas_offset_x/y are WINDOW-RELATIVE (offset within the client area),
 // not screen-relative — the SR weaver adds these to its own window position
 // when computing phase alignment. Since our canvas IS the full window with
@@ -1069,7 +1069,7 @@ displayxr_standalone_start(const char *runtime_json_path)
 	if (s_unity_gfx_api == 21 /* Vulkan */) win_gfx_enable = "XR_KHR_vulkan_enable";
 #endif
 #endif
-	// XR_EXT_view_rig (#396): probe availability BEFORE requesting it — older
+	// XR_DXR_view_rig (#396): probe availability BEFORE requesting it — older
 	// runtimes reject an unknown extension at xrCreateInstance. Only enable it
 	// when advertised; otherwise the SA path falls back to the legacy local
 	// Kooima compute in compute_views (see the has_view_rig gate there).
@@ -1090,7 +1090,7 @@ displayxr_standalone_start(const char *runtime_json_path)
 				if (XR_SUCCEEDED(enum_ext(NULL, avail, &avail, props))) {
 					for (uint32_t i = 0; i < avail; i++) {
 						if (strcmp(props[i].extensionName,
-						           XR_EXT_VIEW_RIG_EXTENSION_NAME) == 0) {
+						           XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0) {
 							s_sa.has_view_rig = 1;
 							break;
 						}
@@ -1099,23 +1099,23 @@ displayxr_standalone_start(const char *runtime_json_path)
 				free(props);
 			}
 		}
-		sa_log("[DisplayXR-SA] XR_EXT_view_rig: %s\n",
+		sa_log("[DisplayXR-SA] XR_DXR_view_rig: %s\n",
 		       s_sa.has_view_rig ? "AVAILABLE (runtime owns Kooima)"
 		                         : "not found (legacy local Kooima path)");
 	}
 
 	const char *extensions[8];
 	uint32_t ext_count = 0;
-	extensions[ext_count++] = XR_EXT_DISPLAY_INFO_EXTENSION_NAME;
+	extensions[ext_count++] = XR_DXR_DISPLAY_INFO_EXTENSION_NAME;
 #if defined(__APPLE__)
 	extensions[ext_count++] = XR_KHR_METAL_ENABLE_EXTENSION_NAME;
-	extensions[ext_count++] = XR_EXT_COCOA_WINDOW_BINDING_EXTENSION_NAME;
+	extensions[ext_count++] = XR_DXR_COCOA_WINDOW_BINDING_EXTENSION_NAME;
 #elif defined(_WIN32)
 	extensions[ext_count++] = win_gfx_enable;
-	extensions[ext_count++] = XR_EXT_WIN32_WINDOW_BINDING_EXTENSION_NAME;
+	extensions[ext_count++] = XR_DXR_WIN32_WINDOW_BINDING_EXTENSION_NAME;
 #endif
 	if (s_sa.has_view_rig)
-		extensions[ext_count++] = XR_EXT_VIEW_RIG_EXTENSION_NAME;
+		extensions[ext_count++] = XR_DXR_VIEW_RIG_EXTENSION_NAME;
 
 	PFN_xrVoidFunction fn_create = NULL;
 	s_sa.gipa(XR_NULL_HANDLE, "xrCreateInstance", &fn_create);
@@ -1171,8 +1171,8 @@ displayxr_standalone_start(const char *runtime_json_path)
 	}
 
 	// --- Step 6: Get system properties + display info ---
-	XrDisplayInfoEXT display_info_ext = {};
-	display_info_ext.type = XR_TYPE_DISPLAY_INFO_EXT;
+	XrDisplayInfoDXR display_info_ext = {};
+	display_info_ext.type = XR_TYPE_DISPLAY_INFO_DXR;
 
 	XrSystemProperties sys_props = {XR_TYPE_SYSTEM_PROPERTIES};
 	sys_props.next = &display_info_ext;
@@ -1274,8 +1274,8 @@ displayxr_standalone_start(const char *runtime_json_path)
 	}
 
 	// Cocoa window binding (plugin-owned preview window)
-	XrCocoaWindowBindingCreateInfoEXT mac_binding = {};
-	mac_binding.type = XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_EXT;
+	XrCocoaWindowBindingCreateInfoDXR mac_binding = {};
+	mac_binding.type = XR_TYPE_COCOA_WINDOW_BINDING_CREATE_INFO_DXR;
 	mac_binding.viewHandle = displayxr_sa_metal_get_view();
 	mac_binding.readbackCallback = NULL;
 	mac_binding.readbackUserdata = NULL;
@@ -1288,8 +1288,8 @@ displayxr_standalone_start(const char *runtime_json_path)
 	// Win32 window binding — identical for both graphics APIs. The runtime
 	// composites the woven output directly into this plugin-owned HWND.
 	// Declared at function scope so it outlives the xrCreateSession call below.
-	XrWin32WindowBindingCreateInfoEXT win_binding = {};
-	win_binding.type = XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_EXT;
+	XrWin32WindowBindingCreateInfoDXR win_binding = {};
+	win_binding.type = XR_TYPE_WIN32_WINDOW_BINDING_CREATE_INFO_DXR;
 	win_binding.windowHandle = (void *)s_sa.preview_hwnd;
 	win_binding.readbackCallback = NULL;
 	win_binding.readbackUserdata = NULL;
@@ -1549,13 +1549,13 @@ displayxr_standalone_begin_frame(int *should_render)
 		XrViewState view_state = {XR_TYPE_VIEW_STATE};
 		uint32_t view_count = 0;
 
-		// XR_EXT_view_rig (#396): chain a rig descriptor so the runtime returns
+		// XR_DXR_view_rig (#396): chain a rig descriptor so the runtime returns
 		// render-ready XrView{pose,fov}, and chain the raw channel to recover the
 		// raw display-space eyes (for the gizmo / eye cache). The runtime owns the
-		// window/canvas resolve (we pushed it via xrSetSharedTextureOutputRectEXT).
-		XrDisplayRigEXT display_rig = {XR_TYPE_DISPLAY_RIG_EXT};
-		XrCameraRigEXT camera_rig = {XR_TYPE_CAMERA_RIG_EXT};
-		XrViewDisplayRawEXT raw_probe = {XR_TYPE_VIEW_DISPLAY_RAW_EXT};
+		// window/canvas resolve (we pushed it via xrSetSharedTextureOutputRectDXR).
+		XrDisplayRigDXR display_rig = {XR_TYPE_DISPLAY_RIG_DXR};
+		XrCameraRigDXR camera_rig = {XR_TYPE_CAMERA_RIG_DXR};
+		XrViewDisplayRawDXR raw_probe = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
 		XrPosef rig_pose = s_sa.display_pose_set
 			? s_sa.display_pose
 			: XrPosef{{0, 0, 0, 1}, {0, 0, 0}};
@@ -1681,7 +1681,7 @@ displayxr_standalone_submit_frame_atlas(void *atlas_tex)
 	s_sa.pfn_release_swapchain_image(s_sa.atlas.handle, &rel_info);
 
 	// Get current mode tiling parameters (canvas-aware render dims)
-	const XrDisplayRenderingModeInfoEXT *mode = get_current_mode();
+	const XrDisplayRenderingModeInfoDXR *mode = get_current_mode();
 	uint32_t eye_count, tile_cols, tile_rows, view_w, view_h;
 	get_render_tiling(mode, &eye_count, &tile_cols, &tile_rows, &view_w, &view_h);
 
@@ -1755,7 +1755,7 @@ displayxr_standalone_submit_frame_atlas(void *atlas_tex)
 	// Window-space UI overlay (issue #67). Lazily creates an overlay
 	// swapchain on this session, copies Unity's RT into it, and fills
 	// hud_layer if a Unity texture is registered.
-	XrCompositionLayerWindowSpaceEXT hud_layer = {};
+	XrCompositionLayerWindowSpaceDXR hud_layer = {};
 	WsuiStandaloneFns wsui_fns = {
 		s_sa.pfn_enumerate_swapchain_formats,
 		s_sa.pfn_create_swapchain,
@@ -1834,7 +1834,7 @@ displayxr_standalone_end_frame_empty(void)
 
 
 // ============================================================================
-// XR_EXT_view_rig (#396): render-ready XrView{pose,fov} -> renderer matrices.
+// XR_DXR_view_rig (#396): render-ready XrView{pose,fov} -> renderer matrices.
 // Ported verbatim from the runtime reference app
 // (test_apps/cube_handle_d3d11_win/main.cpp): same convention the displayxr::math
 // rigs emit, so RenderEyeToAtlas's existing Z-flip / proj-Y-flip stay correct.
@@ -1902,7 +1902,7 @@ displayxr_standalone_compute_views(
 	s_sa.last_near_z = near_z;
 	s_sa.last_far_z = far_z;
 
-	// XR_EXT_view_rig (#396): the runtime already returned render-ready per-view
+	// XR_DXR_view_rig (#396): the runtime already returned render-ready per-view
 	// pose+fov this frame (window/canvas resolve + Kooima done runtime-side).
 	// Build the renderer matrices straight from them; the legacy display3d /
 	// camera3d compute below is the fallback for runtimes without the extension.
@@ -1925,13 +1925,13 @@ displayxr_standalone_compute_views(
 		return;
 	}
 
-	// XR_EXT_view_rig (#396 W7): no rig views this frame => the runtime lacks the
+	// XR_DXR_view_rig (#396 W7): no rig views this frame => the runtime lacks the
 	// extension (or the locate failed). There is NO local Kooima fallback — signal
 	// "no views" so the caller skips the eye render. One-shot WARN.
 	static int s_sa_no_rig_warned = 0;
 	if (!s_sa_no_rig_warned) {
 		s_sa_no_rig_warned = 1;
-		sa_log("[DisplayXR-SA] compute_views: runtime lacks XR_EXT_view_rig — "
+		sa_log("[DisplayXR-SA] compute_views: runtime lacks XR_DXR_view_rig — "
 		       "no stereo views produced. Update the DisplayXR runtime.\n");
 	}
 	*valid = 0;
@@ -1950,7 +1950,7 @@ displayxr_standalone_get_current_mode_info(
 	float *view_scale_x, float *view_scale_y,
 	int *hardware_display_3d)
 {
-	const XrDisplayRenderingModeInfoEXT *mode = get_current_mode();
+	const XrDisplayRenderingModeInfoDXR *mode = get_current_mode();
 	uint32_t vc, tc, tr, vw, vh;
 	get_render_tiling(mode, &vc, &tc, &tr, &vw, &vh);
 
@@ -2440,7 +2440,7 @@ displayxr_standalone_request_display_mode(int mode_3d)
 	    s_sa.session == XR_NULL_HANDLE)
 		return 0;
 
-	XrDisplayModeEXT mode = mode_3d ? XR_DISPLAY_MODE_3D_EXT : XR_DISPLAY_MODE_2D_EXT;
+	XrDisplayModeDXR mode = mode_3d ? XR_DISPLAY_MODE_3D_DXR : XR_DISPLAY_MODE_2D_DXR;
 	XrResult result = s_sa.pfn_request_display_mode(s_sa.session, mode);
 	sa_log("[DisplayXR-SA] RequestDisplayMode(%s) → %d\n",
 		mode_3d ? "3D" : "2D", result);
@@ -2454,7 +2454,7 @@ displayxr_standalone_request_display_mode(int mode_3d)
 // backend's modes. Returns count via *out_count and the pointer to the
 // modes array via *out_modes.
 static void pick_rendering_modes_source(
-	const XrDisplayRenderingModeInfoEXT **out_modes,
+	const XrDisplayRenderingModeInfoDXR **out_modes,
 	uint32_t *out_count)
 {
 	if (s_sa.session != XR_NULL_HANDLE && s_sa.rendering_mode_count > 0) {
@@ -2487,7 +2487,7 @@ displayxr_standalone_get_rendering_mode_name(uint32_t array_slot, char *buffer, 
 	// flat byte buffer + capacity and parse a null-terminated UTF-8 string out.
 	if (!buffer || buffer_size == 0) return 0;
 	buffer[0] = '\0';
-	const XrDisplayRenderingModeInfoEXT *modes = nullptr;
+	const XrDisplayRenderingModeInfoDXR *modes = nullptr;
 	uint32_t total = 0;
 	pick_rendering_modes_source(&modes, &total);
 	if (modes == nullptr || array_slot >= total) return 0;
@@ -2543,7 +2543,7 @@ displayxr_standalone_enumerate_rendering_modes(
 	float *view_scale_x, float *view_scale_y,
 	int *hardware_display_3d)
 {
-	const XrDisplayRenderingModeInfoEXT *modes = nullptr;
+	const XrDisplayRenderingModeInfoDXR *modes = nullptr;
 	uint32_t total = 0;
 	pick_rendering_modes_source(&modes, &total);
 

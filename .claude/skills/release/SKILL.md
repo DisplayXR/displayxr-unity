@@ -156,51 +156,114 @@ Run: `gh run view RUN_ID --json status,conclusion`
 
 `displayxr_unity.dll` is the native plugin that loads into the Unity
 player, so Smart App Control blocks it when unsigned. CI builds it on a
-GitHub-hosted runner (unsigned; the code-signing key is held on a build
-machine and isn't available to cloud CI, and no secret lives in this
-public repo). So a signed release is produced by signing the shipped DLL
-on a signing-capable machine and re-publishing.
+GitHub-hosted runner (UNSIGNED — the EV signing key lives on a self-hosted
+build box, never in cloud CI, and this public repo names no signer). So a
+signed release is produced by sending the CI-built DLL to a **remote
+signing provider** and re-injecting the signed DLL into both distribution
+channels.
 
-Signing does **not** require rebuilding — we sign the CI-built DLL in
-place inside both distribution channels (the `.tgz` asset and the `upm`
-orphan branch). No-ops cleanly without signing capability.
+The provider is named by the **`DXR_SIGN_REPO` local env var** (unset here →
+unsigned; the public repo hardcodes no provider path). On the dev/release box
+it's typically sourced from the runtime repo's `.env.local`
+(`export DXR_SIGN_REPO=<owner/repo>`). The provider exposes a **`sign-artifact`**
+folder hook: zip a folder of PEs → it signs every `.dll`/`.exe` on its
+self-hosted EV box → returns a `signed` artifact. This flow is **OS-agnostic**
+(runs from macOS / Linux / any Windows — no local cert, no `SIGN_CMD`), the same
+primitive `/dxr-release` and `/installer-release` use. Contract: the runtime
+repo's `docs/specs/runtime/release-signing.md`.
+
+Signing does **not** rebuild — the CI-built DLL is signed in place inside the
+`.tgz` release asset AND the `upm` orphan branch (git-URL installs read the DLL
+from there). It **never gates publishing**: any failure leaves the unsigned CI
+release and is flagged in the report. Re-running this against an already-released
+version signs it in place — safe and idempotent — so a version cut without a
+signer can be signed later by simply re-running `/release [VERSION]`.
 
 ### Step 3.5.1: Capability check
 ```bash
-if [ -z "$SIGN_CMD" ] || ! uname -s | grep -qiE 'mingw|msys|cygwin|windows'; then
-  echo "⚠  SIGNING SKIPPED — no signing capability; release DLL stays UNSIGNED."
-  echo "   Re-run /release on a signing-capable build machine (SIGN_CMD set)."
-  SIGNED=no   # continue — do not fail
-else
+SIGN_REPO="${DXR_SIGN_REPO}"   # local env only; unset -> unsigned (public repo names no provider)
+if [ -n "$SIGN_REPO" ] && gh workflow view sign-artifact -R "$SIGN_REPO" >/dev/null 2>&1; then
   SIGNED=yes
+else
+  echo "⚠  SIGNING SKIPPED — DXR_SIGN_REPO unset in the env, or the provider is unreachable."
+  echo "   The release DLL stays UNSIGNED. Set DXR_SIGN_REPO to a repo implementing"
+  echo "   'sign-artifact' (e.g. source the runtime repo's .env.local), then re-run"
+  echo "   /release [VERSION] — it detects the existing release and signs it in place."
+  SIGNED=no   # continue — do not fail
 fi
 ```
 
-### Step 3.5.2: Sign the DLL in the `.tgz` asset, repack, re-upload (if SIGNED=yes)
+### Step 3.5.2: Sign the DLL via `sign-artifact`, re-inject into BOTH channels (if SIGNED=yes)
+Fold **only** the DLL into a sign folder, hand it to the provider, then re-inject
+the signed copy into the `.tgz` asset and the `upm` branch. Cleans up the temp
+signing release on the provider regardless of outcome.
 ```bash
-TGZ="com.displayxr.unity-[VERSION_NUMBER].tgz"
-gh release download [VERSION] --repo DisplayXR/displayxr-unity --pattern "$TGZ" --dir /tmp/usign
-mkdir -p /tmp/usign/x && tar -xzf "/tmp/usign/$TGZ" -C /tmp/usign/x
-DLL=$(find /tmp/usign/x -ipath '*Windows/x64/displayxr_unity.dll')
-powershell -NoProfile -ExecutionPolicy Bypass -File Scripts~\\sign-release.ps1 -Path "$(dirname "$DLL")" -SignCmd "$SIGN_CMD"
-# repack with the same internal layout (npm packages root at 'package/')
-( cd /tmp/usign/x && tar -czf "/tmp/usign/$TGZ" package )
-gh release upload [VERSION] "/tmp/usign/$TGZ" --clobber --repo DisplayXR/displayxr-unity
+if [ "$SIGNED" = yes ]; then
+  TGZ="com.displayxr.unity-[VERSION_NUMBER].tgz"
+  DLL_REL="Runtime/Plugins/Windows/x64/displayxr_unity.dll"
+  D=$(mktemp -d)
+
+  # Pull the just-released .tgz and extract the CI-built (unsigned) DLL.
+  gh release download [VERSION] -R DisplayXR/displayxr-unity -p "$TGZ" -D "$D"
+  mkdir -p "$D/x"; tar xzf "$D/$TGZ" -C "$D/x"
+  PKGDIR=$(ls -d "$D"/x/com.displayxr.unity-* 2>/dev/null | head -1); [ -z "$PKGDIR" ] && PKGDIR="$D/x/package"
+  DLL="$PKGDIR/$DLL_REL"
+
+  SIGNED_DLL=""
+  if [ ! -f "$DLL" ]; then
+    echo "⚠ $DLL_REL not found in $TGZ — ships unsigned."; SIGNED=no
+  else
+    mkdir -p "$D/in"; cp "$DLL" "$D/in/"                       # fold ONLY the DLL into a sign folder
+    # portable zip: git-bash on Windows has no `zip` — fall back to PowerShell.
+    if command -v zip >/dev/null; then ( cd "$D/in" && zip -qr "$D/unsigned.zip" . )
+    else powershell -NoProfile -Command "Compress-Archive -Path '$(cygpath -w "$D/in")\*' -DestinationPath '$(cygpath -w "$D/unsigned.zip")' -Force"; fi
+
+    TMP="sign-unity-$(date +%s)-$$"
+    gh release create "$TMP" -R "$SIGN_REPO" --prerelease --title "$TMP" \
+       --notes "temp unity-signing payload (auto-deleted)" "$D/unsigned.zip"
+    SINCE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+    gh workflow run sign-artifact -R "$SIGN_REPO" -f release_tag="$TMP"
+    RID=""
+    for _ in $(seq 1 20); do
+      RID=$(gh run list -R "$SIGN_REPO" --workflow sign-artifact --event workflow_dispatch \
+              --limit 8 --json databaseId,createdAt \
+              --jq "[.[]|select(.createdAt>=\"$SINCE\")]|sort_by(.createdAt)|last|.databaseId // empty")
+      [ -n "$RID" ] && break; sleep 4
+    done
+    if [ -n "$RID" ] && gh run watch "$RID" -R "$SIGN_REPO" --interval 15 --exit-status; then
+      gh run download "$RID" -R "$SIGN_REPO" -n signed -D "$D/out"
+      # portable unzip (git-bash on Windows has no `unzip`).
+      if command -v unzip >/dev/null; then ( cd "$D/out" && unzip -qo signed.zip -d "$D/signed" 2>/dev/null || true )
+      else powershell -NoProfile -Command "Expand-Archive -Path '$(cygpath -w "$D/out/signed.zip")' -DestinationPath '$(cygpath -w "$D/signed")' -Force"; fi
+      SIGNED_DLL=$(ls "$D/signed/displayxr_unity.dll" 2>/dev/null | head -1)
+    fi
+    gh release delete "$TMP" -R "$SIGN_REPO" --yes --cleanup-tag >/dev/null 2>&1 || true
+
+    if [ -z "$SIGNED_DLL" ]; then
+      echo "⚠ sign-artifact did not return a signed DLL — ships unsigned."; SIGNED=no
+    else
+      # Channel 1 — repack the .tgz with the signed DLL, re-upload over the asset.
+      cp "$SIGNED_DLL" "$DLL"
+      ( cd "$D/x" && tar czf "$D/$TGZ" "$(basename "$PKGDIR")" )
+      gh release upload [VERSION] "$D/$TGZ" --clobber -R DisplayXR/displayxr-unity
+
+      # Channel 2 — put the signed DLL on the `upm` branch + move its version tag.
+      # CI already force-pushed `upm` with the unsigned DLL; layer the signed one on top.
+      git fetch origin upm --quiet && git checkout -B upm origin/upm
+      cp "$SIGNED_DLL" "$DLL_REL"; git add -f "$DLL_REL"
+      git commit -q -m "Sign displayxr_unity.dll for [VERSION] (Leia EV)" || echo "(upm already signed)"
+      git push -f origin upm
+      git tag -f "upm/[VERSION]" && git push -f origin "upm/[VERSION]"
+      git checkout main
+      echo "✅ signed displayxr_unity.dll re-injected into the .tgz asset + upm branch (Valid/Leia EV)."
+    fi
+  fi
+  rm -rf "$D"
+fi
 ```
 
-### Step 3.5.3: Sign the DLL on the `upm` branch too
-Users who install by git URL get the DLL from the `upm` orphan branch,
-not the `.tgz` — sign that copy as well.
-```bash
-git fetch origin upm && git checkout upm
-powershell -NoProfile -ExecutionPolicy Bypass -File Scripts~\\sign-release.ps1 \
-  -Path "Runtime/Plugins/Windows/x64" -SignCmd "$SIGN_CMD"
-git commit -am "Sign displayxr_unity.dll for [VERSION]"
-git push origin upm
-# move the upm/[VERSION] tag onto the signed commit so the pinned install is signed too
-git tag -f "upm/[VERSION]" && git push -f origin "upm/[VERSION]"
-git checkout main
-```
+Verify (optional): `gh run download` the `.tgz`, extract, and
+`Get-AuthenticodeSignature` the DLL should report `Valid` / signer `Leia, Inc.`.
 
 Note: the macOS `displayxr_unity.bundle` is signed with an Apple
 Developer ID cert + notarization (a separate track from the Windows EV
@@ -232,6 +295,8 @@ Build:
   - Windows x64:  PASSED
   - macOS Universal: PASSED
   - Release job: PASSED (run #RUN_ID)
+
+Signing:  [SIGNED=yes → "displayxr_unity.dll signed (Leia EV) on the provider runner and re-injected into the .tgz asset + upm branch"] | [SIGNED=no → "⚠ Windows DLL UNSIGNED — DXR_SIGN_REPO unset/unreachable; set it and re-run /release [VERSION] to sign in place"]  (macOS .bundle: unsigned — separate Apple Developer ID track)
 
 Published to:
   - GitHub Release: https://github.com/DisplayXR/displayxr-unity/releases/tag/[VERSION]

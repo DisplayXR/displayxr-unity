@@ -6,7 +6,7 @@ using System.Runtime.InteropServices;
 namespace DisplayXR
 {
     /// <summary>
-    /// Physical display properties queried from the DisplayXR runtime via XR_EXT_display_info.
+    /// Physical display properties queried from the DisplayXR runtime via XR_DXR_display_info.
     /// </summary>
     [StructLayout(LayoutKind.Sequential)]
     public struct DisplayXRDisplayInfo

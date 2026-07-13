@@ -43,15 +43,15 @@ Raw CMake (`cd native~ && mkdir build && cd build && cmake .. -DCMAKE_BUILD_TYPE
 
 1. **Runtime (C#)** — the **`IUnityXRDisplay` display provider** (`Runtime/Provider/`): `DisplayXRDisplayLoader` is the XR-Management loader/subsystem, `DisplayXRProvider` is the app-facing facade, `DisplayXRProviderDriver` runs the per-frame pump. `DisplayXRCamera.cs` and `DisplayXRDisplay.cs` are the two stereo rig modes; `DisplayXRRigManager.cs` coordinates multi-camera scenes.
 2. **Editor (C#)** — Custom inspectors and the settings/XR-Management page. (No standalone preview system — Play Mode runs the provider directly.)
-3. **Native (C/C++)** — the display provider (`native~/displayxr_xrprovider/`): opens the OpenXR session on **Unity's D3D12 device**, creates an `arraySize=2` swapchain (SPI or MultiPass), chains the runtime's view-rig descriptor (`XR_EXT_view_rig`) onto `xrLocateViews` and consumes render-ready `XrView{pose, fov}` — the runtime owns the Kooima math — and submits via `xrEndFrame`. The win32 overlay, wsui composition layer, and Local2D paths survive alongside it; thread-safe shared state. The SA render-to-atlas core (`displayxr_standalone*`) is kept on disk but **not compiled** (dormant), reserved as the seed for a future many-view "quilt" render path (see `docs~/adr/ADR-007-render-path-by-view-count.md`).
+3. **Native (C/C++)** — the display provider (`native~/displayxr_xrprovider/`): opens the OpenXR session on **Unity's D3D12 device**, creates an `arraySize=2` swapchain (SPI or MultiPass), chains the runtime's view-rig descriptor (`XR_DXR_view_rig`) onto `xrLocateViews` and consumes render-ready `XrView{pose, fov}` — the runtime owns the Kooima math — and submits via `xrEndFrame`. The win32 overlay, wsui composition layer, and Local2D paths survive alongside it; thread-safe shared state. The SA render-to-atlas core (`displayxr_standalone*`) is kept on disk but **not compiled** (dormant), reserved as the seed for a future many-view "quilt" render path (see `docs~/adr/ADR-007-render-path-by-view-count.md`).
 
 ### Key Features
 
 - **Two stereo rig modes**: Camera-centric (`DisplayXRCamera` — inherits camera FOV, inv. convergence distance tunable) and display-centric (`DisplayXRDisplay` — physical display geometry, virtual display height, scale-as-zoom)
 - **Multi-camera support**: Multiple rigs coexist in one scene; `DisplayXRRigManager` coordinates which rig is active (see below)
 - **Play Mode == built app**: the `IUnityXRDisplay` provider runs identically in-editor and in a built player. Pressing Play *is* the preview — there is no separate preview window.
-- **2D UI overlay**: Canvas → `XrCompositionLayerWindowSpaceEXT` with stereo disparity
-- **Runtime-owned Kooima math (`XR_EXT_view_rig`, #396 W7)**: the plugin no longer computes Kooima. It chains an `XrDisplayRigEXT`/`XrCameraRigEXT` descriptor (the handful of tunables) onto `xrLocateViews` and consumes render-ready `XrView{pose, fov}` in the provider's per-frame pump (Play Mode and built player alike). **This requires a runtime that advertises `XR_EXT_view_rig` (SPEC_VERSION 2)**; against an older runtime the plugin emits a one-shot WARN and passes raw views through (no stereo). The former vendored/`displayxr::math` display3d/camera3d math is gone (do not re-add — see the `no-vendored-math` drift guard).
+- **2D UI overlay**: Canvas → `XrCompositionLayerWindowSpaceDXR` with stereo disparity
+- **Runtime-owned Kooima math (`XR_DXR_view_rig`, #396 W7)**: the plugin no longer computes Kooima. It chains an `XrDisplayRigDXR`/`XrCameraRigDXR` descriptor (the handful of tunables) onto `xrLocateViews` and consumes render-ready `XrView{pose, fov}` in the provider's per-frame pump (Play Mode and built player alike). **This requires a runtime that advertises `XR_DXR_view_rig` (SPEC_VERSION 2)**; against an older runtime the plugin emits a one-shot WARN and passes raw views through (no stereo). The former vendored/`displayxr::math` display3d/camera3d math is gone (do not re-add — see the `no-vendored-math` drift guard).
 
 ### Render Pipeline Support (BiRP / URP / HDRP)
 
@@ -70,29 +70,33 @@ app that wants them.
 
 #### Render path (SPI vs MultiPass) × graphics API — the default policy
 
-The provider supports **D3D11 and D3D12** (selected at session create from
-`IUnityGraphics::GetRenderer()`; Vulkan/Metal are out of scope — the provider no-starts). The
+The provider supports **D3D11, D3D12, and Metal** (selected at session create from
+`IUnityGraphics::GetRenderer()`; Vulkan is out of scope — the provider no-starts). The
 render-path decision is made in `DisplayXRDisplayLoader.IsSinglePassEligible()` and pushed to native
 via `dxr_prov_set_single_pass` **before** the session starts:
 
-| Pipeline | D3D11 | D3D12 |
-|----------|-------|-------|
-| **URP**  | **SPI** | **SPI** |
-| **HDRP** | **SPI** | **SPI** |
-| **BiRP** | **MultiPass** | **MultiPass** |
+| Pipeline | D3D11 | D3D12 | Metal (macOS) |
+|----------|-------|-------|---------------|
+| **URP**  | **SPI** | **SPI** | **SPI** |
+| **HDRP** | **SPI** | **SPI** | **SPI** |
+| **BiRP** | **MultiPass** | **MultiPass** | **MultiPass** |
 
-- **URP and HDRP default to Single-Pass-Instanced (SPI) on both D3D11 and D3D12.** Both consume the
+- **URP and HDRP default to Single-Pass-Instanced (SPI) on D3D11, D3D12, and Metal.** All consume the
   full projection matrix above and render into the `arraySize=2` SPI swapchain (eyes = array slices
-  0/1); the path is pipeline-agnostic. *(HDRP+D3D12 SPI was briefly gated off over a "washed-out
-  splash" (#191); that washout is pipeline-wide — it repros on D3D12 MultiPass and D3D11 SPI too — so
-  it's an HDRP lighting/exposure issue, not an SPI regression, and HDRP now defaults to SPI.)*
+  0/1); the path is pipeline-agnostic. On **Metal** the whole `arraySize=2` swapchain image is wrapped
+  as one 2-slice Unity texture (zero-copy, #205) and Unity renders both eyes into it. *(HDRP+D3D12 SPI
+  was briefly gated off over a "washed-out splash" (#191); that washout is pipeline-wide — it repros on
+  D3D12 MultiPass and D3D11 SPI too — so it's an HDRP lighting/exposure issue, not an SPI regression,
+  and HDRP now defaults to SPI.)*
 - **BiRP → MultiPass** (SPI renders BiRP's off-center opaque geometry wrong). **MultiPass runs on
-  both D3D11 and D3D12** (#195): each eye renders into its own single-slice texture, which the
-  provider copies (per slice) into the `arraySize=2` swapchain's slice 0/1. On **D3D12** the per-eye
+  D3D11, D3D12, and Metal** (#195, #204): each eye renders into its own single-slice texture, which the
+  provider weaves into the `arraySize=2` swapchain's slice 0/1. On **D3D12** the per-eye
   textures are the own-device bridge; on **D3D11** they are plain Unity-device textures in a built
   player (zero-copy, same-device `CopySubresourceRegion` + Flush) or the own-device shared bridge in
-  the editor (fence-ordered own-context copy). So **BiRP + D3D11 is fully supported** (editor +
-  player).
+  the editor (fence-ordered own-context copy). On **Metal** each eye is a zero-copy single-slice VIEW
+  of the swapchain image (no blit; `order_weave` MTLSharedEvent orders the compositor after Unity's
+  renders). So **BiRP + D3D11 is fully supported** (editor + player); **BiRP + Metal** is supported in
+  built players (macOS editor Play Mode is gated pending a Unity Metal bug — see below).
 - **D3D11 backend (#195):** built players use a **zero-copy** path (session bound on Unity's
   `ID3D11Device`); the **editor** uses an **own-device bridge** (separate `ID3D11Device` + NT-handle
   shared 2-slice bridge + shared `ID3D11Fence`) — Unity's editor GameView present would otherwise
@@ -145,7 +149,7 @@ Scenes can contain multiple cameras with different rig types (display-centric, c
 
 ### OpenXR path: the display provider
 
-The plugin drives OpenXR through the custom `IUnityXRDisplay` provider (`native~/displayxr_xrprovider/`) — it is the **sole** backend. The provider opens the session on Unity's D3D12 device, drives an `arraySize=2` swapchain (SPI/MultiPass), chains `XR_EXT_view_rig` onto `xrLocateViews` for runtime-owned Kooima, downgrades sRGB→UNORM swapchains in Gamma-space projects (so output isn't double-gamma-encoded), and submits overlay/wsui composition layers via `xrEndFrame`.
+The plugin drives OpenXR through the custom `IUnityXRDisplay` provider (`native~/displayxr_xrprovider/`) — it is the **sole** backend. The provider opens the session on Unity's D3D12 device, drives an `arraySize=2` swapchain (SPI/MultiPass), chains `XR_DXR_view_rig` onto `xrLocateViews` for runtime-owned Kooima, downgrades sRGB→UNORM swapchains in Gamma-space projects (so output isn't double-gamma-encoded), and submits overlay/wsui composition layers via `xrEndFrame`.
 
 > **The legacy OpenXR API-layer hook (`DisplayXRFeature` + `displayxr_hooks.cpp`) and the standalone (SA) editor-preview session/window were hard-removed in #166.** The provider replaced them. See `docs~/architecture/xr-display-provider.md`. Renamed native headers: `displayxr_hooks.h`→`displayxr_exports.h`, `displayxr_hooks_internal.h`→`displayxr_backend.h`; re-homed glue lives in `displayxr_native_shared.cpp`.
 
@@ -297,24 +301,29 @@ For detailed architecture and design decisions, see `docs~/`:
 - The runtime provides the OpenXR compositor, display drivers, and eye tracking; this plugin provides the Unity-side stereo rendering pipeline.
 - **Decoupled from the runtime's `versions.json` bundle matrix** — this UPM package is a downstream consumer of the runtime's OpenXR wire protocol, not part of the co-released installer bundle (runtime/shell/leia-plugin/mcp/demos). The two ship on independent cadences. Spec: [`versions-json-autobump.md`](https://github.com/DisplayXR/displayxr-runtime/blob/main/docs/specs/runtime/versions-json-autobump.md).
 
-### Test repos
+### Sample projects
 
-Four sibling Unity projects exercise the plugin against different feature areas and render pipelines. Treat them as a regression net — when a plugin change risks affecting any of these, fetch and verify before tagging a release.
+The plugin's sample Unity projects live in one monorepo,
+[`DisplayXR/displayxr-unity-samples`](https://github.com/DisplayXR/displayxr-unity-samples),
+under `samples/`. Treat them as a regression net — when a plugin change risks
+affecting any of these, build and verify before tagging a release.
+(They were consolidated from the former `displayxr-unity-test*` repos, which are
+now archived and redirect here.)
 
-| Repo | Focus | Notes |
+| Sample (folder) | Focus | Notes |
 |------|-------|-------|
-| [`DisplayXR/displayxr-unity-test`](https://github.com/DisplayXR/displayxr-unity-test) | Baseline rendering / stereo correctness (**BiRP**) | Plain cube + camera-centric and display-centric rigs |
-| [`DisplayXR/displayxr-unity-test-transparent`](https://github.com/DisplayXR/displayxr-unity-test-transparent) | Transparent overlay + click-through (#57 family, alpha-native), now **URP + `XR_EXT_display_zones` / Local2D bubble** in a floating window | Tiger FBX clickable, foreground-only render. `main` = URP/zones (v2.0.0+); the Built-in (BiRP) baseline lives on the `legacy-birp` branch |
-| [`DisplayXR/displayxr-unity-test-2d-ui`](https://github.com/DisplayXR/displayxr-unity-test-2d-ui) | 2D UI window-space composition layer (**URP**) | Tuning panel built from `DisplayXRWindowSpaceUI` |
-| [`DisplayXR/displayxr-unity-test-hdrp`](https://github.com/DisplayXR/displayxr-unity-test-hdrp) | Off-axis correctness on **HDRP** (#22, #166 M3) | Textured crate; HDRP consumes the provider's projection matrix natively (no fix feature) |
+| `samples/birp-multipass` | Baseline rendering / stereo correctness (**BiRP**, multi-pass) | Plain cube + camera-centric and display-centric rigs |
+| `samples/urp-singlepass-ui` | 2D UI window-space composition layer (**URP**, single-pass) | Tuning panel built from `DisplayXRWindowSpaceUI` |
+| `samples/hdrp-singlepass-ui` | Off-axis correctness on **HDRP** (single-pass) | Textured crate; HDRP consumes the provider's projection matrix natively (no fix feature) |
+| `samples/desktop-avatar` | Desktop avatar showcase (**URP**): alpha-native transparency, click-through, per-eye foreground clip, `XR_DXR_display_zones` + Local2D bubble | Tiger FBX (Git LFS), foreground-only render |
 
-All four pin the plugin via `https://github.com/DisplayXR/displayxr-unity.git#upm` (floating; tracks latest release).
+All pin the plugin via `https://github.com/DisplayXR/displayxr-unity.git#upm/vX.Y.Z`.
 
-Each test repo also has its own `CLAUDE.md` describing its scene, scripts, and which plugin features it exercises — designed so an agent can work in the test repo without loading the plugin's context.
+Each sample has its own `README.md`/`CLAUDE.md`. **Installer/build logic is shared** in the monorepo's `installer/common/SampleInstaller.nsh` — a per-sample `.nsi` is just a stub setting five `SAMPLE_*` defines, so install dir / regkeys / ARP / manifest slug all derive from one key and can't drift. See the monorepo's root `CLAUDE.md`.
 
-**Test-repo releases ship as NSIS installers, not zips** (#108). Each test repo's `installer/` dir (`.nsi` + `build-installer.bat`) mirrors the [`displayxr-demo-gaussiansplat`](https://github.com/DisplayXR/displayxr-demo-gaussiansplat) pattern: hard-prereqs the runtime, installs the Unity Player under `Program Files\DisplayXR\Unity\<Variant>\`, and drops a registered-mode `.displayxr.json` manifest under `%ProgramData%\DisplayXR\apps\` (renamed `icon_unity_test*.png` per variant) so the Shell launcher discovers it as a tile. Build flow is manual today (build Player → `installer\build-installer.bat` → `gh release create`); CI automation is blocked on Unity license activation.
+**Sample releases ship as NSIS installers.** Each installs the Unity Player under `Program Files\DisplayXR\Unity\<Key>\` and drops a registered-mode `.displayxr.json` manifest + slug-scoped icons under `%ProgramData%\DisplayXR\apps\` so the Shell launcher discovers it as a tile. Build flow is manual (build Player → `installer\build-installer.bat`); CI is lint-only (Unity license/runner not wired).
 
-#### Where to launch Claude Code when working on the test repos
+#### Where to launch Claude Code
 
-- **Test-only work** (tweak a scene, polish a test-repo script, fix a test-repo bug) → launch from the test repo directly. Its `CLAUDE.md` auto-loads with focused context, git ops target the right repo by default, smaller context is cheaper and faster. The plugin's installed source is still readable at `Library/PackageCache/com.displayxr.unity@<hash>/` if a grep into plugin internals is needed.
-- **Plugin work that also touches a test repo** (new plugin API + test repo update to consume it) → launch from `displayxr-unity`. The plugin is the primary surface; the test repos are reachable via adjacent `../displayxr-unity-test*` paths. Land the plugin change first, let CI publish `#upm`, then update the test repo.
+- **Sample-only work** (tweak a scene, fix a sample bug) → launch from `displayxr-unity-samples` (or a `samples/<name>` subdir); its `CLAUDE.md` auto-loads focused context. The plugin's installed source is readable at `Library/PackageCache/com.displayxr.unity@<hash>/`.
+- **Plugin work that also updates a sample** → launch from `displayxr-unity`; land the plugin change first, let CI publish `#upm`, then update the sample in the monorepo.

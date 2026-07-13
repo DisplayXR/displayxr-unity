@@ -8,7 +8,7 @@ using UnityEngine.Rendering;
 namespace DisplayXR
 {
     /// <summary>
-    /// Submits a Unity UI Canvas as an OpenXR XrCompositionLayerLocal2DEXT
+    /// Submits a Unity UI Canvas as an OpenXR XrCompositionLayerLocal2DDXR
     /// composition layer (#439/#491) — the modern, mask-based 2D-over-3D path.
     /// The runtime composites this "glass over 3D": the woven 3D under the
     /// layer's pixel rect goes flat 2D (implicit mask) and the Canvas content is
@@ -115,13 +115,13 @@ namespace DisplayXR
 
         void OnEnable()
         {
-            // Submitting an XrCompositionLayerLocal2DEXT when XR_EXT_local_3d_zone
+            // Submitting an XrCompositionLayerLocal2DDXR when XR_DXR_local_3d_zone
             // isn't enabled makes the runtime reject the WHOLE xrEndFrame
             // (XR_ERROR_LAYER_INVALID) — black screen. Gate on it: if the runtime
             // doesn't support Local2D, stay inert (no RT, no submission) so the
             // rest of the scene renders normally.
             //
-            // The provider (the sole backend since #166) enables XR_EXT_local_3d_zone
+            // The provider (the sole backend since #166) enables XR_DXR_local_3d_zone
             // on its own OpenXR instance and is the only thing that submits the Local2D
             // layer, so gate purely on the provider being active. When it isn't (edit
             // mode, or XR not started) stay inert — no RT, no submission — so the rest
@@ -207,11 +207,16 @@ namespace DisplayXR
 
             m_Canvas.worldCamera = m_OverlayCamera;
 
+            // Register the raw native texture unconditionally (mirrors
+            // DisplayXRWindowSpaceUI). On Metal the provider reads this pending texture
+            // directly (no cross-device bridge — the compositor is on Unity's own
+            // MTLDevice) and blits it into its Local2D swapchain image. On Windows the
+            // D3D provider path uses the cross-device bridge below and never reads the
+            // pending texture, so this registration is inert there.
+            DisplayXRNative.displayxr_local2d_set_texture(
+                OverlayTexture.GetNativeTexturePtr(), resolution.x, resolution.y);
             if (m_ProviderMode)
-                TryAcquireBridge(); // provider owns its own cross-device Local2D bridge
-            else
-                DisplayXRNative.displayxr_local2d_set_texture(
-                    OverlayTexture.GetNativeTexturePtr(), resolution.x, resolution.y);
+                TryAcquireBridge(); // Windows: provider owns its own cross-device Local2D bridge
 
             // Scope the URP foreground clip out of our overlay camera (see field doc).
             RenderPipelineManager.beginCameraRendering += OnBeginOverlayCamera;

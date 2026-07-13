@@ -5,6 +5,14 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.0] - 2026-07-12
+- 6acc285 feat!: rename DisplayXR extensions XR_EXT_* -> XR_DXR_* (DisplayXR/displayxr-runtime#734)
+- 85d3afb chore: bump package.json version to 2.4.0 to match released v2.4.0 tag
+- 5287e39 Provider: Metal Local2D + extra 3D display-zones composition layers (#206)
+- f9c4b88 Release v2.4.0
+- a5138d4 docs: point samples at the displayxr-unity-samples monorepo
+- 1f50a08 ci: docs_only short-circuit for empty/marker pushes
+
 ## [2.3.2] - 2026-07-07
 
 ### Added
@@ -106,7 +114,7 @@ The custom **`IUnityXRDisplay` display provider becomes the shipping rendering p
 - **Live tile reallocation** (#172) — zone-rect tile realloc for primary + extra zones and realloc on window resize.
 - **App-owned / dedicated / self-host weave targets** (#173) — provider defaults to an app-owned window; self-host behind `DISPLAYXR_PROV_SELFHOST`; a dedicated movable weave window for in-editor Play Mode.
 - **Provider runs in Play Mode** (#171) — provider-aware editor status; `xreditorsubsystem` keyword so the display subsystem is discoverable in-editor.
-- **App-facing atlas screenshot** (`I` key) via `XR_EXT_atlas_capture` — screenshot parity with the hook path (#140).
+- **App-facing atlas screenshot** (`I` key) via `XR_DXR_atlas_capture` — screenshot parity with the hook path (#140).
 - **Shared smooth 2D↔3D mode-switch sequencer** (`DisplayXRModeSwitch`) (#172).
 - **Window-space UI (HUD) composition layer** under the provider (#166).
 - **DLL code-signing** in the `.tgz` and `upm` branch (#167).
@@ -132,7 +140,7 @@ The custom **`IUnityXRDisplay` display provider becomes the shipping rendering p
 ## [1.21.0] - 2026-06-19
 
 ### Added
-- **`XR_EXT_display_zones` port — 3D display zones**: the plugin renders into runtime-advertised display zones, sizing the 3D eye render to `xrGetDisplayZoneRecommendedViewSize` (via `renderViewportScale`) so the zone-sized stereo render no longer leaks a band under zoom.
+- **`XR_DXR_display_zones` port — 3D display zones**: the plugin renders into runtime-advertised display zones, sizing the 3D eye render to `xrGetDisplayZoneRecommendedViewSize` (via `renderViewportScale`) so the zone-sized stereo render no longer leaks a band under zoom.
 - **Local2D composition layer (#439/#491)** — modern 2D-over-3D path: a `DisplayXRLocal2D` component composites a 2D layer over the 3D scene.
 - **Avatar-style windowing primitives** on the transparent overlay: native toggle-decoration (B), keyboard window resize, drag-move, get/set overlay window position (for app-side persistence), and consume-overlay-close-request (close-to-quit). Window-chrome UI policy moved out of the plugin into the app.
 
@@ -144,7 +152,7 @@ The custom **`IUnityXRDisplay` display provider becomes the shipping rendering p
 - **Window-chrome UI policy moved out of the plugin into the app** — the plugin exposes native windowing primitives (decoration toggle, resize, position get/set, close-request) and the app owns the UX policy.
 
 ### Fixed
-- **`XR_EXT_view_rig` SPEC_VERSION 3 compatibility** (native): the runtime advanced the extension to SPEC 3, which adds a trailing `metersToVirtual` float to `XrCameraRigEXT`. The plugin shipped the SPEC 2 struct, so against a SPEC 3 runtime the runtime read that field past the end of the plugin's struct for **camera-centric** rigs (`DisplayXRCamera`) — undefined value (best case 0 → runtime's pre-v3 default of 1.0, worst case garbage → wrong world scale). The plugin now declares SPEC 3 and writes `metersToVirtual = 1.0f` (scene scale is already folded into `convergenceDiopters`, so this exactly preserves pre-v3 behavior). **Display-centric rigs (`DisplayXRDisplay` → `XrDisplayRigEXT`) were unaffected** — that struct is byte-identical across SPEC 2/3 — so the transparent/2D-UI display-centric demos already worked on a SPEC 3 runtime; this fixes the camera-centric path. Detection remains name-based (no version gate).
+- **`XR_DXR_view_rig` SPEC_VERSION 3 compatibility** (native): the runtime advanced the extension to SPEC 3, which adds a trailing `metersToVirtual` float to `XrCameraRigDXR`. The plugin shipped the SPEC 2 struct, so against a SPEC 3 runtime the runtime read that field past the end of the plugin's struct for **camera-centric** rigs (`DisplayXRCamera`) — undefined value (best case 0 → runtime's pre-v3 default of 1.0, worst case garbage → wrong world scale). The plugin now declares SPEC 3 and writes `metersToVirtual = 1.0f` (scene scale is already folded into `convergenceDiopters`, so this exactly preserves pre-v3 behavior). **Display-centric rigs (`DisplayXRDisplay` → `XrDisplayRigDXR`) were unaffected** — that struct is byte-identical across SPEC 2/3 — so the transparent/2D-UI display-centric demos already worked on a SPEC 3 runtime; this fixes the camera-centric path. Detection remains name-based (no version gate).
 
 ## [1.20.0] - 2026-06-15
 
@@ -162,8 +170,8 @@ The custom **`IUnityXRDisplay` display provider becomes the shipping rendering p
 ## [1.19.0] - 2026-06-09
 
 ### Changed
-- **Kooima projection is now owned by the DisplayXR runtime via `XR_EXT_view_rig`** (`DisplayXR/displayxr-runtime#396` W7, ADR-024). The plugin no longer computes Kooima: it chains an `XrDisplayRigEXT`/`XrCameraRigEXT` descriptor (scene transform + the handful of tunables) onto `xrLocateViews` and consumes render-ready `XrView{pose, fov}` — on **both** the built-app hook path and the standalone editor-preview session. The former vendored/`displayxr::math` display3d/camera3d Kooima math is removed (~500 lines, plus `displayxr_kooima.{cpp,h}`; the `displayxr::math` link is dropped). The P/Invoke surface and C# API are unchanged.
-  - **⚠️ Requires a DisplayXR runtime that advertises `XR_EXT_view_rig` (SPEC_VERSION 2) _and_ the #396 W7 window-metrics fixes — both ship in runtime `v1.16.0` (bundle `0.17.0`).** Against an older runtime the plugin emits a one-shot WARN and passes the raw views through, which renders **no stereo**. Update the runtime to `0.17.0`+ before installing this plugin version.
+- **Kooima projection is now owned by the DisplayXR runtime via `XR_DXR_view_rig`** (`DisplayXR/displayxr-runtime#396` W7, ADR-024). The plugin no longer computes Kooima: it chains an `XrDisplayRigDXR`/`XrCameraRigDXR` descriptor (scene transform + the handful of tunables) onto `xrLocateViews` and consumes render-ready `XrView{pose, fov}` — on **both** the built-app hook path and the standalone editor-preview session. The former vendored/`displayxr::math` display3d/camera3d Kooima math is removed (~500 lines, plus `displayxr_kooima.{cpp,h}`; the `displayxr::math` link is dropped). The P/Invoke surface and C# API are unchanged.
+  - **⚠️ Requires a DisplayXR runtime that advertises `XR_DXR_view_rig` (SPEC_VERSION 2) _and_ the #396 W7 window-metrics fixes — both ship in runtime `v1.16.0` (bundle `0.17.0`).** Against an older runtime the plugin emits a one-shot WARN and passes the raw views through, which renders **no stereo**. Update the runtime to `0.17.0`+ before installing this plugin version.
 - The BiRP per-eye projection override (`SetStereoProjectionMatrix`) is **retained and always applied**. A probe showed BiRP consumes `views[i].fov` directly when the window is centered, but for **window-relative off-center** windows the rig fov is a sheared off-axis frustum that Unity's XR fov→projection path mishandles (over-separates the eyes) — so the plugin keeps building the projection itself. BiRP also keeps the `SetStereoViewMatrix` + `FlipViewZ` handedness shim.
 - Foreground-only clip (#57 family) is preserved under the rig path: the rig fov is clip-independent, so the per-view far plane is rebuilt app-side (display rig = eye→display-plane distance; camera rig = convergence distance) — BiRP via `SetStereoProjectionMatrix`, **URP via `Camera.farClipPlane`** (URP ignores `SetStereoProjectionMatrix`).
 
@@ -197,12 +205,12 @@ The custom **`IUnityXRDisplay` display provider becomes the shipping rendering p
 ## [1.16.0] - 2026-06-05
 
 ### Changed
-- Atlas screenshot filenames adopt the runtime-owned suffix `<stem>-<N>_atlas_<viewCount>_<cols>x<rows>.png` (XR_EXT_atlas_capture spec v2, `DisplayXR/displayxr-runtime#425`). The live `xrCaptureAtlasEXT` path now passes a bare `<stem>-<N>` prefix (no pre-baked `_<cols>x<rows>`) and lets the runtime own the `_atlas_…` tokens, so the final name no longer duplicates the layout (`..._2x1_atlas_2_2x1.png`). The editor-preview (app-side) path writes the same name so both share one sequence counter.
+- Atlas screenshot filenames adopt the runtime-owned suffix `<stem>-<N>_atlas_<viewCount>_<cols>x<rows>.png` (XR_DXR_atlas_capture spec v2, `DisplayXR/displayxr-runtime#425`). The live `xrCaptureAtlasDXR` path now passes a bare `<stem>-<N>` prefix (no pre-baked `_<cols>x<rows>`) and lets the runtime own the `_atlas_…` tokens, so the final name no longer duplicates the layout (`..._2x1_atlas_2_2x1.png`). The editor-preview (app-side) path writes the same name so both share one sequence counter.
 
 ## [1.15.0] - 2026-06-04
 
 ### Changed
-- **The 'I'-key atlas screenshot is now runtime-owned via `xrCaptureAtlasEXT`** (XR_EXT_atlas_capture, spec v1) for live OpenXR sessions (#140, #396 W6). A live session hands the runtime a path prefix; the runtime reads back its own composited atlas and writes `<prefix>_atlas.png`. The plugin no longer does an app-side `AsyncGPUReadback` or a hidden-camera Kooima re-render on the live path. New public API `DisplayXRFeature.CaptureAtlas(pathPrefix, projectionOnly)`. **Requires a DisplayXR runtime that advertises `XR_EXT_atlas_capture`** — against older runtimes the capture logs `…unavailable` and is a no-op (no crash). The editor-preview (standalone-session) path is unchanged: it still encodes the atlas RT app-side, since there is no runtime OpenXR session in pure-editor preview.
+- **The 'I'-key atlas screenshot is now runtime-owned via `xrCaptureAtlasDXR`** (XR_DXR_atlas_capture, spec v1) for live OpenXR sessions (#140, #396 W6). A live session hands the runtime a path prefix; the runtime reads back its own composited atlas and writes `<prefix>_atlas.png`. The plugin no longer does an app-side `AsyncGPUReadback` or a hidden-camera Kooima re-render on the live path. New public API `DisplayXRFeature.CaptureAtlas(pathPrefix, projectionOnly)`. **Requires a DisplayXR runtime that advertises `XR_DXR_atlas_capture`** — against older runtimes the capture logs `…unavailable` and is a no-op (no crash). The editor-preview (standalone-session) path is unchanged: it still encodes the atlas RT app-side, since there is no runtime OpenXR session in pure-editor preview.
 
 ### Fixed
 - Live-path screenshot no longer captures the white feedback flash. The flash draws into the same eye buffers the runtime composites for the capture, so arming it immediately whited out the saved atlas; the flash is now deferred a few frames so the runtime grabs the clean atlas first (#140).
@@ -414,7 +422,7 @@ The custom **`IUnityXRDisplay` display provider becomes the shipping rendering p
 
 ### Added
 - **macOS transparent overlay — Phase 1 visual transparency (`#85`)** —
-  `XR_EXT_cocoa_window_binding` is wired through with the
+  `XR_DXR_cocoa_window_binding` is wired through with the
   `transparentBackgroundEnabled` flag, and Unity's `NSWindow` is configured
   for per-pixel alpha so the runtime can render into a transparent surface
   on macOS. Mirrors the Windows transparent overlay capability (#57) at the
@@ -692,7 +700,7 @@ The custom **`IUnityXRDisplay` display provider becomes the shipping rendering p
 ## [1.2.6] - 2026-05-06
 
 ### Added
-- Submit `DisplayXRWindowSpaceUI` as `XrCompositionLayerWindowSpaceEXT` so
+- Submit `DisplayXRWindowSpaceUI` as `XrCompositionLayerWindowSpaceDXR` so
   2D UI canvases composite as a stereo overlay layer with proper disparity
   on the DisplayXR runtime. (#67)
 
@@ -1020,7 +1028,7 @@ documentation structure with ADRs.
 
 ### Fixed
 - Fix canvas rect DPI: send logical pixels on Windows, backing pixels on macOS (#41)
-  - `xrSetSharedTextureOutputRectEXT` takes HWND client-area pixels per spec
+  - `xrSetSharedTextureOutputRectDXR` takes HWND client-area pixels per spec
   - On DPI-aware Windows (Unity 6), `Screen.width` is already logical pixels
   - On macOS, `Screen.width` is in points — multiply by backing scale factor
 
@@ -1172,7 +1180,7 @@ documentation structure with ADRs.
 - 2D UI overlay component (`DisplayXRWindowSpaceUI`) for HUDs and menus
 - Standalone editor preview window with camera selector, rendering mode controls, and zero-copy GPU texture sharing (IOSurface/DXGI)
 - Game View overlay (`DisplayXRGameViewOverlay`) for Play Mode shared texture output
-- Canvas-aware shared texture cropping via `xrSetSharedTextureOutputRectEXT`
+- Canvas-aware shared texture cropping via `xrSetSharedTextureOutputRectDXR`
 - Custom inspectors for camera-centric and display-centric modes
 - Project Settings page showing runtime status and display info
 - Native plugin source (`native~/`) with independent CMake build

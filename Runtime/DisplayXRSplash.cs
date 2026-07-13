@@ -98,7 +98,7 @@ namespace DisplayXR
 
             // Wait for the runtime to report display geometry so we can size the
             // logo to the physical display. Fall back after ~2 s. Read the
-            // provider's own XR_EXT_display_info.
+            // provider's own XR_DXR_display_info.
             float t = 0f;
             float displayH = 0.19f;
             while (t < 2f)

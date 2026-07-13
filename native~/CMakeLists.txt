@@ -39,7 +39,7 @@ endif()
 
 # --- displayxr::math removed (#396 W7) ---
 # The plugin no longer computes Kooima locally — the DisplayXR runtime owns the
-# view-rig math via XR_EXT_view_rig, and the plugin consumes render-ready
+# view-rig math via XR_DXR_view_rig, and the plugin consumes render-ready
 # XrView{pose,fov}. The former displayxr-common (display3d/camera3d) dependency
 # is gone; do NOT re-add it (see the no-vendored-math drift guard).
 
@@ -88,6 +88,11 @@ set(SOURCES
     displayxr_vk_loader.cpp
     displayxr_window_space_ui.cpp
     displayxr_local2d.cpp
+    displayxr_unity_plugin.cpp
+    # Custom IUnityXRDisplay Display Provider (epic #166; macOS port #202).
+    # Cross-platform TUs: D3D backends behind _WIN32, Metal behind __APPLE__.
+    displayxr_xrprovider/displayxr_provider_session.cpp
+    displayxr_xrprovider/displayxr_display_provider.cpp
 )
 
 set(HEADERS
@@ -101,24 +106,23 @@ set(HEADERS
 
 # Apple-only: IOSurface helpers (Objective-C) + transparent-overlay NSWindow config
 if(APPLE)
-    list(APPEND SOURCES displayxr_metal.m displayxr_macos.mm)
+    list(APPEND SOURCES displayxr_metal.m displayxr_macos.mm
+        displayxr_xrprovider/displayxr_provider_gfx_metal.mm)
+    list(APPEND HEADERS displayxr_xrprovider/displayxr_provider_gfx_metal.h)
     list(APPEND HEADERS displayxr_metal.h)
 endif()
 
 # Windows-only: overlay child window + D3D11/DXGI + dGPU preference exports
 # user32 is required for SetLayeredWindowAttributes / WS_EX_LAYERED
 # (transparent overlay mode, issue #57).
+list(APPEND HEADERS displayxr_xrprovider/displayxr_provider_session.h)
+
 if(WIN32)
-    list(APPEND SOURCES displayxr_win32.c displayxr_gpu_preference.cpp displayxr_unity_plugin.cpp)
+    list(APPEND SOURCES displayxr_win32.c displayxr_gpu_preference.cpp)
     list(APPEND HEADERS displayxr_win32.h displayxr_vk_loader.h)
-    # Custom IUnityXRDisplay Display Provider (epic #166, M1 — Windows/D3D12).
-    # Compiled into the same displayxr_unity DLL; registered from UnityPluginLoad.
-    # Does not disturb the hook path or the editor standalone path.
-    list(APPEND SOURCES
-        displayxr_xrprovider/displayxr_provider_session.cpp
-        displayxr_xrprovider/displayxr_display_provider.cpp)
-    list(APPEND HEADERS displayxr_xrprovider/displayxr_provider_session.h)
-    link_libraries(user32 d3d11 d3d12 dxgi)
+    # dwmapi + advapi32: MSVC links them via #pragma comment(lib, ...) in the TUs,
+    # but MinGW (the macOS cross-compile check) ignores that pragma — list them here.
+    link_libraries(user32 d3d11 d3d12 dxgi dwmapi advapi32)
 endif()
 
 # --- Build shared library ---
@@ -134,13 +138,15 @@ target_include_directories(displayxr_unity PRIVATE
     ${OPENXR_INCLUDE_DIR}
 )
 
-# Vulkan headers + vendored Unity native-plugin interface headers (Windows
-# standalone Vulkan backend, issue #124).
+# Vendored Unity native-plugin interface headers (all platforms — the display
+# provider TUs compile everywhere; #202).
+target_include_directories(displayxr_unity PRIVATE
+    ${CMAKE_CURRENT_SOURCE_DIR}/unity_pluginapi
+)
+
+# Vulkan headers (Windows standalone Vulkan backend, issue #124).
 if(WIN32)
-    target_include_directories(displayxr_unity PRIVATE
-        ${VULKAN_INCLUDE_DIR}
-        ${CMAKE_CURRENT_SOURCE_DIR}/unity_pluginapi
-    )
+    target_include_directories(displayxr_unity PRIVATE ${VULKAN_INCLUDE_DIR})
 endif()
 
 # Symbol visibility
@@ -176,7 +182,8 @@ if(APPLE)
         ${QUARTZCORE_FRAMEWORK}
     )
     # Enable ARC for Objective-C / Objective-C++ files
-    set_source_files_properties(displayxr_metal.m displayxr_macos.mm PROPERTIES
+    set_source_files_properties(displayxr_metal.m displayxr_macos.mm
+        displayxr_xrprovider/displayxr_provider_gfx_metal.mm PROPERTIES
         COMPILE_FLAGS "-fobjc-arc"
     )
 endif()

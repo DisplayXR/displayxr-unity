@@ -21,7 +21,7 @@ so this ceiling is a real constraint, not a hypothetical.
 ## Decision
 
 The plugin selects a render path from the display's advertised maximum view count
-(from `XR_EXT_display_info` / the enumerated modes' view counts, already read at
+(from `XR_DXR_display_info` / the enumerated modes' view counts, already read at
 subsystem start):
 
 - **≤ 8 views — the provider path** (Unity `IUnityXRDisplay`) — eye-tracked stereo
@@ -63,7 +63,7 @@ marked as the quilt seed. Whoever promotes it must:
   to quad (≤ 8 views) is the easy win — generalize the existing multi-zone
   N-render-pass machinery in `displayxr_display_provider.cpp` `PopulateNextFrameDesc`
   from "N zones each 2-view" to "1 display, N views" (arraySize=N swapchain, submit
-  views `imageArrayIndex` 0..N-1). It needs the runtime `XR_EXT_view_rig` to return
+  views `imageArrayIndex` 0..N-1). It needs the runtime `XR_DXR_view_rig` to return
   N views + an N-view DP weave. The multi-zone code is the proof-of-concept.
 
 ## References

@@ -3,7 +3,7 @@
 //
 // Local2D overlay (#439/#491).
 //
-// Routes a Unity RenderTexture through to an XrCompositionLayerLocal2DEXT
+// Routes a Unity RenderTexture through to an XrCompositionLayerLocal2DDXR
 // composition layer so the runtime composites it "glass over 3D" — the woven
 // 3D under the layer's pixel rect goes flat 2D (implicit mask) and the 2D
 // content is alpha-composited on top.
@@ -41,11 +41,16 @@ DISPLAYXR_EXPORT void displayxr_local2d_set_texture(void *unity_native_tex,
                                                     int width, int height);
 
 // Set the destination rect in client-window PIXELS (post-DPI), matching the
-// XrCompositionLayerLocal2DEXT::rect / mask-tier coordinate space.
+// XrCompositionLayerLocal2DDXR::rect / mask-tier coordinate space.
 DISPLAYXR_EXPORT void displayxr_local2d_set_rect(int x, int y, int width, int height);
 
 // Disable the layer (stops submitting it this frame onward).
 DISPLAYXR_EXPORT void displayxr_local2d_clear(void);
+
+// Read the pending Unity texture (provider Metal Local2D path; mirrors
+// displayxr_window_space_ui_get_pending). Returns 1 iff a non-zero-size texture is
+// registered. The destination pixel rect comes from provider state, not from here.
+DISPLAYXR_EXPORT int displayxr_local2d_get_pending(void **out_tex, int *out_w, int *out_h);
 
 #ifdef __cplusplus
 } // extern "C"

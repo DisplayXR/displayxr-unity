@@ -7,7 +7,7 @@
 // This is the provider's analog of displayxr_standalone.cpp: it loads the
 // DisplayXR runtime directly via xrNegotiateLoaderRuntimeInterface, creates the
 // instance/system/session, enables the EXT extensions, enumerates rendering
-// modes, creates the (SPI, arraySize=2) swapchain, and consumes XR_EXT_view_rig
+// modes, creates the (SPI, arraySize=2) swapchain, and consumes XR_DXR_view_rig
 // render-ready views — but it differs from the standalone in two ways:
 //
 //   1. The graphics binding is created on UNITY'S OWN D3D12 device + queue
@@ -56,15 +56,18 @@ extern "C" {
 /// own-device + shared-texture-bridge path; D3D11 is a zero-copy path that binds
 /// the session on Unity's own ID3D11Device (the runtime's native D3D11 compositor
 /// creates + weaves swapchain images on that device — no bridge/copy/fence).
-/// VULKAN is reserved for a follow-up. Kept as an int across the C ABI.
+/// METAL is the macOS client-queue path (#202/#204: session bound on a
+/// provider-created MTLCommandQueue on Unity's MTLDevice). VULKAN is reserved.
+/// Kept as an int across the C ABI; values are append-only (ABI-stable).
 typedef enum DxrGfxKind {
 	DXR_GFX_NONE = 0,
 	DXR_GFX_D3D12,
 	DXR_GFX_D3D11,
 	DXR_GFX_VULKAN, // reserved (not implemented)
+	DXR_GFX_METAL,  // macOS (#202/#204)
 } DxrGfxKind;
 
-/// One render-ready view consumed from xrLocateViews (XR_EXT_view_rig).
+/// One render-ready view consumed from xrLocateViews (XR_DXR_view_rig).
 typedef struct DxrProvView {
 	float position[3];    ///< Eye position, OpenXR LOCAL (display) space.
 	float orientation[4]; ///< Eye orientation quaternion (x,y,z,w).
@@ -72,7 +75,7 @@ typedef struct DxrProvView {
 	int   valid;          ///< 1 if this view is render-ready.
 } DxrProvView;
 
-/// Display geometry surfaced from XR_EXT_display_info (for C# / logging).
+/// Display geometry surfaced from XR_DXR_display_info (for C# / logging).
 typedef struct DxrProvDisplayInfo {
 	float    width_m, height_m;          ///< Physical display size (meters).
 	uint32_t pixel_width, pixel_height;  ///< Display pixel dimensions.
@@ -81,7 +84,7 @@ typedef struct DxrProvDisplayInfo {
 	int      is_valid;
 } DxrProvDisplayInfo;
 
-/// One enumerated rendering mode surfaced to C# (XrDisplayRenderingModeInfoEXT).
+/// One enumerated rendering mode surfaced to C# (XrDisplayRenderingModeInfoDXR).
 typedef struct DxrProvModeInfo {
 	uint32_t mode_index;
 	uint32_t view_count;
@@ -241,10 +244,10 @@ DISPLAYXR_EXPORT void dxr_prov_set_transparent_background(int enable);
 int dxr_prov_wants_transparent(void);
 
 /// Set the single 3D-zone rect (client-window px, top-left origin) the runtime
-/// frames the Kooima 3D into (#166 Phase B). The locate chains XrDisplayZoneEXT in
+/// frames the Kooima 3D into (#166 Phase B). The locate chains XrDisplayZoneDXR in
 /// front of the view-rig and submit chains the same zone on the projection layer;
 /// the swapchain is sized to the zone's recommended view size. w<=0||h<=0 clears
-/// (full-window framing). Requires the runtime to advertise XR_EXT_display_zones.
+/// (full-window framing). Requires the runtime to advertise XR_DXR_display_zones.
 /// Seed BEFORE the session starts (like the hook SeedLaunchZone) for born-zone-sized.
 DISPLAYXR_EXPORT void dxr_prov_set_3d_zone_rect(int32_t x, int32_t y, int32_t w, int32_t h);
 
@@ -296,7 +299,7 @@ DISPLAYXR_EXPORT int dxr_prov_get_zone_rect_px(uint32_t zone, int *x, int *y, in
 /// Local2D layer (#166 Phase B): lazily create the provider's Local2D overlay
 /// swapchain + cross-device bridge sized to w×h and return the Unity-device handle
 /// of the bridge. C# (DisplayXRLocal2D) Graphics.CopyTexture's its canvas RT into it
-/// each frame; the provider submits an XrCompositionLayerLocal2DEXT at the pixel
+/// each frame; the provider submits an XrCompositionLayerLocal2DDXR at the pixel
 /// rect. Mirrors dxr_prov_get_wsui_bridge. *out_ptr = NULL when no session running.
 DISPLAYXR_EXPORT void dxr_prov_get_local2d_bridge(uint32_t w, uint32_t h,
                                                   void **out_ptr, uint32_t *out_w, uint32_t *out_h);
@@ -308,7 +311,10 @@ DISPLAYXR_EXPORT void dxr_prov_set_local2d_rect(int32_t x, int32_t y, int32_t w,
 // ---- Frame loop -------------------------------------------------------------
 
 /// Pump OpenXR session-state events (xrPollEvent). Drives the session to READY.
-void dxr_prov_poll_events(void);
+/// Exported for the macOS main-thread pump (#204): the runtime's poll drains
+/// NSApp events + flushes CATransaction (main-thread-only), so on macOS the C#
+/// driver calls this every LateUpdate instead of the graphics-thread pump.
+DISPLAYXR_EXPORT void dxr_prov_poll_events(void);
 
 /// Live tile realloc (#172): if the primary per-view target size (window×scaleXY,
 /// or the 3D-zone recommended view size) has changed and held stable, recreate the
@@ -372,9 +378,9 @@ void dxr_prov_end_frame_empty(void);
 /// displayxr_standalone_set_tunables so DisplayXRDisplay (display-centric) and
 /// DisplayXRCamera (camera-centric) both drive the provider:
 ///   - display-centric (camera_centric=0): uses virtual_display_height, ipd,
-///     parallax, perspective → chained as XrDisplayRigEXT.
+///     parallax, perspective → chained as XrDisplayRigDXR.
 ///   - camera-centric  (camera_centric=1): uses inv_convergence_distance,
-///     fov_override (= tan(vFov/2)), ipd, parallax → chained as XrCameraRigEXT.
+///     fov_override (= tan(vFov/2)), ipd, parallax → chained as XrCameraRigDXR.
 /// near_z/far_z are owned by Unity's projection (not the rig descriptor); stored
 /// but unused, matching the standalone. Scale-as-zoom is folded into
 /// virtual_display_height / inv_convergence_distance on the C# side (the rig's
@@ -399,10 +405,10 @@ DISPLAYXR_EXPORT int dxr_prov_get_display_pose_oxr(float out_pos[3], float out_q
 
 // ---- Queries ----------------------------------------------------------------
 
-/// Display info surfaced from XR_EXT_display_info.
+/// Display info surfaced from XR_DXR_display_info.
 DISPLAYXR_EXPORT void dxr_prov_get_display_info(DxrProvDisplayInfo *out_info);
 
-/// Whether the runtime advertised XR_EXT_view_rig (else no stereo — WARN+passthrough).
+/// Whether the runtime advertised XR_DXR_view_rig (else no stereo — WARN+passthrough).
 int  dxr_prov_has_view_rig(void);
 
 /// The active per-view RENDER rect this frame = window(overlay client) ×
@@ -420,7 +426,7 @@ DISPLAYXR_EXPORT void dxr_prov_get_render_rect(uint32_t *out_w, uint32_t *out_h)
 DISPLAYXR_EXPORT void dxr_prov_get_wsui_bridge(uint32_t w, uint32_t h,
                                                void **out_ptr, uint32_t *out_w, uint32_t *out_h);
 
-// ---- Rendering modes (XR_EXT_display_info) ----------------------------------
+// ---- Rendering modes (XR_DXR_display_info) ----------------------------------
 
 /// Number of enumerated rendering modes.
 DISPLAYXR_EXPORT uint32_t dxr_prov_get_mode_count(void);
@@ -431,19 +437,19 @@ DISPLAYXR_EXPORT int  dxr_prov_get_mode_info(uint32_t index, DxrProvModeInfo *ou
 /// modeIndex of the currently active mode (isActive), or 0 if unknown.
 DISPLAYXR_EXPORT uint32_t dxr_prov_get_active_mode_index(void);
 
-/// Request a vendor rendering mode by modeIndex (xrRequestDisplayRenderingModeEXT).
+/// Request a vendor rendering mode by modeIndex (xrRequestDisplayRenderingModeDXR).
 /// Returns 1 on XR_SUCCEEDED.
 DISPLAYXR_EXPORT int  dxr_prov_request_rendering_mode(uint32_t mode_index);
 
-/// Request the hardware 2D/3D display state (xrRequestDisplayModeEXT). mode3d=1
-/// → XR_DISPLAY_MODE_3D_EXT, 0 → 2D. Returns 1 on XR_SUCCEEDED.
+/// Request the hardware 2D/3D display state (xrRequestDisplayModeDXR). mode3d=1
+/// → XR_DISPLAY_MODE_3D_DXR, 0 → 2D. Returns 1 on XR_SUCCEEDED.
 DISPLAYXR_EXPORT int  dxr_prov_request_display_mode(int mode3d);
 
-/// Request the eye-tracking mode (xrRequestEyeTrackingModeEXT). manual=1 →
+/// Request the eye-tracking mode (xrRequestEyeTrackingModeDXR). manual=1 →
 /// MANUAL, 0 → MANAGED. Returns 1 on XR_SUCCEEDED (0 if unsupported/unresolved).
 DISPLAYXR_EXPORT int  dxr_prov_set_eye_tracking_mode(int manual);
 
-// ---- Atlas capture (XR_EXT_atlas_capture, #140) -----------------------------
+// ---- Atlas capture (XR_DXR_atlas_capture, #140) -----------------------------
 
 /// App-facing atlas screenshot ('I' key / DisplayXRScreenshot): hand the runtime
 /// a path prefix + capture stage; the runtime reads back its own compositor atlas
@@ -455,16 +461,16 @@ DISPLAYXR_EXPORT int  dxr_prov_capture_atlas(const char *path_prefix, int stage)
 
 // ---- Event consumption (atomic read-and-clear; pumped by dxr_prov_poll_events) --
 
-/// Returns 1 once after a XrEventDataRenderingModeChangedEXT, filling the
+/// Returns 1 once after a XrEventDataRenderingModeChangedDXR, filling the
 /// previous/current modeIndex; 0 otherwise. The native side has already
 /// re-enumerated modes + re-derived tiling/resolution by the time this returns 1.
 DISPLAYXR_EXPORT int  dxr_prov_consume_mode_changed(uint32_t *prev_index, uint32_t *cur_index);
 
-/// Returns 1 once after a XrEventDataHardwareDisplayStateChangedEXT, filling the
+/// Returns 1 once after a XrEventDataHardwareDisplayStateChangedDXR, filling the
 /// new hardwareDisplay3D state; 0 otherwise.
 DISPLAYXR_EXPORT int  dxr_prov_consume_hw_state_changed(int *hw3d);
 
-/// Returns 1 once after a XrEventDataEyeTrackingStateChangedEXT, filling the new
+/// Returns 1 once after a XrEventDataEyeTrackingStateChangedDXR, filling the new
 /// isTracking state and activeMode (0=MANAGED, 1=MANUAL); 0 otherwise.
 DISPLAYXR_EXPORT int  dxr_prov_consume_eye_tracking_changed(int *is_tracking, int *active_mode);
 

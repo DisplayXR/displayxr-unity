@@ -25,6 +25,7 @@
 #include <string.h>
 #include "displayxr_exports.h"
 #include "displayxr_shared_state.h"
+#include "displayxr_win32.h" // own decls — newer GCC (MinGW cross-check) errors on implicit declarations
 
 #pragma comment(lib, "dwmapi.lib")
 

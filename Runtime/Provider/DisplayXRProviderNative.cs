@@ -20,7 +20,7 @@ namespace DisplayXR
     {
         private const string LibName = "displayxr_unity";
 
-        /// <summary>Display geometry surfaced from XR_EXT_display_info (mirrors DxrProvDisplayInfo).</summary>
+        /// <summary>Display geometry surfaced from XR_DXR_display_info (mirrors DxrProvDisplayInfo).</summary>
         [StructLayout(LayoutKind.Sequential)]
         public struct DisplayInfo
         {
@@ -49,6 +49,16 @@ namespace DisplayXR
         /// <summary>Whether the provider's runtime session is currently running.</summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern int dxr_prov_session_is_running();
+
+        /// <summary>
+        /// Pump xrPollEvent (session-state machine + runtime event latches). On
+        /// Windows the native provider pumps from the graphics thread each frame;
+        /// on macOS the runtime's poll drains NSApp events + flushes CATransaction,
+        /// which are MAIN-thread-only (AppKit throws off-main) — so the driver calls
+        /// this every LateUpdate there instead (#204). No-op while no session runs.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void dxr_prov_poll_events();
 
         /// <summary>
         /// Select the stereo render mode BEFORE the session starts (#166 task #8):
@@ -263,7 +273,7 @@ namespace DisplayXR
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern int dxr_prov_set_eye_tracking_mode(int manual);
 
-        // ---- Atlas capture (XR_EXT_atlas_capture, #140) ----------------------
+        // ---- Atlas capture (XR_DXR_atlas_capture, #140) ----------------------
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern int dxr_prov_capture_atlas(

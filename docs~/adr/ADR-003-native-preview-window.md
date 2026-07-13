@@ -14,7 +14,7 @@ The original editor preview used a shared texture approach: the runtime composit
 
 - IOSurface creation + MTLTexture wrapping on macOS
 - D3D12 cross-device shared texture + DXGI handle on Windows
-- Canvas rect signaling (`xrSetSharedTextureOutputRectEXT`)
+- Canvas rect signaling (`xrSetSharedTextureOutputRectDXR`)
 - UV cropping for aspect ratio mismatch
 - Y-flip handling for Metal
 - Complex teardown (destroy IOSurface before session, but after compositor)

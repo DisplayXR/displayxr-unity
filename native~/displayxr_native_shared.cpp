@@ -139,8 +139,8 @@ displayxr_set_viewport_size_native(uint32_t width, uint32_t height,
 // (displayxr_set_canvas_rect) was re-homed out of the deleted hook TU — without it
 // the accessor returns 0 (full-window), the mask is stamped full-window while the
 // zone is woven into the sub-rect, and the mask CLIPS the woven content (#166).
-// The hook-era output-rect apply (xrSetSharedTextureOutputRectEXT) is dropped: the
-// provider drives the zone weave via XrDisplayZoneEXT (dxr_prov_set_3d_zone_rect),
+// The hook-era output-rect apply (xrSetSharedTextureOutputRectDXR) is dropped: the
+// provider drives the zone weave via XrDisplayZoneDXR (dxr_prov_set_3d_zone_rect),
 // so this setter only needs to update the shared canvas rect the mask path reads.
 static int s_canvas_rect_valid = 0;
 static int32_t s_canvas_rect_x = 0, s_canvas_rect_y = 0;

@@ -24,9 +24,19 @@ namespace DisplayXR.Editor
     /// App pollers early-return in the editor (`Application.isEditor`), so this
     /// editor-only poll is the sole consumer in Play Mode — no double-consume race.
     /// </summary>
+    /// <remarks>
+    /// Windows-editor-only: the dedicated weave window + its close-request flag are
+    /// win32 concepts (`displayxr_consume_overlay_close_request` is inside the
+    /// UNITY_STANDALONE_WIN block of DisplayXRNative). On macOS the runtime
+    /// self-hosts its window (#204) — close policy there is a Phase 4 topic (#206).
+    /// Without this gate the whole Editor assembly failed to compile on macOS.
+    /// </remarks>
+#if UNITY_EDITOR_WIN
     [InitializeOnLoad]
+#endif
     internal static class DisplayXRPreviewClose
     {
+#if UNITY_EDITOR_WIN
         static DisplayXRPreviewClose()
         {
             EditorApplication.update += Poll;
@@ -55,5 +65,6 @@ namespace DisplayXR.Editor
                 EditorApplication.isPlaying = false;
             }
         }
+#endif // UNITY_EDITOR_WIN
     }
 }

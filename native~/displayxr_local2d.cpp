@@ -68,3 +68,18 @@ displayxr_local2d_clear(void)
 	s_pending.native_tex = nullptr;
 	displayxr_log("[DisplayXR] local2d_clear\n");
 }
+
+// Read the pending Unity texture (mirrors displayxr_window_space_ui_get_pending).
+// The provider's Metal Local2D arm (ps_submit_local2d) blits this straight into its
+// overlay swapchain image (same device). The destination pixel rect is NOT read here
+// — it comes from provider state (dxr_prov_set_local2d_rect). Returns 1 iff a texture
+// of non-zero size is registered.
+extern "C" int
+displayxr_local2d_get_pending(void **out_tex, int *out_w, int *out_h)
+{
+	void *tex = s_pending.native_tex;
+	if (out_tex) *out_tex = tex;
+	if (out_w)   *out_w   = s_pending.width;
+	if (out_h)   *out_h   = s_pending.height;
+	return (tex != nullptr && s_pending.width > 0 && s_pending.height > 0) ? 1 : 0;
+}

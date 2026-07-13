@@ -8,14 +8,14 @@ The plugin **used to** reach the runtime via an **OpenXR API-layer hook**
 (`displayxr_hooks.cpp`) riding Unity's own OpenXR plugin. In that model the runtime
 treated Unity as a **fixed-resolution, always-2-view "legacy compromise" app**
 (see `displayxr-runtime/docs/architecture/unity-d3d12-app-path.md`):
-`XR_EXT_display_info` off, mode keys disabled, per-view resolution fixed at session
+`XR_DXR_display_info` off, mode keys disabled, per-view resolution fixed at session
 start, and the plugin coupled to Unity's OpenXR-stack internals.
 
 Epic #166 replaced that hook with a **custom `IUnityXRDisplay` Display Provider**
 (the route Oculus / Varjo / Google Cardboard use), and this provider is now the
 **sole shipping backend** — the hook and the standalone editor-preview session were
 removed. We drive the session; Unity still renders (keeping **SPI + URP/HDRP**); we
-enable `XR_EXT_display_info` so the runtime treats us as a **first-class extension
+enable `XR_DXR_display_info` so the runtime treats us as a **first-class extension
 app** — the Unity analog of the UE plugin (`unreal-d3d12-app-path.md`). The
 historical M1–M2 bring-up sections below document how the architecture was proven
 and hardened on hardware. For the >8-view (light-field/quilt) roadmap that layers on
@@ -27,7 +27,7 @@ top of this provider, see [ADR-007](../adr/ADR-007-render-path-by-view-count.md)
 |---|---|
 | `Runtime/UnitySubsystemsManifest.json` | Registers the display subsystem (`name: "DisplayXR"`, display `id: "DisplayXR Display"`, `libraryName: "displayxr_unity"`). Unity scans package manifests at load. |
 | `native~/displayxr_xrprovider/displayxr_display_provider.cpp` | Unity-facing half: `RegisterLifecycleProvider`, main-thread + graphics-thread provider callbacks, `CreateTexture` handoff, per-frame `PopulateNextFrameDesc` / `SubmitCurrentFrame`. |
-| `native~/displayxr_xrprovider/displayxr_provider_session.{h,cpp}` | Runtime-facing half: loads the DisplayXR runtime via `xrNegotiateLoaderRuntimeInterface`, creates instance/system/session on **Unity's D3D12 device**, enables EXT extensions, creates the `arraySize=2` (SPI) swapchain, consumes `XR_EXT_view_rig` render-ready views, submits the 2-view projection layer. |
+| `native~/displayxr_xrprovider/displayxr_provider_session.{h,cpp}` | Runtime-facing half: loads the DisplayXR runtime via `xrNegotiateLoaderRuntimeInterface`, creates instance/system/session on **Unity's D3D12 device**, enables EXT extensions, creates the `arraySize=2` (SPI) swapchain, consumes `XR_DXR_view_rig` render-ready views, submits the 2-view projection layer. |
 | `native~/displayxr_unity_plugin.cpp` | `UnityPluginLoad` calls `displayxr_register_xr_display_provider(ifaces)`. Single DLL — no second plugin. |
 | `native~/unity_pluginapi/` | Vendored Unity XR SDK headers (`IUnityXRDisplay.h`, `UnitySubsystemTypes.h`, `UnityXRTypes.h`, …) — Unity ships only graphics headers in the editor; the XR provider headers are sourced from the Unity XR SDK (Unity Companion License). |
 
@@ -53,7 +53,7 @@ GfxStart (render thread)
   ├─ Get Unity ID3D12Device + queue (IUnityGraphicsD3D12v8::GetDevice/GetCommandQueue)
   └─ dxr_prov_session_start ───────►  xrNegotiateLoaderRuntimeInterface (load runtime DLL)
                                        xrCreateInstance(+display_info,+D3D12,+win32_binding,+view_rig)
-                                       xrGetSystem / xrGetSystemProperties(XrDisplayInfoEXT)
+                                       xrGetSystem / xrGetSystemProperties(XrDisplayInfoDXR)
                                        xrGetD3D12GraphicsRequirementsKHR (LUID; Unity's device honored)
                                        xrCreateSession(GraphicsBindingD3D12{Unity device,queue} → win_binding)
                                        xrCreateReferenceSpace(LOCAL)
@@ -61,7 +61,7 @@ GfxStart (render thread)
 PopulateNextFrameDesc (per frame)
   ├─ dxr_prov_poll_events ─────────►  xrPollEvent → on READY: xrBeginSession + create swapchain
   ├─ create_textures_if_ready ─────►  CreateTexture(nativePtr = runtime swapchain image[i])  ← zero-copy
-  ├─ dxr_prov_begin_frame ─────────►  xrWaitFrame + xrBeginFrame + xrLocateViews(XrDisplayRigEXT) + Acquire/Wait
+  ├─ dxr_prov_begin_frame ─────────►  xrWaitFrame + xrBeginFrame + xrLocateViews(XrDisplayRigDXR) + Acquire/Wait
   └─ fill 1 RenderPass × 2 RenderParams (slices 0/1, projection from view fov)
 [Unity renders both eyes into the acquired swapchain image's 2 array slices]
 SubmitCurrentFrame
@@ -130,7 +130,7 @@ compositor-owned `ID3D12Resource`s on Unity's device"). Then:
 - `renderParams[eye].textureArraySlice = eye` (0 = left, 1 = right).
 - `renderParams[eye].projection` = `kUnityXRProjectionTypeHalfAngles` with
   `{left,right,top,bottom} = tan(fov.angleLeft/Right/Up/Down)` from the runtime's
-  render-ready `XR_EXT_view_rig` view.
+  render-ready `XR_DXR_view_rig` view.
 - `renderParams[eye].deviceAnchorToEyePose` = the view pose, converted OpenXR
   (right-handed, −Z fwd) → Unity (left-handed, +Z fwd).
 - `GfxStart` sets `renderingCaps.noSinglePassRenderingSupport = false`.
@@ -140,10 +140,10 @@ the runtime's shipped SPI fix (per-view SRV `FirstArraySlice = imageArrayIndex`)
 
 ## Extensions enabled (extension-app, not legacy)
 
-`XR_EXT_display_info` (geometry + becomes an extension app), `XR_KHR_D3D12_enable`
-(graphics binding), `XR_EXT_win32_window_binding` (weave target window),
-`XR_EXT_view_rig` (runtime-owned Kooima → render-ready views; probed before
-enabling, since older runtimes reject unknown extensions). Without `XR_EXT_view_rig`
+`XR_DXR_display_info` (geometry + becomes an extension app), `XR_KHR_D3D12_enable`
+(graphics binding), `XR_DXR_win32_window_binding` (weave target window),
+`XR_DXR_view_rig` (runtime-owned Kooima → render-ready views; probed before
+enabling, since older runtimes reject unknown extensions). Without `XR_DXR_view_rig`
 the provider logs a one-shot WARN and produces no stereo (same contract as the hook
 / standalone).
 
@@ -168,8 +168,8 @@ rig**, not fixed defaults — so a tracked face gets correct depth/parallax.
   hook-path LateUpdate push, which is inert in provider mode because
   `DisplayXRFeature` needs Unity's OpenXR loader). It respects the same gating
   (`SplashActive`, active-rig-only) as the rigs.
-- Native `dxr_prov_begin_frame` chains `XrDisplayRigEXT` (display-centric) or
-  `XrCameraRigEXT` (camera-centric) exactly like `displayxr_standalone.cpp`. The
+- Native `dxr_prov_begin_frame` chains `XrDisplayRigDXR` (display-centric) or
+  `XrCameraRigDXR` (camera-centric) exactly like `displayxr_standalone.cpp`. The
   rig pose is converted Unity→OpenXR (negate posZ, negate quat X/Y) in
   `dxr_prov_set_display_pose`; scene scale (`lossyScale`, scale-as-zoom) is folded
   into `virtualDisplayHeight` / `convergenceDiopters` on the C# side, matching the
@@ -197,16 +197,16 @@ rig**, not fixed defaults — so a tracked face gets correct depth/parallax.
 ### C. Mode enumeration + control + events
 
 - Native exports surface the enumerated modes (`dxr_prov_get_mode_count/info`),
-  the active mode, and `xrRequestDisplayRenderingModeEXT` /
-  `xrRequestDisplayModeEXT` / `xrRequestEyeTrackingModeEXT` (all soft-resolved —
+  the active mode, and `xrRequestDisplayRenderingModeDXR` /
+  `xrRequestDisplayModeDXR` / `xrRequestEyeTrackingModeDXR` (all soft-resolved —
   inert on an older runtime).
-- `dxr_prov_poll_events` handles `XrEventDataRenderingModeChangedEXT` (re-enumerate
+- `dxr_prov_poll_events` handles `XrEventDataRenderingModeChangedDXR` (re-enumerate
   modes + re-derive tiling/resolution live), `…HardwareDisplayStateChangedEXT`,
   and `…EyeTrackingStateChangedEXT`, latching each into atomic read-and-clear
   flags. The driver pumps them into `DisplayXRProvider`'s C# events. Mode
   *keybinding* stays app policy — the plugin only exposes the API. The three event
   structs were added to `displayxr_extensions.h` verbatim from the runtime's
-  `XR_EXT_display_info.h`.
+  `XR_DXR_display_info.h`.
 
 ### Loader (XR Plug-in Management)
 
@@ -345,7 +345,7 @@ needs to change *where it reads from*, not the downstream logic:
 |---|---|---|
 | `DisplayXRFeature.Instance.GetStereoMatrices(...)` | `displayxr_get_stereo_matrices` (provider-populated via `ps_publish_stereo_matrices`) | `DisplayXRTransparentOverlay` silhouette/hit-test (URP eye_world view+proj — else the click-through silhouette truncates popped-out geometry, bc001ce). *(The former URP `KooimaProjectionFixFeature` also read this; it was removed in v2.2.0 once the provider began handing Unity a full projection matrix — see #22.)* |
 | hook `LateUpdate` push of `dxr_set_tunables` / display pose | `DisplayXRProviderDriver` per-frame `dxr_prov_set_tunables` / `dxr_prov_set_display_pose` | display/camera rig tunables |
-| `OpenXRRuntime.IsExtensionEnabled("XR_EXT_local_3d_zone")` gate | `DisplayXRProviderDriver.IsActive` | `DisplayXRLocal2D` bridge branch |
+| `OpenXRRuntime.IsExtensionEnabled("XR_DXR_local_3d_zone")` gate | `DisplayXRProviderDriver.IsActive` | `DisplayXRLocal2D` bridge branch |
 | `SetEnvironmentBlendMode(AlphaBlend)` on the OpenXR feature | `dxr_prov_set_transparent_background` | `DisplayXRTransparentOverlay` |
 | foreground-clip globals from `GetStereoMatrices` (rig URP branch) | `dxr_prov_get_eye_clip` published in `DisplayXRDisplay.PublishProviderForegroundClip` | `DisplayXR/ForegroundClipURP` |
 

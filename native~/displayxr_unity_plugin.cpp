@@ -31,6 +31,12 @@
 extern "C" void displayxr_register_xr_display_provider(IUnityInterfaces *ifaces);
 extern "C" void displayxr_unregister_xr_display_provider(void);
 
+#ifdef __APPLE__
+// Metal glue (#204): stash IUnityInterfaces so the provider can fetch
+// IUnityGraphicsMetal (device/queue) on the graphics thread.
+#include "displayxr_xrprovider/displayxr_provider_gfx_metal.h"
+#endif
+
 static IUnityInterfaces *s_unity_ifaces = nullptr;
 static IUnityGraphics   *s_unity_gfx    = nullptr;
 #if defined(DXR_HAVE_UNITY_VULKAN)
@@ -94,6 +100,10 @@ UnityPluginLoad(IUnityInterfaces *unityInterfaces)
 		// case kUnityGfxDeviceEventInitialize already fired — capture now too.
 		on_graphics_device_event(kUnityGfxDeviceEventInitialize);
 	}
+
+#ifdef __APPLE__
+	dxr_prov_metal_set_unity_ifaces(s_unity_ifaces);
+#endif
 
 	// Register the custom IUnityXRDisplay Display Provider (epic #166, M1).
 	// This is what makes Unity drive the DisplayXR runtime as a first-class
