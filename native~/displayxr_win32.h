@@ -48,6 +48,12 @@ void displayxr_destroy_provider_dedicated_window(void);
 /// Unity's PlayerLoop is blocked in a modal move loop. NULL pane_hwnd disables it.
 void displayxr_set_pane_follow(void *pane_hwnd, int off_x, int off_y, int w, int h);
 
+/// (#740 auto-switch) Programmatic child-glue selection — see displayxr_exports.h.
+void displayxr_set_child_glue(int enable, void *pane_hwnd);
+
+/// (#740 auto-switch) 1 while the dedicated weave window is a live HWND.
+int displayxr_dedicated_window_alive(void);
+
 /// Check whether the plugin is running in shell/IPC mode.
 /// Detected via DISPLAYXR_WORKSPACE_SESSION=1 (legacy DISPLAYXR_SHELL_SESSION=1
 /// is also honored) environment variable.

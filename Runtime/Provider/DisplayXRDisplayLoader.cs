@@ -98,6 +98,11 @@ namespace DisplayXR
 
         public override bool Start()
         {
+            // (#740 auto-switch) Detect the Game view's dock state and pick the bind mode
+            // BEFORE the subsystem starts (session_start reads it): docked → texture +
+            // child-glue (in-tab occlusion), undocked → present. Runs on every Start, so a
+            // mid-Play dock-transition restart (Stop→Start) re-binds the right mode.
+            DisplayXRProviderDriver.ApplyDockModeForSessionStart();
             // Re-push the render-path decision on EVERY start (#740): the native session
             // teardown memsets the provider state (only runtime_lib survives), so a mid-Play
             // subsystem restart (GameView re-host watcher, future dock auto-switch) would

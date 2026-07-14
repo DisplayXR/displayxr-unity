@@ -1252,6 +1252,33 @@ static int   s_childglue        = 0;   // dedicated window born WS_CHILD of the 
 // SCREEN rect to container-client child coords before SetWindowPos.
 int displayxr_dedicated_is_childglue(void) { return s_childglue; }
 
+// (#740 auto-switch) Programmatic child-glue selection. The C# dock-state detector
+// drives this before every session (re)start: docked → (1, matched PANE hwnd),
+// undocked → (0, NULL). -1 leaves the DISPLAYXR_PROV_GV_CHILDGLUE env in charge
+// (test launchers; C# skips this setter when that env is set). The PANE handle is
+// stashed and its GA_ROOT container is resolved AT WINDOW-CREATION time — the
+// attempt-#1 lesson: a container captured in C# at loader.Start() can be destroyed
+// as Play settles (WS_CHILD dies with its parent → mono). Like the present-mode
+// override this survives session stop — C# must re-set it per (re)start.
+static int  s_childglue_override = -1;
+static HWND s_childglue_pane     = NULL;
+
+void displayxr_set_child_glue(int enable, void *pane_hwnd)
+{
+	s_childglue_override = enable < 0 ? -1 : (enable ? 1 : 0);
+	s_childglue_pane     = (HWND)pane_hwnd;
+}
+
+// (#740 auto-switch) Alive-check for the C# recovery watcher: a child-glue weave
+// window dies WITH its parent container (Unity can rebuild containers as Play
+// settles or on layout churn) — the session then weaves against a dead HWND
+// (atlas canvas (-1,-1) → mono). The watcher polls this and restarts the
+// subsystem, which recreates the window under the surviving container.
+int displayxr_dedicated_window_alive(void)
+{
+	return s_dedicated_hwnd != NULL && IsWindow(s_dedicated_hwnd) ? 1 : 0;
+}
+
 // (#740) Pane-follow during OS modal drags. When the user drags a UNITY window (editor
 // container or the undocked floating Game view), Windows enters a modal move loop that
 // blocks Unity's PlayerLoop — so the C# glue (LateUpdate → dxr_prov_set_gameview_rect)
@@ -1330,10 +1357,20 @@ static void follow_reposition_to_pane(void)
 {
 	if (!s_dedicated_hwnd || !s_pane_follow_hwnd || !IsWindow(s_pane_follow_hwnd)) return;
 	RECT pr;
-	if (GetWindowRect(s_pane_follow_hwnd, &pr))
-		SetWindowPos(s_dedicated_hwnd, NULL, pr.left + s_pane_follow_ox, pr.top + s_pane_follow_oy,
-		             s_pane_follow_w, s_pane_follow_h,
-		             SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER); // no FRAMECHANGED (#727)
+	if (!GetWindowRect(s_pane_follow_hwnd, &pr)) return;
+	int tx = pr.left + s_pane_follow_ox, ty = pr.top + s_pane_follow_oy;
+	// Child-glue (#740 auto-switch): SetWindowPos on a WS_CHILD wants coords relative
+	// to the parent container's client, not screen. (When the container moves, the
+	// child rides along and this becomes a no-op — only a pane move WITHIN the
+	// container repositions it.)
+	if (s_childglue) {
+		HWND parent = GetAncestor(s_dedicated_hwnd, GA_PARENT);
+		POINT o = {0, 0};
+		if (parent != NULL && ClientToScreen(parent, &o)) { tx -= o.x; ty -= o.y; }
+	}
+	SetWindowPos(s_dedicated_hwnd, NULL, tx, ty,
+	             s_pane_follow_w, s_pane_follow_h,
+	             SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER); // no FRAMECHANGED (#727)
 }
 
 static LRESULT CALLBACK follow_host_subclass_proc(HWND host, UINT msg, WPARAM wParam, LPARAM lParam)
@@ -1560,9 +1597,7 @@ dedicated_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 						SendMessageW(hwnd, WM_ENTERSIZEMOVE, 0, 0); // #61 phase-snap bracket
 					}
 					s_pane_follow_last_move_tick = GetTickCount64();
-					SetWindowPos(hwnd, NULL, pr.left + s_pane_follow_ox, pr.top + s_pane_follow_oy,
-					             s_pane_follow_w, s_pane_follow_h,
-					             SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+					follow_reposition_to_pane(); // child-glue-aware coords (#740)
 				} else if (s_pane_follow_in_bracket &&
 				           GetTickCount64() - s_pane_follow_last_move_tick >= DXR_PANE_FOLLOW_SETTLE_MS) {
 					// Pane settled: close the bracket → the weaver snaps to lenticular pixels.
@@ -1781,9 +1816,21 @@ displayxr_create_provider_dedicated_window(void)
 
 	HWND child_parent = NULL;
 	int cx = igx, cy = igy;
-	s_childglue = (!present_mode && have_init && getenv("DISPLAYXR_PROV_GV_CHILDGLUE") != NULL) ? 1 : 0;
+	// Auto-switch (#740): the C# override (dock-state detector) wins over the env gate.
+	int childglue_want = (s_childglue_override >= 0)
+	    ? s_childglue_override
+	    : (getenv("DISPLAYXR_PROV_GV_CHILDGLUE") != NULL ? 1 : 0);
+	s_childglue = (!present_mode && have_init && childglue_want) ? 1 : 0;
 	if (s_childglue) {
-		child_parent = find_unity_hwnd();
+		// Resolve the container NOW (window-creation time), from the C#-matched PANE's
+		// live GA_ROOT — deterministic, and as late as possible (attempt #1 pre-captured
+		// the container in C# at loader.Start() and Unity destroyed it as Play settled).
+		// find_unity_hwnd() remains the fallback for env-driven runs (it prefers the
+		// foreground window, which can be wrong when a floating Unity window is focused).
+		child_parent = (s_childglue_pane != NULL && IsWindow(s_childglue_pane))
+		    ? GetAncestor(s_childglue_pane, GA_ROOT) : NULL;
+		if (child_parent == NULL)
+			child_parent = find_unity_hwnd();
 		if (child_parent != NULL) {
 			POINT o = {0, 0};
 			ClientToScreen(child_parent, &o);

@@ -334,6 +334,21 @@ DISPLAYXR_EXPORT void displayxr_resize_overlay(int width, int height);
 /// frozen the PlayerLoop (and thus the C# glue). NULL pane_hwnd disables.
 DISPLAYXR_EXPORT void displayxr_set_pane_follow(void *pane_hwnd, int off_x, int off_y, int w, int h);
 
+/// (#740 auto-switch) Programmatic child-glue selection for the docked texture path.
+/// C# dock-state detection calls this BEFORE every session (re)start: docked →
+/// (1, matched PANE hwnd) — the pane's GA_ROOT container is resolved at WINDOW-CREATION
+/// time, never pre-captured (Unity can destroy a pre-Play container as Play settles);
+/// undocked → (0, NULL) top-level. enable=-1 restores the DISPLAYXR_PROV_GV_CHILDGLUE
+/// env gate. Dead/NULL pane → find_unity_hwnd() fallback. The value survives session
+/// stop — re-set it per start. Windows editor only.
+DISPLAYXR_EXPORT void displayxr_set_child_glue(int enable, void *pane_hwnd);
+
+/// (#740 auto-switch) 1 while the dedicated weave window exists and is a live HWND.
+/// A child-glue window dies WITH its parent container (Unity rebuilds containers on
+/// layout churn / as Play settles) — the C# recovery watcher polls this and restarts
+/// the display subsystem to recreate the window under the surviving container.
+DISPLAYXR_EXPORT int displayxr_dedicated_window_alive(void);
+
 /// (display-zones port) Get/set the managed overlay window's screen-space
 /// top-left, for app-side window-position persistence (remember/restore across
 /// launches). set is #61-bracketed (size unchanged). Windows overlay only.
