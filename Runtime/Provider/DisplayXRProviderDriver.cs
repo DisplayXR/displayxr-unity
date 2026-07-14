@@ -889,6 +889,14 @@ namespace DisplayXR
             if (!TryGetGameViewRenderRect(out int px, out int py, out int pw, out int ph, out string dbg))
                 return;
             if (!s_loggedGlueOnce) { s_loggedGlueOnce = true; Debug.Log($"[DisplayXR] GameView glue: {dbg}"); }
+            // (#740) Pane-follow: publish the matched pane HWND + render-vs-pane-window offset
+            // so the native WM_TIMER keeps the weave window glued during OS modal drags of a
+            // Unity window (which freeze this LateUpdate → the C# glue stops). The timer
+            // re-derives the pane's live screen rect and repositions our window. Runs for all
+            // glue arrangements; harmless when the window doesn't track (no-op).
+            if (s_hwndCorrValid && s_hwndCorrHwnd != System.IntPtr.Zero)
+                DisplayXRProviderNative.displayxr_set_pane_follow(
+                    s_hwndCorrHwnd, px - s_hwndCorrX, py - s_hwndCorrY, pw, ph);
             // BINDPANE: the bound window IS the pane — publish only the render area's
             // client-relative offset (the pane moves itself; zone x/y stay put unless the
             // in-pane layout changes). Never any window op.

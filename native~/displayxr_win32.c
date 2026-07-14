@@ -1252,6 +1252,37 @@ static int   s_childglue        = 0;   // dedicated window born WS_CHILD of the 
 // SCREEN rect to container-client child coords before SetWindowPos.
 int displayxr_dedicated_is_childglue(void) { return s_childglue; }
 
+// (#740) Pane-follow during OS modal drags. When the user drags a UNITY window (editor
+// container or the undocked floating Game view), Windows enters a modal move loop that
+// blocks Unity's PlayerLoop — so the C# glue (LateUpdate → dxr_prov_set_gameview_rect)
+// freezes and the weave window stops following until mouse-up (the woven output lags the
+// window). A WM_TIMER on our window keeps firing during that modal loop (same thread), so
+// the timer re-derives the pane's LIVE screen rect (GetWindowRect on the pane HWND updates
+// as its host window moves) and repositions our window to stay glued. C# publishes the
+// pane HWND + the render-area offset within the pane window + size via displayxr_set_pane_follow.
+static HWND s_pane_follow_hwnd = NULL;
+static int  s_pane_follow_ox = 0, s_pane_follow_oy = 0; // render origin − pane window origin
+static int  s_pane_follow_w = 0, s_pane_follow_h = 0;
+static int  s_ded_present = 0;                          // present mode: SR resolves OUR window
+// Follow-burst / #61 phase-snap bracket state (present mode only). We track the PANE's
+// last-followed screen position (not our window's) so the weaver's exit phase-snap — which
+// nudges our window a few px to lenticular-aligned pixels — is NOT itself treated as a
+// pane move and re-followed (that would fight the snap). Bracket rides the follow so the
+// weaver phase-snaps on settle, exactly like main's dedicated-window drag.
+static int       s_pane_follow_last_valid = 0;
+static LONG      s_pane_follow_last_px = 0, s_pane_follow_last_py = 0;
+static int       s_pane_follow_in_bracket = 0;
+static ULONGLONG s_pane_follow_last_move_tick = 0;
+#define DXR_PANE_FOLLOW_TIMER 0xD7A0
+#define DXR_PANE_FOLLOW_SETTLE_MS 180
+
+void displayxr_set_pane_follow(void *pane_hwnd, int off_x, int off_y, int w, int h)
+{
+	s_pane_follow_hwnd = (HWND)pane_hwnd;
+	s_pane_follow_ox = off_x; s_pane_follow_oy = off_y;
+	s_pane_follow_w = w; s_pane_follow_h = h;
+}
+
 // (#740) The dedicated window's container parent's client origin in screen px (child-glue
 // coord base). Returns 1 + fills *ox,*oy when child-glue is active and the parent resolves.
 int displayxr_dedicated_parent_client_origin(int *ox, int *oy)
@@ -1312,6 +1343,46 @@ dedicated_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		// (mouse delta/buttons for camera drag). Without this, clicking the weave
 		// window to drag-rotate can steal focus and freeze Unity's mouse.
 		return MA_NOACTIVATE;
+
+	case WM_TIMER:
+		// (#740) Pane-follow during OS modal drags: fires even while a Unity window's
+		// modal move loop has frozen the PlayerLoop (same-thread timer). Re-derive the
+		// pane's LIVE screen rect and keep our window glued. Plain move/resize (no
+		// SWP_FRAMECHANGED) — weaver-safe (#727). Skips itself during our OWN custom drag.
+		// In PRESENT mode the SR weaver resolves OUR window, so bracket the follow burst
+		// with #61 WM_ENTERSIZEMOVE/EXITSIZEMOVE — the weaver phase-snaps on settle (main's
+		// dedicated-window recipe). NOT bracketed in texture mode (SR resolves Unity's
+		// container, which gets its own OS brackets; a synthetic bracket there re-anchors
+		// the hidden proxy off the pane — the reverted b01c850 regression).
+		if (wParam == DXR_PANE_FOLLOW_TIMER && s_pane_follow_hwnd && IsWindow(s_pane_follow_hwnd)
+		    && !s_ded_dragging && !s_ded_sizing_edge) {
+			RECT pr;
+			if (GetWindowRect(s_pane_follow_hwnd, &pr)) {
+				// Track the PANE's position (not our window's — the exit snap moves ours).
+				int pane_moved = !s_pane_follow_last_valid
+				                 || pr.left != s_pane_follow_last_px
+				                 || pr.top  != s_pane_follow_last_py;
+				if (pane_moved) {
+					s_pane_follow_last_valid = 1;
+					s_pane_follow_last_px = pr.left; s_pane_follow_last_py = pr.top;
+					if (s_ded_present && !s_pane_follow_in_bracket) {
+						s_pane_follow_in_bracket = 1;
+						SendMessageW(hwnd, WM_ENTERSIZEMOVE, 0, 0); // #61 phase-snap bracket
+					}
+					s_pane_follow_last_move_tick = GetTickCount64();
+					SetWindowPos(hwnd, NULL, pr.left + s_pane_follow_ox, pr.top + s_pane_follow_oy,
+					             s_pane_follow_w, s_pane_follow_h,
+					             SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+				} else if (s_pane_follow_in_bracket &&
+				           GetTickCount64() - s_pane_follow_last_move_tick >= DXR_PANE_FOLLOW_SETTLE_MS) {
+					// Pane settled: close the bracket → the weaver snaps to lenticular pixels.
+					s_pane_follow_in_bracket = 0;
+					SendMessageW(hwnd, WM_EXITSIZEMOVE, 0, 0);
+				}
+			}
+			return 0;
+		}
+		break;
 
 	case WM_CLOSE:
 		// Quit the whole app on close (X / Alt+F4), mirroring the overlay path:
@@ -1514,6 +1585,8 @@ displayxr_create_provider_dedicated_window(void)
 	// (GA_ROOT==self). Forces top-level + visible, overriding child-glue.
 	extern int dxr_prov_get_present_mode(void);
 	int present_mode = have_init && dxr_prov_get_present_mode();
+	s_ded_present = present_mode;                 // wndproc reads this for the #61 snap bracket
+	s_pane_follow_last_valid = 0; s_pane_follow_in_bracket = 0; // reset per session
 
 	HWND child_parent = NULL;
 	int cx = igx, cy = igy;
@@ -1579,6 +1652,26 @@ displayxr_create_provider_dedicated_window(void)
 
 	// Show WITHOUT activating so the editor keeps OS foreground (input stays live).
 	ShowWindow(s_dedicated_hwnd, SW_SHOWNOACTIVATE);
+
+	// (#740) Pane-follow timer: keeps the window glued during OS modal drags of a Unity
+	// window (which freeze the PlayerLoop + the C# glue). Only needed for the glued paths
+	// (have_init); harmless if C# never publishes a pane (the WM_TIMER no-ops). Raise the
+	// system timer resolution to ~1ms (default ~15.6ms starves a fast drag → the woven
+	// window visibly lags the cursor) and run at ~8ms so the follow keeps up. winmm loaded
+	// dynamically (not linked); handle intentionally leaked (editor-lifetime).
+	if (have_init) {
+		static int s_tbp_done = 0;
+		if (!s_tbp_done) {
+			s_tbp_done = 1;
+			HMODULE winmm = LoadLibraryW(L"winmm.dll");
+			if (winmm) {
+				typedef UINT (WINAPI *pfn_tbp)(UINT);
+				pfn_tbp tbp = (pfn_tbp)GetProcAddress(winmm, "timeBeginPeriod");
+				if (tbp) tbp(1);
+			}
+		}
+		SetTimer(s_dedicated_hwnd, DXR_PANE_FOLLOW_TIMER, 8, NULL);
+	}
 
 	// Publish as the managed top-level overlay HWND so the app-facing window
 	// helpers (displayxr_resize_overlay / _get/_set_overlay_position /

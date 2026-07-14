@@ -328,6 +328,12 @@ DISPLAYXR_EXPORT int displayxr_consume_overlay_close_request(void);
 /// keyboard shortcut. Windows transparent overlay only; no-op elsewhere.
 DISPLAYXR_EXPORT void displayxr_resize_overlay(int width, int height);
 
+/// (#740) Pane-follow during OS modal drags — see displayxr_win32.h. C# publishes the
+/// matched Game-view pane HWND + render-origin-minus-pane-window offset + size; a WM_TIMER
+/// on the dedicated weave window keeps it glued while a Unity window's modal move loop has
+/// frozen the PlayerLoop (and thus the C# glue). NULL pane_hwnd disables.
+DISPLAYXR_EXPORT void displayxr_set_pane_follow(void *pane_hwnd, int off_x, int off_y, int w, int h);
+
 /// (display-zones port) Get/set the managed overlay window's screen-space
 /// top-left, for app-side window-position persistence (remember/restore across
 /// launches). set is #61-bracketed (size unchanged). Windows overlay only.

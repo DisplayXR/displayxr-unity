@@ -140,6 +140,21 @@ namespace DisplayXR
         public static extern void dxr_prov_set_external_weave_hwnd(System.IntPtr hwnd);
 
         /// <summary>
+        /// Bind mode within the editor GameView feature (#740 hybrid): 0 = texture (docked),
+        /// 1 = present (undocked). Set before session start, dock-state-driven.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void dxr_prov_set_present_mode(int enable);
+
+        /// <summary>
+        /// (#740) Publish the matched Game-view pane HWND + render-origin-minus-pane-window
+        /// offset + size so a native WM_TIMER keeps the weave window glued to the pane during
+        /// OS modal drags (which freeze the C# glue). NULL pane disables.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void displayxr_set_pane_follow(System.IntPtr paneHwnd, int offX, int offY, int w, int h);
+
+        /// <summary>
         /// GameView weave-to-texture presentation (Task (a), editor + texture probe): the
         /// runtime-woven shared texture opened on Unity's D3D device. C# wraps it as an
         /// external Texture2D and draws it into the Game view (DisplayXRGameViewPresenter).
