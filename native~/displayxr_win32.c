@@ -1284,6 +1284,47 @@ static ULONGLONG s_pane_follow_last_move_tick = 0;
 // Mirrors the overlay path's parent_subclass_proc. Re-targets on dock/undock (host change).
 static HWND    s_follow_host_hwnd = NULL;
 static WNDPROC s_follow_host_orig_proc = NULL;
+// (#740) Custom host MOVE drag: DefWindowProc's modal move loop blocks Unity's PlayerLoop,
+// so the per-frame pump (window-relative Kooima / POV) freezes until mouse-up. Instead of
+// handing the OS the loop, run the #61 capture-based custom drag (dedicated_wnd_proc's
+// SC_MOVE recipe) ON THE HOST: each WM_MOUSEMOVE does a plain SetWindowPos and returns, so
+// the main thread keeps returning to Unity's message loop → PlayerLoop ticks → POV live
+// while the 3D keeps lockstep-following. "pending" = caption pressed, not yet past the OS
+// drag threshold (a plain title-bar click must not move the window or open a bracket).
+static int   s_follow_drag_pending = 0;
+static int   s_follow_dragging     = 0;
+static POINT s_follow_drag_cursor  = {0, 0};
+static RECT  s_follow_drag_rect    = {0, 0, 0, 0};
+
+// Trade-off while a session is live: Win11 Snap Layouts / drag-to-edge / drag-to-top for
+// the Unity window don't engage during the custom drag (they are modal-loop features;
+// Win+Arrow snapping still works). DISPLAYXR_PROV_HOST_DRAG=0 restores the OS drag
+// (and with it the frozen-POV-during-drag behavior).
+static int follow_host_drag_enabled(void)
+{
+	static int s_checked = 0, s_enabled = 1;
+	if (!s_checked) {
+		const char *v = getenv("DISPLAYXR_PROV_HOST_DRAG");
+		s_enabled = !(v != NULL && v[0] == '0' && v[1] == '\0');
+		s_checked = 1;
+	}
+	return s_enabled;
+}
+
+// End the custom host drag. Clears the flags BEFORE the bracket close / ReleaseCapture so
+// the recursive WM_CAPTURECHANGED sees the drag inactive (dedicated_wnd_proc's ordering).
+static void follow_host_drag_end(HWND host, int release_capture)
+{
+	int was_dragging = s_follow_dragging;
+	s_follow_drag_pending = 0;
+	s_follow_dragging = 0;
+	if (was_dragging) {
+		SendMessageW(host, WM_EXITSIZEMOVE, 0, 0);
+		displayxr_log("[DisplayXR][HostDrag] end\n");
+	}
+	if (release_capture && GetCapture() == host)
+		ReleaseCapture();
+}
 
 static void follow_reposition_to_pane(void)
 {
@@ -1311,8 +1352,65 @@ static LRESULT CALLBACK follow_host_subclass_proc(HWND host, UINT msg, WPARAM wP
 		// Host moved/resized (fires synchronously during its modal loop) → lockstep-follow.
 		follow_reposition_to_pane();
 		break;
+
+	// ----- (#740) #61 custom MOVE drag of the HOST (bypass the Unity-blocking modal loop) -----
+	case WM_SYSCOMMAND:
+		// Only a mouse caption drag (SC_MOVE|HTCAPTION = 0xF012, button down): keyboard
+		// move (Alt+Space,M → 0xF010) and a maximized-window drag (OS restore-and-drag)
+		// keep the OS modal loop. SC_SIZE is untouched by design (resize stays modal).
+		if (host == s_follow_host_hwnd && s_dedicated_hwnd
+		    && (wParam & 0xFFF0) == SC_MOVE && (wParam & 0x000F) == HTCAPTION
+		    && GetKeyState(VK_LBUTTON) < 0 && !IsZoomed(host)
+		    && follow_host_drag_enabled()) {
+			SetCapture(host);
+			GetCursorPos(&s_follow_drag_cursor);
+			GetWindowRect(host, &s_follow_drag_rect);
+			s_follow_drag_pending = 1; // promoted to a drag past the OS threshold below
+			return 0; // no DefWindowProc → no modal loop
+		}
+		break;
+
+	case WM_MOUSEMOVE:
+		if (s_follow_drag_pending || s_follow_dragging) {
+			if (GetKeyState(VK_LBUTTON) >= 0) { // missed the up somehow — end cleanly
+				follow_host_drag_end(host, 1);
+				return 0;
+			}
+			POINT cur; GetCursorPos(&cur);
+			int dx = cur.x - s_follow_drag_cursor.x;
+			int dy = cur.y - s_follow_drag_cursor.y;
+			if (!s_follow_dragging) {
+				if (abs(dx) < GetSystemMetrics(SM_CXDRAG) && abs(dy) < GetSystemMetrics(SM_CYDRAG))
+					return 0; // still a click, not a drag
+				s_follow_dragging = 1;
+				// Deliver the bracket a real OS drag would: to the HOST. Our own
+				// ENTERSIZEMOVE case forwards it to the weave window in present mode
+				// only (b01c850 guardrail), and the SR weaver's docked-container
+				// subclass sees it for phase-snap, exactly like a real drag.
+				SendMessageW(host, WM_ENTERSIZEMOVE, 0, 0);
+				displayxr_log("[DisplayXR][HostDrag] begin\n");
+			}
+			SetWindowPos(host, NULL, s_follow_drag_rect.left + dx, s_follow_drag_rect.top + dy,
+			             0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+			return 0; // swallow, as the OS modal loop does
+		}
+		break;
+
+	case WM_LBUTTONUP:
+		if (s_follow_drag_pending || s_follow_dragging) {
+			follow_host_drag_end(host, 1);
+			return 0;
+		}
+		break;
+
+	case WM_CAPTURECHANGED:
+		if (s_follow_drag_pending || s_follow_dragging)
+			follow_host_drag_end(host, 0); // capture already gone — just close the bracket
+		break;
+
 	case WM_NCDESTROY:
 		if (host == s_follow_host_hwnd) {
+			follow_host_drag_end(host, 1);
 			if (orig) SetWindowLongPtrW(host, GWLP_WNDPROC, (LONG_PTR)orig);
 			s_follow_host_hwnd = NULL; s_follow_host_orig_proc = NULL;
 		}
@@ -1324,6 +1422,13 @@ static LRESULT CALLBACK follow_host_subclass_proc(HWND host, UINT msg, WPARAM wP
 
 static void follow_unsubclass_host(void)
 {
+	// A retarget/teardown can land mid-drag: end it first (flags cleared before the
+	// recursive WM_CAPTURECHANGED) so no capture is left on a window whose proc we
+	// are about to stop handling.
+	if (s_follow_host_hwnd && IsWindow(s_follow_host_hwnd))
+		follow_host_drag_end(s_follow_host_hwnd, 1);
+	else
+		{ s_follow_drag_pending = 0; s_follow_dragging = 0; }
 	if (s_follow_host_hwnd && s_follow_host_orig_proc && IsWindow(s_follow_host_hwnd))
 		SetWindowLongPtrW(s_follow_host_hwnd, GWLP_WNDPROC, (LONG_PTR)s_follow_host_orig_proc);
 	s_follow_host_hwnd = NULL; s_follow_host_orig_proc = NULL;
