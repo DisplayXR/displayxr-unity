@@ -3056,18 +3056,42 @@ displayxr_get_overlay_pointer(int *clientX, int *clientY, int *buttons)
 			// (GetAsyncKeyState). Motion comes from Mouse.current.delta (raw input to
 			// the foreground editor). This lets the sample controller's provider-mode
 			// button path (displayxr_get_overlay_pointer) drive left-drag rotate.
-			if (GetAsyncKeyState(VK_LBUTTON) & 0x8000) b |= 1;
-			if (GetAsyncKeyState(VK_RBUTTON) & 0x8000) b |= 2;
-			if (GetAsyncKeyState(VK_MBUTTON) & 0x8000) b |= 4;
-		} else {
-			// s_vkey_state is updated by shell_subclass_proc on Unity's HWND
-			// (installed via displayxr_install_focus_hook from the transparent
-			// path). PostMessage'd left/right/middle clicks from overlay_wnd_proc
-			// flow through Unity's wndproc → subclass → here.
-			if (s_vkey_state[VK_LBUTTON] & 0x8000) b |= 1;
-			if (s_vkey_state[VK_RBUTTON] & 0x8000) b |= 2;
-			if (s_vkey_state[VK_MBUTTON] & 0x8000) b |= 4;
+			//
+			// (#740 f-up) Origin-gate that global state: report a button only while
+			// a press that STARTED inside the weave window rect (== the Game view
+			// surface) is held. GetAsyncKeyState is global, so without this a
+			// title-bar drag of the editor (which now keeps the PlayerLoop running —
+			// the custom host drag) or a click on any other editor panel would drive
+			// the sample controller's left-drag rotate while the user is just moving
+			// the window. Latch at the up→down transition; a drag that leaves the
+			// rect keeps its latch until release (normal drag semantics).
+			static int s_btn_prev[3]   = {0, 0, 0};
+			static int s_btn_inside[3] = {0, 0, 0};
+			static const int s_btn_vk[3] = {VK_LBUTTON, VK_RBUTTON, VK_MBUTTON};
+			RECT wr;
+			int have_rect = s_overlay_hwnd != NULL && IsWindow(s_overlay_hwnd) &&
+			                GetWindowRect(s_overlay_hwnd, &wr);
+			for (int i = 0; i < 3; i++) {
+				int down = (GetAsyncKeyState(s_btn_vk[i]) & 0x8000) != 0;
+				if (down && !s_btn_prev[i]) {
+					POINT cp;
+					s_btn_inside[i] = have_rect && GetCursorPos(&cp) && PtInRect(&wr, cp);
+				} else if (!down) {
+					s_btn_inside[i] = 0;
+				}
+				s_btn_prev[i] = down;
+				if (down && s_btn_inside[i]) b |= (1 << i);
+			}
+			*buttons = b;
+			return;
 		}
+		// s_vkey_state is updated by shell_subclass_proc on Unity's HWND
+		// (installed via displayxr_install_focus_hook from the transparent
+		// path). PostMessage'd left/right/middle clicks from overlay_wnd_proc
+		// flow through Unity's wndproc → subclass → here.
+		if (s_vkey_state[VK_LBUTTON] & 0x8000) b |= 1;
+		if (s_vkey_state[VK_RBUTTON] & 0x8000) b |= 2;
+		if (s_vkey_state[VK_MBUTTON] & 0x8000) b |= 4;
 		*buttons = b;
 	}
 }
