@@ -1066,6 +1066,9 @@ namespace DisplayXR
         int m_LastGlueX = int.MinValue, m_LastGlueY, m_LastGlueW, m_LastGlueH;
         System.IntPtr m_LastFollowPane; // last pane HWND published to pane-follow (#740)
         int m_LastDbgW = int.MinValue, m_LastDbgH; // size-change diagnostic log key (#740)
+        int m_PushedW = int.MinValue, m_PushedH;   // last size actually pushed (settle-debounce, #740)
+        int m_PendW = int.MinValue, m_PendH;       // candidate size awaiting settle
+        double m_PendSince;                        // when the candidate appeared
 
         // (#740) DOCKED phase calibration knob: the docked texture path showed an exact L/R
         // eye swap — the signature of a constant ~one-view-pitch (~2px) residual in the
@@ -1128,6 +1131,34 @@ namespace DisplayXR
             // moves, content doesn't (see UpdatePhaseNudge).
             UpdatePhaseNudge();
             px += s_phaseNudgeX;
+            // (#740) SIZE settle-debounce: a continuous interactive resize (dock splitter /
+            // tab edge drag) changes the pane size EVERY frame → per-frame zone re-drive →
+            // per-frame swapchain+bridge realloc — a long splitter drag hung the D3D12
+            // device (DXGI_ERROR_DEVICE_HUNG → device removed → editor fatal). Push a
+            // CHANGED size only after it has held for kResizeSettleSeconds; POSITION keeps
+            // pushing immediately (the window stays glued, briefly at the old size), so a
+            // whole resize costs ONE realloc at settle instead of one per frame.
+            const double kResizeSettleSeconds = 0.35;
+            if (m_PushedW == int.MinValue)
+            {
+                m_PushedW = pw; m_PushedH = ph; // first frame: adopt (session-start size)
+            }
+            else if (pw != m_PushedW || ph != m_PushedH)
+            {
+                double now = Time.realtimeSinceStartupAsDouble;
+                if (pw != m_PendW || ph != m_PendH)
+                {
+                    m_PendW = pw; m_PendH = ph; m_PendSince = now; // (re)start the settle clock
+                }
+                if (now - m_PendSince < kResizeSettleSeconds)
+                {
+                    pw = m_PushedW; ph = m_PushedH; // hold the old size while resizing
+                }
+                else
+                {
+                    m_PushedW = pw; m_PushedH = ph; // settled: push the new size once
+                }
+            }
             // (#740) Pane-follow: publish the matched pane HWND + render-vs-pane-window offset
             // so the native WM_TIMER keeps the weave window glued during OS modal drags of a
             // Unity window (which freeze this LateUpdate → the C# glue stops). The timer
