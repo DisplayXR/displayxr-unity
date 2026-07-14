@@ -1245,6 +1245,26 @@ static int s_dedicated_class_registered = 0;
 static int   s_ded_dragging     = 0;
 static int   s_ded_sizing_edge  = 0;   // WMSZ_* (1..8) while resizing, else 0
 static int   s_ded_clickthrough = 0;   // glued probe window: pass ALL mouse to the editor below
+static int   s_childglue        = 0;   // dedicated window born WS_CHILD of the container (#740)
+
+// (#740) 1 when the dedicated weave window is a WS_CHILD of Unity's container
+// (child-glue). The provider's per-frame glue reads this to convert the incoming
+// SCREEN rect to container-client child coords before SetWindowPos.
+int displayxr_dedicated_is_childglue(void) { return s_childglue; }
+
+// (#740) The dedicated window's container parent's client origin in screen px (child-glue
+// coord base). Returns 1 + fills *ox,*oy when child-glue is active and the parent resolves.
+int displayxr_dedicated_parent_client_origin(int *ox, int *oy)
+{
+	if (!s_childglue || s_dedicated_hwnd == NULL) return 0;
+	HWND parent = GetAncestor(s_dedicated_hwnd, GA_PARENT);
+	if (parent == NULL) return 0;
+	POINT o = {0, 0};
+	if (!ClientToScreen(parent, &o)) return 0;
+	if (ox) *ox = o.x;
+	if (oy) *oy = o.y;
+	return 1;
+}
 static POINT s_ded_drag_cursor  = {0, 0};
 static RECT  s_ded_drag_rect    = {0, 0, 0, 0};
 
@@ -1478,30 +1498,84 @@ displayxr_create_provider_dedicated_window(void)
 	// WS_EX_LAYERED (+ alpha 0 below) keeps it invisible; the WM_NCHITTEST → HTTRANSPARENT
 	// handler (gated on s_ded_clickthrough) passes ALL mouse through to the Game view
 	// underneath so the in-game mouse controller keeps working.
-	DWORD ex_style = WS_EX_NOACTIVATE | WS_EX_TOPMOST;
-	if (have_init) { ex_style |= WS_EX_LAYERED; s_ded_clickthrough = 1; }
-	else s_ded_clickthrough = 0;
+	//
+	// CHILD-GLUE (#740): born as a WS_CHILD of Unity's container window instead of a
+	// parentless top-level. GA_ROOT(child) == the container = the window the SR SDK
+	// resolves as its phase anchor → the runtime's weave-phase fix computes the correct
+	// pane-vs-container offset. Unlike BINDPANE (which binds Unity's OWN pane GUIView and
+	// dies when Unity re-hosts it on dock/undock/maximize/domain-reload), this window is
+	// OURS: the container is stable across tab re-hosts, so the child survives them; we
+	// recreate it each session. Child coords are relative to the container's client, so it
+	// follows the container automatically and only needs repositioning when the pane moves
+	// WITHIN the container (plain move, weaver-safe #727). Gated: DISPLAYXR_PROV_GV_CHILDGLUE.
+	// PRESENT mode (#740 hybrid, undocked): the runtime presents the woven stereo INTO
+	// this window, so it must be a VISIBLE top-level window over the floating pane (not the
+	// invisible child-glue proxy used for the docked texture path). SR self-anchors to it
+	// (GA_ROOT==self). Forces top-level + visible, overriding child-glue.
+	extern int dxr_prov_get_present_mode(void);
+	int present_mode = have_init && dxr_prov_get_present_mode();
+
+	HWND child_parent = NULL;
+	int cx = igx, cy = igy;
+	s_childglue = (!present_mode && have_init && getenv("DISPLAYXR_PROV_GV_CHILDGLUE") != NULL) ? 1 : 0;
+	if (s_childglue) {
+		child_parent = find_unity_hwnd();
+		if (child_parent != NULL) {
+			POINT o = {0, 0};
+			ClientToScreen(child_parent, &o);
+			cx = igx - o.x; cy = igy - o.y; // screen → container-client child coords
+		} else {
+			s_childglue = 0; // no container found → fall back to top-level
+		}
+	}
+
+	// Children can't be WS_EX_TOPMOST; use TRANSPARENT for click-through (no top-level
+	// HTTRANSPARENT z-fight). Top-level path keeps NOACTIVATE|TOPMOST as before.
+	// PRESENT mode: VISIBLE top-level (no WS_EX_LAYERED alpha-0 — the runtime presents the
+	// woven stereo into it and the user must SEE it), TOPMOST, NOACTIVATE (never steals
+	// editor focus). Keep clickthrough so the input path + #61 drag brackets still work.
+	DWORD ex_style = WS_EX_NOACTIVATE;
+	if (!s_childglue) ex_style |= WS_EX_TOPMOST;
+	if (have_init && !present_mode) {
+		ex_style |= WS_EX_LAYERED;
+		if (s_childglue) ex_style |= WS_EX_TRANSPARENT;
+		s_ded_clickthrough = 1;
+	} else if (present_mode) {
+		s_ded_clickthrough = 1; // input via GetAsyncKeyState + drag brackets; window is visible
+	} else s_ded_clickthrough = 0;
+
+	DWORD style = s_childglue ? (WS_CHILD | WS_VISIBLE)
+	                          : (have_init ? WS_POPUP : WS_OVERLAPPEDWINDOW);
 
 	s_dedicated_hwnd = CreateWindowExW(
 		ex_style,
 		DEDICATED_CLASS_NAME,
 		L"DisplayXR (Provider)",
-		have_init ? WS_POPUP : WS_OVERLAPPEDWINDOW,
-		have_init ? igx : CW_USEDEFAULT, have_init ? igy : CW_USEDEFAULT,
+		style,
+		s_childglue ? cx : (have_init ? igx : CW_USEDEFAULT),
+		s_childglue ? cy : (have_init ? igy : CW_USEDEFAULT),
 		have_init ? igw : def_w,          have_init ? igh : def_h,
-		NULL, NULL, GetModuleHandleW(NULL), NULL);
+		child_parent, NULL, GetModuleHandleW(NULL), NULL);
 
 	if (s_dedicated_hwnd == NULL) {
 		fprintf(stderr, "[DisplayXR] Failed to create dedicated provider window: %lu\n",
 		        GetLastError());
 		return NULL;
 	}
+	if (s_childglue)
+		displayxr_log("[DisplayXR] CHILD-GLUE (#740): dedicated window born WS_CHILD of "
+		              "container %p at child (%d,%d) [screen (%d,%d)] %dx%d\n",
+		              (void *)child_parent, cx, cy, igx, igy, igw, igh);
 
-	// Glued probe path: the window is WS_EX_LAYERED — make it fully transparent (alpha 0)
-	// so the invisible geometry proxy never paints a black rect over the Game view. Also
-	// belt-and-braces click-through pairing with WS_EX_TRANSPARENT.
-	if (have_init)
+	// Glued texture-probe path: the window is WS_EX_LAYERED — make it fully transparent
+	// (alpha 0) so the invisible geometry proxy never paints a black rect over the Game
+	// view. PRESENT mode is NOT layered (visible — it presents the woven stereo).
+	if (have_init && !present_mode)
 		SetLayeredWindowAttributes(s_dedicated_hwnd, 0, 0, LWA_ALPHA);
+	if (present_mode)
+		displayxr_log("[DisplayXR] PRESENT mode (#740): dedicated window born VISIBLE top-level "
+		              "WS_POPUP at screen (%d,%d) %dx%d — runtime presents woven stereo into it\n",
+		              igx, igy, igw, igh);
 
 	// Show WITHOUT activating so the editor keeps OS foreground (input stays live).
 	ShowWindow(s_dedicated_hwnd, SW_SHOWNOACTIVATE);

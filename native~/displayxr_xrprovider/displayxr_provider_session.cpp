@@ -1691,6 +1691,12 @@ extern "C" int displayxr_window_space_ui_get_pending(void **out_tex, int *out_te
 // (same device); the destination pixel rect comes from provider state (l2d_rect_*).
 extern "C" int displayxr_local2d_get_pending(void **out_tex, int *out_w, int *out_h);
 
+// Child-glue (#740, displayxr_win32.c): 1 when the dedicated weave window is a WS_CHILD
+// of Unity's container; the parent-client-origin getter converts the glue's SCREEN rect
+// to child coords for SetWindowPos.
+extern "C" int displayxr_dedicated_is_childglue(void);
+extern "C" int displayxr_dedicated_parent_client_origin(int *ox, int *oy);
+
 // Create (or recreate) the wsui overlay swapchain + cross-device bridge sized to
 // w×h. Format = B8G8R8A8_UNORM (87) to match Unity's URP wsui RT — CopyTextureRegion
 // is invalid across formats and the runtime's DComp path turns a mismatch into a
@@ -2754,6 +2760,28 @@ static int ps_probe_env(void)
 	return (e && *e && *e != '0') ? 1 : 0;
 }
 
+// Bind mode within the editor GameView feature (#740 hybrid): the feature (s_probe_enabled)
+// binds in TEXTURE mode when DOCKED (weave into a shared texture → mirror-blit into the
+// Game tab; the SR weaver resolves Unity's container which Unity presents → snap rides
+// Unity's present; the leia phase_off cancels the container→pane offset) and in PRESENT
+// mode when UNDOCKED (the Game view is its own floating top-level → runtime presents the
+// woven stereo into our dedicated top-level window over it: GA_ROOT==self, correct anchor +
+// snap, zero correction, no mirror seam). Set from C# via dxr_prov_set_present_mode BEFORE
+// session start (dock-state-driven); env DISPLAYXR_PROV_PRESENT_MODE forces it for testing.
+static int s_bind_present_override = -1; // -1 unset, 0 texture, 1 present
+static int ps_bind_present(void)
+{
+	if (s_bind_present_override >= 0) return s_bind_present_override;
+	const char *e = getenv("DISPLAYXR_PROV_PRESENT_MODE");
+	return (e && *e && *e != '0') ? 1 : 0;
+}
+void dxr_prov_set_present_mode(int enable)
+{
+	s_bind_present_override = enable ? 1 : 0;
+	ps_log("[DisplayXR-PROV] bind mode set: %s\n", enable ? "PRESENT (undocked)" : "TEXTURE (docked)");
+}
+int dxr_prov_get_present_mode(void) { return ps_bind_present(); }
+
 // Readback path: DISPLAYXR_PROV_TEXTURE_PROBE may carry a literal path (any value
 // other than "1"); otherwise default under %TEMP%.
 static void ps_probe_path(char *out, size_t n)
@@ -3420,9 +3448,16 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	// Unconditional build marker: if this line is ABSENT from the log, the editor is
 	// running a STALE DLL (restart Unity). If present with env_probe=0, the env var
 	// DISPLAYXR_PROV_TEXTURE_PROBE=1 did not reach the editor process.
-	ps_log("[DisplayXR-PROV] PROBE build=weave-to-texture-2tile env_probe=%d\n", s_probe_enabled);
+	int bind_present = s_probe_enabled && ps_bind_present();
+	ps_log("[DisplayXR-PROV] PROBE build=weave-to-texture-2tile env_probe=%d bind=%s\n",
+	       s_probe_enabled, bind_present ? "PRESENT" : "TEXTURE");
 	ps_probe_cleanup(); // clears counters + any leftover texture from a prior session
-	if (s_probe_enabled) {
+	// PRESENT mode (undocked, #740 hybrid): skip the shared-texture bind entirely — the
+	// runtime presents the woven stereo into the dedicated window (windowHandle) like the
+	// shipping/main path. No shared texture ⟹ no mirror-blit (s_woven_tex_id stays 0) and
+	// no forced zone; the window is born VISIBLE top-level (displayxr_win32.c) and the SR
+	// weaver self-anchors to it (GA_ROOT==self). Correct anchor + phase-snap, zero correction.
+	if (s_probe_enabled && !bind_present) {
 		DisplayXRDisplayInfo *pdi = &displayxr_get_state()->display_info;
 		uint32_t pw = pdi->display_pixel_width  ? pdi->display_pixel_width  : 1920;
 		uint32_t ph = pdi->display_pixel_height ? pdi->display_pixel_height : 1080;
@@ -3775,11 +3810,21 @@ void dxr_prov_set_gameview_rect(int x, int y, int w, int h)
 	if (x == lx && y == ly && w == lw && h == lh) return; // only on actual change from born/last
 	lx = x; ly = y; lw = w; lh = h;
 
+	// Child-glue (#740): the incoming rect is SCREEN px, but the window is a WS_CHILD —
+	// SetWindowPos wants coords relative to the container's client. Convert. (When the
+	// container itself moves, the pane's screen pos changes but the child coord stays put,
+	// so this is a no-op; only a pane move WITHIN the container repositions the child.)
+	int sx = x, sy = y;
+	if (displayxr_dedicated_is_childglue()) {
+		int ox = 0, oy = 0;
+		if (displayxr_dedicated_parent_client_origin(&ox, &oy)) { sx = x - ox; sy = y - oy; }
+	}
+
 	UINT flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER; // NO SWP_FRAMECHANGED
 	if (s_track == 2) flags |= SWP_NOSIZE; // move only
-	SetWindowPos((HWND)s_ps.overlay_hwnd, NULL, x, y, w, h, flags);
-	ps_log("[DisplayXR-PROV] gameview window track (%s): (%d,%d) %dx%d\n",
-	       s_track == 2 ? "move" : "move+resize", x, y, w, h);
+	SetWindowPos((HWND)s_ps.overlay_hwnd, NULL, sx, sy, w, h, flags);
+	ps_log("[DisplayXR-PROV] gameview window track (%s): screen(%d,%d) -> pos(%d,%d) %dx%d\n",
+	       s_track == 2 ? "move" : "move+resize", x, y, sx, sy, w, h);
 }
 
 // Transparent-background request (#166 Phase A). Set from C# BEFORE the session
