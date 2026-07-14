@@ -1276,11 +1276,77 @@ static ULONGLONG s_pane_follow_last_move_tick = 0;
 #define DXR_PANE_FOLLOW_TIMER 0xD7A0
 #define DXR_PANE_FOLLOW_SETTLE_MS 180
 
+// (#740) LAG-FREE follow: subclass the pane's HOST window (GA_ROOT of the pane — the
+// top-level Unity window the user actually drags). During its OS modal move loop the host
+// gets WM_WINDOWPOSCHANGED/WM_MOVE synchronously per move, so we reposition our window in
+// LOCKSTEP (no polling lag, unlike the WM_TIMER fallback), and forward the host's REAL
+// WM_ENTERSIZEMOVE/EXITSIZEMOVE to our window so the SR weaver phase-snaps (present mode).
+// Mirrors the overlay path's parent_subclass_proc. Re-targets on dock/undock (host change).
+static HWND    s_follow_host_hwnd = NULL;
+static WNDPROC s_follow_host_orig_proc = NULL;
+
+static void follow_reposition_to_pane(void)
+{
+	if (!s_dedicated_hwnd || !s_pane_follow_hwnd || !IsWindow(s_pane_follow_hwnd)) return;
+	RECT pr;
+	if (GetWindowRect(s_pane_follow_hwnd, &pr))
+		SetWindowPos(s_dedicated_hwnd, NULL, pr.left + s_pane_follow_ox, pr.top + s_pane_follow_oy,
+		             s_pane_follow_w, s_pane_follow_h,
+		             SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER); // no FRAMECHANGED (#727)
+}
+
+static LRESULT CALLBACK follow_host_subclass_proc(HWND host, UINT msg, WPARAM wParam, LPARAM lParam)
+{
+	WNDPROC orig = s_follow_host_orig_proc;
+	switch (msg) {
+	case WM_ENTERSIZEMOVE:
+		// Real drag start on the host → hand the weaver the same bracket so it phase-snaps.
+		if (s_ded_present && s_dedicated_hwnd) SendMessageW(s_dedicated_hwnd, WM_ENTERSIZEMOVE, 0, 0);
+		break;
+	case WM_EXITSIZEMOVE:
+		if (s_ded_present && s_dedicated_hwnd) SendMessageW(s_dedicated_hwnd, WM_EXITSIZEMOVE, 0, 0);
+		break;
+	case WM_MOVE:
+	case WM_WINDOWPOSCHANGED:
+		// Host moved/resized (fires synchronously during its modal loop) → lockstep-follow.
+		follow_reposition_to_pane();
+		break;
+	case WM_NCDESTROY:
+		if (host == s_follow_host_hwnd) {
+			if (orig) SetWindowLongPtrW(host, GWLP_WNDPROC, (LONG_PTR)orig);
+			s_follow_host_hwnd = NULL; s_follow_host_orig_proc = NULL;
+		}
+		break;
+	}
+	return orig ? CallWindowProcW(orig, host, msg, wParam, lParam)
+	            : DefWindowProcW(host, msg, wParam, lParam);
+}
+
+static void follow_unsubclass_host(void)
+{
+	if (s_follow_host_hwnd && s_follow_host_orig_proc && IsWindow(s_follow_host_hwnd))
+		SetWindowLongPtrW(s_follow_host_hwnd, GWLP_WNDPROC, (LONG_PTR)s_follow_host_orig_proc);
+	s_follow_host_hwnd = NULL; s_follow_host_orig_proc = NULL;
+}
+
 void displayxr_set_pane_follow(void *pane_hwnd, int off_x, int off_y, int w, int h)
 {
 	s_pane_follow_hwnd = (HWND)pane_hwnd;
 	s_pane_follow_ox = off_x; s_pane_follow_oy = off_y;
 	s_pane_follow_w = w; s_pane_follow_h = h;
+
+	// Keep the host subclass targeted at the pane's current top-level host (re-targets on
+	// dock/undock). The subclass gives lockstep follow + real phase-snap brackets; the
+	// WM_TIMER on our window is only the fallback for when no host is subclassed.
+	HWND host = pane_hwnd ? GetAncestor((HWND)pane_hwnd, GA_ROOT) : NULL;
+	if (host != s_follow_host_hwnd) {
+		follow_unsubclass_host();
+		if (host && IsWindow(host)) {
+			s_follow_host_orig_proc =
+			    (WNDPROC)SetWindowLongPtrW(host, GWLP_WNDPROC, (LONG_PTR)follow_host_subclass_proc);
+			s_follow_host_hwnd = host;
+		}
+	}
 }
 
 // (#740) The dedicated window's container parent's client origin in screen px (child-glue
@@ -1355,7 +1421,7 @@ dedicated_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		// container, which gets its own OS brackets; a synthetic bracket there re-anchors
 		// the hidden proxy off the pane — the reverted b01c850 regression).
 		if (wParam == DXR_PANE_FOLLOW_TIMER && s_pane_follow_hwnd && IsWindow(s_pane_follow_hwnd)
-		    && !s_ded_dragging && !s_ded_sizing_edge) {
+		    && !s_ded_dragging && !s_ded_sizing_edge && !s_follow_host_hwnd) {
 			RECT pr;
 			if (GetWindowRect(s_pane_follow_hwnd, &pr)) {
 				// Track the PANE's position (not our window's — the exit snap moves ours).
@@ -1395,8 +1461,9 @@ dedicated_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
 	case WM_DESTROY:
 		// The window is going away (our own DestroyWindow on teardown, or an OS
-		// destroy). Clear the handle so a re-Play recreates it and the app-facing
-		// overlay helpers stop targeting a dead HWND.
+		// destroy). Restore the host subclass first, then clear the handle so a re-Play
+		// recreates it and the app-facing overlay helpers stop targeting a dead HWND.
+		follow_unsubclass_host(); // (#740)
 		if (s_overlay_hwnd == hwnd) { s_overlay_hwnd = NULL; s_overlay_is_toplevel = 0; }
 		s_dedicated_hwnd = NULL;
 		return 0;
@@ -1699,6 +1766,8 @@ displayxr_create_provider_dedicated_window(void)
 void
 displayxr_destroy_provider_dedicated_window(void)
 {
+	follow_unsubclass_host(); // (#740) restore the host window's original WndProc first
+	s_pane_follow_hwnd = NULL; s_pane_follow_last_valid = 0; s_pane_follow_in_bracket = 0;
 	HWND h = s_dedicated_hwnd;
 	s_dedicated_hwnd = NULL;
 	if (s_overlay_hwnd == h) { s_overlay_hwnd = NULL; s_overlay_is_toplevel = 0; }
