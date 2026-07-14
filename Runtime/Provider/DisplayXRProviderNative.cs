@@ -155,6 +155,16 @@ namespace DisplayXR
         public static extern void displayxr_set_pane_follow(System.IntPtr paneHwnd, int offX, int offY, int w, int h);
 
         /// <summary>
+        /// (#740 auto-switch) Child-glue selection for the docked texture path: docked →
+        /// (1, GA_ROOT(pane) container) so the weave window is born WS_CHILD of the pane's
+        /// actual container; undocked → (0, IntPtr.Zero). -1 restores the
+        /// DISPLAYXR_PROV_GV_CHILDGLUE env gate. Survives session stop — set before EVERY
+        /// session (re)start, dock-state-driven.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void displayxr_set_child_glue(int enable, System.IntPtr parentHwnd);
+
+        /// <summary>
         /// GameView weave-to-texture presentation (Task (a), editor + texture probe): the
         /// runtime-woven shared texture opened on Unity's D3D device. C# wraps it as an
         /// external Texture2D and draws it into the Game view (DisplayXRGameViewPresenter).

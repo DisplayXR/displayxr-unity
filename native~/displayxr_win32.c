@@ -1252,6 +1252,23 @@ static int   s_childglue        = 0;   // dedicated window born WS_CHILD of the 
 // SCREEN rect to container-client child coords before SetWindowPos.
 int displayxr_dedicated_is_childglue(void) { return s_childglue; }
 
+// (#740 auto-switch) Programmatic child-glue selection. The C# dock-state detector
+// drives this before every session (re)start: docked → (1, GA_ROOT(pane)) so the
+// child parents deterministically to the pane's actual container (find_unity_hwnd's
+// GetForegroundWindow preference can pick the wrong top-level when a floating Unity
+// window is focused); undocked → (0, NULL). -1 leaves the DISPLAYXR_PROV_GV_CHILDGLUE
+// env in charge (test launchers; C# skips this setter when that env is set). Read
+// once at dedicated-window creation. Like the present-mode override this survives
+// session stop — C# must re-set it per (re)start, never rely on a stale value.
+static int  s_childglue_override = -1;
+static HWND s_childglue_parent   = NULL;
+
+void displayxr_set_child_glue(int enable, void *parent_hwnd)
+{
+	s_childglue_override = enable < 0 ? -1 : (enable ? 1 : 0);
+	s_childglue_parent   = (HWND)parent_hwnd;
+}
+
 // (#740) Pane-follow during OS modal drags. When the user drags a UNITY window (editor
 // container or the undocked floating Game view), Windows enters a modal move loop that
 // blocks Unity's PlayerLoop — so the C# glue (LateUpdate → dxr_prov_set_gameview_rect)
@@ -1657,9 +1674,17 @@ displayxr_create_provider_dedicated_window(void)
 
 	HWND child_parent = NULL;
 	int cx = igx, cy = igy;
-	s_childglue = (!present_mode && have_init && getenv("DISPLAYXR_PROV_GV_CHILDGLUE") != NULL) ? 1 : 0;
+	// Auto-switch (#740): the C# override (dock-state detector) wins over the env gate.
+	int childglue_want = (s_childglue_override >= 0)
+	    ? s_childglue_override
+	    : (getenv("DISPLAYXR_PROV_GV_CHILDGLUE") != NULL ? 1 : 0);
+	s_childglue = (!present_mode && have_init && childglue_want) ? 1 : 0;
 	if (s_childglue) {
-		child_parent = find_unity_hwnd();
+		// Prefer the C#-supplied container (GA_ROOT of the matched pane — deterministic);
+		// find_unity_hwnd() remains the fallback for env-driven runs (it prefers the
+		// foreground window, which can be wrong when a floating Unity window is focused).
+		child_parent = (s_childglue_parent != NULL && IsWindow(s_childglue_parent))
+		    ? s_childglue_parent : find_unity_hwnd();
 		if (child_parent != NULL) {
 			POINT o = {0, 0};
 			ClientToScreen(child_parent, &o);

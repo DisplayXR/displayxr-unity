@@ -109,6 +109,18 @@ namespace DisplayXR
         static bool         s_lowResResolved;     // member lookup done (found or not)
         static bool         s_loggedLowResOnce;
 
+        // Dock-state detection (#740 auto-switch): the GameView instance the render rect
+        // came from + the reflection chain View.window (ContainerWindow) → m_ShowMode.
+        // ShowMode.MainWindow (4) == the view is docked in the main editor window.
+        static object       s_matchedGameView;    // instance TryGetGameViewRenderRect matched
+        static PropertyInfo s_hostWindowProp;     // View.window → ContainerWindow
+        static FieldInfo    s_showModeField;      // ContainerWindow.m_ShowMode (int)
+        static PropertyInfo s_showModeProp;       // fallback: ContainerWindow.showMode
+        static bool         s_warnedDockDetect;
+        static bool         s_lastAppliedDocked = true;
+        /// <summary>Dock state the current session was bound for (watcher compares against this).</summary>
+        public static bool LastAppliedDocked => s_lastAppliedDocked;
+
         // Force the editor Game view to render its mirror RT at FULL (physical) resolution
         // rather than the HiDPI "Low Resolution Aspect Ratios" mode. That toggle (ON by default
         // on a scaled display) makes Unity render the Game view at LOGICAL px (panel_physical /
@@ -222,20 +234,20 @@ namespace DisplayXR
             return s_probeGate == 1;
         }
 
-        // Zone-glue arrangement (#740/#742, DEFAULT ON; env DISPLAYXR_PROV_GV_ZONEGLUE=0
-        // restores the legacy window-glue): the weave window is born ONCE at the monitor
-        // rect (origin-anchored, never moved — no #727 exposure, no drag re-snap churn) and
-        // the ZONE rect carries the Game view pane's true screen offset — the contract the
-        // desktop-avatar multi-zone sample proves correct for weaving at a screen sub-rect.
-        // Fixes the docked-layout phase error where the window-origin channel broke down
-        // (pane parked mid-host: phase off by a position-dependent amount, #740).
+        // Zone-glue arrangement (#740/#742, SUPERSEDED experiment — env
+        // DISPLAYXR_PROV_GV_ZONEGLUE=1 opts back in): the weave window parked ONCE at the
+        // monitor rect with the ZONE rect carrying the pane's screen offset. It did NOT fix
+        // the docked phase error (both arrangements failed identically — the SR weaver
+        // anchors to the DXGI window association, not the zone rect, #740), so the hybrid
+        // (docked texture+child-glue / undocked present) runs on the legacy WINDOW-GLUE push
+        // path — now the default (both HW-proven hybrid configs use it).
         static int s_zoneGlueGate = -1;
         static bool ZoneGlueEnabled()
         {
             if (!ProbeEnabled()) return false;
             if (s_zoneGlueGate < 0)
                 s_zoneGlueGate = System.Environment.GetEnvironmentVariable(
-                    "DISPLAYXR_PROV_GV_ZONEGLUE") == "0" ? 0 : 1;
+                    "DISPLAYXR_PROV_GV_ZONEGLUE") == "1" ? 1 : 0;
             return s_zoneGlueGate == 1;
         }
 
@@ -335,6 +347,8 @@ namespace DisplayXR
         [DllImport("user32.dll")] static extern bool GetWindowRect(System.IntPtr hWnd, out Win32Rect r);
         [DllImport("user32.dll")] static extern bool GetClientRect(System.IntPtr hWnd, out Win32Rect r);
         [DllImport("user32.dll")] static extern bool IsWindowVisible(System.IntPtr hWnd);
+        [DllImport("user32.dll")] static extern System.IntPtr GetAncestor(System.IntPtr hWnd, uint flags);
+        const uint GA_ROOT = 2;
 
         // --- GameView zoom-area sub-pixel fit: THE maximize/resize seam fix (#727 f-up) ---
         // Root cause (measured 2026-07-12, ~50 instrumented captures): the GameView
@@ -744,6 +758,7 @@ namespace DisplayXR
             // position to the same panel the size came from), else the largest-area instance.
             Rect host = default; bool haveHost = false; float bestScore = float.MaxValue, bestArea = -1f;
             Rect fallbackHost = default;
+            object matchedWin = null, fallbackWin = null;
             var wins = (s_parentField != null) ? Resources.FindObjectsOfTypeAll(s_gvType) : null;
             if (wins != null)
                 foreach (var w in wins)
@@ -758,16 +773,17 @@ namespace DisplayXR
                     if (s_screenPosProp == null) continue;
                     var wr = (Rect)s_screenPosProp.GetValue(pr, null);
                     float area = wr.width * wr.height;
-                    if (area > bestArea) { bestArea = area; fallbackHost = wr; }
+                    if (area > bestArea) { bestArea = area; fallbackHost = wr; fallbackWin = w; }
                     // GetMainGameViewTargetSize is in LOGICAL points, same units as
                     // screenPosition, so match panel width to it directly (ppp-independent).
                     if (size.x > 1f)
                     {
                         float score = Mathf.Abs(wr.width - size.x);
-                        if (score < bestScore) { bestScore = score; host = wr; haveHost = true; }
+                        if (score < bestScore) { bestScore = score; host = wr; haveHost = true; matchedWin = w; }
                     }
                 }
-            if (!haveHost) { host = fallbackHost; haveHost = bestArea >= 0f; }
+            if (!haveHost) { host = fallbackHost; haveHost = bestArea >= 0f; matchedWin = fallbackWin; }
+            if (haveHost) s_matchedGameView = matchedWin;   // dock-state detection reads this
 
             // Compose the PHYSICAL render rect. GetMainGameViewTargetSize returns the render
             // area (excludes the toolbar) but its UNITS vary by project: LOGICAL points in
@@ -828,11 +844,130 @@ namespace DisplayXR
             return false;
         }
 
-        // Called by the loader BEFORE the subsystem starts. Zone-glue (default): born the
-        // weave window at the MONITOR rect (parked there for the whole session) and seed
-        // the ZONE at the pane's screen rect — the zone, not the window origin, carries
-        // the position (#740/#742). Legacy window-glue (DISPLAYXR_PROV_GV_ZONEGLUE=0):
-        // born the window at the pane rect; zone at (0,0) window-sized.
+        // Dock-state detection (#740 auto-switch): is the (matched) Game view docked in the
+        // MAIN editor window? Reflection chain: GameView.m_Parent (HostView) → View.window
+        // (ContainerWindow) → m_ShowMode; ShowMode.MainWindow (4) ⟺ docked. Chosen over the
+        // Win32 GA_ROOT==find_unity_hwnd comparison because find_unity_hwnd prefers
+        // GetForegroundWindow — a focused floating Game view would misdetect as docked.
+        // Returns false when the chain can't be resolved (editor internals changed) —
+        // the caller falls back to docked/texture.
+        public static bool TryDetectGameViewDocked(out bool docked)
+        {
+            docked = true;
+            if (s_matchedGameView == null)
+                TryGetGameViewRenderRect(out _, out _, out _, out _, out _);
+            var gv = s_matchedGameView;
+            if (gv == null || s_parentField == null) return false;
+            try
+            {
+                var parent = s_parentField.GetValue(gv);   // HostView/DockArea
+                if (parent == null) return false;
+                if (s_hostWindowProp == null)
+                    for (var t = parent.GetType(); t != null && s_hostWindowProp == null; t = t.BaseType)
+                    {
+                        var p = t.GetProperty("window",
+                            BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+                        if (p != null && p.PropertyType.Name == "ContainerWindow") s_hostWindowProp = p;
+                    }
+                if (s_hostWindowProp == null) return false;
+                var container = s_hostWindowProp.GetValue(parent, null);
+                if (container == null) return false;
+                if (s_showModeField == null && s_showModeProp == null)
+                    for (var t = container.GetType(); t != null; t = t.BaseType)
+                    {
+                        s_showModeField = t.GetField("m_ShowMode",
+                            BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+                        if (s_showModeField != null) break;
+                        s_showModeProp = t.GetProperty("showMode",
+                            BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+                        if (s_showModeProp != null) break;
+                    }
+                int mode;
+                if (s_showModeField != null)
+                    mode = System.Convert.ToInt32(s_showModeField.GetValue(container));
+                else if (s_showModeProp != null)
+                    mode = System.Convert.ToInt32(s_showModeProp.GetValue(container, null));
+                else return false;
+                docked = mode == 4; // UnityEditor.ShowMode.MainWindow
+                return true;
+            }
+            catch { return false; }
+        }
+
+        // (#740 auto-switch) Fresh dock-state read for the transition watcher: re-match the
+        // live GameView instance first (a dock/undock re-hosts the view — possibly into a
+        // NEW instance — and a stale stash would read the old container), then detect.
+        public static bool TryDetectDockStateFresh(out bool docked)
+        {
+            docked = true;
+            if (!ProbeEnabled()) return false;
+            if (!TryGetGameViewRenderRect(out _, out _, out _, out _, out _)) return false;
+            return TryDetectGameViewDocked(out docked);
+        }
+
+        // (#740 auto-switch) One-shot dock-state override consumed by the NEXT
+        // ApplyDockModeForSessionStart — the %TEMP%\dxr_dock_toggle test hook uses it to
+        // exercise the full Stop→Start re-bind with a flipped mode without a physical
+        // undock (real detection would just re-bind the same mode).
+        static int s_forcedDockState = -1; // -1 none, 0 undocked, 1 docked
+        public static void ForceNextDockState(bool docked) { s_forcedDockState = docked ? 1 : 0; }
+
+        // (#740 auto-switch) Called by the loader BEFORE the subsystem (re)starts: detect the
+        // Game view's dock state and drive the native bind mode — DOCKED → texture mode +
+        // child-glue window (in-tab occlusion via mirror-blit; the leia phase_off DP fix
+        // anchors phase via GA_ROOT=container); UNDOCKED → PRESENT mode (runtime presents
+        // woven stereo into our visible top-level window over the floating pane; SR
+        // self-anchors, phase-snap free). The env vars stay authoritative TEST overrides:
+        // when DISPLAYXR_PROV_PRESENT_MODE / DISPLAYXR_PROV_GV_CHILDGLUE are set the setters
+        // are skipped (the native side then falls back to the env). Native overrides survive
+        // session stop, so this must run before EVERY start, not just the first.
+        public static void ApplyDockModeForSessionStart()
+        {
+            if (!ProbeEnabled()) return;
+            if (Application.platform != RuntimePlatform.WindowsEditor) return;
+            // Refresh the matched GameView instance + pane HWND (s_hwndCorrHwnd) first.
+            TryGetGameViewRenderRect(out _, out _, out _, out _, out _);
+            bool docked, forced = s_forcedDockState >= 0;
+            if (forced)
+            {
+                docked = s_forcedDockState == 1; // dxr_dock_toggle test hook (one-shot)
+                s_forcedDockState = -1;
+            }
+            else if (!TryDetectGameViewDocked(out docked))
+            {
+                docked = true; // occlusion-correct default; present mode stays reachable via env
+                if (!s_warnedDockDetect)
+                {
+                    s_warnedDockDetect = true;
+                    Debug.LogWarning("[DisplayXR] GameView dock-state detection unavailable " +
+                        "(editor internals changed?) — assuming DOCKED (texture mode).");
+                }
+            }
+            s_lastAppliedDocked = docked;
+            bool presentEnv = System.Environment.GetEnvironmentVariable("DISPLAYXR_PROV_PRESENT_MODE") != null;
+            bool childEnv   = System.Environment.GetEnvironmentVariable("DISPLAYXR_PROV_GV_CHILDGLUE") != null;
+            if (!presentEnv)
+                DisplayXRProviderNative.dxr_prov_set_present_mode(docked ? 0 : 1);
+            if (!childEnv)
+            {
+                // Docked: parent the child-glue window to the pane's actual container
+                // (GA_ROOT of the matched pane HWND — deterministic, unlike the native
+                // find_unity_hwnd foreground heuristic). Zero → native fallback.
+                var parent = System.IntPtr.Zero;
+                if (docked && s_hwndCorrValid && s_hwndCorrHwnd != System.IntPtr.Zero)
+                    parent = GetAncestor(s_hwndCorrHwnd, GA_ROOT);
+                DisplayXRProviderNative.displayxr_set_child_glue(docked ? 1 : 0, parent);
+            }
+            Debug.Log("[DisplayXR] GameView dock state: " + (docked
+                ? "DOCKED → texture mode + child-glue" : "UNDOCKED → PRESENT mode")
+                + (forced ? " [FORCED test hook]" : "")
+                + (presentEnv || childEnv ? " [env override active — mode pinned by env]" : ""));
+        }
+
+        // Called by the loader BEFORE the subsystem starts. Window-glue (default): born the
+        // weave window at the pane rect; zone at (0,0) window-sized. Zone-glue opt-in
+        // (DISPLAYXR_PROV_GV_ZONEGLUE=1, superseded experiment): born at the MONITOR rect
+        // (parked for the whole session) with the ZONE carrying the pane's screen offset.
         public static void TryPushInitialGameViewRect()
         {
             if (!ProbeEnabled()) return;
@@ -906,7 +1041,7 @@ namespace DisplayXR
                     DisplayXRProviderNative.dxr_prov_set_panel_rect(px - s_hwndCorrX, py - s_hwndCorrY, pw, ph);
                 return;
             }
-            // Zone-glue (default, #740/#742): the window is parked at the monitor origin —
+            // Zone-glue (opt-in experiment, #740/#742): the window is parked at the monitor origin —
             // publish the pane's monitor-local rect to the zone-convergence path every frame
             // (native no-ops once converged; moves = pure zone x/y updates, no window op at
             // all). NEVER call dxr_prov_set_gameview_rect here in this mode.

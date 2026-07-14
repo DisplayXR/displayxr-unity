@@ -334,6 +334,14 @@ DISPLAYXR_EXPORT void displayxr_resize_overlay(int width, int height);
 /// frozen the PlayerLoop (and thus the C# glue). NULL pane_hwnd disables.
 DISPLAYXR_EXPORT void displayxr_set_pane_follow(void *pane_hwnd, int off_x, int off_y, int w, int h);
 
+/// (#740 auto-switch) Programmatic child-glue selection for the docked texture path.
+/// C# dock-state detection calls this BEFORE every session (re)start: docked →
+/// (1, GA_ROOT(pane) container HWND) so the dedicated weave window is born WS_CHILD of
+/// the pane's actual container; undocked → (0, NULL) top-level. enable=-1 restores the
+/// DISPLAYXR_PROV_GV_CHILDGLUE env gate. parent_hwnd NULL → find_unity_hwnd() fallback.
+/// The value survives session stop — re-set it per start. Windows editor only.
+DISPLAYXR_EXPORT void displayxr_set_child_glue(int enable, void *parent_hwnd);
+
 /// (display-zones port) Get/set the managed overlay window's screen-space
 /// top-left, for app-side window-position persistence (remember/restore across
 /// launches). set is #61-bracketed (size unchanged). Windows overlay only.

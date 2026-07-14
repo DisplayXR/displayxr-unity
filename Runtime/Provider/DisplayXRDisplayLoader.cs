@@ -98,6 +98,11 @@ namespace DisplayXR
 
         public override bool Start()
         {
+            // (#740 auto-switch) Detect the Game view's dock state and pick the bind mode
+            // BEFORE the subsystem starts (session_start reads it): docked → texture +
+            // child-glue (in-tab occlusion), undocked → present. Runs on every Start, so a
+            // mid-Play dock-transition restart (Stop→Start) re-binds the right mode.
+            DisplayXRProviderDriver.ApplyDockModeForSessionStart();
             // GameView weave-to-texture fill (Task (a)): stash the Game view's render rect
             // BEFORE the subsystem (→ native session_start) so the forced full-window zone
             // is born at the panel's native resolution (otherwise it freezes at the weave
