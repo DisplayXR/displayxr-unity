@@ -803,6 +803,13 @@ namespace DisplayXR
                 float sizeScale = ppp; // bring `size` to physical px; default = treat as points
                 if (haveHost && host.width > 1f && ppp > 1.1f)
                 {
+                    // Per-frame disambiguation on purpose — do NOT latch this decision: the
+                    // units legitimately flip within a session (mainSize is LOGICAL while
+                    // "Low Resolution Aspect Ratios" is on and PHYSICAL once our force turns
+                    // it off), and a latch turned the healed post-layout-reset readings into
+                    // ×ppp-doubled rects (#740). Truly corrupt readings (Unity's recreated
+                    // GameView double-scales after an in-Play layout reset) are rejected by
+                    // the pane-client cross-check below, not here.
                     float dLogical  = Mathf.Abs(size.x - host.width);       // size already in points
                     float dPhysical = Mathf.Abs(size.x - host.width * ppp); // size already in px
                     sizeScale = (dLogical <= dPhysical) ? ppp : 1f;
@@ -832,12 +839,29 @@ namespace DisplayXR
                 if (rh > monH) rh = monH;
             }
 
+            // (#740) Pane-client cross-check (Win32 truth): the render area can never exceed
+            // the matched pane window's client rect. Unity's RECREATED GameView after an
+            // in-Play layout reset is corrupted — its view rect reports physical px as points,
+            // so Unity itself allocates a ×ppp-doubled target (GVGEOM: viewInWindow 1532x769
+            // "pt" inside a 693pt host → m_TargetTexture 3830x1923) and mainSize follows.
+            // Those readings are internally consistent, under the monitor bound, and steady —
+            // only the pane client exposes them. Reject → last-good (the re-host watcher
+            // heals the view via maximize/restore and restarts the subsystem).
+            bool paneFit = true;
+            if (s_hwndCorrValid && s_hwndCorrHwnd != System.IntPtr.Zero &&
+                GetClientRect(s_hwndCorrHwnd, out var pcr))
+            {
+                int cw = pcr.right - pcr.left, ch = pcr.bottom - pcr.top;
+                if (cw > 64 && ch > 64 && (rw > cw + 8 || rh > ch + 8))
+                    paneFit = false;
+            }
+
             // Sanity: reject implausible SIZE readings (transient 0x0 during a play/layout
             // transition) and reuse the last-good rect so the zone never borns wrong-size.
             // The zone size comes from GetMainGameViewTargetSize (ppp-independent), so a
             // not-yet-latched ppp only offsets the initial POSITION (the per-frame glue
             // corrects it once ppp latches) — don't gate the zone on ppp.
-            bool sane = haveHost && size.x > 1f && size.y > 1f
+            bool sane = haveHost && size.x > 1f && size.y > 1f && paneFit
                         && rw >= 256 && rh >= 256 && rw <= 8192 && rh <= 8192;
             if (sane)
             {
@@ -907,6 +931,7 @@ namespace DisplayXR
 
         int m_LastGlueX = int.MinValue, m_LastGlueY, m_LastGlueW, m_LastGlueH;
         System.IntPtr m_LastFollowPane; // last pane HWND published to pane-follow (#740)
+        int m_LastDbgW = int.MinValue, m_LastDbgH; // size-change diagnostic log key (#740)
 
         void PushGameViewRectEditorProbe()
         {
@@ -920,6 +945,14 @@ namespace DisplayXR
             if (!TryGetGameViewRenderRect(out int px, out int py, out int pw, out int ph, out string dbg))
                 return;
             if (!s_loggedGlueOnce) { s_loggedGlueOnce = true; Debug.Log($"[DisplayXR] GameView glue: {dbg}"); }
+            // (#740) Log the full computation whenever the resulting SIZE changes — a layout
+            // reset produced steady wrong ×ppp sizes and the once-only log above hid the
+            // inputs (mainSize/host/ppp/toolbar) that explain them.
+            if (pw != m_LastDbgW || ph != m_LastDbgH)
+            {
+                m_LastDbgW = pw; m_LastDbgH = ph;
+                Debug.Log($"[DisplayXR] GameView glue size change: {dbg}");
+            }
             // (#740) Pane-follow: publish the matched pane HWND + render-vs-pane-window offset
             // so the native WM_TIMER keeps the weave window glued during OS modal drags of a
             // Unity window (which freeze this LateUpdate → the C# glue stops). The timer

@@ -98,6 +98,13 @@ namespace DisplayXR
 
         public override bool Start()
         {
+            // Re-push the render-path decision on EVERY start (#740): the native session
+            // teardown memsets the provider state (only runtime_lib survives), so a mid-Play
+            // subsystem restart (GameView re-host watcher, future dock auto-switch) would
+            // otherwise re-bind with the getter's SPI default — wrong on BiRP. Same lesson
+            // as the auto-switch attempt: native overrides must be re-set per start.
+            bool spi = IsSinglePassEligible();
+            DisplayXRProviderNative.dxr_prov_set_single_pass(spi ? 1 : 0);
             // GameView weave-to-texture fill (Task (a)): stash the Game view's render rect
             // BEFORE the subsystem (→ native session_start) so the forced full-window zone
             // is born at the panel's native resolution (otherwise it freezes at the weave
