@@ -1436,6 +1436,17 @@ static void follow_unsubclass_host(void)
 
 void displayxr_set_pane_follow(void *pane_hwnd, int off_x, int off_y, int w, int h)
 {
+	// (#740) Defensive size clamp at the storage point (both follow paths — host
+	// subclass and WM_TIMER — reposition from these): the render area can never
+	// exceed the virtual screen, so no publish may ever stick the weave window at
+	// an insane size (a transient container-sized rect during a layout reset once
+	// glued it huge and it stuck when the pane died).
+	int maxw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+	int maxh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+	if (maxw > 0 && w > maxw) w = maxw;
+	if (maxh > 0 && h > maxh) h = maxh;
+
+	int pane_changed = (s_pane_follow_hwnd != (HWND)pane_hwnd);
 	s_pane_follow_hwnd = (HWND)pane_hwnd;
 	s_pane_follow_ox = off_x; s_pane_follow_oy = off_y;
 	s_pane_follow_w = w; s_pane_follow_h = h;
@@ -1451,6 +1462,14 @@ void displayxr_set_pane_follow(void *pane_hwnd, int off_x, int off_y, int w, int
 			    (WNDPROC)SetWindowLongPtrW(host, GWLP_WNDPROC, (LONG_PTR)follow_host_subclass_proc);
 			s_follow_host_hwnd = host;
 		}
+	}
+
+	// (#740) Re-glue immediately when the pane target changes (layout reset replaces the
+	// GameView pane): with a static host no host message fires and the timer is gated off
+	// while a host is subclassed, so nothing else would reposition until the next host move.
+	if (pane_changed && pane_hwnd) {
+		displayxr_log("[DisplayXR][PaneFollow] retarget pane=%p host=%p\n", pane_hwnd, (void *)host);
+		follow_reposition_to_pane();
 	}
 }
 

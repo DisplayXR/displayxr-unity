@@ -335,6 +335,7 @@ namespace DisplayXR
         [DllImport("user32.dll")] static extern bool GetWindowRect(System.IntPtr hWnd, out Win32Rect r);
         [DllImport("user32.dll")] static extern bool GetClientRect(System.IntPtr hWnd, out Win32Rect r);
         [DllImport("user32.dll")] static extern bool IsWindowVisible(System.IntPtr hWnd);
+        [DllImport("user32.dll")] static extern bool IsWindow(System.IntPtr hWnd);
 
         // --- GameView zoom-area sub-pixel fit: THE maximize/resize seam fix (#727 f-up) ---
         // Root cause (measured 2026-07-12, ~50 instrumented captures): the GameView
@@ -629,12 +630,32 @@ namespace DisplayXR
         static int    s_hwndCorrX, s_hwndCorrY;
         static System.IntPtr s_hwndCorrHwnd;   // the matched pane GUIView (BINDPANE binds it)
         static string s_lastHwndCorrLog;
+        static int    s_hwndCorrRetryTick;     // throttles re-enum retries while unmatched (#740)
 
         static void ApplyWin32HostPositionCorrection(Rect host, float ppp, int toolbar,
                                                      ref int rx, ref int ry)
         {
             if (Application.platform != RuntimePlatform.WindowsEditor) return;
-            if (host != s_hwndCorrHostKey || ppp != s_hwndCorrPppKey)
+            // (#740) Stale-pane detection: a layout reset destroys/recreates the GameView, so
+            // the matched pane HWND can die while the reflection host rect (the re-enum key
+            // below) stays IDENTICAL — without this the glue would keep publishing a dead HWND
+            // (the native follow goes inert and the weave window sticks at its last rect).
+            // Invalidate, park the native pane-follow (unsubclasses the old host), and force
+            // a re-enumeration so the recreated pane is re-matched.
+            if (s_hwndCorrHwnd != System.IntPtr.Zero && !IsWindow(s_hwndCorrHwnd))
+            {
+                s_hwndCorrValid = false;
+                s_hwndCorrHwnd = System.IntPtr.Zero;
+                s_hwndCorrHostKey = default; s_hwndCorrPppKey = 0f;
+                s_hwndCorrRetryTick = 0;
+                Debug.Log("[DisplayXR] GameView glue: matched pane HWND died (layout change) -> re-matching");
+                DisplayXRProviderNative.displayxr_set_pane_follow(System.IntPtr.Zero, 0, 0, 0, 0);
+            }
+            // Re-enumerate on a key change, and RETRY (throttled — EnumWindows isn't free)
+            // while unmatched: a failed match mid-layout-transition used to consume the key,
+            // so a layout that settled at the same rect never re-tried and stayed stuck.
+            bool retryUnmatched = !s_hwndCorrValid && (s_hwndCorrRetryTick++ % 10 == 0);
+            if (host != s_hwndCorrHostKey || ppp != s_hwndCorrPppKey || retryUnmatched)
             {
                 s_hwndCorrHostKey = host; s_hwndCorrPppKey = ppp;
                 s_hwndCorrValid = false;
@@ -802,6 +823,15 @@ namespace DisplayXR
             ry = Mathf.Max(0, Mathf.RoundToInt(host.y * ppp) + toolbar);
             ApplyWin32HostPositionCorrection(host, ppp, toolbar, ref rx, ref ry);
 
+            // (#740) Clamp to the monitor: a transient container/full-desktop-sized reflection
+            // reading during a layout reset passes the 8192 sanity band below but must never
+            // glue the weave window bigger than the panel (it stuck huge when the pane died).
+            if (TryGetMonitorRect(rx + rw / 2, ry + rh / 2, out _, out _, out int monW, out int monH))
+            {
+                if (rw > monW) rw = monW;
+                if (rh > monH) rh = monH;
+            }
+
             // Sanity: reject implausible SIZE readings (transient 0x0 during a play/layout
             // transition) and reuse the last-good rect so the zone never borns wrong-size.
             // The zone size comes from GetMainGameViewTargetSize (ppp-independent), so a
@@ -876,6 +906,7 @@ namespace DisplayXR
         }
 
         int m_LastGlueX = int.MinValue, m_LastGlueY, m_LastGlueW, m_LastGlueH;
+        System.IntPtr m_LastFollowPane; // last pane HWND published to pane-follow (#740)
 
         void PushGameViewRectEditorProbe()
         {
@@ -895,8 +926,19 @@ namespace DisplayXR
             // re-derives the pane's live screen rect and repositions our window. Runs for all
             // glue arrangements; harmless when the window doesn't track (no-op).
             if (s_hwndCorrValid && s_hwndCorrHwnd != System.IntPtr.Zero)
+            {
                 DisplayXRProviderNative.displayxr_set_pane_follow(
                     s_hwndCorrHwnd, px - s_hwndCorrX, py - s_hwndCorrY, pw, ph);
+                // (#740) New pane matched (layout reset replaced the GameView): drop the
+                // window-glue debounce so the next dxr_prov_set_gameview_rect push fires
+                // even if the new pane landed at the identical rect (the native side also
+                // re-glues immediately on the pane-follow retarget).
+                if (m_LastFollowPane != s_hwndCorrHwnd)
+                {
+                    m_LastFollowPane = s_hwndCorrHwnd;
+                    m_LastGlueX = int.MinValue;
+                }
+            }
             // BINDPANE: the bound window IS the pane — publish only the render area's
             // client-relative offset (the pane moves itself; zone x/y stay put unless the
             // in-pane layout changes). Never any window op.

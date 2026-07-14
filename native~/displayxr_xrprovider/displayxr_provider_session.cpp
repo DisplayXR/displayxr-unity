@@ -3793,6 +3793,14 @@ void dxr_prov_set_gameview_rect(int x, int y, int w, int h)
 {
 	if (s_ext_weave_hwnd) return; // BINDPANE: the bound window is UNITY'S — never touch it
 	if (w <= 0 || h <= 0 || !s_ps.overlay_hwnd) return;
+	// (#740) Defensive size clamp: the render area can never exceed the virtual screen —
+	// a transient container-sized rect during a layout reset must not glue the window huge.
+	{
+		int maxw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+		int maxh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+		if (maxw > 0 && w > maxw) w = maxw;
+		if (maxh > 0 && h > maxh) h = maxh;
+	}
 	static int s_track = -1;      // -1 unknown, 0 off, 1 move+resize, 2 move-only
 	if (s_track < 0) {
 		const char *e = getenv("DISPLAYXR_PROV_GV_TRACK");
