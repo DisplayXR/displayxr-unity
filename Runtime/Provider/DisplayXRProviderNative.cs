@@ -174,6 +174,16 @@ namespace DisplayXR
         public static extern int displayxr_dedicated_window_alive();
 
         /// <summary>
+        /// (#740 f-up) 1 while the custom host MOVE drag is in progress. The driver pauses
+        /// its per-frame GameView glue pushes during the drag (Unity's maximized-view
+        /// layout readings flap by the toolbar height per frame while the container moves
+        /// → zone/swapchain realloc storm → shimmer); the native lockstep follow owns the
+        /// window position until mouse-up.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int displayxr_host_drag_active();
+
+        /// <summary>
         /// GameView weave-to-texture presentation (Task (a), editor + texture probe): the
         /// runtime-woven shared texture opened on Unity's D3D device. C# wraps it as an
         /// external Texture2D and draws it into the Game view (DisplayXRGameViewPresenter).

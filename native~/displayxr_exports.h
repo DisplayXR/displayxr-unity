@@ -349,6 +349,12 @@ DISPLAYXR_EXPORT void displayxr_set_child_glue(int enable, void *pane_hwnd);
 /// the display subsystem to recreate the window under the surviving container.
 DISPLAYXR_EXPORT int displayxr_dedicated_window_alive(void);
 
+/// (#740 f-up) 1 while the custom host MOVE drag is in progress. The C# driver pauses
+/// its per-frame GameView glue pushes during the drag (Unity's maximized-view layout
+/// readings flap per frame while the container moves → zone/swapchain realloc storm →
+/// shimmer); the native lockstep follow owns the window position until mouse-up.
+DISPLAYXR_EXPORT int displayxr_host_drag_active(void);
+
 /// (display-zones port) Get/set the managed overlay window's screen-space
 /// top-left, for app-side window-position persistence (remember/restore across
 /// launches). set is #61-bracketed (size unchanged). Windows overlay only.

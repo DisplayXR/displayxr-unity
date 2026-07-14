@@ -54,6 +54,9 @@ void displayxr_set_child_glue(int enable, void *pane_hwnd);
 /// (#740 auto-switch) 1 while the dedicated weave window is a live HWND.
 int displayxr_dedicated_window_alive(void);
 
+/// (#740 f-up) 1 while the custom host MOVE drag is in progress.
+int displayxr_host_drag_active(void);
+
 /// Check whether the plugin is running in shell/IPC mode.
 /// Detected via DISPLAYXR_WORKSPACE_SESSION=1 (legacy DISPLAYXR_SHELL_SESSION=1
 /// is also honored) environment variable.

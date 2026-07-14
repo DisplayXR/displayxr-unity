@@ -1353,6 +1353,18 @@ static void follow_host_drag_end(HWND host, int release_capture)
 		ReleaseCapture();
 }
 
+// (#740 f-up) 1 while the custom host MOVE drag is in progress. The C# glue pauses
+// its per-frame GameView pushes during the drag: Unity's maximized-view layout
+// readings FLAP by the toolbar height every frame while the container moves
+// (mainSize 1596↔1536 observed) → per-frame zone re-drive → swapchain realloc
+// storm → visible shimmer/loss of 3D. During the drag the native lockstep follow
+// owns the window position (the pre-drag-fix behavior, which was smooth); the C#
+// glue resumes at mouse-up.
+int displayxr_host_drag_active(void)
+{
+	return (s_follow_drag_pending || s_follow_dragging) ? 1 : 0;
+}
+
 static void follow_reposition_to_pane(void)
 {
 	if (!s_dedicated_hwnd || !s_pane_follow_hwnd || !IsWindow(s_pane_follow_hwnd)) return;
@@ -1484,6 +1496,8 @@ void displayxr_set_pane_follow(void *pane_hwnd, int off_x, int off_y, int w, int
 	if (maxh > 0 && h > maxh) h = maxh;
 
 	int pane_changed = (s_pane_follow_hwnd != (HWND)pane_hwnd);
+	int geom_changed = (s_pane_follow_ox != off_x || s_pane_follow_oy != off_y ||
+	                    s_pane_follow_w != w || s_pane_follow_h != h);
 	s_pane_follow_hwnd = (HWND)pane_hwnd;
 	s_pane_follow_ox = off_x; s_pane_follow_oy = off_y;
 	s_pane_follow_w = w; s_pane_follow_h = h;
@@ -1501,11 +1515,13 @@ void displayxr_set_pane_follow(void *pane_hwnd, int off_x, int off_y, int w, int
 		}
 	}
 
-	// (#740) Re-glue immediately when the pane target changes (layout reset replaces the
-	// GameView pane): with a static host no host message fires and the timer is gated off
-	// while a host is subclassed, so nothing else would reposition until the next host move.
-	if (pane_changed && pane_hwnd) {
-		displayxr_log("[DisplayXR][PaneFollow] retarget pane=%p host=%p\n", pane_hwnd, (void *)host);
+	// (#740) Re-glue immediately when the pane target OR the published offsets change
+	// (layout reset replaces the pane; the phase-nudge calibration knob shifts off_x):
+	// with a static host no host message fires and the timer is gated off while a host
+	// is subclassed, so nothing else would reposition until the next host move.
+	if (pane_hwnd && (pane_changed || geom_changed)) {
+		if (pane_changed)
+			displayxr_log("[DisplayXR][PaneFollow] retarget pane=%p host=%p\n", pane_hwnd, (void *)host);
 		follow_reposition_to_pane();
 	}
 }
@@ -1840,13 +1856,26 @@ displayxr_create_provider_dedicated_window(void)
 		}
 	}
 
+	// PRESENT mode z-order (#740 f-up): the woven window must float over the FLOATING
+	// Game view but respect global z-order (focusing another app used to leave the
+	// TOPMOST weave on top of everything). Make it an OWNED window of the pane's
+	// top-level container: it z-rides above its owner, drops with it when another app
+	// is focused, and minimizes with it. OWNERSHIP ≠ parentship — GA_ROOT stays self,
+	// so the SR weaver's DXGI/phase self-anchor is untouched. The pane handle comes
+	// from the dock-state detector (displayxr_set_child_glue stashes it in both
+	// modes); env-driven runs without a pane keep the legacy TOPMOST behavior.
+	HWND present_owner = NULL;
+	if (present_mode && s_childglue_pane != NULL && IsWindow(s_childglue_pane))
+		present_owner = GetAncestor(s_childglue_pane, GA_ROOT);
+
 	// Children can't be WS_EX_TOPMOST; use TRANSPARENT for click-through (no top-level
 	// HTTRANSPARENT z-fight). Top-level path keeps NOACTIVATE|TOPMOST as before.
 	// PRESENT mode: VISIBLE top-level (no WS_EX_LAYERED alpha-0 — the runtime presents the
-	// woven stereo into it and the user must SEE it), TOPMOST, NOACTIVATE (never steals
-	// editor focus). Keep clickthrough so the input path + #61 drag brackets still work.
+	// woven stereo into it and the user must SEE it), NOACTIVATE (never steals editor
+	// focus); TOPMOST only when no owner resolved. Keep clickthrough so the input path +
+	// #61 drag brackets still work.
 	DWORD ex_style = WS_EX_NOACTIVATE;
-	if (!s_childglue) ex_style |= WS_EX_TOPMOST;
+	if (!s_childglue && present_owner == NULL) ex_style |= WS_EX_TOPMOST;
 	if (have_init && !present_mode) {
 		ex_style |= WS_EX_LAYERED;
 		if (s_childglue) ex_style |= WS_EX_TRANSPARENT;
@@ -1866,7 +1895,7 @@ displayxr_create_provider_dedicated_window(void)
 		s_childglue ? cx : (have_init ? igx : CW_USEDEFAULT),
 		s_childglue ? cy : (have_init ? igy : CW_USEDEFAULT),
 		have_init ? igw : def_w,          have_init ? igh : def_h,
-		child_parent, NULL, GetModuleHandleW(NULL), NULL);
+		s_childglue ? child_parent : present_owner, NULL, GetModuleHandleW(NULL), NULL);
 
 	if (s_dedicated_hwnd == NULL) {
 		fprintf(stderr, "[DisplayXR] Failed to create dedicated provider window: %lu\n",
@@ -1885,8 +1914,10 @@ displayxr_create_provider_dedicated_window(void)
 		SetLayeredWindowAttributes(s_dedicated_hwnd, 0, 0, LWA_ALPHA);
 	if (present_mode)
 		displayxr_log("[DisplayXR] PRESENT mode (#740): dedicated window born VISIBLE top-level "
-		              "WS_POPUP at screen (%d,%d) %dx%d — runtime presents woven stereo into it\n",
-		              igx, igy, igw, igh);
+		              "WS_POPUP at screen (%d,%d) %dx%d owner=%p (%s) — runtime presents woven "
+		              "stereo into it\n",
+		              igx, igy, igw, igh, (void *)present_owner,
+		              present_owner ? "z-rides the floating Game view" : "TOPMOST legacy");
 
 	// Show WITHOUT activating so the editor keeps OS foreground (input stays live).
 	ShowWindow(s_dedicated_hwnd, SW_SHOWNOACTIVATE);

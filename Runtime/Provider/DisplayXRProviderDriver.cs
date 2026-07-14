@@ -1005,7 +1005,10 @@ namespace DisplayXR
                 DisplayXRProviderNative.dxr_prov_set_present_mode(docked ? 0 : 1);
             if (!childEnv)
             {
-                var pane = (docked && s_hwndCorrValid) ? s_hwndCorrHwnd : System.IntPtr.Zero;
+                // The pane handle is passed in BOTH modes: docked → child-glue parent
+                // (GA_ROOT resolved natively at creation); undocked → the present window's
+                // OWNER hint (z-rides the floating Game view instead of global TOPMOST).
+                var pane = s_hwndCorrValid ? s_hwndCorrHwnd : System.IntPtr.Zero;
                 DisplayXRProviderNative.displayxr_set_child_glue(docked ? 1 : 0, pane);
             }
             Debug.Log("[DisplayXR] GameView dock state: " + (docked
@@ -1064,9 +1067,46 @@ namespace DisplayXR
         System.IntPtr m_LastFollowPane; // last pane HWND published to pane-follow (#740)
         int m_LastDbgW = int.MinValue, m_LastDbgH; // size-change diagnostic log key (#740)
 
+        // (#740) DOCKED phase calibration knob: the docked texture path showed an exact L/R
+        // eye swap — the signature of a constant ~one-view-pitch (~2px) residual in the
+        // phase_off correction, NOT drift (per-eye fields stay uniform). The docked child
+        // weave window is INVISIBLE (pure phase anchor + zone canvas), so shifting its X
+        // moves ONLY the interlace phase, never the on-screen content — a clean live knob:
+        // write an integer to %TEMP%\dxr_phase_nudge.txt (re-read ~every half second) and
+        // sweep seated until the eyes are correct; the found constant then goes to the
+        // runtime agent (#740) for a proper DP-side calibration. Docked/texture mode only.
+        static int s_phaseNudgeX;
+        static int s_phaseNudgeTick;
+        static void UpdatePhaseNudge()
+        {
+            if (!s_lastAppliedDocked) { s_phaseNudgeX = 0; return; }
+            if ((s_phaseNudgeTick++ % 30) != 0) return;
+            try
+            {
+                string f = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "dxr_phase_nudge.txt");
+                int v = 0;
+                if (System.IO.File.Exists(f))
+                    int.TryParse(System.IO.File.ReadAllText(f).Trim(), out v);
+                if (v != s_phaseNudgeX)
+                {
+                    s_phaseNudgeX = v;
+                    Debug.Log("[DisplayXR] docked phase nudge X = " + v + " px");
+                }
+            }
+            catch { }
+        }
+
         void PushGameViewRectEditorProbe()
         {
             if (!ProbeEnabled()) return;
+            // (#740 f-up) Pause ALL glue work while the custom host drag is live: Unity's
+            // maximized-view layout readings flap by the toolbar height every frame while
+            // the container moves (mainSize 1596↔1536 observed) → per-frame zone re-drive →
+            // swapchain realloc storm → shimmer/loss of 3D. The native lockstep follow owns
+            // the window position during the drag (the original smooth behavior); everything
+            // here resumes at mouse-up. POV stays live regardless (the frame pump is
+            // independent of this glue).
+            if (DisplayXRProviderNative.displayxr_host_drag_active() != 0) return;
             // Keep the Game view at full (physical) resolution — re-enforce in case the user
             // (or a layout change) flips "Low Resolution Aspect Ratios" back on mid-session.
             ForceGameViewFullResolution();
@@ -1084,6 +1124,10 @@ namespace DisplayXR
                 m_LastDbgW = pw; m_LastDbgH = ph;
                 Debug.Log($"[DisplayXR] GameView glue size change: {dbg}");
             }
+            // (#740) Docked phase calibration: shift the invisible child anchor's X — phase
+            // moves, content doesn't (see UpdatePhaseNudge).
+            UpdatePhaseNudge();
+            px += s_phaseNudgeX;
             // (#740) Pane-follow: publish the matched pane HWND + render-vs-pane-window offset
             // so the native WM_TIMER keeps the weave window glued during OS modal drags of a
             // Unity window (which freeze this LateUpdate → the C# glue stops). The timer
