@@ -1868,6 +1868,29 @@ displayxr_create_provider_dedicated_window(void)
 	if (present_mode && s_childglue_pane != NULL && IsWindow(s_childglue_pane))
 		present_owner = GetAncestor(s_childglue_pane, GA_ROOT);
 
+	// (#740 styles A/B) The docked child is normally WS_EX_LAYERED with alpha 0 +
+	// WS_EX_TRANSPARENT. Per MSDN, "hit testing of a layered window is based on the shape
+	// and transparency of the window ... areas whose alpha value is zero will let the
+	// mouse messages through" — i.e. an alpha-0 layered window is INVISIBLE to
+	// WindowFromPoint and to any point-based window resolution. If the SR SDK resolves
+	// its weaving window that way, our child is skipped and the phase anchors to whatever
+	// lies underneath (Unity's pane/container) — the leading #740 hypothesis, and the one
+	// delta between our child and the runtime agent's plain harness child (which weaves
+	// correctly at our exact geometry).
+	// DISPLAYXR_PROV_CHILD_ALPHA=<1..255> borns the child at that alpha (1/255 is visually
+	// imperceptible) and WITHOUT WS_EX_TRANSPARENT, so it IS hit-test-visible; input still
+	// falls through via our WM_NCHITTEST → HTTRANSPARENT (s_ded_clickthrough). If docked
+	// phase snaps correct under this variant, the mechanism is confirmed app-side.
+	int child_alpha = 0;
+	{
+		const char *e = getenv("DISPLAYXR_PROV_CHILD_ALPHA");
+		if (e && e[0]) {
+			child_alpha = atoi(e);
+			if (child_alpha < 0) child_alpha = 0;
+			if (child_alpha > 255) child_alpha = 255;
+		}
+	}
+
 	// Children can't be WS_EX_TOPMOST; use TRANSPARENT for click-through (no top-level
 	// HTTRANSPARENT z-fight). Top-level path keeps NOACTIVATE|TOPMOST as before.
 	// PRESENT mode: VISIBLE top-level (no WS_EX_LAYERED alpha-0 — the runtime presents the
@@ -1878,7 +1901,7 @@ displayxr_create_provider_dedicated_window(void)
 	if (!s_childglue && present_owner == NULL) ex_style |= WS_EX_TOPMOST;
 	if (have_init && !present_mode) {
 		ex_style |= WS_EX_LAYERED;
-		if (s_childglue) ex_style |= WS_EX_TRANSPARENT;
+		if (s_childglue && child_alpha == 0) ex_style |= WS_EX_TRANSPARENT;
 		s_ded_clickthrough = 1;
 	} else if (present_mode) {
 		s_ded_clickthrough = 1; // input via GetAsyncKeyState + drag brackets; window is visible
@@ -1910,8 +1933,13 @@ displayxr_create_provider_dedicated_window(void)
 	// Glued texture-probe path: the window is WS_EX_LAYERED — make it fully transparent
 	// (alpha 0) so the invisible geometry proxy never paints a black rect over the Game
 	// view. PRESENT mode is NOT layered (visible — it presents the woven stereo).
-	if (have_init && !present_mode)
-		SetLayeredWindowAttributes(s_dedicated_hwnd, 0, 0, LWA_ALPHA);
+	// (#740 styles A/B) DISPLAYXR_PROV_CHILD_ALPHA overrides the alpha — see above.
+	if (have_init && !present_mode) {
+		SetLayeredWindowAttributes(s_dedicated_hwnd, 0, (BYTE)child_alpha, LWA_ALPHA);
+		if (child_alpha != 0)
+			displayxr_log("[DisplayXR] #740 styles A/B: child born LAYERED alpha=%d, "
+			              "WS_EX_TRANSPARENT OFF — hit-test VISIBLE\n", child_alpha);
+	}
 	if (present_mode)
 		displayxr_log("[DisplayXR] PRESENT mode (#740): dedicated window born VISIBLE top-level "
 		              "WS_POPUP at screen (%d,%d) %dx%d owner=%p (%s) — runtime presents woven "
