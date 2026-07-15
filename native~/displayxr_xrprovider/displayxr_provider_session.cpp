@@ -1591,6 +1591,29 @@ static void ps_realloc_grave_stash(IUnknown *p, IUnknown **stash, int *count)
 	if (*count < PS_REALLOC_GRAVE_MAX) stash[(*count)++] = p;
 	else p->Release(); // overflow safety — never expected (max 12 live bridges)
 }
+
+// (#747 bug 2 / XR_KHR_D3D12_enable swapchain-image state contract) Every copy into
+// an ACQUIRED swapchain image must be bracketed with explicit transitions: the spec
+// hands a color image to the app "with a resource state match with
+// D3D12_RESOURCE_STATE_RENDER_TARGET" at xrWaitSwapchainImage success, and at
+// xrReleaseSwapchainImage "the OpenXR runtime must interpret the image as" being back
+// in RENDER_TARGET. Our copies previously relied on implicit COMMON promotion and
+// released the image decayed to COMMON — the compositor's next RT-assuming barrier
+// then mismatched (debug-layer id 527 on 'DXR.xr_swapchain_img[n]', runtime #747).
+// Bracketing RT→COPY_DEST→RT is self-consistent from frame 2 on regardless of the
+// image's creation state, and satisfies the release half the compositor depends on.
+static void ps_sc_image_barrier(ID3D12GraphicsCommandList *cl, ID3D12Resource *img,
+                                D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
+{
+	if (cl == NULL || img == NULL) return;
+	D3D12_RESOURCE_BARRIER b = {};
+	b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	b.Transition.pResource = img;
+	b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	b.Transition.StateBefore = before;
+	b.Transition.StateAfter = after;
+	cl->ResourceBarrier(1, &b);
+}
 #endif // _WIN32
 
 // Tear down the primary swapchain + its cross-device bridge(s) (NOT the shared
@@ -2012,6 +2035,8 @@ static int ps_submit_wsui(XrCompositionLayerWindowSpaceDXR *out_layer)
 	if (s_ps.wsui_images[idx].texture && s_ps.own_cmd_list) {
 		s_ps.own_cmd_alloc->Reset();
 		s_ps.own_cmd_list->Reset(s_ps.own_cmd_alloc, NULL);
+		ps_sc_image_barrier(s_ps.own_cmd_list, s_ps.wsui_images[idx].texture,
+		                    D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
 		D3D12_TEXTURE_COPY_LOCATION dl = {};
 		dl.pResource = s_ps.wsui_images[idx].texture;
 		dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dl.SubresourceIndex = 0;
@@ -2019,6 +2044,8 @@ static int ps_submit_wsui(XrCompositionLayerWindowSpaceDXR *out_layer)
 		sl.pResource = s_ps.wsui_bridge_own;
 		sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; sl.SubresourceIndex = 0;
 		s_ps.own_cmd_list->CopyTextureRegion(&dl, 0, 0, 0, &sl, NULL);
+		ps_sc_image_barrier(s_ps.own_cmd_list, s_ps.wsui_images[idx].texture,
+		                    D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
 		s_ps.own_cmd_list->Close();
 		ID3D12CommandList *lists[] = { s_ps.own_cmd_list };
 		s_ps.own_queue->ExecuteCommandLists(1, lists);
@@ -2304,6 +2331,8 @@ static int ps_submit_local2d(XrCompositionLayerLocal2DDXR *out_layer)
 	if (s_ps.l2d_images[idx].texture && s_ps.own_cmd_list) {
 		s_ps.own_cmd_alloc->Reset();
 		s_ps.own_cmd_list->Reset(s_ps.own_cmd_alloc, NULL);
+		ps_sc_image_barrier(s_ps.own_cmd_list, s_ps.l2d_images[idx].texture,
+		                    D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
 		D3D12_TEXTURE_COPY_LOCATION dl = {};
 		dl.pResource = s_ps.l2d_images[idx].texture;
 		dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dl.SubresourceIndex = 0;
@@ -2311,6 +2340,8 @@ static int ps_submit_local2d(XrCompositionLayerLocal2DDXR *out_layer)
 		sl.pResource = s_ps.l2d_bridge_own;
 		sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; sl.SubresourceIndex = 0;
 		s_ps.own_cmd_list->CopyTextureRegion(&dl, 0, 0, 0, &sl, NULL);
+		ps_sc_image_barrier(s_ps.own_cmd_list, s_ps.l2d_images[idx].texture,
+		                    D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
 		s_ps.own_cmd_list->Close();
 		ID3D12CommandList *lists[] = { s_ps.own_cmd_list };
 		s_ps.own_queue->ExecuteCommandLists(1, lists);
@@ -2662,11 +2693,15 @@ static void ps_copy_extra_zone(ProviderExtraZone *z)
 	if (dst && copy_src && s_ps.own_cmd_list) {
 		s_ps.own_cmd_alloc->Reset();
 		s_ps.own_cmd_list->Reset(s_ps.own_cmd_alloc, NULL);
+		ps_sc_image_barrier(s_ps.own_cmd_list, dst,
+		                    D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
 		for (UINT slice = 0; slice < 2; slice++) {
 			D3D12_TEXTURE_COPY_LOCATION dl = {}; dl.pResource = dst; dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dl.SubresourceIndex = slice;
 			D3D12_TEXTURE_COPY_LOCATION sl = {}; sl.pResource = sp ? z->bridge_own : z->bridge_own_eye[slice]; sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; sl.SubresourceIndex = sp ? slice : 0;
 			s_ps.own_cmd_list->CopyTextureRegion(&dl, 0, 0, 0, &sl, NULL);
 		}
+		ps_sc_image_barrier(s_ps.own_cmd_list, dst,
+		                    D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
 		s_ps.own_cmd_list->Close();
 		if (s_ps.shared_fence_unity && s_ps.shared_fence_own && s_ps.unity_queue) {
 			s_ps.sync_val++;
@@ -4654,18 +4689,11 @@ static void ps_diag_fill_slice_colors(ID3D12Resource *dst, UINT n)
 		rv.Texture2DArray.PlaneSlice = 0;
 		D3D12_CPU_DESCRIPTOR_HANDLE h = base; h.ptr += (SIZE_T)slice * rtv_size;
 		s_ps.own_device->CreateRenderTargetView(dst, &rv, h);
-		D3D12_RESOURCE_BARRIER b = {};
-		b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
-		b.Transition.pResource = dst;
-		b.Transition.Subresource = slice; // mip 0, array slice = slice
-		b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
-		b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
-		s_ps.own_cmd_list->ResourceBarrier(1, &b);
+		// XR_KHR_D3D12_enable contract (#747 bug 2): the acquired image is ALREADY in
+		// RENDER_TARGET and must be RELEASED in RENDER_TARGET — clear directly, no
+		// barriers (the old COMMON→RT→COMMON pair both mismatched the actual state and
+		// released the image in the wrong state).
 		s_ps.own_cmd_list->ClearRenderTargetView(h, colors[slice], 0, NULL);
-		D3D12_RESOURCE_BARRIER b2 = b;
-		b2.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
-		b2.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
-		s_ps.own_cmd_list->ResourceBarrier(1, &b2);
 	}
 	static int logged = 0;
 	if (!logged) { logged = 1;
@@ -4749,20 +4777,27 @@ int dxr_prov_submit_frame(uint32_t image_index)
 			if (s_slice_colors < 0) { const char *e = getenv("DISPLAYXR_PROV_SLICE_COLORS");
 			                          s_slice_colors = (e && e[0] && e[0] != '0') ? 1 : 0; }
 			if (s_slice_colors) {
+				// Image arrives in RENDER_TARGET per the XR_KHR_D3D12_enable contract —
+				// the diag clears directly and leaves it RT (no barriers, see helper).
 				ps_diag_fill_slice_colors(dst, submit_n);
-			} else
-			for (UINT slice = 0; slice < submit_n; slice++) {
-				D3D12_TEXTURE_COPY_LOCATION dl = {};
-				dl.pResource = dst;
-				dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-				dl.SubresourceIndex = slice;
-				D3D12_TEXTURE_COPY_LOCATION sl = {};
-				// SPI: slice `slice` of the array bridge. MultiPass: subresource 0 of the
-				// per-eye bridge for this eye.
-				sl.pResource = sp ? s_ps.bridge_own : s_ps.bridge_own_eye[slice];
-				sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-				sl.SubresourceIndex = sp ? slice : 0;
-				s_ps.own_cmd_list->CopyTextureRegion(&dl, 0, 0, 0, &sl, NULL);
+			} else {
+				ps_sc_image_barrier(s_ps.own_cmd_list, dst,
+				                    D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
+				for (UINT slice = 0; slice < submit_n; slice++) {
+					D3D12_TEXTURE_COPY_LOCATION dl = {};
+					dl.pResource = dst;
+					dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+					dl.SubresourceIndex = slice;
+					D3D12_TEXTURE_COPY_LOCATION sl = {};
+					// SPI: slice `slice` of the array bridge. MultiPass: subresource 0 of the
+					// per-eye bridge for this eye.
+					sl.pResource = sp ? s_ps.bridge_own : s_ps.bridge_own_eye[slice];
+					sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+					sl.SubresourceIndex = sp ? slice : 0;
+					s_ps.own_cmd_list->CopyTextureRegion(&dl, 0, 0, 0, &sl, NULL);
+				}
+				ps_sc_image_barrier(s_ps.own_cmd_list, dst,
+				                    D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
 			}
 			s_ps.own_cmd_list->Close();
 
