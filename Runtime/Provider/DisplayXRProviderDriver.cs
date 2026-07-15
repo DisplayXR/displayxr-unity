@@ -1067,6 +1067,7 @@ namespace DisplayXR
         System.IntPtr m_LastFollowPane; // last pane HWND published to pane-follow (#740)
         int m_LastDbgW = int.MinValue, m_LastDbgH; // size-change diagnostic log key (#740)
         int m_PushedW = int.MinValue, m_PushedH;   // last size actually pushed (settle-debounce, #740)
+        static int s_freezeSizeGate = -1;          // DISPLAYXR_PROV_FREEZE_SIZE (task 7 sandbox)
         int m_PendW = int.MinValue, m_PendH;       // candidate size awaiting settle
         double m_PendSince;                        // when the candidate appeared
 
@@ -1138,10 +1139,22 @@ namespace DisplayXR
             // CHANGED size only after it has held for kResizeSettleSeconds; POSITION keeps
             // pushing immediately (the window stays glued, briefly at the old size), so a
             // whole resize costs ONE realloc at settle instead of one per frame.
+            // DISPLAYXR_PROV_FREEZE_SIZE=1: never push a size change at all — the swapchain
+            // stays at its born size for the whole session (positions keep tracking live).
+            // Crash-proof sandbox for interactive layout/phase exploration while the
+            // realloc-adjacent D3D12 instability (per-frame compositor barrier UB, id 527)
+            // is chased runtime-side: content letterboxes/stretches on a resize (cosmetic).
+            if (s_freezeSizeGate < 0)
+                s_freezeSizeGate = System.Environment.GetEnvironmentVariable(
+                    "DISPLAYXR_PROV_FREEZE_SIZE") == "1" ? 1 : 0;
             const double kResizeSettleSeconds = 0.35;
             if (m_PushedW == int.MinValue)
             {
                 m_PushedW = pw; m_PushedH = ph; // first frame: adopt (session-start size)
+            }
+            else if (s_freezeSizeGate == 1)
+            {
+                pw = m_PushedW; ph = m_PushedH; // frozen at born size
             }
             else if (pw != m_PushedW || ph != m_PushedH)
             {

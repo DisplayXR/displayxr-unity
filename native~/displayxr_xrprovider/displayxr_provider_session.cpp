@@ -1560,6 +1560,39 @@ static void ps_drain_gpu(void)
 #endif // _WIN32
 }
 
+// (#740 / editor resize crash, task 7) Deferred-release graveyard for the rewrapped
+// bridge textures (ADR-001, realloc-scoped). Releasing the old bridges IMMEDIATELY
+// lets the D3D12 allocator hand the replacement bridge the SAME pointer address while
+// Unity's XRTextureManager is still processing the old texture's destroy
+// ASYNCHRONOUSLY — its D3D12 state cache then treats the new resource as the old one
+// (address-keyed), skips the initial COMMON→RENDER_TARGET transition, and clears a
+// COMMON resource (debug layer id 538: "Expected RENDER_TARGET, Actual
+// COMMON|PRESENT" on 'XR Texture [n]'), intermittently escalating to
+// DXGI_ERROR_DEVICE_HUNG → device removed → editor fatal on interactive resizes.
+// Holding the previous generation until AFTER the new bridges are allocated (and
+// flushing it only then) makes address aliasing against live Unity state impossible.
+// (Extra-zone tiles realloc through their own path and want the same treatment if
+// zone-resize churn ever shows this signature.)
+#ifdef _WIN32
+#define PS_REALLOC_GRAVE_MAX 16
+static IUnknown *s_realloc_grave[PS_REALLOC_GRAVE_MAX];
+static int s_realloc_grave_count = 0;
+
+static void ps_realloc_grave_flush(void)
+{
+	for (int i = 0; i < s_realloc_grave_count; i++)
+		if (s_realloc_grave[i]) s_realloc_grave[i]->Release();
+	s_realloc_grave_count = 0;
+}
+
+static void ps_realloc_grave_stash(IUnknown *p, IUnknown **stash, int *count)
+{
+	if (p == NULL) return;
+	if (*count < PS_REALLOC_GRAVE_MAX) stash[(*count)++] = p;
+	else p->Release(); // overflow safety — never expected (max 12 live bridges)
+}
+#endif // _WIN32
+
 // Tear down the primary swapchain + its cross-device bridge(s) (NOT the shared
 // fence or own device — those are size-independent), then recreate at the current
 // target size via ps_create_swapchain (which recomputes size from the window/zone
@@ -1583,27 +1616,40 @@ static int ps_recreate_primary_swapchain(void)
 
 #ifdef _WIN32
 	// SPI bridge (2-slice) + MultiPass per-eye bridges. Keep the shared fence.
-	if (s_ps.bridge_unity) { s_ps.bridge_unity->Release(); s_ps.bridge_unity = NULL; }
+	// STASH instead of Release (see graveyard comment above): the NEW bridges must be
+	// allocated while these are still alive so they can't reuse addresses Unity's
+	// async texture-destroy still has D3D12 state cached for.
+	IUnknown *stash[PS_REALLOC_GRAVE_MAX]; int stash_count = 0;
+	ps_realloc_grave_stash(s_ps.bridge_unity, stash, &stash_count); s_ps.bridge_unity = NULL;
 	if (s_ps.bridge_handle) { CloseHandle(s_ps.bridge_handle); s_ps.bridge_handle = NULL; }
-	if (s_ps.bridge_own)   { s_ps.bridge_own->Release();   s_ps.bridge_own = NULL; }
+	ps_realloc_grave_stash(s_ps.bridge_own, stash, &stash_count); s_ps.bridge_own = NULL;
 	for (int e = 0; e < 2; e++) {
-		if (s_ps.bridge_unity_eye[e]) { s_ps.bridge_unity_eye[e]->Release(); s_ps.bridge_unity_eye[e] = NULL; }
+		ps_realloc_grave_stash(s_ps.bridge_unity_eye[e], stash, &stash_count); s_ps.bridge_unity_eye[e] = NULL;
 		if (s_ps.bridge_handle_eye[e]) { CloseHandle(s_ps.bridge_handle_eye[e]); s_ps.bridge_handle_eye[e] = NULL; }
-		if (s_ps.bridge_own_eye[e])   { s_ps.bridge_own_eye[e]->Release();   s_ps.bridge_own_eye[e] = NULL; }
+		ps_realloc_grave_stash(s_ps.bridge_own_eye[e], stash, &stash_count); s_ps.bridge_own_eye[e] = NULL;
 	}
 	// D3D11 size-dependent targets (#195): the SPI bridge (editor), the MultiPass per-eye
-	// targets (editor shared + zero-copy plain) — release + recreate. Keep own device +
+	// targets (editor shared + zero-copy plain) — stash + recreate. Keep own device +
 	// shared fence (size-independent, like the D3D12 shared fence). The NT handles were
 	// already closed inside ps_alloc_shared_tex_d3d11 (fields stay NULL).
-	if (s_ps.d3d11_bridge_unity) { s_ps.d3d11_bridge_unity->Release(); s_ps.d3d11_bridge_unity = NULL; }
-	if (s_ps.d3d11_bridge_own)   { s_ps.d3d11_bridge_own->Release();   s_ps.d3d11_bridge_own = NULL; }
+	ps_realloc_grave_stash(s_ps.d3d11_bridge_unity, stash, &stash_count); s_ps.d3d11_bridge_unity = NULL;
+	ps_realloc_grave_stash(s_ps.d3d11_bridge_own, stash, &stash_count);   s_ps.d3d11_bridge_own = NULL;
 	for (int e = 0; e < 2; e++) {
-		if (s_ps.d3d11_bridge_unity_eye[e]) { s_ps.d3d11_bridge_unity_eye[e]->Release(); s_ps.d3d11_bridge_unity_eye[e] = NULL; }
-		if (s_ps.d3d11_bridge_own_eye[e])   { s_ps.d3d11_bridge_own_eye[e]->Release();   s_ps.d3d11_bridge_own_eye[e] = NULL; }
+		ps_realloc_grave_stash(s_ps.d3d11_bridge_unity_eye[e], stash, &stash_count); s_ps.d3d11_bridge_unity_eye[e] = NULL;
+		ps_realloc_grave_stash(s_ps.d3d11_bridge_own_eye[e], stash, &stash_count);   s_ps.d3d11_bridge_own_eye[e] = NULL;
 	}
 #endif // _WIN32
 
 	int ok = ps_create_swapchain(); // recomputes target size + re-pairs the bridge
+
+#ifdef _WIN32
+	// New bridges exist (their addresses are guaranteed distinct from the stash).
+	// Now the generation from the PREVIOUS realloc can finally go, and this
+	// generation takes its place until the next one.
+	ps_realloc_grave_flush();
+	for (int i = 0; i < stash_count; i++)
+		s_realloc_grave[s_realloc_grave_count++] = stash[i];
+#endif // _WIN32
 	ps_log("[DisplayXR-PROV] realloc: primary swapchain+bridge recreated -> %ux%u (%s)\n",
 	       s_ps.sc_width, s_ps.sc_height, ok ? "OK" : "FAILED");
 	return ok;
@@ -3641,6 +3687,7 @@ void dxr_prov_session_stop(void)
 
 #ifdef _WIN32
 	// Bridge + cross-device fence + own-device resources.
+	ps_realloc_grave_flush(); // deferred realloc generation (#740 resize crash)
 	if (s_ps.shared_fence_unity)  s_ps.shared_fence_unity->Release();
 	if (s_ps.shared_fence_handle) CloseHandle(s_ps.shared_fence_handle);
 	if (s_ps.shared_fence_own)    s_ps.shared_fence_own->Release();
