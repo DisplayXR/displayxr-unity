@@ -5,6 +5,14 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Weave-to-texture Play Mode: the runtime's woven stereo now renders **inside** Unity's editor Game view (dockable/maximizable, identical to a built player) instead of a separate window. Auto-switching docked/undocked hybrid — docked binds texture mode (shared-texture weave → Game-tab mirror-blit, DP `phase_off` correction) and undocked binds present mode (self-anchored). Includes live POV during host drag, layout-reset re-target, and D3D12 resize stability (atlas crop barrier + full `XR_KHR_D3D12_enable` swapchain-state contract). Windows/D3D-only; env-gated on the probe, additive (the external-window path is unchanged when off). The prior external-window Play Mode approach is archived at branch/tag `*/external-window-playmode`. (#740, #747)
+
+### Fixed
+- Docked Game-view interlace phase: corrected two anchor-vs-content RT-centring offsets (Unity centres the render target in the pane, +3px X, and draws it with a bottom margin, −4px Y → X-phase through the slanted lens), latched to stay stable through interactive resizes. (#740)
+
 ## [2.5.0] - 2026-07-12
 - 6acc285 feat!: rename DisplayXR extensions XR_EXT_* -> XR_DXR_* (DisplayXR/displayxr-runtime#734)
 - 85d3afb chore: bump package.json version to 2.4.0 to match released v2.4.0 tag
