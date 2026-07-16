@@ -174,6 +174,16 @@ namespace DisplayXR
         public static extern int displayxr_dedicated_window_alive();
 
         /// <summary>
+        /// (#740 stereo unswap) 1 = submit the two stereo views into opposite swapchain
+        /// slots — cancels the docked texture path's view-order flip (a discrete, geometry-
+        /// invariant, runtime/SDK-side defect). Set per (re)start = docked-and-not-maximized.
+        /// STEREO ONLY; -1 restores the DISPLAYXR_PROV_VIEW_SWAP env gate. Survives session
+        /// stop — re-set per start.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void dxr_prov_set_view_swap(int enable);
+
+        /// <summary>
         /// (#740 f-up) 1 while the custom host MOVE drag is in progress. The driver pauses
         /// its per-frame GameView glue pushes during the drag (Unity's maximized-view
         /// layout readings flap by the toolbar height per frame while the container moves

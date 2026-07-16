@@ -1069,6 +1069,7 @@ namespace DisplayXR
                 }
             }
             s_lastAppliedDocked = docked;
+            s_lastViewSwap = -1; // (#740) force the per-frame view-swap to re-push this session
             bool presentEnv = System.Environment.GetEnvironmentVariable("DISPLAYXR_PROV_PRESENT_MODE") != null;
             bool childEnv   = System.Environment.GetEnvironmentVariable("DISPLAYXR_PROV_GV_CHILDGLUE") != null;
             if (!presentEnv)
@@ -1085,6 +1086,45 @@ namespace DisplayXR
                 ? "DOCKED → texture mode + child-glue" : "UNDOCKED → PRESENT mode")
                 + (forced ? " [FORCED test hook]" : "")
                 + (presentEnv || childEnv ? " [env override active — mode pinned by env]" : ""));
+        }
+
+        // (#740 stereo unswap) The docked texture weave path assigns the two views in the
+        // reversed order vs maximized/floating — a discrete flip, geometry-invariant,
+        // runtime/SDK-side (#740). HW-proven: forcing the swap makes docked correct and
+        // maximized wrong; gating it to docked-non-maximized makes both correct. It's a
+        // PER-FRAME copy decision, and maximize/unmaximize does NOT restart the session
+        // (same GameView instance, so the RehostWatcher doesn't fire), so this must be
+        // re-evaluated every frame — not once at bind. present (undocked) is already correct
+        // (s_lastAppliedDocked=false). Env DISPLAYXR_PROV_VIEW_SWAP is the authoritative test
+        // override. Stereo-only band-aid until the runtime fixes the maximized-path root
+        // cause — must NOT ship on the N>2 quilt path.
+        static int s_lastViewSwap = -1;
+        static void UpdateViewSwap()
+        {
+            if (System.Environment.GetEnvironmentVariable("DISPLAYXR_PROV_VIEW_SWAP") != null) return; // env pins it
+            int want = (s_lastAppliedDocked && !IsMatchedGameViewMaximized()) ? 1 : 0;
+            if (want == s_lastViewSwap) return;
+            s_lastViewSwap = want;
+            DisplayXRProviderNative.dxr_prov_set_view_swap(want);
+            Debug.Log("[DisplayXR] #740 view swap -> " + (want == 1 ? "ON (docked)" : "off (maximized/undocked)"));
+        }
+
+        // (#740) EditorWindow.maximized for the matched Game view — the discriminant for the
+        // stereo unswap (docked non-maximized swaps; maximized does not). Reuses the
+        // s_maximizedProp cache resolved by LogGameViewInstancesOnChange.
+        static bool IsMatchedGameViewMaximized()
+        {
+            if (s_matchedGameView == null) return false;
+            try
+            {
+                if (s_maximizedProp == null && s_gvType != null)
+                    for (var t = s_gvType; t != null && s_maximizedProp == null; t = t.BaseType)
+                        s_maximizedProp = t.GetProperty("maximized",
+                            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                if (s_maximizedProp == null) return false;
+                return (bool)s_maximizedProp.GetValue(s_matchedGameView, null);
+            }
+            catch { return false; }
         }
 
         // Called by the loader BEFORE the subsystem starts. Window-glue (default): born the
@@ -1187,6 +1227,7 @@ namespace DisplayXR
             LogGameViewInstancesOnChange();
             LogGameViewGeometryOnChange();
             ApplyGameViewFit();
+            UpdateViewSwap(); // (#740 stereo unswap) per-frame — maximize doesn't restart
             if (!TryGetGameViewRenderRect(out int px, out int py, out int pw, out int ph, out string dbg))
                 return;
             if (!s_loggedGlueOnce) { s_loggedGlueOnce = true; Debug.Log($"[DisplayXR] GameView glue: {dbg}"); }

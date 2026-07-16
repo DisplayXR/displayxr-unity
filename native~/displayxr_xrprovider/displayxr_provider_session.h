@@ -361,6 +361,16 @@ void *dxr_prov_get_external_weave_hwnd(void);
 DISPLAYXR_EXPORT void dxr_prov_set_present_mode(int enable);
 int dxr_prov_get_present_mode(void);
 
+/// (#740 stereo unswap) 1 = submit the two stereo views into the OPPOSITE swapchain slots.
+/// The docked texture weave path assigns the two views in the reversed order vs
+/// maximized/floating (a ~half-lens-pitch flip, geometry-invariant, runtime/SDK-side, #740);
+/// for a 2-view interlace, swapping the submitted slots exactly cancels it. Set from C# per
+/// (re)start = docked-AND-not-maximized (NOT in maximized or present). Env override for
+/// testing: DISPLAYXR_PROV_VIEW_SWAP. STEREO ONLY — must not be used on the N>2 quilt path.
+/// -1 restores the env gate. Survives session stop — re-set per start. Editor + probe only.
+DISPLAYXR_EXPORT void dxr_prov_set_view_swap(int enable);
+int dxr_prov_view_swap(void);
+
 /// Consume the per-extra-zone realloc latch (0-based index). Returns 1 (and clears)
 /// if that extra zone was just reallocated by dxr_prov_reconcile_size and its Unity
 /// texture(s) must be dropped + re-wrapped. Call for each extra zone each frame.

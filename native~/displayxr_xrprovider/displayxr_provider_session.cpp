@@ -2863,6 +2863,29 @@ void dxr_prov_set_present_mode(int enable)
 }
 int dxr_prov_get_present_mode(void) { return ps_bind_present(); }
 
+// (#740 stereo unswap) The docked texture path weaves the two views in the OPPOSITE order
+// vs maximized/floating — an exact ~half-lens-pitch swap that is invariant to all window
+// geometry (measured: three docked in-container-X of 573/393/253 give identical interlace
+// phase; only the maximized STATE differs, by ~half a period). Root cause is runtime/SDK-
+// side (the maximized weave path), tracked on #740. As a STEREO-ONLY stopgap the plugin can
+// submit the two views into the opposite swapchain slots, which for a 2-view interlace
+// exactly cancels a view-order flip (== a half-pitch phase shift; the two are identical
+// output for N=2). Does NOT generalise to N>2 (quilt) — that needs the runtime phase fix.
+// Set from C# per (re)start based on dock state (docked-non-maximized => swap); env
+// DISPLAYXR_PROV_VIEW_SWAP forces it for testing. Survives session stop — re-set per start.
+static int s_view_swap_override = -1; // -1 unset, 0 off, 1 swap
+int dxr_prov_view_swap(void)
+{
+	if (s_view_swap_override >= 0) return s_view_swap_override;
+	const char *e = getenv("DISPLAYXR_PROV_VIEW_SWAP");
+	return (e && *e && *e != '0') ? 1 : 0;
+}
+void dxr_prov_set_view_swap(int enable)
+{
+	s_view_swap_override = enable < 0 ? -1 : (enable ? 1 : 0);
+	ps_log("[DisplayXR-PROV] view swap: %s\n", enable > 0 ? "ON (docked stereo unswap)" : "off");
+}
+
 // Readback path: DISPLAYXR_PROV_TEXTURE_PROBE may carry a literal path (any value
 // other than "1"); otherwise default under %TEMP%.
 static void ps_probe_path(char *out, size_t n)
@@ -4678,6 +4701,7 @@ static void ps_diag_fill_slice_colors(ID3D12Resource *dst, UINT n)
 	}
 	const float colors[2][4] = { {0.0f, 0.0f, 1.0f, 1.0f},   // slice 0 = BLUE (left)
 	                             {1.0f, 0.0f, 0.0f, 1.0f} };  // slice 1 = RED  (right)
+	int swap = (n >= 2) && dxr_prov_view_swap(); // #740: mirror the real path's slot swap
 	D3D12_CPU_DESCRIPTOR_HANDLE base = rtv_heap->GetCPUDescriptorHandleForHeapStart();
 	for (UINT slice = 0; slice < n && slice < 2; slice++) {
 		D3D12_RENDER_TARGET_VIEW_DESC rv = {};
@@ -4693,7 +4717,8 @@ static void ps_diag_fill_slice_colors(ID3D12Resource *dst, UINT n)
 		// RENDER_TARGET and must be RELEASED in RENDER_TARGET — clear directly, no
 		// barriers (the old COMMON→RT→COMMON pair both mismatched the actual state and
 		// released the image in the wrong state).
-		s_ps.own_cmd_list->ClearRenderTargetView(h, colors[slice], 0, NULL);
+		UINT src_eye = swap ? (1 - slice) : slice; // #740 stereo unswap, mirror the real path
+		s_ps.own_cmd_list->ClearRenderTargetView(h, colors[src_eye], 0, NULL);
 	}
 	static int logged = 0;
 	if (!logged) { logged = 1;
@@ -4783,17 +4808,19 @@ int dxr_prov_submit_frame(uint32_t image_index)
 			} else {
 				ps_sc_image_barrier(s_ps.own_cmd_list, dst,
 				                    D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
+				int swap = (submit_n >= 2) && dxr_prov_view_swap(); // #740 stereo unswap
 				for (UINT slice = 0; slice < submit_n; slice++) {
+					UINT src_eye = swap ? (1 - slice) : slice; // submit views into opposite slots
 					D3D12_TEXTURE_COPY_LOCATION dl = {};
 					dl.pResource = dst;
 					dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
 					dl.SubresourceIndex = slice;
 					D3D12_TEXTURE_COPY_LOCATION sl = {};
-					// SPI: slice `slice` of the array bridge. MultiPass: subresource 0 of the
-					// per-eye bridge for this eye.
-					sl.pResource = sp ? s_ps.bridge_own : s_ps.bridge_own_eye[slice];
+					// SPI: slice `src_eye` of the array bridge. MultiPass: subresource 0 of the
+					// per-eye bridge for `src_eye`.
+					sl.pResource = sp ? s_ps.bridge_own : s_ps.bridge_own_eye[src_eye];
 					sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-					sl.SubresourceIndex = sp ? slice : 0;
+					sl.SubresourceIndex = sp ? src_eye : 0;
 					s_ps.own_cmd_list->CopyTextureRegion(&dl, 0, 0, 0, &sl, NULL);
 				}
 				ps_sc_image_barrier(s_ps.own_cmd_list, dst,
