@@ -1109,7 +1109,7 @@ namespace DisplayXR
 
         // (#740 auto-switch) Called by the loader BEFORE the subsystem (re)starts: detect the
         // Game view's dock state and drive the native bind mode — DOCKED → texture mode +
-        // child-glue window (in-tab occlusion via mirror-blit; the leia phase_off DP fix
+        // child-glue window (in-tab occlusion via mirror-blit; the DP phase_off fix
         // anchors phase via GA_ROOT=container); UNDOCKED → PRESENT mode (runtime presents
         // woven stereo into our visible top-level window over the floating pane; SR
         // self-anchors, phase-snap free). The env vars stay authoritative TEST overrides:

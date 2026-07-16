@@ -2844,7 +2844,7 @@ static int ps_probe_env(void)
 // Bind mode within the editor GameView feature (#740 hybrid): the feature (s_probe_enabled)
 // binds in TEXTURE mode when DOCKED (weave into a shared texture → mirror-blit into the
 // Game tab; the SR weaver resolves Unity's container which Unity presents → snap rides
-// Unity's present; the leia phase_off cancels the container→pane offset) and in PRESENT
+// Unity's present; the DP phase_off cancels the container→pane offset) and in PRESENT
 // mode when UNDOCKED (the Game view is its own floating top-level → runtime presents the
 // woven stereo into our dedicated top-level window over it: GA_ROOT==self, correct anchor +
 // snap, zero correction, no mirror seam). Set from C# via dxr_prov_set_present_mode BEFORE
@@ -3577,7 +3577,7 @@ int dxr_prov_session_start(const char *runtime_json_path,
 			s_probe_woven_w = pw; s_probe_woven_h = ph; // for the GameView mirror srcRect
 			// The Leia DP's texture-mode weave is CANVAS-DRIVEN: a plain projection
 			// gives the DP canvas=(0,0 0x0) → it writes nothing into the shared
-			// texture (confirmed: runtime log leia_dp_d3d11_process_atlas canvas 0x0,
+			// texture (confirmed: runtime log dp_d3d11_process_atlas canvas 0x0,
 			// readback all-black). The cube_zones_texture_* reference apps work
 			// because they submit a display ZONE, which supplies the canvas. Force a
 			// full-window zone here so the DP has a canvas to weave into the shared

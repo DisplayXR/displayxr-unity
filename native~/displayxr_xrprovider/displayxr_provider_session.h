@@ -352,7 +352,7 @@ void *dxr_prov_get_external_weave_hwnd(void);
 
 /// Bind mode within the editor GameView feature (#740 hybrid). Set from C# BEFORE the
 /// session starts, driven by dock state: 0 = TEXTURE (docked — weave into a shared
-/// texture, mirror-blit into the Game tab, leia phase_off correction); 1 = PRESENT
+/// texture, mirror-blit into the Game tab, DP phase_off correction); 1 = PRESENT
 /// (undocked — the runtime presents the woven stereo into our dedicated top-level window
 /// over the floating pane, SR self-anchors, zero correction). Env override for testing:
 /// DISPLAYXR_PROV_PRESENT_MODE. Read by session_start (skip shared-texture bind) and by
