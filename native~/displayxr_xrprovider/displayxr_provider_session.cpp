@@ -3915,6 +3915,11 @@ static void *s_ext_weave_hwnd = NULL;
 
 void dxr_prov_set_gameview_rect(int x, int y, int w, int h)
 {
+#ifndef _WIN32
+	// macOS: GameView weave-to-texture window tracking is a Windows-only feature
+	// (SetWindowPos/child-glue on the dedicated proxy window). No-op — keep the symbol.
+	(void)x; (void)y; (void)w; (void)h;
+#else
 	if (s_ext_weave_hwnd) return; // BINDPANE: the bound window is UNITY'S — never touch it
 	if (w <= 0 || h <= 0 || !s_ps.overlay_hwnd) return;
 	// (#740) Defensive size clamp: the render area can never exceed the virtual screen —
@@ -3957,6 +3962,7 @@ void dxr_prov_set_gameview_rect(int x, int y, int w, int h)
 	SetWindowPos((HWND)s_ps.overlay_hwnd, NULL, sx, sy, w, h, flags);
 	ps_log("[DisplayXR-PROV] gameview window track (%s): screen(%d,%d) -> pos(%d,%d) %dx%d\n",
 	       s_track == 2 ? "move" : "move+resize", x, y, sx, sy, w, h);
+#endif // _WIN32
 }
 
 // Transparent-background request (#166 Phase A). Set from C# BEFORE the session
