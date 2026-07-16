@@ -2806,9 +2806,11 @@ extern "C" uint32_t dxr_prov_get_extra_zone_acquired_index(uint32_t ei)
 // window stays blank while the probe runs — the .bmp is the success signal.
 // ============================================================================
 static int              s_probe_enabled = 0;    // DISPLAYXR_PROV_TEXTURE_PROBE
+#ifdef _WIN32
 static ID3D11Texture2D *s_probe_tex11   = NULL;  // shared texture (D3D11 bind, own device)
 static ID3D12Resource  *s_probe_tex12   = NULL;  // shared texture (D3D12 bind)
 static HANDLE           s_probe_handle  = NULL;  // shared HANDLE handed to the runtime
+#endif
 static unsigned         s_probe_frames  = 0;     // submit counter (dump gate)
 static int              s_probe_dumped  = 0;     // one-shot readback done
 static const unsigned   kProbeDumpFrame = 150;   // warmup gate (matches ref app)
@@ -2831,8 +2833,10 @@ static int s_gv_panel_x = INT32_MIN, s_gv_panel_y = INT32_MIN;
 // GameView mirror (Task (a)): the woven shared texture opened on UNITY'S device so
 // the display-provider can wrap it via CreateTexture and mirror-blit it into the
 // editor Game window. Opened lazily on first request (graphics thread, session ready).
+#ifdef _WIN32
 static ID3D11Texture2D *s_probe_tex_unity = NULL;
 static ID3D12Resource  *s_probe_tex12_unity = NULL; // D3D12 Unity-device view of the woven shared tex
+#endif
 static uint32_t         s_probe_woven_w = 0, s_probe_woven_h = 0;
 
 static int ps_probe_env(void)
@@ -2888,6 +2892,9 @@ void dxr_prov_set_view_swap(int enable)
 
 // Readback path: DISPLAYXR_PROV_TEXTURE_PROBE may carry a literal path (any value
 // other than "1"); otherwise default under %TEMP%.
+// (macOS: the readback / shared-texture / woven-mirror helpers below are Windows/D3D-only —
+// guarded out; dxr_prov_get_woven_unity_texture keeps a NULL macOS stub after #endif.)
+#ifdef _WIN32
 static void ps_probe_path(char *out, size_t n)
 {
 	const char *e = getenv("DISPLAYXR_PROV_TEXTURE_PROBE");
@@ -3125,6 +3132,14 @@ void *dxr_prov_get_woven_unity_texture(uint32_t *w, uint32_t *h)
 	if (h) *h = s_probe_woven_h;
 	return s_probe_tex_unity ? (void *)s_probe_tex_unity : (void *)s_probe_tex12_unity;
 }
+#else  // !_WIN32 — macOS: the weave-to-texture probe/mirror is Windows/D3D-only.
+void *dxr_prov_get_woven_unity_texture(uint32_t *w, uint32_t *h)
+{
+	if (w) *w = 0;
+	if (h) *h = 0;
+	return NULL;
+}
+#endif // _WIN32
 
 // The woven content occupies the canvas sub-rect of the shared texture; report it
 // (+ full texture dims) so the mirror blit can normalize srcRect. The canvas tracks the
@@ -3161,6 +3176,7 @@ void dxr_prov_get_woven_canvas(int32_t *x, int32_t *y, int32_t *cw, int32_t *ch,
 }
 
 // Release probe resources (called from dxr_prov_session_stop and defensively at start).
+#ifdef _WIN32
 static void ps_probe_cleanup(void)
 {
 	if (s_probe_tex_unity) { s_probe_tex_unity->Release(); s_probe_tex_unity = NULL; }
@@ -3178,6 +3194,9 @@ static void ps_probe_cleanup(void)
 	s_probe_frames = 0;
 	s_probe_dumped = 0;
 }
+#else
+static void ps_probe_cleanup(void) {}  // macOS: the weave-to-texture probe is Windows-only
+#endif // _WIN32
 
 int dxr_prov_session_start(const char *runtime_json_path,
                            int backend_kind,
@@ -4668,6 +4687,8 @@ int dxr_prov_get_zone_rect_px(uint32_t zone, int *x, int *y, int *w, int *h)
 // weave reads BOTH array slices (→ a blue/red interlace) or samples slice 0 for both views
 // (→ a flat all-blue field, the "sliced swapchain mishandled in shared-texture case"
 // hypothesis). RTV heap created lazily on the own device; never freed (diagnostic-only).
+// (macOS: D3D12-only diagnostic; the sole caller is already _WIN32-guarded.)
+#ifdef _WIN32
 static void ps_diag_fill_slice_colors(ID3D12Resource *dst, UINT n)
 {
 	if (!dst || !s_ps.own_device || !s_ps.own_cmd_list) return;
@@ -4725,6 +4746,7 @@ static void ps_diag_fill_slice_colors(ID3D12Resource *dst, UINT n)
 		ps_log("[DisplayXR-PROV] PROBE: SLICE COLORS active — slice0=BLUE slice1=RED (n=%u fmt=%d)\n",
 		       n, (int)rd.Format); }
 }
+#endif // _WIN32
 
 int dxr_prov_submit_frame(uint32_t image_index)
 {
@@ -5026,6 +5048,7 @@ int dxr_prov_submit_frame(uint32_t image_index)
 	if (s_ps.graphics_api == DXR_GFX_D3D11 && d11_frames < 100000) d11_frames++;
 	if (XR_FAILED(r)) { ps_log("[DisplayXR-PROV] xrEndFrame failed: %d\n", r); return 0; }
 
+#ifdef _WIN32  // weave-to-texture PROBE readback is Windows/D3D-only
 	// Weave-to-texture PROBE: ON-DEMAND readback of the runtime-woven shared texture.
 	// Touch %TEMP%\displayxr_woven_trigger to dump the CURRENT woven output (any frame,
 	// e.g. while the Game tab is maximized) → displayxr_prov_woven_ondemand.bmp. Lets us
@@ -5091,6 +5114,7 @@ int dxr_prov_submit_frame(uint32_t image_index)
 			s_probe_dumped = 1;
 		}
 	}
+#endif // _WIN32 — weave-to-texture PROBE readback
 	return 1;
 }
 

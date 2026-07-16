@@ -114,8 +114,11 @@ bool                    s_textures_created = false;
 static UnityXRRenderTextureId s_woven_tex_id = 0;
 static bool                   s_woven_tex_created = false;
 // Native mirror blit command objects (Unity device) — reused; released in GfxStop.
+// (macOS: the native mirror blit is D3D12-only; MainBlitToMirrorViewRenderTarget is stubbed.)
+#ifdef _WIN32
 static ID3D12CommandAllocator   *s_mblit_alloc = nullptr;
 static ID3D12GraphicsCommandList *s_mblit_list = nullptr;
+#endif
 
 // Extra 3D zones (#166 Phase B2): each extra zone gets its own Unity texture(s)
 // (SPI: [i][0] = 2-slice array; MultiPass: [i][0/1] = per-eye) + render pass.
@@ -135,6 +138,16 @@ uint32_t                s_current_image_index = 0;  // acquired this frame
 bool                    s_frame_in_flight = false;
 
 extern "C" void dxr_prov_file_log(const char *s); // defined in the session TU
+
+#ifndef _WIN32
+// macOS: MainQueryMirrorViewBlitDesc stays cross-platform (registered unconditionally) but its
+// woven-mirror diagnostics use the Windows-only _snprintf_s. That body is dead on macOS (no
+// woven texture is ever published there — dxr_prov_get_woven_unity_texture returns NULL), yet it
+// must still COMPILE. Map _snprintf_s(buf, size, _TRUNCATE, ...) to the standard bounded snprintf;
+// the count argument is consumed and dropped by the macro (snprintf truncates safely on its own).
+#define _TRUNCATE ((size_t)-1)
+#define _snprintf_s(buf, size, count, ...) snprintf((buf), (size), __VA_ARGS__)
+#endif
 
 void prov_log(const char *msg)
 {
@@ -1067,6 +1080,7 @@ static bool native_mirror_enabled()
 	return s_native_mirror_env == 1;
 }
 
+#ifdef _WIN32  // native mirror blit is D3D12-only (macOS stub below)
 static UnitySubsystemErrorCode UNITY_INTERFACE_API
 MainBlitToMirrorViewRenderTarget(UnitySubsystemHandle handle, void *userData,
                                  const UnityXRMirrorViewBlitInfo info)
@@ -1131,6 +1145,15 @@ MainBlitToMirrorViewRenderTarget(UnitySubsystemHandle handle, void *userData,
 		prov_log(b); }
 	return kUnitySubsystemErrorCodeSuccess;
 }
+#else  // !_WIN32 — macOS: the native mirror blit is D3D12-only; woven mirror not used.
+static UnitySubsystemErrorCode UNITY_INTERFACE_API
+MainBlitToMirrorViewRenderTarget(UnitySubsystemHandle handle, void *userData,
+                                 const UnityXRMirrorViewBlitInfo info)
+{
+	(void)handle; (void)userData; (void)info;
+	return kUnitySubsystemErrorCodeSuccess;
+}
+#endif // _WIN32
 
 UnitySubsystemErrorCode UNITY_INTERFACE_API
 MainQueryMirrorViewBlitDesc(UnitySubsystemHandle handle, void *userData,
