@@ -735,13 +735,37 @@ namespace DisplayXR
         // the on-demand dump can't be stale): docked delta = +3 px (corr 0.96-0.98),
         // maximized delta = 0 px (corr 0.996). Round-half-up matches the measurement
         // (5 px of slack -> +3, i.e. Unity gives the extra pixel to the left).
+        // (#740) LATCH-LAST-GOOD. The true centring offset is width-INVARIANT (Unity's dock
+        // chrome — scrollbar/border — is a constant width, so slack = client_w − rt_w is a
+        // constant to within ±1px of sub-pixel rounding wobble as logical points × ppp round
+        // independently for the pane client vs the RT). Recomputing every frame therefore
+        // JITTERED the published correction by ±1px at some widths (~0.36 cycle — "noticeable
+        // but never inverted") and, worse, dropped to 0 on the transient slack≤0 reads during
+        // an interactive resize's swapchain realloc (a 3px phase pop if you release right
+        // then). So: compute a candidate, accept it only when plausible, and LATCH it — the
+        // settled value rides through the churn unchanged. A fixed ≤0.18-cycle residual from
+        // the inherent sub-pixel rounding remains (the correct integer genuinely alternates
+        // 2/3 with sub-pixel phase); only the runtime canvas_offset can null that fractional
+        // part. Stable-but-slightly-off beats jumpy.
+        static int s_rtCentX = -1;   // -1 = never latched a plausible value
         static int RtCentringOffsetX(int rtWidth)
         {
-            if (!s_hwndCorrValid || s_hwndCorrHwnd == System.IntPtr.Zero) return 0;
-            if (!GetClientRect(s_hwndCorrHwnd, out var cr)) return 0;
-            int slack = (cr.right - cr.left) - rtWidth;
-            if (slack <= 0 || slack > 64) return 0; // no chrome, or an implausible match
-            return (slack + 1) / 2;
+            if (!s_hwndCorrValid || s_hwndCorrHwnd == System.IntPtr.Zero)
+                return s_rtCentX < 0 ? 0 : s_rtCentX;
+            if (!GetClientRect(s_hwndCorrHwnd, out var cr))
+                return s_rtCentX < 0 ? 0 : s_rtCentX;
+            int clientW = cr.right - cr.left;
+            int slack = clientW - rtWidth;
+            if (slack <= 0 || slack > 64)          // transient realloc / implausible match:
+                return s_rtCentX < 0 ? 0 : s_rtCentX; // hold last good, never pop to 0
+            int cand = (slack + 1) / 2;
+            if (cand != s_rtCentX)
+            {
+                Debug.Log("[DisplayXR] #740 RtCentX latch " + s_rtCentX + "->" + cand
+                          + " (clientW=" + clientW + " rtW=" + rtWidth + " slack=" + slack + ")");
+                s_rtCentX = cand;
+            }
+            return s_rtCentX;
         }
 
         // (#740) VERTICAL sibling of the X centring. Our render-Y assumes the RT is
@@ -767,13 +791,21 @@ namespace DisplayXR
         // HiDPI. If a future Unity/DPI shifts docked phase, re-measure via the woven-texture
         // vs screen cross-correlation (δy) and update this constant.
         const float kRtBottomMarginPt = 1.6f;
+        static int s_rtCentY = 0;   // latched (0 is the correct default: no margin until seen)
         static int RtCentringOffsetY(int rtHeight, float ppp)
         {
-            if (!s_hwndCorrValid || s_hwndCorrHwnd == System.IntPtr.Zero) return 0;
-            if (!GetClientRect(s_hwndCorrHwnd, out var cr)) return 0;
+            if (!s_hwndCorrValid || s_hwndCorrHwnd == System.IntPtr.Zero) return s_rtCentY;
+            if (!GetClientRect(s_hwndCorrHwnd, out var cr)) return s_rtCentY;
             int clientH = cr.bottom - cr.top;
-            if (clientH <= rtHeight) return 0; // maximized/floating: no dock chrome ⇒ no margin
-            return -Mathf.RoundToInt(kRtBottomMarginPt * ppp);
+            if (clientH <= rtHeight) return s_rtCentY; // transient realloc: hold last good
+            int cand = -Mathf.RoundToInt(kRtBottomMarginPt * ppp);
+            if (cand != s_rtCentY)
+            {
+                Debug.Log("[DisplayXR] #740 RtCentY latch " + s_rtCentY + "->" + cand
+                          + " (clientH=" + clientH + " rtH=" + rtHeight + " ppp=" + ppp + ")");
+                s_rtCentY = cand;
+            }
+            return s_rtCentY;
         }
 
         // Compute the visible Game view's RENDER-area rect in physical px. SIZE comes from
