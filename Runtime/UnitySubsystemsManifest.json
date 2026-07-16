@@ -4,7 +4,14 @@
   "libraryName": "displayxr_unity",
   "displays": [
     {
-      "id": "DisplayXR Display"
+      "id": "DisplayXR Display",
+      "supportedMirrorBlitReservedModes": ["leftEye", "rightEye", "sideBySide"],
+      "supportedMirrorBlitCustomModes": [
+        {
+          "blitModeId": 1,
+          "blitModeDesc": "DisplayXR Woven GameView"
+        }
+      ]
     }
   ]
 }

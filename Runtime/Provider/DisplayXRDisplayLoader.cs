@@ -98,7 +98,35 @@ namespace DisplayXR
 
         public override bool Start()
         {
+            // (#740 auto-switch) Detect the Game view's dock state and pick the bind mode
+            // BEFORE the subsystem starts (session_start reads it): docked → texture +
+            // child-glue (in-tab occlusion), undocked → present. Runs on every Start, so a
+            // mid-Play dock-transition restart (Stop→Start) re-binds the right mode.
+            DisplayXRProviderDriver.ApplyDockModeForSessionStart();
+            // Re-push the render-path decision on EVERY start (#740): the native session
+            // teardown memsets the provider state (only runtime_lib survives), so a mid-Play
+            // subsystem restart (GameView re-host watcher, future dock auto-switch) would
+            // otherwise re-bind with the getter's SPI default — wrong on BiRP. Same lesson
+            // as the auto-switch attempt: native overrides must be re-set per start.
+            bool spi = IsSinglePassEligible();
+            DisplayXRProviderNative.dxr_prov_set_single_pass(spi ? 1 : 0);
+            // GameView weave-to-texture fill (Task (a)): stash the Game view's render rect
+            // BEFORE the subsystem (→ native session_start) so the forced full-window zone
+            // is born at the panel's native resolution (otherwise it freezes at the weave
+            // window's creation default and the mirror srcRect over-samples into black).
+            DisplayXRProviderDriver.TryPushInitialGameViewRect();
             StartSubsystem<XRDisplaySubsystem>();
+            // GameView weave-to-texture (Task (a), editor + probe): the editor XR game view
+            // only displays the XR mirror-blit (IMGUI/overlay UI don't composite into it), so
+            // presentation goes through the mirror-blit. Select the RESERVED LeftEye mode
+            // app-side so QueryMirrorViewBlitDesc is invoked (custom mode ids threw Unity's
+            // "Invalide XRSDK BlitMode" assertion). Complements the native frame-desc mode.
+            if (Application.isEditor && DisplaySubsystem != null
+                && System.Environment.GetEnvironmentVariable("DISPLAYXR_PROV_TEXTURE_PROBE") == "1")
+            {
+                DisplaySubsystem.SetPreferredMirrorBlitMode((int)XRMirrorViewBlitMode.LeftEye);
+                Debug.Log("[DisplayXR] Provider: editor probe → preferred mirror blit mode = LeftEye (Task a)");
+            }
             DisplayXRProviderDriver.EnsureInstance();
             return true;
         }

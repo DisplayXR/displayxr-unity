@@ -1560,6 +1560,62 @@ static void ps_drain_gpu(void)
 #endif // _WIN32
 }
 
+// (#740 / editor resize crash, task 7) Deferred-release graveyard for the rewrapped
+// bridge textures (ADR-001, realloc-scoped). Releasing the old bridges IMMEDIATELY
+// lets the D3D12 allocator hand the replacement bridge the SAME pointer address while
+// Unity's XRTextureManager is still processing the old texture's destroy
+// ASYNCHRONOUSLY — its D3D12 state cache then treats the new resource as the old one
+// (address-keyed), skips the initial COMMON→RENDER_TARGET transition, and clears a
+// COMMON resource (debug layer id 538: "Expected RENDER_TARGET, Actual
+// COMMON|PRESENT" on 'XR Texture [n]'), intermittently escalating to
+// DXGI_ERROR_DEVICE_HUNG → device removed → editor fatal on interactive resizes.
+// Holding the previous generation until AFTER the new bridges are allocated (and
+// flushing it only then) makes address aliasing against live Unity state impossible.
+// (Extra-zone tiles realloc through their own path and want the same treatment if
+// zone-resize churn ever shows this signature.)
+#ifdef _WIN32
+#define PS_REALLOC_GRAVE_MAX 16
+static IUnknown *s_realloc_grave[PS_REALLOC_GRAVE_MAX];
+static int s_realloc_grave_count = 0;
+
+static void ps_realloc_grave_flush(void)
+{
+	for (int i = 0; i < s_realloc_grave_count; i++)
+		if (s_realloc_grave[i]) s_realloc_grave[i]->Release();
+	s_realloc_grave_count = 0;
+}
+
+static void ps_realloc_grave_stash(IUnknown *p, IUnknown **stash, int *count)
+{
+	if (p == NULL) return;
+	if (*count < PS_REALLOC_GRAVE_MAX) stash[(*count)++] = p;
+	else p->Release(); // overflow safety — never expected (max 12 live bridges)
+}
+
+// (#747 bug 2 / XR_KHR_D3D12_enable swapchain-image state contract) Every copy into
+// an ACQUIRED swapchain image must be bracketed with explicit transitions: the spec
+// hands a color image to the app "with a resource state match with
+// D3D12_RESOURCE_STATE_RENDER_TARGET" at xrWaitSwapchainImage success, and at
+// xrReleaseSwapchainImage "the OpenXR runtime must interpret the image as" being back
+// in RENDER_TARGET. Our copies previously relied on implicit COMMON promotion and
+// released the image decayed to COMMON — the compositor's next RT-assuming barrier
+// then mismatched (debug-layer id 527 on 'DXR.xr_swapchain_img[n]', runtime #747).
+// Bracketing RT→COPY_DEST→RT is self-consistent from frame 2 on regardless of the
+// image's creation state, and satisfies the release half the compositor depends on.
+static void ps_sc_image_barrier(ID3D12GraphicsCommandList *cl, ID3D12Resource *img,
+                                D3D12_RESOURCE_STATES before, D3D12_RESOURCE_STATES after)
+{
+	if (cl == NULL || img == NULL) return;
+	D3D12_RESOURCE_BARRIER b = {};
+	b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	b.Transition.pResource = img;
+	b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	b.Transition.StateBefore = before;
+	b.Transition.StateAfter = after;
+	cl->ResourceBarrier(1, &b);
+}
+#endif // _WIN32
+
 // Tear down the primary swapchain + its cross-device bridge(s) (NOT the shared
 // fence or own device — those are size-independent), then recreate at the current
 // target size via ps_create_swapchain (which recomputes size from the window/zone
@@ -1583,27 +1639,40 @@ static int ps_recreate_primary_swapchain(void)
 
 #ifdef _WIN32
 	// SPI bridge (2-slice) + MultiPass per-eye bridges. Keep the shared fence.
-	if (s_ps.bridge_unity) { s_ps.bridge_unity->Release(); s_ps.bridge_unity = NULL; }
+	// STASH instead of Release (see graveyard comment above): the NEW bridges must be
+	// allocated while these are still alive so they can't reuse addresses Unity's
+	// async texture-destroy still has D3D12 state cached for.
+	IUnknown *stash[PS_REALLOC_GRAVE_MAX]; int stash_count = 0;
+	ps_realloc_grave_stash(s_ps.bridge_unity, stash, &stash_count); s_ps.bridge_unity = NULL;
 	if (s_ps.bridge_handle) { CloseHandle(s_ps.bridge_handle); s_ps.bridge_handle = NULL; }
-	if (s_ps.bridge_own)   { s_ps.bridge_own->Release();   s_ps.bridge_own = NULL; }
+	ps_realloc_grave_stash(s_ps.bridge_own, stash, &stash_count); s_ps.bridge_own = NULL;
 	for (int e = 0; e < 2; e++) {
-		if (s_ps.bridge_unity_eye[e]) { s_ps.bridge_unity_eye[e]->Release(); s_ps.bridge_unity_eye[e] = NULL; }
+		ps_realloc_grave_stash(s_ps.bridge_unity_eye[e], stash, &stash_count); s_ps.bridge_unity_eye[e] = NULL;
 		if (s_ps.bridge_handle_eye[e]) { CloseHandle(s_ps.bridge_handle_eye[e]); s_ps.bridge_handle_eye[e] = NULL; }
-		if (s_ps.bridge_own_eye[e])   { s_ps.bridge_own_eye[e]->Release();   s_ps.bridge_own_eye[e] = NULL; }
+		ps_realloc_grave_stash(s_ps.bridge_own_eye[e], stash, &stash_count); s_ps.bridge_own_eye[e] = NULL;
 	}
 	// D3D11 size-dependent targets (#195): the SPI bridge (editor), the MultiPass per-eye
-	// targets (editor shared + zero-copy plain) — release + recreate. Keep own device +
+	// targets (editor shared + zero-copy plain) — stash + recreate. Keep own device +
 	// shared fence (size-independent, like the D3D12 shared fence). The NT handles were
 	// already closed inside ps_alloc_shared_tex_d3d11 (fields stay NULL).
-	if (s_ps.d3d11_bridge_unity) { s_ps.d3d11_bridge_unity->Release(); s_ps.d3d11_bridge_unity = NULL; }
-	if (s_ps.d3d11_bridge_own)   { s_ps.d3d11_bridge_own->Release();   s_ps.d3d11_bridge_own = NULL; }
+	ps_realloc_grave_stash(s_ps.d3d11_bridge_unity, stash, &stash_count); s_ps.d3d11_bridge_unity = NULL;
+	ps_realloc_grave_stash(s_ps.d3d11_bridge_own, stash, &stash_count);   s_ps.d3d11_bridge_own = NULL;
 	for (int e = 0; e < 2; e++) {
-		if (s_ps.d3d11_bridge_unity_eye[e]) { s_ps.d3d11_bridge_unity_eye[e]->Release(); s_ps.d3d11_bridge_unity_eye[e] = NULL; }
-		if (s_ps.d3d11_bridge_own_eye[e])   { s_ps.d3d11_bridge_own_eye[e]->Release();   s_ps.d3d11_bridge_own_eye[e] = NULL; }
+		ps_realloc_grave_stash(s_ps.d3d11_bridge_unity_eye[e], stash, &stash_count); s_ps.d3d11_bridge_unity_eye[e] = NULL;
+		ps_realloc_grave_stash(s_ps.d3d11_bridge_own_eye[e], stash, &stash_count);   s_ps.d3d11_bridge_own_eye[e] = NULL;
 	}
 #endif // _WIN32
 
 	int ok = ps_create_swapchain(); // recomputes target size + re-pairs the bridge
+
+#ifdef _WIN32
+	// New bridges exist (their addresses are guaranteed distinct from the stash).
+	// Now the generation from the PREVIOUS realloc can finally go, and this
+	// generation takes its place until the next one.
+	ps_realloc_grave_flush();
+	for (int i = 0; i < stash_count; i++)
+		s_realloc_grave[s_realloc_grave_count++] = stash[i];
+#endif // _WIN32
 	ps_log("[DisplayXR-PROV] realloc: primary swapchain+bridge recreated -> %ux%u (%s)\n",
 	       s_ps.sc_width, s_ps.sc_height, ok ? "OK" : "FAILED");
 	return ok;
@@ -1690,6 +1759,12 @@ extern "C" int displayxr_window_space_ui_get_pending(void **out_tex, int *out_te
 // Local2D arm blits this Unity id<MTLTexture> straight into its overlay swapchain image
 // (same device); the destination pixel rect comes from provider state (l2d_rect_*).
 extern "C" int displayxr_local2d_get_pending(void **out_tex, int *out_w, int *out_h);
+
+// Child-glue (#740, displayxr_win32.c): 1 when the dedicated weave window is a WS_CHILD
+// of Unity's container; the parent-client-origin getter converts the glue's SCREEN rect
+// to child coords for SetWindowPos.
+extern "C" int displayxr_dedicated_is_childglue(void);
+extern "C" int displayxr_dedicated_parent_client_origin(int *ox, int *oy);
 
 // Create (or recreate) the wsui overlay swapchain + cross-device bridge sized to
 // w×h. Format = B8G8R8A8_UNORM (87) to match Unity's URP wsui RT — CopyTextureRegion
@@ -1960,6 +2035,8 @@ static int ps_submit_wsui(XrCompositionLayerWindowSpaceDXR *out_layer)
 	if (s_ps.wsui_images[idx].texture && s_ps.own_cmd_list) {
 		s_ps.own_cmd_alloc->Reset();
 		s_ps.own_cmd_list->Reset(s_ps.own_cmd_alloc, NULL);
+		ps_sc_image_barrier(s_ps.own_cmd_list, s_ps.wsui_images[idx].texture,
+		                    D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
 		D3D12_TEXTURE_COPY_LOCATION dl = {};
 		dl.pResource = s_ps.wsui_images[idx].texture;
 		dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dl.SubresourceIndex = 0;
@@ -1967,6 +2044,8 @@ static int ps_submit_wsui(XrCompositionLayerWindowSpaceDXR *out_layer)
 		sl.pResource = s_ps.wsui_bridge_own;
 		sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; sl.SubresourceIndex = 0;
 		s_ps.own_cmd_list->CopyTextureRegion(&dl, 0, 0, 0, &sl, NULL);
+		ps_sc_image_barrier(s_ps.own_cmd_list, s_ps.wsui_images[idx].texture,
+		                    D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
 		s_ps.own_cmd_list->Close();
 		ID3D12CommandList *lists[] = { s_ps.own_cmd_list };
 		s_ps.own_queue->ExecuteCommandLists(1, lists);
@@ -2252,6 +2331,8 @@ static int ps_submit_local2d(XrCompositionLayerLocal2DDXR *out_layer)
 	if (s_ps.l2d_images[idx].texture && s_ps.own_cmd_list) {
 		s_ps.own_cmd_alloc->Reset();
 		s_ps.own_cmd_list->Reset(s_ps.own_cmd_alloc, NULL);
+		ps_sc_image_barrier(s_ps.own_cmd_list, s_ps.l2d_images[idx].texture,
+		                    D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
 		D3D12_TEXTURE_COPY_LOCATION dl = {};
 		dl.pResource = s_ps.l2d_images[idx].texture;
 		dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dl.SubresourceIndex = 0;
@@ -2259,6 +2340,8 @@ static int ps_submit_local2d(XrCompositionLayerLocal2DDXR *out_layer)
 		sl.pResource = s_ps.l2d_bridge_own;
 		sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; sl.SubresourceIndex = 0;
 		s_ps.own_cmd_list->CopyTextureRegion(&dl, 0, 0, 0, &sl, NULL);
+		ps_sc_image_barrier(s_ps.own_cmd_list, s_ps.l2d_images[idx].texture,
+		                    D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
 		s_ps.own_cmd_list->Close();
 		ID3D12CommandList *lists[] = { s_ps.own_cmd_list };
 		s_ps.own_queue->ExecuteCommandLists(1, lists);
@@ -2610,11 +2693,15 @@ static void ps_copy_extra_zone(ProviderExtraZone *z)
 	if (dst && copy_src && s_ps.own_cmd_list) {
 		s_ps.own_cmd_alloc->Reset();
 		s_ps.own_cmd_list->Reset(s_ps.own_cmd_alloc, NULL);
+		ps_sc_image_barrier(s_ps.own_cmd_list, dst,
+		                    D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
 		for (UINT slice = 0; slice < 2; slice++) {
 			D3D12_TEXTURE_COPY_LOCATION dl = {}; dl.pResource = dst; dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dl.SubresourceIndex = slice;
 			D3D12_TEXTURE_COPY_LOCATION sl = {}; sl.pResource = sp ? z->bridge_own : z->bridge_own_eye[slice]; sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; sl.SubresourceIndex = sp ? slice : 0;
 			s_ps.own_cmd_list->CopyTextureRegion(&dl, 0, 0, 0, &sl, NULL);
 		}
+		ps_sc_image_barrier(s_ps.own_cmd_list, dst,
+		                    D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
 		s_ps.own_cmd_list->Close();
 		if (s_ps.shared_fence_unity && s_ps.shared_fence_own && s_ps.unity_queue) {
 			s_ps.sync_val++;
@@ -2701,6 +2788,415 @@ extern "C" uint32_t dxr_prov_get_extra_zone_acquired_index(uint32_t ei)
 // ============================================================================
 // Lifecycle
 // ============================================================================
+
+// ============================================================================
+// Weave-to-texture PROBE (experiment/provider-weave-to-texture)
+//
+// Env-gated diagnostic (DISPLAYXR_PROV_TEXTURE_PROBE=1). Binds the session in
+// TEXTURE MODE: passes a shared texture HANDLE on XrWin32WindowBindingCreateInfoDXR
+// so the runtime weaves the FINAL output into an app-provided texture instead of
+// presenting to the overlay window (windowHandle stays set for weaver position
+// tracking, mirroring test_apps/texture/cube_zones_texture_*). After a warmup gate
+// we read that texture back to a .bmp — proof the PLAIN (non-zones) projection
+// weave-to-texture is correct before building the GameView mirror-blit on top.
+//
+// Fully additive/reversible: with the env var unset every path is skipped and the
+// session binds exactly as before (windowHandle only). Windows/D3D-only TU.
+// NOTE: in texture mode the runtime does NOT present, so the overlay/dedicated
+// window stays blank while the probe runs — the .bmp is the success signal.
+// ============================================================================
+static int              s_probe_enabled = 0;    // DISPLAYXR_PROV_TEXTURE_PROBE
+#ifdef _WIN32
+static ID3D11Texture2D *s_probe_tex11   = NULL;  // shared texture (D3D11 bind, own device)
+static ID3D12Resource  *s_probe_tex12   = NULL;  // shared texture (D3D12 bind)
+static HANDLE           s_probe_handle  = NULL;  // shared HANDLE handed to the runtime
+#endif
+static unsigned         s_probe_frames  = 0;     // submit counter (dump gate)
+static int              s_probe_dumped  = 0;     // one-shot readback done
+static const unsigned   kProbeDumpFrame = 150;   // warmup gate (matches ref app)
+// Initial GameView render rect, stashed from C# BEFORE session_start so the forced
+// full-window zone (and thus the rendered tile size + the runtime's woven region) is
+// born at the panel's native resolution. See dxr_prov_set_initial_gameview_rect docs.
+static int s_init_gv_x = 0, s_init_gv_y = 0, s_init_gv_w = 0, s_init_gv_h = 0;
+// GameView panel physical px, captured each frame from info.mirrorRtDesc (the
+// authoritative Game-view render size — logical-vs-physical unambiguous, unlike the
+// C# GetMainGameViewTargetSize path). The per-frame pump converges the forced zone to
+// this so the compositor canvas == render viewport pixel-exact (Phase 1, #727 follow-up).
+// Written by dxr_prov_set_panel_px / dxr_prov_set_panel_rect, read by
+// dxr_prov_converge_gameview_zone. x/y = the pane's SCREEN position (zone-glue
+// arrangement, #740/#742: the weave window is born at the MONITOR origin covering the
+// panel and never moves; the ZONE rect carries the pane's true screen offset — the
+// desktop-avatar-proven contract for placing woven content at a screen sub-rect).
+// INT32_MIN = position not published (legacy window-glue arrangement, zone at 0,0).
+static int s_gv_panel_w = 0, s_gv_panel_h = 0;
+static int s_gv_panel_x = INT32_MIN, s_gv_panel_y = INT32_MIN;
+// GameView mirror (Task (a)): the woven shared texture opened on UNITY'S device so
+// the display-provider can wrap it via CreateTexture and mirror-blit it into the
+// editor Game window. Opened lazily on first request (graphics thread, session ready).
+#ifdef _WIN32
+static ID3D11Texture2D *s_probe_tex_unity = NULL;
+static ID3D12Resource  *s_probe_tex12_unity = NULL; // D3D12 Unity-device view of the woven shared tex
+#endif
+static uint32_t         s_probe_woven_w = 0, s_probe_woven_h = 0;
+
+static int ps_probe_env(void)
+{
+	const char *e = getenv("DISPLAYXR_PROV_TEXTURE_PROBE");
+	return (e && *e && *e != '0') ? 1 : 0;
+}
+
+// Bind mode within the editor GameView feature (#740 hybrid): the feature (s_probe_enabled)
+// binds in TEXTURE mode when DOCKED (weave into a shared texture → mirror-blit into the
+// Game tab; the SR weaver resolves Unity's container which Unity presents → snap rides
+// Unity's present; the DP phase_off cancels the container→pane offset) and in PRESENT
+// mode when UNDOCKED (the Game view is its own floating top-level → runtime presents the
+// woven stereo into our dedicated top-level window over it: GA_ROOT==self, correct anchor +
+// snap, zero correction, no mirror seam). Set from C# via dxr_prov_set_present_mode BEFORE
+// session start (dock-state-driven); env DISPLAYXR_PROV_PRESENT_MODE forces it for testing.
+static int s_bind_present_override = -1; // -1 unset, 0 texture, 1 present
+static int ps_bind_present(void)
+{
+	if (s_bind_present_override >= 0) return s_bind_present_override;
+	const char *e = getenv("DISPLAYXR_PROV_PRESENT_MODE");
+	return (e && *e && *e != '0') ? 1 : 0;
+}
+void dxr_prov_set_present_mode(int enable)
+{
+	s_bind_present_override = enable ? 1 : 0;
+	ps_log("[DisplayXR-PROV] bind mode set: %s\n", enable ? "PRESENT (undocked)" : "TEXTURE (docked)");
+}
+int dxr_prov_get_present_mode(void) { return ps_bind_present(); }
+
+// (#740 stereo unswap) The docked texture path weaves the two views in the OPPOSITE order
+// vs maximized/floating — an exact ~half-lens-pitch swap that is invariant to all window
+// geometry (measured: three docked in-container-X of 573/393/253 give identical interlace
+// phase; only the maximized STATE differs, by ~half a period). Root cause is runtime/SDK-
+// side (the maximized weave path), tracked on #740. As a STEREO-ONLY stopgap the plugin can
+// submit the two views into the opposite swapchain slots, which for a 2-view interlace
+// exactly cancels a view-order flip (== a half-pitch phase shift; the two are identical
+// output for N=2). Does NOT generalise to N>2 (quilt) — that needs the runtime phase fix.
+// Set from C# per (re)start based on dock state (docked-non-maximized => swap); env
+// DISPLAYXR_PROV_VIEW_SWAP forces it for testing. Survives session stop — re-set per start.
+static int s_view_swap_override = -1; // -1 unset, 0 off, 1 swap
+int dxr_prov_view_swap(void)
+{
+	if (s_view_swap_override >= 0) return s_view_swap_override;
+	const char *e = getenv("DISPLAYXR_PROV_VIEW_SWAP");
+	return (e && *e && *e != '0') ? 1 : 0;
+}
+void dxr_prov_set_view_swap(int enable)
+{
+	s_view_swap_override = enable < 0 ? -1 : (enable ? 1 : 0);
+	ps_log("[DisplayXR-PROV] view swap: %s\n", enable > 0 ? "ON (docked stereo unswap)" : "off");
+}
+
+// Readback path: DISPLAYXR_PROV_TEXTURE_PROBE may carry a literal path (any value
+// other than "1"); otherwise default under %TEMP%.
+// (macOS: the readback / shared-texture / woven-mirror helpers below are Windows/D3D-only —
+// guarded out; dxr_prov_get_woven_unity_texture keeps a NULL macOS stub after #endif.)
+#ifdef _WIN32
+static void ps_probe_path(char *out, size_t n)
+{
+	const char *e = getenv("DISPLAYXR_PROV_TEXTURE_PROBE");
+	if (e && *e && strcmp(e, "1") != 0) { _snprintf_s(out, n, _TRUNCATE, "%s", e); return; }
+	const char *tmp = getenv("TEMP"); if (!tmp || !*tmp) tmp = ".";
+	_snprintf_s(out, n, _TRUNCATE, "%s\\displayxr_prov_texture_readback.bmp", tmp);
+}
+
+// Minimal uncompressed 24-bit BMP (bottom-up, BGR). src is B8G8R8A8_UNORM.
+static void ps_write_bmp_bgra(const char *path, uint32_t w, uint32_t h,
+                              const uint8_t *src, size_t rowPitch)
+{
+	if (!path || !*path || !src || w == 0 || h == 0) return;
+	const uint32_t rowBytes = w * 3;
+	const uint32_t pad = (4 - (rowBytes & 3)) & 3;
+	const uint32_t stride = rowBytes + pad;
+	const uint32_t imgSize = stride * h;
+	const uint32_t fileSize = 54 + imgSize;
+	uint8_t hdr[54] = {0};
+	hdr[0] = 'B'; hdr[1] = 'M';
+	hdr[2] = (uint8_t)fileSize; hdr[3] = (uint8_t)(fileSize >> 8);
+	hdr[4] = (uint8_t)(fileSize >> 16); hdr[5] = (uint8_t)(fileSize >> 24);
+	hdr[10] = 54;                          // pixel-data offset
+	hdr[14] = 40;                          // DIB header size
+	hdr[18] = (uint8_t)w; hdr[19] = (uint8_t)(w >> 8);
+	hdr[20] = (uint8_t)(w >> 16); hdr[21] = (uint8_t)(w >> 24);
+	hdr[22] = (uint8_t)h; hdr[23] = (uint8_t)(h >> 8);
+	hdr[24] = (uint8_t)(h >> 16); hdr[25] = (uint8_t)(h >> 24);
+	hdr[26] = 1;                           // planes
+	hdr[28] = 24;                          // bpp
+	hdr[34] = (uint8_t)imgSize; hdr[35] = (uint8_t)(imgSize >> 8);
+	hdr[36] = (uint8_t)(imgSize >> 16); hdr[37] = (uint8_t)(imgSize >> 24);
+	FILE *f = NULL; fopen_s(&f, path, "wb");
+	if (!f) { ps_log("[DisplayXR-PROV] PROBE: fopen failed for %s\n", path); return; }
+	fwrite(hdr, 1, 54, f);
+	uint8_t *row = (uint8_t *)malloc(stride);
+	if (row) {
+		memset(row, 0, stride);
+		for (int32_t y = (int32_t)h - 1; y >= 0; y--) {     // bottom-up
+			const uint8_t *s = src + (size_t)y * rowPitch;  // B,G,R,A
+			for (uint32_t x = 0; x < w; x++) {
+				row[x * 3 + 0] = s[x * 4 + 0]; // B
+				row[x * 3 + 1] = s[x * 4 + 1]; // G
+				row[x * 3 + 2] = s[x * 4 + 2]; // R
+			}
+			fwrite(row, 1, stride, f);
+		}
+		free(row);
+	}
+	fclose(f);
+	ps_log("[DisplayXR-PROV] PROBE: wrote readback %ux%u -> %s\n", w, h, path);
+}
+
+// Create a shared D3D11 texture (legacy MISC_SHARED → GetSharedHandle). Returns
+// the share HANDLE, or NULL. Stores the texture in s_probe_tex11.
+static HANDLE ps_probe_create_tex_d3d11(ID3D11Device *dev, uint32_t w, uint32_t h)
+{
+	if (!dev || w == 0 || h == 0) return NULL;
+	D3D11_TEXTURE2D_DESC td = {};
+	td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = 1;
+	td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+	td.SampleDesc.Count = 1;
+	td.Usage = D3D11_USAGE_DEFAULT;
+	td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+	td.MiscFlags = D3D11_RESOURCE_MISC_SHARED;
+	HRESULT hr = dev->CreateTexture2D(&td, NULL, &s_probe_tex11);
+	if (FAILED(hr) || !s_probe_tex11) {
+		ps_log("[DisplayXR-PROV] PROBE: D3D11 CreateTexture2D failed 0x%08X\n", hr);
+		return NULL;
+	}
+	IDXGIResource *dxgi = NULL;
+	hr = s_probe_tex11->QueryInterface(__uuidof(IDXGIResource), (void **)&dxgi);
+	if (FAILED(hr) || !dxgi) {
+		ps_log("[DisplayXR-PROV] PROBE: QI IDXGIResource failed 0x%08X\n", hr);
+		return NULL;
+	}
+	HANDLE sh = NULL;
+	hr = dxgi->GetSharedHandle(&sh);
+	dxgi->Release();
+	if (FAILED(hr) || !sh) {
+		ps_log("[DisplayXR-PROV] PROBE: GetSharedHandle failed 0x%08X\n", hr);
+		return NULL;
+	}
+	ps_log("[DisplayXR-PROV] PROBE: D3D11 shared texture %ux%u handle=%p\n", w, h, sh);
+	return sh;
+}
+
+// Create a shared D3D12 texture (HEAP_FLAG_SHARED → CreateSharedHandle NT handle).
+static HANDLE ps_probe_create_tex_d3d12(ID3D12Device *dev, uint32_t w, uint32_t h)
+{
+	if (!dev || w == 0 || h == 0) return NULL;
+	D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+	D3D12_RESOURCE_DESC rd = {};
+	rd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+	rd.Width = w; rd.Height = h; rd.DepthOrArraySize = 1; rd.MipLevels = 1;
+	rd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+	rd.SampleDesc.Count = 1;
+	rd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+	rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+	HRESULT hr = dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_SHARED, &rd,
+	        D3D12_RESOURCE_STATE_COMMON, NULL, __uuidof(ID3D12Resource), (void **)&s_probe_tex12);
+	if (FAILED(hr) || !s_probe_tex12) {
+		ps_log("[DisplayXR-PROV] PROBE: D3D12 CreateCommittedResource failed 0x%08X\n", hr);
+		return NULL;
+	}
+	HANDLE sh = NULL;
+	hr = dev->CreateSharedHandle(s_probe_tex12, NULL, GENERIC_ALL, NULL, &sh);
+	if (FAILED(hr) || !sh) {
+		ps_log("[DisplayXR-PROV] PROBE: D3D12 CreateSharedHandle failed 0x%08X\n", hr);
+		return NULL;
+	}
+	ps_log("[DisplayXR-PROV] PROBE: D3D12 shared texture %ux%u handle=%p\n", w, h, sh);
+	return sh;
+}
+
+// D3D11 readback: CopyResource shared→staging, Map, dump. The runtime weaves on
+// the SAME device/immediate context we use here, so a CopyResource after
+// xrEndFrame is naturally ordered (coherent).
+static void ps_probe_dump_d3d11(ID3D11Device *dev, ID3D11DeviceContext *ctx,
+                                ID3D11Texture2D *tex, const char *path)
+{
+	if (!dev || !ctx || !tex) return;
+	D3D11_TEXTURE2D_DESC d; tex->GetDesc(&d);
+	D3D11_TEXTURE2D_DESC sd = d;
+	sd.Usage = D3D11_USAGE_STAGING; sd.BindFlags = 0;
+	sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ; sd.MiscFlags = 0;
+	ID3D11Texture2D *staging = NULL;
+	if (FAILED(dev->CreateTexture2D(&sd, NULL, &staging)) || !staging) {
+		ps_log("[DisplayXR-PROV] PROBE: D3D11 staging create failed\n"); return;
+	}
+	ctx->CopyResource(staging, tex);
+	ctx->Flush();
+	D3D11_MAPPED_SUBRESOURCE m = {};
+	if (SUCCEEDED(ctx->Map(staging, 0, D3D11_MAP_READ, 0, &m))) {
+		ps_write_bmp_bgra(path, d.Width, d.Height, (const uint8_t *)m.pData, m.RowPitch);
+		ctx->Unmap(staging, 0);
+	} else {
+		ps_log("[DisplayXR-PROV] PROBE: D3D11 Map failed\n");
+	}
+	staging->Release();
+}
+
+// D3D12 readback: copy shared tex → READBACK buffer on the own queue, wait, map,
+// dump. Best-effort — there is no shared fence with the runtime's compositor
+// queue here, so a torn frame is possible; the static-ish scene keeps it legible.
+static void ps_probe_dump_d3d12(const char *path)
+{
+	if (!s_probe_tex12 || !s_ps.own_device || !s_ps.own_queue ||
+	    !s_ps.own_cmd_alloc || !s_ps.own_cmd_list || !s_ps.own_fence) return;
+	D3D12_RESOURCE_DESC rd = s_probe_tex12->GetDesc();
+	D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp = {}; UINT rows = 0; UINT64 rowBytes = 0, total = 0;
+	s_ps.own_device->GetCopyableFootprints(&rd, 0, 1, 0, &fp, &rows, &rowBytes, &total);
+	D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_READBACK;
+	D3D12_RESOURCE_DESC bd = {};
+	bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+	bd.Width = total; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+	bd.Format = DXGI_FORMAT_UNKNOWN; bd.SampleDesc.Count = 1;
+	bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+	ID3D12Resource *rb = NULL;
+	if (FAILED(s_ps.own_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd,
+	        D3D12_RESOURCE_STATE_COPY_DEST, NULL, __uuidof(ID3D12Resource), (void **)&rb)) || !rb) {
+		ps_log("[DisplayXR-PROV] PROBE: D3D12 readback buffer create failed\n"); return;
+	}
+	s_ps.own_cmd_alloc->Reset();
+	s_ps.own_cmd_list->Reset(s_ps.own_cmd_alloc, NULL);
+	D3D12_RESOURCE_BARRIER b = {};
+	b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	b.Transition.pResource = s_probe_tex12; b.Transition.Subresource = 0;
+	b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+	b.Transition.StateAfter = D3D12_RESOURCE_STATE_COPY_SOURCE;
+	s_ps.own_cmd_list->ResourceBarrier(1, &b);
+	D3D12_TEXTURE_COPY_LOCATION dl = {};
+	dl.pResource = rb; dl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT; dl.PlacedFootprint = fp;
+	D3D12_TEXTURE_COPY_LOCATION sl = {};
+	sl.pResource = s_probe_tex12; sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; sl.SubresourceIndex = 0;
+	s_ps.own_cmd_list->CopyTextureRegion(&dl, 0, 0, 0, &sl, NULL);
+	D3D12_RESOURCE_BARRIER b2 = b;
+	b2.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+	b2.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+	s_ps.own_cmd_list->ResourceBarrier(1, &b2);
+	s_ps.own_cmd_list->Close();
+	ID3D12CommandList *lists[] = { s_ps.own_cmd_list };
+	s_ps.own_queue->ExecuteCommandLists(1, lists);
+	s_ps.own_fence_value++;
+	s_ps.own_queue->Signal(s_ps.own_fence, s_ps.own_fence_value);
+	if (s_ps.own_fence->GetCompletedValue() < s_ps.own_fence_value) {
+		s_ps.own_fence->SetEventOnCompletion(s_ps.own_fence_value, s_ps.own_fence_event);
+		WaitForSingleObject(s_ps.own_fence_event, INFINITE);
+	}
+	void *p = NULL; D3D12_RANGE range = {0, (SIZE_T)total};
+	if (SUCCEEDED(rb->Map(0, &range, &p)) && p) {
+		ps_write_bmp_bgra(path, (uint32_t)rd.Width, (uint32_t)rd.Height,
+		                  (const uint8_t *)p, fp.Footprint.RowPitch);
+		rb->Unmap(0, NULL);
+	} else {
+		ps_log("[DisplayXR-PROV] PROBE: D3D12 readback Map failed\n");
+	}
+	rb->Release();
+}
+
+// GameView mirror (Task (a)): hand the display-provider the Unity-device view of the
+// woven shared texture. Opened lazily here (called from the graphics thread once the
+// session is up, so unity_d3d11_device is valid). The runtime writes the same
+// underlying resource on the own device via sharedTextureHandle; legacy MISC_SHARED
+// lets both devices open it (same adapter). NULL when the probe/texture mode is off.
+void *dxr_prov_get_woven_unity_texture(uint32_t *w, uint32_t *h)
+{
+	if (s_probe_enabled && s_probe_handle && !s_probe_tex_unity && s_ps.unity_d3d11_device) {
+		HRESULT hr = s_ps.unity_d3d11_device->OpenSharedResource(
+		        s_probe_handle, __uuidof(ID3D11Texture2D), (void **)&s_probe_tex_unity);
+		if (FAILED(hr) || !s_probe_tex_unity) {
+			s_probe_tex_unity = NULL;
+			ps_log("[DisplayXR-PROV] PROBE: OpenSharedResource(woven, Unity dev) failed 0x%08X\n", hr);
+		} else {
+			ps_log("[DisplayXR-PROV] PROBE: woven texture opened on Unity device for GameView mirror\n");
+		}
+	}
+	// D3D12: open the NT-shared handle on Unity's ID3D12Device (mirrors the per-eye
+	// bridge's OpenSharedHandle in ps_alloc_shared_bridge). On the D3D12 path
+	// unity_d3d11_device is NULL (only unity_device is set), so the D3D11 branch above
+	// is skipped. Unity accepts an ID3D12Resource* in desc.color.nativePtr on a D3D12
+	// device — create_woven_mirror_texture_if_ready wraps whatever we return here.
+	if (s_probe_enabled && s_probe_handle && !s_probe_tex12_unity &&
+	    s_ps.graphics_api == DXR_GFX_D3D12 && s_ps.unity_device) {
+		HRESULT hr = s_ps.unity_device->OpenSharedHandle(
+		        s_probe_handle, __uuidof(ID3D12Resource), (void **)&s_probe_tex12_unity);
+		if (FAILED(hr) || !s_probe_tex12_unity) {
+			s_probe_tex12_unity = NULL;
+			ps_log("[DisplayXR-PROV] PROBE: OpenSharedHandle(woven, Unity D3D12 dev) failed 0x%08X\n", hr);
+		} else {
+			ps_log("[DisplayXR-PROV] PROBE: woven texture opened on Unity D3D12 device for GameView mirror\n");
+		}
+	}
+	if (w) *w = s_probe_woven_w;
+	if (h) *h = s_probe_woven_h;
+	return s_probe_tex_unity ? (void *)s_probe_tex_unity : (void *)s_probe_tex12_unity;
+}
+#else  // !_WIN32 — macOS: the weave-to-texture probe/mirror is Windows/D3D-only.
+void *dxr_prov_get_woven_unity_texture(uint32_t *w, uint32_t *h)
+{
+	if (w) *w = 0;
+	if (h) *h = 0;
+	return NULL;
+}
+#endif // _WIN32
+
+// The woven content occupies the canvas sub-rect of the shared texture; report it
+// (+ full texture dims) so the mirror blit can normalize srcRect. The canvas tracks the
+// LIVE window client (the runtime re-weaves into ps_window_size each frame via the size
+// reconcile), so read it live here — NOT the frozen forced-zone dims cached in
+// s_ps.zone_w/h at session start. When the window is glued to the Game view rect and
+// then resized, the stale cached value would over-report the canvas → the mirror samples
+// past the woven content into black (right/bottom truncation, Task (a) glue).
+void dxr_prov_get_woven_canvas(int32_t *x, int32_t *y, int32_t *cw, int32_t *ch,
+                               uint32_t *texw, uint32_t *texh)
+{
+	// The runtime weaves the ZONE region into the shared texture at the ZONE's rect
+	// (zone-glue: content lands at (zone_x,zone_y), matching where the zone sits inside
+	// the panel-origin weave window; legacy window-glue: zone at (0,0) = texture
+	// top-left, verified by readback). The mirror srcRect must match that woven
+	// region — NOT the live window client. Fall back to the live window only when no
+	// zone is active.
+	int32_t rx = 0, ry = 0;
+	int32_t rw = s_ps.zone_valid ? s_ps.zone_w : 0;
+	int32_t rh = s_ps.zone_valid ? s_ps.zone_h : 0;
+	if (rw > 0 && rh > 0) {
+		rx = s_ps.zone_x; ry = s_ps.zone_y;
+	} else {
+		uint32_t ww = 0, wh = 0; ps_window_size(&ww, &wh);
+		rw = ww ? (int32_t)ww : (int32_t)s_probe_woven_w;
+		rh = wh ? (int32_t)wh : (int32_t)s_probe_woven_h;
+	}
+	if (x)  *x  = rx;
+	if (y)  *y  = ry;
+	if (cw) *cw = rw;
+	if (ch) *ch = rh;
+	if (texw) *texw = s_probe_woven_w;
+	if (texh) *texh = s_probe_woven_h;
+}
+
+// Release probe resources (called from dxr_prov_session_stop and defensively at start).
+#ifdef _WIN32
+static void ps_probe_cleanup(void)
+{
+	if (s_probe_tex_unity) { s_probe_tex_unity->Release(); s_probe_tex_unity = NULL; }
+	// D3D12 Unity-device view: Release only — the NT handle it was opened from
+	// (s_probe_handle) is CloseHandle'd once in the s_probe_tex12 block below.
+	if (s_probe_tex12_unity) { s_probe_tex12_unity->Release(); s_probe_tex12_unity = NULL; }
+	s_probe_woven_w = 0; s_probe_woven_h = 0;
+	if (s_probe_tex11) { s_probe_tex11->Release(); s_probe_tex11 = NULL; }
+	if (s_probe_tex12) {
+		s_probe_tex12->Release(); s_probe_tex12 = NULL;
+		if (s_probe_handle) { CloseHandle(s_probe_handle); } // D3D12 CreateSharedHandle → NT handle
+	}
+	// D3D11 MISC_SHARED GetSharedHandle is owned by the resource — do NOT CloseHandle.
+	s_probe_handle = NULL;
+	s_probe_frames = 0;
+	s_probe_dumped = 0;
+}
+#else
+static void ps_probe_cleanup(void) {}  // macOS: the weave-to-texture probe is Windows-only
+#endif // _WIN32
 
 int dxr_prov_session_start(const char *runtime_json_path,
                            int backend_kind,
@@ -3068,6 +3564,88 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	win_binding.transparentBackgroundEnabled = use_transparent ? XR_TRUE : XR_FALSE;
 	win_binding.chromaKeyColor = 0;
 
+	// Weave-to-texture PROBE (experiment): bind in TEXTURE MODE so the runtime
+	// weaves into our shared texture instead of presenting to the overlay window.
+	// windowHandle stays set (weaver position tracking), mirroring the ref app.
+	s_probe_enabled = ps_probe_env();
+	// Unconditional build marker: if this line is ABSENT from the log, the editor is
+	// running a STALE DLL (restart Unity). If present with env_probe=0, the env var
+	// DISPLAYXR_PROV_TEXTURE_PROBE=1 did not reach the editor process.
+	int bind_present = s_probe_enabled && ps_bind_present();
+	ps_log("[DisplayXR-PROV] PROBE build=weave-to-texture-2tile env_probe=%d bind=%s\n",
+	       s_probe_enabled, bind_present ? "PRESENT" : "TEXTURE");
+	ps_probe_cleanup(); // clears counters + any leftover texture from a prior session
+	// PRESENT mode (undocked, #740 hybrid): skip the shared-texture bind entirely — the
+	// runtime presents the woven stereo into the dedicated window (windowHandle) like the
+	// shipping/main path. No shared texture ⟹ no mirror-blit (s_woven_tex_id stays 0) and
+	// no forced zone; the window is born VISIBLE top-level (displayxr_win32.c) and the SR
+	// weaver self-anchors to it (GA_ROOT==self). Correct anchor + phase-snap, zero correction.
+	if (s_probe_enabled && !bind_present) {
+		DisplayXRDisplayInfo *pdi = &displayxr_get_state()->display_info;
+		uint32_t pw = pdi->display_pixel_width  ? pdi->display_pixel_width  : 1920;
+		uint32_t ph = pdi->display_pixel_height ? pdi->display_pixel_height : 1080;
+		if (is_d3d11) {
+			ID3D11Device *bindDev = s_ps.d3d11_bridge ? s_ps.own_d3d11_device
+			                                          : s_ps.unity_d3d11_device;
+			s_probe_handle = ps_probe_create_tex_d3d11(bindDev, pw, ph);
+		} else {
+			s_probe_handle = ps_probe_create_tex_d3d12(s_ps.own_device, pw, ph);
+		}
+		if (s_probe_handle) {
+			win_binding.sharedTextureHandle = s_probe_handle;
+			s_probe_woven_w = pw; s_probe_woven_h = ph; // for the GameView mirror srcRect
+			// The Leia DP's texture-mode weave is CANVAS-DRIVEN: a plain projection
+			// gives the DP canvas=(0,0 0x0) → it writes nothing into the shared
+			// texture (confirmed: runtime log dp_d3d11_process_atlas canvas 0x0,
+			// readback all-black). The cube_zones_texture_* reference apps work
+			// because they submit a display ZONE, which supplies the canvas. Force a
+			// full-window zone here so the DP has a canvas to weave into the shared
+			// texture. (DISPLAYXR_PROV_TEXTURE_PROBE_NOZONE=1 keeps the plain path for
+			// A/B.)
+			if (s_ps.has_display_zones && getenv("DISPLAYXR_PROV_TEXTURE_PROBE_NOZONE") == NULL) {
+				// Task (a) fill: born the forced zone at the GameView RENDER size (stashed
+				// from C# before the session started, and the dedicated weave window is
+				// created at that same size in displayxr_create_provider_dedicated_window)
+				// so the rendered tile size + the runtime's woven region fill the panel at
+				// native resolution. Without this the window is at its creation default
+				// (~1248x632) and the zone freezes tiny → the mirror srcRect over-samples
+				// into black. Take the zone dims from the stashed values (deterministic);
+				// do NOT restyle/move the window here — the window is fragile mid-start
+				// (raw-input hooks installed, device setup in flight); the per-frame glue
+				// repositions it after the session is up.
+				// Zone-glue arrangement (#740/#742, desktop-avatar contract): when C# has
+				// published the pane's full screen rect pre-session (dxr_prov_set_panel_rect),
+				// the window is born at the MONITOR origin and the ZONE carries the pane's
+				// position — so seed the zone at that rect. Legacy window-glue: zone at
+				// (0,0) window-sized (the window origin carries the position).
+				s_ps.zone_valid = 1;
+				s_ps.zone_id = 1;
+				if (s_gv_panel_x != INT32_MIN && s_gv_panel_w > 0 && s_gv_panel_h > 0) {
+					s_ps.zone_x = s_gv_panel_x; s_ps.zone_y = s_gv_panel_y;
+					s_ps.zone_w = s_gv_panel_w; s_ps.zone_h = s_gv_panel_h;
+					ps_log("[DisplayXR-PROV] PROBE: forced ZONE-GLUE zone (%d,%d %dx%d) as texture-mode canvas\n",
+					       s_ps.zone_x, s_ps.zone_y, s_ps.zone_w, s_ps.zone_h);
+				} else {
+					uint32_t ww = 0, wh = 0;
+					if (s_init_gv_w > 0 && s_init_gv_h > 0) {
+						ww = (uint32_t)s_init_gv_w; wh = (uint32_t)s_init_gv_h;
+					} else {
+						ps_window_size(&ww, &wh);
+					}
+					if (ww == 0 || wh == 0) { ww = 1280; wh = 720; }
+					s_ps.zone_x = 0; s_ps.zone_y = 0;
+					s_ps.zone_w = (int32_t)ww; s_ps.zone_h = (int32_t)wh;
+					ps_log("[DisplayXR-PROV] PROBE: forced full-window zone %dx%d as texture-mode canvas (init_gv=%dx%d)\n",
+					       s_ps.zone_w, s_ps.zone_h, s_init_gv_w, s_init_gv_h);
+				}
+			}
+			ps_log("[DisplayXR-PROV] PROBE: TEXTURE MODE active (%ux%u) — overlay window "
+			       "will NOT present; readback dumps once at frame %u.\n", pw, ph, kProbeDumpFrame);
+		} else {
+			ps_log("[DisplayXR-PROV] PROBE: shared-texture create FAILED — window mode.\n");
+		}
+	}
+
 	// D3D11 (#195): bind DIRECTLY on Unity's ID3D11Device (no queue — the runtime's
 	// native D3D11 compositor uses the immediate context). D3D12: bind on our own device.
 	XrGraphicsBindingD3D11KHR d3d11 = {};
@@ -3178,6 +3756,7 @@ void dxr_prov_session_stop(void)
 		}
 #endif
 	}
+	ps_probe_cleanup(); // weave-to-texture PROBE shared texture + handle (experiment)
 	if (s_ps.swapchain && s_ps.pfn_destroy_swapchain) s_ps.pfn_destroy_swapchain(s_ps.swapchain);
 	if (s_ps.session && s_ps.session_ready && s_ps.pfn_end_session) s_ps.pfn_end_session(s_ps.session);
 	if (s_ps.session && s_ps.pfn_destroy_session) s_ps.pfn_destroy_session(s_ps.session);
@@ -3185,6 +3764,7 @@ void dxr_prov_session_stop(void)
 
 #ifdef _WIN32
 	// Bridge + cross-device fence + own-device resources.
+	ps_realloc_grave_flush(); // deferred realloc generation (#740 resize crash)
 	if (s_ps.shared_fence_unity)  s_ps.shared_fence_unity->Release();
 	if (s_ps.shared_fence_handle) CloseHandle(s_ps.shared_fence_handle);
 	if (s_ps.shared_fence_own)    s_ps.shared_fence_own->Release();
@@ -3263,6 +3843,128 @@ void dxr_prov_set_dedicated_window(int enable)
 }
 int dxr_prov_get_dedicated_window(void) { return s_prov_dedicated_window; }
 
+// Glue-to-GameView (Task (a)): reposition the dedicated editor weave window so its
+// client rect exactly covers the Unity Game view's on-screen region. In texture mode
+// the runtime derives BOTH window-relative Kooima framing AND the weaver's lenticular
+// phase from this window's screen geometry (win_binding.windowHandle) — but the woven
+// output is now shown by the mirror-blit inside the Game tab, not in this window. By
+// gluing the window's client rect to the Game view rect, that geometry becomes correct
+// with zero runtime change, and the forced full-window zone (client-sized) makes the
+// weave canvas == the Game view size so the mirror srcRect follows.
+//
+// The window never presents in texture mode, so we make it invisible-in-practice:
+// strip the chrome (WS_POPUP → client rect == window rect == Game view rect), drop
+// WS_EX_TOPMOST, and push it to the BOTTOM of the z-order so the editor window (which
+// always contains the Game view region) fully occludes it. It stays a normal visible
+// window to the OS, so the runtime's position tracking is unaffected.
+// Called each frame from C# (editor + probe only). x,y = screen px (top-left origin),
+// w,h = Game view size in px. w<=0||h<=0 is ignored.
+void dxr_prov_set_initial_gameview_rect(int x, int y, int w, int h)
+{
+	s_init_gv_x = x; s_init_gv_y = y;
+	s_init_gv_w = (w > 0) ? w : 0;
+	s_init_gv_h = (h > 0) ? h : 0;
+	ps_log("[DisplayXR-PROV] initial gameview rect stashed: (%d,%d %dx%d)\n", x, y, w, h);
+}
+
+int dxr_prov_get_initial_gameview_rect(int *x, int *y, int *w, int *h)
+{
+	if (x) *x = s_init_gv_x;
+	if (y) *y = s_init_gv_y;
+	if (w) *w = s_init_gv_w;
+	if (h) *h = s_init_gv_h;
+	return (s_init_gv_w > 0 && s_init_gv_h > 0) ? 1 : 0;
+}
+
+// The dedicated weave window is BORN WS_POPUP at the Game-view rect
+// (dxr_prov_set_initial_gameview_rect, before session start). It must NOT be
+// RESTYLED while the Dimenco SR weaver is live: any SetWindowPos(..., SWP_FRAMECHANGED)
+// on the bound HWND fires a WM_NCCALCSIZE that trips the weaver's WndProc subclass and
+// permanently collapses the weave to a single view (view0) — the "stereo for one frame
+// then flat mono" bug (#727). Root-caused with a fence-synced post-weave/post-composite
+// dual tap + an A/B on this push (zero window ops = stereo every frame; a single
+// SWP_FRAMECHANGED push = mono from that frame on). PLAIN move/resize (no frame recalc)
+// is weaver-safe — proven across dozens of scripted mid-session re-glues — so the
+// follow below moves/resizes on change but never passes SWP_FRAMECHANGED.
+//
+// GameView follow (DEFAULT ON in texture-probe mode, #727 follow-up): when the Game
+// view moves/resizes (drag, dock/undock, maximize) the weave window follows with a
+// plain move+resize — SWP_FRAMECHANGED is NEVER used (a frame recalc on the SR-weaver-
+// bound HWND permanently collapses the weave to mono, #727); plain move/resize is
+// weaver-proven safe (slice-color captures across dozens of scripted re-glues).
+//   (unset)                       → move + resize follow (default)
+//   DISPLAYXR_PROV_GV_TRACK=0     → off (born-once no-op, the pre-follow behavior)
+//   DISPLAYXR_PROV_GV_TRACK=move  → move only (SWP_NOSIZE) — isolation diagnostic
+//
+// NO #61 drag bracket here (tried 2026-07-12, REGRESSED steady-state phase — do not
+// re-add): synthesizing WM_ENTERSIZEMOVE/WM_EXITSIZEMOVE around the follow pushes made
+// the weaver's exit phase-snap re-anchor the bound window onto lenticular-aligned
+// pixels — correct for a window that presents its own content (#61 overlay drag), but
+// it UN-GLUES this hidden reference window from the Game-view rect by a position-
+// dependent few px → wrong, position-dependent phase at settle in every state except
+// coincidentally-aligned ones. Silent pushes settle phase-correct (HW-verified);
+// mid-drag phase tracking (drag stutter) is an open follow-up needing a different
+// mechanism than the bracket.
+// BINDPANE experiment (#740): when set, the session binds UNITY'S OWN Game-view pane
+// window (GUIView child) instead of the dedicated proxy window — the SR SDK then
+// tracks the real content window natively (GA_ROOT = Unity's container, the normal
+// windowed-SR-app shape) and the zone carries the render-area offset within the
+// pane's client. The plugin must NEVER SetWindowPos / restyle this window (it is
+// Unity's) — dxr_prov_set_gameview_rect below guards on it.
+static void *s_ext_weave_hwnd = NULL;
+
+void dxr_prov_set_gameview_rect(int x, int y, int w, int h)
+{
+#ifndef _WIN32
+	// macOS: GameView weave-to-texture window tracking is a Windows-only feature
+	// (SetWindowPos/child-glue on the dedicated proxy window). No-op — keep the symbol.
+	(void)x; (void)y; (void)w; (void)h;
+#else
+	if (s_ext_weave_hwnd) return; // BINDPANE: the bound window is UNITY'S — never touch it
+	if (w <= 0 || h <= 0 || !s_ps.overlay_hwnd) return;
+	// (#740) Defensive size clamp: the render area can never exceed the virtual screen —
+	// a transient container-sized rect during a layout reset must not glue the window huge.
+	{
+		int maxw = GetSystemMetrics(SM_CXVIRTUALSCREEN);
+		int maxh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+		if (maxw > 0 && w > maxw) w = maxw;
+		if (maxh > 0 && h > maxh) h = maxh;
+	}
+	static int s_track = -1;      // -1 unknown, 0 off, 1 move+resize, 2 move-only
+	if (s_track < 0) {
+		const char *e = getenv("DISPLAYXR_PROV_GV_TRACK");
+		s_track = (e && e[0]) ? (e[0] == 'm' ? 2 : (atoi(e) == 1 ? 1 : 0)) : 1;
+		ps_log("[DisplayXR-PROV] gameview track mode: %s%s\n",
+		       s_track == 0 ? "OFF" : s_track == 2 ? "move-only" : "move+resize",
+		       (e && e[0]) ? " (env)" : " (default)");
+	}
+	if (s_track == 0) return; // env off-switch: born-once no-op (#727-safe baseline)
+
+	// Seed the last-rect from the BORN rect so a docked steady state (incoming == born) never
+	// fires a spurious SetWindowPos — only a genuine move/resize away from born touches the HWND.
+	static int s_have_last = 0, lx = 0, ly = 0, lw = 0, lh = 0;
+	if (!s_have_last) { s_have_last = 1; lx = s_init_gv_x; ly = s_init_gv_y; lw = s_init_gv_w; lh = s_init_gv_h; }
+	if (x == lx && y == ly && w == lw && h == lh) return; // only on actual change from born/last
+	lx = x; ly = y; lw = w; lh = h;
+
+	// Child-glue (#740): the incoming rect is SCREEN px, but the window is a WS_CHILD —
+	// SetWindowPos wants coords relative to the container's client. Convert. (When the
+	// container itself moves, the pane's screen pos changes but the child coord stays put,
+	// so this is a no-op; only a pane move WITHIN the container repositions the child.)
+	int sx = x, sy = y;
+	if (displayxr_dedicated_is_childglue()) {
+		int ox = 0, oy = 0;
+		if (displayxr_dedicated_parent_client_origin(&ox, &oy)) { sx = x - ox; sy = y - oy; }
+	}
+
+	UINT flags = SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER; // NO SWP_FRAMECHANGED
+	if (s_track == 2) flags |= SWP_NOSIZE; // move only
+	SetWindowPos((HWND)s_ps.overlay_hwnd, NULL, sx, sy, w, h, flags);
+	ps_log("[DisplayXR-PROV] gameview window track (%s): screen(%d,%d) -> pos(%d,%d) %dx%d\n",
+	       s_track == 2 ? "move" : "move+resize", x, y, sx, sy, w, h);
+#endif // _WIN32
+}
+
 // Transparent-background request (#166 Phase A). Set from C# BEFORE the session
 // starts; the actual ALPHA_BLEND opt-in also requires the runtime to advertise it
 // (probed in session_start). Preserved across the session_start memset.
@@ -3305,6 +4007,73 @@ void dxr_prov_clear_3d_zone(void)
 {
 	s_ps.zone_valid = 0;
 	ps_log("[DisplayXR-PROV] clear_3d_zone\n");
+}
+
+// --- GameView zone convergence (Phase 1, #727 follow-up) --------------------
+// C# publishes the authoritative Game-view panel PHYSICAL px here each frame
+// (GetMainGameViewTargetSize x ppp). This is the ONLY reliable physical-px source:
+// info.mirrorRtDesc reports LOGICAL px on a HiDPI display (879x374 at ppp=2.5), which
+// wrongly shrinks the zone. The per-frame pump (dxr_prov_converge_gameview_zone)
+// re-drives the forced full-window zone to it so the compositor canvas == render
+// viewport pixel-exact. NO window op — the value is Scale-independent (mainSize is the
+// target size, not the zoom), so magnify (absorbed by the mirror-blit downscale) drives
+// no change; this converges the born size and adapts on a real tab resize.
+void dxr_prov_set_panel_px(int w, int h)
+{
+	s_gv_panel_w = (w > 0) ? w : 0;
+	s_gv_panel_h = (h > 0) ? h : 0;
+}
+
+// BINDPANE (#740): setter/getter for s_ext_weave_hwnd (declared above with the
+// GV_TRACK statics — dxr_prov_set_gameview_rect guards on it). Set from C# BEFORE the
+// session starts; LifecycleStart consumes it instead of creating the dedicated window.
+void dxr_prov_set_external_weave_hwnd(void *hwnd)
+{
+	s_ext_weave_hwnd = hwnd;
+	ps_log("[DisplayXR-PROV] BINDPANE: external weave HWND set: %p\n", hwnd);
+}
+void *dxr_prov_get_external_weave_hwnd(void) { return s_ext_weave_hwnd; }
+
+// Zone-glue arrangement (#740/#742): publish the Game view pane's FULL screen rect.
+// The weave window sits at the monitor origin (born once, never moved — no #727
+// exposure, no drag re-snaps); the zone rect carries the pane position, so a Game view
+// move is a pure zone x/y data update (no realloc — size unchanged) and a resize is the
+// existing converge/realloc path. Called every frame from C# (editor + probe only).
+void dxr_prov_set_panel_rect(int x, int y, int w, int h)
+{
+	s_gv_panel_x = x;
+	s_gv_panel_y = y;
+	s_gv_panel_w = (w > 0) ? w : 0;
+	s_gv_panel_h = (h > 0) ? h : 0;
+}
+
+// Called from the per-frame pump BEFORE dxr_prov_reconcile_size. If the published panel
+// px differs from the live zone, re-drive the zone (clamped to the shared woven texture
+// dims) via the existing change-detected path → reconcile reallocs the swapchain/bridge,
+// the submit re-chains the new zone, and the mirror srcRect remaps. Probe-mode + active
+// zone only; a no-op once converged (so a steady panel triggers no realloc).
+void dxr_prov_converge_gameview_zone(void)
+{
+	if (!s_probe_enabled || !s_ps.zone_valid) return;
+	if (s_gv_panel_w <= 0 || s_gv_panel_h <= 0) return;
+	int w = s_gv_panel_w, h = s_gv_panel_h;
+	// Zone-glue: the zone rect also carries the pane's screen POSITION (weave window is
+	// parked at the monitor origin). Legacy window-glue publishes no position → keep 0,0.
+	int x = (s_gv_panel_x != INT32_MIN) ? s_gv_panel_x : s_ps.zone_x;
+	int y = (s_gv_panel_y != INT32_MIN) ? s_gv_panel_y : s_ps.zone_y;
+	// Clamp to the shared woven texture (the runtime cannot weave past it).
+	if (x < 0) x = 0;
+	if (y < 0) y = 0;
+	if (s_probe_woven_w > 0 && (uint32_t)(x + w) > s_probe_woven_w) w = (int)s_probe_woven_w - x;
+	if (s_probe_woven_h > 0 && (uint32_t)(y + h) > s_probe_woven_h) h = (int)s_probe_woven_h - y;
+	if (w <= 0 || h <= 0) return;
+	if (x == s_ps.zone_x && y == s_ps.zone_y && w == s_ps.zone_w && h == s_ps.zone_h)
+		return; // already converged — no zone churn
+	ps_log("[DisplayXR-PROV] gameview zone converge: (%d,%d %dx%d) -> (%d,%d %dx%d) (panel=(%d,%d %dx%d) tex=%ux%u)\n",
+	       s_ps.zone_x, s_ps.zone_y, s_ps.zone_w, s_ps.zone_h, x, y, w, h,
+	       s_gv_panel_x, s_gv_panel_y, s_gv_panel_w, s_gv_panel_h,
+	       s_probe_woven_w, s_probe_woven_h);
+	dxr_prov_set_3d_zone_rect(x, y, w, h);
 }
 
 // Multi-zone (#166 Phase B2). total_3d_zones = number of 3D zones (index 0 =
@@ -3918,6 +4687,73 @@ int dxr_prov_get_zone_rect_px(uint32_t zone, int *x, int *y, int *w, int *h)
 	return 1;
 }
 
+// DIAGNOSTIC (DISPLAYXR_PROV_SLICE_COLORS=1): record clears of the acquired swapchain image's
+// array slice 0 = solid BLUE and slice 1 = solid RED onto the own command list (caller has
+// already Reset it and will Close + execute). Used to test whether the runtime's texture-mode
+// weave reads BOTH array slices (→ a blue/red interlace) or samples slice 0 for both views
+// (→ a flat all-blue field, the "sliced swapchain mishandled in shared-texture case"
+// hypothesis). RTV heap created lazily on the own device; never freed (diagnostic-only).
+// (macOS: D3D12-only diagnostic; the sole caller is already _WIN32-guarded.)
+#ifdef _WIN32
+static void ps_diag_fill_slice_colors(ID3D12Resource *dst, UINT n)
+{
+	if (!dst || !s_ps.own_device || !s_ps.own_cmd_list) return;
+	static ID3D12DescriptorHeap *rtv_heap = NULL;
+	static UINT rtv_size = 0;
+	if (!rtv_heap) {
+		D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+		hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV;
+		hd.NumDescriptors = 2;
+		hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_NONE;
+		if (FAILED(s_ps.own_device->CreateDescriptorHeap(&hd, __uuidof(ID3D12DescriptorHeap),
+		        (void **)&rtv_heap)) || !rtv_heap) {
+			ps_log("[DisplayXR-PROV] PROBE: slice-colors RTV heap create failed\n"); return;
+		}
+		rtv_size = s_ps.own_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+	}
+	D3D12_RESOURCE_DESC rd = dst->GetDesc();
+	// The runtime creates the swapchain image TYPELESS (fmt 27); an RTV needs a CONCRETE
+	// format, so use the swapchain's typed format (s_ps.sc_format, e.g. 28 = R8G8B8A8_UNORM),
+	// NOT rd.Format. Passing TYPELESS to CreateRenderTargetView faults the GPU (the crash).
+	DXGI_FORMAT rtvFmt = (DXGI_FORMAT)s_ps.sc_format;
+	if (rtvFmt == DXGI_FORMAT_UNKNOWN || rtvFmt == DXGI_FORMAT_R8G8B8A8_TYPELESS)
+		rtvFmt = DXGI_FORMAT_R8G8B8A8_UNORM;
+	// Safety: never RTV/clear an image that wasn't created render-target-capable (would fault).
+	if (!(rd.Flags & D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET)) {
+		static int warned = 0;
+		if (!warned) { warned = 1;
+			ps_log("[DisplayXR-PROV] PROBE: slice-colors SKIPPED — swapchain image not ALLOW_RENDER_TARGET (flags=0x%x)\n",
+			       (unsigned)rd.Flags); }
+		return;
+	}
+	const float colors[2][4] = { {0.0f, 0.0f, 1.0f, 1.0f},   // slice 0 = BLUE (left)
+	                             {1.0f, 0.0f, 0.0f, 1.0f} };  // slice 1 = RED  (right)
+	int swap = (n >= 2) && dxr_prov_view_swap(); // #740: mirror the real path's slot swap
+	D3D12_CPU_DESCRIPTOR_HANDLE base = rtv_heap->GetCPUDescriptorHandleForHeapStart();
+	for (UINT slice = 0; slice < n && slice < 2; slice++) {
+		D3D12_RENDER_TARGET_VIEW_DESC rv = {};
+		rv.Format = rtvFmt;
+		rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+		rv.Texture2DArray.MipSlice = 0;
+		rv.Texture2DArray.FirstArraySlice = slice;
+		rv.Texture2DArray.ArraySize = 1;
+		rv.Texture2DArray.PlaneSlice = 0;
+		D3D12_CPU_DESCRIPTOR_HANDLE h = base; h.ptr += (SIZE_T)slice * rtv_size;
+		s_ps.own_device->CreateRenderTargetView(dst, &rv, h);
+		// XR_KHR_D3D12_enable contract (#747 bug 2): the acquired image is ALREADY in
+		// RENDER_TARGET and must be RELEASED in RENDER_TARGET — clear directly, no
+		// barriers (the old COMMON→RT→COMMON pair both mismatched the actual state and
+		// released the image in the wrong state).
+		UINT src_eye = swap ? (1 - slice) : slice; // #740 stereo unswap, mirror the real path
+		s_ps.own_cmd_list->ClearRenderTargetView(h, colors[src_eye], 0, NULL);
+	}
+	static int logged = 0;
+	if (!logged) { logged = 1;
+		ps_log("[DisplayXR-PROV] PROBE: SLICE COLORS active — slice0=BLUE slice1=RED (n=%u fmt=%d)\n",
+		       n, (int)rd.Format); }
+}
+#endif // _WIN32
+
 int dxr_prov_submit_frame(uint32_t image_index)
 {
 	if (!s_ps.frame_begun || !s_ps.swapchain_created) {
@@ -3987,18 +4823,36 @@ int dxr_prov_submit_frame(uint32_t image_index)
 			ID3D12Resource *dst = s_ps.sc_images[image_index].texture;
 			s_ps.own_cmd_alloc->Reset();
 			s_ps.own_cmd_list->Reset(s_ps.own_cmd_alloc, NULL);
-			for (UINT slice = 0; slice < submit_n; slice++) {
-				D3D12_TEXTURE_COPY_LOCATION dl = {};
-				dl.pResource = dst;
-				dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-				dl.SubresourceIndex = slice;
-				D3D12_TEXTURE_COPY_LOCATION sl = {};
-				// SPI: slice `slice` of the array bridge. MultiPass: subresource 0 of the
-				// per-eye bridge for this eye.
-				sl.pResource = sp ? s_ps.bridge_own : s_ps.bridge_own_eye[slice];
-				sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
-				sl.SubresourceIndex = sp ? slice : 0;
-				s_ps.own_cmd_list->CopyTextureRegion(&dl, 0, 0, 0, &sl, NULL);
+			// DIAGNOSTIC: instead of the real eye copies, paint slice 0 = BLUE, slice 1 = RED
+			// so the woven output reveals whether the runtime's texture-mode weave reads both
+			// array slices (blue/red interlace) or only slice 0 (flat all-blue). See helper.
+			static int s_slice_colors = -1;
+			if (s_slice_colors < 0) { const char *e = getenv("DISPLAYXR_PROV_SLICE_COLORS");
+			                          s_slice_colors = (e && e[0] && e[0] != '0') ? 1 : 0; }
+			if (s_slice_colors) {
+				// Image arrives in RENDER_TARGET per the XR_KHR_D3D12_enable contract —
+				// the diag clears directly and leaves it RT (no barriers, see helper).
+				ps_diag_fill_slice_colors(dst, submit_n);
+			} else {
+				ps_sc_image_barrier(s_ps.own_cmd_list, dst,
+				                    D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
+				int swap = (submit_n >= 2) && dxr_prov_view_swap(); // #740 stereo unswap
+				for (UINT slice = 0; slice < submit_n; slice++) {
+					UINT src_eye = swap ? (1 - slice) : slice; // submit views into opposite slots
+					D3D12_TEXTURE_COPY_LOCATION dl = {};
+					dl.pResource = dst;
+					dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+					dl.SubresourceIndex = slice;
+					D3D12_TEXTURE_COPY_LOCATION sl = {};
+					// SPI: slice `src_eye` of the array bridge. MultiPass: subresource 0 of the
+					// per-eye bridge for `src_eye`.
+					sl.pResource = sp ? s_ps.bridge_own : s_ps.bridge_own_eye[src_eye];
+					sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+					sl.SubresourceIndex = sp ? src_eye : 0;
+					s_ps.own_cmd_list->CopyTextureRegion(&dl, 0, 0, 0, &sl, NULL);
+				}
+				ps_sc_image_barrier(s_ps.own_cmd_list, dst,
+				                    D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
 			}
 			s_ps.own_cmd_list->Close();
 
@@ -4199,6 +5053,74 @@ int dxr_prov_submit_frame(uint32_t image_index)
 	if (d11_diag) ps_log("[DisplayXR-PROV] D3D11 submit[%u]: post-xrEndFrame r=%d\n", d11_frames, r);
 	if (s_ps.graphics_api == DXR_GFX_D3D11 && d11_frames < 100000) d11_frames++;
 	if (XR_FAILED(r)) { ps_log("[DisplayXR-PROV] xrEndFrame failed: %d\n", r); return 0; }
+
+#ifdef _WIN32  // weave-to-texture PROBE readback is Windows/D3D-only
+	// Weave-to-texture PROBE: ON-DEMAND readback of the runtime-woven shared texture.
+	// Touch %TEMP%\displayxr_woven_trigger to dump the CURRENT woven output (any frame,
+	// e.g. while the Game tab is maximized) → displayxr_prov_woven_ondemand.bmp. Lets us
+	// FFT the interlace phase top-vs-bottom to localize the maximize seam. Own-device,
+	// coherent (same path as the one-shot below).
+	if (s_probe_enabled && s_probe_handle) {
+		const char *tmp = getenv("TEMP"); if (!tmp || !*tmp) tmp = ".";
+		char trig[512];
+		_snprintf_s(trig, sizeof(trig), _TRUNCATE, "%s\\displayxr_woven_trigger", tmp);
+		if (GetFileAttributesA(trig) != INVALID_FILE_ATTRIBUTES) {
+			DeleteFileA(trig);
+			char opath[512];
+			_snprintf_s(opath, sizeof(opath), _TRUNCATE, "%s\\displayxr_prov_woven_ondemand.bmp", tmp);
+			if (s_ps.graphics_api == DXR_GFX_D3D11) {
+				ID3D11Device *dev = s_ps.d3d11_bridge ? s_ps.own_d3d11_device : s_ps.unity_d3d11_device;
+				ID3D11DeviceContext *ctx = s_ps.d3d11_bridge ? s_ps.own_d3d11_context : s_ps.unity_d3d11_context;
+				ps_probe_dump_d3d11(dev, ctx, s_probe_tex11, opath);
+			} else {
+				ps_probe_dump_d3d12(opath);
+			}
+		}
+	}
+
+	// Weave-to-texture PROBE: one-shot readback of the runtime-woven shared texture
+	// after the warmup gate. The runtime wove into it during xrEndFrame above.
+	if (s_probe_enabled && s_probe_handle && !s_probe_dumped) {
+		if (++s_probe_frames >= kProbeDumpFrame) {
+			char path[512]; ps_probe_path(path, sizeof(path));
+			if (s_ps.graphics_api == DXR_GFX_D3D11) {
+				ID3D11Device *dev = s_ps.d3d11_bridge ? s_ps.own_d3d11_device
+				                                      : s_ps.unity_d3d11_device;
+				ID3D11DeviceContext *ctx = s_ps.d3d11_bridge ? s_ps.own_d3d11_context
+				                                             : s_ps.unity_d3d11_context;
+				ps_probe_dump_d3d11(dev, ctx, s_probe_tex11, path);
+			} else {
+				ps_probe_dump_d3d12(path);
+			}
+			// Localize the black: also dump the PRE-WEAVE eye texture (what Unity
+			// rendered into the bridge). Eye has content + shared black => lost in
+			// the weave/texture handoff. Eye also black => upstream (Unity render).
+			if (s_ps.graphics_api == DXR_GFX_D3D11 && s_ps.d3d11_bridge && s_ps.d3d11_bridge_own_eye[0]) {
+				const char *tmp = getenv("TEMP"); if (!tmp || !*tmp) tmp = ".";
+				char epath[512];
+				_snprintf_s(epath, sizeof(epath), _TRUNCATE, "%s\\displayxr_prov_eye0_preweave.bmp", tmp);
+				ps_probe_dump_d3d11(s_ps.own_d3d11_device, s_ps.own_d3d11_context,
+				                    s_ps.d3d11_bridge_own_eye[0], epath);
+			}
+			// Cross-device coherence check: dump the UNITY-side view of the woven
+			// texture. If the own-side readback has content but this is black, the
+			// GameView blit reads black because Unity's device doesn't see the
+			// runtime's writes without a shared-fence sync.
+			if (s_probe_tex_unity && s_ps.unity_d3d11_device) {
+				ID3D11DeviceContext *uctx = NULL;
+				s_ps.unity_d3d11_device->GetImmediateContext(&uctx);
+				if (uctx) {
+					const char *tmp = getenv("TEMP"); if (!tmp || !*tmp) tmp = ".";
+					char upath[512];
+					_snprintf_s(upath, sizeof(upath), _TRUNCATE, "%s\\displayxr_prov_woven_unityside.bmp", tmp);
+					ps_probe_dump_d3d11(s_ps.unity_d3d11_device, uctx, s_probe_tex_unity, upath);
+					uctx->Release();
+				}
+			}
+			s_probe_dumped = 1;
+		}
+	}
+#endif // _WIN32 — weave-to-texture PROBE readback
 	return 1;
 }
 

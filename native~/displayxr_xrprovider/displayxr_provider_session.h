@@ -168,6 +168,18 @@ void *dxr_prov_get_bridge_unity_texture(uint32_t *width, uint32_t *height,
 /// NULL for eye>1 or in SPI mode (use dxr_prov_get_bridge_unity_texture instead).
 void *dxr_prov_get_bridge_unity_texture_eye(uint32_t eye, uint32_t *width, uint32_t *height);
 
+/// GameView weave-to-texture (experiment, Task (a)). The runtime-woven shared texture
+/// opened on Unity's device — presented into the editor Game view. NULL unless texture
+/// mode is active (DISPLAYXR_PROV_TEXTURE_PROBE). Opened lazily. Exported so C# can wrap
+/// it as an external Texture2D on a RawImage overlay (deterministic presentation).
+DISPLAYXR_EXPORT void *dxr_prov_get_woven_unity_texture(uint32_t *width, uint32_t *height);
+
+/// The woven content's canvas (== forced zone) sub-rect within the shared texture,
+/// plus the full texture dims, so the presenter can build a normalized uvRect. Exported
+/// for the C# RawImage overlay.
+DISPLAYXR_EXPORT void dxr_prov_get_woven_canvas(int32_t *x, int32_t *y, int32_t *cw, int32_t *ch,
+                               uint32_t *texw, uint32_t *texh);
+
 /// Render mode gate (#166 task #8). Set from C# BEFORE the session starts:
 /// 1 = Single-Pass-Instanced (URP+Win+D3D12), 0 = MultiPass (BiRP/other — SPI
 /// renders opaque geometry wrong on BiRP). Default (unset) = SPI, preserving the
@@ -189,6 +201,33 @@ DISPLAYXR_EXPORT int  dxr_prov_get_single_pass(void);
 /// so it survives the session_start reset without special handling.
 DISPLAYXR_EXPORT void dxr_prov_set_dedicated_window(int enable);
 DISPLAYXR_EXPORT int  dxr_prov_get_dedicated_window(void);
+
+/// Glue-to-GameView follow (editor + texture probe, #727 follow-up): move+resize the
+/// dedicated weave window so its client rect keeps covering the Unity Game view's
+/// on-screen region as it moves/resizes/docks, so window-relative Kooima + the weaver's
+/// lenticular phase track where the mirror-blit shows the woven output. DEFAULT ON;
+/// env DISPLAYXR_PROV_GV_TRACK=0 disables (born-once), =move for move-only. Plain
+/// SILENT SetWindowPos on change only — never SWP_FRAMECHANGED (#727 mono collapse),
+/// and never a #61 ENTER/EXITSIZEMOVE bracket (the weaver's exit phase-snap re-anchors
+/// the window off the glue rect → position-dependent phase error; tried + reverted).
+/// Called each frame from C#; x,y = screen px (top-left origin),
+/// w,h = Game view size in px. w<=0||h<=0 is ignored. Windows-only.
+DISPLAYXR_EXPORT void dxr_prov_set_gameview_rect(int x, int y, int w, int h);
+
+/// Initial GameView render rect (Task (a) fill): stash the Game view's render-area
+/// rect (physical px) BEFORE the session starts. session_start sizes the dedicated
+/// weave window to it before capturing the forced full-window zone, so the zone (and
+/// therefore the rendered tile size + the runtime's woven region in the shared texture)
+/// is born at the panel's native resolution instead of the window's creation default.
+/// Without this the zone freezes tiny (~1248x632) and the mirror srcRect over-samples
+/// into black. w<=0||h<=0 clears. Windows-only; editor + probe path.
+DISPLAYXR_EXPORT void dxr_prov_set_initial_gameview_rect(int x, int y, int w, int h);
+
+/// Read the stashed initial GameView render rect (physical px). Returns 1 and fills the
+/// out-params if a valid rect (w>0 && h>0) was stashed, else 0. Used by the dedicated
+/// weave-window creation (displayxr_win32.c) to born the window at the panel size so the
+/// forced full-window zone is captured at native resolution. NULL out-params are allowed.
+DISPLAYXR_EXPORT int dxr_prov_get_initial_gameview_rect(int *x, int *y, int *w, int *h);
 
 /// Transparent-background request (#166 Phase A). Set from C# BEFORE the session
 /// starts: 1 = opt the session into a transparent background (ALPHA_BLEND env
@@ -283,6 +322,54 @@ DISPLAYXR_EXPORT void dxr_prov_poll_events(void);
 /// eye textures. Returns 1 if it reallocated (caller must drop + rewrap the Unity
 /// textures). Runs only between frames (no-op mid-frame).
 int  dxr_prov_reconcile_size(void);
+
+/// GameView zone convergence (Phase 1, #727 follow-up). C# publishes the authoritative
+/// Game-view panel PHYSICAL px (GetMainGameViewTargetSize x ppp) via dxr_prov_set_panel_px
+/// — info.mirrorRtDesc is LOGICAL px on a HiDPI display so it can't be used. The per-frame
+/// pump calls dxr_prov_converge_gameview_zone (BEFORE dxr_prov_reconcile_size) to re-drive
+/// the forced full-window zone to it so the compositor canvas == render viewport pixel-exact.
+/// Clamped to the shared woven texture; no window op (magnify is absorbed by the mirror-blit
+/// downscale, and the value is Scale-independent). Probe/editor path only.
+DISPLAYXR_EXPORT void dxr_prov_set_panel_px(int w, int h);
+
+/// Zone-glue arrangement (#740/#742, the desktop-avatar-proven contract): publish the
+/// Game view pane's FULL screen rect (position + size, physical px). The weave window
+/// is born ONCE at the monitor origin covering the panel and never moved (no #727
+/// exposure, no drag re-snap churn); the ZONE rect carries the pane's true screen
+/// offset, so the weave phase is computed for the right pixels and a Game view move is
+/// a pure zone x/y data update. Seed BEFORE session start (borns the zone at the pane
+/// rect) and push every frame (converge follows moves/resizes). Editor + probe only.
+DISPLAYXR_EXPORT void dxr_prov_set_panel_rect(int x, int y, int w, int h);
+void dxr_prov_converge_gameview_zone(void);
+
+/// BINDPANE experiment (#740): bind Unity's OWN Game-view pane window (GUIView child)
+/// as the weave HWND instead of the dedicated proxy window. Set from C# BEFORE the
+/// subsystem starts; the zone rect (dxr_prov_set_panel_rect) then carries the render
+/// area's offset within that window's CLIENT rect. The plugin never moves/restyles
+/// this window (it is Unity's). NULL = default (dedicated window). Editor+probe only.
+DISPLAYXR_EXPORT void dxr_prov_set_external_weave_hwnd(void *hwnd);
+void *dxr_prov_get_external_weave_hwnd(void);
+
+/// Bind mode within the editor GameView feature (#740 hybrid). Set from C# BEFORE the
+/// session starts, driven by dock state: 0 = TEXTURE (docked — weave into a shared
+/// texture, mirror-blit into the Game tab, DP phase_off correction); 1 = PRESENT
+/// (undocked — the runtime presents the woven stereo into our dedicated top-level window
+/// over the floating pane, SR self-anchors, zero correction). Env override for testing:
+/// DISPLAYXR_PROV_PRESENT_MODE. Read by session_start (skip shared-texture bind) and by
+/// the dedicated-window creation (present ⟹ born VISIBLE top-level, not the invisible
+/// child-glue proxy). Editor + probe only.
+DISPLAYXR_EXPORT void dxr_prov_set_present_mode(int enable);
+int dxr_prov_get_present_mode(void);
+
+/// (#740 stereo unswap) 1 = submit the two stereo views into the OPPOSITE swapchain slots.
+/// The docked texture weave path assigns the two views in the reversed order vs
+/// maximized/floating (a ~half-lens-pitch flip, geometry-invariant, runtime/SDK-side, #740);
+/// for a 2-view interlace, swapping the submitted slots exactly cancels it. Set from C# per
+/// (re)start = docked-AND-not-maximized (NOT in maximized or present). Env override for
+/// testing: DISPLAYXR_PROV_VIEW_SWAP. STEREO ONLY — must not be used on the N>2 quilt path.
+/// -1 restores the env gate. Survives session stop — re-set per start. Editor + probe only.
+DISPLAYXR_EXPORT void dxr_prov_set_view_swap(int enable);
+int dxr_prov_view_swap(void);
 
 /// Consume the per-extra-zone realloc latch (0-based index). Returns 1 (and clears)
 /// if that extra zone was just reallocated by dxr_prov_reconcile_size and its Unity
