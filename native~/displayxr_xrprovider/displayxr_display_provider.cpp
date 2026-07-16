@@ -1035,8 +1035,10 @@ GfxStop(UnitySubsystemHandle handle, void *userData)
 {
 	(void)handle; (void)userData;
 	destroy_textures();
+#ifdef _WIN32
 	if (s_mblit_list)  { s_mblit_list->Release();  s_mblit_list  = nullptr; }
 	if (s_mblit_alloc) { s_mblit_alloc->Release(); s_mblit_alloc = nullptr; }
+#endif
 	if (s_session_active) {
 		dxr_prov_session_stop();
 		s_session_active = false;
