@@ -744,6 +744,38 @@ namespace DisplayXR
             return (slack + 1) / 2;
         }
 
+        // (#740) VERTICAL sibling of the X centring. Our render-Y assumes the RT is
+        // BOTTOM-aligned in the pane client (top = clientH − rtH, the toolbar). Unity
+        // actually draws it with a small constant BOTTOM MARGIN — measured 4px on this panel
+        // (H=660: RT top 113px below pane top, 4px slack below; H=860: same 4px) — so the
+        // content sits `margin` px ABOVE our anchor. Through the SLANTED lens this vertical
+        // misalignment becomes X-interlace phase (measured 0.288 px-of-phase per row here),
+        // and a −4 anchor-Y correction lands the docked phase EXACTLY on the maximized
+        // (correct) reference (−0.1849 vs −0.1848). Maximized/floating have no dock chrome →
+        // the pane's own client already accounts for it → margin ≈ 0, which is why they were
+        // always correct. Returns a NEGATIVE offset (move the anchor up to the content).
+        // The bottom margin is constant to the integer; a ≤0.05-cycle sub-pixel residual
+        // remains from ppp-rounding of clientH/rtH (fractional — only the runtime
+        // canvas_offset can null it; eye-imperceptible). This is the honest, N-view-general
+        // replacement for the stereo view-swap stopgap.
+        // Measured RT bottom-margin: Unity draws the Game-view RT not flush to the pane
+        // client's bottom but ~1.6pt above it (4px at ppp 2.5, HW-verified: a −4 anchor-Y
+        // correction lands the docked interlace phase digit-for-digit on the maximized
+        // reference). It is NOT derivable from the pane/RT/toolbar rects — those are all
+        // self-consistent with bottom-alignment; this is the delta between Unity's real
+        // toolbar and the clientH−rtH we assume. Expressed in points × ppp so it tracks
+        // HiDPI. If a future Unity/DPI shifts docked phase, re-measure via the woven-texture
+        // vs screen cross-correlation (δy) and update this constant.
+        const float kRtBottomMarginPt = 1.6f;
+        static int RtCentringOffsetY(int rtHeight, float ppp)
+        {
+            if (!s_hwndCorrValid || s_hwndCorrHwnd == System.IntPtr.Zero) return 0;
+            if (!GetClientRect(s_hwndCorrHwnd, out var cr)) return 0;
+            int clientH = cr.bottom - cr.top;
+            if (clientH <= rtHeight) return 0; // maximized/floating: no dock chrome ⇒ no margin
+            return -Mathf.RoundToInt(kRtBottomMarginPt * ppp);
+        }
+
         // Compute the visible Game view's RENDER-area rect in physical px. SIZE comes from
         // Unity's own GetMainGameViewTargetSize() (the render-target pixel size it uses to
         // allocate the main Game view — one stable value, no instance juggling). POSITION
@@ -867,7 +899,16 @@ namespace DisplayXR
             rx = Mathf.Max(0, Mathf.RoundToInt(host.x * ppp));
             ry = Mathf.Max(0, Mathf.RoundToInt(host.y * ppp) + toolbar);
             ApplyWin32HostPositionCorrection(host, ppp, toolbar, ref rx, ref ry);
-            rx += RtCentringOffsetX(rw); // (#740) Unity centres the RT in the pane — see above
+            // (#740) The RT-placement corrections apply ONLY to a docked, non-maximized
+            // Game view — the only state with dock chrome. Maximized and floating draw the
+            // RT flush (δ already (0,0)); correcting them shifts a correct weave (maximized
+            // went inverted when the Y margin was applied there). s_lastAppliedDocked
+            // excludes floating/present; the maximized flag excludes the maximized sub-state.
+            if (s_lastAppliedDocked && !IsMatchedGameViewMaximized())
+            {
+                rx += RtCentringOffsetX(rw);       // Unity centres the RT horizontally
+                ry += RtCentringOffsetY(rh, ppp);  // …and draws it with a bottom margin
+            }
 
             // (#740) Clamp to the monitor: a transient container/full-desktop-sized reflection
             // reading during a layout reset passes the 8192 sanity band below but must never
@@ -1101,12 +1142,15 @@ namespace DisplayXR
         static int s_lastViewSwap = -1;
         static void UpdateViewSwap()
         {
-            if (System.Environment.GetEnvironmentVariable("DISPLAYXR_PROV_VIEW_SWAP") != null) return; // env pins it
-            int want = (s_lastAppliedDocked && !IsMatchedGameViewMaximized()) ? 1 : 0;
-            if (want == s_lastViewSwap) return;
-            s_lastViewSwap = want;
-            DisplayXRProviderNative.dxr_prov_set_view_swap(want);
-            Debug.Log("[DisplayXR] #740 view swap -> " + (want == 1 ? "ON (docked)" : "off (maximized/undocked)"));
+            // Superseded by RtCentringOffsetX/Y (the docked flip was an uncorrected
+            // anchor-vs-content offset, now fixed in-geometry — honest, N-view-general, no
+            // residual). The view-swap mechanism is kept as an env-only fallback
+            // (DISPLAYXR_PROV_VIEW_SWAP): when the env is set the native side pins it and we
+            // don't touch it; otherwise it stays OFF.
+            if (System.Environment.GetEnvironmentVariable("DISPLAYXR_PROV_VIEW_SWAP") != null) return;
+            if (s_lastViewSwap == 0) return;
+            s_lastViewSwap = 0;
+            DisplayXRProviderNative.dxr_prov_set_view_swap(0);
         }
 
         // (#740) EditorWindow.maximized for the matched Game view — the discriminant for the
@@ -1190,24 +1234,32 @@ namespace DisplayXR
         // sweep seated until the eyes are correct; the found constant then goes to the
         // runtime agent (#740) for a proper DP-side calibration. Docked/texture mode only.
         static int s_phaseNudgeX;
+        static int s_phaseNudgeY;
         static int s_phaseNudgeTick;
-        static void UpdatePhaseNudge()
+        static int ReadNudge(string file, int cur, string label)
         {
-            if (!s_lastAppliedDocked) { s_phaseNudgeX = 0; return; }
-            if ((s_phaseNudgeTick++ % 30) != 0) return;
             try
             {
-                string f = System.IO.Path.Combine(System.IO.Path.GetTempPath(), "dxr_phase_nudge.txt");
+                string f = System.IO.Path.Combine(System.IO.Path.GetTempPath(), file);
                 int v = 0;
                 if (System.IO.File.Exists(f))
                     int.TryParse(System.IO.File.ReadAllText(f).Trim(), out v);
-                if (v != s_phaseNudgeX)
-                {
-                    s_phaseNudgeX = v;
-                    Debug.Log("[DisplayXR] docked phase nudge X = " + v + " px");
-                }
+                if (v != cur) Debug.Log("[DisplayXR] docked phase nudge " + label + " = " + v + " px");
+                return v;
             }
-            catch { }
+            catch { return cur; }
+        }
+        static void UpdatePhaseNudge()
+        {
+            // (#740) X shifts the invisible anchor horizontally (moves phase, not content).
+            // Y does the same vertically — through the slanted lens a Y anchor offset ALSO
+            // moves the X-interlace phase, so this probes whether the uncorrected docked
+            // anchor-vs-content Y offset (measured −4px, the vertical sibling of the +3 RT
+            // centring) is the residual half-cycle. dxr_phase_nudge.txt / _y.txt.
+            if (!s_lastAppliedDocked) { s_phaseNudgeX = 0; s_phaseNudgeY = 0; return; }
+            if ((s_phaseNudgeTick++ % 30) != 0) return;
+            s_phaseNudgeX = ReadNudge("dxr_phase_nudge.txt", s_phaseNudgeX, "X");
+            s_phaseNudgeY = ReadNudge("dxr_phase_nudge_y.txt", s_phaseNudgeY, "Y");
         }
 
         void PushGameViewRectEditorProbe()
@@ -1244,6 +1296,7 @@ namespace DisplayXR
             // moves, content doesn't (see UpdatePhaseNudge).
             UpdatePhaseNudge();
             px += s_phaseNudgeX;
+            py += s_phaseNudgeY;
             // (#740) SIZE settle-debounce: a continuous interactive resize (dock splitter /
             // tab edge drag) changes the pane size EVERY frame → per-frame zone re-drive →
             // per-frame swapchain+bridge realloc — a long splitter drag hung the D3D12
