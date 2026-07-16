@@ -720,6 +720,30 @@ namespace DisplayXR
             }
         }
 
+        // (#740) RT-CENTRING offset — the docked-only interlace phase error, measured.
+        // Unity draws the Game view's render target CENTRED inside the pane: the pane's
+        // client is 1733 px wide while the RT is 1728 (5 px of dock chrome), so the woven
+        // pixels land ~3 px right of the pane's left edge — while our invisible weave child
+        // (the DP's phase anchor) sat AT the pane's left edge, because this code assumed a
+        // zero left inset (only Y ever got a toolbar subtraction). The weaver then phases
+        // for X and Unity paints at X+3: a constant interlace phase error that the eye can
+        // never see directly, since the anchor paints nothing.
+        // Maximized / floating have pane client == RT (no dock chrome) => offset 0, which is
+        // exactly why those states were always correct.
+        // Measured by cross-correlating the runtime's woven shared texture against the
+        // screen (real scene content => non-periodic => unambiguous lag; fresh session so
+        // the on-demand dump can't be stale): docked delta = +3 px (corr 0.96-0.98),
+        // maximized delta = 0 px (corr 0.996). Round-half-up matches the measurement
+        // (5 px of slack -> +3, i.e. Unity gives the extra pixel to the left).
+        static int RtCentringOffsetX(int rtWidth)
+        {
+            if (!s_hwndCorrValid || s_hwndCorrHwnd == System.IntPtr.Zero) return 0;
+            if (!GetClientRect(s_hwndCorrHwnd, out var cr)) return 0;
+            int slack = (cr.right - cr.left) - rtWidth;
+            if (slack <= 0 || slack > 64) return 0; // no chrome, or an implausible match
+            return (slack + 1) / 2;
+        }
+
         // Compute the visible Game view's RENDER-area rect in physical px. SIZE comes from
         // Unity's own GetMainGameViewTargetSize() (the render-target pixel size it uses to
         // allocate the main Game view — one stable value, no instance juggling). POSITION
@@ -843,6 +867,7 @@ namespace DisplayXR
             rx = Mathf.Max(0, Mathf.RoundToInt(host.x * ppp));
             ry = Mathf.Max(0, Mathf.RoundToInt(host.y * ppp) + toolbar);
             ApplyWin32HostPositionCorrection(host, ppp, toolbar, ref rx, ref ry);
+            rx += RtCentringOffsetX(rw); // (#740) Unity centres the RT in the pane — see above
 
             // (#740) Clamp to the monitor: a transient container/full-desktop-sized reflection
             // reading during a layout reset passes the 8192 sanity band below but must never
@@ -894,6 +919,51 @@ namespace DisplayXR
             }
             dbg = $"no sane rect yet (mainSize={size.x}x{size.y} host={host.width}x{host.height} ppp={ppp:F3})";
             return false;
+        }
+
+        // (#740) DOCK-BORDER probe — the suspected root of the docked-only phase error.
+        // Our render-area X is the matched pane HWND's left with a ZERO left inset assumed
+        // (we only ever compute a toolbar for Y). But Unity's DockArea INSETS its hosted
+        // window by a border, and EditorWindow.position is defined as
+        // `m_Parent.borderSize.Remove(m_Parent.screenPosition)` — i.e. position is the
+        // content rect with the border REMOVED, while m_Parent.screenPosition (and the
+        // GUIView HWND that matches it) still include it. DockArea suppresses the border
+        // where the view meets the container edge — which is exactly the maximized and
+        // floating cases (correct), versus a mid-layout docked view (wrong). If the content
+        // is drawn N px right of our invisible anchor, the weaver phases for the anchor
+        // while the pixels land at anchor+N: a pure interlace-phase error, invisible to the
+        // eye because the anchor never paints. This logs the border directly.
+        static PropertyInfo s_posProp;
+        static string s_lastBorderLog;
+        static void LogDockBorderOnChange(float ppp, int rx, int ry, int rw, int rh)
+        {
+            if (s_matchedGameView == null || s_parentField == null || s_screenPosProp == null) return;
+            try
+            {
+                if (s_posProp == null)
+                    for (var t = s_matchedGameView.GetType(); t != null && s_posProp == null; t = t.BaseType)
+                        s_posProp = t.GetProperty("position",
+                            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                if (s_posProp == null) return;
+                var pos = (Rect)s_posProp.GetValue(s_matchedGameView, null);   // points, border REMOVED
+                var parent = s_parentField.GetValue(s_matchedGameView);
+                if (parent == null) return;
+                var host = (Rect)s_screenPosProp.GetValue(parent, null);       // points, border INCLUDED
+                float borderXpx = (pos.x - host.x) * ppp;                      // the inset we ignore
+                float borderYpx = (pos.y - host.y) * ppp;
+                string log = $"gv.position=({pos.x:F1},{pos.y:F1} {pos.width:F1}x{pos.height:F1})pt " +
+                             $"host.screenPos=({host.x:F1},{host.y:F1} {host.width:F1}x{host.height:F1})pt " +
+                             $"ppp={ppp:F3} | position*ppp=({pos.x * ppp:F1},{pos.y * ppp:F1}) " +
+                             $"hwnd=({s_hwndCorrX},{s_hwndCorrY}) ourRender=({rx},{ry} {rw}x{rh}) | " +
+                             $"BORDER px: x={borderXpx:F1} y={borderYpx:F1} | " +
+                             $"anchor-vs-content X error = {pos.x * ppp - rx:F1}px";
+                if (log != s_lastBorderLog)
+                {
+                    s_lastBorderLog = log;
+                    Debug.Log("[DisplayXR] #740 dock-border: " + log);
+                }
+            }
+            catch { }
         }
 
         // Dock-state detection (#740 auto-switch): is the (matched) Game view docked in the
@@ -1128,6 +1198,7 @@ namespace DisplayXR
                 m_LastDbgW = pw; m_LastDbgH = ph;
                 Debug.Log($"[DisplayXR] GameView glue size change: {dbg}");
             }
+            LogDockBorderOnChange(s_cachedPpp > 0 ? s_cachedPpp : 1f, px, py, pw, ph); // #740
             // (#740) Docked phase calibration: shift the invisible child anchor's X — phase
             // moves, content doesn't (see UpdatePhaseNudge).
             UpdatePhaseNudge();
