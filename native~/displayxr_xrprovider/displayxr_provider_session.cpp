@@ -4756,7 +4756,16 @@ static void ps_diag_fill_slice_colors(ID3D12Resource *dst, UINT n)
 
 int dxr_prov_submit_frame(uint32_t image_index)
 {
+	// Trace the submit path (shell/IPC bring-up: acquire spins, nothing ever released/
+	// submitted). Written to %TEMP%\displayxr_prov_native.log.
+	static unsigned s_subf_n = 0;
+	int subf_trace = (s_subf_n < 12 || (s_subf_n % 600) == 0);
+	if (subf_trace)
+		ps_log("[DisplayXR-PROV] submit_frame[%u]: frame_begun=%d swapchain_created=%d image_acquired=%d api=%d\n",
+		       s_subf_n, s_ps.frame_begun, s_ps.swapchain_created, s_ps.image_acquired, (int)s_ps.graphics_api);
+	s_subf_n++;
 	if (!s_ps.frame_begun || !s_ps.swapchain_created) {
+		if (subf_trace) ps_log("[DisplayXR-PROV] submit_frame: BAIL (no frame/swapchain) -> end_frame_empty\n");
 		dxr_prov_end_frame_empty();
 		return 0;
 	}
@@ -4906,6 +4915,9 @@ int dxr_prov_submit_frame(uint32_t image_index)
 		XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
 		s_ps.pfn_release_swapchain_image(s_ps.swapchain, &ri);
 		s_ps.image_acquired = 0;
+		if (subf_trace) ps_log("[DisplayXR-PROV] submit_frame[%u]: RELEASED image %u\n", s_subf_n - 1, image_index);
+	} else if (subf_trace) {
+		ps_log("[DisplayXR-PROV] submit_frame[%u]: no image_acquired to release\n", s_subf_n - 1);
 	}
 	if (d11_diag) ps_log("[DisplayXR-PROV] D3D11 submit[%u]: released, building layers\n", d11_frames);
 
@@ -4915,7 +4927,11 @@ int dxr_prov_submit_frame(uint32_t image_index)
 	// ghost) even though Unity rendered both eyes into the 2-slice bridge.
 	uint32_t n = submit_n;
 	if (n > s_ps.view_count) n = s_ps.view_count;
-	if (n == 0) { dxr_prov_end_frame_empty(); return 0; }
+	if (n == 0) {
+		if (subf_trace) ps_log("[DisplayXR-PROV] submit_frame[%u]: BAIL (n=0, submit_n=%u view_count=%u) -> end_frame_empty\n",
+		                       s_subf_n - 1, submit_n, s_ps.view_count);
+		dxr_prov_end_frame_empty(); return 0;
+	}
 	XrCompositionLayerProjectionView pv[DXR_PROV_MAX_VIEWS] = {};
 	for (uint32_t eye = 0; eye < n; eye++) {
 		pv[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
@@ -5049,7 +5065,9 @@ int dxr_prov_submit_frame(uint32_t image_index)
 	ei.layerCount = lc;
 	ei.layers = layers;
 	if (d11_diag) ps_log("[DisplayXR-PROV] D3D11 submit[%u]: pre-xrEndFrame (layers=%u)\n", d11_frames, lc);
+	if (subf_trace) ps_log("[DisplayXR-PROV] submit_frame[%u]: xrEndFrame layers=%u (views n=%u)\n", s_subf_n - 1, lc, n);
 	XrResult r = s_ps.pfn_end_frame(s_ps.session, &ei);
+	if (subf_trace) ps_log("[DisplayXR-PROV] submit_frame[%u]: post-xrEndFrame r=%d\n", s_subf_n - 1, r);
 	if (d11_diag) ps_log("[DisplayXR-PROV] D3D11 submit[%u]: post-xrEndFrame r=%d\n", d11_frames, r);
 	if (s_ps.graphics_api == DXR_GFX_D3D11 && d11_frames < 100000) d11_frames++;
 	if (XR_FAILED(r)) { ps_log("[DisplayXR-PROV] xrEndFrame failed: %d\n", r); return 0; }

@@ -1046,6 +1046,21 @@ UnitySubsystemErrorCode UNITY_INTERFACE_API
 GfxSubmitCurrentFrame(UnitySubsystemHandle handle, void *userData)
 {
 	(void)handle; (void)userData;
+	// Trace whether Unity drives the submit callback at all, and whether a frame was in
+	// flight to submit — the missing half of the acquire→render→release→endFrame cycle
+	// (shell/IPC bring-up: acquire spins but nothing is ever released/submitted). Written
+	// to %TEMP%\displayxr_prov_native.log (the provider's own log; NOT Player.log).
+	{
+		static unsigned s_sub_n = 0;
+		if (s_sub_n < 12 || (s_sub_n % 600) == 0) {
+			char m[144];
+			snprintf(m, sizeof(m),
+			         "[DisplayXR-PROV] submit[%u]: session_active=%d frame_in_flight=%d\n",
+			         s_sub_n, s_session_active ? 1 : 0, s_frame_in_flight ? 1 : 0);
+			prov_log(m);
+		}
+		s_sub_n++;
+	}
 	if (!s_session_active || !s_frame_in_flight) return kUnitySubsystemErrorCodeSuccess;
 	s_frame_in_flight = false;
 
