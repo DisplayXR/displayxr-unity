@@ -1124,6 +1124,60 @@ static int ps_d3d11_check_requirements(void)
 // Create the session's OWN D3D12 device on the runtime's adapter LUID, plus a
 // queue + command list + fence for the per-frame bridge→swapchain copy.
 // (Mirrors displayxr_standalone_d3d12.cpp create_device.)
+// True when the Shell launched us as a workspace tile (DISPLAYXR_WORKSPACE_SESSION=1).
+// Defined in displayxr_win32.c. In this mode the runtime is in IPC/service mode.
+extern "C" int displayxr_is_shell_mode(void);
+
+// Workspace/IPC (shell) mode: bind the OpenXR D3D12 session to UNITY'S device instead of
+// a separate own-device (ps_create_own_device). The own-device isolation exists ONLY to
+// keep the in-process Leia SR weaver off Unity's GameView present device (the Optimus
+// cross-present deadlock). Under the shell there is NO in-process weaver and NO GameView
+// present of the woven output — the out-of-process compositor SERVICE composites — so that
+// rationale doesn't apply. Binding Unity's device makes the whole D3D12 bridge path
+// SAME-DEVICE: the per-eye bridge's own/unity views alias one resource, the render->copy
+// sync is same-queue, and the copy lands Unity's pixels in the arr=2 swapchain slices
+// coherently. A CROSS-device bridge left the slices BLACK under the service path (ADR-032
+// §Consequences: "bind the session to the engine's own device to remove [the bridge copy]";
+// issue #223 round 7). We alias own_device/own_queue = Unity's (AddRef so session_stop's
+// Release stays balanced and never over-releases Unity's device) and create our own command
+// list + fence on Unity's device — so every downstream helper (ps_create_bridge, submit_frame)
+// is unchanged, just same-device now. Matches cube_handle_d3d12_win (engine device = session
+// device), the working IPC reference.
+static int ps_alias_unity_device_d3d12(void)
+{
+	if (!s_ps.unity_device || !s_ps.unity_queue) return 0;
+	// xrGetD3D12GraphicsRequirementsKHR is MANDATORY before xrCreateSession (skipping it
+	// fails the create with GRAPHICS_REQUIREMENTS_CALL_MISSING). We don't build a device
+	// from the LUID — Unity already picked the display GPU — but the call must fire.
+	PFN_xrVoidFunction fn = NULL;
+	s_ps.gipa(s_ps.instance, "xrGetD3D12GraphicsRequirementsKHR", &fn);
+	if (fn) {
+		XrGraphicsRequirementsD3D12KHR req = {XR_TYPE_GRAPHICS_REQUIREMENTS_D3D12_KHR};
+		if (XR_FAILED(((PFN_xrGetD3D12GraphicsRequirementsKHR)fn)(s_ps.instance, s_ps.system_id, &req))) {
+			ps_log("[DisplayXR-PROV] xrGetD3D12GraphicsRequirementsKHR failed (shell alias)\n");
+			return 0;
+		}
+	}
+	s_ps.own_device = s_ps.unity_device; s_ps.own_device->AddRef();
+	s_ps.own_queue  = s_ps.unity_queue;  s_ps.own_queue->AddRef();
+	s_ps.own_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+	        __uuidof(ID3D12CommandAllocator), (void **)&s_ps.own_cmd_alloc);
+	s_ps.own_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+	        s_ps.own_cmd_alloc, NULL, __uuidof(ID3D12GraphicsCommandList),
+	        (void **)&s_ps.own_cmd_list);
+	if (s_ps.own_cmd_list) s_ps.own_cmd_list->Close();
+	s_ps.own_device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+	        __uuidof(ID3D12Fence), (void **)&s_ps.own_fence);
+	s_ps.own_fence_event = CreateEvent(NULL, FALSE, FALSE, NULL);
+	s_ps.own_fence_value = 0;
+	if (!s_ps.own_cmd_alloc || !s_ps.own_cmd_list || !s_ps.own_fence) {
+		ps_log("[DisplayXR-PROV] shell alias: cmd/fence create failed\n");
+		return 0;
+	}
+	ps_log("[DisplayXR-PROV] D3D12 session bound to UNITY's device (workspace/IPC same-device bridge, ADR-032)\n");
+	return 1;
+}
+
 static int ps_create_own_device(void)
 {
 	PFN_xrVoidFunction fn = NULL;
@@ -3458,6 +3512,12 @@ int dxr_prov_session_start(const char *runtime_json_path,
 			// it here for a provider-branded WARN.
 			if (!ps_d3d11_check_requirements()) { dxr_prov_session_stop(); return 0; }
 		}
+	} else if (displayxr_is_shell_mode()) {
+		// --- Workspace/IPC (shell) tile: bind the session to UNITY's D3D12 device (ADR-032).
+		//     No in-process weaver / GameView present under the shell, so the own-device
+		//     isolation isn't needed — and a cross-device bridge leaves the arr=2 swapchain
+		//     slices BLACK (the service imports them; #223 r7). Same-device = coherent. ---
+		if (!ps_alias_unity_device_d3d12()) { dxr_prov_session_stop(); return 0; }
 	} else {
 		// --- Create the session's OWN D3D12 device (matched to runtime adapter LUID).
 		//     The runtime allocates its swapchain on this device; we bridge to Unity. ---
@@ -3693,7 +3753,8 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	}
 #ifdef _WIN32
 	ps_log("[DisplayXR-PROV] Session created (%s, overlay HWND=%p)\n",
-	       !is_d3d11 ? "own D3D12 device"
+	       !is_d3d11 ? (displayxr_is_shell_mode() ? "Unity's D3D12 device (workspace/IPC same-device)"
+	                                              : "own D3D12 device")
 	           : (s_ps.d3d11_bridge ? "own D3D11 device (editor bridge)"
 	                                : "zero-copy on Unity's D3D11 device"), s_ps.overlay_hwnd);
 #else
