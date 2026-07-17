@@ -5128,6 +5128,27 @@ void dxr_prov_end_frame_empty(void)
 {
 	if (!s_ps.frame_begun) return;
 	s_ps.frame_begun = 0;
+	// Release any swapchain image acquired this frame BEFORE ending it. dxr_prov_begin_frame
+	// acquires the primary image up front, but a frame that ends empty (shouldRender=false, or
+	// no submittable views) skips dxr_prov_submit_frame — which is the only other place the
+	// release happens. Leaving the image acquired is fatal on a 1-image swapchain (the shell/
+	// IPC service compositor allocates exactly 1): the next xrAcquireSwapchainImage then fails
+	// with CALL_ORDER_INVALID every frame, spinning the pump and submitting nothing (black tile).
+	// Also release the extra 3D zones' images (acquired in ps_locate_extra_zones) for the same
+	// reason — inert when no zones are active (the BiRP workspace tile).
+	if (s_ps.image_acquired && s_ps.swapchain && s_ps.pfn_release_swapchain_image) {
+		XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+		s_ps.pfn_release_swapchain_image(s_ps.swapchain, &ri);
+		s_ps.image_acquired = 0;
+	}
+	for (uint32_t i = 0; i < s_ps.extra_zone_count && i < (PS_MAX_ZONES - 1); i++) {
+		ProviderExtraZone *z = &s_ps.extra_zones[i];
+		if (z->image_acquired && z->swapchain && s_ps.pfn_release_swapchain_image) {
+			XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+			s_ps.pfn_release_swapchain_image(z->swapchain, &ri);
+			z->image_acquired = 0;
+		}
+	}
 	XrFrameEndInfo ei = {XR_TYPE_FRAME_END_INFO};
 	ei.displayTime = s_ps.predicted_display_time;
 	ei.environmentBlendMode = (s_ps.transparent_requested && s_ps.alpha_blend_supported)

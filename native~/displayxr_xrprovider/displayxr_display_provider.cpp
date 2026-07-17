@@ -843,8 +843,23 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 
 	uint32_t img = 0;
 	int should_render = 0;
-	if (!dxr_prov_begin_frame(&img, &should_render) || !should_render)
+	if (!dxr_prov_begin_frame(&img, &should_render))
+		return kUnitySubsystemErrorCodeSuccess; // session not ready — no frame begun, nothing to end
+	if (!should_render) {
+		// A frame WAS begun (dxr_prov_begin_frame ran xrWaitFrame + xrBeginFrame and
+		// possibly acquired the image) but the runtime says "don't render this one"
+		// (XrFrameState.shouldRender == false) — e.g. the tile is currently occluded /
+		// unfocused under the shell compositor service. We MUST still end it: every
+		// xrBeginFrame needs a matching xrEndFrame, and the acquired image must be
+		// released. The old code just returned here, leaving the frame loop unbalanced —
+		// xrWaitFrame then stops pacing and the (1-image, IPC) swapchain stays acquired,
+		// so the next xrAcquireSwapchainImage fails every frame → the ~740/sec acquire
+		// spin with zero submits (black workspace tile). This was latent on the app-owned
+		// overlay path (always focused → shouldRender always true). end_frame_empty
+		// releases the image and submits a 0-layer xrEndFrame so pacing resumes.
+		dxr_prov_end_frame_empty();
 		return kUnitySubsystemErrorCodeSuccess;
+	}
 
 	s_current_image_index = img;
 	s_frame_in_flight = true;
