@@ -839,24 +839,52 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 	if (s_woven_tex_id != 0)
 		next->mirrorBlitMode = kUnityXRMirrorBlitLeftEye;
 
-	if (!s_textures_created) return kUnitySubsystemErrorCodeSuccess; // not session-ready yet
-
+	// Pump the OpenXR frame loop EVERY tick once the session is running — mirroring a
+	// compliant native client (runtime test_apps/handle/cube_handle_d3d12_win). Its
+	// render thread calls xrWaitFrame → xrBeginFrame → xrEndFrame every iteration while
+	// sessionRunning, UNCONDITIONALLY, and gates only the actual rendering on
+	// shouldRender (it still submits a 0-layer xrEndFrame when it doesn't render). That
+	// continuous frame submission is what drives the runtime's session lifecycle
+	// SYNCHRONIZED → VISIBLE → FOCUSED — and shouldRender only latches true once VISIBLE.
+	//
+	// The provider used to skip the ENTIRE pump whenever it couldn't produce a real
+	// frame — a bare `return` when textures weren't wrapped yet, and (pre-#163df07)
+	// again when shouldRender was false. Under the shell/IPC service the session starts
+	// SYNCHRONIZED (shouldRender=false) and needs frames to climb to VISIBLE, so those
+	// skips stalled the loop: the session never left SYNCHRONIZED and the tile stayed
+	// black (HW round 2: xrEndFrame=1, no submits). On the app-owned overlay path this
+	// was masked — the focused overlay pins the session at FOCUSED so shouldRender is
+	// always true and textures are always ready. Fix: begin AND end a frame here every
+	// tick regardless; only take the render path when we actually have textures AND the
+	// runtime asks us to render.
 	uint32_t img = 0;
 	int should_render = 0;
 	if (!dxr_prov_begin_frame(&img, &should_render))
 		return kUnitySubsystemErrorCodeSuccess; // session not ready — no frame begun, nothing to end
-	if (!should_render) {
-		// A frame WAS begun (dxr_prov_begin_frame ran xrWaitFrame + xrBeginFrame and
-		// possibly acquired the image) but the runtime says "don't render this one"
-		// (XrFrameState.shouldRender == false) — e.g. the tile is currently occluded /
-		// unfocused under the shell compositor service. We MUST still end it: every
-		// xrBeginFrame needs a matching xrEndFrame, and the acquired image must be
-		// released. The old code just returned here, leaving the frame loop unbalanced —
-		// xrWaitFrame then stops pacing and the (1-image, IPC) swapchain stays acquired,
-		// so the next xrAcquireSwapchainImage fails every frame → the ~740/sec acquire
-		// spin with zero submits (black workspace tile). This was latent on the app-owned
-		// overlay path (always focused → shouldRender always true). end_frame_empty
-		// releases the image and submits a 0-layer xrEndFrame so pacing resumes.
+
+	// Trace the pump's view of the loop (first frames + periodically) so a shell run
+	// shows whether shouldRender ever latches true (session reached VISIBLE) or stays
+	// false forever — the single fact that pins a black-tile regression here.
+	{
+		static unsigned s_pump_n = 0;
+		int renderable = (s_textures_created && should_render);
+		if (s_pump_n < 12 || (s_pump_n % 600) == 0) {
+			char m[176];
+			snprintf(m, sizeof(m),
+			         "[DisplayXR-PROV] pump[%u]: should_render=%d textures=%d -> %s\n",
+			         s_pump_n, should_render, s_textures_created ? 1 : 0,
+			         renderable ? "render" : "empty-frame");
+			prov_log(m);
+		}
+		s_pump_n++;
+	}
+
+	// Not renderable this tick (textures not wrapped yet, or shouldRender=false — e.g.
+	// the session is still SYNCHRONIZED / the tile is occluded under the shell service):
+	// submit a 0-layer xrEndFrame. This pairs every xrBeginFrame, releases the acquired
+	// image (fatal to leak on the 1-image IPC swapchain), keeps xrWaitFrame pacing, and
+	// — the point of pumping unconditionally — lets the runtime advance toward VISIBLE.
+	if (!s_textures_created || !should_render) {
 		dxr_prov_end_frame_empty();
 		return kUnitySubsystemErrorCodeSuccess;
 	}
