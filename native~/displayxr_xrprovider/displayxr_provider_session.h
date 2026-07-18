@@ -145,6 +145,10 @@ void dxr_prov_session_stop(void);
 /// Whether the session is currently running.
 DISPLAYXR_EXPORT int  dxr_prov_session_is_running(void);
 
+/// 1 once the runtime signals the app to terminate (session EXITING / LOSS_PENDING —
+/// e.g. the shell's workspace close request). The C# driver calls Application.Quit() on it.
+DISPLAYXR_EXPORT int  dxr_prov_exit_requested(void);
+
 // ---- Bridge surfacing (for CreateTexture) -----------------------------------
 
 /// Swapchain shape, valid after a successful start.

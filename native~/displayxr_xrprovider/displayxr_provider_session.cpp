@@ -223,6 +223,7 @@ typedef struct ProviderSession {
 
 	XrSessionState session_state;
 	int  running;
+	int  exit_requested;     // set on XR_SESSION_STATE_EXITING/LOSS_PENDING → C# Application.Quit()
 	int  session_ready;
 	int  frame_begun;
 	int  image_acquired;     // 1 between xrAcquire/Wait and xrRelease (guards double-acquire)
@@ -3908,6 +3909,11 @@ void dxr_prov_session_stop(void)
 
 int dxr_prov_session_is_running(void) { return s_ps.running; }
 
+// #223 follow-up: 1 once the runtime signals the app to terminate (session EXITING /
+// LOSS_PENDING — e.g. the shell's workspace exit request). The C# driver polls this and
+// calls Application.Quit(); a native app just exits its loop, a Unity app must be told.
+int dxr_prov_exit_requested(void) { return s_ps.exit_requested; }
+
 // Render-mode gate (#166 task #8). C# decides SPI vs MultiPass from the active
 // render pipeline (URP+Win+D3D12 → SPI; BiRP/other → MultiPass — SPI renders
 // opaque geometry wrong on BiRP) and pushes it before the session starts.
@@ -4314,7 +4320,14 @@ void dxr_prov_poll_events(void)
 				break;
 			case XR_SESSION_STATE_EXITING:
 			case XR_SESSION_STATE_LOSS_PENDING:
+				// The runtime is telling us to terminate — e.g. the shell's workspace
+				// close/exit request (request_exit_by_slot) arrives as EXITING, exactly as
+				// a native app (cube_handle) sees it and quits its loop. A Unity app can't
+				// just exit a loop — latch this for the C# driver to call Application.Quit()
+				// (#223 follow-up: the tile was ignoring the shell's close request).
 				s_ps.running = 0;
+				s_ps.exit_requested = 1;
+				ps_log("[DisplayXR-PROV] session EXITING/LOSS_PENDING → exit_requested (Application.Quit)\n");
 				break;
 			default: break;
 			}

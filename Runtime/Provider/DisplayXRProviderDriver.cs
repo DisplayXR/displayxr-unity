@@ -35,6 +35,7 @@ namespace DisplayXR
         public static bool IsActive { get; private set; }
 
         bool  m_SessionStarted;
+        bool  m_QuitRequested;
         float m_DisplayHeightM;
 
         /// <summary>Create the singleton driver (idempotent). Called from the loader's Start.</summary>
@@ -67,6 +68,17 @@ namespace DisplayXR
             // AppKit throws off-main). Windows keeps the graphics-thread pump.
             DisplayXRProviderNative.dxr_prov_poll_events();
 #endif
+            // #223: the shell's workspace close request reaches us as session EXITING. A
+            // native OpenXR app just exits its loop on that event; a Unity app must be told —
+            // quit when the runtime asks. Checked before the is-running gate (EXITING also
+            // clears running). One-shot so the shutdown frames don't re-fire Quit().
+            if (!m_QuitRequested && DisplayXRProviderNative.dxr_prov_exit_requested() != 0)
+            {
+                m_QuitRequested = true;
+                Debug.Log("[DisplayXR] runtime requested session exit → Application.Quit()");
+                Application.Quit();
+                return;
+            }
             if (DisplayXRProviderNative.dxr_prov_session_is_running() == 0)
             {
                 m_SessionStarted = false;
