@@ -5,6 +5,15 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.0] - 2026-07-18
+
+### Added
+- Workspace-tile weave mode: the DisplayXR Shell / IPC service now composites the runtime's woven stereo into a workspace tile. The provider renders with a null window handle (`windowHandle=NULL`), bridges frames on the D3D12 same-device path, and pairs its begin/end frame loop with the service. (#223, #224)
+
+### Fixed
+- Provider now quits on the shell's close/exit request: an `EXITING` session state drives `Application.Quit`, so a shell-initiated close cleanly tears down the player. (#223, #224)
+- Begin/end frame pairing when `shouldRender=false`: the provider no longer leaves an unbalanced frame open on skipped-render frames. (#223, #224)
+
 ## [2.6.0] - 2026-07-16
 
 ### Added
