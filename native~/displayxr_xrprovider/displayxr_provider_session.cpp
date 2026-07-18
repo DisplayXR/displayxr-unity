@@ -1246,6 +1246,38 @@ static int ps_alloc_shared_tex(uint32_t w, uint32_t h, UINT16 arr,
 			       "not yet supported on D3D11 — skipping (#195).\n"); }
 		return 0;
 	}
+	// Workspace/IPC (shell) same-device path: own_device == Unity's device (see
+	// ps_alias_unity_device_d3d12), so there is NO cross-device boundary — a shared
+	// NT-handle texture is unnecessary, and a same-device OpenSharedHandle is an unusual/
+	// untested aliasing pattern that can leave the "own" view reading black even though
+	// Unity rendered into the "unity" view (the arr=2 swapchain slices stayed black at the
+	// service, #223 r9). Allocate a PLAIN Unity-device RT and alias own==unity to the SAME
+	// resource: Unity renders into it and submit copies THAT resource into the swapchain
+	// slice — guaranteed coherent (mirrors the D3D11 zero-copy secondary path,
+	// ps_alloc_unity_tex). AddRef so the two cleanup Releases (bridge_own + bridge_unity)
+	// stay balanced; no shared handle to close (out_handle = NULL).
+	if (displayxr_is_shell_mode()) {
+		D3D12_HEAP_PROPERTIES ph = {}; ph.Type = D3D12_HEAP_TYPE_DEFAULT;
+		D3D12_RESOURCE_DESC pd = {};
+		pd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+		pd.Width = w; pd.Height = h; pd.DepthOrArraySize = arr; pd.MipLevels = 1;
+		pd.Format = (s_ps.sc_format == 87) ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
+		pd.SampleDesc.Count = 1;
+		pd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+		pd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+		ID3D12Resource *ptex = NULL;
+		HRESULT phr = s_ps.unity_device->CreateCommittedResource(&ph, D3D12_HEAP_FLAG_NONE, &pd,
+		        D3D12_RESOURCE_STATE_COMMON, NULL, __uuidof(ID3D12Resource), (void **)&ptex);
+		if (FAILED(phr) || !ptex) {
+			ps_log("[DisplayXR-PROV] %s plain same-device (shell) create failed: 0x%08lx\n", label, phr);
+			return 0;
+		}
+		*out_own = ptex; *out_unity = ptex; ptex->AddRef();
+		*out_handle = NULL;
+		ps_log("[DisplayXR-PROV] %s: %ux%u arr=%u PLAIN same-device (shell) tex=%p\n",
+		       label, w, h, (unsigned)arr, (void *)ptex);
+		return 1;
+	}
 	D3D12_HEAP_PROPERTIES heap = {};
 	heap.Type = D3D12_HEAP_TYPE_DEFAULT;
 	D3D12_RESOURCE_DESC bd = {};
