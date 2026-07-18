@@ -5002,24 +5002,27 @@ static void ps_diag_preclear_bridge_green(void)
 	}
 	DXGI_FORMAT rtvFmt = (s_ps.sc_format == 87) ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
 	const float green[4] = {0.0f, 1.0f, 0.0f, 1.0f};
+	int sp = dxr_prov_get_single_pass();
 	s_ps.own_cmd_alloc->Reset();
 	s_ps.own_cmd_list->Reset(s_ps.own_cmd_alloc, NULL);
 	D3D12_CPU_DESCRIPTOR_HANDLE base = gh->GetCPUDescriptorHandleForHeapStart();
-	for (int e = 0; e < 2; e++) {
-		ID3D12Resource *br = s_ps.bridge_own_eye[e];
-		if (!br) continue;
+	auto clear_slice = [&](ID3D12Resource *br, UINT slice, UINT heapIdx) {
+		if (!br) return;
 		D3D12_RESOURCE_BARRIER b = {}; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
 		b.Transition.pResource = br; b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
 		b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON; b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
 		s_ps.own_cmd_list->ResourceBarrier(1, &b);
 		D3D12_RENDER_TARGET_VIEW_DESC rv = {}; rv.Format = rtvFmt;
-		rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY; rv.Texture2DArray.ArraySize = 1;
-		D3D12_CPU_DESCRIPTOR_HANDLE h = base; h.ptr += (SIZE_T)e * gsz;
+		rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+		rv.Texture2DArray.FirstArraySlice = slice; rv.Texture2DArray.ArraySize = 1;
+		D3D12_CPU_DESCRIPTOR_HANDLE h = base; h.ptr += (SIZE_T)heapIdx * gsz;
 		s_ps.own_device->CreateRenderTargetView(br, &rv, h);
 		s_ps.own_cmd_list->ClearRenderTargetView(h, green, 0, NULL);
 		b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET; b.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
 		s_ps.own_cmd_list->ResourceBarrier(1, &b);
-	}
+	};
+	if (sp) { clear_slice(s_ps.bridge_own, 0, 0); clear_slice(s_ps.bridge_own, 1, 1); } // SPI arr=2 bridge
+	else    { clear_slice(s_ps.bridge_own_eye[0], 0, 0); clear_slice(s_ps.bridge_own_eye[1], 0, 1); } // MultiPass
 	s_ps.own_cmd_list->Close();
 	ID3D12CommandList *lists[] = { s_ps.own_cmd_list };
 	s_ps.own_queue->ExecuteCommandLists(1, lists);
