@@ -1504,7 +1504,23 @@ LifecycleStart(UnitySubsystemHandle handle, void *userData)
 			             : "[DisplayXR-PROV] Lifecycle Start (workspace tile: Unity HWND not found; windowHandle=NULL)\n");
 		} else {
 			s_overlay_hwnd = nullptr;
-			prov_log("[DisplayXR-PROV] Lifecycle Start (workspace tile: shell/IPC — windowHandle=NULL, no overlay/foreground/focus-hook)\n");
+			prov_log("[DisplayXR-PROV] Lifecycle Start (workspace tile: shell/IPC — windowHandle=NULL, no overlay/foreground)\n");
+		}
+		// KEEP UNITY RENDERING. The Shell launches us window-hidden (SW_HIDE) and never gives
+		// us OS foreground — so Unity's player sees itself as background/unfocused and STOPS
+		// rendering its cameras into the XR eye textures (the bridge reads back all-zero even
+		// though the OpenXR session is FOCUSED and shouldRender=1). Install the focus hook: it
+		// IAT-hooks GetForegroundWindow/GetFocus in Unity's process to return Unity's own HWND
+		// (so Application.isFocused stays true → the player keeps rendering) + suppresses
+		// deactivation. Unlike the app-overlay path we do NOT SetForegroundWindow — that would
+		// fight the Shell for real OS foreground; the hook is a per-process lie that never
+		// touches the Shell. (#223 r12: black tile == Unity not drawing into the bridge.)
+		void *unity_hwnd = displayxr_get_unity_main_hwnd();
+		if (unity_hwnd != nullptr) {
+			displayxr_install_focus_hook(unity_hwnd);
+			prov_log("[DisplayXR-PROV] Lifecycle Start (workspace tile: installed focus hook so hidden Unity keeps rendering)\n");
+		} else {
+			prov_log("[DisplayXR-PROV] Lifecycle Start (workspace tile: WARN Unity HWND not found — focus hook NOT installed)\n");
 		}
 	} else if (prov_want_dedicated_window()) {
 		// BINDPANE experiment (#740): C# supplied Unity's own Game-view pane HWND —

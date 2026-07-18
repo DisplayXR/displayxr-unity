@@ -4372,6 +4372,10 @@ void dxr_prov_poll_events(void)
 	}
 }
 
+#ifdef _WIN32
+static void ps_diag_preclear_bridge_green(void); // defined near submit_frame (probe)
+#endif
+
 int dxr_prov_begin_frame(uint32_t *out_image_index, int *out_should_render)
 {
 	if (out_should_render) *out_should_render = 0;
@@ -4563,6 +4567,16 @@ int dxr_prov_begin_frame(uint32_t *out_image_index, int *out_should_render)
 
 	if (out_should_render) *out_should_render = fs.shouldRender ? 1 : 0;
 	if (s_ps.graphics_api == DXR_GFX_D3D11 && d11_bframes < 100000) d11_bframes++;
+#ifdef _WIN32
+	// PROBE: pre-clear the bridges to GREEN before Unity renders this frame, so the submit
+	// readback reveals whether Unity actually draws into the XR eye textures. D3D12 only.
+	if (s_ps.graphics_api != DXR_GFX_D3D11) {
+		static int s_pc = -1;
+		if (s_pc < 0) { const char *e = getenv("DISPLAYXR_PROV_BRIDGE_PRECLEAR");
+		                s_pc = (e && e[0] && e[0] != '0') ? 1 : 0; }
+		if (s_pc) ps_diag_preclear_bridge_green();
+	}
+#endif
 	return 1;
 }
 
@@ -4903,6 +4917,121 @@ static void ps_diag_fill_bridge_colors(UINT n)
 	if (!logged) { logged = 1;
 		ps_log("[DisplayXR-PROV] PROBE: BRIDGE COLORS active — bridge eye0=BLUE eye1=RED (copy carries to slices)\n"); }
 }
+
+// PROBE (DISPLAYXR_PROV_BRIDGE_READBACK=1): read the center pixel of the copy-SOURCE
+// bridge (eye0) and log it, once, after warmup. Called at the END of submit_frame — FIFO
+// after Unity's render + our copy on the (shell) shared queue — so it reads the FINISHED
+// bridge. Splits the black tile (#223 r12) definitively: non-black ⇒ Unity DID render into
+// the bridge (so the black slice is an ordering/sync bug in the copy); 00000000 ⇒ Unity is
+// NOT rendering into the bridge we copy from (wrong texture wrap / render target).
+static void ps_diag_readback_bridge_once(void)
+{
+	static int done = 0;
+	static int frame = 0;
+	if (done) return;
+	if (++frame < 120) return; // warm eye tracking + real frames first
+	done = 1;
+	int sp = dxr_prov_get_single_pass();
+	ID3D12Resource *br = sp ? s_ps.bridge_own : s_ps.bridge_own_eye[0];
+	if (!br || !s_ps.own_device || !s_ps.own_cmd_list || !s_ps.own_queue) return;
+	D3D12_RESOURCE_DESC rd = br->GetDesc();
+	UINT rowPitch = (UINT)((rd.Width * 4 + 255) & ~255u);
+	D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_READBACK;
+	D3D12_RESOURCE_DESC bd = {};
+	bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+	bd.Width = rowPitch; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+	bd.Format = DXGI_FORMAT_UNKNOWN; bd.SampleDesc.Count = 1;
+	bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+	ID3D12Resource *rb = NULL;
+	if (FAILED(s_ps.own_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd,
+	        D3D12_RESOURCE_STATE_COPY_DEST, NULL, __uuidof(ID3D12Resource), (void **)&rb)) || !rb) return;
+	s_ps.own_cmd_alloc->Reset();
+	s_ps.own_cmd_list->Reset(s_ps.own_cmd_alloc, NULL);
+	D3D12_RESOURCE_BARRIER b = {}; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	b.Transition.pResource = br; b.Transition.Subresource = 0;
+	b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+	b.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+	s_ps.own_cmd_list->ResourceBarrier(1, &b);
+	D3D12_TEXTURE_COPY_LOCATION dl = {}; dl.pResource = rb;
+	dl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+	dl.PlacedFootprint.Footprint.Format = (s_ps.sc_format == 87) ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
+	dl.PlacedFootprint.Footprint.Width = (UINT)rd.Width;
+	dl.PlacedFootprint.Footprint.Height = 1;
+	dl.PlacedFootprint.Footprint.Depth = 1;
+	dl.PlacedFootprint.Footprint.RowPitch = rowPitch;
+	D3D12_TEXTURE_COPY_LOCATION slc = {}; slc.pResource = br;
+	slc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; slc.SubresourceIndex = 0;
+	D3D12_BOX box = {}; box.left = 0; box.right = (UINT)rd.Width;
+	box.top = (UINT)rd.Height / 2; box.bottom = box.top + 1; box.front = 0; box.back = 1;
+	s_ps.own_cmd_list->CopyTextureRegion(&dl, 0, 0, 0, &slc, &box);
+	b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+	b.Transition.StateAfter  = D3D12_RESOURCE_STATE_COMMON;
+	s_ps.own_cmd_list->ResourceBarrier(1, &b);
+	s_ps.own_cmd_list->Close();
+	ID3D12CommandList *lists[] = { s_ps.own_cmd_list };
+	s_ps.own_queue->ExecuteCommandLists(1, lists);
+	s_ps.own_fence_value++;
+	s_ps.own_queue->Signal(s_ps.own_fence, s_ps.own_fence_value);
+	if (s_ps.own_fence->GetCompletedValue() < s_ps.own_fence_value) {
+		s_ps.own_fence->SetEventOnCompletion(s_ps.own_fence_value, s_ps.own_fence_event);
+		WaitForSingleObject(s_ps.own_fence_event, INFINITE);
+	}
+	void *p = NULL; D3D12_RANGE mr = {0, rowPitch};
+	if (SUCCEEDED(rb->Map(0, &mr, &p)) && p) {
+		UINT8 *px = (UINT8 *)p + ((UINT)rd.Width / 2) * 4;
+		ps_log("[DisplayXR-PROV] PROBE: BRIDGE READBACK eye0 center=(%u,%u) RGBA=%02x%02x%02x%02x "
+		       "(nonzero => Unity rendered into bridge => ordering/sync bug; 00 => wrong texture)\n",
+		       (UINT)rd.Width / 2, (UINT)rd.Height / 2, px[0], px[1], px[2], px[3]);
+		rb->Unmap(0, NULL);
+	}
+	rb->Release();
+}
+
+// PROBE (DISPLAYXR_PROV_BRIDGE_PRECLEAR=1): clear BOTH per-eye bridges to GREEN and execute
+// immediately — call from begin_frame, BEFORE Unity renders. Paired with the readback (end
+// of submit): if the readback still reads GREEN, Unity never drew into the XR eye texture
+// (stale/broken sample / camera not targeting XR); if it reads black/scene, Unity DID render.
+static void ps_diag_preclear_bridge_green(void)
+{
+	if (!s_ps.own_device || !s_ps.own_cmd_list || !s_ps.own_queue) return;
+	static ID3D12DescriptorHeap *gh = NULL; static UINT gsz = 0;
+	if (!gh) {
+		D3D12_DESCRIPTOR_HEAP_DESC hd = {}; hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; hd.NumDescriptors = 2;
+		if (FAILED(s_ps.own_device->CreateDescriptorHeap(&hd, __uuidof(ID3D12DescriptorHeap), (void **)&gh)) || !gh) return;
+		gsz = s_ps.own_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+	}
+	DXGI_FORMAT rtvFmt = (s_ps.sc_format == 87) ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
+	const float green[4] = {0.0f, 1.0f, 0.0f, 1.0f};
+	s_ps.own_cmd_alloc->Reset();
+	s_ps.own_cmd_list->Reset(s_ps.own_cmd_alloc, NULL);
+	D3D12_CPU_DESCRIPTOR_HANDLE base = gh->GetCPUDescriptorHandleForHeapStart();
+	for (int e = 0; e < 2; e++) {
+		ID3D12Resource *br = s_ps.bridge_own_eye[e];
+		if (!br) continue;
+		D3D12_RESOURCE_BARRIER b = {}; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		b.Transition.pResource = br; b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+		b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON; b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+		s_ps.own_cmd_list->ResourceBarrier(1, &b);
+		D3D12_RENDER_TARGET_VIEW_DESC rv = {}; rv.Format = rtvFmt;
+		rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY; rv.Texture2DArray.ArraySize = 1;
+		D3D12_CPU_DESCRIPTOR_HANDLE h = base; h.ptr += (SIZE_T)e * gsz;
+		s_ps.own_device->CreateRenderTargetView(br, &rv, h);
+		s_ps.own_cmd_list->ClearRenderTargetView(h, green, 0, NULL);
+		b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET; b.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+		s_ps.own_cmd_list->ResourceBarrier(1, &b);
+	}
+	s_ps.own_cmd_list->Close();
+	ID3D12CommandList *lists[] = { s_ps.own_cmd_list };
+	s_ps.own_queue->ExecuteCommandLists(1, lists);
+	s_ps.own_fence_value++;
+	s_ps.own_queue->Signal(s_ps.own_fence, s_ps.own_fence_value);
+	if (s_ps.own_fence->GetCompletedValue() < s_ps.own_fence_value) {
+		s_ps.own_fence->SetEventOnCompletion(s_ps.own_fence_value, s_ps.own_fence_event);
+		WaitForSingleObject(s_ps.own_fence_event, INFINITE);
+	}
+	static int logged = 0;
+	if (!logged) { logged = 1; ps_log("[DisplayXR-PROV] PROBE: BRIDGE PRECLEAR green (before Unity render)\n"); }
+}
 #endif // _WIN32
 
 int dxr_prov_submit_frame(uint32_t image_index)
@@ -4911,9 +5040,16 @@ int dxr_prov_submit_frame(uint32_t image_index)
 	// submitted). Written to %TEMP%\displayxr_prov_native.log.
 	static unsigned s_subf_n = 0;
 	int subf_trace = (s_subf_n < 12 || (s_subf_n % 600) == 0);
-	if (subf_trace)
+	if (subf_trace) {
 		ps_log("[DisplayXR-PROV] submit_frame[%u]: frame_begun=%d swapchain_created=%d image_acquired=%d api=%d\n",
 		       s_subf_n, s_ps.frame_begun, s_ps.swapchain_created, s_ps.image_acquired, (int)s_ps.graphics_api);
+		// Render geometry: view count + per-eye FOV (rad) + render/swapchain dims. A degenerate
+		// FOV (0 / huge) or 0-size render viewport → Unity draws nothing → black bridge (#223 r12).
+		ps_log("[DisplayXR-PROV] submit_frame[%u]: view_count=%u render=%ux%u sc=%ux%u fov0=[%.3f %.3f %.3f %.3f] fov1=[%.3f %.3f %.3f %.3f]\n",
+		       s_subf_n, s_ps.view_count, s_ps.render_w, s_ps.render_h, s_ps.sc_width, s_ps.sc_height,
+		       s_ps.views[0].fov[0], s_ps.views[0].fov[1], s_ps.views[0].fov[2], s_ps.views[0].fov[3],
+		       s_ps.views[1].fov[0], s_ps.views[1].fov[1], s_ps.views[1].fov[2], s_ps.views[1].fov[3]);
+	}
 	s_subf_n++;
 	if (!s_ps.frame_begun || !s_ps.swapchain_created) {
 		if (subf_trace) ps_log("[DisplayXR-PROV] submit_frame: BAIL (no frame/swapchain) -> end_frame_empty\n");
@@ -5229,6 +5365,18 @@ int dxr_prov_submit_frame(uint32_t image_index)
 	if (d11_diag) ps_log("[DisplayXR-PROV] D3D11 submit[%u]: post-xrEndFrame r=%d\n", d11_frames, r);
 	if (s_ps.graphics_api == DXR_GFX_D3D11 && d11_frames < 100000) d11_frames++;
 	if (XR_FAILED(r)) { ps_log("[DisplayXR-PROV] xrEndFrame failed: %d\n", r); return 0; }
+
+#ifdef _WIN32
+	// PROBE (DISPLAYXR_PROV_BRIDGE_READBACK=1): once, read back the copy-source bridge to
+	// tell whether Unity's render ever lands in it (ordering/sync bug) vs never (wrong
+	// texture). D3D12 only.
+	if (s_ps.graphics_api != DXR_GFX_D3D11) {
+		static int s_brd = -1;
+		if (s_brd < 0) { const char *e = getenv("DISPLAYXR_PROV_BRIDGE_READBACK");
+		                 s_brd = (e && e[0] && e[0] != '0') ? 1 : 0; }
+		if (s_brd) ps_diag_readback_bridge_once();
+	}
+#endif
 
 #ifdef _WIN32  // weave-to-texture PROBE readback is Windows/D3D-only
 	// Weave-to-texture PROBE: ON-DEMAND readback of the runtime-woven shared texture.
