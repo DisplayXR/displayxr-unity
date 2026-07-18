@@ -59,6 +59,12 @@ extern "C" int displayxr_unity_get_renderer(void);
 // mode the OpenXR hook is NOT installed, so the provider is the sole caller — the
 // runtime weaves into this surface (in-app weave).
 extern "C" void *displayxr_get_app_main_view(void);
+// (workspace-ipc) True when the Shell launched us as a workspace tile — it sets
+// DISPLAYXR_WORKSPACE_SESSION=1, which the runtime also reads to force IPC/service
+// mode (in-process compositor disabled → client submits frames to comp_d3d11_service).
+// In that mode the provider is a plain OpenXR client: no overlay, no foreground grab,
+// windowHandle=NULL. Defined in displayxr_win32.c / displayxr_macos.mm.
+extern "C" int displayxr_is_shell_mode(void);
 #ifdef _WIN32
 // (#166) Make the overlay a top-level WS_POPUP+NOREDIRECTIONBITMAP (composites the
 // runtime DComp weave) instead of a WS_CHILD. Call before displayxr_get_app_main_view().
@@ -636,6 +642,11 @@ static void destroy_extra_zone_texture(uint32_t i)
 static int
 prov_want_app_window(void)
 {
+	// Workspace tile (shell/IPC): never own an app window — the runtime is in service
+	// mode and the compositor service draws our submitted frames as a tile. The mode
+	// decision below checks displayxr_is_shell_mode() first; this guard keeps any other
+	// caller coherent too.
+	if (displayxr_is_shell_mode()) return 0;
 	const char *self_host = getenv("DISPLAYXR_PROV_SELFHOST");
 	return (self_host && self_host[0] == '1') ? 0 : 1;
 }
@@ -741,8 +752,13 @@ GfxStart(UnitySubsystemHandle handle, void *userData, UnityXRRenderingCapabiliti
 		return kUnitySubsystemErrorCodeFailure;
 	}
 
-	// Weave target. Three modes (window created on the MAIN thread in LifecycleStart,
-	// which sets s_overlay_hwnd for the bound-HWND modes):
+	// Weave target. Four modes (window, if any, created on the MAIN thread in
+	// LifecycleStart, which sets s_overlay_hwnd for the bound-HWND modes):
+	//   - Workspace tile (shell/IPC, DISPLAYXR_WORKSPACE_SESSION=1): windowHandle=NULL,
+	//     no overlay. The runtime is in service mode (in-process compositor disabled) →
+	//     the client_d3d12_compositor submits our frames to comp_d3d11_service, which
+	//     draws the tile. We present nothing. (LifecycleStart leaves s_overlay_hwnd NULL,
+	//     or Unity's own hidden HWND under the DISPLAYXR_WORKSPACE_BIND_UNITY_HWND A/B.)
 	//   - Dedicated window (#173, editor Play Mode): a standalone movable window that
 	//     does NOT track Unity → bind s_overlay_hwnd.
 	//   - App-owned overlay (default, built players): a top-level WS_POPUP overlay
@@ -751,13 +767,23 @@ GfxStart(UnitySubsystemHandle handle, void *userData, UnityXRRenderingCapabiliti
 	//     own window → windowHandle=NULL.
 	// If a bound-HWND mode's window failed to create, self-host is the safe fallback
 	// (s_overlay_hwnd stays NULL).
-	bool want_bound = prov_want_dedicated_window() || prov_want_app_window();
-	void *overlay_hwnd = want_bound ? s_overlay_hwnd : nullptr;
-	prov_log(overlay_hwnd
-	             ? (prov_want_dedicated_window()
-	                    ? "[DisplayXR-PROV] weave target: dedicated provider window (editor, #173)\n"
-	                    : "[DisplayXR-PROV] weave target: app-owned top-level overlay (in-app)\n")
-	             : "[DisplayXR-PROV] weave target: runtime self-hosted window (SELFHOST diagnostic)\n");
+	bool shell = displayxr_is_shell_mode();
+	void *overlay_hwnd;
+	if (shell) {
+		// s_overlay_hwnd is NULL by default; non-NULL only under the A/B env fallback.
+		overlay_hwnd = s_overlay_hwnd;
+		prov_log(overlay_hwnd
+		             ? "[DisplayXR-PROV] weave target: workspace TILE (shell/IPC; bound Unity's hidden HWND — A/B)\n"
+		             : "[DisplayXR-PROV] weave target: workspace TILE (shell/IPC; windowHandle=NULL, service-composited)\n");
+	} else {
+		bool want_bound = prov_want_dedicated_window() || prov_want_app_window();
+		overlay_hwnd = want_bound ? s_overlay_hwnd : nullptr;
+		prov_log(overlay_hwnd
+		             ? (prov_want_dedicated_window()
+		                    ? "[DisplayXR-PROV] weave target: dedicated provider window (editor, #173)\n"
+		                    : "[DisplayXR-PROV] weave target: app-owned top-level overlay (in-app)\n")
+		             : "[DisplayXR-PROV] weave target: runtime self-hosted window (SELFHOST diagnostic)\n");
+	}
 
 	// runtime_json = NULL -> resolve from XR_RUNTIME_JSON (sim_display bring-up).
 	if (!dxr_prov_session_start(nullptr, backend_kind, dev_ptr, queue_ptr, overlay_hwnd)) {
@@ -813,12 +839,55 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 	if (s_woven_tex_id != 0)
 		next->mirrorBlitMode = kUnityXRMirrorBlitLeftEye;
 
-	if (!s_textures_created) return kUnitySubsystemErrorCodeSuccess; // not session-ready yet
-
+	// Pump the OpenXR frame loop EVERY tick once the session is running — mirroring a
+	// compliant native client (runtime test_apps/handle/cube_handle_d3d12_win). Its
+	// render thread calls xrWaitFrame → xrBeginFrame → xrEndFrame every iteration while
+	// sessionRunning, UNCONDITIONALLY, and gates only the actual rendering on
+	// shouldRender (it still submits a 0-layer xrEndFrame when it doesn't render). That
+	// continuous frame submission is what drives the runtime's session lifecycle
+	// SYNCHRONIZED → VISIBLE → FOCUSED — and shouldRender only latches true once VISIBLE.
+	//
+	// The provider used to skip the ENTIRE pump whenever it couldn't produce a real
+	// frame — a bare `return` when textures weren't wrapped yet, and (pre-#163df07)
+	// again when shouldRender was false. Under the shell/IPC service the session starts
+	// SYNCHRONIZED (shouldRender=false) and needs frames to climb to VISIBLE, so those
+	// skips stalled the loop: the session never left SYNCHRONIZED and the tile stayed
+	// black (HW round 2: xrEndFrame=1, no submits). On the app-owned overlay path this
+	// was masked — the focused overlay pins the session at FOCUSED so shouldRender is
+	// always true and textures are always ready. Fix: begin AND end a frame here every
+	// tick regardless; only take the render path when we actually have textures AND the
+	// runtime asks us to render.
 	uint32_t img = 0;
 	int should_render = 0;
-	if (!dxr_prov_begin_frame(&img, &should_render) || !should_render)
+	if (!dxr_prov_begin_frame(&img, &should_render))
+		return kUnitySubsystemErrorCodeSuccess; // session not ready — no frame begun, nothing to end
+
+	// Trace the pump's view of the loop (first frames + periodically) so a shell run
+	// shows whether shouldRender ever latches true (session reached VISIBLE) or stays
+	// false forever — the single fact that pins a black-tile regression here.
+	{
+		static unsigned s_pump_n = 0;
+		int renderable = (s_textures_created && should_render);
+		if (s_pump_n < 12 || (s_pump_n % 600) == 0) {
+			char m[176];
+			snprintf(m, sizeof(m),
+			         "[DisplayXR-PROV] pump[%u]: should_render=%d textures=%d -> %s\n",
+			         s_pump_n, should_render, s_textures_created ? 1 : 0,
+			         renderable ? "render" : "empty-frame");
+			prov_log(m);
+		}
+		s_pump_n++;
+	}
+
+	// Not renderable this tick (textures not wrapped yet, or shouldRender=false — e.g.
+	// the session is still SYNCHRONIZED / the tile is occluded under the shell service):
+	// submit a 0-layer xrEndFrame. This pairs every xrBeginFrame, releases the acquired
+	// image (fatal to leak on the 1-image IPC swapchain), keeps xrWaitFrame pacing, and
+	// — the point of pumping unconditionally — lets the runtime advance toward VISIBLE.
+	if (!s_textures_created || !should_render) {
+		dxr_prov_end_frame_empty();
 		return kUnitySubsystemErrorCodeSuccess;
+	}
 
 	s_current_image_index = img;
 	s_frame_in_flight = true;
@@ -977,6 +1046,21 @@ UnitySubsystemErrorCode UNITY_INTERFACE_API
 GfxSubmitCurrentFrame(UnitySubsystemHandle handle, void *userData)
 {
 	(void)handle; (void)userData;
+	// Trace whether Unity drives the submit callback at all, and whether a frame was in
+	// flight to submit — the missing half of the acquire→render→release→endFrame cycle
+	// (shell/IPC bring-up: acquire spins but nothing is ever released/submitted). Written
+	// to %TEMP%\displayxr_prov_native.log (the provider's own log; NOT Player.log).
+	{
+		static unsigned s_sub_n = 0;
+		if (s_sub_n < 12 || (s_sub_n % 600) == 0) {
+			char m[144];
+			snprintf(m, sizeof(m),
+			         "[DisplayXR-PROV] submit[%u]: session_active=%d frame_in_flight=%d\n",
+			         s_sub_n, s_session_active ? 1 : 0, s_frame_in_flight ? 1 : 0);
+			prov_log(m);
+		}
+		s_sub_n++;
+	}
 	if (!s_session_active || !s_frame_in_flight) return kUnitySubsystemErrorCodeSuccess;
 	s_frame_in_flight = false;
 
@@ -1393,7 +1477,52 @@ LifecycleStart(UnitySubsystemHandle handle, void *userData)
 		}
 	}
 #else
-	if (prov_want_dedicated_window()) {
+	if (displayxr_is_shell_mode()) {
+		// Workspace tile (shell/IPC). The Shell launched us with
+		// DISPLAYXR_WORKSPACE_SESSION=1 (window pre-hidden SW_HIDE, unelevated), and the
+		// runtime reads the same var → forces IPC/service mode → the in-process compositor
+		// is disabled and the client_d3d12_compositor submits our OpenXR frames to
+		// comp_d3d11_service, which composites the tile. So we own NO window and present
+		// nothing:
+		//   - No overlay (a self-weaving in-process overlay never connects to the service).
+		//   - No SetForegroundWindow — the Shell is the foreground app and forwards input.
+		//   - No focus/raw-input hook — input routes to Unity's OWN window naturally
+		//     (displayxr_is_our_process_foreground() already returns 1 in shell mode so the
+		//     app's input controller doesn't drop shell-forwarded input).
+		// Window binding: default windowHandle=NULL (session_start passes s_overlay_hwnd).
+		// In service mode the runtime's in-process compositor is off, so NULL will NOT
+		// spawn a stray self-host window — it means "client submits to the service". This
+		// is the same binding shape as SELFHOST, which is a proven session-create path.
+		// EMPIRICAL A/B (runtime-side hardware bring-up): if the client compositor turns
+		// out to require a non-NULL window handle, DISPLAYXR_WORKSPACE_BIND_UNITY_HWND=1
+		// binds Unity's OWN (shell-hidden) main HWND instead — mirroring the native
+		// cube_handle_* sample under the shell. No overlay is created either way.
+		if (getenv("DISPLAYXR_WORKSPACE_BIND_UNITY_HWND") != nullptr) {
+			s_overlay_hwnd = displayxr_get_unity_main_hwnd();
+			prov_log(s_overlay_hwnd
+			             ? "[DisplayXR-PROV] Lifecycle Start (workspace tile: bound Unity's own hidden main HWND — A/B fallback)\n"
+			             : "[DisplayXR-PROV] Lifecycle Start (workspace tile: Unity HWND not found; windowHandle=NULL)\n");
+		} else {
+			s_overlay_hwnd = nullptr;
+			prov_log("[DisplayXR-PROV] Lifecycle Start (workspace tile: shell/IPC — windowHandle=NULL, no overlay/foreground)\n");
+		}
+		// KEEP UNITY RENDERING. The Shell launches us window-hidden (SW_HIDE) and never gives
+		// us OS foreground — so Unity's player sees itself as background/unfocused and STOPS
+		// rendering its cameras into the XR eye textures (the bridge reads back all-zero even
+		// though the OpenXR session is FOCUSED and shouldRender=1). Install the focus hook: it
+		// IAT-hooks GetForegroundWindow/GetFocus in Unity's process to return Unity's own HWND
+		// (so Application.isFocused stays true → the player keeps rendering) + suppresses
+		// deactivation. Unlike the app-overlay path we do NOT SetForegroundWindow — that would
+		// fight the Shell for real OS foreground; the hook is a per-process lie that never
+		// touches the Shell. (#223 r12: black tile == Unity not drawing into the bridge.)
+		void *unity_hwnd = displayxr_get_unity_main_hwnd();
+		if (unity_hwnd != nullptr) {
+			displayxr_install_focus_hook(unity_hwnd);
+			prov_log("[DisplayXR-PROV] Lifecycle Start (workspace tile: installed focus hook)\n");
+		} else {
+			prov_log("[DisplayXR-PROV] Lifecycle Start (workspace tile: WARN Unity HWND not found — focus hook NOT installed)\n");
+		}
+	} else if (prov_want_dedicated_window()) {
 		// BINDPANE experiment (#740): C# supplied Unity's own Game-view pane HWND —
 		// bind THAT (the SR SDK tracks the real content window natively; the zone
 		// carries the render-area offset within its client). No dedicated window.

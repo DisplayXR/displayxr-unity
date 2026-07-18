@@ -51,6 +51,14 @@ namespace DisplayXR
         public static extern int dxr_prov_session_is_running();
 
         /// <summary>
+        /// 1 once the runtime signals the app to terminate (session EXITING / LOSS_PENDING —
+        /// e.g. the shell's workspace close request). The driver calls Application.Quit() on it
+        /// (#223: the tile was ignoring the shell's close request).
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int dxr_prov_exit_requested();
+
+        /// <summary>
         /// Pump xrPollEvent (session-state machine + runtime event latches). On
         /// Windows the native provider pumps from the graphics thread each frame;
         /// on macOS the runtime's poll drains NSApp events + flushes CATransaction,

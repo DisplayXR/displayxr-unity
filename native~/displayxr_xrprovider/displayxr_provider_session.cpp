@@ -223,6 +223,7 @@ typedef struct ProviderSession {
 
 	XrSessionState session_state;
 	int  running;
+	int  exit_requested;     // set on XR_SESSION_STATE_EXITING/LOSS_PENDING → C# Application.Quit()
 	int  session_ready;
 	int  frame_begun;
 	int  image_acquired;     // 1 between xrAcquire/Wait and xrRelease (guards double-acquire)
@@ -1124,6 +1125,60 @@ static int ps_d3d11_check_requirements(void)
 // Create the session's OWN D3D12 device on the runtime's adapter LUID, plus a
 // queue + command list + fence for the per-frame bridge→swapchain copy.
 // (Mirrors displayxr_standalone_d3d12.cpp create_device.)
+// True when the Shell launched us as a workspace tile (DISPLAYXR_WORKSPACE_SESSION=1).
+// Defined in displayxr_win32.c. In this mode the runtime is in IPC/service mode.
+extern "C" int displayxr_is_shell_mode(void);
+
+// Workspace/IPC (shell) mode: bind the OpenXR D3D12 session to UNITY'S device instead of
+// a separate own-device (ps_create_own_device). The own-device isolation exists ONLY to
+// keep the in-process Leia SR weaver off Unity's GameView present device (the Optimus
+// cross-present deadlock). Under the shell there is NO in-process weaver and NO GameView
+// present of the woven output — the out-of-process compositor SERVICE composites — so that
+// rationale doesn't apply. Binding Unity's device makes the whole D3D12 bridge path
+// SAME-DEVICE: the per-eye bridge's own/unity views alias one resource, the render->copy
+// sync is same-queue, and the copy lands Unity's pixels in the arr=2 swapchain slices
+// coherently. A CROSS-device bridge left the slices BLACK under the service path (ADR-032
+// §Consequences: "bind the session to the engine's own device to remove [the bridge copy]";
+// issue #223 round 7). We alias own_device/own_queue = Unity's (AddRef so session_stop's
+// Release stays balanced and never over-releases Unity's device) and create our own command
+// list + fence on Unity's device — so every downstream helper (ps_create_bridge, submit_frame)
+// is unchanged, just same-device now. Matches cube_handle_d3d12_win (engine device = session
+// device), the working IPC reference.
+static int ps_alias_unity_device_d3d12(void)
+{
+	if (!s_ps.unity_device || !s_ps.unity_queue) return 0;
+	// xrGetD3D12GraphicsRequirementsKHR is MANDATORY before xrCreateSession (skipping it
+	// fails the create with GRAPHICS_REQUIREMENTS_CALL_MISSING). We don't build a device
+	// from the LUID — Unity already picked the display GPU — but the call must fire.
+	PFN_xrVoidFunction fn = NULL;
+	s_ps.gipa(s_ps.instance, "xrGetD3D12GraphicsRequirementsKHR", &fn);
+	if (fn) {
+		XrGraphicsRequirementsD3D12KHR req = {XR_TYPE_GRAPHICS_REQUIREMENTS_D3D12_KHR};
+		if (XR_FAILED(((PFN_xrGetD3D12GraphicsRequirementsKHR)fn)(s_ps.instance, s_ps.system_id, &req))) {
+			ps_log("[DisplayXR-PROV] xrGetD3D12GraphicsRequirementsKHR failed (shell alias)\n");
+			return 0;
+		}
+	}
+	s_ps.own_device = s_ps.unity_device; s_ps.own_device->AddRef();
+	s_ps.own_queue  = s_ps.unity_queue;  s_ps.own_queue->AddRef();
+	s_ps.own_device->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT,
+	        __uuidof(ID3D12CommandAllocator), (void **)&s_ps.own_cmd_alloc);
+	s_ps.own_device->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT,
+	        s_ps.own_cmd_alloc, NULL, __uuidof(ID3D12GraphicsCommandList),
+	        (void **)&s_ps.own_cmd_list);
+	if (s_ps.own_cmd_list) s_ps.own_cmd_list->Close();
+	s_ps.own_device->CreateFence(0, D3D12_FENCE_FLAG_NONE,
+	        __uuidof(ID3D12Fence), (void **)&s_ps.own_fence);
+	s_ps.own_fence_event = CreateEvent(NULL, FALSE, FALSE, NULL);
+	s_ps.own_fence_value = 0;
+	if (!s_ps.own_cmd_alloc || !s_ps.own_cmd_list || !s_ps.own_fence) {
+		ps_log("[DisplayXR-PROV] shell alias: cmd/fence create failed\n");
+		return 0;
+	}
+	ps_log("[DisplayXR-PROV] D3D12 session bound to UNITY's device (workspace/IPC same-device bridge, ADR-032)\n");
+	return 1;
+}
+
 static int ps_create_own_device(void)
 {
 	PFN_xrVoidFunction fn = NULL;
@@ -1191,6 +1246,38 @@ static int ps_alloc_shared_tex(uint32_t w, uint32_t h, UINT16 arr,
 			ps_log("[DisplayXR-PROV] NOTE: shared-bridge layers (wsui/Local2D/extra-zones) are "
 			       "not yet supported on D3D11 — skipping (#195).\n"); }
 		return 0;
+	}
+	// Workspace/IPC (shell) same-device path: own_device == Unity's device (see
+	// ps_alias_unity_device_d3d12), so there is NO cross-device boundary — a shared
+	// NT-handle texture is unnecessary, and a same-device OpenSharedHandle is an unusual/
+	// untested aliasing pattern that can leave the "own" view reading black even though
+	// Unity rendered into the "unity" view (the arr=2 swapchain slices stayed black at the
+	// service, #223 r9). Allocate a PLAIN Unity-device RT and alias own==unity to the SAME
+	// resource: Unity renders into it and submit copies THAT resource into the swapchain
+	// slice — guaranteed coherent (mirrors the D3D11 zero-copy secondary path,
+	// ps_alloc_unity_tex). AddRef so the two cleanup Releases (bridge_own + bridge_unity)
+	// stay balanced; no shared handle to close (out_handle = NULL).
+	if (displayxr_is_shell_mode()) {
+		D3D12_HEAP_PROPERTIES ph = {}; ph.Type = D3D12_HEAP_TYPE_DEFAULT;
+		D3D12_RESOURCE_DESC pd = {};
+		pd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+		pd.Width = w; pd.Height = h; pd.DepthOrArraySize = arr; pd.MipLevels = 1;
+		pd.Format = (s_ps.sc_format == 87) ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
+		pd.SampleDesc.Count = 1;
+		pd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+		pd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+		ID3D12Resource *ptex = NULL;
+		HRESULT phr = s_ps.unity_device->CreateCommittedResource(&ph, D3D12_HEAP_FLAG_NONE, &pd,
+		        D3D12_RESOURCE_STATE_COMMON, NULL, __uuidof(ID3D12Resource), (void **)&ptex);
+		if (FAILED(phr) || !ptex) {
+			ps_log("[DisplayXR-PROV] %s plain same-device (shell) create failed: 0x%08lx\n", label, phr);
+			return 0;
+		}
+		*out_own = ptex; *out_unity = ptex; ptex->AddRef();
+		*out_handle = NULL;
+		ps_log("[DisplayXR-PROV] %s: %ux%u arr=%u PLAIN same-device (shell) tex=%p\n",
+		       label, w, h, (unsigned)arr, (void *)ptex);
+		return 1;
 	}
 	D3D12_HEAP_PROPERTIES heap = {};
 	heap.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -3458,6 +3545,11 @@ int dxr_prov_session_start(const char *runtime_json_path,
 			// it here for a provider-branded WARN.
 			if (!ps_d3d11_check_requirements()) { dxr_prov_session_stop(); return 0; }
 		}
+	} else if (displayxr_is_shell_mode()) {
+		// --- Workspace/IPC (shell) tile: bind the session to UNITY's D3D12 device (ADR-032).
+		//     No in-process weaver / GameView present under the shell, so the own-device
+		//     isolation isn't needed; same-device = coherent bridge into the service. ---
+		if (!ps_alias_unity_device_d3d12()) { dxr_prov_session_stop(); return 0; }
 	} else {
 		// --- Create the session's OWN D3D12 device (matched to runtime adapter LUID).
 		//     The runtime allocates its swapchain on this device; we bridge to Unity. ---
@@ -3693,7 +3785,8 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	}
 #ifdef _WIN32
 	ps_log("[DisplayXR-PROV] Session created (%s, overlay HWND=%p)\n",
-	       !is_d3d11 ? "own D3D12 device"
+	       !is_d3d11 ? (displayxr_is_shell_mode() ? "Unity's D3D12 device (workspace/IPC same-device)"
+	                                              : "own D3D12 device")
 	           : (s_ps.d3d11_bridge ? "own D3D11 device (editor bridge)"
 	                                : "zero-copy on Unity's D3D11 device"), s_ps.overlay_hwnd);
 #else
@@ -3815,6 +3908,11 @@ void dxr_prov_session_stop(void)
 }
 
 int dxr_prov_session_is_running(void) { return s_ps.running; }
+
+// #223 follow-up: 1 once the runtime signals the app to terminate (session EXITING /
+// LOSS_PENDING — e.g. the shell's workspace exit request). The C# driver polls this and
+// calls Application.Quit(); a native app just exits its loop, a Unity app must be told.
+int dxr_prov_exit_requested(void) { return s_ps.exit_requested; }
 
 // Render-mode gate (#166 task #8). C# decides SPI vs MultiPass from the active
 // render pipeline (URP+Win+D3D12 → SPI; BiRP/other → MultiPass — SPI renders
@@ -4222,7 +4320,14 @@ void dxr_prov_poll_events(void)
 				break;
 			case XR_SESSION_STATE_EXITING:
 			case XR_SESSION_STATE_LOSS_PENDING:
+				// The runtime is telling us to terminate — e.g. the shell's workspace
+				// close/exit request (request_exit_by_slot) arrives as EXITING, exactly as
+				// a native app (cube_handle) sees it and quits its loop. A Unity app can't
+				// just exit a loop — latch this for the C# driver to call Application.Quit()
+				// (#223 follow-up: the tile was ignoring the shell's close request).
 				s_ps.running = 0;
+				s_ps.exit_requested = 1;
+				ps_log("[DisplayXR-PROV] session EXITING/LOSS_PENDING → exit_requested (Application.Quit)\n");
 				break;
 			default: break;
 			}
@@ -4278,6 +4383,10 @@ void dxr_prov_poll_events(void)
 		ev = {XR_TYPE_EVENT_DATA_BUFFER};
 	}
 }
+
+#ifdef _WIN32
+static void ps_diag_preclear_bridge_green(void); // defined near submit_frame (probe)
+#endif
 
 int dxr_prov_begin_frame(uint32_t *out_image_index, int *out_should_render)
 {
@@ -4470,6 +4579,16 @@ int dxr_prov_begin_frame(uint32_t *out_image_index, int *out_should_render)
 
 	if (out_should_render) *out_should_render = fs.shouldRender ? 1 : 0;
 	if (s_ps.graphics_api == DXR_GFX_D3D11 && d11_bframes < 100000) d11_bframes++;
+#ifdef _WIN32
+	// PROBE: pre-clear the bridges to GREEN before Unity renders this frame, so the submit
+	// readback reveals whether Unity actually draws into the XR eye textures. D3D12 only.
+	if (s_ps.graphics_api != DXR_GFX_D3D11) {
+		static int s_pc = -1;
+		if (s_pc < 0) { const char *e = getenv("DISPLAYXR_PROV_BRIDGE_PRECLEAR");
+		                s_pc = (e && e[0] && e[0] != '0') ? 1 : 0; }
+		if (s_pc) ps_diag_preclear_bridge_green();
+	}
+#endif
 	return 1;
 }
 
@@ -4752,11 +4871,203 @@ static void ps_diag_fill_slice_colors(ID3D12Resource *dst, UINT n)
 		ps_log("[DisplayXR-PROV] PROBE: SLICE COLORS active — slice0=BLUE slice1=RED (n=%u fmt=%d)\n",
 		       n, (int)rd.Format); }
 }
+
+// PROBE (DISPLAYXR_PROV_BRIDGE_COLORS=1): clear the copy-SOURCE bridge to solid colors
+// (eye0=BLUE, eye1=RED) in our OWN command list, right before the normal bridge->swapchain
+// -slice copy runs. The copy then carries whatever is in the bridge — so this splits the
+// last ambiguity for the black workspace tile (#223 r10/r11): if the display shows the
+// solid colors, the bridge->slice copy MECHANICS are fine and Unity's real render simply
+// isn't in the bridge at copy time (ordering / wrong texture); if it's still black, the
+// copy itself misses (wrong resource/slice). Unlike SLICE_COLORS (which clears the
+// swapchain slice directly), this clears the SOURCE, so it exercises the exact copy path.
+// The bridge is COMMON at copy time (submit's v8->RequestResourceState) — barrier
+// COMMON->RENDER_TARGET to clear, then back to COMMON so the copy reads it (COPY_SOURCE
+// promotion). Recorded on own_cmd_list before the copy, so it is GPU-ordered before it.
+static void ps_diag_fill_bridge_colors(UINT n)
+{
+	if (!s_ps.own_device || !s_ps.own_cmd_list) return;
+	static ID3D12DescriptorHeap *bheap = NULL;
+	static UINT bsz = 0;
+	if (!bheap) {
+		D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+		hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; hd.NumDescriptors = 2;
+		if (FAILED(s_ps.own_device->CreateDescriptorHeap(&hd, __uuidof(ID3D12DescriptorHeap),
+		        (void **)&bheap)) || !bheap) {
+			ps_log("[DisplayXR-PROV] PROBE: bridge-colors RTV heap failed\n"); return;
+		}
+		bsz = s_ps.own_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+	}
+	DXGI_FORMAT rtvFmt = (s_ps.sc_format == 87) ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
+	const float colors[2][4] = { {0.0f, 0.0f, 1.0f, 1.0f},   // eye 0 = BLUE
+	                             {1.0f, 0.0f, 0.0f, 1.0f} };  // eye 1 = RED
+	int sp = dxr_prov_get_single_pass();
+	D3D12_CPU_DESCRIPTOR_HANDLE base = bheap->GetCPUDescriptorHandleForHeapStart();
+	for (UINT e = 0; e < n && e < 2; e++) {
+		ID3D12Resource *br = sp ? s_ps.bridge_own : s_ps.bridge_own_eye[e];
+		if (!br) continue;
+		D3D12_RESOURCE_BARRIER b = {};
+		b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		b.Transition.pResource = br;
+		b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+		b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+		b.Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
+		s_ps.own_cmd_list->ResourceBarrier(1, &b);
+		D3D12_RENDER_TARGET_VIEW_DESC rv = {};
+		rv.Format = rtvFmt;
+		rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+		rv.Texture2DArray.MipSlice = 0;
+		rv.Texture2DArray.FirstArraySlice = sp ? e : 0;
+		rv.Texture2DArray.ArraySize = 1;
+		D3D12_CPU_DESCRIPTOR_HANDLE h = base; h.ptr += (SIZE_T)e * bsz;
+		s_ps.own_device->CreateRenderTargetView(br, &rv, h);
+		s_ps.own_cmd_list->ClearRenderTargetView(h, colors[e], 0, NULL);
+		b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+		b.Transition.StateAfter  = D3D12_RESOURCE_STATE_COMMON;
+		s_ps.own_cmd_list->ResourceBarrier(1, &b);
+	}
+	static int logged = 0;
+	if (!logged) { logged = 1;
+		ps_log("[DisplayXR-PROV] PROBE: BRIDGE COLORS active — bridge eye0=BLUE eye1=RED (copy carries to slices)\n"); }
+}
+
+// PROBE (DISPLAYXR_PROV_BRIDGE_READBACK=1): read the center pixel of the copy-SOURCE
+// bridge (eye0) and log it, once, after warmup. Called at the END of submit_frame — FIFO
+// after Unity's render + our copy on the (shell) shared queue — so it reads the FINISHED
+// bridge. Splits the black tile (#223 r12) definitively: non-black ⇒ Unity DID render into
+// the bridge (so the black slice is an ordering/sync bug in the copy); 00000000 ⇒ Unity is
+// NOT rendering into the bridge we copy from (wrong texture wrap / render target).
+static void ps_diag_readback_bridge_once(void)
+{
+	static int done = 0;
+	static int frame = 0;
+	if (done) return;
+	if (++frame < 120) return; // warm eye tracking + real frames first
+	done = 1;
+	int sp = dxr_prov_get_single_pass();
+	ID3D12Resource *br = sp ? s_ps.bridge_own : s_ps.bridge_own_eye[0];
+	if (!br || !s_ps.own_device || !s_ps.own_cmd_list || !s_ps.own_queue) return;
+	D3D12_RESOURCE_DESC rd = br->GetDesc();
+	UINT rowPitch = (UINT)((rd.Width * 4 + 255) & ~255u);
+	D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_READBACK;
+	D3D12_RESOURCE_DESC bd = {};
+	bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+	bd.Width = rowPitch; bd.Height = 1; bd.DepthOrArraySize = 1; bd.MipLevels = 1;
+	bd.Format = DXGI_FORMAT_UNKNOWN; bd.SampleDesc.Count = 1;
+	bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+	ID3D12Resource *rb = NULL;
+	if (FAILED(s_ps.own_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd,
+	        D3D12_RESOURCE_STATE_COPY_DEST, NULL, __uuidof(ID3D12Resource), (void **)&rb)) || !rb) return;
+	s_ps.own_cmd_alloc->Reset();
+	s_ps.own_cmd_list->Reset(s_ps.own_cmd_alloc, NULL);
+	D3D12_RESOURCE_BARRIER b = {}; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	b.Transition.pResource = br; b.Transition.Subresource = 0;
+	b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+	b.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_SOURCE;
+	s_ps.own_cmd_list->ResourceBarrier(1, &b);
+	D3D12_TEXTURE_COPY_LOCATION dl = {}; dl.pResource = rb;
+	dl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+	dl.PlacedFootprint.Footprint.Format = (s_ps.sc_format == 87) ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
+	dl.PlacedFootprint.Footprint.Width = (UINT)rd.Width;
+	dl.PlacedFootprint.Footprint.Height = 1;
+	dl.PlacedFootprint.Footprint.Depth = 1;
+	dl.PlacedFootprint.Footprint.RowPitch = rowPitch;
+	D3D12_TEXTURE_COPY_LOCATION slc = {}; slc.pResource = br;
+	slc.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; slc.SubresourceIndex = 0;
+	D3D12_BOX box = {}; box.left = 0; box.right = (UINT)rd.Width;
+	box.top = (UINT)rd.Height / 2; box.bottom = box.top + 1; box.front = 0; box.back = 1;
+	s_ps.own_cmd_list->CopyTextureRegion(&dl, 0, 0, 0, &slc, &box);
+	b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_SOURCE;
+	b.Transition.StateAfter  = D3D12_RESOURCE_STATE_COMMON;
+	s_ps.own_cmd_list->ResourceBarrier(1, &b);
+	s_ps.own_cmd_list->Close();
+	ID3D12CommandList *lists[] = { s_ps.own_cmd_list };
+	s_ps.own_queue->ExecuteCommandLists(1, lists);
+	s_ps.own_fence_value++;
+	s_ps.own_queue->Signal(s_ps.own_fence, s_ps.own_fence_value);
+	if (s_ps.own_fence->GetCompletedValue() < s_ps.own_fence_value) {
+		s_ps.own_fence->SetEventOnCompletion(s_ps.own_fence_value, s_ps.own_fence_event);
+		WaitForSingleObject(s_ps.own_fence_event, INFINITE);
+	}
+	void *p = NULL; D3D12_RANGE mr = {0, rowPitch};
+	if (SUCCEEDED(rb->Map(0, &mr, &p)) && p) {
+		UINT8 *px = (UINT8 *)p + ((UINT)rd.Width / 2) * 4;
+		ps_log("[DisplayXR-PROV] PROBE: BRIDGE READBACK eye0 center=(%u,%u) RGBA=%02x%02x%02x%02x "
+		       "(nonzero => Unity rendered into bridge => ordering/sync bug; 00 => wrong texture)\n",
+		       (UINT)rd.Width / 2, (UINT)rd.Height / 2, px[0], px[1], px[2], px[3]);
+		rb->Unmap(0, NULL);
+	}
+	rb->Release();
+}
+
+// PROBE (DISPLAYXR_PROV_BRIDGE_PRECLEAR=1): clear BOTH per-eye bridges to GREEN and execute
+// immediately — call from begin_frame, BEFORE Unity renders. Paired with the readback (end
+// of submit): if the readback still reads GREEN, Unity never drew into the XR eye texture
+// (stale/broken sample / camera not targeting XR); if it reads black/scene, Unity DID render.
+static void ps_diag_preclear_bridge_green(void)
+{
+	if (!s_ps.own_device || !s_ps.own_cmd_list || !s_ps.own_queue) return;
+	static ID3D12DescriptorHeap *gh = NULL; static UINT gsz = 0;
+	if (!gh) {
+		D3D12_DESCRIPTOR_HEAP_DESC hd = {}; hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; hd.NumDescriptors = 2;
+		if (FAILED(s_ps.own_device->CreateDescriptorHeap(&hd, __uuidof(ID3D12DescriptorHeap), (void **)&gh)) || !gh) return;
+		gsz = s_ps.own_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+	}
+	DXGI_FORMAT rtvFmt = (s_ps.sc_format == 87) ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
+	const float green[4] = {0.0f, 1.0f, 0.0f, 1.0f};
+	int sp = dxr_prov_get_single_pass();
+	s_ps.own_cmd_alloc->Reset();
+	s_ps.own_cmd_list->Reset(s_ps.own_cmd_alloc, NULL);
+	D3D12_CPU_DESCRIPTOR_HANDLE base = gh->GetCPUDescriptorHandleForHeapStart();
+	auto clear_slice = [&](ID3D12Resource *br, UINT slice, UINT heapIdx) {
+		if (!br) return;
+		D3D12_RESOURCE_BARRIER b = {}; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		b.Transition.pResource = br; b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+		b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON; b.Transition.StateAfter = D3D12_RESOURCE_STATE_RENDER_TARGET;
+		s_ps.own_cmd_list->ResourceBarrier(1, &b);
+		D3D12_RENDER_TARGET_VIEW_DESC rv = {}; rv.Format = rtvFmt;
+		rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+		rv.Texture2DArray.FirstArraySlice = slice; rv.Texture2DArray.ArraySize = 1;
+		D3D12_CPU_DESCRIPTOR_HANDLE h = base; h.ptr += (SIZE_T)heapIdx * gsz;
+		s_ps.own_device->CreateRenderTargetView(br, &rv, h);
+		s_ps.own_cmd_list->ClearRenderTargetView(h, green, 0, NULL);
+		b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET; b.Transition.StateAfter = D3D12_RESOURCE_STATE_COMMON;
+		s_ps.own_cmd_list->ResourceBarrier(1, &b);
+	};
+	if (sp) { clear_slice(s_ps.bridge_own, 0, 0); clear_slice(s_ps.bridge_own, 1, 1); } // SPI arr=2 bridge
+	else    { clear_slice(s_ps.bridge_own_eye[0], 0, 0); clear_slice(s_ps.bridge_own_eye[1], 0, 1); } // MultiPass
+	s_ps.own_cmd_list->Close();
+	ID3D12CommandList *lists[] = { s_ps.own_cmd_list };
+	s_ps.own_queue->ExecuteCommandLists(1, lists);
+	s_ps.own_fence_value++;
+	s_ps.own_queue->Signal(s_ps.own_fence, s_ps.own_fence_value);
+	if (s_ps.own_fence->GetCompletedValue() < s_ps.own_fence_value) {
+		s_ps.own_fence->SetEventOnCompletion(s_ps.own_fence_value, s_ps.own_fence_event);
+		WaitForSingleObject(s_ps.own_fence_event, INFINITE);
+	}
+	static int logged = 0;
+	if (!logged) { logged = 1; ps_log("[DisplayXR-PROV] PROBE: BRIDGE PRECLEAR green (before Unity render)\n"); }
+}
 #endif // _WIN32
 
 int dxr_prov_submit_frame(uint32_t image_index)
 {
+	// Trace the submit path (shell/IPC bring-up: acquire spins, nothing ever released/
+	// submitted). Written to %TEMP%\displayxr_prov_native.log.
+	static unsigned s_subf_n = 0;
+	int subf_trace = (s_subf_n < 12 || (s_subf_n % 600) == 0);
+	if (subf_trace) {
+		ps_log("[DisplayXR-PROV] submit_frame[%u]: frame_begun=%d swapchain_created=%d image_acquired=%d api=%d\n",
+		       s_subf_n, s_ps.frame_begun, s_ps.swapchain_created, s_ps.image_acquired, (int)s_ps.graphics_api);
+		// Render geometry: view count + per-eye FOV (rad) + render/swapchain dims. A degenerate
+		// FOV (0 / huge) or 0-size render viewport → Unity draws nothing → black bridge (#223 r12).
+		ps_log("[DisplayXR-PROV] submit_frame[%u]: view_count=%u render=%ux%u sc=%ux%u fov0=[%.3f %.3f %.3f %.3f] fov1=[%.3f %.3f %.3f %.3f]\n",
+		       s_subf_n, s_ps.view_count, s_ps.render_w, s_ps.render_h, s_ps.sc_width, s_ps.sc_height,
+		       s_ps.views[0].fov[0], s_ps.views[0].fov[1], s_ps.views[0].fov[2], s_ps.views[0].fov[3],
+		       s_ps.views[1].fov[0], s_ps.views[1].fov[1], s_ps.views[1].fov[2], s_ps.views[1].fov[3]);
+	}
+	s_subf_n++;
 	if (!s_ps.frame_begun || !s_ps.swapchain_created) {
+		if (subf_trace) ps_log("[DisplayXR-PROV] submit_frame: BAIL (no frame/swapchain) -> end_frame_empty\n");
 		dxr_prov_end_frame_empty();
 		return 0;
 	}
@@ -4834,6 +5145,13 @@ int dxr_prov_submit_frame(uint32_t image_index)
 				// the diag clears directly and leaves it RT (no barriers, see helper).
 				ps_diag_fill_slice_colors(dst, submit_n);
 			} else {
+				// PROBE: paint the copy-SOURCE bridge solid (BLUE/RED) before the copy, to
+				// split "copy mechanics work / Unity render not in bridge" from "copy misses"
+				// for the black tile (#223). Recorded before the copy on the same cmd list.
+				static int s_bridge_colors = -1;
+				if (s_bridge_colors < 0) { const char *e = getenv("DISPLAYXR_PROV_BRIDGE_COLORS");
+				                           s_bridge_colors = (e && e[0] && e[0] != '0') ? 1 : 0; }
+				if (s_bridge_colors) ps_diag_fill_bridge_colors(submit_n);
 				ps_sc_image_barrier(s_ps.own_cmd_list, dst,
 				                    D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
 				int swap = (submit_n >= 2) && dxr_prov_view_swap(); // #740 stereo unswap
@@ -4906,6 +5224,9 @@ int dxr_prov_submit_frame(uint32_t image_index)
 		XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
 		s_ps.pfn_release_swapchain_image(s_ps.swapchain, &ri);
 		s_ps.image_acquired = 0;
+		if (subf_trace) ps_log("[DisplayXR-PROV] submit_frame[%u]: RELEASED image %u\n", s_subf_n - 1, image_index);
+	} else if (subf_trace) {
+		ps_log("[DisplayXR-PROV] submit_frame[%u]: no image_acquired to release\n", s_subf_n - 1);
 	}
 	if (d11_diag) ps_log("[DisplayXR-PROV] D3D11 submit[%u]: released, building layers\n", d11_frames);
 
@@ -4915,7 +5236,11 @@ int dxr_prov_submit_frame(uint32_t image_index)
 	// ghost) even though Unity rendered both eyes into the 2-slice bridge.
 	uint32_t n = submit_n;
 	if (n > s_ps.view_count) n = s_ps.view_count;
-	if (n == 0) { dxr_prov_end_frame_empty(); return 0; }
+	if (n == 0) {
+		if (subf_trace) ps_log("[DisplayXR-PROV] submit_frame[%u]: BAIL (n=0, submit_n=%u view_count=%u) -> end_frame_empty\n",
+		                       s_subf_n - 1, submit_n, s_ps.view_count);
+		dxr_prov_end_frame_empty(); return 0;
+	}
 	XrCompositionLayerProjectionView pv[DXR_PROV_MAX_VIEWS] = {};
 	for (uint32_t eye = 0; eye < n; eye++) {
 		pv[eye].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW;
@@ -5049,10 +5374,24 @@ int dxr_prov_submit_frame(uint32_t image_index)
 	ei.layerCount = lc;
 	ei.layers = layers;
 	if (d11_diag) ps_log("[DisplayXR-PROV] D3D11 submit[%u]: pre-xrEndFrame (layers=%u)\n", d11_frames, lc);
+	if (subf_trace) ps_log("[DisplayXR-PROV] submit_frame[%u]: xrEndFrame layers=%u (views n=%u)\n", s_subf_n - 1, lc, n);
 	XrResult r = s_ps.pfn_end_frame(s_ps.session, &ei);
+	if (subf_trace) ps_log("[DisplayXR-PROV] submit_frame[%u]: post-xrEndFrame r=%d\n", s_subf_n - 1, r);
 	if (d11_diag) ps_log("[DisplayXR-PROV] D3D11 submit[%u]: post-xrEndFrame r=%d\n", d11_frames, r);
 	if (s_ps.graphics_api == DXR_GFX_D3D11 && d11_frames < 100000) d11_frames++;
 	if (XR_FAILED(r)) { ps_log("[DisplayXR-PROV] xrEndFrame failed: %d\n", r); return 0; }
+
+#ifdef _WIN32
+	// PROBE (DISPLAYXR_PROV_BRIDGE_READBACK=1): once, read back the copy-source bridge to
+	// tell whether Unity's render ever lands in it (ordering/sync bug) vs never (wrong
+	// texture). D3D12 only.
+	if (s_ps.graphics_api != DXR_GFX_D3D11) {
+		static int s_brd = -1;
+		if (s_brd < 0) { const char *e = getenv("DISPLAYXR_PROV_BRIDGE_READBACK");
+		                 s_brd = (e && e[0] && e[0] != '0') ? 1 : 0; }
+		if (s_brd) ps_diag_readback_bridge_once();
+	}
+#endif
 
 #ifdef _WIN32  // weave-to-texture PROBE readback is Windows/D3D-only
 	// Weave-to-texture PROBE: ON-DEMAND readback of the runtime-woven shared texture.
@@ -5128,6 +5467,27 @@ void dxr_prov_end_frame_empty(void)
 {
 	if (!s_ps.frame_begun) return;
 	s_ps.frame_begun = 0;
+	// Release any swapchain image acquired this frame BEFORE ending it. dxr_prov_begin_frame
+	// acquires the primary image up front, but a frame that ends empty (shouldRender=false, or
+	// no submittable views) skips dxr_prov_submit_frame — which is the only other place the
+	// release happens. Leaving the image acquired is fatal on a 1-image swapchain (the shell/
+	// IPC service compositor allocates exactly 1): the next xrAcquireSwapchainImage then fails
+	// with CALL_ORDER_INVALID every frame, spinning the pump and submitting nothing (black tile).
+	// Also release the extra 3D zones' images (acquired in ps_locate_extra_zones) for the same
+	// reason — inert when no zones are active (the BiRP workspace tile).
+	if (s_ps.image_acquired && s_ps.swapchain && s_ps.pfn_release_swapchain_image) {
+		XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+		s_ps.pfn_release_swapchain_image(s_ps.swapchain, &ri);
+		s_ps.image_acquired = 0;
+	}
+	for (uint32_t i = 0; i < s_ps.extra_zone_count && i < (PS_MAX_ZONES - 1); i++) {
+		ProviderExtraZone *z = &s_ps.extra_zones[i];
+		if (z->image_acquired && z->swapchain && s_ps.pfn_release_swapchain_image) {
+			XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+			s_ps.pfn_release_swapchain_image(z->swapchain, &ri);
+			z->image_acquired = 0;
+		}
+	}
 	XrFrameEndInfo ei = {XR_TYPE_FRAME_END_INFO};
 	ei.displayTime = s_ps.predicted_display_time;
 	ei.environmentBlendMode = (s_ps.transparent_requested && s_ps.alpha_blend_supported)
