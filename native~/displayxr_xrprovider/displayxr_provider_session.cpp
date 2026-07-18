@@ -4845,6 +4845,64 @@ static void ps_diag_fill_slice_colors(ID3D12Resource *dst, UINT n)
 		ps_log("[DisplayXR-PROV] PROBE: SLICE COLORS active — slice0=BLUE slice1=RED (n=%u fmt=%d)\n",
 		       n, (int)rd.Format); }
 }
+
+// PROBE (DISPLAYXR_PROV_BRIDGE_COLORS=1): clear the copy-SOURCE bridge to solid colors
+// (eye0=BLUE, eye1=RED) in our OWN command list, right before the normal bridge->swapchain
+// -slice copy runs. The copy then carries whatever is in the bridge — so this splits the
+// last ambiguity for the black workspace tile (#223 r10/r11): if the display shows the
+// solid colors, the bridge->slice copy MECHANICS are fine and Unity's real render simply
+// isn't in the bridge at copy time (ordering / wrong texture); if it's still black, the
+// copy itself misses (wrong resource/slice). Unlike SLICE_COLORS (which clears the
+// swapchain slice directly), this clears the SOURCE, so it exercises the exact copy path.
+// The bridge is COMMON at copy time (submit's v8->RequestResourceState) — barrier
+// COMMON->RENDER_TARGET to clear, then back to COMMON so the copy reads it (COPY_SOURCE
+// promotion). Recorded on own_cmd_list before the copy, so it is GPU-ordered before it.
+static void ps_diag_fill_bridge_colors(UINT n)
+{
+	if (!s_ps.own_device || !s_ps.own_cmd_list) return;
+	static ID3D12DescriptorHeap *bheap = NULL;
+	static UINT bsz = 0;
+	if (!bheap) {
+		D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+		hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; hd.NumDescriptors = 2;
+		if (FAILED(s_ps.own_device->CreateDescriptorHeap(&hd, __uuidof(ID3D12DescriptorHeap),
+		        (void **)&bheap)) || !bheap) {
+			ps_log("[DisplayXR-PROV] PROBE: bridge-colors RTV heap failed\n"); return;
+		}
+		bsz = s_ps.own_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
+	}
+	DXGI_FORMAT rtvFmt = (s_ps.sc_format == 87) ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
+	const float colors[2][4] = { {0.0f, 0.0f, 1.0f, 1.0f},   // eye 0 = BLUE
+	                             {1.0f, 0.0f, 0.0f, 1.0f} };  // eye 1 = RED
+	int sp = dxr_prov_get_single_pass();
+	D3D12_CPU_DESCRIPTOR_HANDLE base = bheap->GetCPUDescriptorHandleForHeapStart();
+	for (UINT e = 0; e < n && e < 2; e++) {
+		ID3D12Resource *br = sp ? s_ps.bridge_own : s_ps.bridge_own_eye[e];
+		if (!br) continue;
+		D3D12_RESOURCE_BARRIER b = {};
+		b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+		b.Transition.pResource = br;
+		b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+		b.Transition.StateBefore = D3D12_RESOURCE_STATE_COMMON;
+		b.Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
+		s_ps.own_cmd_list->ResourceBarrier(1, &b);
+		D3D12_RENDER_TARGET_VIEW_DESC rv = {};
+		rv.Format = rtvFmt;
+		rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2DARRAY;
+		rv.Texture2DArray.MipSlice = 0;
+		rv.Texture2DArray.FirstArraySlice = sp ? e : 0;
+		rv.Texture2DArray.ArraySize = 1;
+		D3D12_CPU_DESCRIPTOR_HANDLE h = base; h.ptr += (SIZE_T)e * bsz;
+		s_ps.own_device->CreateRenderTargetView(br, &rv, h);
+		s_ps.own_cmd_list->ClearRenderTargetView(h, colors[e], 0, NULL);
+		b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+		b.Transition.StateAfter  = D3D12_RESOURCE_STATE_COMMON;
+		s_ps.own_cmd_list->ResourceBarrier(1, &b);
+	}
+	static int logged = 0;
+	if (!logged) { logged = 1;
+		ps_log("[DisplayXR-PROV] PROBE: BRIDGE COLORS active — bridge eye0=BLUE eye1=RED (copy carries to slices)\n"); }
+}
 #endif // _WIN32
 
 int dxr_prov_submit_frame(uint32_t image_index)
@@ -4936,6 +4994,13 @@ int dxr_prov_submit_frame(uint32_t image_index)
 				// the diag clears directly and leaves it RT (no barriers, see helper).
 				ps_diag_fill_slice_colors(dst, submit_n);
 			} else {
+				// PROBE: paint the copy-SOURCE bridge solid (BLUE/RED) before the copy, to
+				// split "copy mechanics work / Unity render not in bridge" from "copy misses"
+				// for the black tile (#223). Recorded before the copy on the same cmd list.
+				static int s_bridge_colors = -1;
+				if (s_bridge_colors < 0) { const char *e = getenv("DISPLAYXR_PROV_BRIDGE_COLORS");
+				                           s_bridge_colors = (e && e[0] && e[0] != '0') ? 1 : 0; }
+				if (s_bridge_colors) ps_diag_fill_bridge_colors(submit_n);
 				ps_sc_image_barrier(s_ps.own_cmd_list, dst,
 				                    D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
 				int swap = (submit_n >= 2) && dxr_prov_view_swap(); // #740 stereo unswap
