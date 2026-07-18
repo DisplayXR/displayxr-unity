@@ -1518,7 +1518,7 @@ LifecycleStart(UnitySubsystemHandle handle, void *userData)
 		void *unity_hwnd = displayxr_get_unity_main_hwnd();
 		if (unity_hwnd != nullptr) {
 			displayxr_install_focus_hook(unity_hwnd);
-			prov_log("[DisplayXR-PROV] Lifecycle Start (workspace tile: installed focus hook so hidden Unity keeps rendering)\n");
+			prov_log("[DisplayXR-PROV] Lifecycle Start (workspace tile: installed focus hook)\n");
 		} else {
 			prov_log("[DisplayXR-PROV] Lifecycle Start (workspace tile: WARN Unity HWND not found — focus hook NOT installed)\n");
 		}

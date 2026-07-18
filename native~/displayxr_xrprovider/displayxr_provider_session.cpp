@@ -3547,8 +3547,7 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	} else if (displayxr_is_shell_mode()) {
 		// --- Workspace/IPC (shell) tile: bind the session to UNITY's D3D12 device (ADR-032).
 		//     No in-process weaver / GameView present under the shell, so the own-device
-		//     isolation isn't needed — and a cross-device bridge leaves the arr=2 swapchain
-		//     slices BLACK (the service imports them; #223 r7). Same-device = coherent. ---
+		//     isolation isn't needed; same-device = coherent bridge into the service. ---
 		if (!ps_alias_unity_device_d3d12()) { dxr_prov_session_stop(); return 0; }
 	} else {
 		// --- Create the session's OWN D3D12 device (matched to runtime adapter LUID).
