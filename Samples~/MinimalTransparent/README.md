@@ -19,16 +19,17 @@ and which the plugin / runtime handle for you.
    Transparent". The script lands in
    `Assets/Samples/DisplayXR/x.y.z/MinimalTransparent/`.
 2. Open or create an empty scene.
-3. Make sure the OpenXR feature is enabled: *Project Settings → XR Plug-in
-   Management → OpenXR*, check the **DisplayXR** feature.
+3. Enable the DisplayXR provider: *Project Settings → XR Plug-in Management →
+   Standalone*, check **DisplayXR Display** (and make sure **OpenXR** is *not*
+   also checked — the provider drives the runtime itself). Also check
+   **Initialize XR on Startup**.
 4. Set `XR_RUNTIME_JSON` to a DisplayXR runtime build (with no 3D panel it
    uses sim_display automatically; `SIM_DISPLAY_OUTPUT=sbs` optionally picks
    the sim output format). The runtime is
    what implements the OpenXR API and the desktop-compose-under-tiles pass
    that makes transparency look right — see below.
-5. **Build a standalone** (the editor preview window doesn't show
-   transparent mode — `Application.isEditor` short-circuits the native
-   window-restyling plumbing).
+5. **Build a standalone** (editor Play Mode doesn't show transparent mode —
+   `Application.isEditor` short-circuits the native window-restyling plumbing).
 6. Run on a Leia SR machine. The cube floats; click outside it to talk to
    the desktop window underneath.
 
@@ -70,7 +71,7 @@ Each must work or the illusion breaks.
 
 | # | Mechanism | Owner | What it does |
 |---|---|---|---|
-| 1 | Camera clear → `alpha=0` in transparent regions | **App** (via `DisplayXRTransparentOverlay`) | Both eye views render with `Camera.backgroundColor = (0,0,0,0)`. The OpenXR session is in `ALPHA_BLEND` blend mode (set in `DisplayXRFeature.OnInstanceCreate`), so Unity emits real per-pixel alpha into the swapchain |
+| 1 | Camera clear → `alpha=0` in transparent regions | **App** (via `DisplayXRTransparentOverlay`) | Both eye views render with `Camera.backgroundColor = (0,0,0,0)`. The provider opts the OpenXR session into `ALPHA_BLEND` blend mode at session create when transparent background is requested, so Unity emits real per-pixel alpha into the swapchain |
 | 2 | Runtime DP: compose-under-bg + alpha-gate | **Runtime** | The DisplayXR runtime captures the desktop content under each tile, composes it under the atlas RGBA pre-weave, then alpha-gates post-weave so silhouettes carry true anti-aliased alpha. No chroma sentinel involved |
 | 3 | DComp / Cocoa per-pixel-alpha window | **Plugin → OS** | On Windows the plugin creates the overlay HWND as top-level `WS_POPUP` with `WS_EX_NOREDIRECTIONBITMAP` so DWM has no opaque redirection surface; it composites the HWND purely from the runtime's DComp visuals. On macOS the plugin flips Unity's `NSWindow` to `setOpaque:NO` and lets Cocoa do the same job |
 
@@ -84,21 +85,20 @@ DisplayXR is an OpenXR runtime that implements the standard Khronos API
 plus a few **vendor extensions** for 3D-display-specific concerns. The
 transparent overlay relies on:
 
-### `XR_DXR_win32_window_binding` (spec v5) and `XR_DXR_cocoa_window_binding`
+### `XR_DXR_win32_window_binding` and `XR_DXR_cocoa_window_binding`
 
 The app passes the application's `HWND` (or `NSView*`) to the runtime via
 these extensions, chained off `XrSessionCreateInfo.next` at
-`xrCreateSession`. The plugin's native code (`displayxr_hooks.cpp`)
-intercepts session creation, fills in the struct, and forwards. Relevant
-field for transparency:
+`xrCreateSession`. The plugin's native provider
+(`native~/displayxr_xrprovider/`) fills in the struct at session creation
+and forwards it. Relevant field for transparency:
 
 | Field | Type | Set when | Effect |
 |---|---|---|---|
 | `transparentBackgroundEnabled` | `XrBool32` | `RequestTransparentSession()` | Runtime picks a transparent-capable swapchain (D3D11/D3D12 with DComp on Windows; CAMetalLayer on macOS) and the DP's compose-under-bg path |
 | `chromaKeyColor` | `uint32_t` | always `0` now | Legacy post-weave chroma→alpha conversion is disabled. Kept in the ABI for backward compat; the plugin sends `0` unconditionally |
 
-The struct definition lives in `native~/displayxr_extensions.h`. v5 is what
-the plugin and runtime both implement.
+The struct definition lives in `native~/displayxr_extensions.h`.
 
 ### `XR_DXR_display_info`
 
@@ -110,19 +110,19 @@ have to call anything to enable it — the rig components do it.
 
 ## Plugin features in use
 
-### `DisplayXRFeature` (auto-enabled)
+### DisplayXR display provider (auto-enabled)
 
-The OpenXR `OpenXRFeature` subclass that hooks the OpenXR pipeline at the
-C# layer. Drives swapchain configuration, projection-layer submission, and
-display-info plumbing. **You enable it in Project Settings**, not in code.
-In transparent mode it also calls
-`SetEnvironmentBlendMode(XrEnvironmentBlendMode.AlphaBlend)` so Unity
-emits real alpha to the swapchain.
+The custom `IUnityXRDisplay` provider is the shipping backend. **You enable
+it in Project Settings** (XR Plug-in Management → Standalone → DisplayXR
+Display), not in code. It owns the OpenXR session on Unity's graphics
+device and drives swapchain configuration, projection-layer submission, and
+display-info plumbing. In transparent mode it opts the session into
+`ALPHA_BLEND` at session create so Unity emits real alpha to the swapchain.
 
 ### `DisplayXRDisplay` / `DisplayXRCamera`
 
 Two flavors of stereo rig. Both push Kooima projection tunables to the
-native hook chain via a static rig manager (`DisplayXRRigManager`). The
+native provider via a static rig manager (`DisplayXRRigManager`). The
 minimal sample uses `DisplayXRDisplay` (display-centric, scale-as-zoom).
 Swap to `DisplayXRCamera` for camera-centric (FOV-driven) behavior — see
 `docs~/adr/ADR-004-camera-vs-display-mode.md` in the package source.
@@ -165,10 +165,10 @@ PLUGIN  (DisplayXR Unity package — C# in Runtime/, native in native~/)
  ├─ C# component:
  │   ├─ Camera clearFlags + backgroundColor=(0,0,0,0)  (= mechanism 1)
  │   └─ Cursor polling, cyclopean ray, hit-test, UnityEvents
- ├─ DisplayXRFeature.OnInstanceCreate:
- │   └─ SetEnvironmentBlendMode(AlphaBlend) so Unity preserves alpha
+ ├─ Provider (IUnityXRDisplay), at session create:
+ │   └─ opts the session into ALPHA_BLEND so Unity preserves alpha
  └─ Native:
-     ├─ Hooks xrCreateSession; fills XrWin32WindowBindingCreateInfoDXR
+     ├─ At session create, fills XrWin32WindowBindingCreateInfoDXR
      │   with transparentBackgroundEnabled=1, chromaKeyColor=0
      ├─ Creates top-level WS_EX_NOREDIRECTIONBITMAP overlay HWND
      ├─ Cloaks + moves Unity main HWND off-screen for click-through
@@ -177,7 +177,7 @@ PLUGIN  (DisplayXR Unity package — C# in Runtime/, native in native~/)
          (issue #61), click-forward to desktop (Approach C catch+forward)
 
 OPENXR RUNTIME  (DisplayXR/displayxr-runtime — separate repo, separate process)
- ├─ Reads v5 fields off the binding extension at xrCreateSession
+ ├─ Reads the binding-extension fields at xrCreateSession
  ├─ Picks a transparent-capable swapchain (D3D11/D3D12 with DComp; Metal)
  ├─ DP compose-under-bg pre-weave: captures the desktop content under each
  │   tile and composes it under the atlas RGBA  (= mechanism 2)
@@ -210,13 +210,13 @@ OS / DWM (Windows) / Cocoa (macOS)
 - **No multi-camera rig coordination** (see `DisplayXRRigManager` for that —
   if you have multiple rigs in one scene, only the active one drives the
   Kooima projection; this sample assumes single-rig).
-- **No editor-mode preview** (transparent overlay is build-only — the
-  editor preview window isn't the right HWND target).
+- **No editor-mode transparency** (transparent overlay is build-only — in
+  editor Play Mode `Application.isEditor` short-circuits the window restyling).
 
 ## Further reading
 
-- Architecture: `docs~/adr/ADR-001-deferred-destruction.md`,
-  `docs~/adr/ADR-003-native-preview-window.md`,
+- Architecture: `docs~/architecture/xr-display-provider.md` (the display
+  provider), `docs~/adr/ADR-001-deferred-destruction.md`,
   `docs~/adr/ADR-004-camera-vs-display-mode.md`
 - Runtime extension specs: see the [DisplayXR runtime
   repo](https://github.com/DisplayXR/displayxr-runtime), `docs/specs/`
