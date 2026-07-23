@@ -113,22 +113,13 @@ namespace DisplayXR.Editor
             EditorGUILayout.BeginVertical(EditorStyles.helpBox);
             EditorGUILayout.LabelField("Testing", EditorStyles.boldLabel);
 
-            string simDisplay = Environment.GetEnvironmentVariable("SIM_DISPLAY_ENABLE");
-            if (simDisplay == "1")
-            {
-                string output = Environment.GetEnvironmentVariable("SIM_DISPLAY_OUTPUT") ?? "sbs";
-                EditorGUILayout.LabelField("Simulation Display", $"Enabled (output: {output})");
-                EditorGUILayout.HelpBox(
-                    "Using simulation display. No physical 3D display hardware required.",
-                    MessageType.Info);
-            }
-            else
-            {
-                EditorGUILayout.HelpBox(
-                    "For testing without hardware, set SIM_DISPLAY_ENABLE=1 and " +
-                    "SIM_DISPLAY_OUTPUT=sbs (or anaglyph, blend).",
-                    MessageType.Info);
-            }
+            string simOutput = Environment.GetEnvironmentVariable("SIM_DISPLAY_OUTPUT");
+            EditorGUILayout.HelpBox(
+                "With no 3D panel present, the runtime falls back to sim_display " +
+                "automatically — no environment variable needed. SIM_DISPLAY_OUTPUT " +
+                "optionally picks the sim output format: sbs (default), anaglyph, or blend." +
+                (string.IsNullOrEmpty(simOutput) ? "" : $"\nCurrent SIM_DISPLAY_OUTPUT: {simOutput}"),
+                MessageType.Info);
 
             EditorGUILayout.EndVertical();
         }

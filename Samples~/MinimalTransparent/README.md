@@ -21,8 +21,9 @@ and which the plugin / runtime handle for you.
 2. Open or create an empty scene.
 3. Make sure the OpenXR feature is enabled: *Project Settings → XR Plug-in
    Management → OpenXR*, check the **DisplayXR** feature.
-4. Set `XR_RUNTIME_JSON` to a DisplayXR runtime build (or use
-   `SIM_DISPLAY_ENABLE=1 SIM_DISPLAY_OUTPUT=sbs` for a sim). The runtime is
+4. Set `XR_RUNTIME_JSON` to a DisplayXR runtime build (with no 3D panel it
+   uses sim_display automatically; `SIM_DISPLAY_OUTPUT=sbs` optionally picks
+   the sim output format). The runtime is
    what implements the OpenXR API and the desktop-compose-under-tiles pass
    that makes transparency look right — see below.
 5. **Build a standalone** (the editor preview window doesn't show

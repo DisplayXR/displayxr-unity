@@ -119,8 +119,8 @@ Open Terminal **before** launching Unity (environment variables must be set in t
 # Point to your DisplayXR runtime build
 export XR_RUNTIME_JSON=/path/to/SRDisplayXR-macOS/share/openxr/1/openxr_displayxr.json
 
-# Enable simulated display (skip if you have real hardware)
-export SIM_DISPLAY_ENABLE=1
+# With no 3D panel present, the runtime uses sim_display automatically.
+# Optionally pick the sim output format (default: sbs):
 export SIM_DISPLAY_OUTPUT=sbs
 
 # Launch Unity from this terminal
@@ -137,7 +137,7 @@ Open Command Prompt or PowerShell **before** launching Unity:
 ```cmd
 set XR_RUNTIME_JSON=C:\path\to\openxr_displayxr-dev.json
 
-set SIM_DISPLAY_ENABLE=1
+REM With no 3D panel, sim_display is used automatically; SIM_DISPLAY_OUTPUT is optional (default: sbs)
 set SIM_DISPLAY_OUTPUT=sbs
 
 start "" "C:\Program Files\Unity Hub\Unity Hub.exe"
@@ -146,8 +146,7 @@ start "" "C:\Program Files\Unity Hub\Unity Hub.exe"
 **PowerShell:**
 ```powershell
 $env:XR_RUNTIME_JSON = "C:\path\to\openxr_displayxr-dev.json"
-$env:SIM_DISPLAY_ENABLE = "1"
-$env:SIM_DISPLAY_OUTPUT = "sbs"
+$env:SIM_DISPLAY_OUTPUT = "sbs"   # optional; sim_display is the automatic fallback when no 3D panel is present
 
 & "C:\Program Files\Unity Hub\Unity Hub.exe"
 ```
@@ -359,7 +358,7 @@ The resulting `.exe` must be run on a Windows machine with the DisplayXR runtime
 Open Command Prompt in the build folder:
 ```cmd
 set XR_RUNTIME_JSON=C:\path\to\openxr_displayxr-dev.json
-set SIM_DISPLAY_ENABLE=1
+REM With no 3D panel, sim_display is used automatically; SIM_DISPLAY_OUTPUT is optional (default: sbs)
 set SIM_DISPLAY_OUTPUT=sbs
 
 YourApp.exe
@@ -381,8 +380,8 @@ Open Terminal:
 ```bash
 export XR_RUNTIME_JSON=/path/to/SRDisplayXR-macOS/share/openxr/1/openxr_displayxr.json
 
-# For testing without hardware:
-export SIM_DISPLAY_ENABLE=1
+# Without a 3D panel the runtime uses sim_display automatically.
+# Optionally pick the sim output format (default: sbs):
 export SIM_DISPLAY_OUTPUT=sbs
 
 # Launch the app

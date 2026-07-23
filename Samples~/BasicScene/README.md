@@ -17,8 +17,7 @@ Minimal camera-centric stereo setup for testing the DisplayXR plugin.
 
 ## Without Hardware
 
-Set these environment variables before launching Unity:
+With no 3D panel present, the runtime uses **sim_display** automatically — no env var needed. Optionally pick the sim output format before launching Unity:
 ```
-SIM_DISPLAY_ENABLE=1
 SIM_DISPLAY_OUTPUT=sbs
 ```

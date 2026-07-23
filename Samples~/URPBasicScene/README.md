@@ -32,7 +32,7 @@ fall back to mono.
 3. Open a new empty scene; add a Main Camera with `DisplayXRCamera` (or
    `DisplayXRDisplay`) attached.
 4. Add an empty GameObject and attach `URPBasicSceneSetup`.
-5. Set `XR_RUNTIME_JSON` (or use `SIM_DISPLAY_ENABLE=1 SIM_DISPLAY_OUTPUT=sbs`).
+5. Set `XR_RUNTIME_JSON` (with no 3D panel, sim_display is the automatic fallback; `SIM_DISPLAY_OUTPUT=sbs` optionally picks the sim output format).
 6. Enter Play Mode — left/right eye matrices should differ (visible parallax
    on the cubes); toggle `logEyeTracking` on the rig to confirm the per-frame
    stereo callback is firing.

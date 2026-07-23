@@ -42,7 +42,7 @@ KeyLight                — warm directional light
 
 ## Without Hardware
 
+With no 3D panel present, the runtime uses **sim_display** automatically. Optionally pick the sim output format:
 ```
-SIM_DISPLAY_ENABLE=1
 SIM_DISPLAY_OUTPUT=sbs
 ```

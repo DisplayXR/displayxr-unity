@@ -164,7 +164,7 @@ Extension struct definitions in `native~/displayxr_extensions.h` must match the 
 1. Open any Unity 2022.3+ project
 2. Add this package via Package Manager (local path or git URL)
 3. Enable **DisplayXR** in Project Settings > XR Plug-in Management (Standalone tab) — it's the `IUnityXRDisplay` provider toggle, **not** under OpenXR
-4. Set `XR_RUNTIME_JSON` environment variable to point to a DisplayXR runtime build (or use `SIM_DISPLAY_ENABLE=1 SIM_DISPLAY_OUTPUT=sbs` for testing without hardware)
+4. Set `XR_RUNTIME_JSON` environment variable to point to a DisplayXR runtime build (with no 3D panel present the runtime falls back to **sim_display** automatically — no env var needed; `SIM_DISPLAY_OUTPUT=sbs` optionally picks the sim output format)
 5. **Press Play** — Play Mode runs the provider and *is* the preview (identical to a built player); there is no separate preview window
 
 ### No dependency on Unity's OpenXR package (the provider drives OpenXR itself)
