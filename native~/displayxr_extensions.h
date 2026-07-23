@@ -397,7 +397,8 @@ typedef XrResult(XRAPI_PTR *PFN_xrSetWorkspaceViewRigDXR)(XrSession session, con
 // layer's views into that rect). Source of truth: displayxr-runtime (and the
 // avatar's openxr_includes/openxr/XR_DXR_display_zones.h), SPEC_VERSION 1.
 #define XR_DXR_DISPLAY_ZONES_EXTENSION_NAME "XR_DXR_display_zones"
-#define XR_DXR_display_zones_SPEC_VERSION 1
+// SPEC_VERSION 2 (#225): + xrGetWorkspaceTileSizeDXR (live tile canvas px).
+#define XR_DXR_display_zones_SPEC_VERSION 2
 
 #define XR_TYPE_DISPLAY_ZONE_CAPABILITIES_DXR               ((XrStructureType)1004999150)
 #define XR_TYPE_DISPLAY_ZONE_DXR                            ((XrStructureType)1004999151)
@@ -467,6 +468,11 @@ typedef XrResult(XRAPI_PTR *PFN_xrGetDisplayZoneCapabilitiesDXR)(
 
 typedef XrResult(XRAPI_PTR *PFN_xrGetDisplayZoneRecommendedViewSizeDXR)(
     XrSession session, const XrRect2Di *zoneRect, XrExtent2Di *recommendedViewSize);
+
+// (spec v2, #225) Live workspace-tile canvas px — follows the shell's 3D-window
+// resize; a minimized tile queries it to re-author its zone/Local2D each frame.
+typedef XrResult(XRAPI_PTR *PFN_xrGetWorkspaceTileSizeDXR)(
+    XrSession session, XrExtent2Di *tileSize);
 
 #ifdef __cplusplus
 }
