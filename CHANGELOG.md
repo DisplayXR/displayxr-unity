@@ -5,6 +5,17 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.8.0] - 2026-07-23
+
+### Changed
+- **Weave-to-texture GameView is now the editor Play Mode default** (#227, #228): pressing Play weaves the runtime's stereo **inside** the Unity Game view instead of a separate external window — dockable/maximizable, identical to a built player. Opt back into the previous external-window Play Mode with `DISPLAYXR_PROV_EXTERNAL_WINDOW=1`. (Promotes the v2.6.0 texture path, formerly probe-gated behind `DISPLAYXR_PROV_TEXTURE_PROBE`, to the default.)
+
+### Added
+- Workspace-tile shell weave now consumes `xrGetWorkspaceTileSizeDXR` so the provider renders at the shell-assigned tile size rather than a fixed window size (#225, #226).
+
+### Fixed
+- README/docs vendor-neutrality pass: neutralized the vendor name in the `sim_display` note, corrected `SIM_DISPLAY_ENABLE` guidance (sim_display is the automatic fallback), and de-staled the MinimalTransparent README to the provider architecture.
+
 ## [2.7.0] - 2026-07-18
 
 ### Added
