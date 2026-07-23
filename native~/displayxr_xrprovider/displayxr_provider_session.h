@@ -375,6 +375,17 @@ int dxr_prov_get_present_mode(void);
 DISPLAYXR_EXPORT void dxr_prov_set_texture_mode(int enable);
 int dxr_prov_texture_mode_active(void);
 
+/// Unity project color space, pushed from C# BEFORE session start (1 = Linear, 0 = Gamma).
+/// A Linear project on the PRESENT path (undocked editor window / built player) gets an sRGB
+/// swapchain so Unity encodes linear→sRGB on store — the runtime's window present applies no
+/// such encode, so without this the present output is too dark. The docked texture/mirror path
+/// (Unity's GameView present does the encode) and Gamma projects keep UNORM.
+/// dxr_prov_swapchain_is_srgb() reports whether the primary swapchain was actually created sRGB
+/// (used by the display-provider TU to set kUnityXRRenderTextureFlagsSRGB on the eye textures).
+DISPLAYXR_EXPORT void dxr_prov_set_color_space_linear(int linear);
+int dxr_prov_get_color_space_linear(void);
+int dxr_prov_swapchain_is_srgb(void);
+
 /// (#740 stereo unswap) 1 = submit the two stereo views into the OPPOSITE swapchain slots.
 /// The docked texture weave path assigns the two views in the reversed order vs
 /// maximized/floating (a ~half-lens-pitch flip, geometry-invariant, runtime/SDK-side, #740);

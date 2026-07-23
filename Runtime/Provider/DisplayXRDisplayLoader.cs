@@ -117,6 +117,12 @@ namespace DisplayXR
             // as the auto-switch attempt: native overrides must be re-set per start.
             bool spi = IsSinglePassEligible();
             DisplayXRProviderNative.dxr_prov_set_single_pass(spi ? 1 : 0);
+            // Push the project color space BEFORE the subsystem starts (session_start → swapchain
+            // format). A Linear project on the present path needs an sRGB swapchain so Unity encodes
+            // linear→sRGB on store (else the runtime's window present / built player looks too dark;
+            // the docked texture path is unaffected — Unity's GameView present does the encode).
+            DisplayXRProviderNative.dxr_prov_set_color_space_linear(
+                QualitySettings.activeColorSpace == ColorSpace.Linear ? 1 : 0);
             // GameView weave-to-texture fill (Task (a)): stash the Game view's render rect
             // BEFORE the subsystem (→ native session_start) so the forced full-window zone
             // is born at the panel's native resolution (otherwise it freezes at the weave

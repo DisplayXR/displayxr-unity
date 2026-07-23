@@ -982,6 +982,43 @@ static int ps_create_bridge_d3d11(void); // D3D11 editor bridge (#195); defined 
 #endif
 static void ps_publish_stereo_matrices(void); // defined after dxr_prov_begin_frame (overlay hit-test)
 
+// --- Color-space-aware swapchain format (present-path sRGB gamma fix) ---------
+// A Linear-color-space Unity project renders LINEAR values; correct display needs a final
+// linear→sRGB encode. In the DOCKED texture/mirror path Unity's GameView present applies that
+// encode, so the eye/woven textures stay UNORM and look right. But on the PRESENT path
+// (undocked editor window + built player) the runtime presents its woven output straight to the
+// window with NO such encode → the image is too dark. Fix: for a Linear project ON THE PRESENT
+// PATH, request an sRGB swapchain so Unity encodes linear→sRGB on store and the runtime presents
+// correctly-encoded pixels (the standard OpenXR sRGB contract). Gamma projects and the docked
+// path keep UNORM. Safe fallback: if the runtime advertises no sRGB format, s_swapchain_srgb
+// stays 0 and everything is byte-identical to before.
+static int s_color_space_linear = 0; // Unity project color space (C# pushes pre-session)
+static int s_swapchain_srgb     = 0; // primary swapchain created with an sRGB format
+static int s_sc_present_path    = 1; // 1 = runtime presents (no shared texture bound); set in
+                                     // session_start before ps_create_swapchain (s_probe_handle
+                                     // is declared later in the file, so route it through this).
+void dxr_prov_set_color_space_linear(int linear)
+{
+	s_color_space_linear = linear ? 1 : 0;
+	ps_log("[DisplayXR-PROV] color space: %s\n", linear ? "Linear" : "Gamma");
+}
+int dxr_prov_get_color_space_linear(void) { return s_color_space_linear; }
+int dxr_prov_swapchain_is_srgb(void) { return s_swapchain_srgb; }
+#ifdef _WIN32
+// Map the chosen XR swapchain format id to the DXGI format for the paired bridge/staging
+// resources (Unity renders into the bridge; it must match the swapchain). Pure refactor for
+// the UNORM cases (28/87); adds the sRGB variants (29/91) for the present-path Linear fix.
+static DXGI_FORMAT ps_sc_dxgi_format(int64_t f)
+{
+	switch (f) {
+	case 87: return DXGI_FORMAT_B8G8R8A8_UNORM;
+	case 29: return DXGI_FORMAT_R8G8B8A8_UNORM_SRGB;
+	case 91: return DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+	default: return DXGI_FORMAT_R8G8B8A8_UNORM; // 28
+	}
+}
+#endif
+
 static int ps_create_swapchain(void)
 {
 	if (s_ps.swapchain_created) return 1;
@@ -1025,16 +1062,47 @@ static int ps_create_swapchain(void)
 	int64_t formats[32];
 	if (fmt_count > 32) fmt_count = 32;
 	s_ps.pfn_enumerate_swapchain_formats(s_ps.session, fmt_count, &fmt_count, formats);
+	// Log the runtime's advertised formats once (diagnoses sRGB availability for the fix).
+	{
+		char fbuf[256]; int fn = 0;
+		for (uint32_t i = 0; i < fmt_count && fn < 200; i++)
+			fn += snprintf(fbuf + fn, sizeof(fbuf) - fn, "%lld ", (long long)formats[i]);
+		ps_log("[DisplayXR-PROV] swapchain formats advertised: %s\n", fbuf);
+	}
+	// Present path (runtime presents to its window / built player) + Linear project ⇒ prefer an
+	// sRGB format so Unity encodes linear→sRGB on store (else the runtime present is too dark).
+	// Docked texture path (shared texture bound → s_probe_handle set) and Gamma projects keep UNORM.
+	int present_path = s_sc_present_path;
+	int want_srgb = s_color_space_linear && present_path;
 	int64_t format = formats[0];
 	for (uint32_t i = 0; i < fmt_count; i++) {
 #ifdef _WIN32
-		if (formats[i] == 28) { format = 28; break; } // DXGI_FORMAT_R8G8B8A8_UNORM
-		if (formats[i] == 87) { format = 87; }         // DXGI_FORMAT_B8G8R8A8_UNORM
+		if (want_srgb) {
+			if (formats[i] == 29) { format = 29; break; } // DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
+			if (formats[i] == 91) { format = 91; }         // DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
+		} else {
+			if (formats[i] == 28) { format = 28; break; } // DXGI_FORMAT_R8G8B8A8_UNORM
+			if (formats[i] == 87) { format = 87; }         // DXGI_FORMAT_B8G8R8A8_UNORM
+		}
 #else
-		if (formats[i] == 70) { format = 70; break; } // MTLPixelFormatRGBA8Unorm
-		if (formats[i] == 80) { format = 80; }         // MTLPixelFormatBGRA8Unorm
+		if (want_srgb) {
+			if (formats[i] == 71) { format = 71; break; } // MTLPixelFormatRGBA8Unorm_sRGB
+			if (formats[i] == 81) { format = 81; }         // MTLPixelFormatBGRA8Unorm_sRGB
+		} else {
+			if (formats[i] == 70) { format = 70; break; } // MTLPixelFormatRGBA8Unorm
+			if (formats[i] == 80) { format = 80; }         // MTLPixelFormatBGRA8Unorm
+		}
 #endif
 	}
+#ifdef _WIN32
+	s_swapchain_srgb = (format == 29 || format == 91);
+#else
+	s_swapchain_srgb = (format == 71 || format == 81);
+#endif
+	if (want_srgb && !s_swapchain_srgb)
+		ps_log("[DisplayXR-PROV] WARN: Linear project but runtime advertised NO sRGB swapchain format — present stays too dark (needs a runtime-side present encode)\n");
+	ps_log("[DisplayXR-PROV] swapchain format=%lld srgb=%d (linear=%d present_path=%d)\n",
+	       (long long)format, s_swapchain_srgb, s_color_space_linear, present_path);
 
 	XrSwapchainCreateInfo ci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
 	ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
@@ -1319,7 +1387,7 @@ static int ps_alloc_shared_tex(uint32_t w, uint32_t h, UINT16 arr,
 		D3D12_RESOURCE_DESC pd = {};
 		pd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
 		pd.Width = w; pd.Height = h; pd.DepthOrArraySize = arr; pd.MipLevels = 1;
-		pd.Format = (s_ps.sc_format == 87) ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
+		pd.Format = ps_sc_dxgi_format(s_ps.sc_format);
 		pd.SampleDesc.Count = 1;
 		pd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
 		pd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
@@ -1344,7 +1412,7 @@ static int ps_alloc_shared_tex(uint32_t w, uint32_t h, UINT16 arr,
 	bd.Height = h;
 	bd.DepthOrArraySize = arr;
 	bd.MipLevels = 1;
-	bd.Format = (s_ps.sc_format == 87) ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
+	bd.Format = ps_sc_dxgi_format(s_ps.sc_format);
 	bd.SampleDesc.Count = 1;
 	bd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
 	bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
@@ -1371,7 +1439,7 @@ static ID3D11Texture2D *ps_alloc_unity_tex(uint32_t w, uint32_t h, uint32_t arr,
 	if (!s_ps.unity_d3d11_device || w == 0 || h == 0 || arr == 0) return NULL;
 	D3D11_TEXTURE2D_DESC td = {};
 	td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = arr;
-	td.Format = (fmt == 87) ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
+	td.Format = ps_sc_dxgi_format(fmt);
 	td.SampleDesc.Count = 1;
 	td.Usage = D3D11_USAGE_DEFAULT;
 	td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
@@ -1487,7 +1555,7 @@ static int ps_alloc_shared_tex_d3d11(uint32_t w, uint32_t h, uint32_t arr,
 	if (!s_ps.own_d3d11_device || !s_ps.unity_d3d11_device || w == 0 || h == 0 || arr == 0) return 0;
 	D3D11_TEXTURE2D_DESC td = {};
 	td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = arr;
-	td.Format = (fmt == 87) ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
+	td.Format = ps_sc_dxgi_format(fmt);
 	td.SampleDesc.Count = 1;
 	td.Usage = D3D11_USAGE_DEFAULT;
 	td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
@@ -3890,6 +3958,11 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	}
 
 	ps_enumerate_modes();
+
+	// Present path = the runtime presents its woven output to a window (no shared texture bound):
+	// undocked editor window + every built player. Drives the sRGB-swapchain gamma fix in
+	// ps_create_swapchain (s_probe_handle is a file-static declared later, so latch it here).
+	s_sc_present_path = (s_probe_handle == NULL);
 
 	// Swapchain is created on session-ready (deferred), but attempt early too.
 	ps_create_swapchain();

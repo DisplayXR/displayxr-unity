@@ -166,6 +166,16 @@ namespace DisplayXR
         public static extern void dxr_prov_set_texture_mode(int enable);
 
         /// <summary>
+        /// Push the Unity project color space BEFORE session start (1 = Linear, 0 = Gamma). A
+        /// Linear project on the PRESENT path (undocked editor window / built player) gets an sRGB
+        /// swapchain so Unity encodes linear→sRGB on store — the runtime's window present applies no
+        /// such encode, so without this the present output is too dark. The docked texture/mirror
+        /// path and Gamma projects keep UNORM. Loader calls this each Start (state is memset on stop).
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void dxr_prov_set_color_space_linear(int linear);
+
+        /// <summary>
         /// (#740) Publish the matched Game-view pane HWND + render-origin-minus-pane-window
         /// offset + size so a native WM_TIMER keeps the weave window glued to the pane during
         /// OS modal drags (which freeze the C# glue). NULL pane disables.
