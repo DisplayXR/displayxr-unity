@@ -390,7 +390,7 @@ The plugin logs a warning but doesn't crash — your app runs in mono (non-stere
 
 ## Testing Without Hardware
 
-The **sim_display** driver provides a software 3D display for development. When no Leia 3D panel is present, the runtime **falls back to `sim_display` automatically** — you don't need to enable it. Optionally pick the sim output format with `SIM_DISPLAY_OUTPUT`:
+The **sim_display** driver provides a software 3D display for development. When no physical 3D display is present, the runtime **falls back to `sim_display` automatically** — you don't need to enable it. Optionally pick the sim output format with `SIM_DISPLAY_OUTPUT`:
 
 ```bash
 # Windows
