@@ -3962,7 +3962,12 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	// Present path = the runtime presents its woven output to a window (no shared texture bound):
 	// undocked editor window + every built player. Drives the sRGB-swapchain gamma fix in
 	// ps_create_swapchain (s_probe_handle is a file-static declared later, so latch it here).
+	// macOS has no texture-mode shared texture (Editor+Windows-only), so it is always present path.
+#ifdef _WIN32
 	s_sc_present_path = (s_probe_handle == NULL);
+#else
+	s_sc_present_path = 1;
+#endif
 
 	// Swapchain is created on session-ready (deferred), but attempt early too.
 	ps_create_swapchain();
