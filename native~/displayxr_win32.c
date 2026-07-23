@@ -3074,9 +3074,24 @@ displayxr_set_overlay_cursor(int shape)
 	InterlockedExchange(&s_overlay_cursor, (LONG)shape);
 }
 
+// Provided by the provider session (#225): the live workspace-tile canvas px.
+extern int dxr_prov_workspace_tile_size(uint32_t *w, uint32_t *h);
+
 void
 displayxr_get_overlay_size(int *width, int *height)
 {
+	// Workspace tile (#225): report the shell-driven tile canvas so the app
+	// authors its window/zone/Local2D for the tile and re-fits on resize (its
+	// own minimized OS window/backbuffer can't track the 3D-window resize).
+	if (displayxr_is_shell_mode()) {
+		uint32_t tw = 0, th = 0;
+		if (dxr_prov_workspace_tile_size(&tw, &th)) {
+			if (width)  *width  = (int)tw;
+			if (height) *height = (int)th;
+			return;
+		}
+	}
+
 	// Simple-window mode has no overlay — report Unity's REAL HWND client
 	// size so C# silhouette/dst math uses the live window dimensions.
 	HWND h = (s_simple_active && s_simple_hwnd != NULL) ? s_simple_hwnd

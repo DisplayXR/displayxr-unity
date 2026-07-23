@@ -247,6 +247,14 @@ typedef struct ProviderSession {
 	uint32_t zone_max_3d;
 	PFN_xrGetDisplayZoneCapabilitiesDXR       pfn_get_zone_caps;
 	PFN_xrGetDisplayZoneRecommendedViewSizeDXR pfn_get_zone_view_size;
+	PFN_xrGetWorkspaceTileSizeDXR             pfn_get_workspace_tile_size;
+
+	// Live workspace-tile canvas size in px (#225), polled from
+	// xrGetWorkspaceTileSizeDXR. In shell/tile mode this is what the app should
+	// author its window/zone/Local2D for (it follows the shell's 3D-window
+	// resize, which a minimized tile's own backbuffer can't). 0 = not a tile /
+	// not yet known → window path.
+	uint32_t tile_px_w, tile_px_h;
 
 	// App-supplied single 3D-zone rect (client-window px, top-left origin). When
 	// valid + caps OK, the locate hook chains XrDisplayZoneDXR before the rig
@@ -737,6 +745,11 @@ static int ps_resolve_functions(void)
 		_fn = NULL;
 		s_ps.gipa(s_ps.instance, "xrGetDisplayZoneRecommendedViewSizeDXR", &_fn);
 		s_ps.pfn_get_zone_view_size = (PFN_xrGetDisplayZoneRecommendedViewSizeDXR)_fn;
+		// Live workspace-tile canvas size (#225, display_zones spec v2) — soft-
+		// resolve; NULL on an older runtime → the window/GetClientRect path is used.
+		_fn = NULL;
+		s_ps.gipa(s_ps.instance, "xrGetWorkspaceTileSizeDXR", &_fn);
+		s_ps.pfn_get_workspace_tile_size = (PFN_xrGetWorkspaceTileSizeDXR)_fn;
 		// Atlas capture (#140) — soft-resolve; inert if the runtime lacks it.
 		_fn = NULL;
 		s_ps.gipa(s_ps.instance, "xrCaptureAtlasDXR", &_fn);
@@ -838,13 +851,57 @@ static void ps_active_view_scale(float *sx, float *sy)
 	*sx = x; *sy = y;
 }
 
-// The bound overlay's live client size (= Unity's window client area). The
-// runtime weaves into this WS_CHILD overlay; per-view render res tracks it.
+extern "C" int displayxr_is_shell_mode(void); // defined in displayxr_win32.c
+
+// Poll the live workspace-tile canvas size (#225, display_zones spec v2). The
+// compositor composites this client into a shell-driven tile that follows 3D-
+// window resize; the runtime reports its current px here so a tile app tracks
+// the resize (a minimized tile's OS backbuffer can't). 0x0 when not a tile /
+// not yet bound / older runtime → callers keep the window path.
+static void ps_query_tile_size(void)
+{
+	if (!s_ps.pfn_get_workspace_tile_size || s_ps.session == XR_NULL_HANDLE)
+		return;
+	XrExtent2Di ts = {0, 0};
+	if (XR_SUCCEEDED(s_ps.pfn_get_workspace_tile_size(s_ps.session, &ts)) &&
+	    ts.width > 0 && ts.height > 0) {
+		if (s_ps.tile_px_w != (uint32_t)ts.width || s_ps.tile_px_h != (uint32_t)ts.height)
+			ps_log("[DisplayXR-PROV] workspace tile size: %dx%d (was %ux%u)\n",
+			       ts.width, ts.height, s_ps.tile_px_w, s_ps.tile_px_h);
+		s_ps.tile_px_w = (uint32_t)ts.width;
+		s_ps.tile_px_h = (uint32_t)ts.height;
+	}
+}
+
+// Bridge for the C win32 layer's displayxr_get_overlay_size (#225): the last
+// polled workspace-tile canvas px, or 0 when not a tile / not yet known.
+extern "C" int dxr_prov_workspace_tile_size(uint32_t *w, uint32_t *h)
+{
+	if (s_ps.tile_px_w > 0 && s_ps.tile_px_h > 0) {
+		if (w) *w = s_ps.tile_px_w;
+		if (h) *h = s_ps.tile_px_h;
+		return 1;
+	}
+	return 0;
+}
+
+// The size the app + provider render/author for. In workspace-tile mode (#225)
+// this is the shell-driven tile canvas (so the render follows 3D-window resize);
+// otherwise the bound overlay's live client size (= Unity's window client area).
 // Falls back to the display pixel dims when no overlay is bound yet.
 static void ps_window_size(uint32_t *w, uint32_t *h)
 {
 	uint32_t ww = 0, hh = 0;
 #ifdef _WIN32
+	// Workspace tile: author/render for the live tile canvas, not our own window.
+	if (displayxr_is_shell_mode()) {
+		if (s_ps.tile_px_w == 0 || s_ps.tile_px_h == 0)
+			ps_query_tile_size(); // lazy first fetch until the slot binds
+		if (s_ps.tile_px_w > 0 && s_ps.tile_px_h > 0) {
+			*w = s_ps.tile_px_w; *h = s_ps.tile_px_h;
+			return;
+		}
+	}
 	if (s_ps.overlay_hwnd) {
 		RECT rc;
 		if (GetClientRect((HWND)s_ps.overlay_hwnd, &rc)) {
@@ -1825,6 +1882,14 @@ int dxr_prov_reconcile_size(void)
 {
 	if (!s_ps.running || !s_ps.session_ready || !s_ps.swapchain_created) return 0;
 	if (s_ps.frame_begun) return 0; // never realloc between begin_frame and submit
+
+#ifdef _WIN32
+	// #225: re-poll the live tile size each reconcile so a 3D-window resize
+	// flows through — ps_reconcile_primary below re-sizes the swapchain to the
+	// new tile, and the app re-authors its zone from displayxr_get_overlay_size.
+	if (displayxr_is_shell_mode())
+		ps_query_tile_size();
+#endif
 
 	int primary_changed = ps_reconcile_primary();
 	ps_reconcile_extra_zones();
