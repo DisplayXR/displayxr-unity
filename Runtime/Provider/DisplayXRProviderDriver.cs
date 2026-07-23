@@ -105,7 +105,6 @@ namespace DisplayXR
         // the runtime's woven region) is born at the panel's native resolution. Pure
         // reflection into UnityEditor.GameView so the Runtime asmdef needs no UnityEditor
         // reference (Type resolves to null in a built player → inert; gated to editor+probe).
-        static int  s_probeGate = -1;   // -1 unknown, 0 off, 1 on
         static System.Type  s_gvType;
         static FieldInfo    s_parentField;       // EditorWindow.m_Parent (HostView)
         static PropertyInfo s_screenPosProp;     // GUIView.screenPosition (Rect, LOGICAL points)
@@ -237,14 +236,27 @@ namespace DisplayXR
             if (sig != s_lastGvSig) { s_lastGvSig = sig; Debug.Log("[DisplayXR] GameView instances: " + sig); }
         }
 
-        static bool ProbeEnabled()
+        /// <summary>
+        /// Editor GameView weave-to-texture is the DEFAULT (v2.8.0+): show the runtime's woven
+        /// stereo INSIDE the Unity Game view instead of a separate external window. Editor-only
+        /// (a built player uses the app-owned overlay); opt OUT with
+        /// <c>DISPLAYXR_PROV_EXTERNAL_WINDOW=1</c> to restore the pre-2.8 external-window path.
+        /// This is the single source of truth for the flip — the loader pushes it to native via
+        /// <see cref="DisplayXRProviderNative.dxr_prov_set_texture_mode"/>, and the rig glue +
+        /// re-host watcher gate on it.
+        /// </summary>
+        public static bool GameViewTextureModeEnabled()
         {
             if (!Application.isEditor) return false;
-            if (s_probeGate < 0)
-                s_probeGate = System.Environment.GetEnvironmentVariable(
-                    "DISPLAYXR_PROV_TEXTURE_PROBE") == "1" ? 1 : 0;
-            return s_probeGate == 1;
+            if (s_texModeGate < 0)
+                s_texModeGate = System.Environment.GetEnvironmentVariable(
+                    "DISPLAYXR_PROV_EXTERNAL_WINDOW") == "1" ? 0 : 1;
+            return s_texModeGate == 1;
         }
+        static int s_texModeGate = -1;
+
+        // Back-compat alias for the internal glue call sites (was the env-probe gate).
+        static bool ProbeEnabled() => GameViewTextureModeEnabled();
 
         // Zone-glue arrangement (#740/#742, SUPERSEDED experiment — env
         // DISPLAYXR_PROV_GV_ZONEGLUE=1 opts back in): the weave window parked ONCE at the

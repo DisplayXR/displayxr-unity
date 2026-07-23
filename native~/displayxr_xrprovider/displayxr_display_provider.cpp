@@ -1559,7 +1559,7 @@ LifecycleStart(UnitySubsystemHandle handle, void *userData)
 		// (keyboard still works via the raw-input sink, so it looked like "mouse dead,
 		// keyboard fine"). Skip it in the probe path.
 		void *unity_hwnd = displayxr_get_unity_main_hwnd();
-		bool probe_texture = (getenv("DISPLAYXR_PROV_TEXTURE_PROBE") != nullptr);
+		bool probe_texture = (dxr_prov_texture_mode_active() != 0);
 		if (unity_hwnd != nullptr && !probe_texture) {
 			displayxr_install_focus_hook(unity_hwnd);
 			prov_log("[DisplayXR-PROV] Lifecycle Start: installed keyboard focus/raw-input hooks (dedicated window)\n");

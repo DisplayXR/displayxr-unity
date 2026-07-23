@@ -48,8 +48,8 @@ namespace DisplayXR.Editor
     /// Test hook: touching %TEMP%\dxr_dock_toggle forces a flipped-mode restart without a
     /// physical undock (one-shot; real detection restarts back a few seconds later).
     ///
-    /// Editor+Windows only; inert unless the texture probe
-    /// (DISPLAYXR_PROV_TEXTURE_PROBE=1) is active. Triggers 1 and 3 stay ACTIVE when the
+    /// Editor+Windows only; inert unless GameView texture mode is active (the v2.8.0+
+    /// default; opt out with DISPLAYXR_PROV_EXTERNAL_WINDOW=1). Triggers 1 and 3 stay ACTIVE when the
     /// bind mode is env-pinned — those restarts re-bind the SAME mode; they just need the
     /// fresh settled state.
     /// </summary>
@@ -63,7 +63,7 @@ namespace DisplayXR.Editor
         const double kMinRestartGap = 2.0;  // never cycle the subsystem faster
         const double kDetectGap     = 0.25; // detection cadence
 
-        static int         s_gate = -1;     // DISPLAYXR_PROV_TEXTURE_PROBE cache
+        static int         s_gate = -1;     // GameView texture-mode active cache
         static int         s_modePinned = -1; // bind mode env-pinned (dock trigger inert)
         static System.Type s_gvType;
         static string      s_boundSig;      // GameView instance-set signature at session bind
@@ -93,8 +93,9 @@ namespace DisplayXR.Editor
         {
             if (s_gate < 0)
             {
-                s_gate = System.Environment.GetEnvironmentVariable(
-                             "DISPLAYXR_PROV_TEXTURE_PROBE") == "1" ? 1 : 0;
+                // Weave-to-texture GameView is the editor default (v2.8.0+); the watcher is
+                // live whenever texture mode is active (opt out: DISPLAYXR_PROV_EXTERNAL_WINDOW=1).
+                s_gate = DisplayXRProviderDriver.GameViewTextureModeEnabled() ? 1 : 0;
                 // Bind mode env-pinned (test launchers) → the dock-state trigger is inert
                 // (a restart could not change the mode); re-host + death triggers stay live.
                 s_modePinned =

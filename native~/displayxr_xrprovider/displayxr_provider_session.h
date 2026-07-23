@@ -365,6 +365,16 @@ void *dxr_prov_get_external_weave_hwnd(void);
 DISPLAYXR_EXPORT void dxr_prov_set_present_mode(int enable);
 int dxr_prov_get_present_mode(void);
 
+/// Editor GameView weave-to-texture master enable (#740). Set from C# BEFORE the session
+/// starts: 1 = weave the runtime's stereo into the Unity Game view (editor default);
+/// 0 = the legacy external-window path (built players, or DISPLAYXR_PROV_EXTERNAL_WINDOW=1
+/// opt-out). C# is the source of truth for editor-vs-player, so a player never enables it.
+/// When the setter is never called, ps_texture_mode falls back to the DISPLAYXR_PROV_TEXTURE_PROBE
+/// env var (standalone diagnostics). dxr_prov_texture_mode_active() reports the resolved state
+/// (used by the provider to skip the focus hook in texture mode). Editor + Windows only.
+DISPLAYXR_EXPORT void dxr_prov_set_texture_mode(int enable);
+int dxr_prov_texture_mode_active(void);
+
 /// (#740 stereo unswap) 1 = submit the two stereo views into the OPPOSITE swapchain slots.
 /// The docked texture weave path assigns the two views in the reversed order vs
 /// maximized/floating (a ~half-lens-pitch flip, geometry-invariant, runtime/SDK-side, #740);
