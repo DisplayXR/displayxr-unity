@@ -155,6 +155,17 @@ namespace DisplayXR
         public static extern void dxr_prov_set_present_mode(int enable);
 
         /// <summary>
+        /// Editor GameView weave-to-texture master enable (#740): 1 = weave the runtime's
+        /// stereo into the Unity Game view (editor default), 0 = legacy external-window path.
+        /// The loader calls this BEFORE the subsystem starts with
+        /// <see cref="DisplayXRProviderDriver.GameViewTextureModeEnabled"/> — 1 in editor Play
+        /// Mode unless <c>DISPLAYXR_PROV_EXTERNAL_WINDOW=1</c>, 0 in a built player. A player
+        /// never passes 1, so it structurally cannot bind texture mode. Windows-only effect.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void dxr_prov_set_texture_mode(int enable);
+
+        /// <summary>
         /// (#740) Publish the matched Game-view pane HWND + render-origin-minus-pane-window
         /// offset + size so a native WM_TIMER keeps the weave window glued to the pane during
         /// OS modal drags (which freeze the C# glue). NULL pane disables.

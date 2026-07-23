@@ -2957,7 +2957,8 @@ extern "C" uint32_t dxr_prov_get_extra_zone_acquired_index(uint32_t ei)
 // NOTE: in texture mode the runtime does NOT present, so the overlay/dedicated
 // window stays blank while the probe runs — the .bmp is the success signal.
 // ============================================================================
-static int              s_probe_enabled = 0;    // DISPLAYXR_PROV_TEXTURE_PROBE
+static int              s_probe_enabled = 0;    // texture mode active (dxr_prov_set_texture_mode / env)
+static int              s_probe_readback = 0;   // .bmp readback armed — DISPLAYXR_PROV_TEXTURE_PROBE only
 #ifdef _WIN32
 static ID3D11Texture2D *s_probe_tex11   = NULL;  // shared texture (D3D11 bind, own device)
 static ID3D12Resource  *s_probe_tex12   = NULL;  // shared texture (D3D12 bind)
@@ -2991,11 +2992,27 @@ static ID3D12Resource  *s_probe_tex12_unity = NULL; // D3D12 Unity-device view o
 #endif
 static uint32_t         s_probe_woven_w = 0, s_probe_woven_h = 0;
 
-static int ps_probe_env(void)
+// Editor GameView weave-to-texture is the DEFAULT (v2.8.0+): C# passes the enable via
+// dxr_prov_set_texture_mode BEFORE session start — 1 in editor Play Mode (unless
+// DISPLAYXR_PROV_EXTERNAL_WINDOW=1 opts out), 0 in a built player. C# is the single source
+// of truth for "am I the editor", so a player structurally can NEVER bind texture mode
+// (it never calls the setter with 1). The DISPLAYXR_PROV_TEXTURE_PROBE env var remains a
+// standalone-diagnostic fallback (forces texture mode on if the setter was never called)
+// and SEPARATELY arms the .bmp readback (s_probe_readback).
+static int s_texture_mode_forced = -1; // -1 unset (fall back to env), 0 off, 1 on
+static int ps_texture_mode(void)
 {
+	if (s_texture_mode_forced >= 0) return s_texture_mode_forced;
 	const char *e = getenv("DISPLAYXR_PROV_TEXTURE_PROBE");
 	return (e && *e && *e != '0') ? 1 : 0;
 }
+void dxr_prov_set_texture_mode(int enable)
+{
+	s_texture_mode_forced = enable ? 1 : 0;
+	ps_log("[DisplayXR-PROV] texture mode set: %s\n",
+	       enable ? "ON (editor GameView weave)" : "off (external window)");
+}
+int dxr_prov_texture_mode_active(void) { return ps_texture_mode(); }
 
 // Bind mode within the editor GameView feature (#740 hybrid): the feature (s_probe_enabled)
 // binds in TEXTURE mode when DOCKED (weave into a shared texture → mirror-blit into the
@@ -3721,15 +3738,17 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	win_binding.transparentBackgroundEnabled = use_transparent ? XR_TRUE : XR_FALSE;
 	win_binding.chromaKeyColor = 0;
 
-	// Weave-to-texture PROBE (experiment): bind in TEXTURE MODE so the runtime
-	// weaves into our shared texture instead of presenting to the overlay window.
+	// Weave-to-texture (editor GameView default, #740): bind in TEXTURE MODE so the
+	// runtime weaves into our shared texture instead of presenting to the overlay window.
 	// windowHandle stays set (weaver position tracking), mirroring the ref app.
-	s_probe_enabled = ps_probe_env();
+	s_probe_enabled  = ps_texture_mode();
+	// The .bmp readback stays a pure diagnostic: armed ONLY when the env var is set, so it
+	// never fires in the default (setter-driven) editor path.
+	s_probe_readback = (getenv("DISPLAYXR_PROV_TEXTURE_PROBE") != NULL) ? 1 : 0;
 	// Unconditional build marker: if this line is ABSENT from the log, the editor is
-	// running a STALE DLL (restart Unity). If present with env_probe=0, the env var
-	// DISPLAYXR_PROV_TEXTURE_PROBE=1 did not reach the editor process.
+	// running a STALE DLL (restart Unity).
 	int bind_present = s_probe_enabled && ps_bind_present();
-	ps_log("[DisplayXR-PROV] PROBE build=weave-to-texture-2tile env_probe=%d bind=%s\n",
+	ps_log("[DisplayXR-PROV] build=weave-to-texture-2tile texture_mode=%d bind=%s\n",
 	       s_probe_enabled, bind_present ? "PRESENT" : "TEXTURE");
 	ps_probe_cleanup(); // clears counters + any leftover texture from a prior session
 	// PRESENT mode (undocked, #740 hybrid): skip the shared-texture bind entirely — the
@@ -5464,7 +5483,7 @@ int dxr_prov_submit_frame(uint32_t image_index)
 	// e.g. while the Game tab is maximized) → displayxr_prov_woven_ondemand.bmp. Lets us
 	// FFT the interlace phase top-vs-bottom to localize the maximize seam. Own-device,
 	// coherent (same path as the one-shot below).
-	if (s_probe_enabled && s_probe_handle) {
+	if (s_probe_readback && s_probe_handle) {
 		const char *tmp = getenv("TEMP"); if (!tmp || !*tmp) tmp = ".";
 		char trig[512];
 		_snprintf_s(trig, sizeof(trig), _TRUNCATE, "%s\\displayxr_woven_trigger", tmp);
@@ -5484,7 +5503,7 @@ int dxr_prov_submit_frame(uint32_t image_index)
 
 	// Weave-to-texture PROBE: one-shot readback of the runtime-woven shared texture
 	// after the warmup gate. The runtime wove into it during xrEndFrame above.
-	if (s_probe_enabled && s_probe_handle && !s_probe_dumped) {
+	if (s_probe_readback && s_probe_handle && !s_probe_dumped) {
 		if (++s_probe_frames >= kProbeDumpFrame) {
 			char path[512]; ps_probe_path(path, sizeof(path));
 			if (s_ps.graphics_api == DXR_GFX_D3D11) {

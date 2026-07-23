@@ -103,6 +103,13 @@ namespace DisplayXR
             // child-glue (in-tab occlusion), undocked → present. Runs on every Start, so a
             // mid-Play dock-transition restart (Stop→Start) re-binds the right mode.
             DisplayXRProviderDriver.ApplyDockModeForSessionStart();
+            // (#740) Weave-to-texture GameView is the editor DEFAULT (v2.8.0+): push the
+            // enable to native BEFORE the subsystem starts (session_start reads it to bind
+            // texture vs external-window). C# owns the editor-vs-player decision, so a built
+            // player passes 0 here and can never bind texture mode. Re-set per Start like the
+            // other native overrides (session teardown memsets the provider state).
+            DisplayXRProviderNative.dxr_prov_set_texture_mode(
+                DisplayXRProviderDriver.GameViewTextureModeEnabled() ? 1 : 0);
             // Re-push the render-path decision on EVERY start (#740): the native session
             // teardown memsets the provider state (only runtime_lib survives), so a mid-Play
             // subsystem restart (GameView re-host watcher, future dock auto-switch) would
@@ -121,11 +128,10 @@ namespace DisplayXR
             // presentation goes through the mirror-blit. Select the RESERVED LeftEye mode
             // app-side so QueryMirrorViewBlitDesc is invoked (custom mode ids threw Unity's
             // "Invalide XRSDK BlitMode" assertion). Complements the native frame-desc mode.
-            if (Application.isEditor && DisplaySubsystem != null
-                && System.Environment.GetEnvironmentVariable("DISPLAYXR_PROV_TEXTURE_PROBE") == "1")
+            if (DisplaySubsystem != null && DisplayXRProviderDriver.GameViewTextureModeEnabled())
             {
                 DisplaySubsystem.SetPreferredMirrorBlitMode((int)XRMirrorViewBlitMode.LeftEye);
-                Debug.Log("[DisplayXR] Provider: editor probe → preferred mirror blit mode = LeftEye (Task a)");
+                Debug.Log("[DisplayXR] Provider: editor GameView texture mode → preferred mirror blit mode = LeftEye (#740)");
             }
             DisplayXRProviderDriver.EnsureInstance();
             return true;
