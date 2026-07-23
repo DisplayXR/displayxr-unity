@@ -5,6 +5,11 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.8.1] - 2026-07-23
+
+### Fixed
+- Present-path output was too dark for Linear color-space projects (HDRP, URP default): the runtime's window present (undocked editor window + built player) applied no linear→sRGB encode. The provider now requests an sRGB swapchain for Linear projects on the present path so Unity encodes linear→sRGB on store (docked texture path and Gamma projects unchanged). (#229/#230)
+
 ## [2.8.0] - 2026-07-23
 
 ### Changed
