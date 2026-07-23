@@ -389,6 +389,19 @@ static void create_extra_zone_textures()
 	}
 }
 
+// sRGB-aware flags for the PRIMARY eye render textures Unity draws into. When the primary
+// swapchain was created sRGB (a Linear project on the present path — see
+// dxr_prov_set_color_space_linear), tell Unity to render into an sRGB view so it encodes
+// linear→sRGB on store; the runtime then presents correctly-encoded pixels. Otherwise (docked
+// texture path, Gamma projects, or a runtime with no sRGB format) this is just the UV flag —
+// byte-identical to before. NOT applied to the woven-mirror texture or the UI/zone layers.
+static uint32_t prov_eye_tex_flags(void)
+{
+	uint32_t f = kUnityXRRenderTextureFlagsUVDirectionTopToBottom;
+	if (dxr_prov_swapchain_is_srgb()) f |= kUnityXRRenderTextureFlagsSRGB;
+	return f;
+}
+
 // GameView mirror (Task (a)): wrap the runtime-woven shared texture as a Unity texture
 // so MainQueryMirrorViewBlitDesc can blit it into the editor Game window. Independent of
 // the per-eye render textures; runs only when texture mode published a woven texture.
@@ -452,7 +465,7 @@ void create_textures_if_ready()
 				desc.width = w;
 				desc.height = h;
 				desc.textureArrayLength = arr; // 2 -> SPI texture array
-				desc.flags = kUnityXRRenderTextureFlagsUVDirectionTopToBottom;
+				desc.flags = prov_eye_tex_flags();
 				UnityXRRenderTextureId id = 0;
 				if (s_display->CreateTexture(s_handle, &desc, &id) != kUnitySubsystemErrorCodeSuccess) {
 					prov_log("[DisplayXR-PROV] CreateTexture (Metal SPI array) failed\n");
@@ -479,7 +492,7 @@ void create_textures_if_ready()
 				desc.width = sw;
 				desc.height = sh;
 				desc.textureArrayLength = 1; // single-slice view per eye
-				desc.flags = kUnityXRRenderTextureFlagsUVDirectionTopToBottom;
+				desc.flags = prov_eye_tex_flags();
 				UnityXRRenderTextureId id = 0;
 				if (s_display->CreateTexture(s_handle, &desc, &id) != kUnitySubsystemErrorCodeSuccess) {
 					prov_log("[DisplayXR-PROV] CreateTexture (Metal slice view) failed\n");
@@ -523,7 +536,7 @@ void create_textures_if_ready()
 			desc.width = w;
 			desc.height = h;
 			desc.textureArrayLength = arr; // 2 -> SPI texture array
-			desc.flags = kUnityXRRenderTextureFlagsUVDirectionTopToBottom;
+			desc.flags = prov_eye_tex_flags();
 			UnityXRRenderTextureId id = 0;
 			if (s_display->CreateTexture(s_handle, &desc, &id) != kUnitySubsystemErrorCodeSuccess) {
 				prov_log("[DisplayXR-PROV] CreateTexture (D3D11 zero-copy swapchain image) failed\n");
@@ -555,7 +568,7 @@ void create_textures_if_ready()
 		desc.width = w;
 		desc.height = h;
 		desc.textureArrayLength = arr;  // 2 -> SPI texture array
-		desc.flags = kUnityXRRenderTextureFlagsUVDirectionTopToBottom; // D3D top-left origin
+		desc.flags = prov_eye_tex_flags(); // D3D top-left origin
 
 		UnityXRRenderTextureId id = 0;
 		UnitySubsystemErrorCode rc = s_display->CreateTexture(s_handle, &desc, &id);
@@ -586,7 +599,7 @@ void create_textures_if_ready()
 			desc.width = w0;
 			desc.height = h0;
 			desc.textureArrayLength = 1;  // single-slice per eye
-			desc.flags = kUnityXRRenderTextureFlagsUVDirectionTopToBottom;
+			desc.flags = prov_eye_tex_flags();
 
 			UnityXRRenderTextureId id = 0;
 			if (s_display->CreateTexture(s_handle, &desc, &id) != kUnitySubsystemErrorCodeSuccess) {
