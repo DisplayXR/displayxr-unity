@@ -5,6 +5,11 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.8.2] - 2026-07-24
+
+### Fixed
+- URP docked editor Game view was black in weave-to-texture Play Mode (#231): the boot splash's `WaitForEndOfFrame` stalled the docked GameView texture path, and the window-space UI (wsui) layer wasn't rendered on the texture path. Fixed by driving the wsui camera via an explicit `Camera.Render` and adding a native shader-blit GameView mirror so the woven stereo lands in the docked Game view. (BiRP/HDRP and the undocked present path are unchanged.)
+
 ## [2.8.1] - 2026-07-23
 
 ### Fixed
