@@ -122,7 +122,7 @@ if(WIN32)
     list(APPEND HEADERS displayxr_win32.h displayxr_vk_loader.h)
     # dwmapi + advapi32: MSVC links them via #pragma comment(lib, ...) in the TUs,
     # but MinGW (the macOS cross-compile check) ignores that pragma — list them here.
-    link_libraries(user32 d3d11 d3d12 dxgi dwmapi advapi32)
+    link_libraries(user32 d3d11 d3d12 dxgi dwmapi advapi32 d3dcompiler)
 endif()
 
 # --- Build shared library ---

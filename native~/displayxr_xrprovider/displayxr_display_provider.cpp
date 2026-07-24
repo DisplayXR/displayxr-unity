@@ -21,6 +21,7 @@
 #include <d3d12.h>
 #include <d3d11.h> // D3D11 zero-copy backend (#195)
 #include <dxgi1_4.h>
+#include <d3dcompiler.h> // native mirror shader blit (urp-editor GameView, BGRA->RGBA)
 #endif
 
 #include "../unity_pluginapi/IUnityInterface.h"
@@ -1172,14 +1173,170 @@ MainUpdateDisplayState(UnitySubsystemHandle handle, void *userData, UnityXRDispl
 static int s_native_mirror_env = -1;
 static bool native_mirror_enabled()
 {
+	// DEFAULT ON: the native shader-blit is the GameView mirror path (only engages when a woven
+	// texture exists, i.e. editor docked/texture mode). Unity's own blitParams mirror produces a
+	// BLACK docked Game view for URP (its blit is discarded inside URP's RenderGraph GameView
+	// present) — the native draw writes straight to the presented mirror RT. Opt out with
+	// DISPLAYXR_PROV_NATIVE_MIRROR=0 (restores Unity's blitParams path).
 	if (s_native_mirror_env < 0) {
 		const char *e = getenv("DISPLAYXR_PROV_NATIVE_MIRROR");
-		s_native_mirror_env = (e && e[0] == '1') ? 1 : 0;
+		s_native_mirror_env = (e && e[0] == '0') ? 0 : 1; // default ON
 	}
 	return s_native_mirror_env == 1;
 }
 
 #ifdef _WIN32  // native mirror blit is D3D12-only (macOS stub below)
+// Native shader blit (urp-editor-black-screen fix): sample the woven texture (BGRA, fmt 87)
+// and DRAW it into the GameView mirror RT (RGBA, fmt 28) — a format-converting blit that
+// CopyTextureRegion cannot do (RGBA and BGRA are different DXGI copy groups). Unity's own
+// blitParams mirror path produces black for URP (its blit is issued inside URP's RenderGraph
+// GameView present and gets discarded), whereas this native callback writes straight to the
+// presented mirror RT — proven by the red-clear test. Pipeline is built once per RT format.
+static ID3D12RootSignature  *s_blit_rs       = nullptr;
+static ID3D12PipelineState  *s_blit_pso      = nullptr;
+static ID3D12DescriptorHeap *s_blit_srvheap  = nullptr; // shader-visible, 1 SRV
+static ID3D12DescriptorHeap *s_blit_rtvheap  = nullptr; // 1 RTV
+static DXGI_FORMAT           s_blit_pso_fmt   = DXGI_FORMAT_UNKNOWN;
+
+static bool prov_ensure_blit_pipeline(ID3D12Device *dev, DXGI_FORMAT rtFmt)
+{
+	if (s_blit_pso && s_blit_pso_fmt == rtFmt) return true;
+	if (s_blit_pso) { s_blit_pso->Release(); s_blit_pso = nullptr; }
+	if (!s_blit_srvheap) {
+		D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+		hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; hd.NumDescriptors = 1;
+		hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+		if (FAILED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&s_blit_srvheap)))) return false;
+	}
+	if (!s_blit_rtvheap) {
+		D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+		hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; hd.NumDescriptors = 1;
+		if (FAILED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&s_blit_rtvheap)))) return false;
+	}
+	if (!s_blit_rs) {
+		D3D12_DESCRIPTOR_RANGE range = {};
+		range.RangeType = D3D12_DESCRIPTOR_RANGE_TYPE_SRV; range.NumDescriptors = 1;
+		range.BaseShaderRegister = 0; range.OffsetInDescriptorsFromTableStart = 0;
+		D3D12_ROOT_PARAMETER params[2] = {};
+		params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
+		params[0].Constants.ShaderRegister = 0; params[0].Constants.Num32BitValues = 4;
+		params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
+		params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
+		params[1].DescriptorTable.NumDescriptorRanges = 1;
+		params[1].DescriptorTable.pDescriptorRanges = &range;
+		params[1].ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+		D3D12_STATIC_SAMPLER_DESC samp = {};
+		samp.Filter = D3D12_FILTER_MIN_MAG_MIP_LINEAR;
+		samp.AddressU = samp.AddressV = samp.AddressW = D3D12_TEXTURE_ADDRESS_MODE_CLAMP;
+		samp.ShaderRegister = 0; samp.ShaderVisibility = D3D12_SHADER_VISIBILITY_PIXEL;
+		D3D12_ROOT_SIGNATURE_DESC rsd = {};
+		rsd.NumParameters = 2; rsd.pParameters = params;
+		rsd.NumStaticSamplers = 1; rsd.pStaticSamplers = &samp;
+		rsd.Flags = D3D12_ROOT_SIGNATURE_FLAG_ALLOW_INPUT_ASSEMBLER_INPUT_LAYOUT;
+		ID3DBlob *sig = nullptr, *err = nullptr;
+		if (FAILED(D3D12SerializeRootSignature(&rsd, D3D_ROOT_SIGNATURE_VERSION_1, &sig, &err))) {
+			if (err) err->Release(); return false; }
+		HRESULT hr = dev->CreateRootSignature(0, sig->GetBufferPointer(), sig->GetBufferSize(),
+		                                      IID_PPV_ARGS(&s_blit_rs));
+		sig->Release(); if (err) err->Release();
+		if (FAILED(hr)) return false;
+	}
+	static const char *kHLSL =
+		"cbuffer C : register(b0){ float4 srcRect; }\n"
+		"Texture2D tex : register(t0); SamplerState smp : register(s0);\n"
+		"struct V{ float4 pos:SV_Position; float2 uv:TEXCOORD0; };\n"
+		"V VSMain(uint id:SV_VertexID){ V o; float2 t=float2((id<<1)&2, id&2);\n"
+		"  o.uv=t; o.pos=float4(t*float2(2,-2)+float2(-1,1),0,1); return o; }\n"
+		"float4 PSMain(V i):SV_Target{ float2 uv=srcRect.xy + i.uv*srcRect.zw; return tex.Sample(smp, uv); }\n";
+	ID3DBlob *vs = nullptr, *ps = nullptr, *e1 = nullptr, *e2 = nullptr;
+	if (FAILED(D3DCompile(kHLSL, strlen(kHLSL), nullptr, nullptr, nullptr, "VSMain", "vs_5_0", 0, 0, &vs, &e1)) ||
+	    FAILED(D3DCompile(kHLSL, strlen(kHLSL), nullptr, nullptr, nullptr, "PSMain", "ps_5_0", 0, 0, &ps, &e2))) {
+		if (vs) vs->Release(); if (ps) ps->Release(); if (e1) e1->Release(); if (e2) e2->Release();
+		prov_log("[DisplayXR-PROV] native mirror: shader compile failed\n"); return false;
+	}
+	D3D12_GRAPHICS_PIPELINE_STATE_DESC pd = {};
+	pd.pRootSignature = s_blit_rs;
+	pd.VS.pShaderBytecode = vs->GetBufferPointer(); pd.VS.BytecodeLength = vs->GetBufferSize();
+	pd.PS.pShaderBytecode = ps->GetBufferPointer(); pd.PS.BytecodeLength = ps->GetBufferSize();
+	pd.BlendState.RenderTarget[0].RenderTargetWriteMask = D3D12_COLOR_WRITE_ENABLE_ALL;
+	pd.SampleMask = 0xFFFFFFFFu;
+	pd.RasterizerState.FillMode = D3D12_FILL_MODE_SOLID;
+	pd.RasterizerState.CullMode = D3D12_CULL_MODE_NONE;
+	pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
+	pd.NumRenderTargets = 1; pd.RTVFormats[0] = rtFmt;
+	pd.SampleDesc.Count = 1;
+	HRESULT hr = dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&s_blit_pso));
+	vs->Release(); ps->Release();
+	if (FAILED(hr)) { prov_log("[DisplayXR-PROV] native mirror: PSO create failed\n"); return false; }
+	s_blit_pso_fmt = rtFmt;
+	prov_log("[DisplayXR-PROV] native mirror: shader-blit pipeline ready\n");
+	return true;
+}
+
+// Draw the woven canvas sub-rect (src pixels [cx,cy cw x ch] of a tw x th texture) into the
+// full GameView mirror RT. Returns true if it recorded+executed the draw.
+static bool prov_shader_blit_woven(ID3D12Device *dev, IUnityGraphicsD3D12v8 *v8,
+                                   ID3D12Resource *rt, ID3D12Resource *src,
+                                   int32_t cx, int32_t cy, int32_t cw, int32_t ch,
+                                   uint32_t tw, uint32_t th)
+{
+	if (!dev || !v8 || !rt || !src || tw == 0 || th == 0) return false;
+	D3D12_RESOURCE_DESC rd = rt->GetDesc();
+	if (!prov_ensure_blit_pipeline(dev, rd.Format)) return false;
+	if (!s_mblit_alloc)
+		dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&s_mblit_alloc));
+	if (!s_mblit_list && s_mblit_alloc) {
+		dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, s_mblit_alloc, nullptr, IID_PPV_ARGS(&s_mblit_list));
+		if (s_mblit_list) s_mblit_list->Close();
+	}
+	if (!s_mblit_alloc || !s_mblit_list) return false;
+
+	// SRV for the woven source (BGRA).
+	D3D12_CPU_DESCRIPTOR_HANDLE srvCpu = s_blit_srvheap->GetCPUDescriptorHandleForHeapStart();
+	D3D12_GPU_DESCRIPTOR_HANDLE srvGpu = s_blit_srvheap->GetGPUDescriptorHandleForHeapStart();
+	D3D12_SHADER_RESOURCE_VIEW_DESC sv = {};
+	sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	sv.Format = src->GetDesc().Format; sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+	sv.Texture2D.MipLevels = 1;
+	dev->CreateShaderResourceView(src, &sv, srvCpu);
+	// RTV for the mirror RT.
+	D3D12_CPU_DESCRIPTOR_HANDLE rtvCpu = s_blit_rtvheap->GetCPUDescriptorHandleForHeapStart();
+	D3D12_RENDER_TARGET_VIEW_DESC rv = {}; rv.Format = rd.Format; rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+	dev->CreateRenderTargetView(rt, &rv, rtvCpu);
+
+	s_mblit_alloc->Reset();
+	s_mblit_list->Reset(s_mblit_alloc, s_blit_pso);
+	D3D12_RESOURCE_BARRIER b = {}; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	b.Transition.pResource = rt; b.Transition.Subresource = 0;
+	b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+	b.Transition.StateAfter  = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	s_mblit_list->ResourceBarrier(1, &b);
+	s_mblit_list->OMSetRenderTargets(1, &rtvCpu, FALSE, nullptr);
+	D3D12_VIEWPORT vp = { 0.0f, 0.0f, (float)rd.Width, (float)rd.Height, 0.0f, 1.0f };
+	D3D12_RECT sc = { 0, 0, (LONG)rd.Width, (LONG)rd.Height };
+	s_mblit_list->RSSetViewports(1, &vp);
+	s_mblit_list->RSSetScissorRects(1, &sc);
+	s_mblit_list->SetGraphicsRootSignature(s_blit_rs);
+	ID3D12DescriptorHeap *heaps[] = { s_blit_srvheap };
+	s_mblit_list->SetDescriptorHeaps(1, heaps);
+	float srcRect[4] = { (float)cx / tw, (float)cy / th, (float)cw / tw, (float)ch / th };
+	s_mblit_list->SetGraphicsRoot32BitConstants(0, 4, srcRect, 0);
+	s_mblit_list->SetGraphicsRootDescriptorTable(1, srvGpu);
+	s_mblit_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+	s_mblit_list->DrawInstanced(3, 1, 0, 0);
+	b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	b.Transition.StateAfter  = D3D12_RESOURCE_STATE_COPY_DEST;
+	s_mblit_list->ResourceBarrier(1, &b);
+	s_mblit_list->Close();
+	UnityGraphicsD3D12ResourceState st = {};
+	st.resource = rt; st.expected = D3D12_RESOURCE_STATE_COPY_DEST; st.current = D3D12_RESOURCE_STATE_COPY_DEST;
+	v8->ExecuteCommandList(s_mblit_list, 1, &st);
+	static bool logged = false;
+	if (!logged) { logged = true;
+		prov_log("[DisplayXR-PROV] native mirror: shader-blit ACTIVE (woven BGRA -> GameView RT RGBA)\n"); }
+	return true;
+}
+
 static UnitySubsystemErrorCode UNITY_INTERFACE_API
 MainBlitToMirrorViewRenderTarget(UnitySubsystemHandle handle, void *userData,
                                  const UnityXRMirrorViewBlitInfo info)
@@ -1191,57 +1348,19 @@ MainBlitToMirrorViewRenderTarget(UnitySubsystemHandle handle, void *userData,
 	if (!v8) return kUnitySubsystemErrorCodeSuccess;
 	ID3D12Device *dev = v8->GetDevice();
 	ID3D12Resource *rt = v8->TextureFromRenderBuffer(info.mirrorRtDesc->rtNative);
+
 	uint32_t ww = 0, wh = 0;
 	ID3D12Resource *src = (ID3D12Resource *)dxr_prov_get_woven_unity_texture(&ww, &wh);
 	if (!dev || !rt || !src) return kUnitySubsystemErrorCodeSuccess;
 
 	int32_t cx = 0, cy = 0, cw = 0, ch = 0; uint32_t tw = 0, th = 0;
 	dxr_prov_get_woven_canvas(&cx, &cy, &cw, &ch, &tw, &th);
-	D3D12_RESOURCE_DESC rd = rt->GetDesc();
-	D3D12_RESOURCE_DESC sd = src->GetDesc();
-	if (rd.Format != sd.Format) {
-		static bool fmt_logged = false;
-		if (!fmt_logged) { fmt_logged = true; char b[160];
-			_snprintf_s(b, sizeof(b), _TRUNCATE,
-			            "[DisplayXR-PROV] native mirror: format mismatch rt=%d src=%d -> need shader blit; leaving RT (blitParams fallback)\n",
-			            (int)rd.Format, (int)sd.Format);
-			prov_log(b); }
-		return kUnitySubsystemErrorCodeSuccess; // Unity keeps blitParams result
-	}
-	// 1:1 copy of the woven canvas region into the RT top-left. Clamp to both extents.
-	UINT cpw = (UINT)cw, cph = (UINT)ch;
-	if (cpw > (UINT)rd.Width)  cpw = (UINT)rd.Width;
-	if (cph > (UINT)rd.Height) cph = (UINT)rd.Height;
-	if ((UINT)cx + cpw > (UINT)sd.Width)  cpw = (UINT)sd.Width  - (UINT)cx;
-	if ((UINT)cy + cph > (UINT)sd.Height) cph = (UINT)sd.Height - (UINT)cy;
-	if (cpw == 0 || cph == 0) return kUnitySubsystemErrorCodeSuccess;
-
-	if (!s_mblit_alloc)
-		dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&s_mblit_alloc));
-	if (!s_mblit_list && s_mblit_alloc) {
-		dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, s_mblit_alloc, nullptr, IID_PPV_ARGS(&s_mblit_list));
-		if (s_mblit_list) s_mblit_list->Close();
-	}
-	if (!s_mblit_alloc || !s_mblit_list) return kUnitySubsystemErrorCodeSuccess;
-	s_mblit_alloc->Reset();
-	s_mblit_list->Reset(s_mblit_alloc, nullptr);
-
-	D3D12_TEXTURE_COPY_LOCATION dst = {}; dst.pResource = rt;  dst.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dst.SubresourceIndex = 0;
-	D3D12_TEXTURE_COPY_LOCATION srl = {}; srl.pResource = src; srl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; srl.SubresourceIndex = 0;
-	D3D12_BOX box = { (UINT)cx, (UINT)cy, 0, (UINT)cx + cpw, (UINT)cy + cph, 1 };
-	s_mblit_list->CopyTextureRegion(&dst, 0, 0, 0, &srl, &box); // src COMMON->COPY_SOURCE via implicit promotion
-	s_mblit_list->Close();
-
-	// RT is a Unity-tracked resource: declare expected/after so Unity brackets the transition.
-	UnityGraphicsD3D12ResourceState st = {};
-	st.resource = rt; st.expected = D3D12_RESOURCE_STATE_COPY_DEST; st.current = D3D12_RESOURCE_STATE_COPY_DEST;
-	v8->ExecuteCommandList(s_mblit_list, 1, &st);
-	static bool ok_logged = false;
-	if (!ok_logged) { ok_logged = true; char b[160];
-		_snprintf_s(b, sizeof(b), _TRUNCATE,
-		            "[DisplayXR-PROV] native mirror blit ACTIVE: copy %ux%u canvas -> RT %llux%u (fmt=%d) — no Unity tiling\n",
-		            cpw, cph, (unsigned long long)rd.Width, (unsigned)rd.Height, (int)rd.Format);
-		prov_log(b); }
+	if (cw <= 0 || ch <= 0 || tw == 0 || th == 0) return kUnitySubsystemErrorCodeSuccess;
+	// Format-converting SHADER blit: sample the woven canvas sub-rect (BGRA) and draw it,
+	// stretched to fill the GameView mirror RT (RGBA). CopyTextureRegion can't cross the
+	// RGBA/BGRA copy groups, and Unity's blitParams mirror produces black for URP (discarded
+	// inside URP's RenderGraph present) — this native draw writes straight to the presented RT.
+	prov_shader_blit_woven(dev, v8, rt, src, cx, cy, cw, ch, tw, th);
 	return kUnitySubsystemErrorCodeSuccess;
 }
 #else  // !_WIN32 — macOS: the native mirror blit is D3D12-only; woven mirror not used.
