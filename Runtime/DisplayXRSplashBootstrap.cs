@@ -26,6 +26,11 @@ namespace DisplayXR
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.BeforeSceneLoad)]
         static void Boot()
         {
+            // Runtime opt-out (debugging / editor): the compile-define opt-out above
+            // can't be toggled without a recompile, so also honor an env var.
+            if (System.Environment.GetEnvironmentVariable("DISPLAYXR_NO_SPLASH") != null)
+                return;
+
             // Skip for transparent-overlay apps. They run in a cloaked, shifted-
             // offscreen overlay window (set up at SubsystemRegistration, before
             // this runs); the splash rig's window/viewport push pulls that window

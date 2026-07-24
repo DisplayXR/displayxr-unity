@@ -159,8 +159,19 @@ namespace DisplayXR
             }
             // Hold longer than any plausible swapchain image count (2-3) so every
             // buffered eye image is overwritten before the rig goes away.
-            for (int i = 0; i < 6; i++)
-                yield return new WaitForEndOfFrame();
+            //
+            // Use plain per-frame yields, NOT WaitForEndOfFrame: in the editor's XR
+            // weave-to-texture GameView (docked/texture mode) WaitForEndOfFrame never
+            // resumes — the end-of-frame signal doesn't fire on the custom mirror path,
+            // so this coroutine stalled here, the rig was never destroyed, and
+            // DisplayXRRigManager.SplashActive stayed true forever → the app rigs stayed
+            // suspended and the splash camera cleared black → a permanently black docked
+            // Game view (undocked/present + built player were fine). A yield-return-null
+            // still advances one rendered frame per iteration, overwriting the buffered
+            // eye images the same way, and always resumes.
+            for (int i = 0; i < 8; i++)
+                yield return null;
+            Debug.Log("[DisplayXRSplash] handoff: destroying boot-splash rig (SplashActive clears)");
             Destroy(gameObject);
         }
 

@@ -178,10 +178,18 @@ namespace DisplayXR
             m_OverlayCamera.targetTexture = OverlayTexture;
             m_OverlayCamera.cullingMask = 1 << kPrivateLayer;
             m_OverlayCamera.depth = -1000;
-            // Disable URP auto-render. We Render() manually each frame in
-            // LateUpdate — works in BiRP/URP/HDRP and bypasses any
-            // pipeline-specific scheduling quirks for offscreen-only cameras.
-            m_OverlayCamera.enabled = false;
+            // Render in Unity's normal camera loop (enabled), NOT via a manual
+            // Camera.Render() in LateUpdate. Immediate-mode Camera.Render() is
+            // incompatible with URP's RenderGraph (Unity 6): even for a camera
+            // with a targetTexture it retrieves the editor GameView backbuffer off
+            // the gfx worker thread ("Back buffer can only be retrieved on the gfx
+            // worker thread!"), which blanks the whole XR mirror → pure-black docked
+            // Game view (URP only; BiRP/HDRP have no RenderGraph, so the manual path
+            // was fine there). An enabled offscreen camera renders every frame via
+            // the pipeline loop and RenderGraph imports the RT, never the backbuffer.
+            // Mirrors DisplayXRLocal2D (which was migrated off manual Render for the
+            // canvas-rebuild race — same enabled=true resolution).
+            m_OverlayCamera.enabled = true;
 
             // Wire OverlayCamera as the canvas's event camera. GraphicRaycaster
             // needs a camera reference to project screen-cursor input onto a
@@ -335,18 +343,18 @@ namespace DisplayXR
                 }
             }
 
-            // Manually render the overlay camera into our RT. URP/HDRP only.
-            // (BiRP would auto-render via its loop, but Render() is also
-            // perfectly valid there — just slightly redundant.)
+            // Copy our RT into the shared cross-device bridge so the provider's
+            // separate device can read it via the shared NT handle. The overlay
+            // camera now renders every frame via the pipeline loop (enabled=true, see
+            // OnEnable) — so in LateUpdate the RT holds the PREVIOUS frame's content:
+            // a 1-frame latency that's imperceptible for the slow-changing panel UI,
+            // and the price of dropping the RenderGraph-incompatible manual Render.
+            // (Mirrors DisplayXRLocal2D, which copies its bridge the same way.)
+            // No-op off Windows/provider mode (m_BridgeTex stays null).
             if (m_OverlayCamera != null && OverlayTexture != null)
             {
-                m_OverlayCamera.Render();
-
-                // Provider mode: copy our RT into the shared cross-device bridge
-                // so the provider's separate device can read it via the shared NT
-                // handle. No-op elsewhere (m_BridgeTex stays null). Retry bridge
-                // acquisition each frame in case the provider session came up after
-                // our OnEnable.
+                // Retry bridge acquisition each frame in case the provider session
+                // came up after our OnEnable.
                 if (m_BridgeTex == null) TryAcquireBridge();
                 if (m_BridgeTex != null)
                 {
