@@ -5,6 +5,18 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.9.0] - 2026-07-28
+
+### Fixed
+- **App-authored 3D zones were corrupted in the editor's docked weave-to-texture Play Mode** (#233, #234). An app that authors its own 3D zone (a 3D band with a 2D/Local2D band beside it — the `desktop-avatar` pattern) rendered with the content truncated and a matching black band, a visibly magnified/broken weave, and its 2D band missing. Two bugs, one stale assumption — *"the 3D zone is the full pane"*, true only while the provider was forcing it to be:
+  - `dxr_prov_converge_gameview_zone()` paired the app's zone **offset** with the Game view pane's **extent**, producing a zone that overran the pane (e.g. `(0,284) 1728x576` → `(0,284) 1728x860` in an 860-tall pane) and a compositor viewport that overflowed its tile. Converge now *repositions* an app zone (pane origin + app offset, extent preserved, clamped) and never redefines its extent; the app-authored rect is recorded separately so converge is idempotent.
+  - `dxr_prov_get_woven_canvas()` returned the **zone** as the GameView mirror's source rect. Since the mirror stretches that to fill the Game view, a sub-window zone was magnified — destroying the lenticular interlace and never sampling the 2D bands. It now returns the **pane**, which is what the runtime actually composites into the shared texture.
+- **State pushed once before the session started was silently lost on every session restart** (#233, #234, #235). The editor's docked↔undocked switch restarts the display subsystem mid-play, and session stop clears the provider's session state; because each C#→native push is change-detected or once-only, nothing re-pushed. Fixed for all six affected paths — the 3D zone (both render paths, not just the docked one), the transparent-background opt-in (sessions came back **opaque**), extra/multi-zone rects, the Local2D bridge and rect, and the `DisplayXRWindowSpaceUI` bridge. Bridges are now re-acquired by detecting the native pointer change rather than assuming a non-null wrapper is still live — a wrapper around a destroyed resource accepted copies silently, so the failure had no error signature.
+
+### Changed
+- `dxr_prov_get_woven_canvas()` now reports the Game view **pane** rect rather than the active 3D-zone rect. Identical for apps that author no zone (the provider's forced zone equals the pane); different only where an app authors a sub-window zone, which is the case this fixes.
+- `dxr_prov_set_transparent_background()`, `dxr_prov_set_zone_count()` and `dxr_prov_set_zone()` now persist their request across session restarts instead of applying only to the session that was live when they were called.
+
 ## [2.8.3] - 2026-07-28
 
 ### Added
