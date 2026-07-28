@@ -99,6 +99,12 @@ namespace DisplayXR
         // cross the provider's device boundary.
         private bool m_ProviderMode;
         private Texture2D m_BridgeTex;
+        // Native pointer m_BridgeTex wraps. The provider tears the bridge down and
+        // builds a new one whenever the session restarts (the editor's docked<->undocked
+        // switch restarts the display subsystem), so a non-null m_BridgeTex is NOT proof
+        // the bridge is still live — it may wrap a dead pointer. Re-acquire when this
+        // changes. See TryAcquireBridge.
+        private System.IntPtr m_BridgePtr = System.IntPtr.Zero;
 
         // The opt-in URP foreground clip (DisplayXR/ForegroundClipURP) is a built-in
         // FullScreenPassRendererFeature with NO XR-camera guard.
@@ -247,32 +253,58 @@ namespace DisplayXR
         // Provider mode: acquire the provider's cross-device Local2D bridge and wrap it
         // as an external Texture2D we Graphics.CopyTexture the overlay RT into. Lazy —
         // the session may come up after OnEnable. Mirrors DisplayXRWindowSpaceUI.
+        // Re-acquires across session restarts: the getter is cheap (it early-returns
+        // while the session is down and its create is idempotent), so poll it and re-wrap
+        // whenever the native pointer changes. Returning early on "m_BridgeTex != null"
+        // was wrong — after a restart that texture wraps a DESTROYED native resource, so
+        // the copy below silently went nowhere and the 2D content never came back (the
+        // avatar's speech bubble vanished on undock and stayed gone through re-dock).
         private void TryAcquireBridge()
         {
-            if (m_BridgeTex != null) return;
             try
             {
                 DisplayXRProviderNative.dxr_prov_get_local2d_bridge(
                     (uint)resolution.x, (uint)resolution.y,
                     out System.IntPtr bridgePtr, out uint bw, out uint bh);
-                if (bridgePtr != System.IntPtr.Zero && bw > 0 && bh > 0)
+
+                if (bridgePtr == System.IntPtr.Zero || bw == 0 || bh == 0)
                 {
-                    m_BridgeTex = Texture2D.CreateExternalTexture(
-                        (int)bw, (int)bh, TextureFormat.BGRA32, false, true, bridgePtr);
-                    m_BridgeTex.name = "DisplayXR_Local2DBridge";
-                    Debug.Log($"[DisplayXR] Local2D: provider bridge acquired {bw}x{bh}");
+                    // Session down / not ready. Drop a stale wrapper so the next live
+                    // bridge is picked up cleanly rather than copied into a dead one.
+                    if (m_BridgeTex != null) ReleaseBridgeTex();
+                    return;
                 }
+                if (m_BridgeTex != null && bridgePtr == m_BridgePtr) return; // unchanged
+
+                if (m_BridgeTex != null) ReleaseBridgeTex();
+                m_BridgeTex = Texture2D.CreateExternalTexture(
+                    (int)bw, (int)bh, TextureFormat.BGRA32, false, true, bridgePtr);
+                m_BridgeTex.name = "DisplayXR_Local2DBridge";
+                m_BridgePtr = bridgePtr;
+                // A new bridge pointer means a NEW SESSION. dxr_prov_session_stop memsets
+                // the provider state, clearing the Local2D rect — but the rect push below
+                // is change-detected against m_LastRect*, which still matches, so it would
+                // never re-push and the runtime would composite no Local2D layer at all.
+                // Invalidate the cache so LateUpdate re-pushes the rect this frame.
+                m_LastRectX = m_LastRectY = m_LastRectW = m_LastRectH = int.MinValue;
+                Debug.Log($"[DisplayXR] Local2D: provider bridge acquired {bw}x{bh} (rect re-push armed)");
             }
             catch (System.EntryPointNotFoundException) { }
         }
 
-        void OnDisable()
+        private void ReleaseBridgeTex()
         {
             if (m_BridgeTex != null)
             {
                 if (Application.isPlaying) Destroy(m_BridgeTex); else DestroyImmediate(m_BridgeTex);
                 m_BridgeTex = null;
             }
+            m_BridgePtr = System.IntPtr.Zero;
+        }
+
+        void OnDisable()
+        {
+            ReleaseBridgeTex();
 
             if (m_CamRenderHooked)
             {
@@ -348,7 +380,9 @@ namespace DisplayXR
             // latency is invisible for a HUD/bubble.
             if (m_ProviderMode)
             {
-                if (m_BridgeTex == null) TryAcquireBridge();
+                // Unconditional — TryAcquireBridge detects a session restart by the
+                // native pointer changing, which a "== null" guard would hide.
+                TryAcquireBridge();
                 if (m_BridgeTex != null && OverlayTexture != null)
                     Graphics.CopyTexture(OverlayTexture, m_BridgeTex);
             }

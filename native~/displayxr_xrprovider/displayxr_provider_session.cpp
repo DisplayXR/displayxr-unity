@@ -3051,6 +3051,18 @@ static int s_init_gv_x = 0, s_init_gv_y = 0, s_init_gv_w = 0, s_init_gv_h = 0;
 // INT32_MIN = position not published (legacy window-glue arrangement, zone at 0,0).
 static int s_gv_panel_w = 0, s_gv_panel_h = 0;
 static int s_gv_panel_x = INT32_MIN, s_gv_panel_y = INT32_MIN;
+
+// The APP-AUTHORED 3D zone, kept separate from the live zone (s_ps.zone_*). Recorded
+// ONLY by the app-facing dxr_prov_set_3d_zone_rect(); the texture-mode forced zone and
+// the GameView converge write the live zone through ps_apply_3d_zone_rect() and never
+// touch this. Without the split, converge fed its own output back through the app
+// entry point, so after one converge the app's original rect was gone and converge
+// could no longer tell "app wants a sub-window band" from "provider default full
+// window" — it paired the app's OFFSET with the pane's EXTENT and produced a zone that
+// overran the window bottom (desktop-avatar: (0,284) 1728x576 -> (0,284) 1728x860 in an
+// 860-tall pane). Keep this authoritative and derive the live zone from it.
+static int s_app_zone_x = 0, s_app_zone_y = 0, s_app_zone_w = 0, s_app_zone_h = 0;
+static int s_app_zone_valid = 0;
 // GameView mirror (Task (a)): the woven shared texture opened on UNITY'S device so
 // the display-provider can wrap it via CreateTexture and mirror-blit it into the
 // editor Game window. Opened lazily on first request (graphics thread, session ready).
@@ -3388,18 +3400,29 @@ void *dxr_prov_get_woven_unity_texture(uint32_t *w, uint32_t *h)
 void dxr_prov_get_woven_canvas(int32_t *x, int32_t *y, int32_t *cw, int32_t *ch,
                                uint32_t *texw, uint32_t *texh)
 {
-	// The runtime weaves the ZONE region into the shared texture at the ZONE's rect
-	// (zone-glue: content lands at (zone_x,zone_y), matching where the zone sits inside
-	// the panel-origin weave window; legacy window-glue: zone at (0,0) = texture
-	// top-left, verified by readback). The mirror srcRect must match that woven
-	// region — NOT the live window client. Fall back to the live window only when no
-	// zone is active.
+	// The runtime composites the WHOLE PANE into the shared texture at the pane rect:
+	// woven 3D inside the zone(s), plus the Local2D 2D bands outside them (the zone
+	// wish mask + Local2D composite both run over the full pane region). So the mirror
+	// srcRect is the PANE, not the zone.
+	//
+	// Using the zone here was only ever correct while the zone was forced to the full
+	// pane. Once an app authors a sub-window zone (desktop-avatar: a 576-tall 3D band
+	// with a 2D band above it), sampling the zone and stretching it over the Game view
+	// (destRect is the whole RT) magnifies the band — which breaks the lenticular
+	// interlace and hides the 2D bands entirely.
 	int32_t rx = 0, ry = 0;
-	int32_t rw = s_ps.zone_valid ? s_ps.zone_w : 0;
-	int32_t rh = s_ps.zone_valid ? s_ps.zone_h : 0;
-	if (rw > 0 && rh > 0) {
+	int32_t rw = 0, rh = 0;
+	if (s_probe_enabled && s_gv_panel_w > 0 && s_gv_panel_h > 0) {
+		// Zone-glue publishes the pane's screen position; legacy window-glue doesn't
+		// (the weave window origin carries it) → pane sits at the texture top-left.
+		rx = (s_gv_panel_x != INT32_MIN) ? s_gv_panel_x : 0;
+		ry = (s_gv_panel_y != INT32_MIN) ? s_gv_panel_y : 0;
+		rw = s_gv_panel_w; rh = s_gv_panel_h;
+	} else if (s_ps.zone_valid && s_ps.zone_w > 0 && s_ps.zone_h > 0) {
 		rx = s_ps.zone_x; ry = s_ps.zone_y;
-	} else {
+		rw = s_ps.zone_w; rh = s_ps.zone_h;
+	}
+	if (rw <= 0 || rh <= 0) {
 		uint32_t ww = 0, wh = 0; ps_window_size(&ww, &wh);
 		rw = ww ? (int32_t)ww : (int32_t)s_probe_woven_w;
 		rh = wh ? (int32_t)wh : (int32_t)s_probe_woven_h;
@@ -3633,6 +3656,23 @@ int dxr_prov_session_start(const char *runtime_json_path,
 		       s_ps.has_atlas_capture ? "AVAILABLE" : "no (screenshot inert)");
 	}
 
+	// Re-apply the APP-AUTHORED 3D zone (if any) on EVERY session start, for BOTH
+	// render paths. dxr_prov_session_stop memsets s_ps and the docked<->undocked switch
+	// RESTARTS the session, but the app seeds its zone once before XR init and does not
+	// re-seed. The texture-mode canvas block further down runs only on the shared-texture
+	// (docked) path, so without this the PRESENT (undocked) path came up with no zone at
+	// all: the projection was submitted full-window, the zone wish mask never formed, and
+	// the Local2D bands had nothing to composite into — desktop-avatar's speech bubble
+	// vanished on undock and did not come back on re-dock.
+	if (s_app_zone_valid && s_ps.has_display_zones) {
+		s_ps.zone_x = s_app_zone_x; s_ps.zone_y = s_app_zone_y;
+		s_ps.zone_w = s_app_zone_w; s_ps.zone_h = s_app_zone_h;
+		s_ps.zone_id = 1;
+		s_ps.zone_valid = 1;
+		ps_log("[DisplayXR-PROV] session start: re-applied APP zone (%d,%d %dx%d)\n",
+		       s_ps.zone_x, s_ps.zone_y, s_ps.zone_w, s_ps.zone_h);
+	}
+
 	// --- Create instance ---
 	const char *extensions[8];
 	uint32_t ext_count = 0;
@@ -3864,7 +3904,24 @@ int dxr_prov_session_start(const char *runtime_json_path,
 				// (0,0) window-sized (the window origin carries the position).
 				s_ps.zone_valid = 1;
 				s_ps.zone_id = 1;
-				if (s_gv_panel_x != INT32_MIN && s_gv_panel_w > 0 && s_gv_panel_h > 0) {
+				if (s_app_zone_valid) {
+					// The app seeded its own zone (the documented contract) — that
+					// zone IS the DP canvas. Forcing a full-window one here would
+					// only be undone by the app's next push, at the cost of a
+					// swapchain realloc and a transient wrong-sized canvas.
+					//
+					// RESTORE from the authoritative record: dxr_prov_session_stop
+					// memsets s_ps, so on a session RESTART (dock<->undock switches
+					// the render path and restarts the session) the live copy is
+					// zeroed while s_app_zone_valid — a file static — survives.
+					// Reading s_ps here would install a degenerate 0x0 zone that the
+					// compositor skips, killing the zone content and the Local2D
+					// bands with it. The app does not necessarily re-seed on restart.
+					s_ps.zone_x = s_app_zone_x; s_ps.zone_y = s_app_zone_y;
+					s_ps.zone_w = s_app_zone_w; s_ps.zone_h = s_app_zone_h;
+					ps_log("[DisplayXR-PROV] texture-mode canvas: keeping APP zone (%d,%d %dx%d)\n",
+					       s_ps.zone_x, s_ps.zone_y, s_ps.zone_w, s_ps.zone_h);
+				} else if (s_gv_panel_x != INT32_MIN && s_gv_panel_w > 0 && s_gv_panel_h > 0) {
 					s_ps.zone_x = s_gv_panel_x; s_ps.zone_y = s_gv_panel_y;
 					s_ps.zone_w = s_gv_panel_w; s_ps.zone_h = s_gv_panel_h;
 					ps_log("[DisplayXR-PROV] PROBE: forced ZONE-GLUE zone (%d,%d %dx%d) as texture-mode canvas\n",
@@ -4244,7 +4301,10 @@ int dxr_prov_wants_transparent(void) { return s_ps.transparent_requested; }
 // (demo SubsystemRegistration) so the swapchain is born zone-sized — a later
 // change only re-sizes the swapchain on the next session start (live realloc is a
 // follow-up, mirroring the hook path's launch-seed model).
-void dxr_prov_set_3d_zone_rect(int32_t x, int32_t y, int32_t w, int32_t h)
+// Apply a rect to the LIVE zone only (no app-zone bookkeeping). Used by the
+// texture-mode forced zone and the GameView converge, which derive a live rect and
+// must not be mistaken for the app's authored zone.
+static void ps_apply_3d_zone_rect(int32_t x, int32_t y, int32_t w, int32_t h)
 {
 	if (w <= 0 || h <= 0) {
 		if (s_ps.zone_valid) ps_log("[DisplayXR-PROV] 3d_zone: cleared\n");
@@ -4261,6 +4321,19 @@ void dxr_prov_set_3d_zone_rect(int32_t x, int32_t y, int32_t w, int32_t h)
 		ps_log("[DisplayXR-PROV] 3d_zone: (%d,%d) %dx%d -> rec %ux%u\n",
 		       x, y, w, h, s_ps.zone_rec_w, s_ps.zone_rec_h);
 	}
+}
+
+void dxr_prov_set_3d_zone_rect(int32_t x, int32_t y, int32_t w, int32_t h)
+{
+	// Record the app's intent BEFORE applying — converge derives the live zone from
+	// this, so it survives any number of converge passes (idempotent).
+	if (w <= 0 || h <= 0) {
+		s_app_zone_valid = 0;
+	} else {
+		s_app_zone_x = x; s_app_zone_y = y; s_app_zone_w = w; s_app_zone_h = h;
+		s_app_zone_valid = 1;
+	}
+	ps_apply_3d_zone_rect(x, y, w, h);
 }
 
 void dxr_prov_clear_3d_zone(void)
@@ -4316,11 +4389,31 @@ void dxr_prov_converge_gameview_zone(void)
 {
 	if (!s_probe_enabled || !s_ps.zone_valid) return;
 	if (s_gv_panel_w <= 0 || s_gv_panel_h <= 0) return;
-	int w = s_gv_panel_w, h = s_gv_panel_h;
 	// Zone-glue: the zone rect also carries the pane's screen POSITION (weave window is
-	// parked at the monitor origin). Legacy window-glue publishes no position → keep 0,0.
-	int x = (s_gv_panel_x != INT32_MIN) ? s_gv_panel_x : s_ps.zone_x;
-	int y = (s_gv_panel_y != INT32_MIN) ? s_gv_panel_y : s_ps.zone_y;
+	// parked at the monitor origin). Legacy window-glue publishes no position → pane
+	// origin is 0,0 (the window origin carries the position).
+	const int px = (s_gv_panel_x != INT32_MIN) ? s_gv_panel_x : 0;
+	const int py = (s_gv_panel_y != INT32_MIN) ? s_gv_panel_y : 0;
+	int x, y, w, h;
+	if (s_app_zone_valid) {
+		// The app authored a zone (e.g. desktop-avatar's 3D band with a 2D band above
+		// it for the Local2D bubble). Converge REPOSITIONS it into the pane and never
+		// redefines its extent — replacing the extent with the pane's while keeping the
+		// app's offset pushes the zone past the pane bottom, which truncates the woven
+		// content, shifts the lenticular phase, and swallows the 2D band.
+		x = px + s_app_zone_x;
+		y = py + s_app_zone_y;
+		w = s_app_zone_w;
+		h = s_app_zone_h;
+		// Clamp to the pane — an app zone larger than the pane must not weave outside it.
+		if (x < px) { w -= (px - x); x = px; }
+		if (y < py) { h -= (py - y); y = py; }
+		if (x + w > px + s_gv_panel_w) w = px + s_gv_panel_w - x;
+		if (y + h > py + s_gv_panel_h) h = py + s_gv_panel_h - y;
+	} else {
+		// No app zone — the provider's own full-pane canvas (texture-mode default).
+		x = px; y = py; w = s_gv_panel_w; h = s_gv_panel_h;
+	}
 	// Clamp to the shared woven texture (the runtime cannot weave past it).
 	if (x < 0) x = 0;
 	if (y < 0) y = 0;
@@ -4333,7 +4426,9 @@ void dxr_prov_converge_gameview_zone(void)
 	       s_ps.zone_x, s_ps.zone_y, s_ps.zone_w, s_ps.zone_h, x, y, w, h,
 	       s_gv_panel_x, s_gv_panel_y, s_gv_panel_w, s_gv_panel_h,
 	       s_probe_woven_w, s_probe_woven_h);
-	dxr_prov_set_3d_zone_rect(x, y, w, h);
+	// LIVE zone only — must NOT be recorded as the app's authored zone, or the next
+	// converge would derive from its own output and the app's rect would be lost.
+	ps_apply_3d_zone_rect(x, y, w, h);
 }
 
 // Multi-zone (#166 Phase B2). total_3d_zones = number of 3D zones (index 0 =
