@@ -57,6 +57,11 @@
       "path": "Samples~/TransparentAvatar"
     },
     {
+      "displayName": "Face Viewer (Billboard)",
+      "description": "Billboard component that rotates an object to always face the tracked viewer's head, derived from the rendered stereo eye poses (with camera-transform fallback). README covers the head-position helper and the raw physical-space eye/window APIs for advanced head-coupled effects.",
+      "path": "Samples~/FaceViewer"
+    },
+    {
       "displayName": "Minimal Transparent",
       "description": "Smallest working alpha-native transparent overlay scene (~60 lines). Teaching sample — README walks through the three-mechanism pipeline, the OpenXR extensions in use, and the layer ownership map. Windows + macOS standalone.",
       "path": "Samples~/MinimalTransparent"
