@@ -3656,6 +3656,23 @@ int dxr_prov_session_start(const char *runtime_json_path,
 		       s_ps.has_atlas_capture ? "AVAILABLE" : "no (screenshot inert)");
 	}
 
+	// Re-apply the APP-AUTHORED 3D zone (if any) on EVERY session start, for BOTH
+	// render paths. dxr_prov_session_stop memsets s_ps and the docked<->undocked switch
+	// RESTARTS the session, but the app seeds its zone once before XR init and does not
+	// re-seed. The texture-mode canvas block further down runs only on the shared-texture
+	// (docked) path, so without this the PRESENT (undocked) path came up with no zone at
+	// all: the projection was submitted full-window, the zone wish mask never formed, and
+	// the Local2D bands had nothing to composite into — desktop-avatar's speech bubble
+	// vanished on undock and did not come back on re-dock.
+	if (s_app_zone_valid && s_ps.has_display_zones) {
+		s_ps.zone_x = s_app_zone_x; s_ps.zone_y = s_app_zone_y;
+		s_ps.zone_w = s_app_zone_w; s_ps.zone_h = s_app_zone_h;
+		s_ps.zone_id = 1;
+		s_ps.zone_valid = 1;
+		ps_log("[DisplayXR-PROV] session start: re-applied APP zone (%d,%d %dx%d)\n",
+		       s_ps.zone_x, s_ps.zone_y, s_ps.zone_w, s_ps.zone_h);
+	}
+
 	// --- Create instance ---
 	const char *extensions[8];
 	uint32_t ext_count = 0;
@@ -3888,11 +3905,20 @@ int dxr_prov_session_start(const char *runtime_json_path,
 				s_ps.zone_valid = 1;
 				s_ps.zone_id = 1;
 				if (s_app_zone_valid) {
-					// The app seeded its own zone before the session started (the
-					// documented contract) — that zone IS the DP canvas. Forcing a
-					// full-window one here would only be undone by the app's next
-					// push, at the cost of a swapchain realloc and a transient
-					// wrong-sized canvas.
+					// The app seeded its own zone (the documented contract) — that
+					// zone IS the DP canvas. Forcing a full-window one here would
+					// only be undone by the app's next push, at the cost of a
+					// swapchain realloc and a transient wrong-sized canvas.
+					//
+					// RESTORE from the authoritative record: dxr_prov_session_stop
+					// memsets s_ps, so on a session RESTART (dock<->undock switches
+					// the render path and restarts the session) the live copy is
+					// zeroed while s_app_zone_valid — a file static — survives.
+					// Reading s_ps here would install a degenerate 0x0 zone that the
+					// compositor skips, killing the zone content and the Local2D
+					// bands with it. The app does not necessarily re-seed on restart.
+					s_ps.zone_x = s_app_zone_x; s_ps.zone_y = s_app_zone_y;
+					s_ps.zone_w = s_app_zone_w; s_ps.zone_h = s_app_zone_h;
 					ps_log("[DisplayXR-PROV] texture-mode canvas: keeping APP zone (%d,%d %dx%d)\n",
 					       s_ps.zone_x, s_ps.zone_y, s_ps.zone_w, s_ps.zone_h);
 				} else if (s_gv_panel_x != INT32_MIN && s_gv_panel_w > 0 && s_gv_panel_h > 0) {
