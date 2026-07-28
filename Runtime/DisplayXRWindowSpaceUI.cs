@@ -87,6 +87,8 @@ namespace DisplayXR
         // (Metal: unified device, direct path works) and when the provider isn't
         // active (native returns null).
         private Texture2D m_BridgeTex;
+        // Native pointer m_BridgeTex wraps — a change means a new session. See TryAcquireBridge.
+        private System.IntPtr m_BridgePtr = System.IntPtr.Zero;
 
         // Saved state, restored in OnDisable.
         private RenderMode m_OrigRenderMode;
@@ -228,9 +230,14 @@ namespace DisplayXR
                       $"(WorldSpace canvas, layer {kPrivateLayer}, dedicated camera)");
         }
 
+        // Re-acquires across session restarts. The provider destroys the wsui bridge with
+        // the session, and the editor's docked<->undocked switch restarts it mid-play, so
+        // a non-null m_BridgeTex is NOT proof the bridge is live — it may wrap a DESTROYED
+        // resource, into which Graphics.CopyTexture succeeds silently. Poll the pointer
+        // (the getter is cheap: it early-returns while the session is down and its create
+        // is idempotent) and re-wrap when it changes. Same fix as DisplayXRLocal2D.
         private void TryAcquireBridge()
         {
-            if (m_BridgeTex != null) return;
             try
             {
                 System.IntPtr bridgePtr = System.IntPtr.Zero;
@@ -243,20 +250,50 @@ namespace DisplayXR
                         (uint)resolution.x, (uint)resolution.y,
                         out bridgePtr, out bw, out bh);
                 }
-                if (bridgePtr != System.IntPtr.Zero && bw > 0 && bh > 0)
+                if (bridgePtr == System.IntPtr.Zero || bw == 0 || bh == 0)
                 {
-                    m_BridgeTex = Texture2D.CreateExternalTexture(
-                        (int)bw, (int)bh, TextureFormat.BGRA32, false, true,
-                        bridgePtr);
-                    m_BridgeTex.name = "DisplayXR_WsuiBridge";
-                    Debug.Log($"[DisplayXR] wsui: bridge acquired {bw}x{bh} (provider={DisplayXRProviderDriver.IsActive})");
+                    // Session down / not ready — drop a stale wrapper so the next live
+                    // bridge is picked up cleanly instead of being copied into a dead one.
+                    if (m_BridgeTex != null) ReleaseBridgeTex();
+                    return;
                 }
+                if (m_BridgeTex != null && bridgePtr == m_BridgePtr) return; // unchanged
+
+                if (m_BridgeTex != null) ReleaseBridgeTex();
+                m_BridgeTex = Texture2D.CreateExternalTexture(
+                    (int)bw, (int)bh, TextureFormat.BGRA32, false, true,
+                    bridgePtr);
+                m_BridgeTex.name = "DisplayXR_WsuiBridge";
+                m_BridgePtr = bridgePtr;
+                // A new pointer means a NEW SESSION. The layer descriptor lives in a native
+                // file static and survives, but re-push it anyway so a restart can never
+                // leave the runtime with a stale/never-seen layer, and invalidate the
+                // change-detection cache below so LateUpdate re-pushes too.
+                DisplayXRNative.displayxr_window_space_ui_set_texture(
+                    OverlayTexture != null ? OverlayTexture.GetNativeTexturePtr() : System.IntPtr.Zero,
+                    resolution.x, resolution.y);
+                DisplayXRNative.displayxr_window_space_ui_set_layer(
+                    positionX, positionY, width, height, disparity);
+                m_LastX = positionX; m_LastY = positionY;
+                m_LastW = width;     m_LastH = height;
+                m_LastDisparity = disparity;
+                Debug.Log($"[DisplayXR] wsui: bridge acquired {bw}x{bh} (provider={DisplayXRProviderDriver.IsActive})");
             }
             catch (System.EntryPointNotFoundException)
             {
                 // Older plugin without the bridge API — non-Windows path or
                 // pre-bridge build. Stay on the direct unity_tex path.
             }
+        }
+
+        private void ReleaseBridgeTex()
+        {
+            if (m_BridgeTex != null)
+            {
+                if (Application.isPlaying) Destroy(m_BridgeTex); else DestroyImmediate(m_BridgeTex);
+                m_BridgeTex = null;
+            }
+            m_BridgePtr = System.IntPtr.Zero;
         }
 
         void OnDisable()
@@ -296,18 +333,11 @@ namespace DisplayXR
                 OverlayTexture = null;
             }
 
-            if (m_BridgeTex != null)
-            {
-                // Texture2D.CreateExternalTexture'd handles don't own the
-                // underlying native resource — native side keeps the SA-
-                // device bridge alive across enable/disable cycles. Just
-                // drop our Unity-side wrapper.
-                if (Application.isPlaying)
-                    Destroy(m_BridgeTex);
-                else
-                    DestroyImmediate(m_BridgeTex);
-                m_BridgeTex = null;
-            }
+            // Texture2D.CreateExternalTexture'd handles don't own the underlying native
+            // resource — native keeps the bridge alive across enable/disable cycles. Just
+            // drop our Unity-side wrapper (and the cached pointer, so a later enable
+            // re-wraps rather than trusting a stale match).
+            ReleaseBridgeTex();
         }
 
         void LateUpdate()
@@ -353,9 +383,10 @@ namespace DisplayXR
             // No-op off Windows/provider mode (m_BridgeTex stays null).
             if (m_OverlayCamera != null && OverlayTexture != null)
             {
-                // Retry bridge acquisition each frame in case the provider session
-                // came up after our OnEnable.
-                if (m_BridgeTex == null) TryAcquireBridge();
+                // Unconditional — the provider session may come up after our OnEnable, and
+                // TryAcquireBridge also detects a RESTART via the native pointer changing,
+                // which a "== null" guard would hide.
+                TryAcquireBridge();
                 if (m_BridgeTex != null)
                 {
                     Graphics.CopyTexture(OverlayTexture, m_BridgeTex);
