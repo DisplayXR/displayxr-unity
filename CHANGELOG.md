@@ -5,6 +5,11 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.8.3] - 2026-07-28
+
+### Added
+- **Face Viewer (Billboard) sample** (#232): new UPM sample with a `FaceViewer` component that rotates an object to always face the tracked viewer's head. The head position is derived from the rendered stereo eye poses (midpoint of the per-eye view-matrix positions), with a camera-transform fallback when stereo poses aren't available. Exposes a public static `TryGetViewerHead` helper, and the sample README documents the raw physical-space eye/window APIs.
+
 ## [2.8.2] - 2026-07-24
 
 ### Fixed
