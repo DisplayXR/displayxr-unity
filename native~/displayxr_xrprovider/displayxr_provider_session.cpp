@@ -3063,6 +3063,15 @@ static int s_gv_panel_x = INT32_MIN, s_gv_panel_y = INT32_MIN;
 // 860-tall pane). Keep this authoritative and derive the live zone from it.
 static int s_app_zone_x = 0, s_app_zone_y = 0, s_app_zone_w = 0, s_app_zone_h = 0;
 static int s_app_zone_valid = 0;
+
+// Same treatment for the other APP-AUTHORED, "set once before the session starts"
+// requests that used to live only in s_ps and so were lost on every session restart
+// (dock<->undock): the transparent-background opt-in came back OPAQUE, and multi-zone
+// apps lost every extra zone. These mirrors are file statics — they survive the memset —
+// and are re-applied at session start next to the primary zone.
+static int s_app_transparent_requested = 0;
+static ProviderExtraZone s_app_extra_zones[PS_MAX_ZONES - 1];
+static uint32_t s_app_extra_zone_count = 0;
 // GameView mirror (Task (a)): the woven shared texture opened on UNITY'S device so
 // the display-provider can wrap it via CreateTexture and mirror-blit it into the
 // editor Game window. Opened lazily on first request (graphics thread, session ready).
@@ -3671,6 +3680,20 @@ int dxr_prov_session_start(const char *runtime_json_path,
 		s_ps.zone_valid = 1;
 		ps_log("[DisplayXR-PROV] session start: re-applied APP zone (%d,%d %dx%d)\n",
 		       s_ps.zone_x, s_ps.zone_y, s_ps.zone_w, s_ps.zone_h);
+	}
+	// Extra (multi-)zones — same restart problem, same mirror.
+	if (s_app_extra_zone_count > 0 && s_ps.has_display_zones) {
+		for (uint32_t i = 0; i < s_app_extra_zone_count && i < PS_MAX_ZONES - 1; i++)
+			s_ps.extra_zones[i] = s_app_extra_zones[i];
+		s_ps.extra_zone_count = s_app_extra_zone_count;
+		ps_log("[DisplayXR-PROV] session start: re-applied %u extra APP zone(s)\n",
+		       s_app_extra_zone_count);
+	}
+	// Transparent-background opt-in is consumed at xrCreateSession; without this the
+	// session came back OPAQUE after a restart even though the app had requested it.
+	if (s_app_transparent_requested && !s_ps.transparent_requested) {
+		s_ps.transparent_requested = 1;
+		ps_log("[DisplayXR-PROV] session start: re-applied transparent-background request\n");
 	}
 
 	// --- Create instance ---
@@ -4288,6 +4311,7 @@ void dxr_prov_set_gameview_rect(int x, int y, int w, int h)
 void dxr_prov_set_transparent_background(int enable)
 {
 	s_ps.transparent_requested = enable ? 1 : 0;
+	s_app_transparent_requested = s_ps.transparent_requested; // survives session restart
 	ps_log("[DisplayXR-PROV] transparent background requested: %d\n", s_ps.transparent_requested);
 }
 
@@ -4443,6 +4467,9 @@ void dxr_prov_set_zone_count(uint32_t total_3d_zones)
 	// Deactivate any extra zones beyond the new count.
 	for (uint32_t i = extra; i < PS_MAX_ZONES - 1; i++) s_ps.extra_zones[i].valid = 0;
 	s_ps.extra_zone_count = extra;
+	// Mirror for re-apply after a session restart (s_ps is memset at session stop).
+	for (uint32_t i = extra; i < PS_MAX_ZONES - 1; i++) s_app_extra_zones[i].valid = 0;
+	s_app_extra_zone_count = extra;
 }
 
 // Set 3D zone `index`'s rect (client-window px). index 0 → primary (== set_3d_zone_rect);
@@ -4457,11 +4484,18 @@ void dxr_prov_set_zone(uint32_t index, uint32_t zone_id, int32_t x, int32_t y, i
 	uint32_t ei = index - 1;
 	if (ei >= PS_MAX_ZONES - 1) return;
 	ProviderExtraZone *z = &s_ps.extra_zones[ei];
-	if (w <= 0 || h <= 0) { z->valid = 0; return; }
+	if (w <= 0 || h <= 0) {
+		z->valid = 0;
+		s_app_extra_zones[ei].valid = 0;
+		return;
+	}
 	z->zone_id = zone_id ? zone_id : (index + 1);
 	z->rect_x = x; z->rect_y = y; z->rect_w = w; z->rect_h = h;
 	z->valid = 1;
 	if (ei + 1 > s_ps.extra_zone_count) s_ps.extra_zone_count = ei + 1;
+	// Mirror for re-apply after a session restart (s_ps is memset at session stop).
+	s_app_extra_zones[ei] = *z;
+	if (ei + 1 > s_app_extra_zone_count) s_app_extra_zone_count = ei + 1;
 }
 
 uint32_t dxr_prov_get_extra_zone_count(void) { return s_ps.extra_zone_count; }
