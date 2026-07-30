@@ -5,6 +5,11 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.10.0] - 2026-07-31
+
+### Added
+- `DisplayXRProvider.SetZoneFeather(index, featherPx)` (#238) — per-zone cosmetic edge-feather radius in client-window pixels, chained as `XrDisplayZoneFeatherDXR` on the zone at submit (display-zones spec v3, runtime#800/#803). Zone edges are **hard by default** on post-#804 runtimes; a zone wanting a soft composite edge (e.g. the desktop-avatar's zone-vs-band transition) opts in with an explicit radius. Cosmetic only — the published hardware wish stays binary; pre-v3 runtimes ignore the request (hard edges, no error). Survives session restarts; applies from the next submitted frame.
+
 ## [2.9.1] - 2026-07-30
 
 ### Added
