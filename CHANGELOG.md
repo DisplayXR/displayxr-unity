@@ -5,6 +5,14 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.9.1] - 2026-07-30
+
+### Added
+- `DisplayXRProvider.TryGetViewerEyes(out left, out right)` / `TryGetViewerHead(out head)` — the world-space (Unity coords) positions of the two eyes the provider is rendering with this frame, from the render-ready `xrLocateViews` poses. This is the supported way for an app to read the tracked viewer position for head-coupled effects (billboards, lean-to-zoom, parallax UI). A missing native plugin is latched once rather than throwing per frame.
+
+### Fixed
+- **Face Viewer (Billboard) sample never tracked the viewer's head** (#236). It derived the head from `Camera.GetStereoViewMatrix(Left/Right)`, which returns the **same (mono) matrix for both eyes** in provider mode: Unity's C#-side stereo matrix cache is only written by `Camera.SetStereoViewMatrix()`, which the plugin no longer calls — per-eye poses reach Unity through the native frame desc (`deviceAnchorToEyePose`) and are consumed inside Unity's render loop, never round-tripped back into the C# camera. The sample's coincident-eyes guard therefore tripped every frame and the billboard silently fell back to the camera transform, on every pipeline and graphics API. `FaceViewer.TryGetViewerHead(cam, out head)` now forwards to `DisplayXRProvider.TryGetViewerHead` (signature preserved for v2.8.3 source compatibility; `cam` is unused). The sample README documents the correct APIs and why `GetStereoViewMatrix` is the wrong tool here.
+
 ## [2.9.0] - 2026-07-28
 
 ### Fixed
