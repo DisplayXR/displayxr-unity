@@ -30,7 +30,7 @@ These are the exact per-eye poses the display provider renders with (runtime-own
 
 `FaceViewer.TryGetViewerHead(cam, out head)` is public and static — reuse it for your own head-coupled effects (proximity triggers, lean-to-zoom, parallax UI) — though app code is better off calling `DisplayXRProvider.TryGetViewerHead` directly.
 
-> **Do not use `Camera.GetStereoViewMatrix()` for this.** Unity's C#-side stereo matrix cache is only written by `Camera.SetStereoViewMatrix()`, which the plugin does not call in provider mode — the per-eye poses reach Unity through the native frame desc (`deviceAnchorToEyePose`) and are consumed inside Unity's render loop, never round-tripped back into that cache. `GetStereoViewMatrix` therefore returns the same (mono) matrix for both eyes and the head never moves. The v2.8.3 version of this sample got that wrong ([#236](https://github.com/DisplayXR/displayxr-unity/issues/236)).
+> **Prefer this over `Camera.GetStereoViewMatrix()`.** That API has been reported returning the **same matrix for both eyes** under the provider ([#236](https://github.com/DisplayXR/displayxr-unity/issues/236)) — which makes any head-coupled effect built on it silently freeze, since the two eyes never differ. The plugin itself never writes that cache (`Camera.SetStereoViewMatrix` went away with the #166 provider migration); whether Unity populates it is Unity's business and evidently varies by configuration — it *does* get populated in a built player on Windows/D3D12, and it was reported not to in the reporter's setup. `DisplayXRProvider.TryGetViewerHead` reads the provider's own per-eye data and does not depend on that behaviour either way.
 
 ## Physical-space alternative (advanced)
 

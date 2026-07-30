@@ -98,13 +98,15 @@ namespace DisplayXR
         /// <c>xrLocateViews</c> after the runtime's Kooima math (<c>XR_DXR_view_rig</c>),
         /// so they are always consistent with what the viewer actually sees.
         ///
-        /// Use this — NOT <c>Camera.GetStereoViewMatrix()</c> — for head-coupled
-        /// effects. Unity's C#-side stereo matrix cache is only written by
-        /// <c>Camera.SetStereoViewMatrix()</c>, which the plugin no longer calls: in
-        /// provider mode the per-eye poses reach Unity through the native frame desc
-        /// (<c>deviceAnchorToEyePose</c>) and are consumed inside Unity's render loop,
-        /// never round-tripped back into that cache. So <c>GetStereoViewMatrix</c>
-        /// returns the same (mono) matrix for both eyes (#236).
+        /// Prefer this over <c>Camera.GetStereoViewMatrix()</c> for head-coupled
+        /// effects. That API has been reported returning the same matrix for both
+        /// eyes under the provider (#236), which silently freezes any effect built
+        /// on it. The plugin never writes that cache — <c>SetStereoViewMatrix</c>
+        /// went away with the #166 provider migration, and per-eye poses now reach
+        /// Unity through the native frame desc (<c>deviceAnchorToEyePose</c>),
+        /// consumed inside Unity's render loop. Whether Unity then populates the C#
+        /// cache is Unity's behaviour and varies by configuration (it IS populated
+        /// in a built player on Windows/D3D12). This API doesn't depend on it.
         ///
         /// Returns false when the provider isn't running, or the two eyes are still
         /// coincident (no located views yet) — fall back to the camera transform.
