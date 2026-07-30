@@ -9,6 +9,14 @@ Rotates a GameObject so it always faces the tracked viewer's head — a billboar
 3. Attach `FaceViewer` to any world-space object (label quad, avatar, floating panel).
 4. Press Play on a tracking display — the object follows your head.
 
+> **Upgrading from an earlier plugin version?** Unity copies a sample into `Assets/`
+> **once**, at import time — bumping the package does *not* update an already-imported
+> copy, so you keep running the old script. Delete the old
+> `Assets/Samples/DisplayXR/<old-version>/` folder **before** re-importing; two copies
+> in the project both define `DisplayXR.FaceViewer` and the compile fails with
+> `CS0101`. (Versions before **2.9.1** never tracked the head at all — see
+> [#236](https://github.com/DisplayXR/displayxr-unity/issues/236).)
+
 ## Inspector fields
 
 - `yawOnly` — rotate only around world Y (upright billboard). Enable for labels and standing avatars; leave off for full 3-axis facing.
