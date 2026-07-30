@@ -203,6 +203,18 @@ namespace DisplayXR
         public static void SetZone(int index, int zoneId, int x, int y, int width, int height) =>
             DisplayXRProviderNative.dxr_prov_set_zone((uint)index, (uint)zoneId, x, y, width, height);
 
+        /// <summary>
+        /// Set 3D zone <paramref name="index"/>'s cosmetic edge feather radius in
+        /// client-window pixels (0 = hard edge, the default). Zone edges are hard by
+        /// default since runtime spec v3; a zone wanting a soft composite edge (e.g.
+        /// the avatar's zone-vs-band transition) opts in with an explicit radius.
+        /// The runtime clamps the radius to half the zone's shorter side and never
+        /// feathers the hardware wish; runtimes predating spec v3 ignore the request.
+        /// May be called any time (applies from the next submitted frame).
+        /// </summary>
+        public static void SetZoneFeather(int index, float featherPx) =>
+            DisplayXRProviderNative.dxr_prov_set_zone_feather((uint)index, featherPx);
+
         /// <summary>Re-read the enumerated modes from native. Called at session start + on mode change.</summary>
         public static void RefreshModes()
         {

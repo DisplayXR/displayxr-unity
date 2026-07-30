@@ -270,6 +270,13 @@ DISPLAYXR_EXPORT void dxr_prov_set_zone_count(uint32_t total_3d_zones);
 DISPLAYXR_EXPORT void dxr_prov_set_zone(uint32_t index, uint32_t zone_id,
                                         int32_t x, int32_t y, int32_t w, int32_t h);
 
+/// Set zone `index`'s cosmetic edge feather radius (client-window px; 0 = hard,
+/// the default). index 0 → primary; >=1 → extra zones. Chained as
+/// XrDisplayZoneFeatherDXR on the zone at submit (spec v3, runtime#800) — the
+/// runtime clamps to half the zone's shorter side; pre-v3 runtimes ignore it.
+/// App-side state: survives session restarts; may be called any time.
+DISPLAYXR_EXPORT void dxr_prov_set_zone_feather(uint32_t index, float feather_px);
+
 /// Number of active EXTRA zones (total 3D zones = 1 + this).
 DISPLAYXR_EXPORT uint32_t dxr_prov_get_extra_zone_count(void);
 
