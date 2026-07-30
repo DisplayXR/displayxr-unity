@@ -271,6 +271,14 @@ namespace DisplayXR
         public static extern void dxr_prov_set_zone(uint index, uint zoneId, int x, int y, int w, int h);
 
         /// <summary>
+        /// Set 3D zone `index`'s cosmetic edge feather radius (client-window px;
+        /// 0 = hard, the default). Chained as XrDisplayZoneFeatherDXR at submit
+        /// (display-zones spec v3); pre-v3 runtimes ignore it (hard edges).
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void dxr_prov_set_zone_feather(uint index, float featherPx);
+
+        /// <summary>
         /// Lazily create the provider's Local2D overlay swapchain + cross-device bridge
         /// (#166 Phase B) sized to w×h and return the Unity-device handle. Mirrors
         /// dxr_prov_get_wsui_bridge. C# CopyTexture's the canvas RT into it each frame.

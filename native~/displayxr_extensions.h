@@ -398,12 +398,17 @@ typedef XrResult(XRAPI_PTR *PFN_xrSetWorkspaceViewRigDXR)(XrSession session, con
 // avatar's openxr_includes/openxr/XR_DXR_display_zones.h), SPEC_VERSION 1.
 #define XR_DXR_DISPLAY_ZONES_EXTENSION_NAME "XR_DXR_display_zones"
 // SPEC_VERSION 2 (#225): + xrGetWorkspaceTileSizeDXR (live tile canvas px).
-#define XR_DXR_display_zones_SPEC_VERSION 2
+// SPEC_VERSION 3 (runtime#800): + XrDisplayZoneFeatherDXR — per-zone cosmetic
+// edge feather, OPT-IN. Zone edges are HARD by default (and the published
+// hardware wish is always binary/un-feathered regardless of this struct);
+// chain a feather on the zone at xrEndFrame to soften the COMPOSITE only.
+#define XR_DXR_display_zones_SPEC_VERSION 3
 
 #define XR_TYPE_DISPLAY_ZONE_CAPABILITIES_DXR               ((XrStructureType)1004999150)
 #define XR_TYPE_DISPLAY_ZONE_DXR                            ((XrStructureType)1004999151)
 #define XR_TYPE_DISPLAY_ZONES_FRAME_END_INFO_DXR            ((XrStructureType)1004999152)
 #define XR_TYPE_EVENT_DATA_DISPLAY_ZONE_METRICS_CHANGED_DXR ((XrStructureType)1004999153)
+#define XR_TYPE_DISPLAY_ZONE_FEATHER_DXR                    ((XrStructureType)1004999154)
 
 typedef XrFlags64 XrDisplayZonesFrameEndFlagsDXR;
 // Cross-check zone/locate/mask consistency this frame (one-shot WARN per
@@ -434,6 +439,18 @@ typedef struct XrDisplayZoneDXR {
 	uint32_t zoneId;
 	XrRect2Di rect; // client-window pixels
 } XrDisplayZoneDXR;
+
+// Per-zone cosmetic edge feather (spec v3, runtime#800/#803), OPT-IN: chain on
+// XrDisplayZoneDXR::next at the SUBMIT chain point (locate-instance chains are
+// ignored). 0/negative/NaN = hard (the default); the runtime clamps the radius
+// to half the zone's shorter side. Softens the runtime COMPOSITE only — the
+// published hardware wish stays binary regardless. Runtimes predating spec v3
+// ignore the chained struct (hard edges, no error).
+typedef struct XrDisplayZoneFeatherDXR {
+	XrStructureType type; // Must be XR_TYPE_DISPLAY_ZONE_FEATHER_DXR
+	const void *next;
+	float radiusPx; // inward ramp width, client-window px; 0 = hard
+} XrDisplayZoneFeatherDXR;
 
 // The mask handle from XR_DXR_local_3d_zone. The plugin never authors a wish
 // mask (it always auto-derives), so we forward-declare the handle here rather

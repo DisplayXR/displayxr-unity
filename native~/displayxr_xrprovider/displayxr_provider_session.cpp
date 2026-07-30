@@ -3072,6 +3072,11 @@ static int s_app_zone_valid = 0;
 static int s_app_transparent_requested = 0;
 static ProviderExtraZone s_app_extra_zones[PS_MAX_ZONES - 1];
 static uint32_t s_app_extra_zone_count = 0;
+// Per-zone cosmetic edge feather radius (unity#238, runtime#800 spec v3):
+// [0] = primary zone, [1..] = extra zones. APP-side state (not in s_ps, so it
+// survives the session-stop memset like s_app_extra_zones); read at submit,
+// where >0 chains XrDisplayZoneFeatherDXR on the zone. 0 = hard (default).
+static float s_app_zone_feather[PS_MAX_ZONES] = {};
 // GameView mirror (Task (a)): the woven shared texture opened on UNITY'S device so
 // the display-provider can wrap it via CreateTexture and mirror-blit it into the
 // editor Game window. Opened lazily on first request (graphics thread, session ready).
@@ -4498,6 +4503,14 @@ void dxr_prov_set_zone(uint32_t index, uint32_t zone_id, int32_t x, int32_t y, i
 	if (ei + 1 > s_app_extra_zone_count) s_app_extra_zone_count = ei + 1;
 }
 
+void dxr_prov_set_zone_feather(uint32_t index, float feather_px)
+{
+	if (index >= PS_MAX_ZONES) return;
+	// Sanitize here so the submit chain stays branch-simple: negative/NaN =
+	// hard (matches the runtime's own contract).
+	s_app_zone_feather[index] = (feather_px > 0.0f) ? feather_px : 0.0f;
+}
+
 uint32_t dxr_prov_get_extra_zone_count(void) { return s_ps.extra_zone_count; }
 
 // ============================================================================
@@ -5559,11 +5572,19 @@ int dxr_prov_submit_frame(uint32_t image_index)
 	// Zones (#166 Phase B): bind the projection layer's views into the zone rect.
 	// SAME instance/values as the locate chain; the submit values are authoritative.
 	XrDisplayZoneDXR submit_zone = {XR_TYPE_DISPLAY_ZONE_DXR};
+	// Per-zone opt-in edge feather (unity#238, spec v3): chained on the zone's
+	// next at SUBMIT only (locate chains are ignored by the runtime). Structs
+	// persist until xrEndFrame below, like the zones themselves.
+	XrDisplayZoneFeatherDXR submit_zone_feather = {XR_TYPE_DISPLAY_ZONE_FEATHER_DXR};
 	int zone_frame = ps_zone_active();
 	if (zone_frame) {
 		submit_zone.zoneId = s_ps.zone_id ? s_ps.zone_id : 1;
 		submit_zone.rect.offset = {s_ps.zone_x, s_ps.zone_y};
 		submit_zone.rect.extent = {s_ps.zone_w, s_ps.zone_h};
+		if (s_app_zone_feather[0] > 0.0f) {
+			submit_zone_feather.radiusPx = s_app_zone_feather[0];
+			submit_zone.next = &submit_zone_feather;
+		}
 	}
 
 	XrCompositionLayerProjection layer = {XR_TYPE_COMPOSITION_LAYER_PROJECTION};
@@ -5587,6 +5608,7 @@ int dxr_prov_submit_frame(uint32_t image_index)
 	XrCompositionLayerProjectionView extra_pv[PS_MAX_ZONES - 1][2] = {};
 	XrCompositionLayerProjection     extra_layer[PS_MAX_ZONES - 1] = {};
 	XrDisplayZoneDXR                 extra_zone_struct[PS_MAX_ZONES - 1] = {};
+	XrDisplayZoneFeatherDXR          extra_zone_feather[PS_MAX_ZONES - 1] = {};
 	int extra_has[PS_MAX_ZONES - 1] = {};
 	for (uint32_t i = 0; i < s_ps.extra_zone_count; i++) {
 		ProviderExtraZone *z = &s_ps.extra_zones[i];
@@ -5609,6 +5631,11 @@ int dxr_prov_submit_frame(uint32_t image_index)
 		extra_zone_struct[i].zoneId = z->zone_id;
 		extra_zone_struct[i].rect.offset = {z->rect_x, z->rect_y};
 		extra_zone_struct[i].rect.extent = {z->rect_w, z->rect_h};
+		if (s_app_zone_feather[i + 1] > 0.0f) {
+			extra_zone_feather[i].type = XR_TYPE_DISPLAY_ZONE_FEATHER_DXR;
+			extra_zone_feather[i].radiusPx = s_app_zone_feather[i + 1];
+			extra_zone_struct[i].next = &extra_zone_feather[i];
+		}
 		extra_layer[i].type = XR_TYPE_COMPOSITION_LAYER_PROJECTION;
 		extra_layer[i].next = &extra_zone_struct[i];
 		extra_layer[i].layerFlags = (s_ps.transparent_requested && s_ps.alpha_blend_supported)
