@@ -34,10 +34,10 @@ namespace DisplayXR
 
         /// <summary>
         /// Latest eye-tracking state, cached from <see cref="EyeTrackingStateChanged"/>
-        /// (the runtime emits an edge on session start). The provider exposes no eye
-        /// positions — only whether a face is currently tracked — so editor runtime
-        /// status can surface tracked/not-tracked in provider mode. False until the
-        /// first edge / when the provider isn't running.
+        /// (the runtime emits an edge on session start) — whether a face is currently
+        /// tracked, so editor runtime status can surface tracked/not-tracked in provider
+        /// mode. For the tracked eye *positions* see <see cref="TryGetViewerEyes"/>.
+        /// False until the first edge / when the provider isn't running.
         /// </summary>
         public static bool IsEyeTracked { get; private set; }
 
@@ -90,6 +90,67 @@ namespace DisplayXR
             if (!IsRunning) return false;
             DisplayXRProviderNative.dxr_prov_get_display_info(out info);
             return info.isValid != 0;
+        }
+
+        /// <summary>
+        /// World-space positions of the two eyes the provider is rendering with this
+        /// frame (Unity coords) — the render-ready per-eye poses from
+        /// <c>xrLocateViews</c> after the runtime's Kooima math (<c>XR_DXR_view_rig</c>),
+        /// so they are always consistent with what the viewer actually sees.
+        ///
+        /// Use this — NOT <c>Camera.GetStereoViewMatrix()</c> — for head-coupled
+        /// effects. Unity's C#-side stereo matrix cache is only written by
+        /// <c>Camera.SetStereoViewMatrix()</c>, which the plugin no longer calls: in
+        /// provider mode the per-eye poses reach Unity through the native frame desc
+        /// (<c>deviceAnchorToEyePose</c>) and are consumed inside Unity's render loop,
+        /// never round-tripped back into that cache. So <c>GetStereoViewMatrix</c>
+        /// returns the same (mono) matrix for both eyes (#236).
+        ///
+        /// Returns false when the provider isn't running, or the two eyes are still
+        /// coincident (no located views yet) — fall back to the camera transform.
+        /// </summary>
+        public static bool TryGetViewerEyes(out Vector3 left, out Vector3 right)
+        {
+            left = default;
+            right = default;
+            if (s_NativeMissing) return false;
+            Vector3 l = default, r = default;
+            try
+            {
+                if (!IsRunning) return false;
+                DisplayXRProviderNative.dxr_prov_get_eye_clip(0, out _, out float lx, out float ly, out float lz);
+                DisplayXRProviderNative.dxr_prov_get_eye_clip(1, out _, out float rx, out float ry, out float rz);
+                l = new Vector3(lx, ly, lz);
+                r = new Vector3(rx, ry, rz);
+            }
+            // Head-coupled effects call this every frame, so a project without the
+            // native plugin (unsupported platform) must not throw per-frame — latch
+            // and go quiet, mirroring DisplayXRGizmoHelpers.TryGetLiveRawEyes.
+            catch (DllNotFoundException) { s_NativeMissing = true; return false; }
+            catch (EntryPointNotFoundException) { s_NativeMissing = true; return false; }
+
+            // Coincident eyes = the provider hasn't delivered real per-eye views yet
+            // (pre-first-frame zeros, or a head-center-only session).
+            if ((l - r).sqrMagnitude < 1e-10f) return false;
+            left = l;
+            right = r;
+            return true;
+        }
+
+        /// <summary>Latched once the native plugin turns out to be absent, so
+        /// <see cref="TryGetViewerEyes"/> stops throwing on every frame.</summary>
+        static bool s_NativeMissing;
+
+        /// <summary>
+        /// World-space viewer head position: the midpoint of
+        /// <see cref="TryGetViewerEyes"/>. Returns false on the same conditions.
+        /// </summary>
+        public static bool TryGetViewerHead(out Vector3 head)
+        {
+            head = default;
+            if (!TryGetViewerEyes(out Vector3 l, out Vector3 r)) return false;
+            head = (l + r) * 0.5f;
+            return true;
         }
 
         /// <summary>
