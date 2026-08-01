@@ -218,11 +218,19 @@ if [ "$SIGNED" = yes ]; then
     if command -v zip >/dev/null; then ( cd "$D/in" && zip -qr "$D/unsigned.zip" . )
     else powershell -NoProfile -Command "Compress-Archive -Path '$(cygpath -w "$D/in")\*' -DestinationPath '$(cygpath -w "$D/unsigned.zip")' -Force"; fi
 
-    TMP="sign-unity-$(date +%s)-$$"
-    gh release create "$TMP" -R "$SIGN_REPO" --prerelease --title "$TMP" \
+    # NOTE: name this SIGN_TAG, never TMP. `TMP` is an exported env var on
+    # git-bash/Windows (Go's os.TempDir() reads %TMP%), so assigning to it
+    # repoints every child process's temp dir at a relative path — and
+    # `gh run download` below then dies with "error initializing temporary
+    # file: open <cwd>\sign-unity-...\gh-artifact.zip: The system cannot find
+    # the path specified", leaving the release silently unsigned (and littering
+    # an empty sign-unity-* dir in the cwd). Windows-only: macOS/Linux Go reads
+    # TMPDIR, so this never repros on the mac box.
+    SIGN_TAG="sign-unity-$(date +%s)-$$"
+    gh release create "$SIGN_TAG" -R "$SIGN_REPO" --prerelease --title "$SIGN_TAG" \
        --notes "temp unity-signing payload (auto-deleted)" "$D/unsigned.zip"
     SINCE="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-    gh workflow run sign-artifact -R "$SIGN_REPO" -f release_tag="$TMP"
+    gh workflow run sign-artifact -R "$SIGN_REPO" -f release_tag="$SIGN_TAG"
     RID=""
     for _ in $(seq 1 20); do
       RID=$(gh run list -R "$SIGN_REPO" --workflow sign-artifact --event workflow_dispatch \
@@ -237,7 +245,7 @@ if [ "$SIGNED" = yes ]; then
       else powershell -NoProfile -Command "Expand-Archive -Path '$(cygpath -w "$D/out/signed.zip")' -DestinationPath '$(cygpath -w "$D/signed")' -Force"; fi
       SIGNED_DLL=$(ls "$D/signed/displayxr_unity.dll" 2>/dev/null | head -1)
     fi
-    gh release delete "$TMP" -R "$SIGN_REPO" --yes --cleanup-tag >/dev/null 2>&1 || true
+    gh release delete "$SIGN_TAG" -R "$SIGN_REPO" --yes --cleanup-tag >/dev/null 2>&1 || true
 
     if [ -z "$SIGNED_DLL" ]; then
       echo "⚠ sign-artifact did not return a signed DLL — ships unsigned."; SIGNED=no
