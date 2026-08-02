@@ -1204,11 +1204,43 @@ extern "C" void *dxr_prov_get_metal_eye_view(uint32_t image, uint32_t eye)
 #endif
 
 #ifdef _WIN32
+// LUID → human-readable adapter description ("NVIDIA GeForce RTX 3080 Laptop
+// GPU") for the mismatch diagnostics below. Best-effort; "unknown adapter" on
+// any failure.
+static void ps_describe_adapter(LUID luid, char *out, size_t out_len)
+{
+	snprintf(out, out_len, "unknown adapter");
+	IDXGIFactory1 *factory = NULL;
+	if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void **)&factory)) || !factory) {
+		return;
+	}
+	for (UINT i = 0;; i++) {
+		IDXGIAdapter1 *ad = NULL;
+		if (factory->EnumAdapters1(i, &ad) == DXGI_ERROR_NOT_FOUND || !ad) {
+			break;
+		}
+		DXGI_ADAPTER_DESC1 ds = {};
+		if (SUCCEEDED(ad->GetDesc1(&ds)) && ds.AdapterLuid.HighPart == luid.HighPart &&
+		    ds.AdapterLuid.LowPart == luid.LowPart) {
+			snprintf(out, out_len, "%ls", ds.Description);
+			ad->Release();
+			break;
+		}
+		ad->Release();
+	}
+	factory->Release();
+}
+
 // D3D11 zero-copy (#195): call xrGetD3D11GraphicsRequirementsKHR (mandatory before
 // xrCreateSession) and verify Unity's D3D11 device sits on the runtime's required
 // adapter LUID. Returns 1 if OK (or the requirement PFN is absent → let the session
-// create decide), 0 with a clear WARN on an adapter mismatch (multi-GPU) so we fail
-// gracefully instead of the runtime's generic GRAPHICS_DEVICE_INVALID.
+// create decide), 0 on an adapter mismatch (multi-GPU) so we fail gracefully
+// instead of the runtime's generic GRAPHICS_DEVICE_INVALID.
+//
+// The mismatch arm is deliberately LOUD (#240): a quiet one-line WARN here cost
+// a whole perf study a voided headline — the app looks healthy (window up,
+// player rendering, 60 Hz presents) while nothing ever reaches the panel. Name
+// both adapters and print the exact knobs that align them.
 static int ps_d3d11_check_requirements(void)
 {
 	PFN_xrVoidFunction fn = NULL;
@@ -1238,9 +1270,22 @@ static int ps_d3d11_check_requirements(void)
 	int match = (unity_luid.HighPart == req.adapterLuid.HighPart &&
 	             unity_luid.LowPart == req.adapterLuid.LowPart);
 	if (!match && (req.adapterLuid.HighPart != 0 || req.adapterLuid.LowPart != 0)) {
-		ps_log("[DisplayXR-PROV] WARN: Unity's D3D11 device is on a different adapter than the "
-		       "runtime requires (multi-GPU). DisplayXR needs Unity on the display's GPU — "
-		       "session not started (#195).\n");
+		char unity_desc[128], req_desc[128], msg[1024];
+		ps_describe_adapter(unity_luid, unity_desc, sizeof(unity_desc));
+		ps_describe_adapter(req.adapterLuid, req_desc, sizeof(req_desc));
+		snprintf(msg, sizeof(msg),
+		         "[DisplayXR-PROV] ERROR: GPU adapter mismatch - XR session NOT started, nothing "
+		         "will reach the 3D display (#195/#240).\n"
+		         "[DisplayXR-PROV]   Unity renders on : %s (LUID %08x-%08x)\n"
+		         "[DisplayXR-PROV]   Runtime requires : %s (LUID %08x-%08x)\n"
+		         "[DisplayXR-PROV]   Fix: align them. Either set this app's Windows GpuPreference "
+		         "to the runtime's adapter (Settings > System > Display > Graphics), or point the "
+		         "runtime at Unity's adapter with the env var DXR_D3D_FORCE_GPU=igpu|dgpu "
+		         "(runtime >= v2.2.4). '-force-d3d12' on the command line is an alternative "
+		         "when Unity's device filter forced an unintended adapter/API.\n",
+		         unity_desc, (unsigned)unity_luid.HighPart, (unsigned)unity_luid.LowPart,
+		         req_desc, (unsigned)req.adapterLuid.HighPart, (unsigned)req.adapterLuid.LowPart);
+		ps_log(msg);
 		return 0;
 	}
 	ps_log("[DisplayXR-PROV] D3D11 graphics requirements OK (zero-copy on Unity's device)\n");
@@ -1316,6 +1361,33 @@ static int ps_create_own_device(void)
 			return 0;
 		}
 		luid = req.adapterLuid;
+	}
+
+	// The eye bridge copies Unity's slices into the session swapchain, and a
+	// CROSS-ADAPTER bridge presents black (ADR-032 / #223; reproduced on HW in
+	// #240: session fully up, mode 3D, nothing on the panel). If Unity's D3D12
+	// device is not on the runtime's required adapter, refuse loudly with the
+	// exact knobs instead of starting a session that can never display.
+	if (s_ps.unity_device && (luid.HighPart != 0 || luid.LowPart != 0)) {
+		LUID unity_luid = s_ps.unity_device->GetAdapterLuid();
+		if (unity_luid.HighPart != luid.HighPart || unity_luid.LowPart != luid.LowPart) {
+			char unity_desc[128], req_desc[128], msg[1024];
+			ps_describe_adapter(unity_luid, unity_desc, sizeof(unity_desc));
+			ps_describe_adapter(luid, req_desc, sizeof(req_desc));
+			snprintf(msg, sizeof(msg),
+			         "[DisplayXR-PROV] ERROR: GPU adapter mismatch - XR session NOT started, a "
+			         "cross-adapter eye bridge would present black (#240).\n"
+			         "[DisplayXR-PROV]   Unity renders on : %s (LUID %08x-%08x)\n"
+			         "[DisplayXR-PROV]   Runtime requires : %s (LUID %08x-%08x)\n"
+			         "[DisplayXR-PROV]   Fix: align them. Either set this app's Windows "
+			         "GpuPreference to the runtime's adapter (Settings > System > Display > "
+			         "Graphics), or point the runtime at Unity's adapter with the env var "
+			         "DXR_D3D_FORCE_GPU=igpu|dgpu (runtime >= v2.2.4).\n",
+			         unity_desc, (unsigned)unity_luid.HighPart, (unsigned)unity_luid.LowPart,
+			         req_desc, (unsigned)luid.HighPart, (unsigned)luid.LowPart);
+			ps_log(msg);
+			return 0;
+		}
 	}
 
 	IDXGIFactory4 *factory = NULL;
