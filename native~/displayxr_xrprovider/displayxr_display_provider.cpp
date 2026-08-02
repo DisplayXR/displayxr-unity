@@ -736,6 +736,15 @@ GfxStart(UnitySubsystemHandle handle, void *userData, UnityXRRenderingCapabiliti
 		ID3D11Device *dev = nullptr;
 		if (!get_unity_d3d11(&dev)) return kUnitySubsystemErrorCodeFailure;
 		backend_kind = DXR_GFX_D3D11; dev_ptr = dev; queue_ptr = nullptr;
+		// Common on integrated Intel: Unity's built-in D3D12 device filter denies
+		// the iGPU and silently falls back to D3D11 even when the project targets
+		// D3D12 (#240). That's fine — the D3D11 zero-copy backend is fully
+		// supported — but say so, so a D3D11 log line on a D3D12 project reads as
+		// expected behavior rather than a mystery. '-force-d3d12' bypasses the
+		// filter if the D3D12 backend is specifically wanted.
+		prov_log("[DisplayXR-PROV] Renderer is Direct3D11 - using the D3D11 zero-copy backend. "
+		         "(If this project targets D3D12, Unity's device filter likely denied it on this "
+		         "GPU - integrated Intel is the usual case; launch with -force-d3d12 to override.)\n");
 	} else
 #elif defined(__APPLE__)
 	if (renderer == kUnityGfxRendererMetal) {
