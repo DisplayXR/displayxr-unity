@@ -5,6 +5,14 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.10.1] - 2026-08-02
+
+### Fixed
+- **GPU adapter mismatches now fail loudly instead of silently presenting black** (#240, #241). Two configurations let a healthy-looking Unity app measure as rendering while nothing reached the panel:
+  - **D3D12 own-device path**: no adapter-mismatch check existed at all — a session whose own/session device diverged from Unity's device started successfully and presented black through the cross-adapter eye bridge (the ADR-032/#223 failure mode, reproduced on hardware). The provider now refuses to start, with actionable remediation, rather than presenting black.
+  - **D3D11 zero-copy path**: the mismatch WARN was a single quiet line. It now names both adapters (LUID → DXGI description) and prints the exact knobs that align them (per-exe GpuPreference, the runtime's `DXR_D3D_FORCE_GPU` from v2.2.4, `-force-d3d12`).
+  - **D3D11 fallback**: added an info line explaining that Unity's D3D12 device filter commonly denies integrated Intel GPUs, and that the D3D11 zero-copy backend is the supported path there (bypass: `-force-d3d12`).
+
 ## [2.10.0] - 2026-07-31
 
 ### Added
