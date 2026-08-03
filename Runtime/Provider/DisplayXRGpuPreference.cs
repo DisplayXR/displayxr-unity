@@ -69,6 +69,11 @@ namespace DisplayXR
         /// </summary>
         public static TargetGpu Target { get; set; } = TargetGpu.Auto;
 
+        // Was DXR_D3D_FORCE_GPU already set before the plugin ever touched it?
+        // Latched on the first Apply() — see the comment there.
+        static bool s_ExternalChecked;
+        static bool s_ExternallySet;
+
         /// <summary>
         /// Resolve <see cref="Target"/> and push it to the runtime. Called by
         /// <see cref="DisplayXRDisplayLoader.Initialize"/> before the subsystem is
@@ -85,13 +90,25 @@ namespace DisplayXR
                 Application.platform != RuntimePlatform.WindowsEditor)
                 return; // hybrid-adapter steering is a Windows/DXGI concern
 
-            // An env var set from outside the process wins — don't fight a developer
-            // who is deliberately forcing an adapter from the shell.
-            string existing = System.Environment.GetEnvironmentVariable(k_EnvVar);
-            if (!string.IsNullOrEmpty(existing))
+            // An env var set from OUTSIDE the process wins — don't fight a developer
+            // deliberately forcing an adapter from the shell.
+            //
+            // "Outside" is latched on the first call and never re-tested, because the
+            // editor is a long-lived process where Initialize() runs once per Play
+            // session: from the second Play onward the variable is set — by US — and
+            // re-reading it would make the plugin defer to its own previous value and
+            // silently ignore a changed Target.
+            if (!s_ExternalChecked)
             {
-                Debug.Log("[DisplayXR] Target GPU: " + k_EnvVar + "=" + existing +
-                          " already set in the environment — leaving it alone.");
+                s_ExternalChecked = true;
+                s_ExternallySet = !string.IsNullOrEmpty(
+                    System.Environment.GetEnvironmentVariable(k_EnvVar));
+            }
+            if (s_ExternallySet)
+            {
+                Debug.Log("[DisplayXR] Target GPU: " + k_EnvVar + "=" +
+                          System.Environment.GetEnvironmentVariable(k_EnvVar) +
+                          " was set in the environment before startup — leaving it alone.");
                 return;
             }
 
