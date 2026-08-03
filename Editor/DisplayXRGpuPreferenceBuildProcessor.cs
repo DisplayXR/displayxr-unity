@@ -45,6 +45,15 @@ namespace DisplayXR.Editor
             if (string.IsNullOrEmpty(exePath))
                 return;
 
+            // Windows matches these entries against the exe path in its OWN form —
+            // BACKSLASH-separated. Unity hands us outputPath with forward slashes, and
+            // an entry written that way is silently ignored: the value is visibly
+            // present in the registry, and has no effect whatsoever. (Verified on
+            // hardware — a forward-slash "GpuPreference=1;" left Unity on the dGPU;
+            // the identical entry with backslashes moved it to the iGPU.) Normalise.
+            string forwardSlashPath = exePath.Replace('\\', '/');
+            exePath = exePath.Replace('/', '\\');
+
             // Default to Discrete when no settings asset exists — the pre-#242
             // behaviour, so existing projects rebuild identically.
             var settings = DisplayXRManifestSettings.Find();
@@ -67,6 +76,11 @@ namespace DisplayXR.Editor
                         Debug.LogWarning($"DisplayXR: Could not open {subKey} to set the GPU preference for {exePath}.");
                         return;
                     }
+
+                    // Drop the ineffective forward-slash entry that builds before this
+                    // fix wrote, so the registry doesn't keep a misleading no-op around.
+                    if (forwardSlashPath != exePath && key.GetValue(forwardSlashPath) != null)
+                        key.DeleteValue(forwardSlashPath, false);
 
                     if (value == null)
                     {
