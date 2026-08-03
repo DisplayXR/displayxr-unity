@@ -177,6 +177,7 @@ namespace DisplayXR.Editor
             {
                 EditorGUILayout.LabelField("App Name", settings.EffectiveName);
                 EditorGUILayout.LabelField("Category", settings.category.ToString());
+                EditorGUILayout.LabelField("Target GPU", settings.targetGpu.ToString());
                 if (GUILayout.Button("Select Manifest Settings"))
                     Selection.activeObject = settings;
             }

@@ -1791,6 +1791,59 @@ LifecycleShutdown(UnitySubsystemHandle handle, void *userData)
 
 } // namespace
 
+#ifdef _WIN32
+// ============================================================================
+// (#242) Unity's adapter LUID, for displayxr_gpu_preference.cpp.
+//
+// The device getters above live in this file's anonymous namespace (internal
+// linkage), so the GPU-preference TU can't call them directly — this is the
+// narrow bridge. It only exposes WHICH adapter Unity landed on; classifying
+// that adapter as integrated/discrete stays with the rest of the GPU-preference
+// logic, mirroring the runtime's VRAM rule in one place.
+//
+// Valid from plugin load onward (Unity's graphics device exists before the XR
+// loader's Initialize()). Returns 1 on success, 0 if no device is reachable.
+// ============================================================================
+
+extern "C" int dxr_prov_unity_adapter_luid(int32_t *out_high, uint32_t *out_low)
+{
+	if (!out_high || !out_low) return 0;
+	*out_high = 0;
+	*out_low = 0;
+
+	ID3D12Device *d12 = nullptr;
+	ID3D12CommandQueue *q = nullptr;
+	if (get_unity_d3d12(&d12, &q) && d12) {
+		LUID luid = d12->GetAdapterLuid();
+		*out_high = luid.HighPart;
+		*out_low = luid.LowPart;
+		return 1;
+	}
+
+	// D3D11 — commonly Unity's device filter denying D3D12 on integrated Intel (#240).
+	ID3D11Device *d11 = nullptr;
+	if (get_unity_d3d11(&d11) && d11) {
+		IDXGIDevice *dxgi = nullptr;
+		if (SUCCEEDED(d11->QueryInterface(__uuidof(IDXGIDevice), (void **)&dxgi)) && dxgi) {
+			IDXGIAdapter *ad = nullptr;
+			if (SUCCEEDED(dxgi->GetAdapter(&ad)) && ad) {
+				DXGI_ADAPTER_DESC desc = {};
+				if (SUCCEEDED(ad->GetDesc(&desc))) {
+					*out_high = desc.AdapterLuid.HighPart;
+					*out_low = desc.AdapterLuid.LowPart;
+					ad->Release();
+					dxgi->Release();
+					return 1;
+				}
+				ad->Release();
+			}
+			dxgi->Release();
+		}
+	}
+	return 0;
+}
+#endif // _WIN32
+
 // ============================================================================
 // Registration entry — called from UnityPluginLoad / UnityPluginUnload.
 // ============================================================================

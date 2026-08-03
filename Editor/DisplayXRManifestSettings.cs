@@ -46,6 +46,17 @@ namespace DisplayXR.Editor
                  "discover this build without needing it under Program Files.")]
         public bool registerWithDisplayXR = false;
 
+        [Tooltip("Which GPU this app should run on (#242).\n\n" +
+                 "Unity's graphics device is created before any app script runs, so this " +
+                 "must be decided at BUILD time: it writes a per-exe Windows GPU preference " +
+                 "next to the built player. At runtime the plugin points the DisplayXR " +
+                 "runtime at the same adapter, so the two can't diverge (a divergence " +
+                 "presents black — see issue #240).\n\n" +
+                 "Auto keeps Windows' own choice and has the plugin follow whatever Unity " +
+                 "picked. Choose Integrated for a panel driven by the iGPU or to match a " +
+                 "single-GPU Intel target; Discrete for maximum performance on a hybrid laptop.")]
+        public DisplayXRGpuPreference.TargetGpu targetGpu = DisplayXRGpuPreference.TargetGpu.Discrete;
+
         [Tooltip("DisplayXR shows a branded boot splash (logo on the zero-disparity " +
                  "plane) by default, replacing Unity's stock splash in standalone " +
                  "builds. Tick to OPT OUT — keep Unity's splash and skip the DisplayXR " +
