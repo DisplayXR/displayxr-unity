@@ -52,6 +52,16 @@ namespace DisplayXR
                 return false;
             }
 
+            // Align the runtime's suggested adapter with Unity's BEFORE the subsystem
+            // exists (#242). The runtime reads DXR_D3D_FORCE_GPU lazily, at
+            // xrGetD3D11/12GraphicsRequirementsKHR time, but the OpenXR loader loads the
+            // runtime DLL at xrCreateInstance — so this is the deadline for the write to
+            // be observed. A mismatch here is not cosmetic: the eye bridge goes
+            // cross-adapter and presents black (#240), which since #241 the provider
+            // refuses to start on. Default (Auto) is a no-op on single-GPU boxes and on
+            // the ordinary discrete path.
+            DisplayXRGpuPreference.Apply();
+
             // Pick the stereo render mode BEFORE creating/starting the subsystem so
             // the native GfxStart (which reads it) sees the right value (#166 task #8).
             // SPI is correct only on URP+Windows+D3D12; on BiRP it renders opaque

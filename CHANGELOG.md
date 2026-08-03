@@ -5,6 +5,20 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **App-selectable target GPU** (#242) — an app can now choose which GPU it runs on instead of being unconditionally pinned to the discrete one.
+  - **`DisplayXRGpuPreference.Target`** (`Auto` | `Discrete` | `Integrated`), settable from app code before XR initialization (e.g. a `[RuntimeInitializeOnLoadMethod]`), plus a **Target GPU** field on the manifest settings asset (shown in Project Settings > XR Plug-in Management > OpenXR > DisplayXR).
+  - **`Auto` (the new default behaviour at runtime) points the runtime at whichever adapter Unity actually landed on**, using the same dedicated-VRAM classification the runtime uses for its `igpu`/`dgpu` keywords. On the ordinary discrete path this resolves to the runtime's existing default, so nothing changes there; it takes effect only in the configuration that is broken without it. On a single-GPU box it is a no-op — adapters cannot diverge, so the runtime's default is left alone.
+  - This closes the mismatch class behind #240 at the source: previously the plugin pinned Unity to the dGPU while the runtime independently suggested the dGPU, and any deviation (a panel driven by the iGPU, a manually-set GpuPreference, Unity's D3D12 device filter falling back) produced a cross-adapter eye bridge that presents black.
+
+### Changed
+- The post-build GPU pin honours the Target GPU setting instead of hardcoding `GpuPreference=2;`. `Integrated` writes `GpuPreference=1;`, `Auto` removes any per-exe entry so Windows decides. **Default remains `Discrete`, so existing projects rebuild identically.**
+
+### Fixed
+- The runtime's adapter steer is now set through a native `_putenv_s` + `SetEnvironmentVariableW` export rather than managed code. The runtime reads `DXR_D3D_FORCE_GPU` with `getenv()`, which reads the CRT's cached environment table — `SetEnvironmentVariableW` (what C#'s `Environment.SetEnvironmentVariable` calls) does **not** update it, so a managed-only set is silently ignored. Verified on hardware that a late-loaded DLL observes the value via `getenv()` under both `/MD` and `/MT` CRT linkage.
+
 ## [2.10.1] - 2026-08-02
 
 ### Fixed

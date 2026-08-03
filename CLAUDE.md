@@ -103,6 +103,32 @@ via `dxr_prov_set_single_pass` **before** the session starts:
   serialize with the in-process weaver on the shared device and deadlock (Optimus laptops).
 - Dev overrides (both APIs): `DISPLAYXR_FORCE_SPI=1` / `DISPLAYXR_FORCE_MULTIPASS=1`.
 
+#### Which GPU the app runs on (hybrid laptops) — `DisplayXRGpuPreference` (#242)
+
+Unity and the runtime pick adapters **independently**, and if they disagree the eye bridge
+goes cross-adapter and presents **black** with a fully healthy-looking session (#240; since
+#241 the provider refuses to start instead). Two levers keep them aligned, with different
+lifetimes:
+
+| Lever | Steers | When |
+|---|---|---|
+| Per-exe `HKCU\...\DirectX\UserGpuPreferences` (post-build processor) | **Unity** | Build time — Unity's D3D device is created before any app script runs, so this *cannot* be done at runtime |
+| `DXR_D3D_FORCE_GPU=igpu\|dgpu\|<index>` (runtime ≥ v2.2.4) | **the runtime** | Runtime — read lazily at `xrGetD3Dxx­GraphicsRequirementsKHR`, so the loader sets it in `Initialize()` |
+
+`DisplayXRGpuPreference.Target` (`Auto`/`Discrete`/`Integrated`) drives both; apps set it
+before XR init, or pick it in the manifest settings asset. **`Auto` follows Unity** —
+classify Unity's adapter and point the runtime at the same one — so it is a no-op on the
+discrete path and on single-GPU boxes, and only bites where the mismatch would occur.
+
+> **Trap:** the runtime reads the env var with `getenv()`, which reads the **CRT's cached
+> environment table**. `SetEnvironmentVariableW` — what C#'s
+> `Environment.SetEnvironmentVariable` calls — does **not** update that table, so a
+> managed-only set is *silently ignored*. Always go through `dxr_prov_set_env`
+> (`_putenv_s` + `SetEnvironmentVariableW`), and before `xrCreateInstance` loads the
+> runtime DLL. Classification must also use **dedicated-VRAM ordering**, not
+> `EnumAdapterByGpuPreference`: a per-app `UserGpuPreferences` entry reorders the latter,
+> so the two sides would disagree exactly when the app has been pinned.
+
 The **only** pipeline-specific piece left is the opt-in URP foreground clip, which lives in a
 **URP-guarded sub-assembly** (`Runtime/URP/`, `Editor/URP/` — asmdefs gated by
 `defineConstraints: ["DISPLAYXR_URP"]` + a `versionDefines` that defines `DISPLAYXR_URP` only for

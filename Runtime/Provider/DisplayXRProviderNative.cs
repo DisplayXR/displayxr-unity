@@ -79,6 +79,31 @@ namespace DisplayXR
         public static extern void dxr_prov_set_single_pass(int enable);
 
         /// <summary>
+        /// (#242) Classify the adapter Unity's graphics device is on, using the SAME
+        /// dedicated-VRAM rule the runtime uses for its <c>DXR_D3D_FORCE_GPU</c>
+        /// igpu/dgpu keywords: 1 = integrated, 2 = discrete, 0 = unknown.
+        /// Returns 0 when the box has only ONE hardware adapter — nothing can diverge
+        /// there, so the caller must leave the runtime's default suggestion alone.
+        /// Valid from plugin load onward (reads Unity's device via IUnityInterfaces),
+        /// so it may be called before the subsystem starts. Windows-only.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int dxr_prov_unity_gpu_class();
+
+        /// <summary>
+        /// (#242) Set a process environment variable so a LATER-LOADED native DLL's
+        /// <c>getenv()</c> observes it. Returns 1 on success.
+        ///
+        /// Do NOT substitute <c>System.Environment.SetEnvironmentVariable</c>: that
+        /// calls <c>SetEnvironmentVariableW</c>, which updates the Win32 environment
+        /// block but NOT the CRT's cached table that <c>getenv()</c> actually reads —
+        /// the runtime would silently ignore it. The native side does both.
+        /// Windows-only.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl, CharSet = CharSet.Ansi)]
+        public static extern int dxr_prov_set_env(string name, string value);
+
+        /// <summary>
         /// Effective provider render mode: 1 = Single-Pass-Instanced, 0 = MultiPass.
         /// <see cref="DisplayXRPostAA"/> reads it to gate its OnRenderImage FXAA pass:
         /// valid only in MultiPass (each eye is its own single-slice RT); SPI's 2-slice
