@@ -62,6 +62,23 @@ namespace DisplayXR
 
         /// <summary>Set the explicit dest rect (client-window pixels) and enable
         /// explicit-rect mode. Safe to call every frame.</summary>
+        /// <summary>
+        /// Force the overlay to re-render on the next frame, regardless of
+        /// <see cref="maxRefreshHz"/>. Call this after changing Local2D content
+        /// when the throttle's latency would be noticeable (#244).
+        /// </summary>
+        public void SetDirty()
+        {
+            m_ForceRender = true;
+        }
+
+        // #244 refresh throttle. m_ForceRender covers the first frame, explicit
+        // SetDirty() calls, and geometry changes; m_BridgeDirty makes the provider
+        // bridge copy follow the camera instead of running unconditionally.
+        private float m_LastRenderTime = float.NegativeInfinity;
+        private bool m_ForceRender = true;
+        private bool m_BridgeDirty = true;
+
         public void SetExplicitRect(int x, int y, int w, int h)
         {
             useExplicitRect = true;
@@ -72,6 +89,15 @@ namespace DisplayXR
 
         [Tooltip("Resolution of the overlay RenderTexture.")]
         public Vector2Int resolution = new Vector2Int(1024, 512);
+
+        [Tooltip("Maximum times per second the overlay re-renders. Local2D content is " +
+                 "typically static (a speech bubble, a HUD), but an enabled offscreen " +
+                 "camera renders EVERY frame — and in provider mode each frame also pays " +
+                 "a full-RT bridge copy. Throttling both to a few Hz is imperceptible for " +
+                 "text yet removes a fixed per-frame cost. Content still appears within " +
+                 "1/N s, and SetDirty() forces an immediate refresh. 0 = every frame " +
+                 "(default; unchanged behaviour). See displayxr-unity#244.")]
+        public float maxRefreshHz = 0f;
 
         /// <summary>The RenderTexture capturing the Canvas content.</summary>
         public RenderTexture OverlayTexture { get; private set; }
@@ -248,6 +274,10 @@ namespace DisplayXR
             if (cam != m_OverlayCamera) return;
             if (m_SavedForegroundFar.z > 0.5f)
                 Shader.SetGlobalVector(s_ForegroundFarId, m_SavedForegroundFar);
+            // #244 — the overlay RT now holds new content, so the provider bridge
+            // copy in the next LateUpdate has something to do. This is the precise
+            // "did it render" signal (the camera may have been gated off).
+            m_BridgeDirty = true;
         }
 
         // Provider mode: acquire the provider's cross-device Local2D bridge and wrap it
@@ -371,7 +401,29 @@ namespace DisplayXR
                         DisplayXRNative.displayxr_local2d_set_rect(px, py, pw, ph);
                     m_LastRectX = px; m_LastRectY = py;
                     m_LastRectW = pw; m_LastRectH = ph;
+                    m_ForceRender = true; // geometry moved — refresh now, not on the next tick
                 }
+            }
+
+            // #244 — gate the overlay camera instead of letting it render every
+            // frame. Still Unity's normal camera loop (so the canvas rebuild
+            // ordering that OnEnable documents is untouched); we only choose
+            // WHICH frames it runs on. Setting this in LateUpdate takes effect
+            // for the render that follows later this same frame.
+            if (maxRefreshHz > 0f)
+            {
+                float period = 1f / maxRefreshHz;
+                bool due = m_ForceRender || (Time.unscaledTime - m_LastRenderTime) >= period;
+                m_OverlayCamera.enabled = due;
+                if (due)
+                {
+                    m_LastRenderTime = Time.unscaledTime;
+                    m_ForceRender = false;
+                }
+            }
+            else if (!m_OverlayCamera.enabled)
+            {
+                m_OverlayCamera.enabled = true; // throttle turned off at runtime
             }
 
             // Provider mode: mirror the overlay RT into the provider's cross-device
@@ -383,8 +435,15 @@ namespace DisplayXR
                 // Unconditional — TryAcquireBridge detects a session restart by the
                 // native pointer changing, which a "== null" guard would hide.
                 TryAcquireBridge();
-                if (m_BridgeTex != null && OverlayTexture != null)
+                // #244 — the copy only needs to run when the overlay camera has
+                // actually re-rendered since the last one (OnEndOverlayCamera sets
+                // the flag). Unthrottled that is still every frame, so this is a
+                // no-op change at maxRefreshHz = 0.
+                if (m_BridgeTex != null && OverlayTexture != null && m_BridgeDirty)
+                {
                     Graphics.CopyTexture(OverlayTexture, m_BridgeTex);
+                    m_BridgeDirty = false;
+                }
             }
             // No manual Render() here — the camera is enabled and renders in
             // Unity's loop after the canvas rebuild (see OnEnable). This is the
