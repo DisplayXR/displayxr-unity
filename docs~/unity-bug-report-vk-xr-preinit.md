@@ -61,15 +61,22 @@ extra instance/device extensions merged and with
 `kUnityXRPreInitFlagsUseVulkanOffscreenSwapchain` set. The same provider code
 path works correctly on D3D11, D3D12, and Metal.
 
-**Repro steps** (minimal project attached)
-1. Windows Standalone player, Graphics APIs = Vulkan first.
-2. XR Management loader implements `IXRLoaderPreInit` → boot.config gets
-   `xrsdk-pre-init-library=<plugin>`; plugin exports `XRSDKPreInit` and registers
-   a `UnityXRPreInitProvider`.
-3. Observe `GetGraphicsAdapterId(renderer=Vulkan, rendererData=NULL)` called once
-   at boot (defect 1). Return any value → D3D12 silent fallback; return false →
-   continue.
-4. Provider's display subsystem starts; first CreateTexture → crash (defect 2).
+**Repro steps** (project attached; uses the open-source DisplayXR provider,
+which now works around this bug by default — the env var below disables the
+workaround to expose the defect)
+1. Install the DisplayXR OpenXR runtime (github.com/DisplayXR/displayxr-runtime
+   releases; with no 3D panel present it falls back to a simulated display
+   automatically — no hardware needed).
+2. Open the attached project. Build a Windows Standalone player (Graphics APIs
+   list is already Vulkan-first with D3D12 second).
+3. Run the player with environment variable `DISPLAYXR_VK_EXPERIMENTAL=1`
+   (without it, the plugin demonstrates defect 1 instead: it deliberately
+   answers the adapter query with a non-matching sentinel, and Player.log shows
+   "Could not select a physical device" followed by a SILENT fall-back to
+   D3D12 — no warning that the configured API was abandoned).
+4. With the env var set, the provider declines the adapter query, Unity proceeds
+   on Vulkan, the XR session starts, and the first XR texture create crashes
+   (defect 2) — stack in the evidence logs.
 
 **Impact:** third-party XR display providers cannot target Vulkan on Windows
 Standalone at all in Unity 6. D3D11/D3D12/Metal identical code paths work.
