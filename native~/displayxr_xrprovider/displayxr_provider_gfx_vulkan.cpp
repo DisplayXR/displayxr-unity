@@ -279,10 +279,14 @@ pvk_check_same_adapter(void)
 	        "cross-adapter eye bridge would present black (#240, Vulkan form).\n"
 	        "[DisplayXR-PROV-VK]   Unity renders on : %s\n"
 	        "[DisplayXR-PROV-VK]   Runtime selected : %s\n"
-	        "[DisplayXR-PROV-VK]   Fix: align them. Set this app's Windows GpuPreference to the "
-	        "runtime's adapter (Settings > System > Display > Graphics), or point the runtime at "
-	        "Unity's adapter. NOTE the DXGI-based DisplayXRGpuPreference lever (#242) steers the "
-	        "D3D paths only - under Vulkan the runtime picks via xrGetVulkanGraphicsDevice2KHR.\n",
+	        "[DisplayXR-PROV-VK]   Fix: align them. Either set this app's Windows GpuPreference to "
+	        "the runtime's adapter (Settings > System > Display > Graphics), or point the runtime "
+	        "at Unity's adapter with DXR_VK_FORCE_GPU=igpu|dgpu|<index> - the Vulkan cousin of "
+	        "DXR_D3D_FORCE_GPU. It steers the compositor's VkPhysicalDevice, and "
+	        "xrGetVulkanGraphicsDevice2KHR then suggests the device matching the compositor's "
+	        "UUID, so the two sides converge. DisplayXRGpuPreference sets it for you on the "
+	        "Vulkan path (#247); seeing this error with Target=Auto means the write did not "
+	        "land before xrCreateInstance.\n",
 	        d_unity, d_rt);
 	return false;
 }
