@@ -96,11 +96,12 @@ preinit_get_flags(void *, uint64_t *flags)
 {
 	pre_log("[DisplayXR-PREINIT] GetPreInitFlags called\n");
 	if (!flags) return false;
-	// Offscreen swapchain: XR renders offscreen; without this Unity's Vulkan
-	// backbuffer/XR-surface setup runs a path whose XR internals are
-	// uninitialised and the first XR texture create dies in
-	// vk::Image::CreateImageViews (#247 experiment — flags were 0 before).
-	*flags = kUnityXRPreInitFlagsUseVulkanOffscreenSwapchain;
+	// 0 deliberately. kUnityXRPreInitFlagsUseVulkanOffscreenSwapchain was tried
+	// during the #248 bring-up and did NOT fix the CreateImageViews crash, and
+	// under the deliberate-D3D12-fallback policy below Vulkan never proceeds far
+	// enough for it to matter — so keep the smallest possible surface area on the
+	// D3D12/D3D11 paths this provider is now registered on in every Windows build.
+	*flags = 0;
 	return true;
 }
 
@@ -122,56 +123,52 @@ preinit_get_adapter(void *, UnityXRPreInitRenderer renderer,
 	if (renderer != kUnityXRPreInitRendererVulkan || !adapterId) return false;
 	VkInstance instance = (VkInstance)rendererData;
 
-	// Unity 6000.4 asks ONCE, at boot, with rendererData==NULL, and matches the
-	// answer against its later instance's devices in a way that accepts NEITHER a
-	// foreign VkPhysicalDevice handle NOR a packed LUID (both observed to produce
-	// "Could not select a physical device" → silent D3D12 fallback). Until the
-	// accepted encoding is known, answering at all is strictly worse than not:
-	// declining keeps Unity on Vulkan with its own (discrete-first) pick, and the
-	// runtime is aligned to THAT via DXR_VK_FORCE_GPU (DisplayXRGpuPreference sets
-	// it from Unity's adapter class before xrCreateInstance), with the session-side
-	// LUID guard as the backstop. DISPLAYXR_VK_PREINIT_ADAPTER=1 re-enables the
-	// answer for continued experimentation.
-	if (instance == VK_NULL_HANDLE && getenv("DISPLAYXR_VK_PREINIT_ADAPTER") == NULL) {
-		pre_log("[DisplayXR-PREINIT] GetGraphicsAdapterId: declining instance-less query "
-		        "(Unity keeps its own pick; runtime follows via DXR_VK_FORCE_GPU)\n");
+	// DELIBERATE D3D12 FALLBACK (the shipping policy on Unity 6000.4).
+	//
+	// Background, all hardware-verified (#248): Unity asks for the adapter ONCE, at
+	// boot, with rendererData==NULL, and matches the cached answer against its
+	// later instance's devices by RAW VkPhysicalDevice handle equality
+	// (UnityPlayer.dll rva 0x10c47c0) — an encoding no provider can produce before
+	// that instance exists. The two possible truthful answers are both bad:
+	//   - decline (return false) → Unity stays on Vulkan with xrDevice=0 → its
+	//     XR render-surface path hard-CRASHES in vk::Image::CreateImageViews on
+	//     the first XR texture, with every provider-controllable input bisected
+	//     away;
+	//   - answer anything → no match → "Could not select a physical device" →
+	//     Unity falls back to the next API in the project's list.
+	// The second failure is the useful one: a Vulkan-configured project lands on
+	// the fully-working D3D12 backend and gets STEREO, instead of a crash. So we
+	// answer a guaranteed-non-matching sentinel ON PURPOSE, and say so loudly.
+	//
+	// Consequences to know:
+	//   - A project whose graphics-API list is Vulkan-ONLY has no API to fall back
+	//     to and fails engine init. List D3D12 after Vulkan (the sample projects
+	//     do). Still better than the alternative, which is a mid-run crash.
+	//   - DISPLAYXR_VK_EXPERIMENTAL=1 restores the decline path (Unity proceeds on
+	//     Vulkan and reaches the crash) for anyone verifying a future Unity fix.
+	if (instance == VK_NULL_HANDLE && getenv("DISPLAYXR_VK_EXPERIMENTAL") == NULL) {
+		pre_log("[DisplayXR-PREINIT] Vulkan XR is broken in Unity 6000.4 (adapter query "
+		        "unanswerable + CreateImageViews crash, displayxr-unity#248) — deliberately "
+		        "steering the engine to the next graphics API in the project list (expect "
+		        "D3D12). Stereo will run on that backend. Set DISPLAYXR_VK_EXPERIMENTAL=1 "
+		        "to attempt Vulkan anyway.\n");
+		*adapterId = 0x1; // non-NULL, can never equal a real VkPhysicalDevice handle
+		return true;
+	}
+	if (instance == VK_NULL_HANDLE) {
+		pre_log("[DisplayXR-PREINIT] DISPLAYXR_VK_EXPERIMENTAL=1: declining the adapter "
+		        "query — Unity will proceed on Vulkan (crash expected until Unity fixes "
+		        "#248's defects)\n");
 		return false;
 	}
 
+	// From here on instance != NULL: the classic contract, only reachable if a
+	// (future/fixed) Unity passes its real VkInstance again. Enumerate from THAT
+	// instance and answer with one of its handles — the only encoding the matcher
+	// accepts. (The instance-less LUID/own-instance experiments were removed after
+	// the matcher disassembly proved no instance-less answer can ever match.)
 	VkApi api = {};
 	if (!dxr_vk_load_global(&api)) return false;
-
-	// Unity 6 calls this ONCE, BEFORE creating any VkInstance (rendererData==NULL,
-	// observed), caches the answer, and never asks again. Its matcher then compares
-	// the returned id against ITS OWN instance's devices — a VkPhysicalDevice
-	// handle from any instance we create here can never match ("Selected physical
-	// device 0 / Could not select a physical device" → silent D3D12 fallback,
-	// observed). The only instance-independent adapter identity is the LUID, which
-	// is also exactly what this API's D3D arm returns — so for the instance-less
-	// call we answer with the 8-byte deviceLUID packed into the uint64. We still
-	// need SOME instance to enumerate from; it stays private and is destroyed on
-	// exit paths' natural process teardown.
-	bool instanceless = (instance == VK_NULL_HANDLE);
-	static VkInstance s_own_instance = VK_NULL_HANDLE;
-	if (instanceless) {
-		if (s_own_instance == VK_NULL_HANDLE) {
-			const char *enum_exts[] = { "VK_KHR_get_physical_device_properties2" };
-			VkApplicationInfo app = {};
-			app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
-			app.pApplicationName = "DisplayXR PreInit";
-			app.apiVersion = VK_API_VERSION_1_1;
-			VkInstanceCreateInfo ici = {};
-			ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
-			ici.pApplicationInfo = &app;
-			ici.enabledExtensionCount = 1;
-			ici.ppEnabledExtensionNames = enum_exts;
-			if (api.vkCreateInstance(&ici, NULL, &s_own_instance) != VK_SUCCESS) {
-				pre_log("[DisplayXR-PREINIT] vkCreateInstance (enumeration instance) failed\n");
-				return false;
-			}
-		}
-		instance = s_own_instance;
-	}
 	dxr_vk_load_instance(&api, instance);
 	if (!api.vkEnumeratePhysicalDevices || !api.vkGetPhysicalDeviceProperties) return false;
 
@@ -217,37 +214,13 @@ preinit_get_adapter(void *, UnityXRPreInitRenderer renderer,
 	VkPhysicalDeviceProperties props = {};
 	api.vkGetPhysicalDeviceProperties(devs[pick], &props);
 
-	uint64_t id = 0;
-	const char *id_kind;
-	if (instanceless) {
-		// Instance-less query → LUID (instance-independent; Unity matches its own
-		// enumeration against it). Requires properties2 on the enumeration instance.
-		if (!api.vkGetPhysicalDeviceProperties2) {
-			pre_log("[DisplayXR-PREINIT] properties2 unavailable — cannot produce a LUID\n");
-			return false;
-		}
-		VkPhysicalDeviceIDProperties idp = {};
-		idp.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
-		VkPhysicalDeviceProperties2 p2 = {};
-		p2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
-		p2.pNext = &idp;
-		api.vkGetPhysicalDeviceProperties2(devs[pick], &p2);
-		if (!idp.deviceLUIDValid) {
-			pre_log("[DisplayXR-PREINIT] deviceLUID invalid on the picked adapter\n");
-			return false;
-		}
-		memcpy(&id, idp.deviceLUID, sizeof(id));
-		id_kind = "LUID";
-	} else {
-		// Instance provided (the classic contract) → the handle from THAT instance.
-		id = (uint64_t)devs[pick];
-		id_kind = "VkPhysicalDevice";
-	}
+	// Handle from THE PROVIDED instance — the only encoding the matcher accepts.
+	uint64_t id = (uint64_t)devs[pick];
 
 	char msg[352];
 	snprintf(msg, sizeof(msg),
-	         "[DisplayXR-PREINIT] Vulkan adapter for Unity: #%d %s %s=%llx (%s%s)\n",
-	         pick, props.deviceName, id_kind, (unsigned long long)id,
+	         "[DisplayXR-PREINIT] Vulkan adapter for Unity: #%d %s VkPhysicalDevice=%llx (%s%s)\n",
+	         pick, props.deviceName, (unsigned long long)id,
 	         force && force[0] ? "DXR_VK_FORCE_GPU=" : "discrete-first default",
 	         force && force[0] ? force : "");
 	pre_log(msg);
