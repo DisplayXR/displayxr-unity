@@ -79,33 +79,68 @@ typedef XrResult(XRAPI_PTR *PFN_xrGetVulkanGraphicsRequirementsKHR)(
 typedef XrResult(XRAPI_PTR *PFN_xrGetVulkanGraphicsDeviceKHR)(
     XrInstance, XrSystemId, VkInstance, VkPhysicalDevice *);
 
+// XR_KHR_vulkan_enable2 (extension #90, #886). The RUNTIME creates the
+// VkInstance/VkDevice through these, which is what lets it request a
+// runtime-owned queue at device creation — the prerequisite for the #868
+// weave-rate-decoupling repaint. The v2 requirements call reuses the v1
+// requirements struct (XrGraphicsRequirementsVulkan2KHR is an alias), and the
+// v2 graphics binding type aliases XR_TYPE_GRAPHICS_BINDING_VULKAN_KHR.
+#ifndef XR_TYPE_VULKAN_INSTANCE_CREATE_INFO_KHR
+#define XR_TYPE_VULKAN_INSTANCE_CREATE_INFO_KHR      ((XrStructureType)1000090000)
+#endif
+#ifndef XR_TYPE_VULKAN_DEVICE_CREATE_INFO_KHR
+#define XR_TYPE_VULKAN_DEVICE_CREATE_INFO_KHR        ((XrStructureType)1000090001)
+#endif
+#ifndef XR_TYPE_VULKAN_GRAPHICS_DEVICE_GET_INFO_KHR
+#define XR_TYPE_VULKAN_GRAPHICS_DEVICE_GET_INFO_KHR  ((XrStructureType)1000090003)
+#endif
+
+typedef uint64_t XrVulkanInstanceCreateFlagsKHR;
+typedef uint64_t XrVulkanDeviceCreateFlagsKHR;
+
+typedef struct XrVulkanInstanceCreateInfoKHR {
+	XrStructureType                 type;
+	const void                     *next;
+	XrSystemId                      systemId;
+	XrVulkanInstanceCreateFlagsKHR  createFlags;
+	PFN_vkGetInstanceProcAddr       pfnGetInstanceProcAddr;
+	const VkInstanceCreateInfo     *vulkanCreateInfo;
+	const VkAllocationCallbacks    *vulkanAllocator;
+} XrVulkanInstanceCreateInfoKHR;
+
+typedef struct XrVulkanDeviceCreateInfoKHR {
+	XrStructureType                 type;
+	const void                     *next;
+	XrSystemId                      systemId;
+	XrVulkanDeviceCreateFlagsKHR    createFlags;
+	PFN_vkGetInstanceProcAddr       pfnGetInstanceProcAddr;
+	VkPhysicalDevice                vulkanPhysicalDevice;
+	const VkDeviceCreateInfo       *vulkanCreateInfo;
+	const VkAllocationCallbacks    *vulkanAllocator;
+} XrVulkanDeviceCreateInfoKHR;
+
+typedef struct XrVulkanGraphicsDeviceGetInfoKHR {
+	XrStructureType  type;
+	const void      *next;
+	XrSystemId       systemId;
+	VkInstance       vulkanInstance;
+} XrVulkanGraphicsDeviceGetInfoKHR;
+
+typedef XrResult(XRAPI_PTR *PFN_xrCreateVulkanInstanceKHR)(
+    XrInstance, const XrVulkanInstanceCreateInfoKHR *, VkInstance *, VkResult *);
+typedef XrResult(XRAPI_PTR *PFN_xrCreateVulkanDeviceKHR)(
+    XrInstance, const XrVulkanDeviceCreateInfoKHR *, VkDevice *, VkResult *);
+typedef XrResult(XRAPI_PTR *PFN_xrGetVulkanGraphicsDevice2KHR)(
+    XrInstance, const XrVulkanGraphicsDeviceGetInfoKHR *, VkPhysicalDevice *);
+typedef XrResult(XRAPI_PTR *PFN_xrGetVulkanGraphicsRequirements2KHR)(
+    XrInstance, XrSystemId, XrGraphicsRequirementsVulkanKHR *);
+
 #if defined(_WIN32)
 
-// Split a runtime-supplied, space-separated, null-terminated extension string
-// into `out`, then append any of `extra` not already present.
-static void
-merge_extensions(PFN_xrVoidFunction fn, XrInstance instance, XrSystemId system,
-                 const char *const *extra, uint32_t extra_count,
-                 std::vector<std::string> &out)
-{
-	if (fn) {
-		auto pfn = (XrResult(XRAPI_CALL *)(XrInstance, XrSystemId, uint32_t, uint32_t *, char *))fn;
-		uint32_t cap = 0;
-		if (XR_SUCCEEDED(pfn(instance, system, 0, &cap, nullptr)) && cap > 0) {
-			std::vector<char> buf(cap);
-			if (XR_SUCCEEDED(pfn(instance, system, cap, &cap, buf.data()))) {
-				char *ctx = nullptr;
-				char *tok = strtok_s(buf.data(), " ", &ctx);
-				while (tok) { out.emplace_back(tok); tok = strtok_s(nullptr, " ", &ctx); }
-			}
-		}
-	}
-	for (uint32_t i = 0; i < extra_count; i++) {
-		bool present = false;
-		for (auto &s : out) if (s == extra[i]) { present = true; break; }
-		if (!present) out.emplace_back(extra[i]);
-	}
-}
+// (merge_extensions removed with the enable2 port (#886): the runtime merges
+// its own required VK extensions inside xrCreateVulkanInstanceKHR /
+// xrCreateVulkanDeviceKHR, and the v1 xrGetVulkan*ExtensionsKHR string calls
+// are not dispatchable under enable2-only.)
 
 static uint32_t
 find_memory_type(VkApi *api, VkPhysicalDevice phys, uint32_t type_bits, VkMemoryPropertyFlags props)
@@ -160,34 +195,53 @@ public:
 #if defined(_WIN32)
 		if (!dxr_vk_load_global(&vk)) return false; // vulkan-1.dll absent
 
-		// --- Graphics requirements (api version) ---
+		// #886: vulkan_enable2 — the RUNTIME creates the VkInstance/VkDevice.
+		// This is what lets it request a runtime-owned queue at device
+		// creation, which the #868 repaint (weave-rate decoupling) requires;
+		// under enable1 the repaint silently stays off. Note the v2 proc names
+		// throughout — the v1 names are not dispatchable under enable2-only.
+		PFN_xrCreateVulkanInstanceKHR pfn_create_vk_instance = nullptr;
+		PFN_xrCreateVulkanDeviceKHR pfn_create_vk_device = nullptr;
+		PFN_xrGetVulkanGraphicsDevice2KHR pfn_get_vk_device2 = nullptr;
+		{
+			PFN_xrVoidFunction fn = nullptr;
+			gipa(instance, "xrCreateVulkanInstanceKHR", &fn);
+			pfn_create_vk_instance = (PFN_xrCreateVulkanInstanceKHR)fn;
+			fn = nullptr;
+			gipa(instance, "xrCreateVulkanDeviceKHR", &fn);
+			pfn_create_vk_device = (PFN_xrCreateVulkanDeviceKHR)fn;
+			fn = nullptr;
+			gipa(instance, "xrGetVulkanGraphicsDevice2KHR", &fn);
+			pfn_get_vk_device2 = (PFN_xrGetVulkanGraphicsDevice2KHR)fn;
+		}
+		if (pfn_create_vk_instance == nullptr || pfn_create_vk_device == nullptr ||
+		    pfn_get_vk_device2 == nullptr) {
+			fprintf(stderr, "[DisplayXR-SA-VK] XR_KHR_vulkan_enable2 procs not dispatchable — "
+			                "is the extension enabled on the XrInstance?\n");
+			return false;
+		}
+
+		// --- Graphics requirements (api version). v2 name; same struct
+		// layout (XrGraphicsRequirementsVulkan2KHR aliases the v1 struct). ---
 		uint32_t api_version = VK_API_VERSION_1_1;
 		{
 			PFN_xrVoidFunction fn = nullptr;
-			gipa(instance, "xrGetVulkanGraphicsRequirementsKHR", &fn);
+			gipa(instance, "xrGetVulkanGraphicsRequirements2KHR", &fn);
 			if (fn) {
 				XrGraphicsRequirementsVulkanKHR req = {};
 				req.type = XR_TYPE_GRAPHICS_REQUIREMENTS_VULKAN_KHR;
-				((PFN_xrGetVulkanGraphicsRequirementsKHR)fn)(instance, system_id, &req);
+				((PFN_xrGetVulkanGraphicsRequirements2KHR)fn)(instance, system_id, &req);
 			}
 		}
 
-		// --- Instance extensions (runtime-required + our interop needs) ---
+		// --- Instance: OUR interop needs only — the runtime merges in its own
+		// required extensions inside xrCreateVulkanInstanceKHR. ---
 		const char *inst_extra[] = {
 			VK_KHR_SURFACE_EXTENSION_NAME,
 			VK_KHR_WIN32_SURFACE_EXTENSION_NAME,
 			VK_KHR_EXTERNAL_MEMORY_CAPABILITIES_EXTENSION_NAME,
 			VK_KHR_GET_PHYSICAL_DEVICE_PROPERTIES_2_EXTENSION_NAME,
 		};
-		std::vector<std::string> inst_exts;
-		{
-			PFN_xrVoidFunction fn = nullptr;
-			gipa(instance, "xrGetVulkanInstanceExtensionsKHR", &fn);
-			merge_extensions(fn, instance, system_id, inst_extra,
-			                 (uint32_t)(sizeof(inst_extra) / sizeof(inst_extra[0])), inst_exts);
-		}
-		std::vector<const char *> inst_ptrs;
-		for (auto &s : inst_exts) inst_ptrs.push_back(s.c_str());
 
 		VkApplicationInfo app = {};
 		app.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
@@ -198,11 +252,20 @@ public:
 		VkInstanceCreateInfo ici = {};
 		ici.sType = VK_STRUCTURE_TYPE_INSTANCE_CREATE_INFO;
 		ici.pApplicationInfo = &app;
-		ici.enabledExtensionCount = (uint32_t)inst_ptrs.size();
-		ici.ppEnabledExtensionNames = inst_ptrs.data();
+		ici.enabledExtensionCount = (uint32_t)(sizeof(inst_extra) / sizeof(inst_extra[0]));
+		ici.ppEnabledExtensionNames = inst_extra;
 
-		if (vk.vkCreateInstance(&ici, nullptr, &vk_instance) != VK_SUCCESS) {
-			fprintf(stderr, "[DisplayXR-SA-VK] vkCreateInstance failed\n");
+		XrVulkanInstanceCreateInfoKHR xici = {};
+		xici.type = XR_TYPE_VULKAN_INSTANCE_CREATE_INFO_KHR;
+		xici.systemId = system_id;
+		xici.pfnGetInstanceProcAddr = vk.vkGetInstanceProcAddr;
+		xici.vulkanCreateInfo = &ici;
+
+		VkResult vkr = VK_SUCCESS;
+		XrResult xr = pfn_create_vk_instance(instance, &xici, &vk_instance, &vkr);
+		if (XR_FAILED(xr) || vkr != VK_SUCCESS || vk_instance == VK_NULL_HANDLE) {
+			fprintf(stderr, "[DisplayXR-SA-VK] xrCreateVulkanInstanceKHR failed: xr=%d vk=%d\n",
+			        (int)xr, (int)vkr);
 			return false;
 		}
 		dxr_vk_load_instance(&vk, vk_instance);
@@ -210,11 +273,11 @@ public:
 		// --- Physical device: MUST be the one the runtime suggests (the
 		// runtime validates the binding's physicalDevice against this). ---
 		{
-			PFN_xrVoidFunction fn = nullptr;
-			gipa(instance, "xrGetVulkanGraphicsDeviceKHR", &fn);
-			if (fn) {
-				((PFN_xrGetVulkanGraphicsDeviceKHR)fn)(instance, system_id, vk_instance, &vk_physical_device);
-			}
+			XrVulkanGraphicsDeviceGetInfoKHR gdi = {};
+			gdi.type = XR_TYPE_VULKAN_GRAPHICS_DEVICE_GET_INFO_KHR;
+			gdi.systemId = system_id;
+			gdi.vulkanInstance = vk_instance;
+			pfn_get_vk_device2(instance, &gdi, &vk_physical_device);
 		}
 		if (vk_physical_device == VK_NULL_HANDLE) {
 			// Fallback: first device. (Single-GPU machines only.)
@@ -242,7 +305,9 @@ public:
 				if (qfp[q].queueFlags & VK_QUEUE_GRAPHICS_BIT) { vk_queue_family = q; break; }
 		}
 
-		// --- Device extensions (runtime-required + interop) ---
+		// --- Device: OUR interop extensions only — the runtime merges its own
+		// required list (and requests its runtime-owned queue, #868) inside
+		// xrCreateVulkanDeviceKHR. ---
 		const char *dev_extra[] = {
 			VK_KHR_SWAPCHAIN_EXTENSION_NAME,
 			VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
@@ -250,15 +315,6 @@ public:
 			VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME,
 			VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME,
 		};
-		std::vector<std::string> dev_exts;
-		{
-			PFN_xrVoidFunction fn = nullptr;
-			gipa(instance, "xrGetVulkanDeviceExtensionsKHR", &fn);
-			merge_extensions(fn, instance, system_id, dev_extra,
-			                 (uint32_t)(sizeof(dev_extra) / sizeof(dev_extra[0])), dev_exts);
-		}
-		std::vector<const char *> dev_ptrs;
-		for (auto &s : dev_exts) dev_ptrs.push_back(s.c_str());
 
 		float prio = 1.0f;
 		VkDeviceQueueCreateInfo qci = {};
@@ -271,11 +327,21 @@ public:
 		dci.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO;
 		dci.queueCreateInfoCount = 1;
 		dci.pQueueCreateInfos = &qci;
-		dci.enabledExtensionCount = (uint32_t)dev_ptrs.size();
-		dci.ppEnabledExtensionNames = dev_ptrs.data();
+		dci.enabledExtensionCount = (uint32_t)(sizeof(dev_extra) / sizeof(dev_extra[0]));
+		dci.ppEnabledExtensionNames = dev_extra;
 
-		if (vk.vkCreateDevice(vk_physical_device, &dci, nullptr, &vk_device) != VK_SUCCESS) {
-			fprintf(stderr, "[DisplayXR-SA-VK] vkCreateDevice failed\n");
+		XrVulkanDeviceCreateInfoKHR xdci = {};
+		xdci.type = XR_TYPE_VULKAN_DEVICE_CREATE_INFO_KHR;
+		xdci.systemId = system_id;
+		xdci.pfnGetInstanceProcAddr = vk.vkGetInstanceProcAddr;
+		xdci.vulkanPhysicalDevice = vk_physical_device;
+		xdci.vulkanCreateInfo = &dci;
+
+		vkr = VK_SUCCESS;
+		xr = pfn_create_vk_device(instance, &xdci, &vk_device, &vkr);
+		if (XR_FAILED(xr) || vkr != VK_SUCCESS || vk_device == VK_NULL_HANDLE) {
+			fprintf(stderr, "[DisplayXR-SA-VK] xrCreateVulkanDeviceKHR failed: xr=%d vk=%d\n",
+			        (int)xr, (int)vkr);
 			return false;
 		}
 		dxr_vk_load_device(&vk, vk_device);

@@ -1061,12 +1061,15 @@ displayxr_standalone_start(const char *runtime_json_path)
 #if defined(_WIN32)
 	// Enable the graphics extension matching the editor's API so the runtime
 	// accepts our session's graphics binding at xrCreateSession. Vulkan editor →
-	// XR_KHR_vulkan_enable; otherwise XR_KHR_D3D12_enable (which also serves a
-	// D3D11 editor via the atlas bridge). Without the right one here,
-	// xrGetVulkanGraphics*KHR don't resolve and xrCreateSession returns -7.
+	// XR_KHR_vulkan_enable2 (#886: the runtime creates the VkDevice and can
+	// request its runtime-owned queue, which the #868 weave-rate-decoupling
+	// repaint requires — enable1 silently forfeits it); otherwise
+	// XR_KHR_D3D12_enable (which also serves a D3D11 editor via the atlas
+	// bridge). Without the right one here the graphics procs don't resolve and
+	// xrCreateSession returns -7.
 	const char *win_gfx_enable = "XR_KHR_D3D12_enable";
 #if defined(ENABLE_VULKAN)
-	if (s_unity_gfx_api == 21 /* Vulkan */) win_gfx_enable = "XR_KHR_vulkan_enable";
+	if (s_unity_gfx_api == 21 /* Vulkan */) win_gfx_enable = "XR_KHR_vulkan_enable2";
 #endif
 #endif
 	// XR_DXR_view_rig (#396): probe availability BEFORE requesting it — older
