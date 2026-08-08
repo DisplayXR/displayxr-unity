@@ -6,6 +6,9 @@ using UnityEngine;
 using UnityEngine.Rendering;
 using UnityEngine.XR;
 using UnityEngine.XR.Management;
+#if UNITY_EDITOR
+using UnityEditor;
+#endif
 
 namespace DisplayXR
 {
@@ -23,9 +26,29 @@ namespace DisplayXR
     /// Unity input.
     /// </summary>
     public sealed class DisplayXRDisplayLoader : XRLoaderHelper
+#if UNITY_EDITOR
+        , IXRLoaderPreInit
+#endif
     {
         // Must match Runtime/UnitySubsystemsManifest.json's display "id".
         const string k_DisplayId = "DisplayXR Display";
+
+#if UNITY_EDITOR
+        /// <summary>
+        /// XR pre-init (#247): XR Management's build processor writes this library
+        /// name into the player's boot.config (`xrsdk-pre-init-library`), making the
+        /// engine load our native plugin BEFORE graphics-device creation and call its
+        /// XRSDKPreInit export. On Vulkan that is load-bearing: it supplies the
+        /// VkPhysicalDevice (aligned with the runtime's pick) and the external-memory
+        /// device extensions, and it is what keeps Unity's XR-aware Vulkan init from
+        /// running with xrDevice=NULL and crashing on the first XR texture. Harmless
+        /// on D3D/Metal (the provider no-ops for renderers it doesn't handle).
+        /// </summary>
+        public string GetPreInitLibraryName(BuildTarget buildTarget, BuildTargetGroup buildTargetGroup)
+        {
+            return "displayxr_unity";
+        }
+#endif
 
         static readonly List<XRDisplaySubsystemDescriptor> s_DisplayDescriptors = new();
 
@@ -49,6 +72,24 @@ namespace DisplayXR
                 Debug.LogWarning("[DisplayXR] macOS editor Play Mode is disabled pending a Unity " +
                     "editor Metal fix (see displayxr-unity#204) — build & run a macOS player to " +
                     "test stereo, or set DISPLAYXR_METAL_EDITOR=1 to opt in anyway.");
+                return false;
+            }
+
+            // Vulkan EDITOR gate (#247): Unity's Vulkan backend has an XR-aware
+            // device-init path that must be fed by the XR pre-init provider
+            // (boot.config xrsdk-pre-init-library -> XRSDKPreInit) at engine
+            // startup. boot.config exists only in BUILT players, so in editor
+            // Play Mode xrDevice is unavoidably NULL and Unity hard-crashes in
+            // vk::Image::CreateImageViews on the first XR texture — proven by
+            // bisect (crashes even with a Unity-allocated colour target, commit
+            // f5dbf59). Decline cleanly instead of crashing the editor.
+            if (Application.isEditor &&
+                SystemInfo.graphicsDeviceType == GraphicsDeviceType.Vulkan)
+            {
+                Debug.LogWarning("[DisplayXR] Vulkan editor Play Mode is not supported (Unity's " +
+                    "VK XR path needs the boot.config pre-init hook, which only exists in built " +
+                    "players — displayxr-unity#247). Build & run a Windows player to test Vulkan, " +
+                    "or switch the editor to D3D12/D3D11.");
                 return false;
             }
 
@@ -218,11 +259,16 @@ namespace DisplayXR
             bool isMac = plat == RuntimePlatform.OSXPlayer
                       || plat == RuntimePlatform.OSXEditor;
 
+            // Vulkan (#247) behaves like the other Windows APIs here: URP/HDRP → SPI
+            // (one 2-layer bridge image), BiRP → MultiPass (two 1-layer bridge images).
+            // The bridge is an external-memory alias either way, so the render-path
+            // choice is independent of the backend — same rule as D3D11/D3D12.
             var gdt = SystemInfo.graphicsDeviceType;
             bool isD3D11 = gdt == GraphicsDeviceType.Direct3D11;
             bool isD3D12 = gdt == GraphicsDeviceType.Direct3D12;
+            bool isVulkan = gdt == GraphicsDeviceType.Vulkan;
             bool isMetal = gdt == GraphicsDeviceType.Metal;
-            bool apiEligible = (isWindows && (isD3D11 || isD3D12))
+            bool apiEligible = (isWindows && (isD3D11 || isD3D12 || isVulkan))
                             || (isMac && isMetal);
             if (!apiEligible)
                 return false; // unsupported platform/API: MultiPass (native no-starts)

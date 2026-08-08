@@ -93,6 +93,9 @@ set(SOURCES
     # Cross-platform TUs: D3D backends behind _WIN32, Metal behind __APPLE__.
     displayxr_xrprovider/displayxr_provider_session.cpp
     displayxr_xrprovider/displayxr_display_provider.cpp
+    # XR SDK pre-init provider (#247): XRSDKPreInit export, compiled everywhere so
+    # the boot.config xrsdk-pre-init-library entry never dangles; VK-only in effect.
+    displayxr_xrprovider/displayxr_provider_preinit.cpp
 )
 
 set(HEADERS
@@ -118,8 +121,13 @@ endif()
 list(APPEND HEADERS displayxr_xrprovider/displayxr_provider_session.h)
 
 if(WIN32)
-    list(APPEND SOURCES displayxr_win32.c displayxr_gpu_preference.cpp)
-    list(APPEND HEADERS displayxr_win32.h displayxr_vk_loader.h)
+    list(APPEND SOURCES displayxr_win32.c displayxr_gpu_preference.cpp
+        # Provider Vulkan backend (#247): enable2 session device + external-memory
+        # eye bridge to Unity's VkDevice. Windows-only (OPAQUE_WIN32 handles);
+        # guarded internally by ENABLE_VULKAN, which is set for WIN32 below.
+        displayxr_xrprovider/displayxr_provider_gfx_vulkan.cpp)
+    list(APPEND HEADERS displayxr_win32.h displayxr_vk_loader.h
+        displayxr_xrprovider/displayxr_provider_gfx_vulkan.h)
     # dwmapi + advapi32: MSVC links them via #pragma comment(lib, ...) in the TUs,
     # but MinGW (the macOS cross-compile check) ignores that pragma — list them here.
     link_libraries(user32 d3d11 d3d12 dxgi dwmapi advapi32 d3dcompiler)

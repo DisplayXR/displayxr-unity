@@ -82,6 +82,13 @@ dxr_vk_load_instance(VkApi *api, VkInstance instance)
 	DXR_VK_INST(api, instance, vkGetPhysicalDeviceQueueFamilyProperties);
 	DXR_VK_INST(api, instance, vkGetPhysicalDeviceMemoryProperties);
 	DXR_VK_INST(api, instance, vkCreateDevice);
+	// Core in Vulkan 1.1; fall back to the KHR alias so a 1.0 instance (with
+	// VK_KHR_get_physical_device_properties2) still resolves it. NULL is tolerated —
+	// the caller degrades the LUID guard to a warning rather than failing the session.
+	DXR_VK_INST(api, instance, vkGetPhysicalDeviceProperties2);
+	if (!api->vkGetPhysicalDeviceProperties2)
+		*(PFN_vkVoidFunction *)&api->vkGetPhysicalDeviceProperties2 =
+		    api->vkGetInstanceProcAddr(instance, "vkGetPhysicalDeviceProperties2KHR");
 #if defined(_WIN32)
 	DXR_VK_INST(api, instance, vkCreateWin32SurfaceKHR);
 #endif
@@ -121,8 +128,12 @@ dxr_vk_load_device(VkApi *api, VkDevice device)
 	DXR_VK_DEV(api, device, vkAllocateMemory);
 	DXR_VK_DEV(api, device, vkFreeMemory);
 	DXR_VK_DEV(api, device, vkBindImageMemory);
+	DXR_VK_DEV(api, device, vkCreateSemaphore);
+	DXR_VK_DEV(api, device, vkDestroySemaphore);
 #if defined(_WIN32)
 	DXR_VK_DEV(api, device, vkGetMemoryWin32HandleKHR);
+	DXR_VK_DEV(api, device, vkGetSemaphoreWin32HandleKHR);
+	DXR_VK_DEV(api, device, vkImportSemaphoreWin32HandleKHR);
 #endif
 	DXR_VK_DEV(api, device, vkCreateSwapchainKHR);
 	DXR_VK_DEV(api, device, vkDestroySwapchainKHR);

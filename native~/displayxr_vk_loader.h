@@ -43,6 +43,10 @@ struct VkApi {
 	PFN_vkGetPhysicalDeviceQueueFamilyProperties   vkGetPhysicalDeviceQueueFamilyProperties;
 	PFN_vkGetPhysicalDeviceMemoryProperties        vkGetPhysicalDeviceMemoryProperties;
 	PFN_vkCreateDevice                             vkCreateDevice;
+	// Provider VK backend (#247): VkPhysicalDeviceIDProperties.deviceLUID drives the
+	// cross-adapter guard — the VK cousin of the D3D12 LUID check (#240). Core in 1.1;
+	// the KHR alias is the fallback on a 1.0 instance.
+	PFN_vkGetPhysicalDeviceProperties2             vkGetPhysicalDeviceProperties2;
 #if defined(_WIN32)
 	PFN_vkCreateWin32SurfaceKHR                    vkCreateWin32SurfaceKHR;
 #endif
@@ -77,8 +81,16 @@ struct VkApi {
 	PFN_vkAllocateMemory           vkAllocateMemory;
 	PFN_vkFreeMemory               vkFreeMemory;
 	PFN_vkBindImageMemory          vkBindImageMemory;
+	// Provider VK backend (#247): cross-device ordering between the runtime's session
+	// device and Unity's device — the VK cousin of the shared ID3D12Fence. The bridge
+	// image is exported/imported as OPAQUE_WIN32 memory; the ordering primitive is an
+	// OPAQUE_WIN32 semaphore signalled on one device and waited on the other.
+	PFN_vkCreateSemaphore          vkCreateSemaphore;
+	PFN_vkDestroySemaphore         vkDestroySemaphore;
 #if defined(_WIN32)
 	PFN_vkGetMemoryWin32HandleKHR  vkGetMemoryWin32HandleKHR;
+	PFN_vkGetSemaphoreWin32HandleKHR    vkGetSemaphoreWin32HandleKHR;
+	PFN_vkImportSemaphoreWin32HandleKHR vkImportSemaphoreWin32HandleKHR;
 #endif
 	PFN_vkCreateSwapchainKHR       vkCreateSwapchainKHR;
 	PFN_vkDestroySwapchainKHR      vkDestroySwapchainKHR;
