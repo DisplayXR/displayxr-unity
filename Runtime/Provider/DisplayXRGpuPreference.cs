@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 using UnityEngine;
+using UnityEngine.Rendering; // GraphicsDeviceType — picks the D3D vs Vulkan env var (#247)
 
 namespace DisplayXR
 {
@@ -57,7 +58,29 @@ namespace DisplayXR
         }
 
         /// <summary>The runtime env var that steers the runtime's suggested adapter (runtime v2.2.4+).</summary>
-        const string k_EnvVar = "DXR_D3D_FORCE_GPU";
+        const string k_EnvVarD3D = "DXR_D3D_FORCE_GPU";
+
+        /// <summary>
+        /// The Vulkan cousin (#247). Same supported contract and same in-process
+        /// <c>getenv()</c> caveat (runtime #845). It steers the COMPOSITOR's
+        /// VkPhysicalDevice pick, and <c>xrGetVulkanGraphicsDevice2KHR</c> then suggests
+        /// the device whose UUID matches the compositor's — so setting this aligns the
+        /// runtime's enable2 device with Unity's, exactly as the D3D var does for DXGI.
+        /// Without it the provider's cross-adapter guard can only refuse the session.
+        /// </summary>
+        const string k_EnvVarVk = "DXR_VK_FORCE_GPU";
+
+        /// <summary>
+        /// Which env var applies, keyed on the graphics API Unity actually came up on.
+        /// Vulkan and D3D are steered by DIFFERENT runtime variables; setting the wrong
+        /// one is a silent no-op, which is how a hybrid-laptop black screen would come
+        /// back wearing a new hat.
+        /// </summary>
+        static string EnvVarForCurrentApi()
+        {
+            return SystemInfo.graphicsDeviceType == GraphicsDeviceType.Vulkan
+                ? k_EnvVarVk : k_EnvVarD3D;
+        }
 
         // Native dxr_prov_unity_gpu_class() return values.
         const int k_ClassUnknown = 0, k_ClassIntegrated = 1, k_ClassDiscrete = 2;
@@ -98,16 +121,18 @@ namespace DisplayXR
             // session: from the second Play onward the variable is set — by US — and
             // re-reading it would make the plugin defer to its own previous value and
             // silently ignore a changed Target.
+            string envVar = EnvVarForCurrentApi();
+
             if (!s_ExternalChecked)
             {
                 s_ExternalChecked = true;
                 s_ExternallySet = !string.IsNullOrEmpty(
-                    System.Environment.GetEnvironmentVariable(k_EnvVar));
+                    System.Environment.GetEnvironmentVariable(envVar));
             }
             if (s_ExternallySet)
             {
-                Debug.Log("[DisplayXR] Target GPU: " + k_EnvVar + "=" +
-                          System.Environment.GetEnvironmentVariable(k_EnvVar) +
+                Debug.Log("[DisplayXR] Target GPU: " + envVar + "=" +
+                          System.Environment.GetEnvironmentVariable(envVar) +
                           " was set in the environment before startup — leaving it alone.");
                 return;
             }
@@ -134,7 +159,7 @@ namespace DisplayXR
             int ok;
             try
             {
-                ok = DisplayXRProviderNative.dxr_prov_set_env(k_EnvVar, value);
+                ok = DisplayXRProviderNative.dxr_prov_set_env(envVar, value);
             }
             catch (System.DllNotFoundException)
             {
@@ -148,10 +173,10 @@ namespace DisplayXR
             }
 
             if (ok == 1)
-                Debug.Log("[DisplayXR] Target GPU: " + Target + " → " + k_EnvVar + "=" + value +
+                Debug.Log("[DisplayXR] Target GPU: " + Target + " → " + envVar + "=" + value +
                           (Target == TargetGpu.Auto ? " (matched to Unity's adapter)" : ""));
             else
-                Debug.LogWarning("[DisplayXR] Target GPU: failed to set " + k_EnvVar + "=" + value +
+                Debug.LogWarning("[DisplayXR] Target GPU: failed to set " + envVar + "=" + value +
                                  " — the runtime may suggest a different adapter than Unity is on.");
         }
 
