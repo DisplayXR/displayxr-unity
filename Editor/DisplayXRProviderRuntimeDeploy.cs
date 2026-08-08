@@ -78,7 +78,21 @@ namespace DisplayXR.Editor
                 CopyFileInto(manifestSrc, Path.Combine(outputPath, "Contents", "Resources", "Data",
                     "UnitySubsystems", SubsystemName, "UnitySubsystemsManifest.json"));
             }
-            // Other standalone targets (Linux) are not shipped for the provider today.
+            else if (platform == BuildTarget.StandaloneLinux64)
+            {
+                // Linux player layout mirrors Windows (#249): <name>_Data/Plugins/x86_64/
+                // for the native .so, <name>_Data/UnitySubsystems/<id>/ for the manifest.
+                // Without the manifest the display subsystem is never discovered and the
+                // loader fails with "Failed to create the 'DisplayXR Display' subsystem".
+                string exeDir = Path.GetDirectoryName(outputPath);
+                string exeName = Path.GetFileNameWithoutExtension(outputPath);
+                string dataDir = Path.Combine(exeDir, exeName + "_Data");
+                string soSrc = Path.Combine(pkgRoot, "Runtime", "Plugins", "Linux", "x86_64", "libdisplayxr_unity.so");
+
+                CopyFileInto(soSrc, Path.Combine(dataDir, "Plugins", "x86_64", "libdisplayxr_unity.so"));
+                CopyFileInto(manifestSrc, Path.Combine(dataDir, "UnitySubsystems", SubsystemName, "UnitySubsystemsManifest.json"));
+            }
+            // Other standalone targets are not shipped for the provider today.
         }
 
         static void CopyFileInto(string src, string dst)

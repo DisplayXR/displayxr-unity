@@ -109,6 +109,17 @@ namespace DisplayXR
         /// </summary>
         internal static void Apply()
         {
+            // Windows-only: BOTH levers are Windows mechanisms. Unity's side is steered
+            // by the per-exe HKCU UserGpuPreferences entry written at build time, and
+            // the adapter CLASSIFICATION that decides what Auto means reads DXGI.
+            //
+            // Consequence worth knowing on Linux (#249): there is no adapter-alignment
+            // lever there yet. Single-GPU boxes are unaffected — the runtime and Unity
+            // pick the same device by construction — but on a hybrid Linux box nothing
+            // steers them together, and the session-side deviceUUID guard in the VK
+            // backend is what turns that into a loud refusal instead of a black screen.
+            // Wiring DXR_VK_FORCE_GPU from a Vulkan enumeration (rather than DXGI) is
+            // the follow-on that would close it.
             if (Application.platform != RuntimePlatform.WindowsPlayer &&
                 Application.platform != RuntimePlatform.WindowsEditor)
                 return; // hybrid-adapter steering is a Windows/DXGI concern

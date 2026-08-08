@@ -32,8 +32,25 @@
 //     into UNITY's VkDevice so the bridge import is legal on Unity's side.
 //  3. GetVulkanInstanceExtensions: capabilities + properties2 on the instance.
 //
-// Windows-only in effect (the VK backend is Windows-only); the export itself is
-// compiled on all platforms so the boot.config entry never dangles.
+// PER-PLATFORM ADAPTER POLICY (#249) — the interesting divergence lives in
+// preinit_get_adapter() below and is worth stating up front:
+//
+//   Windows : answer a knowingly-non-matching sentinel, ON PURPOSE, so Unity
+//             falls back to D3D12 and the app gets working stereo instead of a
+//             crash. Unity's matcher makes a truthful answer impossible.
+//   Linux   : DECLINE the query. There is no next graphics API to fall back to
+//             (this provider does not support GL), so the Windows sentinel would
+//             just fail engine init. Declining is also the *correct* answer on a
+//             single-GPU box, and it is what the runtime aligns to via
+//             DXR_VK_FORCE_GPU / client_vk_deviceUUID.
+//
+// Declining is precisely the input that produced the CreateImageViews crash on
+// Windows — whether that Unity defect also fires on Linux is UNVERIFIED, and
+// finding out is the reason the Linux leg exists. Keep both arms reachable from
+// one binary (DISPLAYXR_VK_EXPERIMENTAL) so whoever has the hardware can bisect.
+//
+// The export itself is compiled on all platforms so the boot.config entry never
+// dangles; it is a no-op where the VK backend does not exist (macOS).
 
 #include "../unity_pluginapi/IUnityInterface.h"
 #include "../unity_pluginapi/IUnityXRPreInit.h"
@@ -56,22 +73,32 @@ static void pre_log(const char *msg)
 	dxr_prov_file_log(msg);
 }
 
-#if defined(_WIN32) && defined(ENABLE_VULKAN)
+#if defined(ENABLE_VULKAN)
 
 #include "../displayxr_vk_loader.h"
 
 // Space-separated extension lists, mirroring what the session-side bridge uses
 // (displayxr_provider_gfx_vulkan.cpp) — Unity's device must speak the import side
-// of exactly what the session device exports.
+// of exactly what the session device exports. The OS-flavoured pair
+// (external_memory_win32 vs external_memory_fd) must stay in lockstep with the
+// PVK_EXT_EXTERNAL_* macros there, or the bridge exports a handle type Unity's
+// device cannot import.
 static const char *k_instance_exts =
     "VK_KHR_get_physical_device_properties2 "
     "VK_KHR_external_memory_capabilities "
     "VK_KHR_external_semaphore_capabilities";
 static const char *k_device_exts =
+#if defined(_WIN32)
     "VK_KHR_external_memory "
     "VK_KHR_external_memory_win32 "
     "VK_KHR_external_semaphore "
     "VK_KHR_external_semaphore_win32 "
+#else
+    "VK_KHR_external_memory "
+    "VK_KHR_external_memory_fd "
+    "VK_KHR_external_semaphore "
+    "VK_KHR_external_semaphore_fd "
+#endif
     "VK_KHR_dedicated_allocation "
     "VK_KHR_get_memory_requirements2";
 
@@ -123,7 +150,34 @@ preinit_get_adapter(void *, UnityXRPreInitRenderer renderer,
 	if (renderer != kUnityXRPreInitRendererVulkan || !adapterId) return false;
 	VkInstance instance = (VkInstance)rendererData;
 
-	// DELIBERATE D3D12 FALLBACK (the shipping policy on Unity 6000.4).
+#if !defined(_WIN32)
+	// LINUX POLICY (#249): DECLINE the instance-less query.
+	//
+	// Do NOT copy the Windows sentinel below. Its whole value is that Unity has a
+	// working D3D12 backend to fall back to; on Linux the fallback list is Vulkan
+	// or GL, this provider has no GL backend, and a Vulkan-only project would
+	// simply fail engine init. Declining is also the correct answer on the
+	// single-GPU boxes this targets — the runtime aligns to Unity's device via
+	// DXR_VK_FORCE_GPU / client_vk_deviceUUID rather than via this callback, and
+	// the session-side UUID guard is the safety net if they ever diverge.
+	//
+	// UNVERIFIED, and the reason this leg exists: on Windows, declining leaves
+	// xrDevice NULL and Unity's XR render-surface path hard-crashes in
+	// vk::Image::CreateImageViews. Whether that Unity defect also fires on Linux
+	// is exactly what a Linux player run has to answer. If it does, Linux Vulkan
+	// is blocked upstream the same way Windows is, and this callback is where a
+	// Linux-appropriate mitigation would go.
+	if (instance == VK_NULL_HANDLE) {
+		pre_log("[DisplayXR-PREINIT] Linux: declining the instance-less adapter query — correct "
+		        "on a single-GPU box, and there is no alternative graphics API to steer to "
+		        "(displayxr-unity#249). The runtime aligns to Unity's device via DXR_VK_FORCE_GPU "
+		        "/ deviceUUID instead.\n");
+		return false;
+	}
+	// instance != NULL: fall through to the enumerate-and-answer path below, which
+	// is platform-neutral.
+#else
+	// DELIBERATE D3D12 FALLBACK (the shipping policy on Unity 6000.4, Windows only).
 	//
 	// Background, all hardware-verified (#248): Unity asks for the adapter ONCE, at
 	// boot, with rendererData==NULL, and matches the cached answer against its
@@ -161,6 +215,7 @@ preinit_get_adapter(void *, UnityXRPreInitRenderer renderer,
 		        "#248's defects)\n");
 		return false;
 	}
+#endif // !_WIN32 / _WIN32 adapter policy
 
 	// From here on instance != NULL: the classic contract, only reachable if a
 	// (future/fixed) Unity passes its real VkInstance again. Enumerate from THAT
@@ -255,7 +310,7 @@ static UnityXRPreInitProvider s_preinit_provider = {
     preinit_get_device_exts,
 };
 
-#endif // _WIN32 && ENABLE_VULKAN
+#endif // ENABLE_VULKAN
 
 // The engine-called entry point (boot.config xrsdk-pre-init-library). Present on
 // every platform so the boot.config entry the C# loader emits never dangles; a
@@ -263,7 +318,7 @@ static UnityXRPreInitProvider s_preinit_provider = {
 extern "C" UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API
 XRSDKPreInit(IUnityInterfaces *interfaces)
 {
-#if defined(_WIN32) && defined(ENABLE_VULKAN)
+#if defined(ENABLE_VULKAN)
 	if (!interfaces) return;
 	IUnityXRPreInit *preinit = UNITY_GET_INTERFACE(interfaces, IUnityXRPreInit);
 	if (!preinit) {

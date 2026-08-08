@@ -83,14 +83,21 @@ struct VkApi {
 	PFN_vkBindImageMemory          vkBindImageMemory;
 	// Provider VK backend (#247): cross-device ordering between the runtime's session
 	// device and Unity's device — the VK cousin of the shared ID3D12Fence. The bridge
-	// image is exported/imported as OPAQUE_WIN32 memory; the ordering primitive is an
-	// OPAQUE_WIN32 semaphore signalled on one device and waited on the other.
+	// image is exported/imported as external memory; the ordering primitive is an
+	// external semaphore signalled on one device and waited on the other. The handle
+	// FLAVOUR is per-OS — OPAQUE_WIN32 `HANDLE`s on Windows, OPAQUE_FD file
+	// descriptors on Linux (#249) — but the bridge shape either side of it is the
+	// same, so only these three entry points differ.
 	PFN_vkCreateSemaphore          vkCreateSemaphore;
 	PFN_vkDestroySemaphore         vkDestroySemaphore;
 #if defined(_WIN32)
 	PFN_vkGetMemoryWin32HandleKHR  vkGetMemoryWin32HandleKHR;
 	PFN_vkGetSemaphoreWin32HandleKHR    vkGetSemaphoreWin32HandleKHR;
 	PFN_vkImportSemaphoreWin32HandleKHR vkImportSemaphoreWin32HandleKHR;
+#else
+	PFN_vkGetMemoryFdKHR           vkGetMemoryFdKHR;
+	PFN_vkGetSemaphoreFdKHR        vkGetSemaphoreFdKHR;
+	PFN_vkImportSemaphoreFdKHR     vkImportSemaphoreFdKHR;
 #endif
 	PFN_vkCreateSwapchainKHR       vkCreateSwapchainKHR;
 	PFN_vkDestroySwapchainKHR      vkDestroySwapchainKHR;

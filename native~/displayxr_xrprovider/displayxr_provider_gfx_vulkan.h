@@ -24,21 +24,24 @@
 //     workflow here, so an editor-only hole is not acceptable.
 //
 // So the session runs on a runtime-created VkDevice and we bridge to Unity's
-// separate VkDevice with VK_KHR_external_memory_win32 (OPAQUE_WIN32) images plus
-// an OPAQUE_WIN32 semaphore for cross-device ordering. That is the DXR_GFX_D3D12
-// own-device-bridge shape expressed in Vulkan: own device + shared 2-slice array
-// + per-frame copy, with the semaphore playing the role of the shared
-// ID3D12Fence. Intercept-based zero-copy stays available as a player-only
-// optimisation later.
+// separate VkDevice with external-memory images plus an external semaphore for
+// cross-device ordering. That is the DXR_GFX_D3D12 own-device-bridge shape
+// expressed in Vulkan: own device + shared 2-slice array + per-frame copy, with
+// the semaphore playing the role of the shared ID3D12Fence. Intercept-based
+// zero-copy stays available as a player-only optimisation later.
 //
-// Everything here is Windows-only for now (OPAQUE_WIN32 handles). Vulkan on
-// macOS remains out of scope — Metal is the macOS backend (#202/#204).
+// PLATFORMS: Windows (#247) and desktop Linux (#249). The two differ only in the
+// external-memory handle flavour — OPAQUE_WIN32 `HANDLE`s vs OPAQUE_FD file
+// descriptors — which the .cpp isolates behind a handful of PVK_* macros. Vulkan
+// on macOS is out of scope (Metal is the macOS backend, #202/#204), and Android
+// is a separate leg: its runtime is out-of-process, so this in-process bridge is
+// the wrong shape for it.
 
 #pragma once
 
 #include <stdint.h>
 
-#if defined(_WIN32) && defined(ENABLE_VULKAN)
+#if defined(ENABLE_VULKAN)
 
 #include "../displayxr_vk_loader.h"
 
@@ -95,8 +98,8 @@ void dxr_pvk_set_swapchain_images(const void *images, uint32_t count,
                                   uint32_t array_size, int64_t format);
 
 /// Create the eye bridge: a `array_size`-layer VkImage on the SESSION device
-/// exported as OPAQUE_WIN32, imported as a matching VkImage on UNITY's device,
-/// plus the OPAQUE_WIN32 ordering semaphore. Unity renders into the Unity-side
+/// exported as external memory (OPAQUE_WIN32 / OPAQUE_FD), imported as a matching
+/// VkImage on UNITY's device, plus the ordering semaphore. Unity renders into the Unity-side
 /// image; dxr_pvk_copy_to_swapchain_image() copies the session-side alias into
 /// the acquired swapchain image.
 ///
@@ -147,4 +150,4 @@ int dxr_pvk_device_ready(void);
 }
 #endif
 
-#endif // _WIN32 && ENABLE_VULKAN
+#endif // ENABLE_VULKAN

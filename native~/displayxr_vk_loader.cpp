@@ -134,6 +134,12 @@ dxr_vk_load_device(VkApi *api, VkDevice device)
 	DXR_VK_DEV(api, device, vkGetMemoryWin32HandleKHR);
 	DXR_VK_DEV(api, device, vkGetSemaphoreWin32HandleKHR);
 	DXR_VK_DEV(api, device, vkImportSemaphoreWin32HandleKHR);
+#else
+	// Linux/Android external-memory flavour (#249) — same three roles as the
+	// Win32 trio above, fd-shaped.
+	DXR_VK_DEV(api, device, vkGetMemoryFdKHR);
+	DXR_VK_DEV(api, device, vkGetSemaphoreFdKHR);
+	DXR_VK_DEV(api, device, vkImportSemaphoreFdKHR);
 #endif
 	DXR_VK_DEV(api, device, vkCreateSwapchainKHR);
 	DXR_VK_DEV(api, device, vkDestroySwapchainKHR);

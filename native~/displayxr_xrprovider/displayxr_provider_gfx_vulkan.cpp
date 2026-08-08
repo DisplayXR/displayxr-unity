@@ -1,12 +1,27 @@
 // Copyright 2024-2026, DisplayXR contributors
 // SPDX-License-Identifier: Apache-2.0
 //
-// Vulkan graphics glue for the IUnityXRDisplay provider (#247).
+// Vulkan graphics glue for the IUnityXRDisplay provider (#247 Windows, #249 Linux).
 // See displayxr_provider_gfx_vulkan.h for why this is an own-device bridge.
+//
+// PLATFORM SHAPE: everything here — the enable2 sequence, the image create-info
+// mirroring, the dedicated allocations, the parked-in-GENERAL layout scheme, the
+// per-frame copy — is platform-neutral. The ONLY per-OS part is the flavour of
+// external-memory handle the two devices share the bridge image through:
+//
+//   Windows : VK_KHR_external_memory_win32,  OPAQUE_WIN32, a `HANDLE`
+//   Linux   : VK_KHR_external_memory_fd,     OPAQUE_FD,    a file descriptor
+//
+// That difference is isolated in the PVK_* macros and the two handle helpers
+// below; no other code in this file branches on the OS.
 
-#if defined(_WIN32) && defined(ENABLE_VULKAN)
+#if defined(ENABLE_VULKAN)
 
 #include "displayxr_provider_gfx_vulkan.h"
+
+#if !defined(_WIN32)
+#include <unistd.h> // close() — the fd flavour of CloseHandle
+#endif
 
 // UnityVulkanImage / UnityVulkanMemory — the struct Unity's Vulkan backend reads out of
 // UnityXRRenderTextureDesc::color.nativePtr. Include order matters: IUnityGraphicsVulkan.h
@@ -32,8 +47,71 @@ pvk_log(const char *fmt, ...)
 	vsnprintf(buf, sizeof(buf), fmt, ap);
 	va_end(ap);
 	fputs(buf, stderr);
+#if defined(_WIN32)
 	OutputDebugStringA(buf);
+#endif
 	dxr_prov_file_log(buf);
+}
+
+// ---------------------------------------------------------------------------
+// External-memory flavour — the one thing that differs between Windows and Linux
+// ---------------------------------------------------------------------------
+//
+// OWNERSHIP TRAP, and the two OSes are OPPOSITES here. Get it wrong and the
+// symptom is a use-after-free / EBADF that reads like a driver bug:
+//
+//   Windows — vkGetMemoryWin32HandleKHR returns a HANDLE the APPLICATION owns.
+//             Importing does NOT consume it, so we keep it for the bridge's
+//             lifetime and CloseHandle() it at teardown.
+//   Linux   — vkGetMemoryFdKHR returns an fd the application owns, but
+//             VkImportMemoryFdInfoKHR TRANSFERS OWNERSHIP to the implementation
+//             on a SUCCESSFUL vkAllocateMemory. After that the fd must never be
+//             closed or reused; a second import would need its own dup().
+//             So we forget the fd on success, and close it on every failure path.
+//
+// pvk_close_shared_handle() below encodes exactly that, so the ownership rule
+// lives in one place rather than at every early return.
+
+#if defined(_WIN32)
+typedef HANDLE PvkSharedHandle;
+#define PVK_SHARED_HANDLE_NULL          ((HANDLE)NULL)
+#define PVK_EXTERNAL_HANDLE_TYPE_BIT    VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT
+#define PVK_EXT_EXTERNAL_MEMORY_OS      VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME
+#define PVK_EXT_EXTERNAL_SEMAPHORE_OS   VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME
+#define PVK_HANDLE_FMT                  "%p"
+#define PVK_HANDLE_ARG(h)               ((void *)(h))
+#else
+typedef int PvkSharedHandle;
+#define PVK_SHARED_HANDLE_NULL          (-1)
+#define PVK_EXTERNAL_HANDLE_TYPE_BIT    VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT
+#define PVK_EXT_EXTERNAL_MEMORY_OS      VK_KHR_EXTERNAL_MEMORY_FD_EXTENSION_NAME
+#define PVK_EXT_EXTERNAL_SEMAPHORE_OS   VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME
+#define PVK_HANDLE_FMT                  "fd=%d"
+#define PVK_HANDLE_ARG(h)               (h)
+#endif
+
+static inline bool
+pvk_handle_valid(PvkSharedHandle h)
+{
+#if defined(_WIN32)
+	return h != NULL;
+#else
+	return h >= 0;
+#endif
+}
+
+// Release a shared handle we still own. No-op on an already-released handle, so
+// it is safe to call on every path.
+static inline void
+pvk_close_shared_handle(PvkSharedHandle *h)
+{
+	if (!h || !pvk_handle_valid(*h)) return;
+#if defined(_WIN32)
+	CloseHandle(*h);
+#else
+	close(*h);
+#endif
+	*h = PVK_SHARED_HANDLE_NULL;
 }
 
 // ---------------------------------------------------------------------------
@@ -123,13 +201,16 @@ typedef XrResult(XRAPI_PTR *PFN_xrGetVulkanGraphicsDevice2KHR)(
 // One bridge slot: a shared image aliased on both devices.
 //   session-side image  <- the copy source, lives on the runtime's device
 //   unity-side image    <- what Unity renders into, lives on Unity's device
-// Both are bound to the SAME device memory via an OPAQUE_WIN32 handle.
+// Both are bound to the SAME device memory via an external-memory handle
+// (OPAQUE_WIN32 HANDLE on Windows, OPAQUE_FD file descriptor on Linux).
 struct PvkBridge {
 	VkImage        session_image = VK_NULL_HANDLE;
 	VkDeviceMemory session_memory = VK_NULL_HANDLE;
 	VkImage        unity_image = VK_NULL_HANDLE;
 	VkDeviceMemory unity_memory = VK_NULL_HANDLE;
-	HANDLE         shared_handle = NULL;
+	// Still-owned export handle, or PVK_SHARED_HANDLE_NULL once ownership has
+	// passed to Vulkan (Linux, after a successful import) or it has been closed.
+	PvkSharedHandle shared_handle = PVK_SHARED_HANDLE_NULL;
 	uint32_t       width = 0, height = 0, layers = 0;
 	VkFormat       format = VK_FORMAT_UNDEFINED;
 	VkDeviceSize   unity_mem_size = 0;
@@ -227,11 +308,20 @@ dxr_pvk_set_unity_objects(void *instance, void *physical_device, void *device,
 // Cross-adapter guard (the VK form of #240)
 // ---------------------------------------------------------------------------
 
-// Read VkPhysicalDeviceIDProperties.deviceLUID. Returns false when the property
-// is unavailable (no properties2, or deviceLUIDValid == false), which the caller
-// must treat as "cannot check" rather than "mismatch".
+// Read VkPhysicalDeviceIDProperties.deviceUUID. Returns false only when the
+// property is unavailable at all (no properties2), which the caller must treat
+// as "cannot check" rather than "mismatch".
+//
+// UUID rather than LUID, deliberately (#249). deviceLUID is only meaningful when
+// deviceLUIDValid is set, which in practice means Windows — so a LUID comparison
+// degrades to "guard skipped" on Linux, exactly where the guard is still wanted.
+// deviceUUID is always valid, and it is also the identity the RUNTIME matches on:
+// DXR_VK_FORCE_GPU steers the compositor's physical device, which lands in
+// c->sys_info.client_vk_deviceUUID, and oxr_vk_get_physical_device() matches that
+// UUID when suggesting a device from xrGetVulkanGraphicsDevice2KHR. Comparing
+// UUIDs therefore compares the same thing both sides converge on.
 static bool
-pvk_device_luid(VkApi *api, VkPhysicalDevice phys, uint8_t out_luid[VK_LUID_SIZE])
+pvk_device_uuid(VkApi *api, VkPhysicalDevice phys, uint8_t out_uuid[VK_UUID_SIZE])
 {
 	if (!api || !api->vkGetPhysicalDeviceProperties2 || phys == VK_NULL_HANDLE) return false;
 	VkPhysicalDeviceIDProperties idp = {};
@@ -240,8 +330,7 @@ pvk_device_luid(VkApi *api, VkPhysicalDevice phys, uint8_t out_luid[VK_LUID_SIZE
 	p2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
 	p2.pNext = &idp;
 	api->vkGetPhysicalDeviceProperties2(phys, &p2);
-	if (!idp.deviceLUIDValid) return false;
-	memcpy(out_luid, idp.deviceLUID, VK_LUID_SIZE);
+	memcpy(out_uuid, idp.deviceUUID, VK_UUID_SIZE);
 	return true;
 }
 
@@ -256,8 +345,8 @@ pvk_describe(VkApi *api, VkPhysicalDevice phys, char *out, size_t n)
 }
 
 // The eye bridge shares memory between the runtime's device and Unity's. If they
-// are different physical devices the OPAQUE_WIN32 import either fails outright or
-// (worse, and what #240 actually looked like on D3D12) succeeds and presents
+// are different physical devices the external-memory import either fails outright
+// or (worse, and what #240 actually looked like on D3D12) succeeds and presents
 // black with a fully healthy-looking session. Refuse, and name both adapters plus
 // the knobs, rather than start a session that can never display.
 static bool
@@ -273,15 +362,15 @@ pvk_check_same_adapter(void)
 	    s_pvk.unity_physical_device == s_pvk.physical_device)
 		return true;
 
-	uint8_t luid_rt[VK_LUID_SIZE] = {}, luid_unity[VK_LUID_SIZE] = {};
-	bool ok_rt = pvk_device_luid(&s_pvk.api, s_pvk.physical_device, luid_rt);
-	bool ok_unity = pvk_device_luid(&s_pvk.unity_api, s_pvk.unity_physical_device, luid_unity);
+	uint8_t uuid_rt[VK_UUID_SIZE] = {}, uuid_unity[VK_UUID_SIZE] = {};
+	bool ok_rt = pvk_device_uuid(&s_pvk.api, s_pvk.physical_device, uuid_rt);
+	bool ok_unity = pvk_device_uuid(&s_pvk.unity_api, s_pvk.unity_physical_device, uuid_unity);
 	if (!ok_rt || !ok_unity) {
-		pvk_log("[DisplayXR-PROV-VK] WARN: device LUID unavailable (runtime=%d unity=%d) — "
+		pvk_log("[DisplayXR-PROV-VK] WARN: device UUID unavailable (runtime=%d unity=%d) — "
 		        "cross-adapter guard skipped.\n", (int)ok_rt, (int)ok_unity);
 		return true;
 	}
-	if (memcmp(luid_rt, luid_unity, VK_LUID_SIZE) == 0) return true;
+	if (memcmp(uuid_rt, uuid_unity, VK_UUID_SIZE) == 0) return true;
 
 	char d_rt[256], d_unity[256];
 	pvk_describe(&s_pvk.api, s_pvk.physical_device, d_rt, sizeof(d_rt));
@@ -290,8 +379,8 @@ pvk_check_same_adapter(void)
 	        "cross-adapter eye bridge would present black (#240, Vulkan form).\n"
 	        "[DisplayXR-PROV-VK]   Unity renders on : %s\n"
 	        "[DisplayXR-PROV-VK]   Runtime selected : %s\n"
-	        "[DisplayXR-PROV-VK]   Fix: align them. Either set this app's Windows GpuPreference to "
-	        "the runtime's adapter (Settings > System > Display > Graphics), or point the runtime "
+	        "[DisplayXR-PROV-VK]   Fix: align them. On Windows, either set this app's GpuPreference "
+	        "to the runtime's adapter (Settings > System > Display > Graphics), or point the runtime "
 	        "at Unity's adapter with DXR_VK_FORCE_GPU=igpu|dgpu|<index> - the Vulkan cousin of "
 	        "DXR_D3D_FORCE_GPU. It steers the compositor's VkPhysicalDevice, and "
 	        "xrGetVulkanGraphicsDevice2KHR then suggests the device matching the compositor's "
@@ -314,7 +403,8 @@ dxr_pvk_create_device(XrInstance instance, XrSystemId system_id,
 		s_pvk.unity_physical_device = (VkPhysicalDevice)unity_physical_device;
 
 	if (!dxr_vk_load_global(&s_pvk.api)) {
-		pvk_log("[DisplayXR-PROV-VK] vulkan-1.dll unavailable — cannot start a Vulkan session\n");
+		pvk_log("[DisplayXR-PROV-VK] Vulkan loader unavailable (vulkan-1.dll / libvulkan.so.1) — "
+		        "cannot start a Vulkan session\n");
 		return 0;
 	}
 
@@ -443,11 +533,14 @@ dxr_pvk_create_device(XrInstance instance, XrSystemId system_id,
 	qci.queueCount = 1;
 	qci.pQueuePriorities = &prio;
 
+	// The OS-flavoured pair must match what the pre-init provider merges into
+	// UNITY's device (displayxr_provider_preinit.cpp) — the bridge only works if
+	// both sides speak the same external-memory handle type.
 	const char *dev_exts[] = {
 		VK_KHR_EXTERNAL_MEMORY_EXTENSION_NAME,
-		VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,
+		PVK_EXT_EXTERNAL_MEMORY_OS,
 		VK_KHR_EXTERNAL_SEMAPHORE_EXTENSION_NAME,
-		VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME,
+		PVK_EXT_EXTERNAL_SEMAPHORE_OS,
 		VK_KHR_DEDICATED_ALLOCATION_EXTENSION_NAME,
 		VK_KHR_GET_MEMORY_REQUIREMENTS_2_EXTENSION_NAME,
 	};
@@ -574,7 +667,7 @@ pvk_bridge_image_ci(uint32_t w, uint32_t h, uint32_t layers, VkFormat fmt,
 {
 	ext->sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
 	ext->pNext = NULL;
-	ext->handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+	ext->handleTypes = PVK_EXTERNAL_HANDLE_TYPE_BIT;
 
 	VkImageCreateInfo ici = {};
 	ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
@@ -675,15 +768,20 @@ dxr_pvk_create_bridge(int eye, uint32_t width, uint32_t height,
 	ded.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
 	ded.image = b->session_image;
 
+	VkExportMemoryAllocateInfo exp = {};
+	exp.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
+	exp.handleTypes = PVK_EXTERNAL_HANDLE_TYPE_BIT;
+#if defined(_WIN32)
+	// Win32 handles carry a security descriptor / access mask; OPAQUE_FD has no
+	// equivalent, so this extra link in the pNext chain is Windows-only.
 	VkExportMemoryWin32HandleInfoKHR exp_win32 = {};
 	exp_win32.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_WIN32_HANDLE_INFO_KHR;
 	exp_win32.pNext = &ded;
 	exp_win32.dwAccess = GENERIC_ALL;
-
-	VkExportMemoryAllocateInfo exp = {};
-	exp.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
 	exp.pNext = &exp_win32;
-	exp.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+#else
+	exp.pNext = &ded;
+#endif
 
 	VkMemoryAllocateInfo mai = {};
 	mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
@@ -705,6 +803,7 @@ dxr_pvk_create_bridge(int eye, uint32_t width, uint32_t height,
 		return 0;
 	}
 
+#if defined(_WIN32)
 	if (!s_pvk.api.vkGetMemoryWin32HandleKHR) {
 		pvk_log("[DisplayXR-PROV-VK] bridge: vkGetMemoryWin32HandleKHR unresolved — "
 		        "VK_KHR_external_memory_win32 missing on the session device\n");
@@ -713,12 +812,29 @@ dxr_pvk_create_bridge(int eye, uint32_t width, uint32_t height,
 	VkMemoryGetWin32HandleInfoKHR ghi = {};
 	ghi.sType = VK_STRUCTURE_TYPE_MEMORY_GET_WIN32_HANDLE_INFO_KHR;
 	ghi.memory = b->session_memory;
-	ghi.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+	ghi.handleType = PVK_EXTERNAL_HANDLE_TYPE_BIT;
 	if (s_pvk.api.vkGetMemoryWin32HandleKHR(s_pvk.device, &ghi, &b->shared_handle) != VK_SUCCESS ||
-	    !b->shared_handle) {
+	    !pvk_handle_valid(b->shared_handle)) {
 		pvk_log("[DisplayXR-PROV-VK] bridge: vkGetMemoryWin32HandleKHR failed\n");
 		return 0;
 	}
+#else
+	if (!s_pvk.api.vkGetMemoryFdKHR) {
+		pvk_log("[DisplayXR-PROV-VK] bridge: vkGetMemoryFdKHR unresolved — "
+		        "VK_KHR_external_memory_fd missing on the session device\n");
+		return 0;
+	}
+	VkMemoryGetFdInfoKHR ghi = {};
+	ghi.sType = VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR;
+	ghi.memory = b->session_memory;
+	ghi.handleType = PVK_EXTERNAL_HANDLE_TYPE_BIT;
+	if (s_pvk.api.vkGetMemoryFdKHR(s_pvk.device, &ghi, &b->shared_handle) != VK_SUCCESS ||
+	    !pvk_handle_valid(b->shared_handle)) {
+		pvk_log("[DisplayXR-PROV-VK] bridge: vkGetMemoryFdKHR failed\n");
+		b->shared_handle = PVK_SHARED_HANDLE_NULL;
+		return 0;
+	}
+#endif
 
 	// --- Unity side: create an identical image and IMPORT the same memory ---
 	VkExternalMemoryImageCreateInfo u_ext_ci = {};
@@ -734,11 +850,19 @@ dxr_pvk_create_bridge(int eye, uint32_t width, uint32_t height,
 	u_ded.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
 	u_ded.image = b->unity_image;
 
+#if defined(_WIN32)
 	VkImportMemoryWin32HandleInfoKHR imp = {};
 	imp.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR;
 	imp.pNext = &u_ded;
-	imp.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_WIN32_BIT;
+	imp.handleType = PVK_EXTERNAL_HANDLE_TYPE_BIT;
 	imp.handle = b->shared_handle;
+#else
+	VkImportMemoryFdInfoKHR imp = {};
+	imp.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_FD_INFO_KHR;
+	imp.pNext = &u_ded;
+	imp.handleType = PVK_EXTERNAL_HANDLE_TYPE_BIT;
+	imp.fd = b->shared_handle;
+#endif
 
 	VkMemoryAllocateInfo u_mai = {};
 	u_mai.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
@@ -753,8 +877,19 @@ dxr_pvk_create_bridge(int eye, uint32_t width, uint32_t height,
 	}
 	if (s_pvk.unity_api.vkAllocateMemory(s_pvk.unity_device, &u_mai, NULL, &b->unity_memory) != VK_SUCCESS) {
 		pvk_log("[DisplayXR-PROV-VK] bridge: vkAllocateMemory (unity import) failed\n");
+		// We still own the handle on both OSes when the import FAILS — release it
+		// rather than leak it (on Linux a leaked fd per bridge realloc is a slow
+		// EMFILE; on Windows it is a leaked kernel object).
+		pvk_close_shared_handle(&b->shared_handle);
 		return 0;
 	}
+#if !defined(_WIN32)
+	// SUCCESSFUL fd import transfers ownership to the implementation (see the
+	// ownership trap at the top of this file). Forget the fd here so no teardown
+	// path can close a descriptor Vulkan now owns. Windows keeps its HANDLE — the
+	// import took its own reference and CloseHandle() at teardown is required.
+	b->shared_handle = PVK_SHARED_HANDLE_NULL;
+#endif
 	if (s_pvk.unity_api.vkBindImageMemory(s_pvk.unity_device, b->unity_image, b->unity_memory, 0) != VK_SUCCESS) {
 		pvk_log("[DisplayXR-PROV-VK] bridge: vkBindImageMemory (unity) failed\n");
 		return 0;
@@ -805,9 +940,10 @@ dxr_pvk_create_bridge(int eye, uint32_t width, uint32_t height,
 	b->unity_desc.mipCount = 1;
 
 	b->valid = true;
-	pvk_log("[DisplayXR-PROV-VK] bridge[%d]: %ux%u layers=%u fmt=%d shared (session=%p unity=%p handle=%p)\n",
+	pvk_log("[DisplayXR-PROV-VK] bridge[%d]: %ux%u layers=%u fmt=%d shared (session=%p unity=%p handle="
+	        PVK_HANDLE_FMT ")\n",
 	        eye, width, height, array_size, (int)fmt,
-	        (void *)b->session_image, (void *)b->unity_image, (void *)b->shared_handle);
+	        (void *)b->session_image, (void *)b->unity_image, PVK_HANDLE_ARG(b->shared_handle));
 	return 1;
 }
 
@@ -863,9 +999,10 @@ dxr_pvk_signal_unity_done(void)
 	//
 	// This is the Vulkan analogue of ps_d3d11_ctx_drain() on the D3D11 editor
 	// bridge — correct, and deliberately the blunt instrument. The cheap version
-	// is an OPAQUE_WIN32 semaphore signalled from Unity's queue and waited by our
-	// copy submit (the loader already resolves vkGet/ImportSemaphoreWin32HandleKHR
-	// for it), but submitting to Unity's queue safely requires plugin-event queue
+	// is an external semaphore signalled from Unity's queue and waited by our copy
+	// submit (the loader already resolves the OS-appropriate
+	// vkGet/ImportSemaphore{Win32Handle,Fd}KHR for it), but submitting to Unity's
+	// queue safely requires plugin-event queue
 	// access (kUnityVulkanGraphicsQueueAccess_Allow) that the IUnityXRDisplay
 	// callbacks do not carry today. Landing the drain first keeps Phase 1
 	// verifiable; the semaphore is a measured optimisation, not a correctness fix.
@@ -984,10 +1121,12 @@ pvk_destroy_bridge(PvkBridge *b)
 		s_pvk.api.vkDestroyImage(s_pvk.device, b->session_image, NULL);
 	if (b->session_memory && s_pvk.api.vkFreeMemory)
 		s_pvk.api.vkFreeMemory(s_pvk.device, b->session_memory, NULL);
-	// The imported allocation owns a reference to the handle, so it is closed only
-	// after BOTH sides are gone (Vulkan takes a reference at import, but the
-	// exported handle itself is ours to close).
-	if (b->shared_handle) CloseHandle(b->shared_handle);
+	// Release the export handle if we still own one. On Windows that is the normal
+	// case — the import took its own reference, so the exported HANDLE is ours to
+	// close once both sides are gone. On Linux the fd's ownership already passed to
+	// Vulkan at import, so shared_handle is null here and this is a no-op; it only
+	// fires on a bridge that failed partway through creation.
+	pvk_close_shared_handle(&b->shared_handle);
 	*b = PvkBridge{};
 }
 
@@ -1029,4 +1168,4 @@ dxr_pvk_destroy(void)
 	pvk_log("[DisplayXR-PROV-VK] destroyed\n");
 }
 
-#endif // _WIN32 && ENABLE_VULKAN
+#endif // ENABLE_VULKAN

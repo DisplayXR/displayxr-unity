@@ -142,11 +142,21 @@ typedef struct XrGraphicsRequirementsD3D11KHR {
 	D3D_FEATURE_LEVEL minFeatureLevel;
 } XrGraphicsRequirementsD3D11KHR;
 
-// Vulkan (#247): the provider's VK backend lives in displayxr_provider_gfx_vulkan.cpp
-// so vulkan.h never reaches this TU. All this TU needs is the swapchain-image struct
-// to enumerate into, so declare a layout-compatible local mirror of
-// XrSwapchainImageVulkan2KHR. VkImage is a VK_DEFINE_NON_DISPATCHABLE_HANDLE, i.e. a
-// pointer on x64 — and this path is Windows-x64-only — so void* matches exactly.
+typedef XrResult (XRAPI_PTR *PFN_xrGetD3D11GraphicsRequirementsKHR)(
+    XrInstance instance, XrSystemId systemId,
+    XrGraphicsRequirementsD3D11KHR *graphicsRequirements);
+#endif // _WIN32 (D3D11/D3D12 KHR types; Metal types come from displayxr_extensions.h)
+
+// Vulkan (#247 Windows, #249 Linux): the provider's VK backend lives in
+// displayxr_provider_gfx_vulkan.cpp so vulkan.h never reaches this TU. All this TU
+// needs is the swapchain-image struct to enumerate into, so declare a
+// layout-compatible local mirror of XrSwapchainImageVulkan2KHR. VkImage is a
+// VK_DEFINE_NON_DISPATCHABLE_HANDLE, i.e. a pointer on the 64-bit targets this
+// backend builds for, so void* matches exactly.
+//
+// NOTE this block sits OUTSIDE the _WIN32 region above on purpose — the VK backend
+// is Windows AND Linux, and burying these declarations in the D3D-types block was
+// the first thing that broke the Linux build (#249).
 #define XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR_PS ((XrStructureType)1000025001)
 typedef struct XrSwapchainImageVulkanKHR_PS {
 	XrStructureType type;
@@ -157,7 +167,7 @@ typedef struct XrSwapchainImageVulkanKHR_PS {
 // The VK glue's C entry points, forward-declared rather than #included for the same
 // reason (the header pulls vulkan.h). Kept in sync with
 // displayxr_xrprovider/displayxr_provider_gfx_vulkan.h.
-#if defined(_WIN32) && defined(ENABLE_VULKAN)
+#if defined(ENABLE_VULKAN)
 extern "C" int  dxr_pvk_create_device(XrInstance, XrSystemId, PFN_xrGetInstanceProcAddr, void *);
 extern "C" const void *dxr_pvk_session_binding(const void *next);
 extern "C" void dxr_pvk_set_unity_objects(void *, void *, void *, uint32_t, void *);
@@ -170,11 +180,6 @@ extern "C" void dxr_pvk_signal_unity_done(void);
 extern "C" void dxr_pvk_destroy(void);
 extern "C" int  dxr_pvk_device_ready(void);
 #endif
-
-typedef XrResult (XRAPI_PTR *PFN_xrGetD3D11GraphicsRequirementsKHR)(
-    XrInstance instance, XrSystemId systemId,
-    XrGraphicsRequirementsD3D11KHR *graphicsRequirements);
-#endif // _WIN32 (D3D11/D3D12 KHR types; Metal types come from displayxr_extensions.h)
 
 // ============================================================================
 // Size constants
@@ -1008,7 +1013,10 @@ static int ps_zone_active(void) { return s_ps.zone_valid && ps_zones_ready(); }
 #ifdef _WIN32
 static int ps_create_bridge(void); // defined after this function
 static int ps_create_bridge_d3d11(void); // D3D11 editor bridge (#195); defined after this function
-static int ps_create_bridge_vk(void);    // Vulkan external-memory bridge (#247); defined after this function
+#endif
+#if defined(ENABLE_VULKAN)
+// Vulkan external-memory bridge (#247 Windows, #249 Linux); defined after this function.
+static int ps_create_bridge_vk(void);
 #endif
 static void ps_publish_stereo_matrices(void); // defined after dxr_prov_begin_frame (overlay hit-test)
 
@@ -1178,11 +1186,13 @@ static int ps_create_swapchain(void)
 	s_ps.pfn_enumerate_swapchain_images(s_ps.swapchain, 0, &count, NULL);
 	if (count > PS_MAX_SWAPCHAIN_IMAGES) count = PS_MAX_SWAPCHAIN_IMAGES;
 	s_ps.sc_image_count = count;
-#ifdef _WIN32
+#if defined(ENABLE_VULKAN)
+	// Vulkan arm first, and OUTSIDE the per-OS branch below: it is identical on
+	// Windows (#247) and Linux (#249).
 	if (s_ps.graphics_api == DXR_GFX_VULKAN) {
-		// Vulkan (#247): the runtime allocates these arraySize=2 images on the SESSION
-		// device (which the runtime itself created via enable2), so they are not
-		// wrappable as Unity textures — the eye bridge copies into them. Enumerate as
+		// The runtime allocates these arraySize=2 images on the SESSION device (which
+		// the runtime itself created via enable2), so they are not wrappable as Unity
+		// textures — the eye bridge copies into them. Enumerate as
 		// XrSwapchainImageVulkan2KHR and hand the VkImage array to the VK glue TU.
 		XrSwapchainImageVulkanKHR_PS vk_imgs[PS_MAX_SWAPCHAIN_IMAGES] = {};
 		for (uint32_t i = 0; i < count; i++) {
@@ -1194,7 +1204,10 @@ static int ps_create_swapchain(void)
 		        (XrSwapchainImageBaseHeader *)vk_imgs);
 		if (XR_SUCCEEDED(r))
 			dxr_pvk_set_swapchain_images(vk_imgs, count, w, h, 2, format);
-	} else if (s_ps.graphics_api == DXR_GFX_D3D11) {
+	} else
+#endif
+#ifdef _WIN32
+	if (s_ps.graphics_api == DXR_GFX_D3D11) {
 		// D3D11 zero-copy: the runtime allocates these arraySize=2 images on Unity's
 		// device; the display-provider wraps them DIRECTLY via CreateTexture (no bridge).
 		for (uint32_t i = 0; i < count; i++) {
@@ -1213,7 +1226,7 @@ static int ps_create_swapchain(void)
 		r = s_ps.pfn_enumerate_swapchain_images(s_ps.swapchain, count, &count,
 		        (XrSwapchainImageBaseHeader *)s_ps.sc_images);
 	}
-#else
+#elif defined(__APPLE__)
 	{
 		// Metal (#204): enumerate XrSwapchainImageMetalKHR (id<MTLTexture> in .texture).
 		for (uint32_t i = 0; i < count; i++) {
@@ -1224,24 +1237,44 @@ static int ps_create_swapchain(void)
 		r = s_ps.pfn_enumerate_swapchain_images(s_ps.swapchain, count, &count,
 		        (XrSwapchainImageBaseHeader *)s_ps.sc_images_metal);
 	}
+#else
+	{
+		// Linux (#249): Vulkan is the only backend, and the arm above consumed it.
+		// Reaching here means GfxStart bound a backend this platform has no
+		// enumeration path for — a programming error, not a user-facing state.
+		ps_log("[DisplayXR-PROV] swapchain: no image-enumeration path for graphics api %d "
+		       "on this platform\n", (int)s_ps.graphics_api);
+		return 0;
+	}
 #endif
 	if (XR_FAILED(r)) { ps_log("[DisplayXR-PROV] enumerate swapchain images failed: %d\n", r); return 0; }
 
 	s_ps.swapchain_created = 1;
+#if defined(ENABLE_VULKAN)
+	// api= is the line that settles "did this run actually get Vulkan?" — Unity falls
+	// back graphics APIs SILENTLY, so a healthy-looking session proves nothing until
+	// this says Vulkan (#248, paid for on Windows; the same trap applies on Linux).
+	if (s_ps.graphics_api == DXR_GFX_VULKAN) {
+		ps_log("[DisplayXR-PROV] swapchain: %ux%u arraySize=2 submit=%u-view (%s), %u images, "
+		       "fmt=%lld, api=Vulkan(enable2 bridge)\n",
+		       w, h, s_ps.sc_view_count, s_ps.sc_view_count >= 2 ? "3D" : "2D", count,
+		       (long long)format);
+		ps_create_bridge_vk();    // external-memory bridge to Unity's VkDevice (#247/#249)
+	} else
+#endif
 #ifdef _WIN32
+	{
 	ps_log("[DisplayXR-PROV] swapchain: %ux%u arraySize=2 submit=%u-view (%s), %u images, fmt=%lld, api=%s\n",
 	       w, h, s_ps.sc_view_count, s_ps.sc_view_count >= 2 ? "3D" : "2D", count, format,
-	       s_ps.graphics_api == DXR_GFX_VULKAN ? "Vulkan(enable2 bridge)"
-	           : (s_ps.graphics_api != DXR_GFX_D3D11 ? "D3D12"
-	               : (s_ps.d3d11_bridge ? "D3D11(editor bridge)" : "D3D11(zero-copy)")));
+	       s_ps.graphics_api != DXR_GFX_D3D11 ? "D3D12"
+	           : (s_ps.d3d11_bridge ? "D3D11(editor bridge)" : "D3D11(zero-copy)"));
 
-	if (s_ps.graphics_api == DXR_GFX_VULKAN)
-		ps_create_bridge_vk();    // Vulkan: external-memory bridge to Unity's VkDevice (#247)
-	else if (s_ps.graphics_api != DXR_GFX_D3D11)
+	if (s_ps.graphics_api != DXR_GFX_D3D11)
 		ps_create_bridge();       // D3D12: pair the cross-device bridge with the swapchain
 	else
 		ps_create_bridge_d3d11(); // D3D11: per-sub-mode targets (SPI/MultiPass, bridge/zero-copy) (#195)
-#else
+	}
+#elif defined(__APPLE__)
 	ps_log("[DisplayXR-PROV] swapchain: %ux%u arraySize=2 submit=%u-view (%s), %u images, fmt=%lld, api=Metal\n",
 	       w, h, s_ps.sc_view_count, s_ps.sc_view_count >= 2 ? "3D" : "2D", count, (long long)format);
 	// ZERO-COPY (#204): per-image per-eye slice views of the swapchain images —
@@ -1258,6 +1291,14 @@ static int ps_create_swapchain(void)
 			}
 		}
 	}
+#else
+	{
+		// Linux (#249): Vulkan is the only backend and the arm above consumed it.
+		// This closes the dangling `else` when neither D3D nor Metal is compiled in.
+		ps_log("[DisplayXR-PROV] swapchain: no bridge path for graphics api %d on this "
+		       "platform\n", (int)s_ps.graphics_api);
+		return 0;
+	}
 #endif
 	return 1;
 }
@@ -1268,6 +1309,36 @@ extern "C" void *dxr_prov_get_metal_eye_view(uint32_t image, uint32_t eye)
 {
 	if (image >= s_ps.sc_image_count || eye > 1) return NULL;
 	return s_ps.eye_view_metal[image][eye];
+}
+#endif
+
+#if defined(ENABLE_VULKAN)
+// Vulkan (#247 Windows, #249 Linux): create the external-memory render target(s) Unity
+// draws into, sized to the swapchain. Structurally the D3D12 own-device bridge — there
+// is no zero-copy sub-mode, because under enable2 the session device is created by the
+// RUNTIME and can never be Unity's (see displayxr_provider_gfx_vulkan.h for the full
+// argument).
+//   - SPI:       one shared 2-layer image  -> bridge slot -1
+//   - MultiPass: two shared 1-layer images -> bridge slots 0 and 1
+//
+// Lives OUTSIDE the Windows-only D3D helper region below — the VK bridge is
+// platform-neutral and only its handle flavour differs.
+static int ps_create_bridge_vk(void)
+{
+	uint32_t w = s_ps.sc_width, h = s_ps.sc_height;
+	if (w == 0 || h == 0) return 0;
+	if (!dxr_pvk_device_ready()) return 0;
+
+	if (dxr_prov_get_single_pass())
+		return dxr_pvk_create_bridge(-1, w, h, 2, s_ps.sc_format);
+
+	for (int e = 0; e < 2; e++) {
+		if (!dxr_pvk_create_bridge(e, w, h, 1, s_ps.sc_format)) {
+			ps_log("[DisplayXR-PROV] Vulkan MultiPass eye %d bridge alloc failed\n", e);
+			return 0;
+		}
+	}
+	return 1;
 }
 #endif
 
@@ -1721,34 +1792,6 @@ static int ps_alloc_shared_tex_d3d11(uint32_t w, uint32_t h, uint32_t arr,
 	return 1;
 }
 
-// Vulkan (#247): create the external-memory render target(s) Unity draws into, sized
-// to the swapchain. Structurally the D3D12 own-device bridge — there is no zero-copy
-// sub-mode, because under enable2 the session device is created by the RUNTIME and can
-// never be Unity's (see displayxr_provider_gfx_vulkan.h for the full argument).
-//   - SPI:       one shared 2-layer image  -> bridge slot -1
-//   - MultiPass: two shared 1-layer images -> bridge slots 0 and 1
-static int ps_create_bridge_vk(void)
-{
-#if defined(_WIN32) && defined(ENABLE_VULKAN)
-	uint32_t w = s_ps.sc_width, h = s_ps.sc_height;
-	if (w == 0 || h == 0) return 0;
-	if (!dxr_pvk_device_ready()) return 0;
-
-	if (dxr_prov_get_single_pass())
-		return dxr_pvk_create_bridge(-1, w, h, 2, s_ps.sc_format);
-
-	for (int e = 0; e < 2; e++) {
-		if (!dxr_pvk_create_bridge(e, w, h, 1, s_ps.sc_format)) {
-			ps_log("[DisplayXR-PROV] Vulkan MultiPass eye %d bridge alloc failed\n", e);
-			return 0;
-		}
-	}
-	return 1;
-#else
-	return 0;
-#endif
-}
-
 // Create the D3D11 render target(s) Unity draws into, sized to the swapchain. Handles
 // BOTH sub-modes (editor own-device bridge / zero-copy player) x BOTH render modes
 // (SPI / MultiPass), keyed on dxr_prov_get_single_pass(). Mirrors ps_create_bridge (D3D12).
@@ -1906,11 +1949,11 @@ static int ps_create_bridge(void)
 // queue via the shared fence (shared_fence_own mirrors unity_queue's signal).
 static void ps_drain_gpu(void)
 {
-#ifndef _WIN32
+#if defined(__APPLE__)
 	// Metal (#204): frame-level sync lands with the Metal backend; nothing to
 	// drain in Phase 1 (the session never starts on macOS yet).
 	return;
-#else
+#elif defined(_WIN32)
 	if (s_ps.own_queue && s_ps.own_fence && s_ps.own_fence_event) {
 		s_ps.own_fence_value++;
 		s_ps.own_queue->Signal(s_ps.own_fence, s_ps.own_fence_value);
@@ -1937,6 +1980,10 @@ static void ps_drain_gpu(void)
 		ps_d3d11_ctx_drain(s_ps.own_d3d11_context, s_ps.own_d3d11_device);
 		ps_d3d11_ctx_drain(s_ps.unity_d3d11_context, s_ps.unity_d3d11_device);
 	}
+#else
+	// Linux (#249): no cross-device drain — the Vulkan bridge orders Unity's
+	// renders against the session-device copy itself (dxr_pvk_signal_unity_done).
+	return;
 #endif // _WIN32
 }
 
@@ -2173,7 +2220,7 @@ static int ps_create_wsui(uint32_t w, uint32_t h)
 		}
 		return 0;
 	}
-#ifndef _WIN32
+#if defined(__APPLE__)
 	// Metal (#206): an arraySize=1 overlay swapchain on Unity's device. No bridge —
 	// submit blits the C#-registered Unity id<MTLTexture> straight in (same device).
 	if (w == 0 || h == 0) return 0;
@@ -2226,7 +2273,7 @@ static int ps_create_wsui(uint32_t w, uint32_t h)
 	ps_log("[DisplayXR-PROV] wsui: Metal swapchain %ux%u (%u imgs, fmt=%lld)\n",
 	       w, h, count, (long long)format);
 	return 1;
-#else
+#elif defined(_WIN32)
 	int is_d3d11 = (s_ps.graphics_api == DXR_GFX_D3D11);
 	if (w == 0 || h == 0) return 0;
 	if (is_d3d11 ? !s_ps.unity_d3d11_device : (!s_ps.own_device || !s_ps.unity_device)) return 0;
@@ -2328,6 +2375,10 @@ static int ps_create_wsui(uint32_t w, uint32_t h)
 	       is_d3d11 ? (void *)s_ps.wsui_unity_tex : (void *)s_ps.wsui_bridge_unity,
 	       is_d3d11 ? "D3D11 zero-copy" : "D3D12 bridge");
 	return 1;
+#else
+	// Linux (#249): the wsui composition layer is inert on the Vulkan backend.
+	(void)w; (void)h;
+	return 0;
 #endif // _WIN32
 }
 
@@ -2360,7 +2411,7 @@ static int ps_submit_wsui(XrCompositionLayerWindowSpaceDXR *out_layer)
 {
 	if (!out_layer) return 0;
 	memset(out_layer, 0, sizeof(*out_layer));
-#ifndef _WIN32
+#if defined(__APPLE__)
 	// Metal (#206): blit the C#-registered Unity id<MTLTexture> into the acquired
 	// overlay swapchain image (same device, session queue), then submit the layer.
 	if (s_ps.graphics_api != DXR_GFX_METAL) return 0;
@@ -2401,7 +2452,7 @@ static int ps_submit_wsui(XrCompositionLayerWindowSpaceDXR *out_layer)
 	out_layer->width = lw; out_layer->height = lh;
 	out_layer->disparity = ldisp;
 	return 1;
-#else
+#elif defined(_WIN32)
 
 	void *tex = NULL; int tw = 0, th = 0;
 	float lx = 0, ly = 0, lw = 0, lh = 0, ldisp = 0;
@@ -2472,6 +2523,9 @@ static int ps_submit_wsui(XrCompositionLayerWindowSpaceDXR *out_layer)
 	out_layer->width = lw; out_layer->height = lh;
 	out_layer->disparity = ldisp;
 	return 1;
+#else
+	// Linux (#249): wsui inert — nothing to submit.
+	return 0;
 #endif // _WIN32
 }
 
@@ -2492,7 +2546,7 @@ static int ps_create_local2d(uint32_t w, uint32_t h)
 		}
 		return 0;
 	}
-#ifndef _WIN32
+#if defined(__APPLE__)
 	// Metal (#206): an arraySize=1 overlay swapchain on Unity's device. No bridge —
 	// submit blits the C#-registered Unity id<MTLTexture> straight in (same device).
 	// Twin of the wsui Metal arm (ps_create_wsui); the only difference downstream is
@@ -2545,7 +2599,7 @@ static int ps_create_local2d(uint32_t w, uint32_t h)
 	ps_log("[DisplayXR-PROV] local2d: Metal swapchain %ux%u (%u imgs, fmt=%lld)\n",
 	       w, h, count, (long long)format);
 	return 1;
-#else
+#elif defined(_WIN32)
 	int is_d3d11 = (s_ps.graphics_api == DXR_GFX_D3D11);
 	if (w == 0 || h == 0) return 0;
 	if (is_d3d11 ? !s_ps.unity_d3d11_device : (!s_ps.own_device || !s_ps.unity_device)) return 0;
@@ -2637,6 +2691,10 @@ static int ps_create_local2d(uint32_t w, uint32_t h)
 	       is_d3d11 ? (void *)s_ps.l2d_unity_tex : (void *)s_ps.l2d_bridge_unity,
 	       is_d3d11 ? "D3D11 zero-copy" : "D3D12 bridge");
 	return 1;
+#else
+	// Linux (#249): the Local2D composition layer is inert on the Vulkan backend.
+	(void)w; (void)h;
+	return 0;
 #endif // _WIN32
 }
 
@@ -2670,7 +2728,7 @@ static int ps_submit_local2d(XrCompositionLayerLocal2DDXR *out_layer)
 {
 	if (!out_layer) return 0;
 	memset(out_layer, 0, sizeof(*out_layer));
-#ifndef _WIN32
+#if defined(__APPLE__)
 	// Metal (#206): blit the C#-registered Unity id<MTLTexture> into the acquired
 	// Local2D swapchain image (same device, session queue), then submit the layer at
 	// the client-window PIXEL rect. Twin of ps_submit_wsui; the rect comes from
@@ -2715,7 +2773,7 @@ static int ps_submit_local2d(XrCompositionLayerLocal2DDXR *out_layer)
 	out_layer->rect.offset = {s_ps.l2d_rect_x, s_ps.l2d_rect_y};
 	out_layer->rect.extent = {s_ps.l2d_rect_w, s_ps.l2d_rect_h};
 	return 1;
-#else
+#elif defined(_WIN32)
 	int is_d3d11 = (s_ps.graphics_api == DXR_GFX_D3D11);
 	if (!s_ps.l2d_rect_set || !s_ps.l2d_swapchain_created || s_ps.l2d_image_count == 0 ||
 	    (is_d3d11 ? !s_ps.l2d_unity_tex : !s_ps.l2d_bridge_own))
@@ -2780,6 +2838,9 @@ static int ps_submit_local2d(XrCompositionLayerLocal2DDXR *out_layer)
 	out_layer->rect.offset = {s_ps.l2d_rect_x, s_ps.l2d_rect_y};
 	out_layer->rect.extent = {s_ps.l2d_rect_w, s_ps.l2d_rect_h};
 	return 1;
+#else
+	// Linux (#249): Local2D inert — nothing to submit.
+	return 0;
 #endif // _WIN32
 }
 
@@ -2815,7 +2876,7 @@ static int ps_create_extra_zone(ProviderExtraZone *z)
 		}
 		return 0;
 	}
-#ifndef _WIN32
+#if defined(__APPLE__)
 	// Metal (#206): zero-copy extra zone — an arraySize=2 swapchain whose per-eye slice
 	// views Unity renders straight into (no bridge, no blit). Mirrors the primary Metal
 	// swapchain arm in ps_create_swapchain. PopulateNextFrameDesc rotates to acquired_index.
@@ -2859,7 +2920,7 @@ static int ps_create_extra_zone(ProviderExtraZone *z)
 	ps_log("[DisplayXR-PROV] extra zone id=%u: Metal swapchain %ux%u (%u imgs, fmt=%lld, zero-copy slice views)\n",
 	       z->zone_id, w, h, count, (long long)format);
 	return 1;
-#else
+#elif defined(_WIN32)
 	if (z->swapchain_created) return 1;
 	if (!z->valid || !s_ps.session_ready) return 0;
 	ps_query_extra_zone_rec(z);
@@ -2916,6 +2977,9 @@ static int ps_create_extra_zone(ProviderExtraZone *z)
 	           : (s_ps.d3d11_bridge ? "own-device shared target (D3D11 editor bridge)"
 	                                : "Unity-device target (D3D11 zero-copy)"), sp);
 	return 1;
+#else
+	// Linux (#249): extra 3D display zones are inert on the Vulkan backend.
+	return 0;
 #endif // _WIN32
 }
 
@@ -3086,14 +3150,14 @@ static void ps_locate_extra_zones(XrTime display_time)
 static void ps_copy_extra_zone(ProviderExtraZone *z)
 {
 	if (!z->swapchain_created || !z->image_acquired || z->acquired_index >= z->sc_image_count) return;
-#ifndef _WIN32
+#if defined(__APPLE__)
 	// Metal zone copy lands with Phase 4 (#206); release the acquired image so the
 	// swapchain doesn't wedge if a zone was ever created.
 	XrSwapchainImageReleaseInfo ri_mac = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
 	s_ps.pfn_release_swapchain_image(z->swapchain, &ri_mac);
 	z->image_acquired = 0;
 	return;
-#else
+#elif defined(_WIN32)
 	if (s_ps.graphics_api == DXR_GFX_D3D11) {
 		// CopyResource copies both 2-slice array layers, then release. EDITOR bridge: own
 		// context copies the own-side shared target (the frame's fence Wait already ordered
@@ -3143,6 +3207,9 @@ static void ps_copy_extra_zone(ProviderExtraZone *z)
 	XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
 	s_ps.pfn_release_swapchain_image(z->swapchain, &ri);
 	z->image_acquired = 0;
+#else
+	// Linux (#249): extra 3D zones inert — no acquired image to copy or release.
+	return;
 #endif // _WIN32
 }
 
@@ -3763,12 +3830,19 @@ int dxr_prov_session_start(const char *runtime_json_path,
 		s_ps.unity_device = (ID3D12Device *)unity_device;       // for opening the bridge + shared fence
 		s_ps.unity_queue  = (ID3D12CommandQueue *)unity_queue;  // signals the cross-device sync fence
 	}
-#else
+#elif defined(__APPLE__)
 	// Metal (#204): the session queue arrives via unity_queue (a provider-created
 	// MTLCommandQueue on Unity's MTLDevice); stored below as metal_queue.
 	(void)d3d11_bridge;
 	s_ps.metal_device = unity_device;
 	s_ps.metal_queue  = unity_queue;
+#else
+	// Linux (#249): Vulkan only. Unity's VkInstance/VkPhysicalDevice/VkDevice/queue
+	// were pushed straight into the VK glue by GfxStart
+	// (dxr_pvk_set_unity_objects), so nothing lands in s_ps here.
+	(void)d3d11_bridge;
+	(void)unity_device;
+	(void)unity_queue;
 #endif
 	s_ps.overlay_hwnd = overlay_hwnd;
 	s_ps.ipd_factor = s_ps.parallax_factor = s_ps.perspective_factor = 1.0f;
@@ -3783,10 +3857,19 @@ int dxr_prov_session_start(const char *runtime_json_path,
 		ps_log("[DisplayXR-PROV] start: missing Unity %s device\n", is_d3d11 ? "D3D11" : "D3D12");
 		return 0;
 	}
-#else
+#elif defined(__APPLE__)
 	if (gfx != DXR_GFX_METAL || s_ps.metal_device == NULL || s_ps.metal_queue == NULL) {
 		ps_log("[DisplayXR-PROV] start: Metal backend requires a device + command queue "
 		       "(gfx=%d dev=%p queue=%p) — see #204\n", (int)gfx, s_ps.metal_device, s_ps.metal_queue);
+		return 0;
+	}
+#else
+	// Linux (#249): Vulkan only, and it has no Unity-device precondition here — the
+	// session device is created by the runtime further down (enable2) and the
+	// Unity-side objects already went to the VK glue.
+	if (gfx != DXR_GFX_VULKAN) {
+		ps_log("[DisplayXR-PROV] start: Linux requires the Vulkan backend (gfx=%d) — see #249\n",
+		       (int)gfx);
 		return 0;
 	}
 #endif
@@ -3926,6 +4009,16 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	extensions[ext_count++] = is_vk ? "XR_KHR_vulkan_enable2"
 	                                : (is_d3d11 ? "XR_KHR_D3D11_enable" : "XR_KHR_D3D12_enable");
 	extensions[ext_count++] = XR_DXR_WIN32_WINDOW_BINDING_EXTENSION_NAME;
+#elif defined(__linux__) && !defined(__ANDROID__)
+	// Desktop Linux (#249): Vulkan only, same enable2 reasoning as above.
+	//
+	// NO window-binding extension in this phase. The runtime's Linux compositor can
+	// self-host its own XCB window (the shape the macOS bring-up used), and Unity
+	// exposes no X11 window handle through IUnityGraphics — so binding the player's
+	// own window would need a way to obtain it that does not exist yet.
+	// XR_DXR_xlib_window_binding / XR_DXR_wayland_surface_binding are registered
+	// runtime-side and are the follow-on once that handle is reachable.
+	extensions[ext_count++] = "XR_KHR_vulkan_enable2";
 #else
 	extensions[ext_count++] = XR_KHR_METAL_ENABLE_EXTENSION_NAME;
 	extensions[ext_count++] = XR_DXR_COCOA_WINDOW_BINDING_EXTENSION_NAME;
@@ -3967,16 +4060,20 @@ int dxr_prov_session_start(const char *runtime_json_path,
 		ps_log("[DisplayXR-PROV] xrGetSystem failed\n"); dxr_prov_session_stop(); return 0;
 	}
 
-#ifdef _WIN32
+#if defined(ENABLE_VULKAN)
+	// Vulkan (#247 Windows, #249 Linux): the RUNTIME creates the VkInstance/
+	// VkPhysicalDevice/VkDevice (enable2), so it can request its own queue. The glue
+	// also runs the cross-adapter guard — the VK form of #240 — and refuses on
+	// mismatch. Identical on both OSes, hence outside the per-OS branch.
 	if (is_vk) {
-		// Vulkan (#247): the RUNTIME creates the VkInstance/VkPhysicalDevice/VkDevice
-		// (enable2), so it can request its own queue. The glue also runs the
-		// cross-adapter guard — the VK form of #240 — and refuses on mismatch.
 		if (!dxr_pvk_create_device(s_ps.instance, s_ps.system_id, s_ps.gipa, NULL)) {
 			dxr_prov_session_stop();
 			return 0;
 		}
-	} else if (is_d3d11) {
+	} else
+#endif
+#ifdef _WIN32
+	if (is_d3d11) {
 		if (s_ps.d3d11_bridge) {
 			// D3D11 EDITOR bridge (#195): create a SEPARATE own D3D11 device (the session
 			// binds on it, not Unity's) so Unity's editor GameView present never shares the
@@ -3999,7 +4096,7 @@ int dxr_prov_session_start(const char *runtime_json_path,
 		//     The runtime allocates its swapchain on this device; we bridge to Unity. ---
 		if (!ps_create_own_device()) { dxr_prov_session_stop(); return 0; }
 	}
-#else
+#elif defined(__APPLE__)
 	// Metal (#204): call xrGetMetalGraphicsRequirementsKHR before xrCreateSession
 	// (spec-mandated) and WARN-and-continue on a device mismatch — on Apple Silicon
 	// the runtime's preferred device is always the system default = Unity's.
@@ -4016,6 +4113,17 @@ int dxr_prov_session_start(const char *runtime_json_path,
 				       req.metalDevice, s_ps.metal_device);
 		} else {
 			ps_log("[DisplayXR-PROV] WARN: xrGetMetalGraphicsRequirementsKHR unresolved — continuing\n");
+		}
+	}
+#else
+	// Linux (#249): Vulkan-only, handled by the arm above. Closes the dangling `else`
+	// when neither the D3D nor the Metal branch is compiled in.
+	{
+		if (!is_vk) {
+			ps_log("[DisplayXR-PROV] no graphics-device path for this API on Linux — "
+			       "Vulkan is required (#249)\n");
+			dxr_prov_session_stop();
+			return 0;
 		}
 	}
 #endif
@@ -4241,6 +4349,22 @@ int dxr_prov_session_start(const char *runtime_json_path,
 		d3d12.next = &win_binding;
 		gfx_binding = &d3d12;
 	}
+#elif defined(ENABLE_VULKAN) && defined(__linux__) && !defined(__ANDROID__)
+	// --- Session: Vulkan graphics binding, NO window binding (#249 Phase 1) ---
+	//
+	// next == NULL means the runtime SELF-HOSTS its window: its Linux compositor
+	// creates its own XCB window and presents there (comp_vk_native_window_xcb).
+	// That is the same bring-up shape macOS used before the in-app NSView landed.
+	// Binding the player's own window instead needs XR_DXR_xlib_window_binding AND
+	// a way to get Unity's X11 window handle, which IUnityGraphics does not expose —
+	// that pair is the follow-on, not this phase.
+	const void *gfx_binding = dxr_pvk_session_binding(NULL);
+	if (!gfx_binding) {
+		ps_log("[DisplayXR-PROV] Vulkan session binding unavailable\n");
+		dxr_prov_session_stop();
+		return 0;
+	}
+	(void)use_transparent; // no transparent-background path without a window binding
 #else
 	// --- Session: Metal graphics binding (client queue) + cocoa window binding ---
 	// viewHandle == NULL → the runtime self-hosts its NSWindow + CAMetalLayer (the
@@ -4274,10 +4398,13 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	                                                     : "own D3D12 device")
 	               : (s_ps.d3d11_bridge ? "own D3D11 device (editor bridge)"
 	                                    : "zero-copy on Unity's D3D11 device")), s_ps.overlay_hwnd);
-#else
+#elif defined(__APPLE__)
 	ps_log("[DisplayXR-PROV] Session created (Metal client queue=%p, NSView=%p%s)\n",
 	       s_ps.metal_queue, s_ps.overlay_hwnd,
 	       s_ps.overlay_hwnd ? "" : " — runtime self-hosted window");
+#else
+	ps_log("[DisplayXR-PROV] Session created (runtime-created Vulkan device, enable2 + "
+	       "external-memory bridge; runtime self-hosted window)\n");
 #endif
 
 	// --- LOCAL reference space ---
@@ -4346,8 +4473,8 @@ void dxr_prov_session_stop(void)
 	}
 	ps_probe_cleanup(); // weave-to-texture PROBE shared texture + handle (experiment)
 	if (s_ps.swapchain && s_ps.pfn_destroy_swapchain) s_ps.pfn_destroy_swapchain(s_ps.swapchain);
-#if defined(_WIN32) && defined(ENABLE_VULKAN)
-	// Vulkan (#247): drop the bridges BEFORE xrDestroySession — the bridge images live
+#if defined(ENABLE_VULKAN)
+	// Vulkan (#247/#249): drop the bridges BEFORE xrDestroySession — the bridge images live
 	// on the session device, which the runtime tears down with the session. Unity's own
 	// objects are only dereferenced, never destroyed. No-op on the D3D paths.
 	if (s_ps.graphics_api == DXR_GFX_VULKAN) dxr_pvk_destroy();
@@ -4514,11 +4641,11 @@ static void *s_ext_weave_hwnd = NULL;
 
 void dxr_prov_set_gameview_rect(int x, int y, int w, int h)
 {
-#ifndef _WIN32
+#if defined(__APPLE__)
 	// macOS: GameView weave-to-texture window tracking is a Windows-only feature
 	// (SetWindowPos/child-glue on the dedicated proxy window). No-op — keep the symbol.
 	(void)x; (void)y; (void)w; (void)h;
-#else
+#elif defined(_WIN32)
 	if (s_ext_weave_hwnd) return; // BINDPANE: the bound window is UNITY'S — never touch it
 	if (w <= 0 || h <= 0 || !s_ps.overlay_hwnd) return;
 	// (#740) Defensive size clamp: the render area can never exceed the virtual screen —
@@ -4561,6 +4688,9 @@ void dxr_prov_set_gameview_rect(int x, int y, int w, int h)
 	SetWindowPos((HWND)s_ps.overlay_hwnd, NULL, sx, sy, w, h, flags);
 	ps_log("[DisplayXR-PROV] gameview window track (%s): screen(%d,%d) -> pos(%d,%d) %dx%d\n",
 	       s_track == 2 ? "move" : "move+resize", x, y, sx, sy, w, h);
+#else
+	// Linux (#249): GameView weave-to-texture window tracking is Windows-only.
+	(void)x; (void)y; (void)w; (void)h;
 #endif // _WIN32
 }
 
@@ -4785,21 +4915,23 @@ void *dxr_prov_get_bridge_unity_texture(uint32_t *width, uint32_t *height, uint3
 	if (width) *width = s_ps.sc_width;
 	if (height) *height = s_ps.sc_height;
 	if (array_size) *array_size = 2;
-#ifdef _WIN32
 #if defined(ENABLE_VULKAN)
-	// Vulkan (#247): the Unity-side alias of the shared 2-layer bridge image. NOTE this
-	// is a POINTER TO the VkImage handle, not the handle value — Unity's Vulkan
-	// CreateExternalTexture dereferences it (see dxr_pvk_unity_image_ptr).
+	// Vulkan (#247/#249): the Unity-side alias of the shared 2-layer bridge image.
+	// See dxr_pvk_unity_image_ptr for the exact pointer convention Unity's XR
+	// display path expects here — it is NOT the CreateExternalTexture convention.
 	if (s_ps.graphics_api == DXR_GFX_VULKAN)
 		return dxr_pvk_unity_image_ptr(-1); // SPI slot; NULL in MultiPass mode
 #endif
+#ifdef _WIN32
 	// D3D11 editor bridge (#195): the Unity-opened side of the shared 2-slice bridge
 	// (the display-provider wraps it like the D3D12 SPI bridge). Else the D3D12 bridge.
 	if (s_ps.graphics_api == DXR_GFX_D3D11)
 		return s_ps.d3d11_bridge ? (void *)s_ps.d3d11_bridge_unity : NULL;
 	return (void *)s_ps.bridge_unity; // SPI mode; NULL in MultiPass mode
 #else
-	return NULL; // Metal has no bridge — Phase 2 (#204) wires per-eye targets
+	// Metal has no bridge (#204 wires per-eye targets); Linux Vulkan already
+	// returned above.
+	return NULL;
 #endif
 }
 
@@ -4808,12 +4940,12 @@ void *dxr_prov_get_bridge_unity_texture_eye(uint32_t eye, uint32_t *width, uint3
 	if (width) *width = s_ps.sc_width;
 	if (height) *height = s_ps.sc_height;
 	if (eye > 1) return NULL;
-#ifdef _WIN32
 #if defined(ENABLE_VULKAN)
-	// Vulkan (#247): pointer TO the per-eye Unity-side VkImage handle (see above).
+	// Vulkan (#247/#249): the per-eye Unity-side bridge image (see above).
 	if (s_ps.graphics_api == DXR_GFX_VULKAN)
 		return dxr_pvk_unity_image_ptr((int)eye); // MultiPass slots; NULL in SPI mode
 #endif
+#ifdef _WIN32
 	// D3D11 MultiPass (#195): the Unity-side per-eye render target (editor bridge = the
 	// Unity-opened shared side; zero-copy = a plain Unity texture). Else the D3D12 per-eye bridge.
 	if (s_ps.graphics_api == DXR_GFX_D3D11)
@@ -4852,11 +4984,17 @@ void *dxr_prov_get_swapchain_image_texture(uint32_t index, uint32_t *out_w,
 	// display-provider wraps the Unity-side bridge instead (dxr_prov_get_bridge_unity_texture).
 	if (s_ps.graphics_api != DXR_GFX_D3D11 || s_ps.d3d11_bridge || index >= s_ps.sc_image_count) return NULL;
 	return (void *)s_ps.sc_images_d3d11[index].texture;
-#else
+#elif defined(__APPLE__)
 	// Metal zero-copy (Phase 2 #204 fast-follow): the runtime swapchain image
 	// (id<MTLTexture> on Unity's device), wrapped directly by the display provider.
 	if (s_ps.graphics_api != DXR_GFX_METAL || index >= s_ps.sc_image_count) return NULL;
 	return s_ps.sc_images_metal[index].texture;
+#else
+	// Linux/Vulkan (#249): the swapchain images live on the RUNTIME's session device,
+	// so there is nothing here Unity could wrap — the eye bridge is the only path
+	// (dxr_prov_get_bridge_unity_texture).
+	(void)index;
+	return NULL;
 #endif
 }
 
@@ -5658,13 +5796,13 @@ int dxr_prov_submit_frame(uint32_t image_index)
 	// D3D11 EDITOR bridge (#195): the session is bound on our OWN device, so Unity's render
 	// lands in the shared bridge — copy it (own context) into the acquired swapchain image,
 	// ordered after Unity's render by the shared fence. Mirrors the D3D12 arm below.
-	// VULKAN (#247): Unity rendered the eyes into the external-memory bridge image(s) on
-	// ITS device; the same memory is aliased on the runtime's session device. Order after
-	// Unity's render, then copy the session-side alias into the acquired swapchain image.
-	// Structurally the D3D12 arm, with vkCmdCopyImage in place of CopyTextureRegion.
-#ifdef _WIN32
-	if (s_ps.graphics_api == DXR_GFX_VULKAN) {
+	// VULKAN (#247 Windows, #249 Linux): Unity rendered the eyes into the external-memory
+	// bridge image(s) on ITS device; the same memory is aliased on the runtime's session
+	// device. Order after Unity's render, then copy the session-side alias into the
+	// acquired swapchain image. Structurally the D3D12 arm, with vkCmdCopyImage in place
+	// of CopyTextureRegion. Platform-neutral, hence outside the per-OS branch.
 #if defined(ENABLE_VULKAN)
+	if (s_ps.graphics_api == DXR_GFX_VULKAN) {
 		int sp = dxr_prov_get_single_pass();
 		dxr_pvk_signal_unity_done(); // once per frame, before any copy
 		if (sp) {
@@ -5673,8 +5811,10 @@ int dxr_prov_submit_frame(uint32_t image_index)
 			for (uint32_t e = 0; e < submit_n; e++)
 				dxr_pvk_copy_to_swapchain_image((int)e, image_index);
 		}
+	} else
 #endif
-	} else if (s_ps.graphics_api == DXR_GFX_D3D11) {
+#ifdef _WIN32
+	if (s_ps.graphics_api == DXR_GFX_D3D11) {
 		int sp = dxr_prov_get_single_pass();
 		ID3D11Texture2D *dst = (image_index < s_ps.sc_image_count)
 		                           ? s_ps.sc_images_d3d11[image_index].texture : NULL;
@@ -5794,15 +5934,25 @@ int dxr_prov_submit_frame(uint32_t image_index)
 		if (s_ps.unity_d3d11_context) s_ps.unity_d3d11_context->Flush();
 		if (d11_diag) ps_log("[DisplayXR-PROV] D3D11 submit[%u]: flushed, pre-release\n", d11_frames);
 	}
-#else
+#elif defined(__APPLE__)
+	{
 	// Metal ZERO-COPY (#204): Unity already rendered each eye straight into the
 	// acquired image's slice views — nothing to copy. Order the compositor's
 	// weave (encoded on the session queue at xrEndFrame) after Unity's renders
 	// with encoder-less signal/wait CBs.
-	static unsigned d11_frames = 0;
-	int d11_diag = 0;
 	if (s_ps.graphics_api == DXR_GFX_METAL)
 		dxr_prov_metal_order_weave(s_ps.metal_queue);
+	}
+	static unsigned d11_frames = 0;
+	int d11_diag = 0;
+#else
+	{
+	// Linux (#249): Vulkan is the only backend and its arm above already did the
+	// ordering (dxr_pvk_signal_unity_done) and the copy. Nothing further here — the
+	// braces exist so the `else` above has a statement to bind to.
+	}
+	static unsigned d11_frames = 0;
+	int d11_diag = 0;
 #endif
 
 	if (s_ps.image_acquired) {

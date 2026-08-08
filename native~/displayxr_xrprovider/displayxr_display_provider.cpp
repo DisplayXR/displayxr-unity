@@ -16,6 +16,8 @@
 // Registered from displayxr_unity_plugin.cpp's UnityPluginLoad. Windows / D3D12,
 // M1 only. Does NOT touch the OpenXR hook path or the editor standalone path.
 
+#include <stdlib.h> // getenv — Windows gets it via windows.h, Linux does not
+
 #ifdef _WIN32
 #include <windows.h>
 #include <d3d12.h>
@@ -49,7 +51,7 @@ extern "C" uint32_t dxr_prov_get_extra_zone_acquired_index(uint32_t ei);
 // -1 if IUnityGraphics isn't available. Used to select the graphics backend (#195).
 extern "C" int displayxr_unity_get_renderer(void);
 
-#if defined(_WIN32) && defined(ENABLE_VULKAN)
+#if defined(ENABLE_VULKAN)
 // Unity's Vulkan objects (displayxr_unity_plugin.cpp, via IUnityGraphicsVulkan) and the
 // VK glue's entry points (displayxr_provider_gfx_vulkan.cpp). Forward-declared rather
 // than #included so vulkan.h never reaches this TU.
@@ -65,7 +67,7 @@ extern "C" int   dxr_pvk_device_ready(void);
 // is read once rather than per texture creation.
 static bool prov_vk_unity_alloc_probe(void)
 {
-#if defined(_WIN32) && defined(ENABLE_VULKAN)
+#if defined(ENABLE_VULKAN)
 	static int cached = -1;
 	if (cached < 0) cached = (getenv("DISPLAYXR_VK_UNITY_ALLOC") != nullptr) ? 1 : 0;
 	return cached == 1 && dxr_prov_get_graphics_api() == DXR_GFX_VULKAN;
@@ -718,6 +720,34 @@ prov_want_dedicated_window(void)
 	return (env && env[0] == '1') ? 1 : 0;
 }
 
+#if defined(ENABLE_VULKAN)
+// Capture Unity's Vulkan objects for the eye bridge. Shared by the Windows (#247)
+// and Linux (#249) arms of the backend switch — the sequence is identical because
+// the only per-OS part of the bridge is the external-memory handle flavour, which
+// lives inside displayxr_provider_gfx_vulkan.cpp.
+//
+// Unlike D3D, the SESSION device is not Unity's and does not exist yet: the runtime
+// creates it inside dxr_prov_session_start via enable2. All we do here is hand the
+// glue Unity's objects, which the eye bridge imports into.
+static bool
+prov_bind_vulkan_backend(void)
+{
+	void *inst = nullptr, *phys = nullptr, *dev = nullptr, *queue = nullptr;
+	uint32_t qf = 0;
+	if (!displayxr_unity_get_vulkan(&inst, &phys, &dev, &queue, &qf) || !dev) {
+		prov_log("[DisplayXR-PROV] Vulkan: Unity's VkDevice not captured - session not "
+		         "started (#247). IUnityGraphicsVulkan was unavailable or the device was "
+		         "not yet created when the plugin loaded.\n");
+		return false;
+	}
+	dxr_pvk_set_unity_objects(inst, phys, dev, (uint32_t)qf, queue);
+	prov_log("[DisplayXR-PROV] Renderer is Vulkan - using the enable2 own-device bridge "
+	         "backend (#247/#249). Phase 1 covers the primary stereo path; wsui / Local2D / "
+	         "extra 3D zones are inert on this backend.\n");
+	return true;
+}
+#endif
+
 // ============================================================================
 // Graphics-thread provider callbacks
 // ============================================================================
@@ -735,6 +765,16 @@ GfxStart(UnitySubsystemHandle handle, void *userData, UnityXRRenderingCapabiliti
 		caps->noSinglePassRenderingSupport = dxr_prov_get_single_pass() ? false : true;
 #ifdef _WIN32
 		caps->invalidateRenderStateAfterEachCallback = true; // we touch D3D state
+		caps->skipPresentToMainScreen = false;
+#elif defined(__linux__) && !defined(__ANDROID__)
+		// Linux/Vulkan (#249). Deliberately NOT the macOS arm below — that one is
+		// justified entirely by Metal-specific Unity defects (#204/#205) and its
+		// skipPresentToMainScreen=true would blank the player window here for no
+		// reason. Linux behaves like the Windows own-device bridge: the provider
+		// records and submits its own Vulkan command buffers, so Unity's render
+		// state must be re-validated around each callback, and Unity keeps
+		// presenting to its own window.
+		caps->invalidateRenderStateAfterEachCallback = true;
 		caps->skipPresentToMainScreen = false;
 #else
 		// macOS zero-copy touches NO Unity render state in the callbacks (no
@@ -785,24 +825,21 @@ GfxStart(UnitySubsystemHandle handle, void *userData, UnityXRRenderingCapabiliti
 		         "GPU - integrated Intel is the usual case; launch with -force-d3d12 to override.)\n");
 #if defined(ENABLE_VULKAN)
 	} else if (renderer == kUnityGfxRendererVulkan) {
-		// Vulkan (#247): unlike D3D, the SESSION device is not Unity's and does not exist
-		// yet — the runtime creates it inside dxr_prov_session_start via enable2. All we do
-		// here is hand the glue Unity's objects, which the eye bridge imports into.
-		void *inst = nullptr, *phys = nullptr, *dev = nullptr, *queue = nullptr;
-		uint32_t qf = 0;
-		if (!displayxr_unity_get_vulkan(&inst, &phys, &dev, &queue, &qf) || !dev) {
-			prov_log("[DisplayXR-PROV] Vulkan: Unity's VkDevice not captured - session not "
-			         "started (#247). IUnityGraphicsVulkan was unavailable or the device was "
-			         "not yet created when the plugin loaded.\n");
-			return kUnitySubsystemErrorCodeFailure;
-		}
-		dxr_pvk_set_unity_objects(inst, phys, dev, (uint32_t)qf, queue);
+		if (!prov_bind_vulkan_backend()) return kUnitySubsystemErrorCodeFailure;
 		backend_kind = DXR_GFX_VULKAN; dev_ptr = nullptr; queue_ptr = nullptr;
-		prov_log("[DisplayXR-PROV] Renderer is Vulkan - using the enable2 own-device bridge "
-		         "backend (#247). Phase 1 covers the primary stereo path; wsui / Local2D / "
-		         "extra 3D zones are inert on this backend.\n");
 #endif
 	} else
+#elif defined(__linux__) && !defined(__ANDROID__)
+#if defined(ENABLE_VULKAN)
+	// Desktop Linux (#249) is Vulkan-only for this provider: the runtime's Linux
+	// presentation path is the native Vulkan/XCB compositor, and there is no GL
+	// backend here. Same enable2 own-device bridge as Windows — see
+	// prov_bind_vulkan_backend().
+	if (renderer == kUnityGfxRendererVulkan) {
+		if (!prov_bind_vulkan_backend()) return kUnitySubsystemErrorCodeFailure;
+		backend_kind = DXR_GFX_VULKAN; dev_ptr = nullptr; queue_ptr = nullptr;
+	} else
+#endif
 #elif defined(__APPLE__)
 	if (renderer == kUnityGfxRendererMetal) {
 		// Metal (#204): the session binds a provider-created MTLCommandQueue on
@@ -823,6 +860,11 @@ GfxStart(UnitySubsystemHandle handle, void *userData, UnityXRRenderingCapabiliti
 		snprintf(msg, sizeof(msg),
 		         "[DisplayXR-PROV] WARN: unsupported graphics API (renderer=%d). The DisplayXR "
 		         "provider requires Direct3D11 or Direct3D12 — session not started (#195).\n", renderer);
+#elif defined(__linux__) && !defined(__ANDROID__)
+		snprintf(msg, sizeof(msg),
+		         "[DisplayXR-PROV] WARN: unsupported graphics API (renderer=%d). The DisplayXR "
+		         "provider requires Vulkan on Linux — session not started (#249). Set Vulkan "
+		         "first in Project Settings > Player > Graphics APIs.\n", renderer);
 #else
 		snprintf(msg, sizeof(msg),
 		         "[DisplayXR-PROV] WARN: unsupported graphics API (renderer=%d). The DisplayXR "
@@ -1647,7 +1689,7 @@ LifecycleStart(UnitySubsystemHandle handle, void *userData)
 	// attaches to / tracks Unity's main-thread window from GfxStart, the render
 	// thread, deadlocks: the input queues join while the main thread waits on
 	// GfxStart.) GfxStart binds the runtime to s_overlay_hwnd.
-#ifndef _WIN32
+#if defined(__APPLE__)
 	// macOS: bind the runtime's weave to an NSView (via XrCocoaWindowBindingCreateInfoDXR).
 	// Two shapes, both on the MAIN thread (AppKit windows can't be created off-main; and
 	// the runtime's own self-host NSWindow-create inside xrCreateSession — GfxStart =
@@ -1674,6 +1716,13 @@ LifecycleStart(UnitySubsystemHandle handle, void *userData)
 			prov_log("[DisplayXR-PROV] Lifecycle Start (macOS player: in-app weave overlay on Unity's window)\n");
 		}
 	}
+#elif defined(__linux__) && !defined(__ANDROID__)
+	// Linux (#249 Phase 1): no window is created here. The runtime's Vulkan/XCB
+	// compositor self-hosts its own window (session binding chains no window-binding
+	// extension — see dxr_prov_session_start). Binding the player's own X11 window
+	// is the XR_DXR_xlib_window_binding follow-on.
+	s_overlay_hwnd = nullptr;
+	prov_log("[DisplayXR-PROV] Lifecycle Start (Linux: runtime self-hosted weave window)\n");
 #else
 	if (displayxr_is_shell_mode()) {
 		// Workspace tile (shell/IPC). The Shell launched us with
@@ -1827,13 +1876,16 @@ LifecycleStop(UnitySubsystemHandle handle, void *userData)
 		displayxr_destroy_provider_dedicated_window();
 		s_overlay_hwnd = nullptr;
 	}
-#else
+#elif defined(__APPLE__)
 	// macOS (#204/#205): tear down the weave target on the MAIN thread, after
 	// GfxStop already ran dxr_prov_session_stop (xrDestroySession released the
 	// runtime's references into the view) — mirrors the #173 teardown ordering.
 	// Both are safe no-ops if the other shape was used this session.
 	displayxr_metal_destroy_app_overlay();     // built-player in-app overlay
 	displayxr_metal_destroy_preview_window();  // editor / fallback window
+	s_overlay_hwnd = nullptr;
+#else
+	// Linux (#249): no provider-owned window to tear down — the runtime self-hosts.
 	s_overlay_hwnd = nullptr;
 #endif
 	prov_log("[DisplayXR-PROV] Lifecycle Stop\n");
