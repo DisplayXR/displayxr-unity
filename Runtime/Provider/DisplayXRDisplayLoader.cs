@@ -218,11 +218,16 @@ namespace DisplayXR
             bool isMac = plat == RuntimePlatform.OSXPlayer
                       || plat == RuntimePlatform.OSXEditor;
 
+            // Vulkan (#247) behaves like the other Windows APIs here: URP/HDRP → SPI
+            // (one 2-layer bridge image), BiRP → MultiPass (two 1-layer bridge images).
+            // The bridge is an external-memory alias either way, so the render-path
+            // choice is independent of the backend — same rule as D3D11/D3D12.
             var gdt = SystemInfo.graphicsDeviceType;
             bool isD3D11 = gdt == GraphicsDeviceType.Direct3D11;
             bool isD3D12 = gdt == GraphicsDeviceType.Direct3D12;
+            bool isVulkan = gdt == GraphicsDeviceType.Vulkan;
             bool isMetal = gdt == GraphicsDeviceType.Metal;
-            bool apiEligible = (isWindows && (isD3D11 || isD3D12))
+            bool apiEligible = (isWindows && (isD3D11 || isD3D12 || isVulkan))
                             || (isMac && isMetal);
             if (!apiEligible)
                 return false; // unsupported platform/API: MultiPass (native no-starts)

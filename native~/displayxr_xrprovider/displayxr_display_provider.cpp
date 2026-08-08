@@ -49,6 +49,18 @@ extern "C" uint32_t dxr_prov_get_extra_zone_acquired_index(uint32_t ei);
 // -1 if IUnityGraphics isn't available. Used to select the graphics backend (#195).
 extern "C" int displayxr_unity_get_renderer(void);
 
+#if defined(_WIN32) && defined(ENABLE_VULKAN)
+// Unity's Vulkan objects (displayxr_unity_plugin.cpp, via IUnityGraphicsVulkan) and the
+// VK glue's entry points (displayxr_provider_gfx_vulkan.cpp). Forward-declared rather
+// than #included so vulkan.h never reaches this TU.
+extern "C" bool displayxr_unity_get_vulkan(void **out_instance, void **out_physical_device,
+                                           void **out_device, void **out_graphics_queue,
+                                           uint32_t *out_queue_family_index);
+extern "C" void  dxr_pvk_set_unity_objects(void *, void *, void *, uint32_t, void *);
+extern "C" void *dxr_pvk_unity_image_ptr(int eye);
+extern "C" int   dxr_pvk_device_ready(void);
+#endif
+
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -745,6 +757,25 @@ GfxStart(UnitySubsystemHandle handle, void *userData, UnityXRRenderingCapabiliti
 		prov_log("[DisplayXR-PROV] Renderer is Direct3D11 - using the D3D11 zero-copy backend. "
 		         "(If this project targets D3D12, Unity's device filter likely denied it on this "
 		         "GPU - integrated Intel is the usual case; launch with -force-d3d12 to override.)\n");
+#if defined(ENABLE_VULKAN)
+	} else if (renderer == kUnityGfxRendererVulkan) {
+		// Vulkan (#247): unlike D3D, the SESSION device is not Unity's and does not exist
+		// yet — the runtime creates it inside dxr_prov_session_start via enable2. All we do
+		// here is hand the glue Unity's objects, which the eye bridge imports into.
+		void *inst = nullptr, *phys = nullptr, *dev = nullptr, *queue = nullptr;
+		uint32_t qf = 0;
+		if (!displayxr_unity_get_vulkan(&inst, &phys, &dev, &queue, &qf) || !dev) {
+			prov_log("[DisplayXR-PROV] Vulkan: Unity's VkDevice not captured - session not "
+			         "started (#247). IUnityGraphicsVulkan was unavailable or the device was "
+			         "not yet created when the plugin loaded.\n");
+			return kUnitySubsystemErrorCodeFailure;
+		}
+		dxr_pvk_set_unity_objects(inst, phys, dev, (uint32_t)qf, queue);
+		backend_kind = DXR_GFX_VULKAN; dev_ptr = nullptr; queue_ptr = nullptr;
+		prov_log("[DisplayXR-PROV] Renderer is Vulkan - using the enable2 own-device bridge "
+		         "backend (#247). Phase 1 covers the primary stereo path; wsui / Local2D / "
+		         "extra 3D zones are inert on this backend.\n");
+#endif
 	} else
 #elif defined(__APPLE__)
 	if (renderer == kUnityGfxRendererMetal) {
