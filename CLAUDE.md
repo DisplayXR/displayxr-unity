@@ -32,10 +32,17 @@ Use the platform build scripts (they wrap CMake and place the shipping binary):
 - **macOS (shipping binary):** `native~/build-mac.sh` → Universal (x86_64 + arm64) `Runtime/Plugins/macOS/displayxr_unity.bundle`.
 - **Windows (shipping binary, MSVC):** `native~\build-win.bat` → `Runtime/Plugins/Windows/x64/displayxr_unity.dll`. Needs VS 2022 (or Build Tools) + "Desktop development with C++"; run from a Developer Command Prompt or any shell with MSVC on PATH.
 - **Windows (MinGW, compile-check only):** `native~/build-win.sh` → leaves the DLL in `build-win/` (MinGW ABI, not shipped). Run on macOS as a cross-compile check.
+- **Linux (shipping binary):** `native~/build-linux.sh` → `Runtime/Plugins/Linux/x86_64/libdisplayxr_unity.so`. Needs only cmake + a C++17 compiler (no Vulkan SDK — headers are fetched, entry points are `dlopen`ed). **The `.so` is deliberately NOT committed** (gitignored): no maintainer box builds it, so CI's `build-linux` job is the only trustworthy source and the release/package jobs download it from there. Its `.meta` **is** committed. From macOS you can reproduce the CI build exactly with `docker run --rm -v "$PWD":/src ubuntu:22.04` (colima works).
 
 Raw CMake (`cd native~ && mkdir build && cd build && cmake .. -DCMAKE_BUILD_TYPE=Release && cmake --build . --config Release`) works too, but the scripts handle output placement.
 
-**Claude Code: after modifying any file in `native~/`, run the build script for the current platform (`native~/build-mac.sh` on macOS, `native~\build-win.bat` on Windows; also `native~/build-win.sh` as a cross-compile check on macOS) to refresh the shipping binary. Then commit source + your platform's binary, push to a feature branch, and open a PR — CI builds both platforms.**
+**Claude Code: after modifying any file in `native~/`, run the build script for the current platform (`native~/build-mac.sh` on macOS, `native~\build-win.bat` on Windows; also `native~/build-win.sh` as a cross-compile check on macOS) to refresh the shipping binary. Then commit source + your platform's binary, push to a feature branch, and open a PR — CI builds all three platforms.**
+
+**Touching a platform `#ifdef` in `native~/`? Compile-check Linux too.** The provider TUs are
+littered with `#ifdef _WIN32 … #else` blocks whose `#else` historically meant "macOS" — a third
+platform turns every one of those into a latent build break, and neither the macOS nor the Windows
+build will tell you. One container run catches them all:
+`docker run --rm -v "$PWD":/src ubuntu:22.04 bash -c 'apt-get update -qq && apt-get install -y -qq build-essential cmake git ca-certificates && cmake -S /src/native~ -B /tmp/b -DCMAKE_BUILD_TYPE=Release && cmake --build /tmp/b -j4'`
 
 ## Key Architecture
 
@@ -70,16 +77,28 @@ app that wants them.
 
 #### Render path (SPI vs MultiPass) × graphics API — the default policy
 
-The provider supports **D3D11, D3D12, and Metal** (selected at session create from
-`IUnityGraphics::GetRenderer()`; Vulkan is out of scope — the provider no-starts). The
-render-path decision is made in `DisplayXRDisplayLoader.IsSinglePassEligible()` and pushed to native
-via `dxr_prov_set_single_pass` **before** the session starts:
+The provider supports **D3D11, D3D12, Metal, and Vulkan** (selected at session create from
+`IUnityGraphics::GetRenderer()`). The render-path decision is made in
+`DisplayXRDisplayLoader.IsSinglePassEligible()` and pushed to native via
+`dxr_prov_set_single_pass` **before** the session starts:
 
-| Pipeline | D3D11 | D3D12 | Metal (macOS) |
-|----------|-------|-------|---------------|
-| **URP**  | **SPI** | **SPI** | **SPI** |
-| **HDRP** | **SPI** | **SPI** | **SPI** |
-| **BiRP** | **MultiPass** | **MultiPass** | **MultiPass** |
+| Pipeline | D3D11 | D3D12 | Metal (macOS) | Vulkan (Linux) |
+|----------|-------|-------|---------------|----------------|
+| **URP**  | **SPI** | **SPI** | **SPI** | **SPI** |
+| **HDRP** | **SPI** | **SPI** | **SPI** | **SPI** |
+| **BiRP** | **MultiPass** | **MultiPass** | **MultiPass** | **MultiPass** |
+
+> **Vulkan is a special case on Windows.** The `DXR_GFX_VULKAN` backend is complete and
+> compiles on **Windows (#247) and desktop Linux (#249)**, but on **Windows** the shipping
+> policy is a *deliberate D3D12 fallback*: Unity 6000.4's XR pre-init adapter query is
+> unanswerable, so the provider answers a knowingly-non-matching sentinel and a
+> Vulkan-configured project lands on D3D12 **with stereo** (see #248 and
+> `docs~/unity-bug-report-vk-xr-preinit.md`). On **Linux** there is no other API to fall back
+> to, so the pre-init provider *declines* the query instead — which is the correct answer on a
+> single-GPU box, and is the configuration that will reveal whether Unity's
+> `vk::Image::CreateImageViews` crash reproduces off Windows. `DISPLAYXR_VK_EXPERIMENTAL=1`
+> forces the real-Vulkan arm on Windows. **Linux Vulkan builds and ships but is not yet
+> hardware-verified** — see #249.
 
 - **URP and HDRP default to Single-Pass-Instanced (SPI) on D3D11, D3D12, and Metal.** All consume the
   full projection matrix above and render into the `arraySize=2` SPI swapchain (eyes = array slices

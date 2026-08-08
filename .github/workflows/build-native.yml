@@ -131,10 +131,81 @@ jobs:
           name: displayxr_unity-macos
           path: Runtime/Plugins/macOS/displayxr_unity.bundle
 
+  build-linux:
+    name: Linux x86_64
+    needs: DetectChanges
+    runs-on: ubuntu-latest
+    # Build INSIDE ubuntu:22.04 rather than on the runner image, so the .so links
+    # against the oldest glibc we intend to support — a plugin built on a newer
+    # runner silently refuses to load on an older distro, and Unity reports that
+    # as "subsystem not found" rather than as a link error (#249). Same reasoning
+    # as the runtime repo's tri-LTS matrix.
+    container: ubuntu:22.04
+    steps:
+      - name: Install toolchain
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update -qq
+          apt-get install -y --no-install-recommends \
+            build-essential cmake git ca-certificates binutils file
+          # actions/checkout needs a git new enough for its safe.directory handling
+          git --version
+
+      - uses: actions/checkout@v5
+
+      - name: Configure CMake
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: cmake -S native~ -B native~/build -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: cmake --build native~/build --config Release -j"$(nproc)"
+
+      - name: Verify output
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          SO="Runtime/Plugins/Linux/x86_64/libdisplayxr_unity.so"
+          if [ ! -f "$SO" ]; then
+            echo "ERROR: .so not found at $SO"
+            exit 1
+          fi
+          file "$SO"
+          ls -la "$SO"
+
+          # The build uses -fvisibility=hidden, so this is a REAL gate: a translation
+          # unit dropped by a mis-set platform guard shows up here and nowhere else.
+          # XRSDKPreInit in particular is what Unity's boot.config pre-init hook calls,
+          # and it is the Linux-specific piece #249 exists to exercise.
+          for sym in UnityPluginLoad UnityPluginUnload XRSDKPreInit; do
+            if ! nm -D --defined-only "$SO" | grep -q " T $sym$"; then
+              echo "ERROR: required export missing: $sym"
+              nm -D --defined-only "$SO" | head -40
+              exit 1
+            fi
+            echo "export OK: $sym"
+          done
+
+          # The plugin must resolve Vulkan through dlopen (displayxr_vk_loader), never
+          # by linking it — otherwise it fails to load on a box with no Vulkan ICD.
+          if readelf -d "$SO" | grep -q 'libvulkan'; then
+            echo "ERROR: .so has a hard dependency on libvulkan — it must dlopen it instead"
+            readelf -d "$SO" | grep NEEDED
+            exit 1
+          fi
+          echo "no libvulkan link dependency: OK"
+
+      - name: Upload artifact
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: actions/upload-artifact@v6
+        with:
+          name: displayxr_unity-linux-x86_64
+          path: Runtime/Plugins/Linux/x86_64/libdisplayxr_unity.so
+
   # ── Release job: runs on v* tags ──────────────────────────────────────
   release:
     name: Create GitHub Release
-    needs: [build-windows, build-macos]
+    needs: [build-windows, build-macos, build-linux]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
@@ -153,6 +224,16 @@ jobs:
         with:
           name: displayxr_unity-macos
           path: Runtime/Plugins/macOS/
+
+      # Linux (#249). The .so is NOT committed to the repo — unlike the Windows DLL
+      # and macOS bundle, no maintainer box builds it locally — so the artifact is
+      # the only source. Its .meta IS committed, so Unity imports the pair correctly
+      # once this lands.
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: displayxr_unity-linux-x86_64
+          path: Runtime/Plugins/Linux/x86_64/
 
       - name: Get version from tag
         id: version
@@ -276,7 +357,7 @@ jobs:
   # ── Package job: runs on main push (non-tag) ─────────────────────────
   package:
     name: Package Plugin Binaries
-    needs: [DetectChanges, build-windows, build-macos]
+    needs: [DetectChanges, build-windows, build-macos, build-linux]
     runs-on: ubuntu-latest
     # Skip on docs-only / empty (marker) main pushes — the build jobs
     # short-circuit and upload no artifacts, so there's nothing to package.
@@ -295,6 +376,12 @@ jobs:
         with:
           name: displayxr_unity-macos
           path: Runtime/Plugins/macOS/
+
+      - name: Download Linux artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: displayxr_unity-linux-x86_64
+          path: Runtime/Plugins/Linux/x86_64/
 
       - name: Upload combined artifact
         uses: actions/upload-artifact@v6

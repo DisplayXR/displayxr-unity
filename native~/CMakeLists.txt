@@ -43,12 +43,25 @@ endif()
 # XrView{pose,fov}. The former displayxr-common (display3d/camera3d) dependency
 # is gone; do NOT re-add it (see the no-vendored-math drift guard).
 
-# --- Vulkan headers (Windows standalone backend, issue #124) ---
+# --- Which platforms build the Vulkan backend ---
+# Windows (#247) and desktop Linux (#249). Apple is excluded on purpose: Metal is
+# the macOS backend (#202/#204). Android is a future leg (#249 follow-on) and is
+# deliberately NOT switched on here — its runtime is out-of-process, so the
+# in-process bridge this backend implements is the wrong shape for it.
+if(WIN32 OR (UNIX AND NOT APPLE AND NOT ANDROID))
+    set(DXR_VULKAN_BACKEND ON)
+else()
+    set(DXR_VULKAN_BACKEND OFF)
+endif()
+
+# --- Vulkan headers (issue #124, #247, #249) ---
 # Header-only. We compile against these with VK_NO_PROTOTYPES and resolve every
-# entry point from vulkan-1.dll at runtime (displayxr_vk_loader.cpp), so there
-# is NO find_package(Vulkan), NO vulkan-1.lib link, and NO Vulkan SDK needed in
-# CI — and the shipped DLL keeps no hard dependency on vulkan-1.dll.
-if(WIN32)
+# entry point from the Vulkan loader at runtime (displayxr_vk_loader.cpp:
+# vulkan-1.dll / libvulkan.so.1), so there is NO find_package(Vulkan), NO import
+# library to link, and NO Vulkan SDK needed in CI — and the shipped binary keeps
+# no hard dependency on the Vulkan loader, so it still loads on machines that
+# have none.
+if(DXR_VULKAN_BACKEND)
     find_package(VulkanHeaders QUIET)
     if(VulkanHeaders_FOUND)
         get_target_property(VULKAN_INCLUDE_DIR Vulkan::Headers INTERFACE_INCLUDE_DIRECTORIES)
@@ -121,16 +134,22 @@ endif()
 list(APPEND HEADERS displayxr_xrprovider/displayxr_provider_session.h)
 
 if(WIN32)
-    list(APPEND SOURCES displayxr_win32.c displayxr_gpu_preference.cpp
-        # Provider Vulkan backend (#247): enable2 session device + external-memory
-        # eye bridge to Unity's VkDevice. Windows-only (OPAQUE_WIN32 handles);
-        # guarded internally by ENABLE_VULKAN, which is set for WIN32 below.
-        displayxr_xrprovider/displayxr_provider_gfx_vulkan.cpp)
-    list(APPEND HEADERS displayxr_win32.h displayxr_vk_loader.h
-        displayxr_xrprovider/displayxr_provider_gfx_vulkan.h)
+    list(APPEND SOURCES displayxr_win32.c displayxr_gpu_preference.cpp)
+    list(APPEND HEADERS displayxr_win32.h)
     # dwmapi + advapi32: MSVC links them via #pragma comment(lib, ...) in the TUs,
     # but MinGW (the macOS cross-compile check) ignores that pragma — list them here.
     link_libraries(user32 d3d11 d3d12 dxgi dwmapi advapi32 d3dcompiler)
+endif()
+
+# Provider Vulkan backend (#247 Windows, #249 Linux): enable2 session device +
+# external-memory eye bridge to Unity's VkDevice. The TU is platform-parametric —
+# the only per-OS part is the external-memory handle flavour (OPAQUE_WIN32 HANDLEs
+# vs OPAQUE_FD file descriptors) — so it is listed once here rather than under a
+# per-platform branch. Guarded internally by ENABLE_VULKAN, set below.
+if(DXR_VULKAN_BACKEND)
+    list(APPEND SOURCES displayxr_xrprovider/displayxr_provider_gfx_vulkan.cpp)
+    list(APPEND HEADERS displayxr_vk_loader.h
+        displayxr_xrprovider/displayxr_provider_gfx_vulkan.h)
 endif()
 
 # --- Build shared library ---
@@ -152,8 +171,8 @@ target_include_directories(displayxr_unity PRIVATE
     ${CMAKE_CURRENT_SOURCE_DIR}/unity_pluginapi
 )
 
-# Vulkan headers (Windows standalone Vulkan backend, issue #124).
-if(WIN32)
+# Vulkan headers (issue #124, #247, #249).
+if(DXR_VULKAN_BACKEND)
     target_include_directories(displayxr_unity PRIVATE ${VULKAN_INCLUDE_DIR})
 endif()
 
@@ -164,12 +183,9 @@ else()
     target_compile_options(displayxr_unity PRIVATE -fvisibility=hidden)
 endif()
 
-# Enable Vulkan backend on Windows. The stub in displayxr_vulkan_backend.cpp
-# is auto-active on Android/Linux but gated behind ENABLE_VULKAN on Windows
-# so opt-in is explicit. Needed for #122 (test whether Vulkan unlocks MSAA
-# on the XR eye RT). Excludes Apple — Vulkan on macOS is out of scope for
-# this plugin.
-if(WIN32)
+# Enable the Vulkan backend where DXR_VULKAN_BACKEND selected it (Windows #247,
+# desktop Linux #249). Excludes Apple — Metal is the macOS backend (#202/#204).
+if(DXR_VULKAN_BACKEND)
     target_compile_definitions(displayxr_unity PRIVATE ENABLE_VULKAN)
 endif()
 
@@ -224,6 +240,20 @@ elseif(APPLE)
         LIBRARY_OUTPUT_DIRECTORY "${PLUGIN_OUTPUT_DIR}"
         MACOSX_BUNDLE_GUI_IDENTIFIER "com.displayxr.unity.native"
     )
+else()
+    # Desktop Linux (#249). Unity's Linux plugin importer expects the SONAME-style
+    # `lib` prefix, so — unlike Windows — we keep CMake's default naming and land
+    # `libdisplayxr_unity.so` in the x86_64 plugin folder.
+    set(PLUGIN_OUTPUT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../Runtime/Plugins/Linux/x86_64")
+    set_target_properties(displayxr_unity PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY "${PLUGIN_OUTPUT_DIR}"
+        LIBRARY_OUTPUT_DIRECTORY_RELEASE "${PLUGIN_OUTPUT_DIR}"
+        LIBRARY_OUTPUT_DIRECTORY_DEBUG "${PLUGIN_OUTPUT_DIR}"
+    )
+    # The plugin resolves every Vulkan entry point through dlopen/dlsym
+    # (displayxr_vk_loader.cpp), so it needs libdl but must NOT link libvulkan —
+    # that is what keeps the .so loadable on a box with no Vulkan ICD.
+    target_link_libraries(displayxr_unity PRIVATE ${CMAKE_DL_LIBS})
 endif()
 
 # --- Summary ---

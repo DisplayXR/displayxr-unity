@@ -34,3 +34,10 @@ displayxr-app.log.meta
 # Runtime/Plugins/Windows/x64/*.dll
 # Runtime/Plugins/macOS/*.dylib
 # Runtime/Plugins/macOS/*.bundle
+
+# Linux .so (#249): NOT committed, unlike the Windows DLL and macOS bundle.
+# No maintainer box builds it locally, so the only trustworthy source is the
+# build-linux CI job — which the release/package jobs download from. Its .meta
+# IS committed so Unity imports the pair once CI supplies the binary. A local
+# native~/build-linux.sh drops one here; keep it out of commits.
+Runtime/Plugins/Linux/x86_64/*.so

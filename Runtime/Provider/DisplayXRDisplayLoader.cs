@@ -83,13 +83,22 @@ namespace DisplayXR
             // vk::Image::CreateImageViews on the first XR texture — proven by
             // bisect (crashes even with a Unity-allocated colour target, commit
             // f5dbf59). Decline cleanly instead of crashing the editor.
+            //
+            // The gate applies on Linux for the same structural reason (#249), but the
+            // advice differs: Linux has no D3D to switch the editor to, so building a
+            // player is the only route.
             if (Application.isEditor &&
                 SystemInfo.graphicsDeviceType == GraphicsDeviceType.Vulkan)
             {
+                bool linuxEditor = Application.platform == RuntimePlatform.LinuxEditor;
                 Debug.LogWarning("[DisplayXR] Vulkan editor Play Mode is not supported (Unity's " +
                     "VK XR path needs the boot.config pre-init hook, which only exists in built " +
-                    "players — displayxr-unity#247). Build & run a Windows player to test Vulkan, " +
-                    "or switch the editor to D3D12/D3D11.");
+                    "players — displayxr-unity#" + (linuxEditor ? "249" : "247") + "). " +
+                    (linuxEditor
+                        ? "Build & run a Linux player to test Vulkan — the editor has no " +
+                          "alternative graphics API this provider supports."
+                        : "Build & run a Windows player to test Vulkan, or switch the editor " +
+                          "to D3D12/D3D11."));
                 return false;
             }
 
@@ -238,7 +247,9 @@ namespace DisplayXR
             //   --------------------|-----|------|------
             //   Windows × D3D11     | SPI | SPI  | MultiPass
             //   Windows × D3D12     | SPI | SPI  | MultiPass
+            //   Windows × Vulkan    | SPI | SPI  | MultiPass
             //   macOS   × Metal     | SPI | SPI  | MultiPass
+            //   Linux   × Vulkan    | SPI | SPI  | MultiPass   (#249)
             //   anything else       | MultiPass (moot — the native GfxStart no-starts)
             //
             // Rationale: URP and HDRP both consume the provider's full per-eye
@@ -258,18 +269,23 @@ namespace DisplayXR
                           || plat == RuntimePlatform.WindowsEditor;
             bool isMac = plat == RuntimePlatform.OSXPlayer
                       || plat == RuntimePlatform.OSXEditor;
+            bool isLinux = plat == RuntimePlatform.LinuxPlayer
+                        || plat == RuntimePlatform.LinuxEditor;
 
-            // Vulkan (#247) behaves like the other Windows APIs here: URP/HDRP → SPI
-            // (one 2-layer bridge image), BiRP → MultiPass (two 1-layer bridge images).
-            // The bridge is an external-memory alias either way, so the render-path
-            // choice is independent of the backend — same rule as D3D11/D3D12.
+            // Vulkan (#247 Windows, #249 Linux) behaves like the other APIs here:
+            // URP/HDRP → SPI (one 2-layer bridge image), BiRP → MultiPass (two 1-layer
+            // bridge images). The bridge is an external-memory alias either way, so the
+            // render-path choice is independent of the backend — same rule as D3D11/D3D12.
+            // Linux adds a row rather than an exception: Linux × Vulkan is eligible, and
+            // Vulkan is the ONLY eligible API there (the provider has no GL backend).
             var gdt = SystemInfo.graphicsDeviceType;
             bool isD3D11 = gdt == GraphicsDeviceType.Direct3D11;
             bool isD3D12 = gdt == GraphicsDeviceType.Direct3D12;
             bool isVulkan = gdt == GraphicsDeviceType.Vulkan;
             bool isMetal = gdt == GraphicsDeviceType.Metal;
             bool apiEligible = (isWindows && (isD3D11 || isD3D12 || isVulkan))
-                            || (isMac && isMetal);
+                            || (isMac && isMetal)
+                            || (isLinux && isVulkan);
             if (!apiEligible)
                 return false; // unsupported platform/API: MultiPass (native no-starts)
 

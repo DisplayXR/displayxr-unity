@@ -57,13 +57,14 @@ extern "C" {
 /// the session on Unity's own ID3D11Device (the runtime's native D3D11 compositor
 /// creates + weaves swapchain images on that device — no bridge/copy/fence).
 /// METAL is the macOS client-queue path (#202/#204: session bound on a
-/// provider-created MTLCommandQueue on Unity's MTLDevice). VULKAN is reserved.
+/// provider-created MTLCommandQueue on Unity's MTLDevice). VULKAN is the enable2
+/// own-device + external-memory bridge (#247 Windows, #249 Linux).
 /// Kept as an int across the C ABI; values are append-only (ABI-stable).
 typedef enum DxrGfxKind {
 	DXR_GFX_NONE = 0,
 	DXR_GFX_D3D12,
 	DXR_GFX_D3D11,
-	DXR_GFX_VULKAN, // reserved (not implemented)
+	DXR_GFX_VULKAN, // Windows (#247) + desktop Linux (#249)
 	DXR_GFX_METAL,  // macOS (#202/#204)
 } DxrGfxKind;
 
