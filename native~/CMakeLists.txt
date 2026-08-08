@@ -93,6 +93,9 @@ set(SOURCES
     # Cross-platform TUs: D3D backends behind _WIN32, Metal behind __APPLE__.
     displayxr_xrprovider/displayxr_provider_session.cpp
     displayxr_xrprovider/displayxr_display_provider.cpp
+    # XR SDK pre-init provider (#247): XRSDKPreInit export, compiled everywhere so
+    # the boot.config xrsdk-pre-init-library entry never dangles; VK-only in effect.
+    displayxr_xrprovider/displayxr_provider_preinit.cpp
 )
 
 set(HEADERS
