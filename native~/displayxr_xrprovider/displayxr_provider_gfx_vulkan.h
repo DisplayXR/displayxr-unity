@@ -106,16 +106,23 @@ void dxr_pvk_set_swapchain_images(const void *images, uint32_t count,
 int dxr_pvk_create_bridge(int eye, uint32_t width, uint32_t height,
                           uint32_t array_size, int64_t format);
 
-/// POINTER to the Unity-side VkImage handle for bridge slot `eye`, suitable for
-/// UnityXRRenderTextureDesc / Texture2D.CreateExternalTexture.
+/// The value to put in UnityXRRenderTextureDesc::color.nativePtr for bridge slot
+/// `eye`: a pointer to a populated UnityVulkanImage. Storage is owned here and
+/// outlives the texture.
 ///
-/// TRAP (cost us a session's worth of garbage-VkImage debugging in the
-/// standalone backend): on Vulkan, Unity's CreateExternalTexture /
-/// RegisterNativeTextureWithParams expects a POINTER TO the VkImage handle, not
-/// the handle value the way every D3D path passes an ID3D1xTexture2D*. Passing
-/// the value makes Unity dereference the handle as an address and produce a
-/// garbage VkImage. Hence &image, and hence this returns void* to storage that
-/// must outlive the texture.
+/// TRAP, and note it is NOT the same trap as the standalone backend's: Unity has
+/// two different Vulkan external-texture entry points with different contracts.
+///   - Texture2D.CreateExternalTexture (C#) -> RegisterNativeTextureWithParams
+///     wants a POINTER TO a bare VkImage handle. That is what the old standalone
+///     backend documented.
+///   - The XR display provider's CreateTexture path goes through
+///     vk::Texture::CreateFromExternalNativeImage ->
+///     vk::ImageManager::CreateImageFromExternalNativeImage, which reads a whole
+///     UnityVulkanImage. It needs format/aspect/extent/layers/mipCount to build
+///     image views, and NONE of that is queryable from a VkImage handle.
+/// Passing a bare &VkImage here makes Unity read ~100 bytes of struct out of an
+/// 8-byte handle and build views from garbage — observed as a hard crash inside
+/// the NVIDIA driver under vk::Image::CreateImageViews.
 void *dxr_pvk_unity_image_ptr(int eye);
 
 /// Per-frame: copy bridge slot `eye` into swapchain image `image_index`, with

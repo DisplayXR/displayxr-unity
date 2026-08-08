@@ -1105,9 +1105,28 @@ static int ps_create_swapchain(void)
 	int present_path = s_sc_present_path;
 	int want_srgb = s_color_space_linear && present_path;
 	int64_t format = formats[0];
+	// The int64 swapchain format is API-SPECIFIC: DXGI_FORMAT under D3D, VkFormat under
+	// Vulkan, MTLPixelFormat on Metal. They are NOT interchangeable and the numbers
+	// collide — DXGI 91 is B8G8R8A8_UNORM_SRGB but VkFormat 91 is R16G16B16A16_SFLOAT,
+	// so running the DXGI table against a VK format list silently picks a half-float
+	// swapchain. Hence a separate Vulkan arm rather than a shared one. (#247)
+	int is_vk_fmt = (s_ps.graphics_api == DXR_GFX_VULKAN);
 	for (uint32_t i = 0; i < fmt_count; i++) {
 #ifdef _WIN32
-		if (want_srgb) {
+		if (is_vk_fmt) {
+			// RGBA is preferred over BGRA because the display-provider TU declares
+			// kUnityXRRenderTextureFormatRGBA32 to Unity. A mismatch there makes Unity
+			// build an image view whose format differs from the bridge image's, which
+			// without MUTABLE_FORMAT is undefined behaviour — observed as a hard crash
+			// in vk::Image::CreateImageViews inside the NVIDIA driver.
+			if (want_srgb) {
+				if (formats[i] == 43) { format = 43; break; } // VK_FORMAT_R8G8B8A8_SRGB
+				if (formats[i] == 50) { format = 50; }        // VK_FORMAT_B8G8R8A8_SRGB
+			} else {
+				if (formats[i] == 37) { format = 37; break; } // VK_FORMAT_R8G8B8A8_UNORM
+				if (formats[i] == 44) { format = 44; }        // VK_FORMAT_B8G8R8A8_UNORM
+			}
+		} else if (want_srgb) {
 			if (formats[i] == 29) { format = 29; break; } // DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
 			if (formats[i] == 91) { format = 91; }         // DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
 		} else {
@@ -1125,7 +1144,8 @@ static int ps_create_swapchain(void)
 #endif
 	}
 #ifdef _WIN32
-	s_swapchain_srgb = (format == 29 || format == 91);
+	s_swapchain_srgb = is_vk_fmt ? (format == 43 || format == 50)
+	                             : (format == 29 || format == 91);
 #else
 	s_swapchain_srgb = (format == 71 || format == 81);
 #endif

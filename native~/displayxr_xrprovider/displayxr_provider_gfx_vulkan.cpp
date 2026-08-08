@@ -8,6 +8,14 @@
 
 #include "displayxr_provider_gfx_vulkan.h"
 
+// UnityVulkanImage / UnityVulkanMemory — the struct Unity's Vulkan backend reads out of
+// UnityXRRenderTextureDesc::color.nativePtr. Include order matters: IUnityGraphicsVulkan.h
+// needs the Vulkan headers (pulled in by displayxr_vk_loader.h via the .h above) AND
+// IUnityGraphics.h (for UnityRenderingEventAndData) before it.
+#include "../unity_pluginapi/IUnityInterface.h"
+#include "../unity_pluginapi/IUnityGraphics.h"
+#include "../unity_pluginapi/IUnityGraphicsVulkan.h"
+
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -124,10 +132,13 @@ struct PvkBridge {
 	HANDLE         shared_handle = NULL;
 	uint32_t       width = 0, height = 0, layers = 0;
 	VkFormat       format = VK_FORMAT_UNDEFINED;
-	// GENERAL layout is applied once, then kept: the copy transitions
-	// GENERAL->TRANSFER_SRC and back each frame. Mirrors the standalone
-	// backend's bridge_initialized latch.
-	bool           layout_initialized = false;
+	VkDeviceSize   unity_mem_size = 0;
+	uint32_t       unity_mem_type = 0;
+	// What we hand Unity as UnityXRRenderTextureDesc::color.nativePtr. Unity's
+	// vk::ImageManager::CreateImageFromExternalNativeImage reads a UnityVulkanImage —
+	// it needs format/aspect/extent/layers/mipCount to build image views, none of
+	// which are queryable from a bare VkImage handle. Must outlive the texture.
+	UnityVulkanImage unity_desc = {};
 	bool           valid = false;
 };
 
@@ -568,6 +579,15 @@ pvk_bridge_image_ci(uint32_t w, uint32_t h, uint32_t layers, VkFormat fmt,
 	VkImageCreateInfo ici = {};
 	ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
 	ici.pNext = ext;
+	// MUTABLE_FORMAT: Unity's vk::Image::CreateImageViews builds views on the image we
+	// hand it, and does not necessarily use the identical VkFormat (it commonly wants
+	// both an UNORM and an sRGB view of the same memory). Creating a view whose format
+	// differs from the image's is only legal on a MUTABLE_FORMAT image — without this
+	// bit it is undefined behaviour, which showed up as a hard crash inside the NVIDIA
+	// driver under vk::Image::CreateImageViews. The swapchain-format preference above
+	// already makes the formats MATCH; this bit means a residual mismatch degrades to a
+	// wrong-looking colour rather than a process kill.
+	ici.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
 	ici.imageType = VK_IMAGE_TYPE_2D;
 	ici.format = fmt;
 	ici.extent.width = w;
@@ -585,6 +605,43 @@ pvk_bridge_image_ci(uint32_t w, uint32_t h, uint32_t layers, VkFormat fmt,
 	ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
 	ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
 	return ici;
+}
+
+static VkImageMemoryBarrier
+pvk_barrier(VkImage img, VkImageLayout old_layout, VkImageLayout new_layout,
+            VkAccessFlags src_access, VkAccessFlags dst_access,
+            uint32_t base_layer, uint32_t layer_count);
+
+// One-shot UNDEFINED -> GENERAL on the SESSION device. Both devices alias the same
+// memory, so a layout transition on either is visible to the other; doing it once here
+// means neither side has to transition the bridge again (see the call site).
+static bool
+pvk_transition_to_general(PvkBridge *b)
+{
+	VkCommandBufferBeginInfo bi = {};
+	bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+	s_pvk.api.vkResetCommandBuffer(s_pvk.cmd_buf, 0);
+	if (s_pvk.api.vkBeginCommandBuffer(s_pvk.cmd_buf, &bi) != VK_SUCCESS) return false;
+
+	VkImageMemoryBarrier to_general =
+	    pvk_barrier(b->session_image, VK_IMAGE_LAYOUT_UNDEFINED, VK_IMAGE_LAYOUT_GENERAL,
+	                0, VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
+	                0, b->layers);
+	s_pvk.api.vkCmdPipelineBarrier(s_pvk.cmd_buf,
+	                               VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+	                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+	                               0, 0, NULL, 0, NULL, 1, &to_general);
+	if (s_pvk.api.vkEndCommandBuffer(s_pvk.cmd_buf) != VK_SUCCESS) return false;
+
+	VkSubmitInfo si = {};
+	si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	si.commandBufferCount = 1;
+	si.pCommandBuffers = &s_pvk.cmd_buf;
+	s_pvk.api.vkResetFences(s_pvk.device, 1, &s_pvk.copy_fence);
+	if (s_pvk.api.vkQueueSubmit(s_pvk.queue, 1, &si, s_pvk.copy_fence) != VK_SUCCESS) return false;
+	s_pvk.api.vkWaitForFences(s_pvk.device, 1, &s_pvk.copy_fence, VK_TRUE, UINT64_MAX);
+	return true;
 }
 
 int
@@ -705,7 +762,48 @@ dxr_pvk_create_bridge(int eye, uint32_t width, uint32_t height,
 
 	b->width = width; b->height = height; b->layers = array_size;
 	b->format = fmt;
-	b->layout_initialized = false;
+	b->unity_mem_size = u_mai.allocationSize;
+	b->unity_mem_type = u_mai.memoryTypeIndex;
+
+	// Park the image in GENERAL, once, and keep it there forever.
+	//
+	// Layout is the one piece of image state BOTH sides mutate, and neither can see the
+	// other's barriers. Any scheme where Unity leaves it in COLOR_ATTACHMENT_OPTIMAL and
+	// we transition from GENERAL (or vice-versa) is a silent mismatch — legal-looking
+	// code, undefined behaviour. GENERAL is valid for both colour-attachment writes and
+	// transfer reads, so declaring GENERAL to Unity and never transitioning the source in
+	// our copy makes the two sides agree by construction. It costs some bandwidth versus
+	// an optimal layout; correctness first, and this is the kind of bug that reads as
+	// "the bridge is black" rather than as a layout error.
+	if (!pvk_transition_to_general(b)) {
+		pvk_log("[DisplayXR-PROV-VK] bridge: initial GENERAL transition failed\n");
+		return 0;
+	}
+
+	// The descriptor Unity reads. Fields it uses to build views: format, aspect, extent,
+	// layers, mipCount, usage.
+	b->unity_desc = {};
+	b->unity_desc.memory.memory = b->unity_memory;
+	b->unity_desc.memory.offset = 0;
+	b->unity_desc.memory.size = b->unity_mem_size;
+	b->unity_desc.memory.mapped = NULL;
+	b->unity_desc.memory.flags = VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT;
+	b->unity_desc.memory.memoryTypeIndex = b->unity_mem_type;
+	b->unity_desc.image = b->unity_image;
+	b->unity_desc.layout = VK_IMAGE_LAYOUT_GENERAL;
+	b->unity_desc.aspect = VK_IMAGE_ASPECT_COLOR_BIT;
+	b->unity_desc.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT |
+	                      VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
+	b->unity_desc.format = fmt;
+	b->unity_desc.extent.width = width;
+	b->unity_desc.extent.height = height;
+	b->unity_desc.extent.depth = 1;
+	b->unity_desc.tiling = VK_IMAGE_TILING_OPTIMAL;
+	b->unity_desc.type = VK_IMAGE_TYPE_2D;
+	b->unity_desc.samples = VK_SAMPLE_COUNT_1_BIT;
+	b->unity_desc.layers = (int)array_size;
+	b->unity_desc.mipCount = 1;
+
 	b->valid = true;
 	pvk_log("[DisplayXR-PROV-VK] bridge[%d]: %ux%u layers=%u fmt=%d shared (session=%p unity=%p handle=%p)\n",
 	        eye, width, height, array_size, (int)fmt,
@@ -718,10 +816,17 @@ dxr_pvk_unity_image_ptr(int eye)
 {
 	PvkBridge *b = pvk_slot(eye);
 	if (!b || !b->valid) return NULL;
-	// See the header: Unity wants a POINTER TO the VkImage handle on Vulkan, not
-	// the handle value. Returning &b->unity_image (storage that outlives the
-	// texture) rather than (void*)b->unity_image is deliberate.
-	return (void *)&b->unity_image;
+	// The VkImage handle BY VALUE, matching the D3D convention on this API
+	// (UnityXRTextureData::nativePtr is "DX11: ID3D11Texture2D*" — the handle itself,
+	// not its address). VkImage is a non-dispatchable handle, pointer-sized on x64, so
+	// it drops into void* directly.
+	//
+	// Both address-of forms were tried on hardware and crash IDENTICALLY inside
+	// vk::Image::CreateImageViews: &VkImage (the convention the standalone backend
+	// documented for Texture2D.CreateExternalTexture, a DIFFERENT Unity entry point)
+	// and &UnityVulkanImage. That the stack did not move between them is the tell —
+	// Unity was consuming an address as a handle in both cases.
+	return (void *)b->unity_image;
 }
 
 // ---------------------------------------------------------------------------
@@ -789,12 +894,16 @@ dxr_pvk_copy_to_swapchain_image(int eye, uint32_t image_index)
 	s_pvk.api.vkResetCommandBuffer(s_pvk.cmd_buf, 0);
 	if (s_pvk.api.vkBeginCommandBuffer(s_pvk.cmd_buf, &bi) != VK_SUCCESS) return 0;
 
-	// The bridge sits in GENERAL between frames (first frame comes from UNDEFINED).
-	VkImageLayout src_old = b->layout_initialized ? VK_IMAGE_LAYOUT_GENERAL
-	                                              : VK_IMAGE_LAYOUT_UNDEFINED;
-	VkImageMemoryBarrier to_src = pvk_barrier(b->session_image, src_old,
-	                                          VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
-	                                          0, VK_ACCESS_TRANSFER_READ_BIT,
+	// The bridge STAYS in GENERAL (see dxr_pvk_create_bridge): GENERAL is valid as a
+	// transfer-read source, so this is a pure memory/execution barrier making Unity's
+	// colour-attachment writes visible to our transfer read — no layout change, and
+	// therefore no layout state to keep in sync with Unity's side of the alias.
+	VkImageMemoryBarrier to_src = pvk_barrier(b->session_image,
+	                                          VK_IMAGE_LAYOUT_GENERAL,
+	                                          VK_IMAGE_LAYOUT_GENERAL,
+	                                          VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+	                                              VK_ACCESS_MEMORY_WRITE_BIT,
+	                                          VK_ACCESS_TRANSFER_READ_BIT,
 	                                          0, b->layers);
 	VkImageMemoryBarrier to_dst = pvk_barrier(dst, VK_IMAGE_LAYOUT_UNDEFINED,
 	                                          VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
@@ -819,16 +928,18 @@ dxr_pvk_copy_to_swapchain_image(int eye, uint32_t image_index)
 	region.extent.height = b->height;
 	region.extent.depth = 1;
 	s_pvk.api.vkCmdCopyImage(s_pvk.cmd_buf,
-	                         b->session_image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	                         b->session_image, VK_IMAGE_LAYOUT_GENERAL,
 	                         dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 	                         1, &region);
 
 	// Swapchain images must be back in COLOR_ATTACHMENT_OPTIMAL for the runtime's
 	// compositor; the bridge returns to GENERAL for Unity's next render.
 	VkImageMemoryBarrier back_src = pvk_barrier(b->session_image,
-	                                            VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 	                                            VK_IMAGE_LAYOUT_GENERAL,
-	                                            VK_ACCESS_TRANSFER_READ_BIT, 0,
+	                                            VK_IMAGE_LAYOUT_GENERAL,
+	                                            VK_ACCESS_TRANSFER_READ_BIT,
+	                                            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT |
+	                                                VK_ACCESS_MEMORY_WRITE_BIT,
 	                                            0, b->layers);
 	VkImageMemoryBarrier back_dst = pvk_barrier(dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 	                                            VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
@@ -854,8 +965,6 @@ dxr_pvk_copy_to_swapchain_image(int eye, uint32_t image_index)
 	}
 	// xrReleaseSwapchainImage must not run before the copy lands.
 	s_pvk.api.vkWaitForFences(s_pvk.device, 1, &s_pvk.copy_fence, VK_TRUE, UINT64_MAX);
-
-	b->layout_initialized = true;
 	return 1;
 }
 
