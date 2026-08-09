@@ -21,29 +21,37 @@
 // runtime and the whole feature degrades to "no window binding" if libX11 is
 // missing — the runtime then self-hosts, which still renders.
 //
-// WHICH WINDOW THE RUNTIME WEAVES INTO — AND WHY IT IS NOT UNITY'S
-// ----------------------------------------------------------------
-// We create our OWN top-level X11 window and hand the runtime that. This mirrors
-// the other two platforms exactly: Windows passes an app-owned WS_POPUP overlay
-// (never Unity's main HWND) and macOS attaches its own overlay NSView.
+// WHICH WINDOW THE RUNTIME WEAVES INTO — A CHILD OF UNITY'S
+// ---------------------------------------------------------
+// We create our own X11 window and hand the runtime that, never Unity's own.
+// XR_DXR_xlib_window_binding gives the RUNTIME presentation of the supplied
+// window, so it must not already carry a swapchain the app presents to — and
+// Unity's main window does. Measured on the Odyssey: binding Unity's window gave
+// a perfectly healthy session (weaver holding the XID, frames flowing, no errors)
+// and nothing on the panel, because two presenters fought over one surface.
 //
-// It is not a style choice — XR_DXR_xlib_window_binding says the RUNTIME renders
-// into the supplied window, so the window must not already carry a swapchain the
-// app presents to. Unity's main window does: Unity builds its own VkSwapchainKHR
-// on it at startup. Binding it was measured on the Odyssey and produced exactly
-// the pathology you would predict: a perfectly healthy session (weaver holding
-// our XID, 1800+ submitted frames, no errors) and NOTHING on the panel, because
-// the two presenters fight over one surface.
+// The window is a CHILD of Unity's, not a top-level overlay. That is what makes
+// this behave like displayxr-demo-modelviewer — weave INSIDE the app's window on
+// X11 — and it is strictly better than the top-level overlay it replaces:
 //
-// We still LOCATE Unity's window — by walking the tree for _NET_WM_PID ==
-// getpid(), the X11 analogue of walking NSApplication — but only to place and
-// size our overlay over it.
+//   - It renders above its parent by definition, so there is no stacking fight.
+//     A top-level overlay needed override-redirect to stop the WM restacking
+//     Unity's focused window over it.
+//   - It is clipped to and moves with the parent, so dragging or restacking
+//     Unity's window needs no tracking at all — X does it.
+//   - It selects NO events, so X delivers pointer/keyboard to the deepest window
+//     that DID select them — Unity's. Input pass-through comes for free, where a
+//     top-level overlay needed an empty XShape input region (the analogue of
+//     Windows' WS_EX_NOACTIVATE) just to stop stealing clicks.
 //
-// INPUT: this first-light overlay is an ordinary top-level window, so it takes
-// clicks that would otherwise reach Unity. The Windows overlay solves this with
-// WS_EX_NOACTIVATE + a click-through region; the X11 equivalent is an empty
-// XShape INPUT region (libXext). That is a follow-up — it needs a second dlopen
-// and does not block first light.
+// The demo creates ONE decorated top-level and centres it on the 3D panel via
+// XR_DXR_display_info. It can, because it owns the only window. Unity owns its
+// window and its placement, so we follow it rather than fight it — same visible
+// result: the weave appears in the app's window.
+//
+// We still LOCATE Unity's window by walking the tree for _NET_WM_PID ==
+// getpid() — the X11 analogue of macOS walking NSApplication, since Unity does
+// not expose its window through IUnityGraphics.
 
 #if defined(__linux__) && !defined(__ANDROID__)
 
@@ -103,16 +111,11 @@ struct XlibApi {
 	// Overlay-window creation
 	XWin (*XCreateSimpleWindow)(XDpy, XWin, int, int, unsigned int, unsigned int,
 	                            unsigned int, unsigned long, unsigned long);
-	int (*XMapRaised)(XDpy, XWin);
-	int (*XRaiseWindow)(XDpy, XWin);
-	int (*XChangeWindowAttributes)(XDpy, XWin, unsigned long, void *);
+	int (*XMapWindow)(XDpy, XWin);
 	int (*XMoveResizeWindow)(XDpy, XWin, int, int, unsigned int, unsigned int);
-	int (*XStoreName)(XDpy, XWin, const char *);
 	int (*XDestroyWindow)(XDpy, XWin);
 	int (*XFlush)(XDpy);
-	unsigned long (*XBlackPixel)(XDpy, int);
 	int (*XDefaultScreen)(XDpy);
-	int (*XTranslateCoordinates)(XDpy, XWin, XWin, int, int, int *, int *, XWin *);
 };
 
 static struct XlibApi s_x;
@@ -121,8 +124,7 @@ static XWin s_win;       // the player's top-level window, 0 if not found
 static int  s_attempts;  // bounded retry — see the note in the getter
 static int  s_gave_up;   // latched only after we stop trying
 static XWin s_overlay;   // OUR window — the one the runtime weaves into
-static int  s_ox, s_oy;             // last overlay placement, to skip no-op moves
-static unsigned int s_ow, s_oh;
+static unsigned int s_ow, s_oh; // last child size, to skip no-op resizes
 
 // Don't latch a FAILURE forever. The window may simply not be mapped yet on the
 // first call (LifecycleStart can beat Unity's window creation depending on how
@@ -163,44 +165,15 @@ lin_load_xlib(void)
 	XL_SYM(XGetGeometry);
 	XL_SYM(XSync);
 	XL_SYM(XCreateSimpleWindow);
-	XL_SYM(XMapRaised);
-	XL_SYM(XRaiseWindow);
-	XL_SYM(XChangeWindowAttributes);
+	XL_SYM(XMapWindow);
 	XL_SYM(XMoveResizeWindow);
-	XL_SYM(XStoreName);
 	XL_SYM(XDestroyWindow);
 	XL_SYM(XFlush);
-	XL_SYM(XBlackPixel);
 	XL_SYM(XDefaultScreen);
-	XL_SYM(XTranslateCoordinates);
 	return 1;
 }
 
 #define XA_CARDINAL_ 6L // <X11/Xatom.h>, inlined so we need no X11 headers
-#define CW_OVERRIDE_REDIRECT_ (1L << 9) // CWOverrideRedirect from <X11/X.h>
-
-// Binary mirror of Xlib's XSetWindowAttributes. We only ever set
-// override_redirect, but the field ORDER and widths must match exactly — this is
-// an ancient, frozen Xlib ABI, mirrored here for the same reason the OpenXR and
-// Vulkan structs are: so this TU acquires no X11 build dependency.
-struct DxrXSetWindowAttributes {
-	unsigned long background_pixmap;
-	unsigned long background_pixel;
-	unsigned long border_pixmap;
-	unsigned long border_pixel;
-	int           bit_gravity;
-	int           win_gravity;
-	int           backing_store;
-	unsigned long backing_planes;
-	unsigned long backing_pixel;
-	int           save_under;          // Bool
-	long          event_mask;
-	long          do_not_propagate_mask;
-	int           override_redirect;   // Bool — the only field we set
-	unsigned long colormap;
-	unsigned long cursor;
-};
-
 // Read _NET_WM_PID off `w`. 0 when the property is absent.
 static pid_t
 lin_window_pid(XWin w, XAtom pid_atom)
@@ -304,18 +277,19 @@ displayxr_linux_get_app_window(void **out_display, unsigned long *out_window)
 	return 1;
 }
 
-// Absolute screen geometry of Unity's window (its own coordinates are relative to
-// whatever the WM reparented it into, so translate against the root).
+// Size of Unity's window (its client area). A child is positioned in PARENT
+// coordinates, so unlike a top-level overlay we never need the absolute screen
+// position — which also removes the XTranslateCoordinates round-trip and the
+// class of off-by-a-titlebar placement bugs that came with it.
 static int
-lin_unity_geometry(int *out_x, int *out_y, unsigned int *out_w, unsigned int *out_h)
+lin_child_size(unsigned int *out_w, unsigned int *out_h)
 {
 	if (!s_dpy || !s_win) return 0;
-	XWin gr = 0, child = 0;
-	int gx = 0, gy = 0, ax = 0, ay = 0;
+	XWin gr = 0;
+	int gx = 0, gy = 0;
 	unsigned int gw = 0, gh = 0, gb = 0, gd = 0;
 	if (!s_x.XGetGeometry(s_dpy, s_win, &gr, &gx, &gy, &gw, &gh, &gb, &gd)) return 0;
-	if (!s_x.XTranslateCoordinates(s_dpy, s_win, gr, 0, 0, &ax, &ay, &child)) { ax = gx; ay = gy; }
-	*out_x = ax; *out_y = ay; *out_w = gw; *out_h = gh;
+	*out_w = gw; *out_h = gh;
 	return 1;
 }
 
@@ -332,47 +306,30 @@ displayxr_linux_get_weave_window(void **out_display, unsigned long *out_window)
 		unsigned long unity_win = 0;
 		if (!displayxr_linux_get_app_window(&dpy, &unity_win)) return 0;
 
-		int x = 0, y = 0;
 		unsigned int w = 0, h = 0;
-		if (!lin_unity_geometry(&x, &y, &w, &h)) { x = 0; y = 0; w = 1920; h = 1080; }
+		if (!lin_child_size(&w, &h) || w == 0 || h == 0) { w = 1920; h = 1080; }
 
-		XWin root = s_x.XDefaultRootWindow(s_dpy);
-		int scr = s_x.XDefaultScreen(s_dpy);
-		// Background MAGENTA, deliberately, not black: it separates "the runtime never
-		// presented" (window stays magenta) from "the runtime presented black frames"
-		// (window goes black). With a black background those two look identical, which
-		// cost a debugging cycle on the Odyssey. DISPLAYXR_LNX_OVERLAY_BG=black opts out.
-		unsigned long bg = 0x00FF00FF; // magenta in the usual 24-bit TrueColor visual
-		const char *bgenv = getenv("DISPLAYXR_LNX_OVERLAY_BG");
-		if (bgenv && !strcmp(bgenv, "black")) bg = s_x.XBlackPixel(s_dpy, scr);
-		s_overlay = s_x.XCreateSimpleWindow(s_dpy, root, x, y, w, h, 0, bg, bg);
+		// CHILD of Unity's window, at 0,0, full size. CopyFromParent for depth
+		// and visual so it matches whatever Unity negotiated. We deliberately
+		// select NO events: X then delivers pointer/keyboard to the deepest
+		// window that DID select them — Unity's — so input passes straight
+		// through and we never steal a click.
+		s_overlay = s_x.XCreateSimpleWindow(s_dpy, (XWin)unity_win, 0, 0, w, h, 0, 0, 0);
 		if (!s_overlay) {
-			lin_log("[DisplayXR-LNX] XCreateSimpleWindow failed — the runtime will self-host\n");
+			lin_log("[DisplayXR-LNX] XCreateSimpleWindow (child) failed — the runtime "
+			        "will self-host its weave window\n");
 			return 0;
 		}
-		s_x.XStoreName(s_dpy, s_overlay, "DisplayXR Weave");
-
-		// OVERRIDE-REDIRECT: take the window out of the window manager's hands, the
-		// X11 equivalent of the Windows overlay's WS_POPUP. XRaiseWindow alone is only
-		// a REQUEST — a reparenting WM is free to restack Unity's focused window back
-		// on top, and it does. Measured on the Odyssey: the weave was rendering
-		// correctly the whole time and was visible only as a strip along the edges
-		// Unity's window did not cover.
-		{
-			struct DxrXSetWindowAttributes attrs;
-			memset(&attrs, 0, sizeof(attrs));
-			attrs.override_redirect = 1;
-			s_x.XChangeWindowAttributes(s_dpy, s_overlay, CW_OVERRIDE_REDIRECT_, &attrs);
-		}
-		s_x.XMapRaised(s_dpy, s_overlay);
+		s_x.XMapWindow(s_dpy, s_overlay);
 		s_x.XFlush(s_dpy);
 		s_x.XSync(s_dpy, 0);
+		s_ow = w; s_oh = h;
 
 		char m[224];
 		snprintf(m, sizeof(m),
-		         "[DisplayXR-LNX] weave overlay window 0x%lx created at %d,%d %ux%u "
-		         "(over Unity's window 0x%lx)\n",
-		         (unsigned long)s_overlay, x, y, w, h, unity_win);
+		         "[DisplayXR-LNX] weave window 0x%lx created as a CHILD of Unity's window "
+		         "0x%lx (%ux%u) — in-window weave, input passes through\n",
+		         (unsigned long)s_overlay, unity_win, w, h);
 		lin_log(m);
 	}
 	if (!s_dpy || !s_overlay) return 0;
@@ -381,26 +338,18 @@ displayxr_linux_get_weave_window(void **out_display, unsigned long *out_window)
 	return 1;
 }
 
-// Keep the overlay parked over Unity's window. Cheap enough to call per frame;
-// only issues X traffic when the geometry actually moved.
+// Keep the child matched to Unity's client area. POSITION needs no work — a child
+// is clipped to and moves with its parent — so this only ever resizes, and only
+// when the parent actually changed.
 DISPLAYXR_EXPORT void
 displayxr_linux_track_window(void)
 {
 	if (!s_dpy || !s_overlay || !s_win) return;
-	int x = 0, y = 0;
 	unsigned int w = 0, h = 0;
-	if (!lin_unity_geometry(&x, &y, &w, &h) || w == 0 || h == 0) return;
-	int moved = (x != s_ox || y != s_oy || w != s_ow || h != s_oh);
-	if (moved) {
-		s_ox = x; s_oy = y; s_ow = w; s_oh = h;
-		s_x.XMoveResizeWindow(s_dpy, s_overlay, x, y, w, h);
-	}
-	// RE-RAISE, every tick, not just on move. The WM restacks Unity's window above
-	// ours whenever it takes focus, and a covered overlay looks exactly like a dead
-	// weave: on the Odyssey the woven frame was live the whole time and only visible
-	// as a thin strip down the edges Unity's window did not cover. Raising is cheap
-	// (one X request) and idempotent.
-	s_x.XRaiseWindow(s_dpy, s_overlay);
+	if (!lin_child_size(&w, &h) || w == 0 || h == 0) return;
+	if (w == s_ow && h == s_oh) return;
+	s_ow = w; s_oh = h;
+	s_x.XMoveResizeWindow(s_dpy, s_overlay, 0, 0, w, h);
 	s_x.XFlush(s_dpy);
 }
 
@@ -432,7 +381,7 @@ displayxr_linux_destroy_weave_window(void)
 		lin_log("[DisplayXR-LNX] weave overlay window destroyed\n");
 	}
 	s_overlay = 0;
-	s_ox = s_oy = 0; s_ow = s_oh = 0;
+	s_ow = s_oh = 0;
 }
 
 #endif // __linux__ && !__ANDROID__
