@@ -329,8 +329,29 @@ jobs:
                  launch-unity.sh launch-unity.sh.meta
 
           # Force-add the binaries (normally gitignored or absent).
+          # The Linux .so is the one binary that is NEVER committed to the
+          # repo (.gitignore: Runtime/Plugins/Linux/x86_64/*.so) — it exists
+          # here only because the build-linux artifact was downloaded into
+          # the working tree above. It was missing from this list when the
+          # Linux leg landed (#249), so v2.12.0's upm branch shipped only the
+          # .so.meta and git-URL installs got no Linux plugin, while the .tgz
+          # (packed with tar, which ignores .gitignore) was fine. Keep all
+          # three adds in sync with the download-artifact steps.
           git add -f Runtime/Plugins/Windows/x64/displayxr_unity.dll
           git add -f Runtime/Plugins/macOS/displayxr_unity.bundle
+          git add -f Runtime/Plugins/Linux/x86_64/libdisplayxr_unity.so
+
+          # Fail loudly rather than silently shipping an incomplete upm
+          # branch: every platform binary must be staged at this point.
+          for f in Runtime/Plugins/Windows/x64/displayxr_unity.dll \
+                   Runtime/Plugins/macOS/displayxr_unity.bundle/Contents/MacOS/displayxr_unity \
+                   Runtime/Plugins/Linux/x86_64/libdisplayxr_unity.so; do
+            git diff --cached --name-only | grep -qxF "$f" || \
+              git ls-files --error-unmatch "$f" >/dev/null 2>&1 || {
+                echo "::error::$f is not staged for the upm branch — refusing to publish an incomplete package."
+                exit 1
+              }
+          done
 
           # NOTE: deliberately NOT using `git add -A` here. The previous
           # job step ("Create UPM tarball") leaves an untracked staging
