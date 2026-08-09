@@ -1136,13 +1136,19 @@ static int ps_create_swapchain(void)
 	// swapchain. Hence a separate Vulkan arm rather than a shared one. (#247)
 	int is_vk_fmt = (s_ps.graphics_api == DXR_GFX_VULKAN);
 	for (uint32_t i = 0; i < fmt_count; i++) {
-#ifdef _WIN32
+		// VULKAN ARM FIRST, and OUTSIDE the per-OS branch below — the VkFormat table
+		// is the same on Windows and Linux, and burying it under _WIN32 shipped a
+		// real colour bug on Linux (#249): the loop fell through to the Metal arm,
+		// matched nothing, and kept formats[0] = 44 = VK_FORMAT_B8G8R8A8_UNORM while
+		// the display-provider TU declares kUnityXRRenderTextureFormatRGBA32 to
+		// Unity. Unity then wrote RGBA into a BGRA image — red and blue swapped, so
+		// the sample's yellow background came out cyan on the panel.
+		//
+		// RGBA is preferred over BGRA for that same reason. A format mismatch also
+		// makes Unity build an image view whose format differs from the bridge
+		// image's, which without MUTABLE_FORMAT is undefined behaviour — observed as
+		// a hard crash in vk::Image::CreateImageViews inside the NVIDIA driver.
 		if (is_vk_fmt) {
-			// RGBA is preferred over BGRA because the display-provider TU declares
-			// kUnityXRRenderTextureFormatRGBA32 to Unity. A mismatch there makes Unity
-			// build an image view whose format differs from the bridge image's, which
-			// without MUTABLE_FORMAT is undefined behaviour — observed as a hard crash
-			// in vk::Image::CreateImageViews inside the NVIDIA driver.
 			if (want_srgb) {
 				if (formats[i] == 43) { format = 43; break; } // VK_FORMAT_R8G8B8A8_SRGB
 				if (formats[i] == 50) { format = 50; }        // VK_FORMAT_B8G8R8A8_SRGB
@@ -1150,7 +1156,10 @@ static int ps_create_swapchain(void)
 				if (formats[i] == 37) { format = 37; break; } // VK_FORMAT_R8G8B8A8_UNORM
 				if (formats[i] == 44) { format = 44; }        // VK_FORMAT_B8G8R8A8_UNORM
 			}
-		} else if (want_srgb) {
+			continue;
+		}
+#ifdef _WIN32
+		if (want_srgb) {
 			if (formats[i] == 29) { format = 29; break; } // DXGI_FORMAT_R8G8B8A8_UNORM_SRGB
 			if (formats[i] == 91) { format = 91; }         // DXGI_FORMAT_B8G8R8A8_UNORM_SRGB
 		} else {
@@ -1167,12 +1176,15 @@ static int ps_create_swapchain(void)
 		}
 #endif
 	}
+	if (is_vk_fmt) {
+		s_swapchain_srgb = (format == 43 || format == 50);
+	} else {
 #ifdef _WIN32
-	s_swapchain_srgb = is_vk_fmt ? (format == 43 || format == 50)
-	                             : (format == 29 || format == 91);
+		s_swapchain_srgb = (format == 29 || format == 91);
 #else
-	s_swapchain_srgb = (format == 71 || format == 81);
+		s_swapchain_srgb = (format == 71 || format == 81);
 #endif
+	}
 	if (want_srgb && !s_swapchain_srgb)
 		ps_log("[DisplayXR-PROV] WARN: Linear project but runtime advertised NO sRGB swapchain format — present stays too dark (needs a runtime-side present encode)\n");
 	ps_log("[DisplayXR-PROV] swapchain format=%lld srgb=%d (linear=%d present_path=%d)\n",
