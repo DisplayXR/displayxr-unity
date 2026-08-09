@@ -139,6 +139,12 @@ if(WIN32)
     # dwmapi + advapi32: MSVC links them via #pragma comment(lib, ...) in the TUs,
     # but MinGW (the macOS cross-compile check) ignores that pragma — list them here.
     link_libraries(user32 d3d11 d3d12 dxgi dwmapi advapi32 d3dcompiler)
+elseif(UNIX AND NOT APPLE AND NOT ANDROID)
+    # Desktop-Linux platform glue (#249): the shell-mode stub the shared provider
+    # code references unconditionally (macOS ships the same stub), plus the X11
+    # helper that finds the player's own window so Linux can be a HANDLE app
+    # (XR_DXR_xlib_window_binding) like Windows and macOS.
+    list(APPEND SOURCES displayxr_linux.c)
 endif()
 
 # Provider Vulkan backend (#247 Windows, #249 Linux): enable2 session device +
@@ -250,10 +256,20 @@ else()
         LIBRARY_OUTPUT_DIRECTORY_RELEASE "${PLUGIN_OUTPUT_DIR}"
         LIBRARY_OUTPUT_DIRECTORY_DEBUG "${PLUGIN_OUTPUT_DIR}"
     )
-    # The plugin resolves every Vulkan entry point through dlopen/dlsym
-    # (displayxr_vk_loader.cpp), so it needs libdl but must NOT link libvulkan —
-    # that is what keeps the .so loadable on a box with no Vulkan ICD.
+    # The plugin resolves Vulkan AND Xlib entry points through dlopen/dlsym
+    # (displayxr_vk_loader.cpp, displayxr_linux.c), so it needs libdl but must NOT
+    # link libvulkan or libX11 — that is what keeps the .so loadable on a box with
+    # no Vulkan ICD and no X11.
     target_link_libraries(displayxr_unity PRIVATE ${CMAKE_DL_LIBS})
+
+    # --no-undefined: make an unresolved symbol a LINK ERROR instead of a runtime
+    # surprise. Learned the hard way (#249): a Linux shared library links happily
+    # with dangling references and only dies when the loader binds them, so CI
+    # reported green on a .so that could not load at all — `undefined symbol:
+    # displayxr_is_shell_mode` on the target box, inside GfxStart. Windows (MSVC)
+    # and macOS (two-level namespace) both reject this by default; Linux is the
+    # odd one out, so ask for the same strictness explicitly.
+    target_link_options(displayxr_unity PRIVATE -Wl,--no-undefined)
 endif()
 
 # --- Summary ---

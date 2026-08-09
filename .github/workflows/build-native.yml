@@ -186,14 +186,33 @@ jobs:
             echo "export OK: $sym"
           done
 
-          # The plugin must resolve Vulkan through dlopen (displayxr_vk_loader), never
-          # by linking it — otherwise it fails to load on a box with no Vulkan ICD.
-          if readelf -d "$SO" | grep -q 'libvulkan'; then
-            echo "ERROR: .so has a hard dependency on libvulkan — it must dlopen it instead"
-            readelf -d "$SO" | grep NEEDED
+          # The plugin must resolve Vulkan and Xlib through dlopen
+          # (displayxr_vk_loader / displayxr_linux.c), never by linking them —
+          # otherwise it fails to load on a box with no Vulkan ICD or no X11.
+          for lib in libvulkan libX11; do
+            if readelf -d "$SO" | grep -q "$lib"; then
+              echo "ERROR: .so has a hard dependency on $lib — it must dlopen it instead"
+              readelf -d "$SO" | grep NEEDED
+              exit 1
+            fi
+            echo "no $lib link dependency: OK"
+          done
+
+          # NO UNRESOLVED SYMBOLS. This is the check that was missing when #249
+          # first landed: unlike MSVC and macOS's two-level namespace, a Linux
+          # shared library links happily with dangling references and only fails
+          # when the loader binds them — so CI was green on a .so that died at
+          # `undefined symbol: displayxr_is_shell_mode` inside GfxStart on the
+          # target box. The link now also passes -Wl,--no-undefined (see
+          # CMakeLists.txt), which makes this belt-and-braces; keep both, because
+          # the link flag is easy to drop by accident and this is the symptom
+          # a user would actually hit.
+          if ldd -r "$SO" 2>&1 | grep -q 'undefined symbol'; then
+            echo "ERROR: unresolved symbols in the shipped .so — it will fail to load:"
+            ldd -r "$SO" 2>&1 | grep 'undefined symbol' | sort -u
             exit 1
           fi
-          echo "no libvulkan link dependency: OK"
+          echo "no unresolved symbols: OK"
 
       - name: Upload artifact
         if: needs.DetectChanges.outputs.docs_only != 'true'

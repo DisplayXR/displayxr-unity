@@ -885,7 +885,18 @@ static void ps_active_view_scale(float *sx, float *sy)
 	*sx = x; *sy = y;
 }
 
-extern "C" int displayxr_is_shell_mode(void); // defined in displayxr_win32.c
+// Per-platform: displayxr_win32.c / displayxr_macos.mm / displayxr_linux.c.
+// Every platform MUST define it — the shared code below calls it unconditionally,
+// and a missing definition is an unresolved symbol the loader only reports when
+// it binds (see the --no-undefined note in CMakeLists.txt, #249).
+extern "C" int displayxr_is_shell_mode(void);
+
+#if defined(__linux__) && !defined(__ANDROID__)
+// Linux handle-app glue (#249), defined in displayxr_linux.c.
+extern "C" int displayxr_linux_get_weave_window(void **out_display, unsigned long *out_window);
+extern "C" void displayxr_linux_destroy_weave_window(void);
+extern "C" int displayxr_linux_window_size(uint32_t *out_w, uint32_t *out_h);
+#endif
 
 // Poll the live workspace-tile canvas size (#225, display_zones spec v2). The
 // compositor composites this client into a shell-driven tile that follows 3D-
@@ -943,12 +954,17 @@ static void ps_window_size(uint32_t *w, uint32_t *h)
 			hh = (uint32_t)(rc.bottom - rc.top);
 		}
 	}
-#else
+#elif defined(__APPLE__)
 	// macOS (#204): the bound weave NSView's live backing size — the same
 	// per-frame source the runtime's compositor derives its canvas from, so
 	// the per-view sizes agree and live resize lands via the #172 reconcile.
 	if (s_ps.overlay_hwnd)
 		displayxr_metal_view_backing_size(s_ps.overlay_hwnd, &ww, &hh);
+#else
+	// Linux (#249): live geometry of the bound X11 window, same role as the
+	// macOS backing size above. Returns 0 when no window is bound (runtime
+	// self-hosting), which falls through to the display-info default below.
+	displayxr_linux_window_size(&ww, &hh);
 #endif
 	if (ww == 0 || hh == 0) {
 		ww = s_ps.display_info.is_valid ? s_ps.display_info.pixel_width : 1920;
@@ -4010,15 +4026,13 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	                                : (is_d3d11 ? "XR_KHR_D3D11_enable" : "XR_KHR_D3D12_enable");
 	extensions[ext_count++] = XR_DXR_WIN32_WINDOW_BINDING_EXTENSION_NAME;
 #elif defined(__linux__) && !defined(__ANDROID__)
-	// Desktop Linux (#249): Vulkan only, same enable2 reasoning as above.
-	//
-	// NO window-binding extension in this phase. The runtime's Linux compositor can
-	// self-host its own XCB window (the shape the macOS bring-up used), and Unity
-	// exposes no X11 window handle through IUnityGraphics — so binding the player's
-	// own window would need a way to obtain it that does not exist yet.
-	// XR_DXR_xlib_window_binding / XR_DXR_wayland_surface_binding are registered
-	// runtime-side and are the follow-on once that handle is reachable.
+	// Desktop Linux (#249): Vulkan only, same enable2 reasoning as above, plus the
+	// xlib window binding so this is a HANDLE app like Windows and macOS — the
+	// runtime weaves into the player's own window. Requested unconditionally; if we
+	// cannot find the window at session-create we simply chain nothing and the
+	// runtime self-hosts (enabling an extension we then don't use is harmless).
 	extensions[ext_count++] = "XR_KHR_vulkan_enable2";
+	extensions[ext_count++] = XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME;
 #else
 	extensions[ext_count++] = XR_KHR_METAL_ENABLE_EXTENSION_NAME;
 	extensions[ext_count++] = XR_DXR_COCOA_WINDOW_BINDING_EXTENSION_NAME;
@@ -4350,21 +4364,42 @@ int dxr_prov_session_start(const char *runtime_json_path,
 		gfx_binding = &d3d12;
 	}
 #elif defined(ENABLE_VULKAN) && defined(__linux__) && !defined(__ANDROID__)
-	// --- Session: Vulkan graphics binding, NO window binding (#249 Phase 1) ---
+	// --- Session: Vulkan graphics binding + xlib window binding (#249) ---
 	//
-	// next == NULL means the runtime SELF-HOSTS its window: its Linux compositor
-	// creates its own XCB window and presents there (comp_vk_native_window_xcb).
-	// That is the same bring-up shape macOS used before the in-app NSView landed.
-	// Binding the player's own window instead needs XR_DXR_xlib_window_binding AND
-	// a way to get Unity's X11 window handle, which IUnityGraphics does not expose —
-	// that pair is the follow-on, not this phase.
-	const void *gfx_binding = dxr_pvk_session_binding(NULL);
+	// HANDLE app, same shape as Windows (HWND) and macOS (NSView): the runtime
+	// weaves into UNITY'S OWN window rather than creating one of its own.
+	// IUnityGraphics does not hand us the X11 window — exactly the gap macOS has
+	// for its NSView — so displayxr_linux.c finds it by walking the window tree
+	// for _NET_WM_PID == getpid(), the X11 analogue of walking NSApplication.
+	//
+	// If no window is found (no libX11, no DISPLAY, not yet mapped) we chain
+	// nothing and the runtime self-hosts an XCB window instead — degraded but
+	// still rendering, rather than failing the session.
+	XrXlibWindowBindingCreateInfoDXR xlib_binding = {};
+	const void *win_chain = NULL;
+	{
+		void *xdpy = NULL;
+		unsigned long xwin = 0;
+		if (displayxr_linux_get_weave_window(&xdpy, &xwin) && xdpy && xwin) {
+			xlib_binding.type = XR_TYPE_XLIB_WINDOW_BINDING_CREATE_INFO_DXR_PS;
+			xlib_binding.next = NULL;
+			xlib_binding.xDisplay = xdpy;
+			xlib_binding.window = xwin;
+			xlib_binding.transparentBackgroundEnabled = use_transparent ? 1 : 0;
+			win_chain = &xlib_binding;
+			ps_log("[DisplayXR-PROV] Linux: binding the runtime's weave to the PLUGIN-OWNED "
+			       "overlay window 0x%lx (transparent=%d)\n", xwin, (int)use_transparent);
+		} else {
+			ps_log("[DisplayXR-PROV] Linux: no overlay window available — the runtime will "
+			       "self-host its weave window\n");
+		}
+	}
+	const void *gfx_binding = dxr_pvk_session_binding(win_chain);
 	if (!gfx_binding) {
 		ps_log("[DisplayXR-PROV] Vulkan session binding unavailable\n");
 		dxr_prov_session_stop();
 		return 0;
 	}
-	(void)use_transparent; // no transparent-background path without a window binding
 #else
 	// --- Session: Metal graphics binding (client queue) + cocoa window binding ---
 	// viewHandle == NULL → the runtime self-hosts its NSWindow + CAMetalLayer (the

@@ -93,6 +93,12 @@ extern "C" void *displayxr_get_app_main_view(void);
 // In that mode the provider is a plain OpenXR client: no overlay, no foreground grab,
 // windowHandle=NULL. Defined in displayxr_win32.c / displayxr_macos.mm.
 extern "C" int displayxr_is_shell_mode(void);
+#if defined(__linux__) && !defined(__ANDROID__)
+// Linux handle-app glue (#249), defined in displayxr_linux.c.
+extern "C" int displayxr_linux_get_weave_window(void **out_display, unsigned long *out_window);
+extern "C" void displayxr_linux_destroy_weave_window(void);
+extern "C" void displayxr_linux_track_window(void);
+#endif
 #ifdef _WIN32
 // (#166) Make the overlay a top-level WS_POPUP+NOREDIRECTIONBITMAP (composites the
 // runtime DComp weave) instead of a WS_CHILD. Call before displayxr_get_app_main_view().
@@ -767,14 +773,19 @@ GfxStart(UnitySubsystemHandle handle, void *userData, UnityXRRenderingCapabiliti
 		caps->invalidateRenderStateAfterEachCallback = true; // we touch D3D state
 		caps->skipPresentToMainScreen = false;
 #elif defined(__linux__) && !defined(__ANDROID__)
-		// Linux/Vulkan (#249). Deliberately NOT the macOS arm below — that one is
-		// justified entirely by Metal-specific Unity defects (#204/#205) and its
-		// skipPresentToMainScreen=true would blank the player window here for no
-		// reason. Linux behaves like the Windows own-device bridge: the provider
-		// records and submits its own Vulkan command buffers, so Unity's render
-		// state must be re-validated around each callback, and Unity keeps
-		// presenting to its own window.
+		// Linux/Vulkan (#249). The provider records and submits its own Vulkan
+		// command buffers, so Unity's render state must be re-validated around each
+		// callback — same as the Windows own-device bridge.
 		caps->invalidateRenderStateAfterEachCallback = true;
+		// Unity keeps presenting to ITS OWN window — same as Windows, and for the
+		// same reason: the runtime weaves into a SEPARATE plugin-owned overlay
+		// window, so the two never contend for one surface.
+		//
+		// Measured on the Odyssey, both wrong ways round: binding Unity's own window
+		// gave a healthy session (weaver holding the XID, 1800+ frames) with a BLACK
+		// panel when Unity also presented, and an EMPTY window when it did not —
+		// because XR_DXR_xlib_window_binding hands presentation of that window to the
+		// runtime, and Unity already owns a swapchain on its main window.
 		caps->skipPresentToMainScreen = false;
 #else
 		// macOS zero-copy touches NO Unity render state in the callbacks (no
@@ -904,7 +915,16 @@ GfxStart(UnitySubsystemHandle handle, void *userData, UnityXRRenderingCapabiliti
 		             ? (prov_want_dedicated_window()
 		                    ? "[DisplayXR-PROV] weave target: dedicated provider window (editor, #173)\n"
 		                    : "[DisplayXR-PROV] weave target: app-owned top-level overlay (in-app)\n")
+#if defined(__linux__) && !defined(__ANDROID__)
+		             // Linux carries its window through the xlib binding, not through
+		             // s_overlay_hwnd (the binding needs a Display*+Window PAIR), so a
+		             // NULL handle here does NOT mean self-hosting — saying "SELFHOST"
+		             // read as a contradiction against the xlib-binding line that
+		             // follows it. The session logs the real target.
+		             : "[DisplayXR-PROV] weave target: X11 window binding (decided at session create)\n");
+#else
 		             : "[DisplayXR-PROV] weave target: runtime self-hosted window (SELFHOST diagnostic)\n");
+#endif
 	}
 
 	// runtime_json = NULL -> resolve from XR_RUNTIME_JSON (sim_display bring-up).
@@ -929,14 +949,30 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 
 	if (!s_session_active) return kUnitySubsystemErrorCodeSuccess;
 
-#ifdef _WIN32
+#if defined(_WIN32) || (defined(__linux__) && !defined(__ANDROID__))
+	// Windows and Linux pump xrPollEvent HERE, on the graphics thread.
+	//
+	// This is load-bearing and easy to miss: without it the READY event is never
+	// consumed, so xrBeginSession is never called, the session sits at state 2
+	// (READY) forever, shouldRender stays false, and NOTHING renders. On the Odyssey
+	// that presented as a perfectly healthy-looking run — session created, weaver
+	// holding our window, ~1800 pump ticks — with a blank panel and zero bridge
+	// copies. Linux originally inherited the macOS arm below and hit exactly that
+	// (#249); it has no AppKit constraint, so it belongs on the Windows side.
 	dxr_prov_poll_events();
+#endif
+#if defined(__linux__) && !defined(__ANDROID__)
+	// Keep the plugin-owned weave overlay parked over — and ABOVE — Unity's window.
+	// The Windows overlay does the same tracking via SetWindowPos in its WndProc.
+	displayxr_linux_track_window();
+#endif
+#ifdef _WIN32
 	// GameView zone convergence (Phase 1, #727 follow-up): re-drive the forced full-window
 	// zone to the authoritative panel px the mirror callback published, so the compositor
 	// canvas == Game-view render viewport pixel-exact. A no-op once converged; when it does
 	// change the zone, the reconcile below reallocs the swapchain/bridge to match.
 	dxr_prov_converge_gameview_zone();
-#else
+#elif defined(__APPLE__)
 	// macOS (#204): xrPollEvent is pumped from the MAIN thread instead — the
 	// runtime's oxr_macos_pump_events drains NSApp events + flushes CATransaction,
 	// both main-thread-only (AppKit throws off-main). DisplayXRProviderDriver
@@ -1717,12 +1753,24 @@ LifecycleStart(UnitySubsystemHandle handle, void *userData)
 		}
 	}
 #elif defined(__linux__) && !defined(__ANDROID__)
-	// Linux (#249 Phase 1): no window is created here. The runtime's Vulkan/XCB
-	// compositor self-hosts its own window (session binding chains no window-binding
-	// extension — see dxr_prov_session_start). Binding the player's own X11 window
-	// is the XR_DXR_xlib_window_binding follow-on.
-	s_overlay_hwnd = nullptr;
-	prov_log("[DisplayXR-PROV] Lifecycle Start (Linux: runtime self-hosted weave window)\n");
+	// Linux (#249): HANDLE app — resolve the player's own top-level X11 window here,
+	// on the main thread, before GfxStart binds the session (same ordering as the
+	// Windows overlay HWND and the macOS NSView). displayxr_linux.c caches the
+	// result; dxr_prov_session_start chains it as XR_DXR_xlib_window_binding.
+	//
+	// s_overlay_hwnd stays NULL: on Windows/macOS it carries the native window the
+	// session binds, but the xlib binding needs a (Display*, Window) PAIR that does
+	// not fit one pointer — so the session pulls both from displayxr_linux.c rather
+	// than through this field.
+	{
+		void *xdpy = nullptr;
+		unsigned long xwin = 0;
+		bool have = displayxr_linux_get_weave_window(&xdpy, &xwin) != 0;
+		s_overlay_hwnd = nullptr;
+		prov_log(have
+		             ? "[DisplayXR-PROV] Lifecycle Start (Linux: plugin-owned overlay weave window)\n"
+		             : "[DisplayXR-PROV] Lifecycle Start (Linux: no overlay window — runtime self-hosted weave window)\n");
+	}
 #else
 	if (displayxr_is_shell_mode()) {
 		// Workspace tile (shell/IPC). The Shell launched us with
@@ -1885,7 +1933,10 @@ LifecycleStop(UnitySubsystemHandle handle, void *userData)
 	displayxr_metal_destroy_preview_window();  // editor / fallback window
 	s_overlay_hwnd = nullptr;
 #else
-	// Linux (#249): no provider-owned window to tear down — the runtime self-hosts.
+	// Linux (#249): drop the plugin-owned overlay on the MAIN thread, after GfxStop
+	// already ran dxr_prov_session_stop (xrDestroySession released the runtime's
+	// surface on it) — same ordering rule as the #173 Windows / #204 macOS teardown.
+	displayxr_linux_destroy_weave_window();
 	s_overlay_hwnd = nullptr;
 #endif
 	prov_log("[DisplayXR-PROV] Lifecycle Stop\n");
