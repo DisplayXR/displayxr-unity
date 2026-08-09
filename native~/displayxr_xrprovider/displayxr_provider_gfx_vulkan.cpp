@@ -1102,6 +1102,17 @@ dxr_pvk_copy_to_swapchain_image(int eye, uint32_t image_index)
 	}
 	// xrReleaseSwapchainImage must not run before the copy lands.
 	s_pvk.api.vkWaitForFences(s_pvk.device, 1, &s_pvk.copy_fence, VK_TRUE, UINT64_MAX);
+
+	// Periodic proof-of-life for the bridge copy. Without it, "the panel is black"
+	// is ambiguous between "the runtime never presented", "it presented black" and
+	// "we never copied" — three very different bugs that look identical from the
+	// outside. Cheap: one line per 600 copies.
+	{
+		static unsigned long copies = 0;
+		if ((copies++ % 600) == 0)
+			pvk_log("[DisplayXR-PROV-VK] bridge copy #%lu OK (eye=%d img=%u %ux%u)\n",
+			        copies, eye, image_index, b->width, b->height);
+	}
 	return 1;
 }
 

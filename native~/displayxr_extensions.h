@@ -220,6 +220,33 @@ typedef struct XrCocoaWindowBindingCreateInfoDXR {
     XrBool32 transparentBackgroundEnabled; // SPEC_VERSION 5
 } XrCocoaWindowBindingCreateInfoDXR;
 
+// --- XR_DXR_xlib_window_binding (desktop Linux, #249) ---
+// Third sibling of the win32 (HWND) / cocoa (NSView) bindings: hands the runtime
+// the app's own X11 window so it weaves there instead of self-hosting one.
+//
+// Xlib types are used deliberately by the extension (Display* / Window) — the
+// runtime converts to XCB internally via XGetXCBConnection and builds its surface
+// with VK_KHR_xcb_surface. We mirror the struct with `void *` / `unsigned long`
+// rather than including <X11/Xlib.h>, for the same reason the Vulkan structs are
+// mirrored here: this TU must not acquire an X11 build dependency, and the plugin
+// resolves Xlib at runtime via dlopen (displayxr_linux.c).
+//
+// CONTRACT WORTH REMEMBERING: the Display connection must OUTLIVE the session —
+// the runtime borrows it for the lifetime of the Vulkan surface. displayxr_linux.c
+// therefore keeps its XOpenDisplay connection open for the process lifetime.
+#define XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME "XR_DXR_xlib_window_binding"
+#define XR_DXR_XLIB_WINDOW_BINDING_SPEC_VERSION 2
+
+#define XR_TYPE_XLIB_WINDOW_BINDING_CREATE_INFO_DXR_PS ((XrStructureType)1004999200)
+
+typedef struct XrXlibWindowBindingCreateInfoDXR {
+    XrStructureType type;
+    const void *next;
+    void *xDisplay;                        // Display* from XOpenDisplay
+    unsigned long window;                  // X11 Window (XID)
+    XrBool32 transparentBackgroundEnabled; // SPEC_VERSION 2
+} XrXlibWindowBindingCreateInfoDXR;
+
 // --- XR_KHR_metal_enable ---
 // Hand-defined: the fetched OpenXR-SDK release-1.0.34 headers predate the
 // Metal enable extension (it landed in the 1.1.x line), so openxr_platform.h
