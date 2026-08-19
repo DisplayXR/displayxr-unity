@@ -5,6 +5,18 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.12.1] - Unreleased
+
+### Fixed
+- **The transparent-overlay hit test no longer CPU-skins and ray-scans renderers that aren't being drawn** (#254). `DisplayXRTransparentOverlay.clickableRenderers` drove an unconditional `SkinnedMeshRenderer.BakeMesh` plus a managed per-triangle Möller–Trumbore scan for **every** entry, active or not — an app that wires four ~50k-triangle characters into the list and then deactivates three of them was skinning and scanning ~167k triangles per frame, almost all of it for invisible objects. The bake path and both hit-test loops (Win32 and macOS) now apply the same `enabled && activeInHierarchy` criteria the silhouette-mask and union-rect paths already used, via one shared `IsHitTestable()` helper so the two can't drift.
+  - **Also a behaviour fix:** an invisible renderer used to stay clickable while being absent from the silhouette / `SetWindowRgn` click-through mask, so clicking and visibility disagreed. They now agree. Apps that deliberately relied on a `renderer.enabled = false` object still being clickable should deactivate a *collider* instead, or keep the renderer enabled with a transparent material.
+  - A renderer skipped while inactive has its cached bake invalidated on the way past, so reactivating it can never hit-test against the pose it held before deactivation — the first bake after reactivation re-arms it.
+- **Two ~600 KB-per-frame allocations in the bake path** (#254). The topology change-check read `entry.mesh.triangles.Length`, which materialises the entire `int[]` every frame purely to read a length off it and discard it; it now sums `Mesh.GetIndexCount()` over the submeshes (the same total `triangles[]` concatenates, and alloc-free). The vertex fetch moved from `Mesh.vertices` (a fresh `Vector3[]` per frame) to `Mesh.GetVertices(List<Vector3>)` into a persistent per-entry list. The bake path is now allocation-free in steady state.
+- **The per-triangle scan is bounds-gated** (#254). `TryRayHitBakedSkinnedMesh` now rejects on `SkinnedMeshRenderer.bounds.IntersectRay()` before walking triangles, so the linear scan only runs when the cursor ray is actually over the renderer. `updateWhenOffscreen` keeps those bounds tracking the skinned pose, and the file already documents that the bake-local→world transform reproduces `renderer.bounds` exactly, so the box and the triangles live in the same space. A bounds reject is an ordinary miss — the `STICKY_FRAMES` hysteresis is untouched.
+
+### Changed
+- **`package.json` now declares `com.unity.inputsystem` (>= 1.4.4)** (#254). The `Runtime` asmdef has always hard-referenced `Unity.InputSystem`, and `DisplayXRTransparentOverlay` calls `InputSystem.QueueStateEvent` / `Mouse.current` to keep standard input alive behind the cloaked HWND, but the manifest declared only `com.unity.xr.management` — so a project without the Input System installed hit an unresolved assembly reference. 1.4.4 is the version Unity 2022.3 LTS (the package's minimum editor) verifies, and the APIs in use all date to 1.0, so the floor is as low as it can usefully go and no project is forced past its verified version.
+
 ## [2.12.0] - 2026-08-09
 
 ### Added
