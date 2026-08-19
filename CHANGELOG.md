@@ -5,7 +5,7 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [2.12.1] - Unreleased
+## [2.12.1] - 2026-08-19
 
 ### Fixed
 - **The transparent-overlay hit test no longer CPU-skins and ray-scans renderers that aren't being drawn** (#254). `DisplayXRTransparentOverlay.clickableRenderers` drove an unconditional `SkinnedMeshRenderer.BakeMesh` plus a managed per-triangle Möller–Trumbore scan for **every** entry, active or not — an app that wires four ~50k-triangle characters into the list and then deactivates three of them was skinning and scanning ~167k triangles per frame, almost all of it for invisible objects. The bake path and both hit-test loops (Win32 and macOS) now apply the same `enabled && activeInHierarchy` criteria the silhouette-mask and union-rect paths already used, via one shared `IsHitTestable()` helper so the two can't drift.
