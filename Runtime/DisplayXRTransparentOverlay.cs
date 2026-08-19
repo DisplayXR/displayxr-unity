@@ -137,12 +137,35 @@ namespace DisplayXR
         private class BakedHit
         {
             public Mesh mesh;
-            public Vector3[] verts;
+            // Filled by Mesh.GetVertices(List) — reuses the list's own buffer.
+            // Mesh.vertices would hand back a fresh Vector3[] every frame
+            // (~600 KB at 50k verts). Indexed directly by the ray-triangle
+            // loop; copying it out to an array would only trade a List
+            // indexer for a per-frame memcpy of the same size (#254).
+            public readonly List<Vector3> verts = new List<Vector3>();
             public int[] tris;
+            // Total index count tris[] was fetched at. Compared against
+            // Mesh.GetIndexCount() — reading entry.mesh.triangles.Length
+            // instead allocates the whole int[] every frame to discard it (#254).
+            public int triIndexCount = -1;
             public int lastBakeFrame;
+            // False while the renderer is inactive/disabled: whatever is in
+            // verts[] is then a pre-deactivation pose, so nothing may hit-test
+            // against it until a fresh bake lands (#254).
+            public bool valid;
         }
         private static readonly Dictionary<SkinnedMeshRenderer, BakedHit> s_BakedHits
             = new Dictionary<SkinnedMeshRenderer, BakedHit>();
+
+        // Visibility criteria shared by the bake path, both hit-test loops, the
+        // union-rect path and the silhouette-mask path. clickableRenderers feeds
+        // BOTH clicking and the SetWindowRgn visibility shape, so the two must
+        // agree on what "present" means or an invisible object stays clickable
+        // while being absent from the click-through mask (#254).
+        private static bool IsHitTestable(Renderer r)
+        {
+            return r != null && r.enabled && r.gameObject.activeInHierarchy;
+        }
 
         // Per-pixel silhouette mask (Approach B+, #57). Each frame we
         // render the clickable renderers to a small R8 RenderTexture
@@ -426,7 +449,7 @@ namespace DisplayXR
                     for (int i = 0; i < clickableRenderers.Length; i++)
                     {
                         var r = clickableRenderers[i];
-                        if (r == null) continue;
+                        if (!IsHitTestable(r)) continue;
                         if (r is SkinnedMeshRenderer smrR)
                         {
                             if (TryRayHitBakedSkinnedMesh(ray, bestT, smrR, out float t))
@@ -689,7 +712,7 @@ namespace DisplayXR
                             for (int i = 0; i < clickableRenderers.Length; i++)
                             {
                                 var r = clickableRenderers[i];
-                                if (r == null) continue;
+                                if (!IsHitTestable(r)) continue;
                                 if (r is SkinnedMeshRenderer smrM)
                                 {
                                     if (TryRayHitBakedSkinnedMesh(rayM, bestTM, smrM, out float tM))
@@ -890,7 +913,13 @@ namespace DisplayXR
         {
             hitT = 0f;
             if (!s_BakedHits.TryGetValue(smr, out BakedHit entry)) return false;
-            if (entry.verts == null || entry.tris == null) return false;
+            if (!entry.valid || entry.tris == null || entry.verts.Count == 0) return false;
+            // Cheap world-space AABB reject before the managed per-triangle scan:
+            // with updateWhenOffscreen the SMR's bounds track the skinned pose, so
+            // a ray that misses the box cannot hit a triangle. Counts as an ordinary
+            // miss — identical to a failed scan, so the caller's STICKY_FRAMES
+            // hysteresis behaves exactly as before (#254).
+            if (!smr.bounds.IntersectRay(ray)) return false;
             var verts = entry.verts;
             var tris = entry.tris;
             // BakeMesh outputs verts already in world *units* (post-skinning,
@@ -945,9 +974,11 @@ namespace DisplayXR
         // register as misses, which the native overlay routes via
         // WM_NCHITTEST = HTTRANSPARENT.
         //
-        // BakeMesh costs ~1–3 ms per frame for a typical character mesh;
-        // the verts[] copy is one extra alloc per frame (Mesh.vertices
-        // returns a fresh array). Acceptable for a small clickable cast.
+        // BakeMesh costs ~1–3 ms per frame for a typical character mesh, so
+        // this only runs for renderers that are actually being drawn (#254) —
+        // a list holding four characters of which three are deactivated used
+        // to skin all four. The vertex fetch and the topology check are
+        // steady-state alloc-free; see BakedHit.
         //
         // No-op for non-skinned renderers (regular MeshRenderer): they keep
         // whatever collider the user attached and use Physics.Raycast.
@@ -959,6 +990,21 @@ namespace DisplayXR
             {
                 var smr = clickableRenderers[i] as SkinnedMeshRenderer;
                 if (smr == null) continue;
+
+                // Skip renderers that aren't being drawn — the bake is the
+                // expensive part of the whole hit test (a CPU skin plus a
+                // vertex copy per SMR per frame), and an invisible renderer
+                // must not be clickable anyway (same criteria as the
+                // silhouette-mask path). Invalidate any earlier bake on the
+                // way past so a reactivated renderer can't be hit-tested
+                // against its pre-deactivation pose; the next bake refills
+                // it (#254).
+                if (!IsHitTestable(smr))
+                {
+                    if (s_BakedHits.TryGetValue(smr, out BakedHit stale) && stale != null)
+                        stale.valid = false;
+                    continue;
+                }
 
                 if (!s_BakedHits.TryGetValue(smr, out BakedHit entry) || entry == null)
                 {
@@ -992,12 +1038,26 @@ namespace DisplayXR
                 if (entry.lastBakeFrame == frame) continue;
 
                 smr.BakeMesh(entry.mesh);
-                // Cache mesh data once when the topology stabilises; verts
-                // change every frame so we always re-fetch them.
-                entry.verts = entry.mesh.vertices;
-                if (entry.tris == null || entry.tris.Length != entry.mesh.triangles.Length)
+                // Verts change every frame so they're always re-fetched, but
+                // into the entry's persistent List — Mesh.vertices would return
+                // a fresh Vector3[] each frame (~600 KB at 50k verts).
+                entry.mesh.GetVertices(entry.verts);
+                // Topology is cached once it stabilises. The change check reads
+                // GetIndexCount(), NOT entry.mesh.triangles.Length: the latter
+                // materialises the whole int[] (~600 KB at 50k tris) every frame
+                // just to read a length off it and discard it. Summing over the
+                // submeshes is what triangles[] concatenates, so the two counts
+                // are directly comparable (#254).
+                int idxCount = 0;
+                for (int s = 0; s < entry.mesh.subMeshCount; s++)
+                    idxCount += (int)entry.mesh.GetIndexCount(s);
+                if (entry.tris == null || entry.triIndexCount != idxCount)
+                {
                     entry.tris = entry.mesh.triangles;
+                    entry.triIndexCount = idxCount;
+                }
                 entry.lastBakeFrame = frame;
+                entry.valid = true;
 
             }
         }
@@ -1254,8 +1314,7 @@ namespace DisplayXR
             for (int i = 0; i < clickableRenderers.Length; i++)
             {
                 var r = clickableRenderers[i];
-                if (r == null || !r.enabled || !r.gameObject.activeInHierarchy)
-                    continue;
+                if (!IsHitTestable(r)) continue;
                 if (!TryProjectBoundsToScreen(r.bounds, overlayW, overlayH,
                                                cyclopeanView, cyclopeanProj,
                                                out int rx, out int ry, out int rw, out int rh))
@@ -1435,14 +1494,14 @@ namespace DisplayXR
                 for (int i = 0; i < clickableRenderers.Length; i++)
                 {
                     var r = clickableRenderers[i];
-                    if (r == null || !r.enabled || !r.gameObject.activeInHierarchy) continue;
+                    if (!IsHitTestable(r)) continue;
                     DrawSilhouetteAllSubmeshes(r);
                 }
                 m_HitMaskCB.SetGlobalMatrix("_DXRViewProj", rVP);
                 for (int i = 0; i < clickableRenderers.Length; i++)
                 {
                     var r = clickableRenderers[i];
-                    if (r == null || !r.enabled || !r.gameObject.activeInHierarchy) continue;
+                    if (!IsHitTestable(r)) continue;
                     DrawSilhouetteAllSubmeshes(r);
                 }
             }
