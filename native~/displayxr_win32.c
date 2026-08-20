@@ -41,6 +41,16 @@
 
 static HWND s_overlay_hwnd = NULL;
 static WNDPROC s_original_wndproc = NULL;
+// (#256) The HWND parent_subclass_proc was installed on, remembered so the teardown
+// can restore s_original_wndproc onto the SAME window. find_unity_hwnd() is not a
+// safe substitute at teardown time — it can return a different top-level window than
+// the one that was subclassed (see the same caveat in displayxr_set_simple_window).
+static HWND s_parent_subclass_hwnd = NULL;
+// (#256) Posted to the overlay so its own (main) thread performs the destroy:
+// DestroyWindow is only valid on the creating thread, and the session-failure path
+// that triggers it runs on the render thread. Mirrors the DXR_WM_PARK_OFFSCREEN
+// PostMessage pattern used by shell mode.
+#define DXR_WM_DESTROY_OVERLAY (WM_APP + 0x38)
 static const wchar_t OVERLAY_CLASS_NAME[] = L"DisplayXROverlay";
 // (#173) Dedicated provider window class (editor Play Mode weave target). Declared
 // here alongside the overlay class so find_unity_hwnd can skip it too (a visible,
@@ -865,6 +875,13 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		InterlockedExchange(&s_overlay_close_requested, 1);
 		return 0;
 
+	// (#256) Teardown request marshalled from another thread. We are on the
+	// creating (main) thread here, so displayxr_destroy_app_overlay takes its
+	// direct arm and DestroyWindow is valid.
+	case DXR_WM_DESTROY_OVERLAY:
+		displayxr_destroy_app_overlay();
+		return 0;
+
 	default:
 		break;
 	}
@@ -1200,6 +1217,7 @@ displayxr_get_app_main_view(void)
 
 	s_original_wndproc = (WNDPROC)SetWindowLongPtrW(
 	    unity_hwnd, GWLP_WNDPROC, (LONG_PTR)parent_subclass_proc);
+	s_parent_subclass_hwnd = unity_hwnd;
 
 	displayxr_log("[DisplayXR] Created overlay HWND (%dx%d at %d,%d) on Unity window %p — %s\n",
 	              w, h, x, y, (void *)unity_hwnd,
@@ -2005,6 +2023,71 @@ displayxr_destroy_provider_dedicated_window(void)
 		displayxr_log("[DisplayXR] Destroying dedicated provider window %p (#173 teardown)\n", (void *)h);
 		DestroyWindow(h);
 	}
+}
+
+// (#256) Destroy the app-owned overlay created by displayxr_get_app_main_view and
+// undo everything that call installed. Two callers, one shape:
+//
+//   - GfxStart's session-start failure. The overlay is created in LifecycleStart,
+//     BEFORE the session is attempted, so a refusal (no runtime, unsupported GPU,
+//     cross-adapter guard) used to leak a TOPMOST window for the process lifetime —
+//     and in transparent mode it is created WITHOUT WS_EX_TRANSPARENT, so the orphan
+//     also swallowed every click over the app.
+//   - LifecycleStop, so the overlay does not outlive the subsystem on Windows either
+//     (previously only the editor's dedicated window was destroyed here).
+//
+// TEARDOWN ORDER matters and is the reverse of installation:
+//   1. Un-cloak / un-park Unity's window (no-op unless the transparent path applied
+//      it). Must precede the destroy: the restore rect is read off the overlay.
+//   2. Remove the focus hook's subclass, which was chained ON TOP of
+//      parent_subclass_proc — a WndProc chain must be unwound from the outside in.
+//   3. Restore parent_subclass_proc's saved original, verifying we are still the
+//      current proc so a foreign subclass installed since is never clobbered.
+//   4. Clear the overlay statics, THEN DestroyWindow — no surviving handler may see
+//      a dangling s_overlay_hwnd.
+//
+// Thread affinity: DestroyWindow is only valid on the creating (main) thread, so a
+// call from anywhere else is marshalled via PostMessage and returns immediately.
+// Idempotent. Never touches the #173 dedicated window (that has its own destroy).
+void
+displayxr_destroy_app_overlay(void)
+{
+	HWND h = s_overlay_hwnd;
+	if (h == NULL || h == s_dedicated_hwnd || !IsWindow(h))
+		return;
+
+	if (GetWindowThreadProcessId(h, NULL) != GetCurrentThreadId()) {
+		PostMessageW(h, DXR_WM_DESTROY_OVERLAY, 0, 0);
+		return;
+	}
+
+	displayxr_log("[DisplayXR] Destroying app overlay %p (#256 teardown)\n", (void *)h);
+
+	// 1. Restore Unity's own window if the transparent path hid it. Inert when it
+	//    didn't (s_overlay_active / s_simple_active are 0) — including the ordinary
+	//    case where the component's OnDisable already reverted it.
+	displayxr_set_transparent_overlay(0, 0);
+	displayxr_set_simple_window(0, 0);
+
+	// 2 + 3. Unwind the WndProc chain on Unity's window, outermost first.
+	displayxr_uninstall_focus_hook();
+	if (s_original_wndproc != NULL && s_parent_subclass_hwnd != NULL
+	    && IsWindow(s_parent_subclass_hwnd)) {
+		WNDPROC cur = (WNDPROC)GetWindowLongPtrW(s_parent_subclass_hwnd, GWLP_WNDPROC);
+		if (cur == parent_subclass_proc)
+			SetWindowLongPtrW(s_parent_subclass_hwnd, GWLP_WNDPROC,
+			                  (LONG_PTR)s_original_wndproc);
+		else
+			displayxr_log("[DisplayXR] app overlay teardown: Unity WndProc is not ours "
+			              "(%p) — leaving the chain alone\n", (void *)cur);
+	}
+	s_original_wndproc = NULL;
+	s_parent_subclass_hwnd = NULL;
+
+	// 4. Drop the overlay.
+	s_overlay_hwnd = NULL;
+	s_overlay_is_toplevel = 0;
+	DestroyWindow(h);
 }
 
 void *
@@ -3315,6 +3398,9 @@ displayxr_set_overlay_position(int x, int y)
 
 static HWND s_shell_unity_hwnd = NULL;
 static WNDPROC s_shell_original_wndproc = NULL;
+// File scope (not function-local) so displayxr_uninstall_focus_hook can clear it —
+// a later re-install must be able to re-patch. See both functions below.
+static int s_focus_hook_installed = 0;
 
 // Custom message: park the window off-screen + visible (handled synchronously
 // on the main UI thread by shell_subclass_proc). Posted from the render thread
@@ -3545,7 +3631,6 @@ displayxr_install_focus_hook(void *unity_hwnd)
 	// infinitely (s_shell_original_wndproc would point at our own subclass
 	// proc). Both shell mode and transparent overlay (#57) install this for
 	// the same reason: Unity needs to receive input while not OS-foreground.
-	static int s_focus_hook_installed = 0;
 	if (s_focus_hook_installed) {
 		s_shell_unity_hwnd = (HWND)unity_hwnd;
 		return 1;
@@ -3618,6 +3703,63 @@ displayxr_install_focus_hook(void *unity_hwnd)
 	        count, unity_hwnd);
 
 	return count > 0;
+}
+
+// (#256) Reverse displayxr_install_focus_hook. Needed on the app-overlay teardown
+// path: with no session there is no overlay for Unity to be "behind", so the lies
+// this hook tells (GetForegroundWindow/GetFocus always answer Unity, WM_ACTIVATE
+// deactivation suppressed, WM_KILLFOCUS reclaimed) become active harm — an ordinary
+// 2D window that can never lose focus.
+//
+// iat_hook matches on the value currently in the thunk, so passing (hook, real)
+// swaps the patch back. The wndproc restore is guarded on shell_subclass_proc still
+// being the outermost proc: anything else means a subclass was installed after ours
+// and unwinding here would break its chain.
+void
+displayxr_uninstall_focus_hook(void)
+{
+	if (!s_focus_hook_installed)
+		return;
+	s_focus_hook_installed = 0;
+
+	HWND hwnd = s_shell_unity_hwnd;
+	if (s_shell_original_wndproc != NULL && hwnd != NULL && IsWindow(hwnd)) {
+		WNDPROC cur = (WNDPROC)GetWindowLongPtrW(hwnd, GWLP_WNDPROC);
+		if (cur == shell_subclass_proc)
+			SetWindowLongPtrW(hwnd, GWLP_WNDPROC, (LONG_PTR)s_shell_original_wndproc);
+		else
+			displayxr_log("[DisplayXR] focus hook: Unity WndProc is not ours (%p) — "
+			              "leaving the chain alone\n", (void *)cur);
+	}
+	s_shell_original_wndproc = NULL;
+
+	HMODULE exe = GetModuleHandleW(NULL);
+	HMODULE unity_player = GetModuleHandleA("UnityPlayer.dll");
+	int count = 0;
+	if (s_real_GetForegroundWindow != NULL) {
+		count += iat_hook(exe, "user32.dll", (void *)hooked_GetForegroundWindow,
+		                  (void *)s_real_GetForegroundWindow, NULL);
+		count += iat_hook(unity_player, "user32.dll", (void *)hooked_GetForegroundWindow,
+		                  (void *)s_real_GetForegroundWindow, NULL);
+	}
+	if (s_real_GetFocus != NULL) {
+		count += iat_hook(exe, "user32.dll", (void *)hooked_GetFocus,
+		                  (void *)s_real_GetFocus, NULL);
+		count += iat_hook(unity_player, "user32.dll", (void *)hooked_GetFocus,
+		                  (void *)s_real_GetFocus, NULL);
+	}
+	if (s_real_RegisterRawInputDevices != NULL) {
+		count += iat_hook(exe, "user32.dll", (void *)hooked_RegisterRawInputDevices,
+		                  (void *)s_real_RegisterRawInputDevices, NULL);
+		count += iat_hook(unity_player, "user32.dll", (void *)hooked_RegisterRawInputDevices,
+		                  (void *)s_real_RegisterRawInputDevices, NULL);
+	}
+
+	// Keep the real pointers: the hooked_* thunks may still be executing on
+	// another thread as we unpatch, and they dereference these.
+	s_shell_unity_hwnd = NULL;
+	displayxr_log("[DisplayXR] Uninstalled focus/raw-input hooks (restored %d IAT entries)\n",
+	              count);
 }
 
 // --- Shell mouse state for C# ---

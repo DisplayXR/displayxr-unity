@@ -70,6 +70,24 @@ namespace DisplayXR
         // OnDisable branch on this so the editor / non-Win paths stay inert.
         private bool m_SimpleWindow;
 
+#if UNITY_STANDALONE_WIN
+        // (#256) Session gate for the Windows parent-window hiding. The cloak +
+        // off-screen move is only recoverable while something is drawing the overlay,
+        // so it is applied ONLY once the provider session is live and reverted if that
+        // session later goes away. Nothing else in this component may call the
+        // windowing natives — ApplyWindowing/RevertWindowing are the only sites.
+        private bool m_WindowingApplied;
+        private Coroutine m_WindowingCo;
+        // realtimeSinceStartup at which the session was first seen gone after the
+        // windowing was applied; -1 = session healthy (or not yet applied).
+        private float m_SessionLostSince = -1f;
+        // Seconds to wait for the session at enable, and to tolerate its loss after.
+        // Generous on both ends: the provider's OpenXR session starts on the render
+        // thread, and a mid-run restart must not trip the watchdog.
+        private const float SESSION_WAIT_SECONDS = 5f;
+        private const float SESSION_LOST_GRACE_SECONDS = 5f;
+#endif
+
         [Header("Hit testing")]
 
         [Tooltip("Renderers (must have colliders) that drive the pointer events. " +
@@ -323,6 +341,82 @@ namespace DisplayXR
             // doesn't drag the overlay off-screen following cloaked Unity.
 
             m_SimpleWindow = useSimpleWindow;
+            m_WindowingApplied = false;
+            m_SessionLostSince = -1f;
+
+            // (#256) DEFER the hiding until the provider session is actually live.
+            // Applying it unconditionally is what made a runtime-less machine show an
+            // app that "doesn't start": Unity's HWND cloaked + parked at (-32000,-32000)
+            // with a healthy DWM thumbnail and nothing on screen. A machine with no
+            // runtime at all never gets here (the loader declines in Initialize()), so
+            // this covers the residual cases — a session that refuses for another
+            // reason, or XR init that an app drives itself.
+            if (m_WindowingCo != null) StopCoroutine(m_WindowingCo);
+            m_WindowingCo = StartCoroutine(ApplyWindowingWhenSessionUp());
+#elif UNITY_STANDALONE_OSX
+            // (#85 Phase 1) Flip Unity's NSWindow opaque flag so the desktop
+            // shows through alpha=0 regions. Runtime handles its own
+            // CAMetalLayer + NSWindow via XR_DXR_cocoa_window_binding v5; the
+            // Unity-owned NSWindow is the app's responsibility. Skip in the
+            // editor unless we're in Play Mode — at edit time the game-view
+            // hasn't been built and we'd mutate the wrong window.
+            if (!Application.isEditor || Application.isPlaying)
+            {
+                Application.runInBackground = true;
+                DisplayXRNative.displayxr_macos_configure_unity_nswindow(1);
+            }
+#endif
+        }
+
+#if UNITY_STANDALONE_WIN
+        /// <summary>
+        /// (#256) Poll until the provider session is live, then hide Unity's own window.
+        /// <para>
+        /// What it gates on, and why both halves: <c>DisplayXRDisplayLoader.SubsystemRunning</c>
+        /// is what makes the native overlay HWND exist (LifecycleStart creates it), and
+        /// <c>DisplayXRProvider.IsRunning</c> is what makes hiding Unity's window
+        /// recoverable (something is drawing the overlay the user will see instead).
+        /// Neither alone is enough: the subsystem is running well before the session, and
+        /// the session flag can only ever be true when the subsystem is.
+        /// </para>
+        /// <para>
+        /// Healthy-path timing: XR-Management starts the subsystem before the first scene
+        /// loads, so at this OnEnable the subsystem is already up and the session is one
+        /// or two frames behind it (GfxStart runs on the render thread). The cloak
+        /// therefore lands a frame or two later than it used to. Nothing depends on
+        /// cloak-before-first-frame: the runtime composites the overlay from its own
+        /// DComp visuals (never from Unity's redirection surface), the #61 drag bracket
+        /// is driven by window messages after the fact, and the click-through mask is
+        /// pushed per-frame from LateUpdate. The visible cost is at most a couple of
+        /// frames of Unity's own window before it disappears.
+        /// </para>
+        /// </summary>
+        private System.Collections.IEnumerator ApplyWindowingWhenSessionUp()
+        {
+            float deadline = Time.realtimeSinceStartup + SESSION_WAIT_SECONDS;
+            while (Time.realtimeSinceStartup < deadline)
+            {
+                if (DisplayXRDisplayLoader.SubsystemRunning && DisplayXRProvider.IsRunning)
+                {
+                    ApplyWindowing();
+                    m_WindowingCo = null;
+                    yield break;
+                }
+                yield return null;
+            }
+            m_WindowingCo = null;
+            Debug.LogWarning("[DisplayXR] No DisplayXR session after " + SESSION_WAIT_SECONDS +
+                "s — leaving this app's window visible and skipping transparent-overlay " +
+                "windowing. The app runs as a standard 2D application. (Transparent-overlay " +
+                "mode needs a running DisplayXR runtime.)");
+        }
+
+        // The ONLY site that turns the parent-window hiding on. Paired with
+        // RevertWindowing; m_WindowingApplied is the single source of truth for whether
+        // the hit-test path below may touch the overlay.
+        private void ApplyWindowing()
+        {
+            if (m_WindowingApplied) return;
             if (m_SimpleWindow)
             {
                 // Avatar-style: style Unity's REAL HWND borderless. Dormant / not
@@ -339,20 +433,24 @@ namespace DisplayXR
             // Default hit rect = whole window until LateUpdate refines it.
             DisplayXRNative.displayxr_set_overlay_hit_rect(
                 0, 0, Screen.width, Screen.height);
-#elif UNITY_STANDALONE_OSX
-            // (#85 Phase 1) Flip Unity's NSWindow opaque flag so the desktop
-            // shows through alpha=0 regions. Runtime handles its own
-            // CAMetalLayer + NSWindow via XR_DXR_cocoa_window_binding v5; the
-            // Unity-owned NSWindow is the app's responsibility. Skip in the
-            // editor unless we're in Play Mode — at edit time the game-view
-            // hasn't been built and we'd mutate the wrong window.
-            if (!Application.isEditor || Application.isPlaying)
-            {
-                Application.runInBackground = true;
-                DisplayXRNative.displayxr_macos_configure_unity_nswindow(1);
-            }
-#endif
+            m_WindowingApplied = true;
+            m_SessionLostSince = -1f;
         }
+
+        // The ONLY site that turns it back off — OnDisable and the session-loss
+        // watchdog both route through here so an app can never be left cloaked.
+        private void RevertWindowing()
+        {
+            if (!m_WindowingApplied) return;
+            m_WindowingApplied = false;
+            m_SessionLostSince = -1f;
+            if (m_SimpleWindow)
+                DisplayXRNative.displayxr_set_simple_window(0, 0);
+            else
+                DisplayXRNative.displayxr_set_transparent_overlay(0, 0);
+            DisplayXRNative.displayxr_set_overlay_hit_active(0);
+        }
+#endif
 
         // Hit-test runs in LateUpdate (not Update) so BakeMesh captures the
         // CURRENT frame's animated pose. Unity's animation step runs between
@@ -367,6 +465,37 @@ namespace DisplayXR
 #if UNITY_STANDALONE_WIN
             if (Application.isEditor || m_Camera == null)
                 return;
+
+            // (#256) Reverse watchdog. Nothing else un-cloaks Unity if the session dies
+            // mid-run without this component being disabled: the driver simply goes
+            // quiet on !is_running, and only the runtime-requested exit path reaches
+            // Application.Quit() (→ OnDisable → RevertWindowing). Left alone, a lost
+            // session means a permanently invisible app. The grace period keeps a
+            // subsystem restart from flapping the window.
+            if (!m_WindowingApplied)
+                return; // windowing not on: the overlay is not ours to drive
+            if (DisplayXRProvider.IsRunning)
+            {
+                m_SessionLostSince = -1f;
+            }
+            else if (m_SessionLostSince < 0f)
+            {
+                m_SessionLostSince = Time.realtimeSinceStartup;
+                return;
+            }
+            else if (Time.realtimeSinceStartup - m_SessionLostSince > SESSION_LOST_GRACE_SECONDS)
+            {
+                Debug.LogWarning("[DisplayXR] DisplayXR session lost for more than " +
+                    SESSION_LOST_GRACE_SECONDS + "s — restoring this app's own window so it " +
+                    "stays visible (transparent-overlay windowing off).");
+                RevertWindowing();
+                return;
+            }
+            else
+            {
+                return; // inside the grace window — nothing to drive yet
+            }
+
             if (clickableRenderers == null || clickableRenderers.Length == 0)
                 return;
             // Multi-rig gate: only the active rig drives hit_active.
@@ -835,14 +964,13 @@ namespace DisplayXR
         void OnDisable()
         {
 #if UNITY_STANDALONE_WIN
-            if (!Application.isEditor)
+            if (m_WindowingCo != null)
             {
-                if (m_SimpleWindow)
-                    DisplayXRNative.displayxr_set_simple_window(0, 0);
-                else
-                    DisplayXRNative.displayxr_set_transparent_overlay(0, 0);
-                DisplayXRNative.displayxr_set_overlay_hit_active(0);
+                StopCoroutine(m_WindowingCo);
+                m_WindowingCo = null;
             }
+            if (!Application.isEditor)
+                RevertWindowing();
             ReleaseHitMaskResources();
 #elif UNITY_STANDALONE_OSX
             if (!Application.isEditor || Application.isPlaying)

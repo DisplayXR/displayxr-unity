@@ -55,8 +55,35 @@ namespace DisplayXR
         /// <summary>The created display subsystem (null until Initialize succeeds).</summary>
         public XRDisplaySubsystem DisplaySubsystem => GetLoadedSubsystem<XRDisplaySubsystem>();
 
+        /// <summary>
+        /// True between a successful <see cref="Start"/> and the matching <see cref="Stop"/>
+        /// — i.e. while the native display subsystem is running. NOT the same as
+        /// <see cref="DisplayXRProvider.IsRunning"/>, which additionally requires the
+        /// OpenXR session (started on the render thread in GfxStart, so it lags this by a
+        /// frame or two even in a healthy run). Window-mutating components gate on the
+        /// pair — see DisplayXRTransparentOverlay (#256).
+        /// </summary>
+        internal static bool SubsystemRunning { get; private set; }
+
         public override bool Initialize()
         {
+            // GRACEFUL 2D FALLBACK (#256/#257). Decline BEFORE anything is created: the
+            // native LifecycleStart is the only site that creates the "DisplayXR Overlay"
+            // HWND, and it runs before the session is ever attempted — so on a machine
+            // with no runtime the session refusal used to arrive too late, leaving a
+            // TOPMOST orphan overlay and (for transparent apps) a cloaked Unity window.
+            // Returning false here means XR-Management proceeds without the subsystem and
+            // Unity renders normally into its own window. Same probe the public
+            // DisplayXRRuntime API exposes, which is the same resolution the native
+            // session start performs.
+            if (DisplayXRRuntime.ProbeSupported && !DisplayXRRuntime.IsInstalled)
+            {
+                Debug.LogWarning("[DisplayXR] No DisplayXR runtime found on this machine — " +
+                    "XR disabled, running as a standard 2D application. (Install the DisplayXR " +
+                    "runtime for 3D; set XR_RUNTIME_JSON to override.)");
+                return false;
+            }
+
             // macOS EDITOR gate (#204): built players run the full zero-copy Metal
             // pipeline, but the Unity EDITOR SEGVs in its Metal GfxDeviceWorker
             // (CreateColorRenderSurface NULL deref) whenever it allocates a new
@@ -200,11 +227,13 @@ namespace DisplayXR
                 Debug.Log("[DisplayXR] Provider: editor GameView texture mode → preferred mirror blit mode = LeftEye (#740)");
             }
             DisplayXRProviderDriver.EnsureInstance();
+            SubsystemRunning = true;
             return true;
         }
 
         public override bool Stop()
         {
+            SubsystemRunning = false;
             DisplayXRProviderDriver.DestroyInstance();
             StopSubsystem<XRDisplaySubsystem>();
             return true;

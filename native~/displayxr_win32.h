@@ -18,6 +18,15 @@ extern "C" {
 /// @return HWND cast to void*, or NULL if no window found.
 void *displayxr_get_app_main_view(void);
 
+/// (#256) Destroy the app-owned overlay from displayxr_get_app_main_view and undo
+/// what that call installed (Unity-window subclass, focus hook, and any transparent-
+/// mode cloak/off-screen park). Call on session-start failure — the overlay is
+/// created BEFORE the session is attempted, so a refusal would otherwise leak a
+/// TOPMOST, click-eating window for the process lifetime — and from LifecycleStop so
+/// it does not outlive the subsystem. Safe from any thread (marshalled to the
+/// creating thread when needed). Idempotent; never touches the #173 dedicated window.
+void displayxr_destroy_app_overlay(void);
+
 /// Get Unity's top-level HWND without creating an overlay child window.
 /// For shell/IPC mode where the compositor uses IPC swapchain textures.
 /// @return HWND cast to void*, or NULL if no window found.
@@ -68,6 +77,12 @@ int displayxr_is_shell_mode(void);
 /// @param unity_hwnd The Unity main HWND.
 /// @return 1 on success, 0 on failure.
 int displayxr_install_focus_hook(void *unity_hwnd);
+
+/// (#256) Reverse displayxr_install_focus_hook: restore the patched IAT entries and
+/// Unity's original WndProc. Without a live session there is nothing for Unity to be
+/// "behind", and the hook's lies (always-foreground, suppressed deactivation) turn a
+/// plain 2D window into one that can never lose focus. Idempotent.
+void displayxr_uninstall_focus_hook(void);
 
 /// Shell mode: ask the main UI thread to park the app window far OFF-SCREEN
 /// while keeping it visible (WS_VISIBLE), so Unity keeps rendering into the XR
