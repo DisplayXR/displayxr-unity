@@ -10,6 +10,26 @@ namespace DisplayXR
     /// Camera-centric stereo rig. Attach to a Camera whose transform represents the
     /// viewer pose. The camera's vertical FOV is inherited as the rendering FOV.
     /// Exposes only: IPD, parallax, and inverse convergence distance.
+    /// <para>
+    /// <b>2D fallback (#256): this rig needs no code at all — drop the convergence and
+    /// that is the whole story.</b> Its transform already IS a viewer position and its
+    /// FOV is the camera's own, so with no DisplayXR runtime Unity renders the authored
+    /// viewpoint unchanged. And the convergence drops itself: <see cref="invConvergenceDistance"/>
+    /// leaves managed code ONLY via <see cref="GetProviderTunables"/> → the provider
+    /// driver → <c>dxr_prov_set_tunables</c>, i.e. a native tunable consumed at
+    /// <c>xrLocateViews</c>. With no session there is no driver (the loader never
+    /// creates one), nothing is pushed, and nothing consumes it. Nothing camera-side —
+    /// no projection override, no lens shift, no eye/anchor offset — is derived from it
+    /// anywhere in managed code; the only other reader is the editor gizmo. The BiRP
+    /// foreground-clip pass is likewise attached disabled and only ever enabled inside a
+    /// <c>DisplayXRProviderDriver.IsActive</c> branch. So the camera renders as a
+    /// completely plain camera with no gating required.
+    /// </para>
+    /// <para>
+    /// Only <see cref="DisplayXRDisplay"/> needs a fallback adjustment: its transform is
+    /// the virtual DISPLAY PLANE, so a non-stereo camera sits on that plane and clips
+    /// through the content. See <c>DisplayXRDisplay.ApplyTwoDFallbackPullback</c>.
+    /// </para>
     /// </summary>
     [AddComponentMenu("DisplayXR/Camera-Centric Rig")]
     [DisallowMultipleComponent]

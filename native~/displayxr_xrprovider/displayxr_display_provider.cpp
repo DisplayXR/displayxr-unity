@@ -117,6 +117,11 @@ extern "C" void *displayxr_get_unity_main_hwnd(void);
 extern "C" void *displayxr_create_provider_dedicated_window(void);
 // (#173) Destroy that window on teardown so it doesn't linger frozen after Play stop.
 extern "C" void  displayxr_destroy_provider_dedicated_window(void);
+// (#256) Destroy the app-owned overlay + undo the Unity-window subclass / focus hook
+// it installed. The overlay is created in LifecycleStart, BEFORE the session is
+// attempted, so without this a session refusal leaves a TOPMOST, click-eating orphan
+// for the process lifetime. Safe from any thread; see displayxr_win32.h.
+extern "C" void  displayxr_destroy_app_overlay(void);
 #endif
 
 // Must match Runtime/UnitySubsystemsManifest.json ("name" + display "id").
@@ -930,6 +935,20 @@ GfxStart(UnitySubsystemHandle handle, void *userData, UnityXRRenderingCapabiliti
 	// runtime_json = NULL -> resolve from XR_RUNTIME_JSON (sim_display bring-up).
 	if (!dxr_prov_session_start(nullptr, backend_kind, dev_ptr, queue_ptr, overlay_hwnd)) {
 		prov_log("[DisplayXR-PROV] dxr_prov_session_start failed\n");
+#ifdef _WIN32
+		// (#256) No session ⇒ nothing will ever draw into the overlay LifecycleStart
+		// created, and Unity is about to go on rendering into its own window. Take the
+		// overlay (and the Unity-window subclass/focus hook installed alongside it) back
+		// down so the app degrades to a normal, visible 2D window instead of sitting
+		// behind a TOPMOST orphan that eats clicks. We are on the RENDER thread here —
+		// the destroy marshals itself to the window's creating thread. Scoped to the
+		// app-window mode: the editor's dedicated window (#173) has its own teardown in
+		// LifecycleStop and must survive a failed start so Play-stop can log/see it.
+		if (!shell && !prov_want_dedicated_window() && prov_want_app_window()) {
+			displayxr_destroy_app_overlay();
+			s_overlay_hwnd = nullptr;
+		}
+#endif
 		return kUnitySubsystemErrorCodeFailure;
 	}
 	s_session_active = true;
@@ -1922,6 +1941,16 @@ LifecycleStop(UnitySubsystemHandle handle, void *userData)
 #ifdef _WIN32
 	if (prov_want_dedicated_window()) {
 		displayxr_destroy_provider_dedicated_window();
+		s_overlay_hwnd = nullptr;
+	} else {
+		// (#256) Built players: drop the app-owned overlay too. It used to outlive the
+		// subsystem — only the editor's dedicated window was destroyed here — so a
+		// subsystem that stopped without the process exiting left a TOPMOST window with
+		// a frozen last frame in front of a still-running app. Same ordering guarantee
+		// as the #173 branch: MAIN thread, after GfxStop ran dxr_prov_session_stop, so
+		// xrDestroySession has already released the runtime's references into it. No-op
+		// in shell/self-host mode (no overlay was created).
+		displayxr_destroy_app_overlay();
 		s_overlay_hwnd = nullptr;
 	}
 #elif defined(__APPLE__)

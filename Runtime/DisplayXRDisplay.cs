@@ -110,6 +110,93 @@ namespace DisplayXR
             m_PostAA.enabled = postProcessAntiAliasing && DisplayXRPostAA.SupportedForCurrentStereoMode();
         }
 
+        void Start()
+        {
+            ApplyTwoDFallbackPullback();
+        }
+
+        /// <summary>
+        /// (#256) 2D-fallback framing. This rig treats its transform as the VIRTUAL
+        /// DISPLAY PLANE — the driver sends exactly this pose to the runtime as the
+        /// display pose, and the Kooima projection puts the eyes in front of it. With no
+        /// DisplayXR runtime there is no Kooima and no eye offset, so Unity renders a
+        /// plain perspective camera sitting *on* the display plane: near-clipping through
+        /// the content the scene was authored to show. The graceful 2D path was visible
+        /// but showed the inside of the avatar mesh.
+        /// <para>
+        /// The rig owns both numbers needed to fix it. Backing the camera out along its
+        /// own −forward by <c>D = (H / 2) / tan(fov / 2)</c> makes the frustum intercept
+        /// the virtual display's height exactly at the former display plane, so the 2D
+        /// view frames what the 3D view framed. (vHeight 2, 60° → D = 1.732.)
+        /// </para>
+        /// <para>
+        /// Runtime-only: it moves the live transform in Play Mode and touches nothing
+        /// serialized. One-shot at Start — never re-evaluated, so it cannot fight a
+        /// script that repositions the camera afterwards.
+        /// </para>
+        /// </summary>
+        void ApplyTwoDFallbackPullback()
+        {
+            if (!Application.isPlaying) return;
+
+            // THE GATE — "XR is not going to run", not merely "is not running now".
+            //
+            // DisplayXRDisplayLoader.SubsystemRunning == false alone is NOT sufficient:
+            // the editor's dock/undock auto-switch restarts the subsystem mid-Play
+            // (Stop → Start), which would drag the camera back another D every time.
+            // Nor is a "loader declined" flag sufficient on its own — the canonical
+            // 2D-fallback pattern from #257 sets XRGeneralSettings.InitManagerOnStart =
+            // false, so Initialize() never runs and never gets to decline.
+            //
+            // DisplayXRRuntime.IsInstalled covers both and is restart-immune: it is a
+            // cached machine-level fact (no runtime manifest resolves ⇒ no session can
+            // ever start in this process), so a subsystem restart cannot flip it.
+            // SubsystemRunning is kept as belt-and-braces: never pull back while the
+            // subsystem is in fact up. ProbeSupported keeps platforms with no managed
+            // probe (where IsInstalled is uninformative) on the existing behavior.
+            if (!DisplayXRRuntime.ProbeSupported) return;
+            if (DisplayXRRuntime.IsInstalled) return;
+            if (DisplayXRDisplayLoader.SubsystemRunning) return;
+
+            // The boot splash owns its own framing and destroys itself seconds later.
+            if (bootSplashOverlay) return;
+
+            var cam = m_Camera != null ? m_Camera : GetComponent<Camera>();
+            if (cam == null || !cam.enabled) return;
+
+            // Vertical FOV — Unity's Camera.fieldOfView. The 3D rig ignores it (the
+            // display geometry defines the frustum); in 2D Unity honors it, which is
+            // exactly why it is the right number here.
+            float fov = cam.fieldOfView;
+            if (!(fov > 0.01f) || fov >= 179.99f) return;
+            float tanHalf = Mathf.Tan(fov * 0.5f * Mathf.Deg2Rad);
+            if (!(tanHalf > 1e-4f)) return;
+
+            // World-space height of the virtual display. virtualDisplayHeight is a LOCAL
+            // measure — the gizmo draws the display quad through localToWorldMatrix — so
+            // the frustum must intercept height * lossyScale.y. (Note this is not the
+            // driver's `vdh /= scale`: that folds scale into the metric the RUNTIME owns
+            // to get scale-as-zoom; here we need plain world units for a transform move.)
+            float height = virtualDisplayHeight;
+            if (height <= 0f)
+            {
+                // 0 means "use the physical display height", which is unknowable with no
+                // session. Fall back to the same nominal the gizmos use for an unknown
+                // display, so such a scene still gets a proportionate pull-back.
+                height = 0.2f;
+            }
+            float scaleY = Mathf.Abs(transform.lossyScale.y);
+            if (!(scaleY > 1e-4f)) return;
+            float worldHeight = height * scaleY;
+
+            float d = (worldHeight * 0.5f) / tanHalf;
+            if (!(d > 1e-4f) || float.IsNaN(d) || float.IsInfinity(d)) return;
+
+            transform.position -= transform.forward * d;
+            Debug.Log($"[DisplayXR] 2D fallback: camera moved back {d:F2} units so a " +
+                      $"{fov:F0}° camera frames the virtual display (height {worldHeight:F2}).");
+        }
+
         void OnDisable()
         {
             if (m_UsingSRP)
