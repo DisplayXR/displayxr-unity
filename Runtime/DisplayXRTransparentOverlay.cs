@@ -1,4 +1,4 @@
-// Copyright 2026, DisplayXR contributors
+﻿// Copyright 2026, DisplayXR contributors
 // SPDX-License-Identifier: Apache-2.0
 
 using System;
@@ -199,10 +199,31 @@ namespace DisplayXR
         // Resolution kept low intentionally — the region only needs to
         // be silhouette-accurate, not feature-accurate. Higher values
         // increase readback cost and region complexity (more RECTs).
-        private const int  HIT_MASK_WIDTH  = 256;
-        private const int  HIT_MASK_HEIGHT = 144;
+        // (#259) The mask raster SCALES with the overlay. The region it
+        // drives is a VISUAL clip (SetWindowRgn shapes the window), not just
+        // a hit mask: a fixed 256x144 raster is ~15 px per texel on a 4K
+        // window, so a feature thinner than a texel (a hat brim edge-on)
+        // fails to rasterize and is CUT FROM THE PICTURE, not merely
+        // unclickable. ~4 px per texel, floored at the old fixed size,
+        // capped so the readback and native RLE stay cheap.
+        private const int  HIT_MASK_TEXEL_PX   = 4;
+        private const int  HIT_MASK_MIN_WIDTH  = 256;
+        private const int  HIT_MASK_MIN_HEIGHT = 144;
+        private const int  HIT_MASK_MAX_WIDTH  = 640;
+        private const int  HIT_MASK_MAX_HEIGHT = 512;
+        // Margin the dilation must reach in WINDOW pixels. Sized for the
+        // visual consumer: it absorbs AA edges, sub-pixel mismatch, AND the
+        // readback's 1-2 frames of latency while the silhouette moves (a
+        // head turn sweeps the brim tens of px between request and apply).
+        private const int  HIT_MASK_MARGIN_PX  = 24;
+        private int m_HitMaskW = HIT_MASK_MIN_WIDTH;
+        private int m_HitMaskH = HIT_MASK_MIN_HEIGHT;
         private RenderTexture m_HitMaskRT;
         private RenderTexture m_HitMaskDilatedRT;
+        private RenderTexture m_HitMaskDilatedRT2;   // ping-pong for multi-pass dilate
+        // Mask dimensions captured at request time (the raster can resize
+        // between request and callback).
+        private int  m_HitMaskPendingW, m_HitMaskPendingH;
         private Material      m_SilhouetteMat;
         private Material      m_SilhouetteDilateMat;
         private CommandBuffer m_HitMaskCB;
@@ -1482,30 +1503,37 @@ namespace DisplayXR
                 m_HitMaskCB.DrawRenderer(r, m_SilhouetteMat, s, 0);
         }
 
-        void EnsureHitMaskResources()
+        static RenderTexture MakeHitMaskRT(int w, int h)
         {
-            if (m_HitMaskRT == null)
+            var rt = new RenderTexture(w, h, 0, RenderTextureFormat.R8)
             {
-                m_HitMaskRT = new RenderTexture(HIT_MASK_WIDTH, HIT_MASK_HEIGHT,
-                                                0, RenderTextureFormat.R8)
-                {
-                    filterMode  = FilterMode.Point,
-                    useMipMap   = false,
-                    autoGenerateMips = false,
-                };
-                m_HitMaskRT.Create();
-            }
-            if (m_HitMaskDilatedRT == null)
+                filterMode  = FilterMode.Point,
+                useMipMap   = false,
+                autoGenerateMips = false,
+            };
+            rt.Create();
+            return rt;
+        }
+
+        void EnsureHitMaskResources(int overlayW, int overlayH)
+        {
+            // Raster sized from the overlay (~HIT_MASK_TEXEL_PX window px per
+            // texel). Never resized under an in-flight readback: the callback
+            // interprets the bytes with the dimensions captured at request.
+            int wantW = Mathf.Clamp(overlayW / HIT_MASK_TEXEL_PX,
+                                    HIT_MASK_MIN_WIDTH,  HIT_MASK_MAX_WIDTH);
+            int wantH = Mathf.Clamp(overlayH / HIT_MASK_TEXEL_PX,
+                                    HIT_MASK_MIN_HEIGHT, HIT_MASK_MAX_HEIGHT);
+            if (!m_HitMaskReadbackPending && (wantW != m_HitMaskW || wantH != m_HitMaskH))
             {
-                m_HitMaskDilatedRT = new RenderTexture(HIT_MASK_WIDTH, HIT_MASK_HEIGHT,
-                                                       0, RenderTextureFormat.R8)
-                {
-                    filterMode  = FilterMode.Point,
-                    useMipMap   = false,
-                    autoGenerateMips = false,
-                };
-                m_HitMaskDilatedRT.Create();
+                m_HitMaskW = wantW; m_HitMaskH = wantH;
+                if (m_HitMaskRT         != null) { m_HitMaskRT.Release();         Destroy(m_HitMaskRT);         m_HitMaskRT         = null; }
+                if (m_HitMaskDilatedRT  != null) { m_HitMaskDilatedRT.Release();  Destroy(m_HitMaskDilatedRT);  m_HitMaskDilatedRT  = null; }
+                if (m_HitMaskDilatedRT2 != null) { m_HitMaskDilatedRT2.Release(); Destroy(m_HitMaskDilatedRT2); m_HitMaskDilatedRT2 = null; }
             }
+            if (m_HitMaskRT         == null) m_HitMaskRT         = MakeHitMaskRT(m_HitMaskW, m_HitMaskH);
+            if (m_HitMaskDilatedRT  == null) m_HitMaskDilatedRT  = MakeHitMaskRT(m_HitMaskW, m_HitMaskH);
+            if (m_HitMaskDilatedRT2 == null) m_HitMaskDilatedRT2 = MakeHitMaskRT(m_HitMaskW, m_HitMaskH);
             if (m_SilhouetteMat == null)
             {
                 Shader s = Shader.Find("Hidden/DisplayXR/Silhouette");
@@ -1555,9 +1583,9 @@ namespace DisplayXR
             if (clickableRenderers == null || clickableRenderers.Length == 0)
                 return;
 
-            EnsureHitMaskResources();
-            if (m_SilhouetteMat == null) return;
             if (m_HitMaskReadbackPending) return;
+            EnsureHitMaskResources(overlayW, overlayH);
+            if (m_SilhouetteMat == null) return;
 
             // Convert OpenXR-convention view matrices (right-handed,
             // -Z forward in world space) to Unity-convention (left-
@@ -1634,15 +1662,29 @@ namespace DisplayXR
                 }
             }
 
-            // Dilate the union by ~2 mask pixels to absorb AA-edge
-            // pixels at the silhouette boundary. Falls back to a
-            // direct readback of m_HitMaskRT if the dilation shader
-            // is unavailable.
+            // Dilate the union until the margin reaches HIT_MASK_MARGIN_PX in
+            // WINDOW pixels (the 5x5 max kernel adds 2 texels per pass; the
+            // shader reads _MainTex_TexelSize, so ping-pong passes compose).
+            // The margin is a visual-clip safety, not a hit-test nicety: any
+            // pixel the region misses is a pixel of the picture that is not
+            // drawn. Falls back to a direct readback of m_HitMaskRT if the
+            // dilation shader is unavailable.
             RenderTexture readbackRT;
             if (m_SilhouetteDilateMat != null && m_HitMaskDilatedRT != null)
             {
-                m_HitMaskCB.Blit(m_HitMaskRT, m_HitMaskDilatedRT, m_SilhouetteDilateMat);
-                readbackRT = m_HitMaskDilatedRT;
+                float texelPx = Mathf.Max(1f, (float)overlayW / m_HitMaskW);
+                int passes = Mathf.Clamp(
+                    Mathf.CeilToInt(HIT_MASK_MARGIN_PX / (2f * texelPx)), 1, 6);
+                RenderTexture src = m_HitMaskRT;
+                for (int pass = 0; pass < passes; pass++)
+                {
+                    RenderTexture dst = ((pass & 1) == 0) ? m_HitMaskDilatedRT
+                                                          : m_HitMaskDilatedRT2;
+                    if (dst == null) break;
+                    m_HitMaskCB.Blit(src, dst, m_SilhouetteDilateMat);
+                    src = dst;
+                }
+                readbackRT = src;
             }
             else
             {
@@ -1653,6 +1695,8 @@ namespace DisplayXR
 
             m_HitMaskPendingDstW = overlayW;
             m_HitMaskPendingDstH = overlayH;
+            m_HitMaskPendingW = m_HitMaskW;
+            m_HitMaskPendingH = m_HitMaskH;
             m_HitMaskReadbackPending = true;
             AsyncGPUReadback.Request(readbackRT, 0, OnHitMaskReadback);
         }
@@ -1671,31 +1715,32 @@ namespace DisplayXR
                     .NativeArrayUnsafeUtility.GetUnsafeReadOnlyPtr(data);
                 DisplayXRNative.displayxr_set_overlay_hit_mask(
                     ptr,
-                    HIT_MASK_WIDTH, HIT_MASK_HEIGHT,
+                    m_HitMaskPendingW, m_HitMaskPendingH,
                     m_HitMaskPendingDstW, m_HitMaskPendingDstH);
             }
             if (s_DumpHitMask && (m_HitMaskDumpCounter++ % 15) == 0)
-                DumpHitMaskPng(data);
+                DumpHitMaskPng(data, m_HitMaskPendingW, m_HitMaskPendingH);
 #endif
         }
 
         // Debug: encode the R8 hit-mask readback to a grayscale PNG so the silhouette
         // coverage (which region SetWindowRgn keeps visible) can be inspected. The mask
-        // is HIT_MASK_WIDTH×HIT_MASK_HEIGHT, one byte per pixel, row 0 = top.
-        void DumpHitMaskPng(Unity.Collections.NativeArray<byte> data)
+        // is w×h (the raster size captured at request), one byte per pixel,
+        // row 0 = top.
+        void DumpHitMaskPng(Unity.Collections.NativeArray<byte> data, int w, int h)
         {
             try
             {
-                int n = HIT_MASK_WIDTH * HIT_MASK_HEIGHT;
+                int n = w * h;
                 if (data.Length < n) return;
-                var tex = new Texture2D(HIT_MASK_WIDTH, HIT_MASK_HEIGHT, TextureFormat.RGBA32, false);
+                var tex = new Texture2D(w, h, TextureFormat.RGBA32, false);
                 var px = new Color32[n];
                 for (int i = 0; i < n; i++)
                 {
                     byte v = data[i];
                     // Flip vertically: PNG row 0 = bottom, mask row 0 = top.
-                    int x = i % HIT_MASK_WIDTH, y = i / HIT_MASK_WIDTH;
-                    px[(HIT_MASK_HEIGHT - 1 - y) * HIT_MASK_WIDTH + x] = new Color32(v, v, v, 255);
+                    int x = i % w, y = i / w;
+                    px[(h - 1 - y) * w + x] = new Color32(v, v, v, 255);
                 }
                 tex.SetPixels32(px);
                 tex.Apply(false);
@@ -1704,7 +1749,7 @@ namespace DisplayXR
                 string path = System.IO.Path.Combine(
                     System.Environment.GetEnvironmentVariable("TEMP") ?? ".", "displayxr_hitmask.png");
                 System.IO.File.WriteAllBytes(path, png);
-                Debug.Log($"[DisplayXR] hit-mask dumped to {path} ({HIT_MASK_WIDTH}x{HIT_MASK_HEIGHT})");
+                Debug.Log($"[DisplayXR] hit-mask dumped to {path} ({w}x{h})");
             }
             catch (System.Exception e) { Debug.LogWarning($"[DisplayXR] hit-mask dump failed: {e.Message}"); }
         }
@@ -1727,6 +1772,7 @@ namespace DisplayXR
                 Destroy(m_HitMaskDilatedRT);
                 m_HitMaskDilatedRT = null;
             }
+            if (m_HitMaskDilatedRT2 != null) { m_HitMaskDilatedRT2.Release(); Destroy(m_HitMaskDilatedRT2); m_HitMaskDilatedRT2 = null; }
             if (m_SilhouetteMat != null)
             {
                 Destroy(m_SilhouetteMat);
