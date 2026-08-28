@@ -202,6 +202,12 @@ static volatile LONG s_overlay_cursor = 0;
 // keep calling _hit_rect for opaque-mode users; the rect just becomes
 // hit-test bookkeeping in transparent mode, not the routing driver.
 static int   s_hit_mask_active    = 0;
+// (#259) FNV-1a of the last applied hit-mask region (rects + dst size).
+// SetWindowRgn was called EVERY FRAME with bRedraw=TRUE even when the region
+// was identical, forcing a repaint invalidation 60x/s -- visible as flicker at
+// the region boundary while the window is dragged. Identical regions are now
+// skipped. 0 = no region applied / unknown (always apply next time).
+static unsigned long long s_hit_mask_region_hash = 0;
 
 // (#131) Opaque surround rect (overlay client pixels, top-left origin) for a 2D
 // element drawn in the surround region — e.g. a high-res text bubble — that must
@@ -2471,6 +2477,7 @@ displayxr_set_simple_window(int enabled, int topmost)
 			s_simple_orig_wndproc = NULL;
 		}
 		SetWindowRgn(hwnd, NULL, TRUE);
+		s_hit_mask_region_hash = 0;
 		SetWindowLongPtrW(hwnd, GWL_STYLE, (LONG_PTR)s_simple_saved_style);
 		SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (LONG_PTR)s_simple_saved_exstyle);
 		SetWindowPos(hwnd, HWND_NOTOPMOST, 0, 0, 0, 0,
@@ -2542,8 +2549,10 @@ apply_window_decoration(int decorated)
 	// Decorated: clear the silhouette region so the whole framed window is
 	// grabbable/visible. Borderless: the next hit-mask push re-shapes it (the
 	// region path skips updates while decorated — see region_target_ready).
-	if (s_window_decorated)
+	if (s_window_decorated) {
 		SetWindowRgn(hwnd, NULL, TRUE);
+		s_hit_mask_region_hash = 0;
+	}
 
 	displayxr_log("[DisplayXR] window decoration: %s (hwnd=%p overlay=%d)\n",
 	              s_window_decorated ? "ON (move/resize)" : "OFF (borderless)",
@@ -2806,6 +2815,7 @@ displayxr_set_overlay_hit_mask(const uint8_t *mask, int mask_w, int mask_h,
 		// NULL/empty: clear and revert to AABB-region path.
 		SetWindowRgn(target, NULL, TRUE);
 		s_hit_mask_active = 0;
+		s_hit_mask_region_hash = 0;
 		displayxr_log("[DisplayXR] hit_mask: cleared (reverting to AABB region)\n");
 		return;
 	}
@@ -2934,6 +2944,30 @@ displayxr_set_overlay_hit_mask(const uint8_t *mask, int mask_w, int mask_h,
 		}
 	}
 
+	// (#259) Skip identical regions: hash the final rect list + dst size and
+	// compare against the last applied region. SetWindowRgn(bRedraw=TRUE)
+	// every frame forces a repaint invalidation even when nothing changed --
+	// with a static avatar that is 60 wasted invalidations per second and a
+	// visible flicker at the region edge during window drags.
+	{
+		unsigned long long hh = 1469598103934665603ULL; /* FNV-1a 64 */
+		const unsigned char *hb = (const unsigned char *)rects;
+		size_t hn = (size_t)n * sizeof(RECT);
+		for (size_t hi = 0; hi < hn; hi++) {
+			hh ^= hb[hi];
+			hh *= 1099511628211ULL;
+		}
+		hh ^= (unsigned long long)(unsigned)n;      hh *= 1099511628211ULL;
+		hh ^= (unsigned long long)(unsigned)dst_w;  hh *= 1099511628211ULL;
+		hh ^= (unsigned long long)(unsigned)dst_h;  hh *= 1099511628211ULL;
+		if (hh == 0) hh = 1; /* 0 is the "unknown" sentinel */
+		if (s_hit_mask_active && hh == s_hit_mask_region_hash) {
+			free(rects);
+			return;
+		}
+		s_hit_mask_region_hash = hh;
+	}
+
 	HRGN rgn = NULL;
 	if (n == 0) {
 		// Empty silhouette: 0x0 rect = nothing-catches region.
@@ -2976,6 +3010,7 @@ displayxr_set_overlay_hit_mask(const uint8_t *mask, int mask_w, int mask_h,
 
 	if (!SetWindowRgn(target, rgn, TRUE)) {
 		DeleteObject(rgn);
+		s_hit_mask_region_hash = 0;
 		displayxr_log("[DisplayXR] hit_mask: SetWindowRgn failed err=%lu\n",
 		              (unsigned long)GetLastError());
 		return;
