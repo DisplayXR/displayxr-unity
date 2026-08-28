@@ -5,6 +5,14 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.13.1] - 2026-08-28
+
+### Fixed
+- **The transparent overlay's hit mask no longer clips the picture** (#259, #260). The `SetWindowRgn` region the mask drives shapes the *window* — a pixel the region misses is a pixel of the picture that is not drawn — but every trade-off in the mask path was justified against hit-testing and never re-checked against what the user sees (the same defect class displayxr-common fixed in its #27/#31). Field report from Lenovo's 3DLuma avatar on a 4K 3D display: the hat brim clipped when the avatar turned its head, and the region edge flickered near the taskbar while dragging the window. Three changes:
+  - **The mask raster scales with the overlay** (~4 px per texel, floor 256x144, cap 640x512). The fixed 256x144 raster was ~15 px per texel at 4K, so a feature thinner than a texel — a hat brim edge-on — failed to rasterize and was cut from the picture. Mask dimensions are captured at request time and flow through the readback callback and the native call, so the raster can resize between frames without misinterpreting bytes; it is never resized under an in-flight readback.
+  - **Dilation is sized in window pixels** (24 px target): the 5x5 max kernel ping-pongs as many passes as the texel size requires, absorbing AA edges *and* the readback's 1-2 frames of latency while the silhouette moves.
+  - **Identical regions are skipped natively**: `displayxr_set_overlay_hit_mask` hashes the final rect list + destination size (FNV-1a) and skips `SetWindowRgn` when nothing changed. It previously called `SetWindowRgn(bRedraw=TRUE)` every frame even for identical regions — a forced repaint invalidation 60x/s, visible as flicker at the region edge during drags. The hash resets on every path that clears the region and on apply failure.
+
 ## [2.13.0] - 2026-08-19
 
 ### Added
