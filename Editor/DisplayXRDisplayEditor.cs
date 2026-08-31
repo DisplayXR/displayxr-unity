@@ -38,6 +38,8 @@ namespace DisplayXR.Editor
                 "Best for tabletop, AR-like, and object-focused setups.",
                 MessageType.Info);
 
+            DrawFramingPreviewBox();
+
             // Display info header
             DrawDisplayInfoBox();
 
@@ -108,6 +110,34 @@ namespace DisplayXR.Editor
             }
 
             serializedObject.ApplyModifiedProperties();
+        }
+
+        // (#265) Framing preview toggle. Outside Play there is no provider and no Kooima,
+        // so Unity renders this rig's camera sitting ON the display plane — the Game view
+        // shows the wrong viewpoint until you press Play. The preview overrides the
+        // camera's view matrix for rendering only; it never touches the transform, because
+        // for THIS rig the transform is the display plane itself and moving it would change
+        // what the scene means in Play.
+        private void DrawFramingPreviewBox()
+        {
+            EditorGUILayout.Space();
+            bool on = DisplayXRDisplayFramingPreview.Enabled;
+            bool now = EditorGUILayout.ToggleLeft(
+                new GUIContent("Edit-Mode Framing Preview",
+                    "Frame the Game view as if a 2D camera were viewing the virtual display, " +
+                    "so authoring matches Play. Rendering-only — nothing is serialized. " +
+                    "Editor-wide setting, not part of the scene."),
+                on);
+            if (now != on) DisplayXRDisplayFramingPreview.Enabled = now;
+
+            EditorGUILayout.HelpBox(
+                now
+                    ? "The Game view is framed as if viewing the virtual display. This is a " +
+                      "FRAMING preview only — stereo is real in Play Mode, which runs the " +
+                      "provider and is the actual preview."
+                    : "Preview off: outside Play the Game view renders from the display plane " +
+                      "itself, so the framing will not match Play Mode.",
+                MessageType.None);
         }
 
         private void DrawDisplayInfoBox()

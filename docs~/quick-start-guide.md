@@ -201,6 +201,28 @@ This takes about 5 minutes and teaches you the setup:
 
 7. **Why this content suits camera-centric mode:** The camera is at the origin looking forward — like a person standing in a room. Objects are placed at varying distances to show the stereo depth gradient: near objects pop out of the screen, objects at the convergence distance sit on the screen plane, and far objects recede. Moving the camera (or the viewer's head) creates natural motion parallax through the scene.
 
+### Why the Game view looks wrong until you press Play
+
+This rig treats its transform as the **virtual display plane**, not as a viewpoint — that
+exact pose is what the driver sends the runtime, and the Kooima projection puts the eyes in
+front of it. Outside Play there is no provider and no Kooima, so Unity renders a plain
+perspective camera sitting *on* the display plane: the Game view shows the scene from the
+wrong place, usually near-clipping straight through your content. The framing only snaps to
+what you authored once you press Play.
+
+The rig's inspector has an **Edit-Mode Framing Preview** toggle (on by default, also under
+**DisplayXR > Edit-Mode Framing Preview**) that frames the Game view as if a 2D camera were
+viewing the virtual display, so authoring matches Play. It overrides the camera's view
+matrix for rendering only — it never moves the transform, because for this rig the transform
+*is* the display plane and moving it would change what the scene means in Play.
+
+It is a **framing** preview, not a stereo preview: it answers "am I pointing at the right
+thing", not "how does the depth feel". Play Mode runs the provider and remains the real
+preview.
+
+> Don't "fix" the framing by moving the camera back yourself. That moves the virtual display
+> with it, and the scene will be wrong in Play in a way that is hard to spot.
+
 ### Key parameters to experiment with
 
 | Parameter | Try this | Effect |
