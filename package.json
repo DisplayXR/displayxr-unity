@@ -63,6 +63,11 @@
       "path": "Samples~/FaceViewer"
     },
     {
+      "displayName": "Window Space UI Mouse Router",
+      "description": "Makes the UI rendered by DisplayXRWindowSpaceUI clickable (#268). The wsui component drives your Canvas as a private WorldSpace canvas rendered by a hidden offscreen camera, so GraphicRaycaster never hits anything and buttons/sliders are dead out of the box. Drop this router on the same GameObject and they work. Input policy is app-owned, so fork it freely — see the README for the Y-flip and ignoreReversedGraphics traps.",
+      "path": "Samples~/WindowSpaceUI"
+    },
+    {
       "displayName": "Minimal Transparent",
       "description": "Smallest working alpha-native transparent overlay scene (~60 lines). Teaching sample — README walks through the three-mechanism pipeline, the OpenXR extensions in use, and the layer ownership map. Windows + macOS standalone.",
       "path": "Samples~/MinimalTransparent"

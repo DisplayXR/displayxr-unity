@@ -1,0 +1,113 @@
+# 2D scenes and menus
+
+**The problem in one sentence:** while a DisplayXR session is running, XR is active
+process-wide and Unity renders *every* camera in stereo — including a plain camera with no
+DisplayXR rig component on it at all — so a flat menu comes out weaved.
+
+This trips up almost every app, because the intuition is exactly backwards. The rig
+components (`DisplayXRCamera`, `DisplayXRDisplay`) only **tune** stereo; they do not
+**gate** it. Deleting them does not give you a 2D scene. It gives you a stereo scene with
+default tuning.
+
+## The short answer
+
+Put a **`DisplayXRSceneMode`** component anywhere in the scene and set its mode to **2D**.
+
+```csharp
+// or from script:
+sceneMode.Apply(DisplayXRSceneDimensionality.TwoD);
+```
+
+It works with **no rig present**, which is the point — a 2D menu usually has none.
+
+## What's actually happening underneath
+
+Three levers exist. `DisplayXRSceneMode` drives all three in the right order; this section
+is for when you need to drive them yourself.
+
+| Lever | API | What it changes |
+|---|---|---|
+| **Rendering mode** | `DisplayXRProvider.RequestRenderingMode(modeIndex)` | How many views the runtime renders. The mode whose `viewCount <= 1` is the mono one. **This is the real 2D switch.** |
+| **Hardware display state** | `DisplayXRProvider.RequestDisplayMode(bool mode3d)` | Whether the panel itself is in its 3D or 2D state |
+| **Disparity** | `ipdFactor` on the rig | Flattens the stereo separation. Cosmetic on its own — it does not change the render path |
+
+Enumerate the available modes with `DisplayXRProvider.Modes`; each entry carries
+`modeIndex`, `viewCount`, `name` and `isRequestable`.
+
+### The transition is asymmetric — this is the part people get wrong
+
+You cannot just flip the mode. The two directions need opposite ordering:
+
+- **3D → 2D:** ramp disparity to zero **first**, *then* issue the mode request, so the
+  switch lands on content that is already flat.
+- **2D → 3D:** issue the mode request **first** (the first 3D frame is flat anyway), *then*
+  ease disparity up to its steady value.
+
+Get it backwards and you get a visible snap at the switch. `DisplayXRModeSwitch`
+(`Runtime/DisplayXRModeSwitch.cs`) is a dependency-free sequencer that encodes this — it is
+a C# port of the same state machine the native runtime test apps use, it is wall-clock
+driven so it is frame-rate independent, and it retargets cleanly mid-ramp (a not-yet-fired
+3D→2D reverses without ever having switched). `DisplayXRSceneMode` is a thin scene-level
+wrapper around it.
+
+Driving the sequencer by hand:
+
+```csharp
+var seq = new DisplayXRModeSwitch();
+seq.Configure(0.18f);
+seq.Request(targetMode, targetViewCount,
+            DisplayXRProvider.ActiveModeIndex, currentViewCount,
+            currentIpd, steadyIpd);
+
+// every frame:
+float ipd = seq.Update(Time.unscaledDeltaTime, out bool fire, out uint mode);
+rig.ipdFactor = ipd;
+if (fire && mode != DisplayXRProvider.ActiveModeIndex)
+    DisplayXRProvider.RequestRenderingMode(mode);
+```
+
+## `DisplayXRSceneMode` reference
+
+| Field | Default | Meaning |
+|---|---|---|
+| `mode` | `ThreeD` | How this scene should be presented |
+| `applyOnEnable` | `true` | Apply on enable. Turn off to drive transitions yourself via `Apply()` |
+| `transitionSeconds` | `0.18` | Disparity ramp length. `0` switches instantly |
+| `driveHardwareDisplayMode` | `true` | Also request the panel's hardware 2D/3D state |
+| `steadyIpdFactor` | `0` (auto) | The `ipdFactor` to restore on return to 3D. Captured from the active rig on first apply when left at 0 |
+
+Behavioral notes worth knowing:
+
+- **`Apply()` is safe before the session exists.** The request is held and applied on the
+  first frame the provider reports a live session.
+- **It survives a subsystem restart.** The editor's dock/undock auto-switch stops and
+  restarts the session mid-Play; a once-only push into a dead session succeeds *silently*,
+  so the request is re-armed rather than dropped.
+- **The 3D mode it returns to is captured, not guessed** — whatever multi-view mode was
+  active the first time it looked, so a 2D→3D transition restores your app's real mode
+  rather than "the first stereo mode in the list".
+- **Graceful degrade.** If the runtime advertises no mono mode, it flattens disparity, asks
+  for the panel's 2D state, and logs one warning saying content will be flat but still
+  rendered through the stereo path. It never throws and never blocks scene load.
+
+## Patterns
+
+**A 2D home screen that loads into a 3D scene.** Put a `DisplayXRSceneMode` set to `TwoD` in
+the menu scene and one set to `ThreeD` in the content scene. Each applies on enable; the
+sequencer handles the ramp in both directions.
+
+**A 2D overlay inside a 3D scene** is a *different* problem — you want
+`DisplayXRWindowSpaceUI` (a composition layer at a fixed window rect) or `DisplayXRLocal2D`
+(a flat 2D band inside the 3D scene), not a mode switch. Mode switching changes the whole
+panel.
+
+**Toggling at runtime** — call `Apply()` on the component. Don't call
+`RequestRenderingMode` directly while a `DisplayXRSceneMode` is driving transitions, or the
+two will fight over the same state.
+
+## See also
+
+- `Runtime/DisplayXRModeSwitch.cs` — the sequencer, including the reasoning for the
+  asymmetry
+- [`window-space-ui.md`](window-space-ui.md) — 2D UI *within* a 3D scene
+- [`xr-display-provider.md`](xr-display-provider.md) — how the provider drives the runtime

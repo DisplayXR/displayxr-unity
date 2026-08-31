@@ -10,6 +10,8 @@
 ### Architecture — How the system works
 - [XR Display Provider](architecture/xr-display-provider.md) — **the shipping path (#166):** the custom `IUnityXRDisplay` provider, its component map, and Play Mode parity
 - [Kooima Pipeline](architecture/kooima-pipeline.md) — Stereo projection math, transform chain, tunables
+- [2D Scenes and Menus](architecture/two-dimensional-scenes.md) — why a rig-less camera still renders stereo, the three levers that actually switch to 2D, the asymmetric 3D↔2D transition, and `DisplayXRSceneMode`
+- [Window-Space 2D UI](architecture/window-space-ui.md) — `DisplayXRWindowSpaceUI` rendering model and the input-routing contract (the composition layer carries pixels, not input)
 - [Click-Through Silhouette Mask](architecture/click-through-mask.md) — transparent-overlay per-pixel click-through: the mask→`SetWindowRgn` pipeline, the mask/weave rect-alignment invariant, and the debugging pitfalls (the #166 clip)
 
 ### Architecture Decision Records — Why things are the way they are
