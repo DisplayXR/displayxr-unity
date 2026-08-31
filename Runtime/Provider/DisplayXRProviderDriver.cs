@@ -373,6 +373,58 @@ namespace DisplayXR
         [DllImport("user32.dll")] static extern bool IsWindowVisible(System.IntPtr hWnd);
         [DllImport("user32.dll")] static extern bool IsWindow(System.IntPtr hWnd);
 
+        // --- (#263) Per-monitor DPI reconciliation -------------------------------
+        // THE BUG THIS FIXES: the managed glue and the native weave window speak two
+        // different DPI coordinate spaces, and nothing converted between them.
+        //   * Native  — the weave window is created DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2
+        //     (displayxr_win32.c), so its SetWindowPos/GetWindowRect are TRUE physical
+        //     virtual-desktop pixels.
+        //   * Managed — this file never sets an awareness context, so every GetWindowRect /
+        //     GetClientRect here reads in Unity's process awareness, where Windows
+        //     VIRTUALIZES coordinates on any monitor whose scale differs from the primary's.
+        // Virtualized == physical on the primary monitor, which is why every single-monitor
+        // (and same-scale dual-monitor) rig worked and this went unseen. On a mixed-DPI pair
+        // they diverge by the ratio of the two scale factors, and the weave window lands
+        // mispositioned AND wrong-sized (field report: laptop 2560x1440 @200% primary + SR
+        // 2560x1600 @150%; the glue computed a pane 1928 px tall for a 1600 px-tall panel).
+        //
+        // THE FIX: keep every existing computation in Unity's (virtualized) space — all the
+        // #727/#740 sub-pixel work stays byte-identical — and convert ONCE at the boundary,
+        // just before publishing to native. The conversion factor is MEASURED, not assumed:
+        // k = physical pane width / virtualized pane width, both read from the same matched
+        // pane HWND. On the primary monitor the two reads are identical, so k == 1.0 exactly
+        // and this path is a mathematical no-op — the tested configurations cannot regress.
+        [DllImport("user32.dll")] static extern System.IntPtr SetThreadDpiAwarenessContext(System.IntPtr ctx);
+        [DllImport("user32.dll")] static extern System.IntPtr MonitorFromWindow(System.IntPtr hWnd, uint flags);
+        [DllImport("user32.dll")] static extern int GetSystemMetrics(int index);
+
+        static readonly System.IntPtr kPerMonitorAwareV2 = new System.IntPtr(-4);
+        const int SM_XVIRTUALSCREEN = 76, SM_YVIRTUALSCREEN = 77;
+        const int SM_CXVIRTUALSCREEN = 78, SM_CYVIRTUALSCREEN = 79;
+
+        // Read a window's rects in the PER-MONITOR-AWARE space (i.e. the space native's
+        // weave window lives in), restoring the caller's context immediately. Returns false
+        // if the OS predates per-monitor-v2 (Win10 1703-) — callers then keep k = 1, which
+        // is exactly the pre-#263 behavior.
+        static bool TryGetPhysicalRects(System.IntPtr hwnd, out Win32Rect win, out Win32Rect client)
+        {
+            win = default; client = default;
+            if (hwnd == System.IntPtr.Zero) return false;
+            System.IntPtr prev = System.IntPtr.Zero;
+            try { prev = SetThreadDpiAwarenessContext(kPerMonitorAwareV2); }
+            catch { return false; }            // EntryPointNotFound on older Windows
+            if (prev == System.IntPtr.Zero) return false;
+            try { return GetWindowRect(hwnd, out win) && GetClientRect(hwnd, out client); }
+            finally { SetThreadDpiAwarenessContext(prev); }
+        }
+
+        // Physical rect + measured scale of the matched pane, refreshed with the match.
+        static Win32Rect s_paneVirtWin, s_panePhysWin, s_panePhysClient;
+        static float s_paneScaleK = 1f;
+        static bool  s_panePhysValid;
+        static string s_lastDpiLog;
+        static string s_lastCandidateLog;
+
         // --- GameView zoom-area sub-pixel fit: THE maximize/resize seam fix (#727 f-up) ---
         // Root cause (measured 2026-07-12, ~50 instrumented captures): the GameView
         // allocates its mirror RT at ceil(dest_px) rows, where dest_px is fractional —
@@ -560,9 +612,17 @@ namespace DisplayXR
                 if (!IsWindowVisible(h)) return true;
                 var nameSb = new System.Text.StringBuilder(64);
                 GetClassName(h, nameSb, 64);
+                // (#263) Never consider OUR OWN weave window. Without this the diagnostic
+                // matched "DisplayXRProviderWindow" and printed a meaningless score
+                // (observed: score=912.0) in exactly the misaligned state the capture was
+                // taken to diagnose — the correction path at ApplyWin32HostPositionCorrection
+                // has always had this exclusion; the diagnostic did not, which made the log
+                // actively misleading precisely where it mattered.
+                string cls0 = nameSb.ToString();
+                if (cls0.StartsWith("DisplayXR")) return true;
                 GetWindowRect(h, out var wr);
                 GetClientRect(h, out var cr);
-                hwnds.Add((h, nameSb.ToString(), wr, cr));
+                hwnds.Add((h, cls0, wr, cr));
                 return true;
             };
             Win32EnumProc top = (h, l) =>
@@ -576,7 +636,9 @@ namespace DisplayXR
             try { EnumWindows(top, System.IntPtr.Zero); } catch { }
 
             var sb = new System.Text.StringBuilder();
-            sb.Append($"ppp={ppp:F3} live={livePpp:F3} xrMode={UnityEngine.XR.XRSettings.gameViewRenderMode}");
+            sb.Append($"ppp={ppp:F3} live={livePpp:F3} k={s_paneScaleK:F4}" +
+                      (s_panePhysValid ? "" : "(unconv)") +
+                      $" xrMode={UnityEngine.XR.XRSettings.gameViewRenderMode}");
             foreach (var w in wins)
             {
                 Rect sp = default; bool haveSp = false;
@@ -695,24 +757,45 @@ namespace DisplayXR
             {
                 s_hwndCorrHostKey = host; s_hwndCorrPppKey = ppp;
                 s_hwndCorrValid = false;
-                float exX = host.x * ppp, exY = host.y * ppp;
+                // (#263) SCORE ON SIZE, NEVER POSITION.
+                //
+                // The old scorer summed |dleft|+|dtop|+|dwidth|+|dheight| against
+                // host*ppp and accepted only <150. That rejects the CORRECT pane whenever
+                // the Game view lives on a non-primary monitor: `ppp` is the pane's own
+                // monitor scale, so the SIZE terms are right (delta ~ 0), but the POSITION
+                // terms are wrong by the whole cross-monitor offset. Field capture: a pane
+                // matching 3840x1949 exactly was thrown out on score=2560 — 17x the
+                // threshold — purely on x. We were using the one measurement we cannot
+                // compute across a scale boundary as a rejection criterion for the one we
+                // can.
+                //
+                // Size is scale-correct by construction (both sides use the pane's own
+                // monitor scale). Position is what we are trying to LEARN, so it must not
+                // gate the match — it is read from the winner instead.
                 float exW = host.width * ppp, exH = host.height * ppp;
                 float bestScore = float.MaxValue; Win32Rect bestWr = default; string bestCls = null;
                 System.IntPtr bestH = System.IntPtr.Zero;
+                bool bestIsGuiView = false;
                 uint myPid = (uint)System.Diagnostics.Process.GetCurrentProcess().Id;
+                var rejected = s_gvGeomGate == 1 ? new System.Text.StringBuilder() : null;
                 Win32EnumProc collect = (h, l) =>
                 {
                     if (!IsWindowVisible(h)) return true;
                     var nameSb = new System.Text.StringBuilder(64);
                     GetClassName(h, nameSb, 64);
                     string cls = nameSb.ToString();
-                    // Never match our own weave window (it is glued to this very rect).
-                    if (cls.StartsWith("DisplayXR")) return true;
                     GetWindowRect(h, out var wr);
-                    float score = Mathf.Abs(wr.left - exX) + Mathf.Abs(wr.top - exY)
-                                + Mathf.Abs((wr.right - wr.left) - exW)
-                                + Mathf.Abs((wr.bottom - wr.top) - exH);
-                    if (score < bestScore) { bestScore = score; bestWr = wr; bestCls = cls; bestH = h; }
+                    int cw = wr.right - wr.left, ch = wr.bottom - wr.top;
+                    // Never match our own weave window: it is glued to the very rect we are
+                    // validating, so it scores ~0 against our own (possibly wrong) output.
+                    bool skip = cls.StartsWith("DisplayXR");
+                    float score = Mathf.Abs(cw - exW) + Mathf.Abs(ch - exH);
+                    rejected?.Append($" [{cls} ({wr.left},{wr.top} {cw}x{ch}) size-score={score:F0}{(skip ? " SKIP-own" : "")}]");
+                    if (skip) return true;
+                    // Prefer a real GUIView over any other same-sized window of ours.
+                    bool isGuiView = cls.IndexOf("GUIView", System.StringComparison.OrdinalIgnoreCase) >= 0;
+                    bool better = isGuiView != bestIsGuiView ? isGuiView : score < bestScore;
+                    if (better) { bestScore = score; bestWr = wr; bestCls = cls; bestH = h; bestIsGuiView = isGuiView; }
                     return true;
                 };
                 Win32EnumProc top = (h, l) =>
@@ -724,23 +807,65 @@ namespace DisplayXR
                     return true;
                 };
                 try { EnumWindows(top, System.IntPtr.Zero); } catch { return; }
-                // Accept only an unambiguous near match — the docked discrepancy is ~13 px;
-                // anything further off is a different panel, so keep the reflection rect.
-                if (bestCls != null && bestScore < 150f)
+
+                // Tolerance is on SIZE only, so it can be tight: a pane either is the one
+                // Unity reported the dimensions of or it is not. 64px absorbs border/DPI
+                // rounding without admitting a differently-sized window.
+                bool accept = bestCls != null && bestScore < 64f;
+                if (rejected != null)
+                {
+                    string rlog = $"expect {exW:F0}x{exH:F0} -> " +
+                                  (accept ? $"MATCH {bestCls} score={bestScore:F0}" : "NO MATCH") +
+                                  " | candidates:" + rejected;
+                    if (rlog != s_lastCandidateLog) { s_lastCandidateLog = rlog; Debug.Log("[DisplayXR] GVGEOM pane candidates: " + rlog); }
+                }
+                if (accept)
                 {
                     s_hwndCorrValid = true;
                     s_hwndCorrX = bestWr.left; s_hwndCorrY = bestWr.top;
                     s_hwndCorrHwnd = bestH;
-                    string log = $"hwnd[{bestCls}]=({bestWr.left},{bestWr.top}) " +
-                                 $"reflected=({exX:F0},{exY:F0}) score={bestScore:F1}";
+
+                    // Ground truth in the space native's weave window actually lives in.
+                    // Everything downstream reads THESE, not points x ppp.
+                    s_panePhysValid = TryGetPhysicalRects(bestH, out s_panePhysWin, out s_panePhysClient);
+                    if (s_panePhysValid)
+                    {
+                        int pw = s_panePhysWin.right - s_panePhysWin.left;
+                        int vw = bestWr.right - bestWr.left;
+                        s_paneScaleK = (vw > 64 && pw > 64) ? (float)pw / vw : 1f;
+                        if (!(s_paneScaleK > 0.25f && s_paneScaleK < 4f)) s_paneScaleK = 1f;
+                    }
+                    else s_paneScaleK = 1f;
+
+                    string log = $"{bestCls} virt=({bestWr.left},{bestWr.top} " +
+                                 $"{bestWr.right - bestWr.left}x{bestWr.bottom - bestWr.top}) " +
+                                 (s_panePhysValid
+                                     ? $"phys=({s_panePhysWin.left},{s_panePhysWin.top} " +
+                                       $"{s_panePhysWin.right - s_panePhysWin.left}x" +
+                                       $"{s_panePhysWin.bottom - s_panePhysWin.top}) k={s_paneScaleK:F4}"
+                                     : "phys=<unavailable>") +
+                                 $" size-score={bestScore:F0}";
                     if (log != s_lastHwndCorrLog)
-                    { s_lastHwndCorrLog = log; Debug.Log("[DisplayXR] GameView glue Win32 position: " + log); }
+                    { s_lastHwndCorrLog = log; Debug.Log("[DisplayXR] GameView glue matched pane: " + log); }
+                }
+                else
+                {
+                    s_panePhysValid = false; s_paneScaleK = 1f;
                 }
             }
             if (s_hwndCorrValid)
             {
-                rx = Mathf.Max(0, s_hwndCorrX);
-                ry = Mathf.Max(0, s_hwndCorrY + toolbar);
+                // (#263) No Mathf.Max(0, ...) here any more. The Windows virtual desktop is
+                // SIGNED — a monitor arranged left of or above the primary has negative
+                // coordinates — so clamping to zero silently dragged the weave window onto
+                // the primary. (That clamp was NOT what the mixed-DPI field report hit: the
+                // toolbar offset kept the pre-clamp value positive across all 2,580 GVGEOM
+                // records of that capture. It is a separate latent bug, fixed here because
+                // it produces an identical-looking symptom and would cost a whole debugging
+                // cycle to rediscover.) The real bound is the virtual desktop, applied once
+                // at the publish boundary below.
+                rx = s_hwndCorrX;
+                ry = s_hwndCorrY + toolbar;
             }
         }
 
@@ -938,7 +1063,15 @@ namespace DisplayXR
                     // the pane-client cross-check below, not here.
                     float dLogical  = Mathf.Abs(size.x - host.width);       // size already in points
                     float dPhysical = Mathf.Abs(size.x - host.width * ppp); // size already in px
-                    sizeScale = (dLogical <= dPhysical) ? ppp : 1f;
+                    // (#263) STRICT `<`, so an exact tie falls to PHYSICAL. A tie is not
+                    // hypothetical: a Game view pinned to a fixed resolution sitting exactly
+                    // midway between the pane's point width and its physical width produces
+                    // dLogical == dPhysical == 1280 (measured: size 2560, host 1280pt at
+                    // ppp 3.0). The old `<=` then multiplied an already-physical 2560x1600
+                    // by 3.0 -> 7680x4800, which the monitor clamp truncated to the panel
+                    // size — wrong, but plausible-looking. Scaling an already-physical value
+                    // is the worse failure of the two, so the tie must not land there.
+                    sizeScale = (dLogical < dPhysical) ? ppp : 1f;
                 }
                 rw = Mathf.RoundToInt(size.x * sizeScale);
                 rh = Mathf.RoundToInt(size.y * sizeScale);
@@ -952,27 +1085,116 @@ namespace DisplayXR
                 rh = Mathf.RoundToInt(host.height * ppp);
                 toolbar = 0;
             }
-            rx = Mathf.Max(0, Mathf.RoundToInt(host.x * ppp));
-            ry = Mathf.Max(0, Mathf.RoundToInt(host.y * ppp) + toolbar);
+            // (#263) No Mathf.Max(0, ...) — the virtual desktop is signed. See the note in
+            // ApplyWin32HostPositionCorrection; the bound is applied once at the boundary below.
+            rx = Mathf.RoundToInt(host.x * ppp);
+            ry = Mathf.RoundToInt(host.y * ppp) + toolbar;
             ApplyWin32HostPositionCorrection(host, ppp, toolbar, ref rx, ref ry);
             // (#740) The RT-placement corrections apply ONLY to a docked, non-maximized
             // Game view — the only state with dock chrome. Maximized and floating draw the
             // RT flush (δ already (0,0)); correcting them shifts a correct weave (maximized
             // went inverted when the Y margin was applied there). s_lastAppliedDocked
             // excludes floating/present; the maximized flag excludes the maximized sub-state.
-            if (s_lastAppliedDocked && !IsMatchedGameViewMaximized())
+            // (#263) Applied here only for the UNMATCHED fallback — the matched path below
+            // re-applies them on top of the pane's own physical rect, so doing it in both
+            // places would double-count.
+            if (!(s_panePhysValid && s_hwndCorrValid) &&
+                s_lastAppliedDocked && !IsMatchedGameViewMaximized())
             {
                 rx += RtCentringOffsetX(rw);       // Unity centres the RT horizontally
                 ry += RtCentringOffsetY(rh, ppp);  // …and draws it with a bottom margin
             }
 
-            // (#740) Clamp to the monitor: a transient container/full-desktop-sized reflection
-            // reading during a layout reset passes the 8192 sanity band below but must never
-            // glue the weave window bigger than the panel (it stuck huge when the pane died).
-            if (TryGetMonitorRect(rx + rw / 2, ry + rh / 2, out _, out _, out int monW, out int monH))
+            // ============ (#263) TAKE GROUND TRUTH FROM THE MATCHED PANE ============
+            // Everything above derived the rect from Unity's points x a single global ppp.
+            // That is correct only while the pane sits on the primary monitor; the moment
+            // the origin crosses onto a monitor at a different scale, the POSITION is wrong
+            // by the whole cross-monitor offset (measured: computed x=5120, true x=2560).
+            //
+            // When we have matched the pane we do not need any of that arithmetic: its
+            // physical rect, read under PER_MONITOR_AWARE_V2, is the space native's weave
+            // window lives in. Take BOTH position and size from it.
+            //
+            // Size matters as much as position here: a field capture with a fixed-resolution
+            // Game view matched the pane, positioned it correctly, and STILL rendered wrong
+            // — 2560x1600 of content drawn inside a 3840x1949 pane (~67% linear) — because
+            // size still came from GetMainGameViewTargetSize. Taking only position would
+            // have "fixed" that capture into looking correct while staying wrong.
+            if (s_panePhysValid && s_hwndCorrValid)
+            {
+                int pcw = s_panePhysClient.right - s_panePhysClient.left;
+                int pch = s_panePhysClient.bottom - s_panePhysClient.top;
+                if (pcw > 64 && pch > 64)
+                {
+                    // The toolbar is chrome measured in the virtualized space; scale it into
+                    // physical with the pane's own measured factor. Bounded quantity, so a
+                    // small error here cannot move the window off the panel.
+                    int toolbarPhys = Mathf.RoundToInt(toolbar * s_paneScaleK);
+                    if (toolbarPhys < 0) toolbarPhys = 0;
+                    if (toolbarPhys > pch / 2) toolbarPhys = 0;   // implausible: ignore it
+
+                    rx = s_panePhysWin.left;
+                    ry = s_panePhysWin.top + toolbarPhys;
+                    rw = pcw;
+                    rh = pch - toolbarPhys;
+
+                    // The RT-centring corrections (#740) are expressed in the same physical
+                    // px as the client rect they were measured from, so they still apply.
+                    if (s_lastAppliedDocked && !IsMatchedGameViewMaximized())
+                    {
+                        rx += RtCentringOffsetX(rw);
+                        ry += RtCentringOffsetY(rh, ppp);
+                    }
+                }
+            }
+
+            // (#740/#263) Clamp to the monitor the PANE is on. Resolve it from the matched
+            // pane HWND rather than from a computed centre point: the centre point is derived
+            // from the very rect we are validating, so on a mixed-DPI rig a wrong rect
+            // selected the wrong monitor and then "clamped" against it — a second-order
+            // failure that would have survived the scale fix. Falls back to the point probe
+            // when there is no matched pane yet.
+            int monW = 0, monH = 0;
+            bool haveMon = false;
+            if (s_hwndCorrValid && s_hwndCorrHwnd != System.IntPtr.Zero)
+            {
+                var mon = MonitorFromWindow(s_hwndCorrHwnd, 2 /* MONITOR_DEFAULTTONEAREST */);
+                if (mon != System.IntPtr.Zero)
+                {
+                    var mi = new Win32MonitorInfo { cbSize = Marshal.SizeOf<Win32MonitorInfo>() };
+                    System.IntPtr prevCtx = System.IntPtr.Zero;
+                    try { prevCtx = SetThreadDpiAwarenessContext(kPerMonitorAwareV2); } catch { }
+                    try
+                    {
+                        if (GetMonitorInfoW(mon, ref mi))
+                        {
+                            monW = mi.rcMonitor.right - mi.rcMonitor.left;
+                            monH = mi.rcMonitor.bottom - mi.rcMonitor.top;
+                            haveMon = monW > 0 && monH > 0;
+                        }
+                    }
+                    finally { if (prevCtx != System.IntPtr.Zero) SetThreadDpiAwarenessContext(prevCtx); }
+                }
+            }
+            if (!haveMon)
+                haveMon = TryGetMonitorRect(rx + rw / 2, ry + rh / 2, out _, out _, out monW, out monH);
+            if (haveMon)
             {
                 if (rw > monW) rw = monW;
                 if (rh > monH) rh = monH;
+            }
+
+            // (#263) The real positional bound: the virtual desktop, which is SIGNED. This
+            // replaces the old Mathf.Max(0, ...) clamps, which pinned any monitor left of or
+            // above the primary to the primary's top-left corner.
+            {
+                int vsx = GetSystemMetrics(SM_XVIRTUALSCREEN), vsy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+                int vsw = GetSystemMetrics(SM_CXVIRTUALSCREEN), vsh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+                if (vsw > 0 && vsh > 0)
+                {
+                    rx = Mathf.Clamp(rx, vsx - rw, vsx + vsw);
+                    ry = Mathf.Clamp(ry, vsy - rh, vsy + vsh);
+                }
             }
 
             // (#740) Pane-client cross-check (Win32 truth): the render area can never exceed
@@ -984,8 +1206,13 @@ namespace DisplayXR
             // only the pane client exposes them. Reject → last-good (the re-host watcher
             // heals the view via maximize/restore and restarts the subsystem).
             bool paneFit = true;
-            if (s_hwndCorrValid && s_hwndCorrHwnd != System.IntPtr.Zero &&
-                GetClientRect(s_hwndCorrHwnd, out var pcr))
+            // (#263) Compare against the pane client in the SAME space rw/rh now carry:
+            // physical when the conversion ran, virtualized otherwise.
+            Win32Rect pcr = default; bool havePcr;
+            if (s_panePhysValid && s_hwndCorrValid) { pcr = s_panePhysClient; havePcr = true; }
+            else havePcr = s_hwndCorrValid && s_hwndCorrHwnd != System.IntPtr.Zero &&
+                           GetClientRect(s_hwndCorrHwnd, out pcr);
+            if (havePcr)
             {
                 int cw = pcr.right - pcr.left, ch = pcr.bottom - pcr.top;
                 if (cw > 64 && ch > 64 && (rw > cw + 8 || rh > ch + 8))
