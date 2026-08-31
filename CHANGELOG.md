@@ -5,6 +5,16 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.13.2] - 2026-08-31
+
+### Fixed
+- **The Basic Scene sample now ships the scene the docs tell you to open** (#261). Quick Start Step 4 and the sample's own README both said to open `Basic Scene/BasicScene.unity`; that file was never committed (the original #7 task never closed), so the imported sample contained only a script and a README and the very first thing a new user does after installing the package failed. `Samples~/BasicScene/BasicScene.unity` is now a real committed scene — a **Main Camera** carrying `DisplayXRCamera` and a **Scene Setup** object carrying `BasicSceneSetup` — with a committed `.meta` for the script so the scene's script reference is stable across imports. The test geometry is still built at Play time rather than authored, so the sample picks a material shader matching the host project's render pipeline (URP `Lit`, falling back to Built-in `Standard`) instead of shipping a material that renders magenta on the other one; the README now says so, since it means the Scene view looks empty until you press Play. The quick start's hardcoded `Assets/Samples/DisplayXR/0.1.0/...` path — stale by thirteen minor versions — is now version-agnostic.
+- **The setup scripts in five samples no longer no-op when the boot splash is enabled** (#262). Each guarded on `FindAnyObjectByType<MeshRenderer>() != null` meaning "this scene already has content, don't rebuild it". But `FindAnyObjectByType` also scans the **DontDestroyOnLoad** scene, and the boot splash — on by default — spawns there at `BeforeSceneLoad` (`DisplayXRSplashBootstrap`) and builds its logo and subtitle quads with `MeshRenderer` (`DisplayXRSplash.MakeQuadGO`). When display info resolves on frame 1, `BuildArtwork` runs synchronously inside the splash's `Start()`, ahead of the scene's `Start()` — so the guard saw the splash's quads, concluded the scene was already populated, and created nothing. The symptom was an empty scene with no error, and the only workaround was to turn the splash off. All five guards are now scoped to the setup object's own scene (`gameObject.scene`, or the active scene in `MinimalTransparent`, which is a static class with no GameObject of its own): `BasicSceneSetup`, `DisplaySceneSetup`, `URPBasicSceneSetup`, `TransparentAvatarSetup`, `MinimalTransparent`. The two transparent samples were latently rather than actually affected — the splash bootstrap skips transparent-overlay apps — but the guard was wrong in the same way and is fixed in the same way.
+  - Worth knowing beyond the samples: **any** app calling `FindAnyObjectByType` / `FindObjectsByType` on frame 1 sees the splash rig, because it is a `DontDestroyOnLoad` object created before the first scene loads.
+- **The `DisplayXRWsuiMouseRouter` link in this changelog pointed at an archived repo** (#268). It now resolves to `displayxr-unity-samples/samples/urp-singlepass-ui`, where the router actually lives. (Shipping the router with the package, and documenting `DisplayXRWindowSpaceUI` at all, is tracked in #268.)
+
+All five findings above came from a partner integrator's first-touch onboarding pass; the remaining reports from that pass are tracked in #263 (docked Game view weave glue on a second monitor), #264 (editor crash), #265 (display-centric framing outside Play), #266 (player opens on the OS main display) and #267 (no way to author a 2D scene).
+
 ## [2.13.1] - 2026-08-28
 
 ### Fixed
@@ -812,7 +822,7 @@ The custom **`IUnityXRDisplay` display provider becomes the shipping rendering p
   `DisplayXRWindowSpaceUI` interactive. The plugin doesn't ship a router
   — different consumer apps want different input models (mouse, hand-
   tracking, touch). See the sample
-  [`DisplayXRWsuiMouseRouter.cs`](https://github.com/DisplayXR/displayxr-unity-test-2d-ui/blob/main/Assets/Scripts/DisplayXRWsuiMouseRouter.cs)
+  [`DisplayXRWsuiMouseRouter.cs`](https://github.com/DisplayXR/displayxr-unity-samples/blob/main/samples/urp-singlepass-ui/Assets/Scripts/DisplayXRWsuiMouseRouter.cs)
   in `displayxr-unity-test-2d-ui` for the canonical mouse → fractional →
   canvas-local → `EventSystem.RaycastAll` flow.
 

@@ -7,15 +7,25 @@ namespace DisplayXR.Samples
 {
     /// <summary>
     /// Creates a minimal stereo test scene with colored cubes at varying depths.
-    /// Attach to any GameObject, or use the included BasicScene.unity scene file.
+    /// Attach to any GameObject, or use the included BasicScene.unity scene file
+    /// (where it sits on the "Scene Setup" object next to the Main Camera).
     /// </summary>
     public class BasicSceneSetup : MonoBehaviour
     {
         void Start()
         {
-            // Only create objects if the scene is empty (no cubes present)
-            if (FindAnyObjectByType<MeshRenderer>() != null)
-                return;
+            // Only create objects if OUR scene is empty (no cubes present).
+            //
+            // Scope the check to this GameObject's scene on purpose. A plain
+            // FindAnyObjectByType<MeshRenderer>() also scans the DontDestroyOnLoad
+            // scene, where the DisplayXR boot splash (on by default, spawned at
+            // BeforeSceneLoad) builds its logo quads with MeshRenderer — so the
+            // guard tripped on the splash and this sample created nothing at all
+            // unless you disabled the splash (issue #262).
+            var scene = gameObject.scene;
+            foreach (var mr in FindObjectsByType<MeshRenderer>(FindObjectsSortMode.None))
+                if (mr.gameObject.scene == scene)
+                    return;
 
             // Reset Main Camera to origin so it faces the test objects
             var cam = Camera.main;

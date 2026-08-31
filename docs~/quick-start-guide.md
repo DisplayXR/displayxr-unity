@@ -163,7 +163,8 @@ Camera-centric mode works like a standard Unity camera with added stereo. This i
 
 1. Open **Window > Package Manager > DisplayXR**.
 2. Expand the **Samples** section and click **Import** next to **Basic Scene**.
-3. Open the imported scene at `Assets/Samples/DisplayXR/0.1.0/Basic Scene/BasicScene.unity`.
+3. Open the imported scene at `Assets/Samples/DisplayXR/<version>/Basic Scene/BasicScene.unity`
+   (`<version>` is the installed package version, e.g. `2.13.2`).
 4. The Main Camera already has a **DisplayXRCamera** component.
 
 ### Or build it from scratch
