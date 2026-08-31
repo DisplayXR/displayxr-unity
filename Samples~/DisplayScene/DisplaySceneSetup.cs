@@ -18,11 +18,27 @@ namespace DisplayXR.Samples
 
         void Start()
         {
-            // Don't recreate if scene already has content
-            if (FindAnyObjectByType<MeshRenderer>() != null)
+            // Don't recreate if OUR scene already has content
+            if (SceneHasContent())
                 return;
 
             CreateSceneObjects();
+        }
+
+        // True when this GameObject's own scene already has visible geometry.
+        //
+        // Scoped to our scene on purpose: a plain FindAnyObjectByType<MeshRenderer>()
+        // also scans the DontDestroyOnLoad scene, where the DisplayXR boot splash
+        // (on by default, spawned at BeforeSceneLoad) builds its logo quads with
+        // MeshRenderer — so the guard tripped on the splash and the sample created
+        // nothing at all unless you disabled it (issue #262).
+        bool SceneHasContent()
+        {
+            var scene = gameObject.scene;
+            foreach (var r in FindObjectsByType<MeshRenderer>(FindObjectsSortMode.None))
+                if (r.gameObject.scene == scene)
+                    return true;
+            return false;
         }
 
         void Update()

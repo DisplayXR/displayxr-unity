@@ -38,10 +38,26 @@ namespace DisplayXR.Samples
         private GameObject m_Capsule;
         private Vector3 m_BaseScale;
 
+        // True when this GameObject's own scene already has visible geometry.
+        //
+        // Scoped to our scene on purpose: a plain FindAnyObjectByType<MeshRenderer>()
+        // also scans the DontDestroyOnLoad scene, where the DisplayXR boot splash
+        // (on by default, spawned at BeforeSceneLoad) builds its logo quads with
+        // MeshRenderer — so the guard tripped on the splash and the sample created
+        // nothing at all unless you disabled it (issue #262).
+        bool SceneHasContent()
+        {
+            var scene = gameObject.scene;
+            foreach (var r in FindObjectsByType<MeshRenderer>(FindObjectsSortMode.None))
+                if (r.gameObject.scene == scene)
+                    return true;
+            return false;
+        }
+
         void Start()
         {
-            // Skip if scene already has objects (e.g. user pre-built it).
-            if (FindAnyObjectByType<MeshRenderer>() != null)
+            // Skip if OUR scene already has objects (e.g. user pre-built it).
+            if (SceneHasContent())
                 return;
 
             // Reset Main Camera + add the transparent overlay component.

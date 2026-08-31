@@ -32,6 +32,24 @@ namespace DisplayXR.Samples
         // Attach the rig + overlay to Camera.main and ensure there's
         // something to render.
         [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.AfterSceneLoad)]
+
+        // True when the ACTIVE scene already has visible geometry.
+        //
+        // Scoped to the active scene on purpose: a plain
+        // FindAnyObjectByType<MeshRenderer>() also scans the DontDestroyOnLoad
+        // scene, where the DisplayXR boot splash builds its logo quads with
+        // MeshRenderer — which would make this sample skip its placeholder
+        // content (issue #262). This class is static (no GameObject of its
+        // own), so it asks SceneManager rather than gameObject.scene.
+        static bool ActiveSceneHasContent()
+        {
+            var scene = UnityEngine.SceneManagement.SceneManager.GetActiveScene();
+            foreach (var r in Object.FindObjectsByType<MeshRenderer>(FindObjectsSortMode.None))
+                if (r.gameObject.scene == scene)
+                    return true;
+            return false;
+        }
+
         static void Install()
         {
             var cam = Camera.main;
@@ -61,7 +79,7 @@ namespace DisplayXR.Samples
 
             // Placeholder content if the scene is empty. Replace with your
             // own avatar / props / etc.
-            if (Object.FindAnyObjectByType<MeshRenderer>() == null)
+            if (!ActiveSceneHasContent())
             {
                 var cube = GameObject.CreatePrimitive(PrimitiveType.Cube);
                 cube.name = "Avatar";
