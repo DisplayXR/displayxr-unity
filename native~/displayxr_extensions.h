@@ -29,6 +29,37 @@ typedef struct XrDisplayInfoDXR {
     uint32_t displayPixelHeight;
 } XrDisplayInfoDXR;
 
+// --- Desktop position of the 3D panel (XR_DXR_display_info SPEC_VERSION 16) ---
+// Chained onto XrSystemProperties (alongside XrDisplayInfoDXR) so a client can find
+// out WHERE on the Windows virtual desktop the panel is, which XrDisplayInfoDXR does
+// not say — it carries only physical size and pixel dimensions. Without this the
+// plugin cannot place the player window on the 3D display and the app simply opens
+// on whatever the OS primary happens to be (issue #266).
+//
+// COORDINATE SPACE: signed virtual-desktop PHYSICAL pixels, as a per-monitor-DPI-aware
+// process sees them. A monitor left of or above the primary has negative coordinates.
+// Anything consuming these MUST read and act in a per-monitor-aware context, or it
+// gets Windows' virtualized geometry instead and lands the window wrong on exactly
+// the mixed-DPI multi-monitor setups this exists to serve (measured in #263: a true
+// x=2560 read as x=5120 on a 300%/150% pair).
+//
+// Chaining an unknown struct is harmless on an older runtime — it ignores what it does
+// not recognise — so the fields keep their sentinel and the client falls back. Detect
+// that rather than assuming: (0,0) is a legitimate value for a panel that IS primary.
+#define XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR ((XrStructureType)1004999210)
+
+typedef struct XrDisplayDesktopPositionDXR {
+    XrStructureType type;   // XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR
+    void *next;
+    int32_t left;
+    int32_t top;
+} XrDisplayDesktopPositionDXR;
+
+// SPEC_VERSION 18 will add XrDisplayDesktopInfoDXR (1004999211) with the full
+// desktopRect + GDI deviceName + isPrimary. Deliberately a SEPARATE struct rather
+// than an extension of this one, so it cannot overrun an allocation made by a client
+// compiled against v16. See DisplayXR/displayxr-runtime#1301.
+
 typedef enum XrDisplayModeDXR {
     XR_DISPLAY_MODE_2D_DXR = 0,
     XR_DISPLAY_MODE_3D_DXR = 1,

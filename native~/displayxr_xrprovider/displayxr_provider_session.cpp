@@ -430,6 +430,11 @@ typedef struct ProviderSession {
 #endif // _WIN32
 
 	DxrProvDisplayInfo display_info;
+	// (#266) Panel position on the Windows virtual desktop, signed PHYSICAL px as a
+	// per-monitor-aware process sees them. Valid only against a runtime advertising
+	// XR_DXR_display_info v16+.
+	int32_t desktop_origin_x, desktop_origin_y;
+	int     desktop_origin_valid;
 
 	// Rendering modes
 	XrDisplayRenderingModeInfoDXR modes[PS_MAX_RENDERING_MODES];
@@ -4157,6 +4162,15 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	// --- Display info ---
 	XrDisplayInfoDXR di = {};
 	di.type = XR_TYPE_DISPLAY_INFO_DXR;
+	// (#266) Chain the panel's desktop position (XR_DXR_display_info v16). Sentinel
+	// first: an older runtime ignores a struct it does not recognise and leaves the
+	// fields untouched, and (0,0) is a LEGITIMATE value for a panel that IS primary --
+	// so "did we get an answer" cannot be inferred from the value being zero.
+	XrDisplayDesktopPositionDXR ddp = {};
+	ddp.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR;
+	ddp.left = INT32_MIN;
+	ddp.top  = INT32_MIN;
+	di.next = &ddp;
 	XrSystemProperties sp = {XR_TYPE_SYSTEM_PROPERTIES};
 	sp.next = &di;
 	if (XR_SUCCEEDED(s_ps.pfn_get_system_properties(s_ps.instance, s_ps.system_id, &sp))) {
@@ -4189,6 +4203,18 @@ int dxr_prov_session_start(const char *runtime_json_path,
 		sdi->recommended_view_scale_x = di.recommendedViewScaleX;
 		sdi->recommended_view_scale_y = di.recommendedViewScaleY;
 		sdi->is_valid = 1;
+
+		// (#266) Store the desktop origin only if the runtime actually answered.
+		if (ddp.left != INT32_MIN && ddp.top != INT32_MIN) {
+			s_ps.desktop_origin_x = ddp.left;
+			s_ps.desktop_origin_y = ddp.top;
+			s_ps.desktop_origin_valid = 1;
+			ps_log("[DisplayXR-PROV] Display desktop origin: (%d,%d) [v16]\n", ddp.left, ddp.top);
+		} else {
+			s_ps.desktop_origin_valid = 0;
+			ps_log("[DisplayXR-PROV] Display desktop origin: NOT REPORTED - runtime predates "
+			       "v16; placing the window on the 3D display is unavailable (#266)\n");
+		}
 
 		ps_log("[DisplayXR-PROV] Display: %ux%u %.3fx%.3fm\n",
 		       di.displayPixelWidth, di.displayPixelHeight,
@@ -6387,6 +6413,96 @@ int dxr_prov_get_mode_info(uint32_t index, DxrProvModeInfo *out_info)
 }
 
 uint32_t dxr_prov_get_active_mode_index(void) { return s_ps.active_mode_index; }
+
+// --- (#266) Placing the app window on the 3D display ----------------------------
+//
+// Reports the panel's virtual-desktop origin, and moves the app's own window onto it.
+//
+// THE MOVE IS DONE HERE, IN NATIVE, ON PURPOSE. The coordinates are signed virtual-
+// desktop PHYSICAL pixels as a per-monitor-DPI-aware process sees them. Managed code
+// in this plugin runs in Unity's process awareness, where Windows VIRTUALIZES geometry
+// on any monitor whose scale differs from the primary's -- so handing these numbers to
+// C# and calling Screen.MoveMainWindowTo / SetWindowPos from there lands the window in
+// the wrong place on precisely the mixed-DPI multi-monitor rigs this feature exists to
+// serve, while looking perfect on every single-monitor dev box. (Measured in #263 on a
+// 300%/150% pair: a true x=2560 read as x=5120.) Keeping the coordinates entirely
+// inside a per-monitor-aware context removes that failure mode by construction rather
+// than by remembering to convert at each call site.
+extern "C" void *displayxr_find_unity_hwnd(void);
+
+int dxr_prov_get_display_desktop_origin(int *out_x, int *out_y)
+{
+	if (!s_ps.desktop_origin_valid) return 0;
+	if (out_x) *out_x = (int)s_ps.desktop_origin_x;
+	if (out_y) *out_y = (int)s_ps.desktop_origin_y;
+	return 1;
+}
+
+int dxr_prov_move_window_to_display(void)
+{
+#if defined(_WIN32)
+	if (!s_ps.desktop_origin_valid) {
+		ps_log("[DisplayXR-PROV] move_window_to_display: no desktop origin (runtime < v16)\n");
+		return 0;
+	}
+	HWND hwnd = (HWND)displayxr_find_unity_hwnd();
+	if (!hwnd || !IsWindow(hwnd)) {
+		ps_log("[DisplayXR-PROV] move_window_to_display: no app window\n");
+		return 0;
+	}
+
+	DPI_AWARENESS_CONTEXT prev = SetThreadDpiAwarenessContext(
+		DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+	int rc = 0;
+	MONITORINFO mi;
+	mi.cbSize = sizeof(MONITORINFO);
+	POINT pt;
+	pt.x = s_ps.desktop_origin_x;
+	pt.y = s_ps.desktop_origin_y;
+	HMONITOR mon = MonitorFromPoint(pt, MONITOR_DEFAULTTONULL);
+	if (!mon) {
+		ps_log("[DisplayXR-PROV] move_window_to_display: no monitor at (%d,%d) - "
+		       "display arrangement changed since session start?\n",
+		       (int)s_ps.desktop_origin_x, (int)s_ps.desktop_origin_y);
+	} else if (GetMonitorInfo(mon, &mi)) {
+		RECT wr;
+		wr.left = wr.top = wr.right = wr.bottom = 0;
+		GetWindowRect(hwnd, &wr);
+		int ww = (int)(wr.right - wr.left), wh = (int)(wr.bottom - wr.top);
+		int mw = (int)(mi.rcMonitor.right - mi.rcMonitor.left);
+		int mh = (int)(mi.rcMonitor.bottom - mi.rcMonitor.top);
+
+		// Already there: do nothing. The common case is a user who has ALREADY
+		// worked around #266 by making the panel their primary display, and a
+		// pointless move would hand them a window jump they did not have before.
+		HMONITOR cur = MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST);
+		if (cur == mon) {
+			ps_log("[DisplayXR-PROV] move_window_to_display: already on the 3D display\n");
+			rc = 1;
+		} else {
+			// Centre it, and clamp so a window LARGER than the panel still lands
+			// with its top-left on the panel rather than off the top/left edge
+			// where the title bar becomes unreachable.
+			int x = (int)mi.rcMonitor.left + (mw - ww) / 2;
+			int y = (int)mi.rcMonitor.top  + (mh - wh) / 2;
+			if (x < (int)mi.rcMonitor.left) x = (int)mi.rcMonitor.left;
+			if (y < (int)mi.rcMonitor.top)  y = (int)mi.rcMonitor.top;
+			rc = SetWindowPos(hwnd, NULL, x, y, 0, 0,
+			                  SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE) ? 1 : 0;
+			ps_log("[DisplayXR-PROV] move_window_to_display: (%d,%d) %dx%d -> (%d,%d) on "
+			       "monitor (%d,%d %dx%d) rc=%d\n",
+			       (int)wr.left, (int)wr.top, ww, wh, x, y,
+			       (int)mi.rcMonitor.left, (int)mi.rcMonitor.top, mw, mh, rc);
+		}
+	}
+
+	if (prev) SetThreadDpiAwarenessContext(prev);
+	return rc;
+#else
+	return 0;
+#endif
+}
 
 int dxr_prov_request_rendering_mode(uint32_t mode_index)
 {
