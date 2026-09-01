@@ -16,6 +16,7 @@
 // Registered from displayxr_unity_plugin.cpp's UnityPluginLoad. Windows / D3D12,
 // M1 only. Does NOT touch the OpenXR hook path or the editor standalone path.
 
+#include <chrono>  // steady_clock (non-Windows monotonic clock)
 #include <stdlib.h> // getenv — Windows gets it via windows.h, Linux does not
 
 #ifdef _WIN32
@@ -31,6 +32,7 @@
 #ifdef _WIN32
 #include "../unity_pluginapi/IUnityGraphicsD3D12.h"
 #include "../unity_pluginapi/IUnityGraphicsD3D11.h" // #195
+#include "../displayxr_win32.h"           // startup curtain (overlay cloaked until steady)
 #endif
 #ifdef __APPLE__
 #include "displayxr_provider_gfx_metal.h" // Metal device/queue glue (#204)
@@ -201,6 +203,35 @@ void prov_log(const char *msg)
 	OutputDebugStringA(msg);
 #endif
 	dxr_prov_file_log(msg);
+}
+
+// Armed once the session has actually rendered for a while, so the
+// DXR_AVATAR_PRESENT_HZ cap can never interfere with the SYNCHRONIZED -> VISIBLE
+// climb (which needs continuous frame submission — see GfxPopulateNextFrameDesc).
+static bool s_cap_armed = false;
+
+// Monotonic nanoseconds for the present cap's pacing gate. QPC on Windows for the
+// same reason the twin uses steady_clock: the gate opens a few ms before a vblank
+// and a coarse clock would smear that phase.
+static uint64_t prov_monotonic_ns(void)
+{
+#ifdef _WIN32
+	static LARGE_INTEGER freq = { };
+	if (freq.QuadPart == 0) QueryPerformanceFrequency(&freq);
+	LARGE_INTEGER c;
+	QueryPerformanceCounter(&c);
+	return (uint64_t)((double)c.QuadPart * 1e9 / (double)freq.QuadPart);
+#else
+	// std::chrono rather than clock_gettime: this branch had never been compiled
+	// (CI's Linux/macOS jobs caught it on the first build) because <time.h> was not
+	// included, so CLOCK_MONOTONIC and clock_gettime were undeclared. steady_clock
+	// needs no feature-test macros, is monotonic by definition, and is what the
+	// comment above already refers to -- so it removes the portability question
+	// instead of adding an include and hoping. Windows keeps QPC deliberately, for
+	// the phase precision the gate depends on.
+	return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count();
+#endif
 }
 
 // OpenXR (right-handed, -Z forward) -> Unity (left-handed, +Z forward).
@@ -1034,6 +1065,73 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 	// always true and textures are always ready. Fix: begin AND end a frame here every
 	// tick regardless; only take the render path when we actually have textures AND the
 	// runtime asks us to render.
+	// ── DXR_AVATAR_PRESENT_HZ: present cap (the native twin's Phase-B perf knob) ──
+	// Ported from lenovo-unity-avatar native-vk~/windows/main.cpp so ONE perf-ladder
+	// config drives both trees. Same env name, same semantics: skip the frame
+	// entirely — no xrWaitFrame, no xrBeginFrame, no xrEndFrame — so weave, the
+	// zones/Local2D composite and present all drop to N Hz with the render.
+	//
+	// Two things had to be true for this to sit HERE, and both were measured
+	// 2026-08-24 rather than assumed:
+	//
+	//  1. Unity's own knob cannot do it. Assets/PerfKnobs.cs sets vSyncCount=0 +
+	//     Application.targetFrameRate; the [PerfKnobs] line logs and the runtime
+	//     still sees ~57-60 presents/s, because an XR display provider owns pacing
+	//     and targetFrameRate is ignored.
+	//  2. An EMPTY xrEndFrame is not a cap. The first cut kept the pump and took the
+	//     0-layer path below on skipped ticks: submits fell to exactly 1-in-3
+	//     (pump 5400 : submit 1800) and presents/weaves stayed at 60.0 — the runtime
+	//     presents its frame whether or not the app handed it layers. Only skipping
+	//     xrEndFrame moves the runtime's rate.
+	//
+	// Placed AFTER the per-tick housekeeping above (xrPollEvent, zone converge, size
+	// reconcile, texture wrap) — every one of which is load-bearing and must keep
+	// running on a skipped tick — and BEFORE the frame pump, which is the only part
+	// being dropped. Gated behind s_cap_armed so it can never interfere with the
+	// SYNCHRONIZED -> VISIBLE climb the pump comment below describes: the cap starts
+	// only after the session has rendered real frames for a while.
+	//
+	// Pacing follows the twin exactly: an exact panel-rate division on a
+	// high-resolution clock, opening ~4 ms early so the following xrWaitFrame lands
+	// every presented frame on the same vblank phase. A naive 1000/N ms gate beats
+	// against the 16.67 ms grid and alternates skip counts — judder on top of the
+	// lower rate. Sleep(1) instead of spinning, since we are no longer blocking in
+	// xrWaitFrame on these ticks.
+	{
+		static const int s_present_every = [] {
+			const char *e = getenv("DXR_AVATAR_PRESENT_HZ");
+			const int v = e ? atoi(e) : 0;
+			if (v < 1 || v > 240)
+				return 0;
+			const int panel_hz = 60; // same assumption (and TODO) as the twin's knob
+			if (v >= panel_hz)
+				return 1;
+			const int every = (panel_hz + v / 2) / v;
+			return every < 1 ? 1 : every;
+		}();
+		if (s_present_every > 1 && s_cap_armed) {
+			static double s_period_ns = 0.0;
+			static uint64_t s_last_ns = 0;
+			if (s_period_ns == 0.0) {
+				s_period_ns = (1e9 / 60.0) * s_present_every - 4.0e6;
+				char m[192];
+				snprintf(m, sizeof(m),
+				         "[DisplayXR-PROV] DXR_AVATAR_PRESENT_HZ: presenting 1 frame in %d "
+				         "(~%.1f Hz at 60 Hz panel); skipped ticks pump NO frame\n",
+				         s_present_every, 60.0 / s_present_every);
+				prov_log(m);
+			}
+			const uint64_t now_ns = prov_monotonic_ns();
+			if (s_last_ns != 0 && (double)(now_ns - s_last_ns) < s_period_ns) {
+#ifdef _WIN32
+				Sleep(1);
+#endif
+				return kUnitySubsystemErrorCodeSuccess; // no frame begun, nothing to end
+			}
+			s_last_ns = now_ns;
+		}
+	}
+
 	uint32_t img = 0;
 	int should_render = 0;
 	if (!dxr_prov_begin_frame(&img, &should_render))
@@ -1066,8 +1164,29 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 		return kUnitySubsystemErrorCodeSuccess;
 	}
 
+#if defined(_WIN32)
+	// (startup curtain) One real, renderable frame. The overlay was born cloaked;
+	// this is what eventually uncloaks it, once the app frame intervals stop
+	// lurching. Placed AFTER the empty-frame and divisor-skip returns on purpose:
+	// those are not frames the user would see, and feeding them to the pacing test
+	// would keep the curtain down until its timeout on every run.
+	displayxr_curtain_note_frame();
+#endif
+
 	s_current_image_index = img;
 	s_frame_in_flight = true;
+
+	// Arm the DXR_AVATAR_PRESENT_HZ cap only after the session has been genuinely
+	// renderable for ~2 s of panel time. Before that the pump must run every tick to
+	// climb SYNCHRONIZED -> VISIBLE (see above), and a cap that started early would
+	// reproduce the black-tile stall as a perf knob.
+	if (!s_cap_armed) {
+		static unsigned s_renderable_ticks = 0;
+		if (++s_renderable_ticks >= 120) {
+			s_cap_armed = true;
+			prov_log("[DisplayXR-PROV] present-cap armed (session renderable)\n");
+		}
+	}
 
 	uint32_t scW = 0, scH = 0, scArr = 0, scImgs = 0;
 	dxr_prov_get_swapchain_info(&scW, &scH, &scArr, &scImgs);

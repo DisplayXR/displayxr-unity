@@ -14,6 +14,9 @@
 #include <cstdlib>   // calloc/free — explicit; macOS clang/libc++ no longer pulls these in transitively
 #include <cstring>   // strcmp — same reason
 #include "displayxr_native_shared.h"
+#if defined(_WIN32)
+#include "displayxr_win32.h"
+#endif
 
 // --- Logging helper ---
 // On Windows built apps, fprintf(stderr) goes nowhere (no console).
@@ -281,4 +284,12 @@ displayxr_set_transparent_background(int enabled)
 	state->transparent_background_requested = (uint8_t)(enabled != 0);
 	displayxr_log("[DisplayXR] set_transparent_background: requested=%d\n",
 	              (int)state->transparent_background_requested);
+#if defined(_WIN32)
+	// Cloak Unity's main window HERE, the earliest native touchpoint a
+	// transparent app gives us -- ~110 ms before Unity's own ShowWindow.
+	// Waiting for overlay birth (let alone ApplyWindowing's coroutine) leaves
+	// an empty white window on the panel; see the pre-cloak's own comment.
+	if (state->transparent_background_requested)
+		displayxr_precloak_unity_main_window();
+#endif
 }

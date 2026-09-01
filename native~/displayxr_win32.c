@@ -81,6 +81,40 @@ static volatile LONG s_overlay_wheel_accum = 0;
 static DWORD s_saved_style    = 0;
 static DWORD s_saved_exstyle  = 0;
 static int   s_overlay_active = 0;
+// (startup white window) Set when the overlay's birth cloaked Unity's main HWND
+// eagerly, BEFORE ApplyWindowing's coroutine could. Tracked separately from
+// s_overlay_active because every existing un-cloak is gated on THAT flag, and an
+// early cloak that never got reverted would leave the app permanently invisible.
+static int   s_unity_early_cloaked = 0;
+
+// (startup curtain) The overlay is BORN CLOAKED and stays invisible until the app
+// is pacing steadily, so a user never sees the warm-up. Measured on the 3DLuma
+// avatar: after the first frame lands, frame+1 costs 1.5 s and frames 2-8 run ~350 ms
+// each before the app reaches a steady interval ~3 s later. Showing that is what
+// reads as "jerky, and the whole system goes slow" -- and it also drags DWM into
+// compositing the whole desktop against a presenter running at 3 fps, because a
+// transparent NOREDIRECTIONBITMAP window is never eligible for independent flip.
+//
+// Steadiness is judged on the RATIO between consecutive app frame intervals, never
+// on an absolute target: this app legitimately runs at 20 fps under
+// DXR_APP_FRAME_DIVISOR=3, and an absolute 16.7 ms gate would hold the curtain down
+// forever on exactly the configuration we recommend.
+static int      s_curtain_down = 0;
+static uint64_t s_curtain_start_ms = 0;
+static uint64_t s_curtain_last_frame_ms = 0;
+static uint64_t s_curtain_prev_gap_ms = 0;
+static int      s_curtain_steady_run = 0;
+
+// How many consecutive well-paced frames raise the curtain, and the backstop that
+// raises it regardless. Without the backstop an app that never reaches a steady rate
+// would stay invisible forever, which presents as "the app is broken".
+#define DXR_CURTAIN_STEADY_FRAMES 20
+#define DXR_CURTAIN_MAX_MS_DEFAULT 20000
+
+// Defined with the other curtain helpers further down; the overlay-birth call site
+// sits above them. Without this the C compiler implicit-declares it as returning
+// int and the real static void definition is then a redefinition error.
+static void curtain_lower(void);
 static RECT  s_hit_rect       = {0, 0, 0, 0};
 
 // Unity's pre-transparent screen rect, captured in displayxr_set_transparent_overlay
@@ -1234,6 +1268,37 @@ displayxr_get_app_main_view(void)
 	    unity_hwnd, GWLP_WNDPROC, (LONG_PTR)parent_subclass_proc);
 	s_parent_subclass_hwnd = unity_hwnd;
 
+	// Cloak Unity's main window NOW rather than waiting for ApplyWindowing.
+	//
+	// The cloak that hides Unity's empty backbuffer already exists, but its only
+	// caller is DisplayXRTransparentOverlay.ApplyWindowing -- a Unity COROUTINE,
+	// so it cannot run while the main thread is busy loading the scene. Measured
+	// on the 3DLuma avatar: Unity shows its main window at ~1.7 s, the main thread
+	// then does not yield until ~10 s, and the cloak lands there. For those ~8 s a
+	// full-screen empty (white) window sits on the panel -- which Windows also
+	// re-titles "(Not responding)", the pump being blocked -- and it
+	// is the first thing a user sees on every launch.
+	//
+	// This site runs at session init, BEFORE Unity's own ShowWindow, and
+	// DWMWA_CLOAK is a pure DWM-side attribute: it needs no message pump, it
+	// survives the later ShowWindow, and it leaves input, focus and rendering
+	// untouched. ApplyWindowing still does the style strip and the off-screen park
+	// once the main thread frees up; re-cloaking there is idempotent.
+	if (transparent_mode) {
+		BOOL cloak = TRUE;
+		HRESULT hr = DwmSetWindowAttribute(unity_hwnd, DWMWA_CLOAK,
+		                                   &cloak, sizeof(cloak));
+		if (SUCCEEDED(hr))
+			s_unity_early_cloaked = 1;
+		displayxr_log("[DisplayXR] Early-cloaked Unity main window at overlay "
+		              "birth (before ApplyWindowing): hr=0x%08X\n", (unsigned)hr);
+	}
+
+	// Hold the curtain: the overlay exists but stays invisible until the app is
+	// pacing steadily. Suki's requirement was explicit -- a slower startup is fine,
+	// the desktop going jerky is not.
+	curtain_lower();
+
 	displayxr_log("[DisplayXR] Created overlay HWND (%dx%d at %d,%d) on Unity window %p — %s\n",
 	              w, h, x, y, (void *)unity_hwnd,
 	              transparent_mode ? "TOP-LEVEL WS_POPUP + NOREDIRECTIONBITMAP (transparent)"
@@ -2154,6 +2219,197 @@ displayxr_get_unity_main_hwnd(void)
 // Mutually exclusive with shell mode (early-out below).
 // ============================================================================
 
+// (startup white window) Unity's main HWND, found even while it is still HIDDEN.
+//
+// find_unity_hwnd() cannot serve the pre-cloak: it requires IsWindowVisible() and a
+// client width > 100, which is exactly what Unity's window is NOT yet at the moment
+// we need to cloak it. Measured: the window exists (hidden, 183x137) from ~0.3 s and
+// Unity shows it at ~1.65 s, so the only useful window of opportunity is while it is
+// still hidden. Match on the class name instead -- that is stable and unambiguous.
+//
+// EDITOR GUARD: the Unity editor's own main window carries the same class, and
+// cloaking the editor would hide the user's IDE. Only ever run this in a player.
+static HWND
+find_unity_main_hwnd_any(void)
+{
+	wchar_t exe[MAX_PATH];
+	if (GetModuleFileNameW(NULL, exe, MAX_PATH) > 0) {
+		const wchar_t *base = wcsrchr(exe, L'\\');
+		base = base ? base + 1 : exe;
+		if (_wcsicmp(base, L"Unity.exe") == 0)
+			return NULL; // editor, not a player
+	}
+
+	DWORD our_pid = GetCurrentProcessId();
+	HWND hwnd = NULL;
+	while ((hwnd = FindWindowExW(NULL, hwnd, NULL, NULL)) != NULL) {
+		DWORD pid = 0;
+		GetWindowThreadProcessId(hwnd, &pid);
+		if (pid != our_pid || is_displayxr_overlay_class(hwnd))
+			continue;
+		wchar_t cls[64];
+		if (GetClassNameW(hwnd, cls, 64) > 0
+		    && _wcsicmp(cls, L"UnityWndClass") == 0)
+			return hwnd;
+	}
+	return NULL;
+}
+
+// Cloak Unity's main window at the EARLIEST native touchpoint we have.
+//
+// Cloaking at overlay birth still left a visible flash: the overlay is born at
+// ~1.87 s but Unity shows its window at ~1.65 s, so ~220 ms of empty white window
+// reached the panel (confirmed by DWMWA_CLOAKED going True only after the show, and
+// by eye). displayxr_set_transparent_background() is the app's first native call --
+// ~110 ms before the show -- so cloaking there closes the gap.
+//
+// Idempotent, and safe to fail: if Unity's window does not exist yet the overlay-birth
+// cloak still runs as the backstop.
+void
+displayxr_precloak_unity_main_window(void)
+{
+	if (s_unity_early_cloaked)
+		return;
+	if (displayxr_is_shell_mode())
+		return;
+
+	HWND hwnd = find_unity_main_hwnd_any();
+	if (hwnd == NULL) {
+		displayxr_log("[DisplayXR] pre-cloak: no Unity main window yet "
+		              "(overlay birth will cloak instead)\n");
+		return;
+	}
+
+	BOOL cloak = TRUE;
+	HRESULT hr = DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &cloak, sizeof(cloak));
+	if (SUCCEEDED(hr))
+		s_unity_early_cloaked = 1;
+	displayxr_log("[DisplayXR] Pre-cloaked Unity main window %p BEFORE its "
+		      "first ShowWindow: hr=0x%08X\n", (void *)hwnd, (unsigned)hr);
+}
+
+static uint64_t
+curtain_now_ms(void)
+{
+	return (uint64_t)GetTickCount64();
+}
+
+// OPT-IN, not opt-out. Measured on the 3DLuma avatar box after this shipped
+// default-on: with the curtain the avatar appeared 28.7 s after launch, without it
+// 5.4 s -- a 23-SECOND regression. It lifted on the 20 s backstop, not on the
+// "20 consecutively well-paced frames" fast path, because that box takes ~18 s to
+// reach steady state and so can never accumulate 20 good frames inside the window.
+//
+// That is the wrong shape for a default: the curtain degrades most on exactly the
+// slow-starting machines it exists to help, and its benefit is cosmetic -- it hides
+// warm-up, it does not shorten it (its author measured peak GPU 72.5% -> 69.1%,
+// mean flat). The white-window bug this branch fixes is fixed by the CLOAK, which
+// is unconditional; the curtain is not load-bearing for it. Verified on hardware:
+// no window was ever visible-and-uncloaked with the curtain OFF either.
+//
+// Kept because it does what it claims on a fast-starting box (its author measured
+// it lifting at 15.6/17.7 s via the fast path there), so it stays available behind
+// DXR_AVATAR_CURTAIN=1.
+static int
+curtain_enabled(void)
+{
+	const char *e = getenv("DXR_AVATAR_CURTAIN");
+	return e != NULL && e[0] == '1';
+}
+
+static uint64_t
+curtain_max_ms(void)
+{
+	const char *e = getenv("DXR_AVATAR_CURTAIN_MS");
+	if (e != NULL && e[0] != '\0') {
+		long v = strtol(e, NULL, 10);
+		if (v > 0)
+			return (uint64_t)v;
+	}
+	return (uint64_t)DXR_CURTAIN_MAX_MS_DEFAULT;
+}
+
+// Uncloak the overlay and stop tracking. Idempotent.
+static void
+curtain_raise(const char *why)
+{
+	if (!s_curtain_down)
+		return;
+	s_curtain_down = 0;
+	if (s_overlay_hwnd != NULL && IsWindow(s_overlay_hwnd)) {
+		BOOL cloak = FALSE;
+		DwmSetWindowAttribute(s_overlay_hwnd, DWMWA_CLOAK, &cloak, sizeof(cloak));
+	}
+	displayxr_log("[DisplayXR] startup curtain UP after %llu ms (%s) "
+		      "-- the overlay is now visible\n",
+		      (unsigned long long)(curtain_now_ms() - s_curtain_start_ms), why);
+}
+
+// Called at overlay birth. Cloaks the overlay so nothing of the warm-up is seen.
+static void
+curtain_lower(void)
+{
+	if (!curtain_enabled()) {
+		displayxr_log("[DisplayXR] startup curtain off (default; set "
+		              "DXR_AVATAR_CURTAIN=1 to enable)\n");
+		return;
+	}
+	if (s_overlay_hwnd == NULL)
+		return;
+	BOOL cloak = TRUE;
+	HRESULT hr = DwmSetWindowAttribute(s_overlay_hwnd, DWMWA_CLOAK, &cloak, sizeof(cloak));
+	if (FAILED(hr)) {
+		displayxr_log("[DisplayXR] startup curtain: cloak failed hr=0x%08X "
+		              "-- showing the warm-up\n", (unsigned)hr);
+		return;
+	}
+	s_curtain_down = 1;
+	s_curtain_start_ms = curtain_now_ms();
+	s_curtain_last_frame_ms = 0;
+	s_curtain_prev_gap_ms = 0;
+	s_curtain_steady_run = 0;
+	displayxr_log("[DisplayXR] startup curtain DOWN -- overlay cloaked until the app "
+		      "paces %d consecutive frames steadily (or %llu ms elapse)\n",
+		      DXR_CURTAIN_STEADY_FRAMES, (unsigned long long)curtain_max_ms());
+}
+
+void
+displayxr_curtain_note_frame(void)
+{
+	if (!s_curtain_down)
+		return;
+
+	const uint64_t now = curtain_now_ms();
+	if (now - s_curtain_start_ms >= curtain_max_ms()) {
+		curtain_raise("timeout");
+		return;
+	}
+
+	if (s_curtain_last_frame_ms == 0) {
+		s_curtain_last_frame_ms = now;
+		return;
+	}
+	const uint64_t gap = now - s_curtain_last_frame_ms;
+	s_curtain_last_frame_ms = now;
+	if (s_curtain_prev_gap_ms == 0) {
+		s_curtain_prev_gap_ms = gap;
+		return;
+	}
+
+	// Ratio test, so 60 fps and the divisor's 20 fps both qualify. A frame that
+	// took more than 1.5x its predecessor (or less than 2/3) restarts the run.
+	const uint64_t lo = (gap < s_curtain_prev_gap_ms) ? gap : s_curtain_prev_gap_ms;
+	const uint64_t hi = (gap < s_curtain_prev_gap_ms) ? s_curtain_prev_gap_ms : gap;
+	s_curtain_prev_gap_ms = gap;
+	if (lo > 0 && hi * 2 <= lo * 3) {
+		s_curtain_steady_run++;
+		if (s_curtain_steady_run >= DXR_CURTAIN_STEADY_FRAMES)
+			curtain_raise("steady");
+	} else {
+		s_curtain_steady_run = 0;
+	}
+}
+
 void
 displayxr_set_transparent_overlay(int enabled, int topmost)
 {
@@ -2167,6 +2423,18 @@ displayxr_set_transparent_overlay(int enabled, int topmost)
 	if (hwnd == NULL) {
 		displayxr_log("[DisplayXR] transparent_overlay: no Unity HWND\n");
 		return;
+	}
+
+	// The early cloak has no matching un-cloak below: every branch there is gated
+	// on s_overlay_active, which is still 0 when the main thread never freed up to
+	// run ApplyWindowing. Without this, a session-loss revert (or a teardown on
+	// that path) would leave Unity's window cloaked and the app invisible.
+	if (!enabled && s_unity_early_cloaked && !s_overlay_active) {
+		BOOL cloak = FALSE;
+		DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &cloak, sizeof(cloak));
+		s_unity_early_cloaked = 0;
+		displayxr_log("[DisplayXR] transparent_overlay: reverted the EARLY "
+		              "cloak (ApplyWindowing never ran)\n");
 	}
 
 	if (enabled && !s_overlay_active) {
@@ -2390,6 +2658,7 @@ displayxr_set_transparent_overlay(int enabled, int topmost)
 		{
 			BOOL cloak = FALSE;
 			DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &cloak, sizeof(cloak));
+			s_unity_early_cloaked = 0;
 		}
 		SetWindowLongPtrW(hwnd, GWL_STYLE, (LONG_PTR)s_saved_style);
 		SetWindowLongPtrW(hwnd, GWL_EXSTYLE, (LONG_PTR)s_saved_exstyle);
