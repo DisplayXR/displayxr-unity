@@ -16,6 +16,7 @@
 // Registered from displayxr_unity_plugin.cpp's UnityPluginLoad. Windows / D3D12,
 // M1 only. Does NOT touch the OpenXR hook path or the editor standalone path.
 
+#include <chrono>  // steady_clock (non-Windows monotonic clock)
 #include <stdlib.h> // getenv — Windows gets it via windows.h, Linux does not
 
 #ifdef _WIN32
@@ -221,9 +222,15 @@ static uint64_t prov_monotonic_ns(void)
 	QueryPerformanceCounter(&c);
 	return (uint64_t)((double)c.QuadPart * 1e9 / (double)freq.QuadPart);
 #else
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (uint64_t)ts.tv_sec * 1000000000ull + (uint64_t)ts.tv_nsec;
+	// std::chrono rather than clock_gettime: this branch had never been compiled
+	// (CI's Linux/macOS jobs caught it on the first build) because <time.h> was not
+	// included, so CLOCK_MONOTONIC and clock_gettime were undeclared. steady_clock
+	// needs no feature-test macros, is monotonic by definition, and is what the
+	// comment above already refers to -- so it removes the portability question
+	// instead of adding an include and hoping. Windows keeps QPC deliberately, for
+	// the phase precision the gate depends on.
+	return (uint64_t)std::chrono::duration_cast<std::chrono::nanoseconds>(
+		std::chrono::steady_clock::now().time_since_epoch()).count();
 #endif
 }
 
