@@ -31,6 +31,7 @@
 #ifdef _WIN32
 #include "../unity_pluginapi/IUnityGraphicsD3D12.h"
 #include "../unity_pluginapi/IUnityGraphicsD3D11.h" // #195
+#include "../displayxr_win32.h"           // startup curtain (overlay cloaked until steady)
 #endif
 #ifdef __APPLE__
 #include "displayxr_provider_gfx_metal.h" // Metal device/queue glue (#204)
@@ -1155,6 +1156,15 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 		dxr_prov_end_frame_empty();
 		return kUnitySubsystemErrorCodeSuccess;
 	}
+
+#if defined(_WIN32)
+	// (startup curtain) One real, renderable frame. The overlay was born cloaked;
+	// this is what eventually uncloaks it, once the app frame intervals stop
+	// lurching. Placed AFTER the empty-frame and divisor-skip returns on purpose:
+	// those are not frames the user would see, and feeding them to the pacing test
+	// would keep the curtain down until its timeout on every run.
+	displayxr_curtain_note_frame();
+#endif
 
 	s_current_image_index = img;
 	s_frame_in_flight = true;
