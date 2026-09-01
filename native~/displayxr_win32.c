@@ -2294,11 +2294,27 @@ curtain_now_ms(void)
 	return (uint64_t)GetTickCount64();
 }
 
+// OPT-IN, not opt-out. Measured on the 3DLuma avatar box after this shipped
+// default-on: with the curtain the avatar appeared 28.7 s after launch, without it
+// 5.4 s -- a 23-SECOND regression. It lifted on the 20 s backstop, not on the
+// "20 consecutively well-paced frames" fast path, because that box takes ~18 s to
+// reach steady state and so can never accumulate 20 good frames inside the window.
+//
+// That is the wrong shape for a default: the curtain degrades most on exactly the
+// slow-starting machines it exists to help, and its benefit is cosmetic -- it hides
+// warm-up, it does not shorten it (its author measured peak GPU 72.5% -> 69.1%,
+// mean flat). The white-window bug this branch fixes is fixed by the CLOAK, which
+// is unconditional; the curtain is not load-bearing for it. Verified on hardware:
+// no window was ever visible-and-uncloaked with the curtain OFF either.
+//
+// Kept because it does what it claims on a fast-starting box (its author measured
+// it lifting at 15.6/17.7 s via the fast path there), so it stays available behind
+// DXR_AVATAR_CURTAIN=1.
 static int
 curtain_enabled(void)
 {
 	const char *e = getenv("DXR_AVATAR_CURTAIN");
-	return !(e != NULL && e[0] == '0');
+	return e != NULL && e[0] == '1';
 }
 
 static uint64_t
@@ -2334,8 +2350,8 @@ static void
 curtain_lower(void)
 {
 	if (!curtain_enabled()) {
-		displayxr_log("[DisplayXR] startup curtain disabled "
-		              "(DXR_AVATAR_CURTAIN=0)\n");
+		displayxr_log("[DisplayXR] startup curtain off (default; set "
+		              "DXR_AVATAR_CURTAIN=1 to enable)\n");
 		return;
 	}
 	if (s_overlay_hwnd == NULL)
