@@ -206,7 +206,11 @@ if [ "$SIGNED" = yes ]; then
   # Pull the just-released .tgz and extract the CI-built (unsigned) DLL.
   gh release download [VERSION] -R DisplayXR/displayxr-unity -p "$TGZ" -D "$D"
   mkdir -p "$D/x"; tar xzf "$D/$TGZ" -C "$D/x"
-  PKGDIR=$(ls -d "$D"/x/com.displayxr.unity-* 2>/dev/null | head -1); [ -z "$PKGDIR" ] && PKGDIR="$D/x/package"
+  # NOTE: probe with `find`, never `ls`. Many git-bash profiles alias ls to
+  # `ls -F`, which appends a classify char to the NAME (`/` for a directory,
+  # `*` for an executable) — see the trap on SIGNED_DLL below.
+  PKGDIR=$(find "$D/x" -mindepth 1 -maxdepth 1 -type d -name 'com.displayxr.unity-*' | head -1)
+  [ -z "$PKGDIR" ] && PKGDIR="$D/x/package"
   DLL="$PKGDIR/$DLL_REL"
 
   SIGNED_DLL=""
@@ -243,7 +247,17 @@ if [ "$SIGNED" = yes ]; then
       # portable unzip (git-bash on Windows has no `unzip`).
       if command -v unzip >/dev/null; then ( cd "$D/out" && unzip -qo signed.zip -d "$D/signed" 2>/dev/null || true )
       else powershell -NoProfile -Command "Expand-Archive -Path '$(cygpath -w "$D/out/signed.zip")' -DestinationPath '$(cygpath -w "$D/signed")' -Force"; fi
-      SIGNED_DLL=$(ls "$D/signed/displayxr_unity.dll" 2>/dev/null | head -1)
+      # NOTE: test the path directly — do NOT probe it with `ls`. A git-bash
+      # profile that aliases ls to `ls -F` makes `ls <file>` print
+      # "displayxr_unity.dll*" (trailing classify char for an executable), so
+      # SIGNED_DLL comes back NON-EMPTY — the "did not return a signed DLL"
+      # guard below passes — yet every later `cp "$SIGNED_DLL"` dies with
+      # "cannot stat", the .tgz is repacked with the UNSIGNED CI DLL, the upm
+      # commit is a no-op, and the script still prints the ✅ signed line.
+      # This silently shipped an unsigned v2.14.0 on the win box before it was
+      # caught by hand. Same class of trap as the TMP one above.
+      SIGNED_DLL=""
+      [ -f "$D/signed/displayxr_unity.dll" ] && SIGNED_DLL="$D/signed/displayxr_unity.dll"
     fi
     gh release delete "$SIGN_TAG" -R "$SIGN_REPO" --yes --cleanup-tag >/dev/null 2>&1 || true
 
@@ -270,8 +284,20 @@ if [ "$SIGNED" = yes ]; then
 fi
 ```
 
-Verify (optional): `gh run download` the `.tgz`, extract, and
-`Get-AuthenticodeSignature` the DLL should report `Valid` / signer `Leia, Inc.`.
+### Step 3.5.3: Verify the SHIPPED bytes (REQUIRED when SIGNED=yes)
+Never report "signed" off the script's own success line — re-download what the
+world will actually install and check it. Both channels:
+```bash
+V=$(mktemp -d); mkdir -p "$V/x"
+gh release download [VERSION] -R DisplayXR/displayxr-unity -p "com.displayxr.unity-[VERSION_NUMBER].tgz" -D "$V"
+tar xzf "$V/com.displayxr.unity-[VERSION_NUMBER].tgz" -C "$V/x"
+powershell -NoProfile -Command "(Get-AuthenticodeSignature '$(cygpath -w "$V/x/com.displayxr.unity-[VERSION_NUMBER]/Runtime/Plugins/Windows/x64/displayxr_unity.dll")').Status"
+git cat-file -p "origin/upm:Runtime/Plugins/Windows/x64/displayxr_unity.dll" > "$V/upm.dll"
+powershell -NoProfile -Command "(Get-AuthenticodeSignature '$(cygpath -w "$V/upm.dll")').Status"
+rm -rf "$V"
+```
+Both must print `Valid` (signer `Leia, Inc.`). Anything else → report SIGNED=no,
+whatever the script above claimed. (On macOS/Linux use `osslsigncode verify`.)
 
 Note: the macOS `displayxr_unity.bundle` is signed with an Apple
 Developer ID cert + notarization (a separate track from the Windows EV
