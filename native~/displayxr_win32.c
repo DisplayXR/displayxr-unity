@@ -1248,6 +1248,33 @@ displayxr_get_app_main_view(void)
 	}
 
 	s_overlay_is_toplevel = toplevel;
+	/*
+	 * CURSOR RESPONSIVENESS DURING WARM-UP.
+	 *
+	 * The overlay is created on Unity's MAIN thread, so its wndproc runs there too. It
+	 * is topmost and covers the panel until the first real resize (~10.6 s). Until
+	 * then, every WM_NCHITTEST / WM_SETCURSOR for a cursor over the panel is answered
+	 * by a thread that -- measured -- only pumps every 170-450 ms during the app's
+	 * warm-up. So the CURSOR ITSELF can only update ~5 times a second.
+	 *
+	 * Reported precisely: the busy cursor is fine (Windows draws that itself), and the
+	 * sluggishness starts the moment it becomes a normal arrow -- i.e. the moment a
+	 * window on this thread starts answering for it -- and clears when the avatar
+	 * appears and the thread reaches 60 fps.
+	 *
+	 * So birth the overlay HIT-TEST TRANSPARENT: the OS then routes cursor queries past
+	 * it to whatever is underneath, without waiting on this thread. Nothing is lost
+	 * while the curtain is down -- the overlay is cloaked and there is nothing to click.
+	 * displayxr_set_overlay_hit_active() owns the flag from the first frame onward and
+	 * will clear it as soon as the app is live, restoring normal hit behaviour.
+	 */
+	if (transparent_mode && s_overlay_hwnd != NULL) {
+		const LONG_PTR ex_now = GetWindowLongPtrW(s_overlay_hwnd, GWL_EXSTYLE);
+		SetWindowLongPtrW(s_overlay_hwnd, GWL_EXSTYLE, ex_now | WS_EX_TRANSPARENT);
+		displayxr_log("[DisplayXR] overlay born HIT-TEST TRANSPARENT so a slow app "
+		              "thread cannot stall the cursor\n");
+	}
+
 
 	s_original_wndproc = (WNDPROC)SetWindowLongPtrW(
 	    unity_hwnd, GWLP_WNDPROC, (LONG_PTR)parent_subclass_proc);
@@ -2269,6 +2296,33 @@ displayxr_precloak_unity_main_window(void)
 	HRESULT hr = DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &cloak, sizeof(cloak));
 	if (SUCCEEDED(hr))
 		s_unity_early_cloaked = 1;
+
+	/*
+	 * ...and take it OUT OF THE HIT-TEST PATH, not just out of compositing.
+	 *
+	 * DWMWA_CLOAK hides the window from DWM but leaves the HWND where
+	 * WindowFromPoint finds it -- the same reason ApplyWindowing parks Unity
+	 * off-screen later (see the #57 Approach A comment further down). Until that
+	 * park runs, the cursor sits over a FULL-SCREEN window whose message pump is
+	 * blocked by the scene load, so every WM_SETCURSOR / WM_NCHITTEST waits on a
+	 * dead thread. Reported symptom, exactly: "cursor still ok, then cursor slow,
+	 * then cursor fast and then avatar shows up" -- sluggish from the show (~1.7 s)
+	 * until the park (~10 s), recovering BEFORE the avatar ever appears.
+	 *
+	 * Parking here costs nothing: the window is already cloaked, and Unity keeps
+	 * receiving input by HWND (RawInput INPUTSINK + the overlay PostMessage path),
+	 * which is position-independent -- the same argument the later park relies on.
+	 * ApplyWindowing re-parks idempotently.
+	 */
+	if (s_unity_early_cloaked) {
+		GetWindowRect(hwnd, &s_unity_saved_rect);
+		const int w = s_unity_saved_rect.right - s_unity_saved_rect.left;
+		const int h = s_unity_saved_rect.bottom - s_unity_saved_rect.top;
+		SetWindowPos(hwnd, NULL, -32000, -32000, w > 0 ? w : 1, h > 0 ? h : 1,
+		             SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+		displayxr_log("[DisplayXR] Early-parked Unity main window off-screen so a hung "
+		              "pump cannot stall the cursor\n");
+	}
 	displayxr_log("[DisplayXR] Pre-cloaked Unity main window %p BEFORE its "
 		      "first ShowWindow: hr=0x%08X\n", (void *)hwnd, (unsigned)hr);
 }
@@ -2345,6 +2399,46 @@ curtain_lower(void)
 void
 displayxr_curtain_note_frame(void)
 {
+	/*
+	 * APP-SIDE FRAME TIMELINE. The runtime logs present gaps ([GAP]) but nothing said
+	 * when the APP itself was slow, which is the other half of "when is it sluggish".
+	 * This is called once per renderable frame, so it can answer that directly:
+	 * every frame whose interval exceeds the threshold is logged with its elapsed
+	 * time since process start, so a run can be read as a timeline.
+	 *
+	 * DXR_AVATAR_FRAMELOG_MS=<n> sets the threshold (default 25); 0 disables.
+	 * Runs regardless of the curtain, hence ahead of the early-out below.
+	 */
+	{
+		static double thr = -1.0;
+		static uint64_t first_ms = 0;
+		static uint64_t prev_ms = 0;
+		static uint64_t frame_no = 0;
+		if (thr < 0.0) {
+			const char *e = getenv("DXR_AVATAR_FRAMELOG_MS");
+			thr = 25.0;
+			if (e != NULL && e[0] != '\0') {
+				const double v = atof(e);
+				thr = (v >= 0.0) ? v : 25.0;
+			}
+		}
+		const uint64_t now = (uint64_t)GetTickCount64();
+		frame_no++;
+		if (first_ms == 0) {
+			first_ms = now;
+			displayxr_log("[FRAMELOG] first renderable app frame\n");
+		} else if (thr > 0.0) {
+			const double gap = (double)(now - prev_ms);
+			if (gap >= thr) {
+				displayxr_log("[FRAMELOG] frame %llu at t+%.2fs: %.0f ms since the "
+				              "previous app frame\n",
+				              (unsigned long long)frame_no,
+				              (double)(now - first_ms) / 1000.0, gap);
+			}
+		}
+		prev_ms = now;
+	}
+
 	if (!s_curtain_down)
 		return;
 
