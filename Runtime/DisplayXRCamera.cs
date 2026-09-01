@@ -220,6 +220,61 @@ namespace DisplayXR
         }
 
         /// <summary>
+        /// (#274) The FOV this rig actually projects with — the value you authored on the
+        /// Camera, not what <see cref="Camera.fieldOfView"/> reads back.
+        ///
+        /// <para>
+        /// <b>Why this exists.</b> While a session is running the provider hands Unity a
+        /// full per-eye projection, and Unity's XR then WRITES <c>Camera.fieldOfView</c>
+        /// from it each frame — a tracking-derived number that moves with the viewer's
+        /// head (measured in the field at 76.5°–124.5° against an authored 60°). Anything
+        /// reading <c>Camera.fieldOfView</c> in Play therefore gets a value that is neither
+        /// what you set nor stable: a <c>Screen Space - Camera</c> canvas sizes itself from
+        /// it and so renders too large and rescales as the viewer moves, and gameplay or
+        /// cinematic code doing FOV maths silently drifts.
+        /// </para>
+        ///
+        /// <para>
+        /// The rig has always kept the authored value (it must, or reading the camera back
+        /// would feed the Kooima FOV into itself and collapse it); it was simply private.
+        /// This exposes it, and makes it settable so an app CAN change FOV at runtime —
+        /// assigning <c>Camera.fieldOfView</c> while XR is active does not work, because
+        /// XR overwrites it and the rig projects from this cache regardless.
+        /// </para>
+        ///
+        /// <para>
+        /// <b>A camera with no rig has no such record.</b> Nothing captures its authored
+        /// FOV before XR starts, so the original is simply gone. If you need it, snapshot
+        /// it yourself before the session comes up — or use
+        /// <c>DisplayXRWindowSpaceUI</c> for screen-fixed UI, which is a composition layer
+        /// at a fixed window rect and immune to the camera pose and projection entirely.
+        /// See <c>docs~/architecture/two-dimensional-scenes.md</c>.
+        /// </para>
+        /// </summary>
+        public float AuthoredFieldOfView
+        {
+            get
+            {
+                if (m_CachedCameraFov >= 1.0f) return m_CachedCameraFov;
+                var c = m_Camera != null ? m_Camera : GetComponent<Camera>();
+                return c != null ? c.fieldOfView : 60f;
+            }
+            set
+            {
+                if (!(value >= 1.0f) || value >= 179.0f) return;
+                m_CachedCameraFov = value;
+                // Outside Play, Camera.fieldOfView is still the authored value and the
+                // inspector shows it, so keep the two in step. In Play, writing it would
+                // be pointless — XR overwrites it every frame from the projection.
+                if (!Application.isPlaying)
+                {
+                    var c = m_Camera != null ? m_Camera : GetComponent<Camera>();
+                    if (c != null) c.fieldOfView = value;
+                }
+            }
+        }
+
+        /// <summary>
         /// (epic #166 provider) The stereo tunables this camera-centric rig would
         /// push this frame, as raw rig fields. fovOverride = tan(halfVFov) from the
         /// cached camera FOV (cached because XR overrides Camera.fieldOfView).
@@ -229,8 +284,7 @@ namespace DisplayXR
         public DisplayXRTunables GetProviderTunables()
         {
             var cam = m_Camera != null ? m_Camera : GetComponent<Camera>();
-            float fovDeg = m_CachedCameraFov >= 1.0f ? m_CachedCameraFov
-                          : (cam != null ? cam.fieldOfView : 60f);
+            float fovDeg = AuthoredFieldOfView;   // (#274) single source of truth
             var t = DisplayXRTunables.Default;
             t.ipdFactor = ipdFactor;
             t.parallaxFactor = parallaxFactor;

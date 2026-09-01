@@ -123,6 +123,27 @@ canvas sizes itself from that value — so it renders too large and rescales as 
 head moves. `DisplayXRWindowSpaceUI` sidesteps this completely: it is a composition layer at
 a fixed window rect, not something projected through the camera.
 
+### Reading (and changing) the FOV you authored
+
+`Camera.fieldOfView` is **not** your authored value in Play — XR overwrites it from the
+projection, so it is tracking-derived and moves with the viewer (measured in the field at
+76.5°–124.5° against an authored 60°). Anything doing FOV maths off it drifts silently.
+
+`DisplayXRCamera.AuthoredFieldOfView` is the value the rig actually projects with:
+
+```csharp
+float fov = rig.AuthoredFieldOfView;   // what you set, stable
+rig.AuthoredFieldOfView = 75f;         // change it at runtime
+```
+
+Assigning `Camera.fieldOfView` while a session is running does **not** work — XR overwrites
+it each frame, and the rig projects from its own cache regardless. The setter above is the
+supported way to change FOV at runtime.
+
+A camera with **no rig** has no such record: nothing captured its authored FOV before XR
+started, so the original is gone. Snapshot it yourself before the session comes up if you
+need it — or use window-space UI, which doesn't care about the camera at all.
+
 **A 2D overlay inside a 3D scene** is a *different* problem — you want
 `DisplayXRWindowSpaceUI` (a composition layer at a fixed window rect) or `DisplayXRLocal2D`
 (a flat 2D band inside the 3D scene), not a mode switch. Mode switching changes the whole
