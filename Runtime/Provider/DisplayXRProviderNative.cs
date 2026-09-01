@@ -399,6 +399,36 @@ namespace DisplayXR
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern uint dxr_prov_get_active_mode_index();
 
+        /// <summary>
+        /// (#266) Origin of the 3D panel on the Windows virtual desktop, in SIGNED
+        /// PHYSICAL pixels. Returns 0 when the runtime predates XR_DXR_display_info v16.
+        /// <para>
+        /// (0,0) is a LEGITIMATE value — a panel that is the primary display sits there —
+        /// so test the RETURN VALUE, never the coordinates, to decide whether an answer
+        /// was given.
+        /// </para>
+        /// <para>
+        /// Prefer <see cref="dxr_prov_move_window_to_display"/> over acting on these from
+        /// C#. Managed code here runs in Unity's process DPI awareness, where Windows
+        /// virtualizes geometry on any monitor whose scale differs from the primary's, so
+        /// a managed SetWindowPos/MoveMainWindowTo would land the window wrong on exactly
+        /// the mixed-DPI multi-monitor rigs this exists to serve (#263).
+        /// </para>
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int dxr_prov_get_display_desktop_origin(out int x, out int y);
+
+        /// <summary>
+        /// (#266) Move the app's own window onto the 3D panel, centred. Returns 1 on
+        /// success — including the no-op case where the window is already on that panel,
+        /// which is the common one for users who worked around #266 by making the panel
+        /// their primary display. The move happens natively, inside a
+        /// PER_MONITOR_AWARE_V2 thread context, so the coordinates never pass through
+        /// Unity's virtualized DPI space. Windows only; returns 0 elsewhere.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int dxr_prov_move_window_to_display();
+
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern int dxr_prov_request_rendering_mode(uint modeIndex);
 

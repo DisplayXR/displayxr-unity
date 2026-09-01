@@ -508,6 +508,23 @@ DISPLAYXR_EXPORT int  dxr_prov_get_mode_info(uint32_t index, DxrProvModeInfo *ou
 /// modeIndex of the currently active mode (isActive), or 0 if unknown.
 DISPLAYXR_EXPORT uint32_t dxr_prov_get_active_mode_index(void);
 
+/// (#266) Origin of the 3D panel on the Windows virtual desktop, in SIGNED PHYSICAL
+/// pixels as a per-monitor-DPI-aware process sees them. Returns 0 when the runtime
+/// predates XR_DXR_display_info v16 and did not report it -- note that (0,0) is a
+/// LEGITIMATE value for a panel that is the primary display, so callers must use the
+/// return value rather than testing the coordinates.
+///
+/// Prefer dxr_prov_move_window_to_display() over consuming these from managed code:
+/// C# here runs in Unity's process DPI awareness and would read virtualized geometry.
+DISPLAYXR_EXPORT int  dxr_prov_get_display_desktop_origin(int *out_x, int *out_y);
+
+/// (#266) Move the app's own window onto the 3D panel, centred, and return 1 on
+/// success. No-op returning 1 when the window is already on that panel -- the common
+/// case for users who worked around #266 by making the panel their primary display.
+/// Returns 0 if the origin is unknown, the window cannot be found, or the panel is no
+/// longer at that origin (arrangement changed since session start). Windows only.
+DISPLAYXR_EXPORT int  dxr_prov_move_window_to_display(void);
+
 /// Request a vendor rendering mode by modeIndex (xrRequestDisplayRenderingModeDXR).
 /// Returns 1 on XR_SUCCEEDED.
 DISPLAYXR_EXPORT int  dxr_prov_request_rendering_mode(uint32_t mode_index);

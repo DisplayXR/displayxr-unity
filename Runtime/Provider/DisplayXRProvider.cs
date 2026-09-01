@@ -61,6 +61,41 @@ namespace DisplayXR
         public static bool RequestRenderingMode(uint modeIndex) =>
             IsRunning && DisplayXRProviderNative.dxr_prov_request_rendering_mode(modeIndex) != 0;
 
+        /// <summary>
+        /// (#266) Move the app's window onto the DisplayXR panel. Returns true on success,
+        /// including the no-op case where it is already there.
+        /// <para>
+        /// Needs a runtime advertising <c>XR_DXR_display_info</c> v16+; returns false
+        /// against anything older, and false off Windows. Call it once the session is
+        /// running — the panel's desktop position is read at session start.
+        /// </para>
+        /// <para>
+        /// The move is performed in native inside a per-monitor-DPI-aware context on
+        /// purpose. Doing the equivalent from C# with <c>Screen.MoveMainWindowTo</c> reads
+        /// Unity's virtualized geometry and mis-places the window on mixed-DPI
+        /// multi-monitor setups — the same coordinate-space split diagnosed in #263 —
+        /// while looking correct on every single-monitor machine.
+        /// </para>
+        /// </summary>
+        public static bool MoveWindowToDisplay() =>
+            IsRunning && DisplayXRProviderNative.dxr_prov_move_window_to_display() != 0;
+
+        /// <summary>
+        /// (#266) The panel's origin on the Windows virtual desktop, in signed physical
+        /// pixels. False when the runtime predates <c>XR_DXR_display_info</c> v16.
+        /// <para>
+        /// Informational only — for placing a window prefer
+        /// <see cref="MoveWindowToDisplay"/>, which acts in the right DPI context.
+        /// (0,0) is a legitimate origin, so never infer "unknown" from the value.
+        /// </para>
+        /// </summary>
+        public static bool TryGetDisplayDesktopOrigin(out int x, out int y)
+        {
+            x = 0; y = 0;
+            return IsRunning &&
+                   DisplayXRProviderNative.dxr_prov_get_display_desktop_origin(out x, out y) != 0;
+        }
+
         /// <summary>Request the hardware 2D/3D display state. Returns true on success.</summary>
         public static bool RequestDisplayMode(bool mode3d) =>
             IsRunning && DisplayXRProviderNative.dxr_prov_request_display_mode(mode3d ? 1 : 0) != 0;

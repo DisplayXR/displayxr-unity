@@ -76,6 +76,10 @@ int displayxr_is_shell_mode(void);
 /// Subclasses Unity's HWND to suppress deactivation and track button state.
 /// @param unity_hwnd The Unity main HWND.
 /// @return 1 on success, 0 on failure.
+/// (#266) The app's main (Unity) window, skipping any window this plugin created.
+/// NULL when it cannot be identified. Windows only.
+void *displayxr_find_unity_hwnd(void);
+
 int displayxr_install_focus_hook(void *unity_hwnd);
 
 /// (#256) Reverse displayxr_install_focus_hook: restore the patched IAT entries and

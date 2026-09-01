@@ -338,6 +338,15 @@ find_unity_hwnd(void)
 	return unity_hwnd;
 }
 
+// (#266) Accessor so other TUs (the provider) can reach the app's main window
+// without duplicating the class-skipping enumeration. find_unity_hwnd is static
+// because it is used all over this file; this is the only sanctioned way out.
+void *
+displayxr_find_unity_hwnd(void)
+{
+	return (void *)find_unity_hwnd();
+}
+
 // ============================================================================
 // Standalone mode: overlay window + parent subclass
 // ============================================================================
