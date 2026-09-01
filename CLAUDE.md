@@ -38,6 +38,33 @@ Raw CMake (`cd native~ && mkdir build && cd build && cmake .. -DCMAKE_BUILD_TYPE
 
 **Claude Code: after modifying any file in `native~/`, run the build script for the current platform (`native~/build-mac.sh` on macOS, `native~\build-win.bat` on Windows; also `native~/build-win.sh` as a cross-compile check on macOS) to refresh the shipping binary. Then commit source + your platform's binary, push to a feature branch, and open a PR — CI builds all three platforms.**
 
+**Adding a Win32 geometry call? Decide which DPI space it answers in — FIRST.** `GetMonitorInfoW`,
+`GetWindowRect`, `GetClientRect`, `MonitorFromPoint`/`MonitorFromWindow` and friends answer in the
+**calling process's** DPI awareness. This plugin spans two:
+
+| Side | Awareness | What its numbers mean |
+|---|---|---|
+| `native~/` weave + overlay windows | pinned `PER_MONITOR_AWARE_V2` | true physical virtual-desktop px |
+| `Runtime/**.cs` (P/Invoke from managed) | **Unity's**, never pinned | Windows-VIRTUALIZED px |
+
+They are identical on the primary monitor and diverge by the ratio of the scale factors anywhere
+else — so a mistake here is invisible on every single-monitor dev box and wrong on exactly the
+mixed-DPI multi-monitor rigs that need it. Measured in #263: a true `x=2560` read as `x=5120` on a
+300%/150% pair, which cost three failed fixes before it was understood.
+
+Rules of thumb:
+- **Prefer doing the work in native inside a pinned scope** (`SetThreadDpiAwarenessContext(PER_MONITOR_AWARE_V2)`,
+  restore after) so the coordinates never enter managed code — you cannot forget a conversion you
+  never have to make. `dxr_prov_move_window_to_display` (#266) is the reference shape.
+- **Never mix numbers from the two spaces in one expression**, including "sanity checks" — under a
+  DPI-unaware host they disagree by the scale factor *even when both are correct*.
+- **`(0,0)` is a legitimate coordinate**, not a "no value" sentinel: it is where a primary-display
+  panel sits, which is the most common configuration. Signal absence out of band.
+- This is a DLL problem, not a Unity problem: a DLL does not control its process's awareness, so it
+  inherits the host's. The DisplayXR runtime hit the identical trap in its own resolver — see
+  [`docs/reference/dpi-awareness.md`](https://github.com/DisplayXR/displayxr-runtime/blob/main/docs/reference/dpi-awareness.md)
+  in the runtime repo for the cross-component write-up.
+
 **Touching a platform `#ifdef` in `native~/`? Compile-check Linux too.** The provider TUs are
 littered with `#ifdef _WIN32 … #else` blocks whose `#else` historically meant "macOS" — a third
 platform turns every one of those into a latent build break, and neither the macOS nor the Windows
