@@ -18,6 +18,17 @@ extern "C" {
 /// @return HWND cast to void*, or NULL if no window found.
 void *displayxr_get_app_main_view(void);
 
+/// (startup white window) Cloak Unity's main window at the app's first native
+/// call, before Unity ever shows it. No-op in the editor, in shell mode, or if
+/// already cloaked; overlay birth re-cloaks as the backstop.
+void displayxr_precloak_unity_main_window(void);
+
+/// (startup curtain) Note that the app delivered a frame. Raises the curtain once
+/// the app has paced DXR_CURTAIN_STEADY_FRAMES consecutive frames evenly, or when
+/// DXR_AVATAR_CURTAIN_MS elapses. No-op once the curtain is up, or if disabled with
+/// DXR_AVATAR_CURTAIN=0. Cheap: two comparisons on the frame path.
+void displayxr_curtain_note_frame(void);
+
 /// (#256) Destroy the app-owned overlay from displayxr_get_app_main_view and undo
 /// what that call installed (Unity-window subclass, focus hook, and any transparent-
 /// mode cloak/off-screen park). Call on session-start failure — the overlay is
