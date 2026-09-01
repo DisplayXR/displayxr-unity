@@ -109,6 +109,31 @@ static int      s_curtain_steady_run = 0;
 // raises it regardless. Without the backstop an app that never reaches a steady rate
 // would stay invisible forever, which presents as "the app is broken".
 #define DXR_CURTAIN_STEADY_FRAMES 20
+
+/*!
+ * One refresh period in ms, for the curtain's steadiness tolerance. Queried from the
+ * display the app is actually on rather than assuming 60 Hz; falls back to 60 Hz when
+ * the mode is unavailable. Clamped so a bogus mode cannot widen the bound without limit.
+ */
+static uint64_t
+curtain_refresh_period_ms(void)
+{
+	static uint64_t cached = 0;
+	if (cached != 0)
+		return cached;
+	uint64_t hz = 60;
+	DEVMODEW dm;
+	memset(&dm, 0, sizeof(dm));
+	dm.dmSize = sizeof(dm);
+	if (EnumDisplaySettingsW(NULL, ENUM_CURRENT_SETTINGS, &dm) && dm.dmDisplayFrequency > 1)
+		hz = (uint64_t)dm.dmDisplayFrequency;
+	cached = 1000 / hz;
+	if (cached < 4)
+		cached = 4;
+	if (cached > 40)
+		cached = 40;
+	return cached;
+}
 #define DXR_CURTAIN_MAX_MS_DEFAULT 20000
 
 // Defined with the other curtain helpers further down; the overlay-birth call site
@@ -2358,6 +2383,29 @@ curtain_raise(const char *why)
 {
 	if (!s_curtain_down)
 		return;
+	/*
+	 * DIAGNOSTIC HOLD: DXR_AVATAR_CURTAIN_HOLD=1 keeps the curtain down forever, so the
+	 * session parks indefinitely in the state between "the 3D light came on" and "the avatar
+	 * appeared" -- the window Suki reports the stickiness in. Everything else runs exactly as
+	 * it normally would (3D lens on, capture running, app rendering and pacing); only the
+	 * uncloak is withheld. That makes the state inspectable for as long as needed instead of
+	 * for the ~6 s it naturally lasts.
+	 *
+	 * Never set in normal operation -- with this on, the avatar never becomes visible.
+	 */
+	{
+		const char *hold = getenv("DXR_AVATAR_CURTAIN_HOLD");
+		if (hold != NULL && hold[0] == '1') {
+			static int logged = 0;
+			if (!logged) {
+				logged = 1;
+				displayxr_log("[DisplayXR] startup curtain HELD DOWN by "
+					      "DXR_AVATAR_CURTAIN_HOLD=1 (would have raised: %s) -- "
+					      "diagnostic only, the avatar stays hidden\n", why);
+			}
+			return;
+		}
+	}
 	s_curtain_down = 0;
 	if (s_overlay_hwnd != NULL && IsWindow(s_overlay_hwnd)) {
 		BOOL cloak = FALSE;
@@ -2459,12 +2507,31 @@ displayxr_curtain_note_frame(void)
 		return;
 	}
 
-	// Ratio test, so 60 fps and the divisor's 20 fps both qualify. A frame that
-	// took more than 1.5x its predecessor (or less than 2/3) restarts the run.
-	const uint64_t lo = (gap < s_curtain_prev_gap_ms) ? gap : s_curtain_prev_gap_ms;
-	const uint64_t hi = (gap < s_curtain_prev_gap_ms) ? s_curtain_prev_gap_ms : gap;
+	/*
+	 * Steadiness is judged with a ONE-REFRESH-PERIOD tolerance, not a ratio.
+	 *
+	 * The ratio test this replaces (1.5x) could never pass for a rate-capped app,
+	 * and so the curtain ALWAYS fell out on its 20 s timeout. A ~30 fps app on a
+	 * 60 Hz panel does not produce a constant interval -- it alternates between
+	 * TWO and THREE refresh periods, 31 ms and 47 ms. That ratio is 1.516, just
+	 * over the 1.5x bound, so the run reset on literally every frame. Measured on
+	 * this box: the app was steady from t+13.4 s but the avatar stayed hidden
+	 * until t+20.4 s ("curtain UP after 20015 ms (timeout)") -- SEVEN SECONDS of
+	 * dead time that read to the user as part of the slow startup.
+	 *
+	 * A refresh period of jitter is the correct tolerance because vsync
+	 * quantisation is exactly what a well-behaved capped app does. It still
+	 * rejects what the curtain exists to hide: warm-up frames here run 170-450 ms
+	 * apart, so consecutive differences are 100 ms and up -- an order of magnitude
+	 * outside this bound.
+	 *
+	 * The bound is derived from the panel, not hardcoded to 60 Hz, so a 120 Hz
+	 * panel tightens it automatically rather than silently over-accepting.
+	 */
+	const uint64_t d = (gap > s_curtain_prev_gap_ms) ? (gap - s_curtain_prev_gap_ms)
+	                                                 : (s_curtain_prev_gap_ms - gap);
 	s_curtain_prev_gap_ms = gap;
-	if (lo > 0 && hi * 2 <= lo * 3) {
+	if (gap > 0 && d <= curtain_refresh_period_ms() + 1) {
 		s_curtain_steady_run++;
 		if (s_curtain_steady_run >= DXR_CURTAIN_STEADY_FRAMES)
 			curtain_raise("steady");
@@ -2701,10 +2768,41 @@ displayxr_set_transparent_overlay(int enabled, int topmost)
 			}
 		}
 
-		// Install global low-level mouse hook for click-routing
-		// diagnostics. Idempotent; never uninstalled. See the
-		// instrumentation block above displayxr_set_overlay_hit_active.
-		displayxr_install_ll_mouse_hook();
+		/*
+		 * DIAGNOSTIC low-level mouse hook -- OFF unless explicitly asked for.
+		 *
+		 * This is instrumentation from the #57 click-routing work. It was left on by
+		 * default, and it is the cause of the reported "app startup makes the whole system
+		 * cursor sluggish". WH_MOUSE_LL is GLOBAL: every mouse event in the system is routed
+		 * to the installing thread and the OS WITHHOLDS that input until the thread returns
+		 * or LowLevelHooksTimeout (300 ms default) expires. The install thread here is
+		 * UNITY'S MAIN THREAD -- the one that stops pumping for ~5.5 s during scene load.
+		 *
+		 * Measured on this box (GetCursorPos polled at ~10 kHz while the mouse was moved):
+		 *   nothing running          p50  8.0 ms   max     9.9 ms   no gaps
+		 *   avatar starting up       p50 15.4 ms   max   250.0 ms   gaps >100 ms
+		 * The ~250 ms maximum sits right at the 300 ms hook timeout, and the OS separately
+		 * marks our windows hung (IsHungAppWindow) across t+5.3..10.8 s.
+		 *
+		 * The 8 -> 16 ms halving that persists even once the app is healthy is the callback's
+		 * own cost: it writes a log line to disk PER MOUSE EVENT and does a
+		 * SendMessageTimeoutW(WM_GETTEXT, 50 ms) round trip, inside the global input path.
+		 *
+		 * The callback comments say "Observation only -- never block delivery", which is true
+		 * of its return value and false of its existence: a low-level hook blocks by being
+		 * installed. Hence default OFF. DXR_AVATAR_LLMOUSE_HOOK=1 restores it for click-routing
+		 * debugging, where its cost is the point.
+		 *
+		 * NOTE the display path is NOT implicated and was individually cleared by A/B against
+		 * the same cursor instrument: the 3D lens (a native zones app with the light ON is a
+		 * healthy 8.0 ms), the WGC capture, the cross-adapter reroute, and transparency.
+		 */
+		{
+			const char *e = getenv("DXR_AVATAR_LLMOUSE_HOOK");
+			if (e != NULL && e[0] == '1') {
+				displayxr_install_ll_mouse_hook();
+			}
+		}
 	} else if (!enabled && s_overlay_active) {
 		// Pick the rect Unity should restore to before uncloaking. If the
 		// overlay still exists, use its current screen rect — the user
