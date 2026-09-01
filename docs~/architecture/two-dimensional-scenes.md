@@ -86,15 +86,42 @@ Behavioral notes worth knowing:
 - **The 3D mode it returns to is captured, not guessed** — whatever multi-view mode was
   active the first time it looked, so a 2D→3D transition restores your app's real mode
   rather than "the first stereo mode in the list".
-- **Graceful degrade.** If the runtime advertises no mono mode, it flattens disparity, asks
-  for the panel's 2D state, and logs one warning saying content will be flat but still
-  rendered through the stereo path. It never throws and never blocks scene load.
+- **It waits for a late mode table.** In a **built player** the runtime's mode table is not
+  populated at scene-load time — it reads empty or stale for a while *after* the session
+  reports running, and only later advertises the mono mode. `DisplayXRSceneMode` refreshes
+  and retries for up to 5 s rather than deciding once, then re-asserts the request until
+  `ActiveModeIndex` actually reads back as the one it asked for. Hardware-verified: deciding
+  once worked in the editor and silently degraded in players, which presents as
+  `RequestDisplayMode` returning `true` while the active mode never changes — a 2D scene
+  that renders weaved and looks black.
+- **Graceful degrade.** If no mono mode appears within that window, it flattens disparity,
+  asks for the panel's 2D state, and logs one warning. It never throws and never blocks
+  scene load.
+
+  > **The degrade path still head-tracks.** "Flat but still rendered through the stereo
+  > path" means the mono view keeps the head-tracked pose, so **world-anchored UI visibly
+  > follows the viewer's face**. A `Screen Space - Camera` canvas will drift and rescale as
+  > the viewer moves. If you need screen-fixed UI on this path, use
+  > [`DisplayXRWindowSpaceUI`](window-space-ui.md) — it is a composition layer at a fixed
+  > window rect and is immune to the camera pose entirely.
 
 ## Patterns
 
 **A 2D home screen that loads into a 3D scene.** Put a `DisplayXRSceneMode` set to `TwoD` in
 the menu scene and one set to `ThreeD` in the content scene. Each applies on enable; the
 sequencer handles the ramp in both directions.
+
+**Screen-fixed 2D UI.** The configuration verified on hardware for a fully flat, clickable
+home screen in a built player is:
+
+> **no rig** + `DisplayXRSceneMode(TwoD)` + a full-rect `DisplayXRWindowSpaceUI` + the
+> `Samples~/WindowSpaceUI` mouse router.
+
+Do **not** reach for a `Screen Space - Camera` canvas here. While a session is running,
+Unity's XR writes `Camera.fieldOfView` each frame from the runtime's projection, and such a
+canvas sizes itself from that value — so it renders too large and rescales as the viewer's
+head moves. `DisplayXRWindowSpaceUI` sidesteps this completely: it is a composition layer at
+a fixed window rect, not something projected through the camera.
 
 **A 2D overlay inside a 3D scene** is a *different* problem — you want
 `DisplayXRWindowSpaceUI` (a composition layer at a fixed window rect) or `DisplayXRLocal2D`

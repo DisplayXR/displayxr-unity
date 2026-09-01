@@ -42,7 +42,9 @@ namespace DisplayXR
     /// scene load.
     /// </para>
     /// </summary>
-    [AddComponentMenu("DisplayXR/Scene Mode (2D / 3D)")]
+    // NB: no "/" inside the NAME — Unity parses it as a menu path separator, so
+    // "Scene Mode (2D / 3D)" renders in the inspector header as just "3D)".
+    [AddComponentMenu("DisplayXR/Scene Mode (2D-3D)")]
     [DisallowMultipleComponent]
     public class DisplayXRSceneMode : MonoBehaviour
     {
@@ -66,8 +68,23 @@ namespace DisplayXR
 
         readonly DisplayXRModeSwitch m_Switch = new DisplayXRModeSwitch();
 
+        // (hardware finding, UNITY-133) In a BUILT PLAYER the runtime's mode table is not
+        // populated at scene-load time — it reads empty or stale for a while after the
+        // session reports running, and only later advertises the mono mode. Deciding once
+        // at scene load therefore took the graceful-degrade path in players while working
+        // in the editor, which is precisely the "RequestDisplayMode returned true but the
+        // active mode never changed" symptom that made a 2D Home scene render weaved and
+        // look black. So: refresh and retry until a mono mode shows up, and only degrade
+        // once the window has genuinely elapsed.
+        const float kModeTableTimeout = 5f;   // seconds to wait for a late mode table
+        const float kVerifyTimeout    = 3f;   // seconds to keep re-asserting after firing
+
         bool  m_Pending;                 // a target is set but the session wasn't up yet
         bool  m_Applied;
+        float m_WaitElapsed;
+        float m_VerifyElapsed;
+        bool  m_Verifying;
+        uint  m_RequestedMode;
         uint  m_ThreeDModeIndex;         // the 3D mode to come back to
         bool  m_HaveThreeDMode;
         bool  m_WarnedNoMonoMode;
@@ -97,6 +114,8 @@ namespace DisplayXR
             mode = target;
             m_Pending = true;
             m_Applied = false;
+            m_WaitElapsed = 0f;
+            m_Verifying = false;
             if (DisplayXRProvider.IsRunning) BeginTransition();
         }
 
@@ -106,18 +125,54 @@ namespace DisplayXR
             // dock/undock auto-switch restarts it mid-run — so a held request is re-armed
             // rather than dropped (a once-only push into a dead session succeeds silently).
             if (m_Pending && !m_Applied && DisplayXRProvider.IsRunning)
+            {
+                m_WaitElapsed += Time.unscaledDeltaTime;
                 BeginTransition();
+            }
 
-            if (!m_Switch.Active) return;
+            if (m_Switch.Active)
+            {
+                float ipd = m_Switch.Update(Time.unscaledDeltaTime, out bool fire, out uint modeIndex);
+                PushIpdFactor(ipd);
+                if (fire && DisplayXRProvider.IsRunning)
+                {
+                    if (modeIndex != DisplayXRProvider.ActiveModeIndex)
+                        DisplayXRProvider.RequestRenderingMode(modeIndex);
+                    m_RequestedMode = modeIndex;
+                    m_Verifying = true;
+                    m_VerifyElapsed = 0f;
+                }
+                return;
+            }
 
-            float ipd = m_Switch.Update(Time.unscaledDeltaTime, out bool fire, out uint modeIndex);
-            PushIpdFactor(ipd);
-            if (fire && DisplayXRProvider.IsRunning && modeIndex != DisplayXRProvider.ActiveModeIndex)
-                DisplayXRProvider.RequestRenderingMode(modeIndex);
+            // Post-fire verification. A request can be accepted (returns true) and then not
+            // take — the same late-mode-table window that makes the initial lookup fail also
+            // swallows an early request. Re-assert until the active mode actually reads back
+            // as the one we asked for, then stop.
+            if (!m_Verifying) return;
+            m_VerifyElapsed += Time.unscaledDeltaTime;
+            if (!DisplayXRProvider.IsRunning) return;
+            if (DisplayXRProvider.ActiveModeIndex == m_RequestedMode || m_VerifyElapsed > kVerifyTimeout)
+            {
+                m_Verifying = false;
+                return;
+            }
+            DisplayXRProvider.RefreshModes();
+            DisplayXRProvider.RequestRenderingMode(m_RequestedMode);
         }
 
         void BeginTransition()
         {
+            // Hold off while the runtime has not advertised a mono mode yet — in a player
+            // the table fills in late. Refresh and come back next frame rather than
+            // committing to the degrade path on a table that simply is not ready.
+            if (m_Target == DisplayXRSceneDimensionality.TwoD &&
+                !TryFindMonoMode(out _) && m_WaitElapsed < kModeTableTimeout)
+            {
+                DisplayXRProvider.RefreshModes();
+                return;                              // m_Applied stays false -> retried
+            }
+
             m_Applied = true;
 
             // Remember the 3D mode to return to: whatever multi-view mode is active the first
@@ -150,11 +205,15 @@ namespace DisplayXR
                     {
                         m_WarnedNoMonoMode = true;
                         Debug.LogWarning(
-                            "[DisplayXR] SceneMode: the runtime advertises no mono (viewCount<=1) " +
-                            "rendering mode, so this scene cannot be switched to a true 2D render " +
-                            "path. Falling back to zero disparity" +
+                            "[DisplayXR] SceneMode: the runtime advertised no mono (viewCount<=1) " +
+                            $"rendering mode within {kModeTableTimeout:F0}s ({DisplayXRProvider.Modes.Count} " +
+                            "mode(s) enumerated), so this scene cannot be switched to a true 2D " +
+                            "render path. Falling back to zero disparity" +
                             (driveHardwareDisplayMode ? " + the panel's hardware 2D state." : ".") +
-                            " Content will be flat but still rendered through the stereo path.");
+                            " Content will be flat but STILL RENDERED THROUGH THE STEREO PATH, " +
+                            "which means it keeps the head-tracked pose — world-anchored UI will " +
+                            "visibly follow the viewer's face. Use DisplayXRWindowSpaceUI for " +
+                            "screen-fixed UI when this path is taken.");
                     }
                 }
             }
