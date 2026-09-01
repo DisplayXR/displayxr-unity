@@ -163,20 +163,46 @@ namespace DisplayXR
 
             var cam = m_Camera != null ? m_Camera : GetComponent<Camera>();
             if (cam == null || !cam.enabled) return;
+            if (!TryGetVirtualDisplayPullback(cam, out float d, out float worldHeight)) return;
 
-            // Vertical FOV — Unity's Camera.fieldOfView. The 3D rig ignores it (the
-            // display geometry defines the frustum); in 2D Unity honors it, which is
-            // exactly why it is the right number here.
+            transform.position -= transform.forward * d;
+            Debug.Log($"[DisplayXR] 2D fallback: camera moved back {d:F2} units so a " +
+                      $"{cam.fieldOfView:F0}° camera frames the virtual display " +
+                      $"(height {worldHeight:F2}).");
+        }
+
+        /// <summary>
+        /// Distance to back <paramref name="cam"/> out along its own −forward so that its
+        /// symmetric frustum intercepts the virtual display's height exactly at the display
+        /// plane — i.e. so a plain 2D camera frames what the 3D rig frames.
+        /// <c>D = (H / 2) / tan(fov / 2)</c>.
+        /// <para>
+        /// Pure: reads nothing but the camera and this transform, mutates nothing, and is
+        /// safe to call in edit mode with no session. It is the single implementation behind
+        /// both the runtime 2D fallback (#256) and the edit-mode Game-view framing preview
+        /// (#265) — they must never drift apart.
+        /// </para>
+        /// <para>
+        /// The FOV used is the camera's own <see cref="Camera.fieldOfView"/>. The 3D rig
+        /// ignores it (the display geometry defines the frustum); Unity honors it in 2D,
+        /// which is exactly why it is the right number here. <paramref name="worldHeight"/>
+        /// is the display height in WORLD units — <c>virtualDisplayHeight</c> is a local
+        /// measure, so it is scaled by <c>lossyScale.y</c>. (This is deliberately not the
+        /// driver's <c>vdh /= scale</c>, which folds scale into the runtime-owned metric to
+        /// get scale-as-zoom; a transform move needs plain world units.)
+        /// </para>
+        /// </summary>
+        /// <returns>False when the inputs cannot produce a sane distance.</returns>
+        public bool TryGetVirtualDisplayPullback(Camera cam, out float distance, out float worldHeight)
+        {
+            distance = 0f; worldHeight = 0f;
+            if (cam == null) return false;
+
             float fov = cam.fieldOfView;
-            if (!(fov > 0.01f) || fov >= 179.99f) return;
+            if (!(fov > 0.01f) || fov >= 179.99f) return false;
             float tanHalf = Mathf.Tan(fov * 0.5f * Mathf.Deg2Rad);
-            if (!(tanHalf > 1e-4f)) return;
+            if (!(tanHalf > 1e-4f)) return false;
 
-            // World-space height of the virtual display. virtualDisplayHeight is a LOCAL
-            // measure — the gizmo draws the display quad through localToWorldMatrix — so
-            // the frustum must intercept height * lossyScale.y. (Note this is not the
-            // driver's `vdh /= scale`: that folds scale into the metric the RUNTIME owns
-            // to get scale-as-zoom; here we need plain world units for a transform move.)
             float height = virtualDisplayHeight;
             if (height <= 0f)
             {
@@ -186,15 +212,13 @@ namespace DisplayXR
                 height = 0.2f;
             }
             float scaleY = Mathf.Abs(transform.lossyScale.y);
-            if (!(scaleY > 1e-4f)) return;
-            float worldHeight = height * scaleY;
+            if (!(scaleY > 1e-4f)) return false;
+            worldHeight = height * scaleY;
 
             float d = (worldHeight * 0.5f) / tanHalf;
-            if (!(d > 1e-4f) || float.IsNaN(d) || float.IsInfinity(d)) return;
-
-            transform.position -= transform.forward * d;
-            Debug.Log($"[DisplayXR] 2D fallback: camera moved back {d:F2} units so a " +
-                      $"{fov:F0}° camera frames the virtual display (height {worldHeight:F2}).");
+            if (!(d > 1e-4f) || float.IsNaN(d) || float.IsInfinity(d)) return false;
+            distance = d;
+            return true;
         }
 
         void OnDisable()
