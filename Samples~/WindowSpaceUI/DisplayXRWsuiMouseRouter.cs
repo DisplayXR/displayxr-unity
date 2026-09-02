@@ -14,11 +14,21 @@
 //   1. Read the cursor in fractional window coords.
 //   2. Hit-test the wsui layer's fractional rect.
 //   3. Map the hit to canvas-pixel coords inside the OverlayTexture.
-//   4. Synthesize PointerEventData and dispatch click/drag to UI Selectables.
+//   4. Raycast EVERY GraphicRaycaster under the wsui canvas (nested canvases included).
+//   5. Synthesize PointerEventData and dispatch enter/exit, scroll, click and drag.
+//
+// NESTED CANVASES. Anything that brings its own Canvas under the wsui root — a file
+// browser, a modal dialog, a dropdown's blocker — comes with its own GraphicRaycaster,
+// and the root raycaster never sees those graphics. Two things go wrong at once: the
+// nested graphics are never hit-tested (the dialog is dead to clicks), and a nested
+// WorldSpace canvas does NOT inherit the root's worldCamera, so its raycaster falls back
+// to Camera.main and projects with the wrong camera. The router collects every
+// raycaster under the wsui, points every nested canvas at the overlay camera, and
+// orders hits by sortingOrder (dialogs override-sort above the app UI) then depth.
 //
 // This ships as a SAMPLE, not a plugin component, because input policy is app-owned
 // (same reasoning as Samples~/DefaultInputController). Fork it freely — if your input
-// model isn't a mouse, steps 1 and 4 are the only parts you need to replace.
+// model isn't a mouse, steps 1 and 5 are the only parts you need to replace.
 //
 // USAGE: drop it on the same GameObject as your DisplayXRWindowSpaceUI, or anywhere
 // above it in the hierarchy. Assign `windowSpaceUI` explicitly if the automatic
@@ -41,10 +51,16 @@ namespace DisplayXR.Samples
         public DisplayXRWindowSpaceUI windowSpaceUI;
 
         private DisplayXRWindowSpaceUI m_Wsui;
-        private GraphicRaycaster m_Raycaster;
         private EventSystem m_EventSystem;
 
+        // Every GraphicRaycaster under the wsui canvas, re-collected each frame so
+        // canvases spawned at runtime (dialogs, popups) are picked up without wiring.
+        private readonly List<GraphicRaycaster> m_Raycasters = new List<GraphicRaycaster>();
+        private readonly List<RaycastResult> m_Hits = new List<RaycastResult>();
+        private readonly List<RaycastResult> m_TempHits = new List<RaycastResult>();
+
         private GameObject m_PressTarget;
+        private GameObject m_Hovered;
         private PointerEventData m_PointerData;
         private Vector2 m_LastCanvasPos;
         private bool m_LeftDown;
@@ -75,6 +91,15 @@ namespace DisplayXR.Samples
             m_PointerData = new PointerEventData(m_EventSystem);
         }
 
+        void OnDisable()
+        {
+            // Leave no Selectable stuck in its highlighted/pressed state, and release the
+            // input claim so scene controllers resume.
+            SetHovered(null);
+            ReleaseIfDown();
+            DisplayXRWindowSpaceUI.IsCursorOverInteractive = false;
+        }
+
         void Update()
         {
             if (m_Wsui == null)
@@ -83,23 +108,17 @@ namespace DisplayXR.Samples
                     ? windowSpaceUI
                     : GetComponentInChildren<DisplayXRWindowSpaceUI>();
                 if (m_Wsui == null) return;
-            }
-            if (m_Raycaster == null)
-            {
-                m_Raycaster = m_Wsui.GetComponent<GraphicRaycaster>()
-                              ?? m_Wsui.gameObject.AddComponent<GraphicRaycaster>();
-                // The wsui's OverlayCamera has up = Vector3.down and looks toward -Z to
-                // Y-flip the rendered RT (the runtime's texture origin is top-left), which
-                // makes Dot(camera.forward, canvas.forward) == -1. GraphicRaycaster's
-                // ignoreReversedGraphics reads that as "back of the graphic faces the
-                // camera" and skips every hit — so it must be off.
-                m_Raycaster.ignoreReversedGraphics = false;
+                // A canvas authored without a raycaster gets one on the root so it is
+                // hit-testable at all; nested canvases bring their own.
+                if (m_Wsui.GetComponent<GraphicRaycaster>() == null)
+                    m_Wsui.gameObject.AddComponent<GraphicRaycaster>();
             }
 
             // ---- 1. Cursor in fractional window coords -------------------------
             if (!TryGetWindowMouseFractional(out Vector2 windowFrac))
             {
                 DisplayXRWindowSpaceUI.IsCursorOverInteractive = false;
+                SetHovered(null);
                 ReleaseIfDown();
                 return;
             }
@@ -109,6 +128,7 @@ namespace DisplayXR.Samples
                 windowFrac.y < m_Wsui.positionY || windowFrac.y > m_Wsui.positionY + m_Wsui.height)
             {
                 DisplayXRWindowSpaceUI.IsCursorOverInteractive = m_PressTarget != null;
+                SetHovered(null);
                 ReleaseIfDown();
                 return;
             }
@@ -121,7 +141,7 @@ namespace DisplayXR.Samples
             var canvasPos = new Vector2(panelFracX * m_Wsui.resolution.x,
                                         panelFracY * m_Wsui.resolution.y);
 
-            // ---- 4. Synthesize PointerEventData and dispatch --------------------
+            // ---- 4. Raycast every raycaster under the wsui canvas ---------------
             m_PointerData.Reset();
             m_PointerData.position = canvasPos;
             m_PointerData.delta = canvasPos - m_LastCanvasPos;
@@ -129,21 +149,43 @@ namespace DisplayXR.Samples
             m_PointerData.button = PointerEventData.InputButton.Left;
             m_PointerData.pressPosition = m_LeftDown ? m_PointerData.pressPosition : canvasPos;
 
-            var hits = new List<RaycastResult>();
-            m_Raycaster.Raycast(m_PointerData, hits);
-            var hovered = hits.Count > 0 ? hits[0].gameObject : null;
+            RaycastAll();
+            var hovered = m_Hits.Count > 0 ? m_Hits[0].gameObject : null;
 
-            // The cursor is inside the wsui rect: claim input so scene controllers pause
-            // (a slider drag must not also rotate the camera). True even over empty space
-            // inside the panel — that matches what a user means by "in the UI".
-            DisplayXRWindowSpaceUI.IsCursorOverInteractive = true;
+            // Claim input so scene controllers pause (a slider drag must not also rotate
+            // the camera) — but only over an ACTUAL graphic, or while a press is held.
+            // The recommended 2D-scene recipe is a full-rect wsui (position 0,0 / size
+            // 1,1), and "anywhere inside the layer rect" would then be the whole window,
+            // blocking orbit/pan/zoom everywhere. The plugin's own doc comment on the flag
+            // says "hovering or a press is held over a wsui-rendered UI element"; this
+            // matches it.
+            DisplayXRWindowSpaceUI.IsCursorOverInteractive = hovered != null || m_PressTarget != null;
 
             // pressEventCamera / enterEventCamera are read-only in Unity 6's UGUI — they
             // derive from pointerCurrentRaycast.module / pointerPressRaycast.module. Wiring
             // the raycast results is what makes consumers such as Slider.OnDrag's
             // ScreenPointToLocalPointInRectangle resolve OverlayCamera and project correctly.
-            m_PointerData.pointerCurrentRaycast = hits.Count > 0 ? hits[0] : default(RaycastResult);
+            m_PointerData.pointerCurrentRaycast = m_Hits.Count > 0 ? m_Hits[0] : default(RaycastResult);
 
+            // ---- 5a. Enter / exit — Selectable hover highlights, tooltips ---------
+            SetHovered(hovered);
+
+            // ---- 5b. Scroll wheel — ScrollRect lists, dropdowns ------------------
+            var mouse = Mouse.current;
+            if (hovered != null && mouse != null)
+            {
+                Vector2 scroll = mouse.scroll.ReadValue();
+                if (scroll.sqrMagnitude > 0.001f)
+                {
+                    // Windows reports 120 per notch; UGUI's ScrollRect expects roughly
+                    // 1 per notch (it multiplies by scrollSensitivity itself).
+                    m_PointerData.scrollDelta = scroll / 120f;
+                    ExecuteEvents.ExecuteHierarchy(hovered, m_PointerData, ExecuteEvents.scrollHandler);
+                    m_PointerData.scrollDelta = Vector2.zero;
+                }
+            }
+
+            // ---- 5c. Click / drag -------------------------------------------------
             bool nowDown = IsLeftDown();
             if (!m_LeftDown && nowDown && hovered != null)
             {
@@ -169,13 +211,67 @@ namespace DisplayXR.Samples
                 var clickHandler = ExecuteEvents.GetEventHandler<IPointerClickHandler>(m_PressTarget);
                 bool overPressHierarchy = hovered != null &&
                     ExecuteEvents.GetEventHandler<IPointerClickHandler>(hovered) == clickHandler;
-                if (clickHandler != null && (overPressHierarchy || hits.Count > 0))
+                if (clickHandler != null && (overPressHierarchy || m_Hits.Count > 0))
                     ExecuteEvents.Execute(clickHandler, m_PointerData, ExecuteEvents.pointerClickHandler);
                 m_PressTarget = null;
             }
 
             m_LeftDown = nowDown;
             m_LastCanvasPos = canvasPos;
+        }
+
+        // Raycast every GraphicRaycaster under the wsui canvas into m_Hits, best hit first.
+        private void RaycastAll()
+        {
+            m_Hits.Clear();
+            m_Wsui.GetComponentsInChildren(false, m_Raycasters);
+            Camera overlayCam = m_Wsui.GetComponent<Canvas>().worldCamera;
+            for (int i = 0; i < m_Raycasters.Count; i++)
+            {
+                var rc = m_Raycasters[i];
+                // The wsui's OverlayCamera has up = Vector3.down and looks toward -Z to
+                // Y-flip the rendered RT (the runtime's texture origin is top-left), which
+                // makes Dot(camera.forward, canvas.forward) == -1. GraphicRaycaster's
+                // ignoreReversedGraphics reads that as "back of the graphic faces the
+                // camera" and skips every hit — so it must be off, on EVERY raycaster
+                // (a nested canvas arrives with Unity's default of true).
+                rc.ignoreReversedGraphics = false;
+                // A nested WorldSpace canvas does not inherit the root's worldCamera, and
+                // GraphicRaycaster then falls back to Camera.main — the wrong projection.
+                // Point every canvas under the wsui at the overlay camera.
+                var c = rc.GetComponent<Canvas>();
+                if (c != null && overlayCam != null && c.worldCamera != overlayCam)
+                    c.worldCamera = overlayCam;
+
+                m_TempHits.Clear();
+                rc.Raycast(m_PointerData, m_TempHits);
+                m_Hits.AddRange(m_TempHits);
+            }
+            // Cross-canvas ordering: higher sortingOrder wins (dialogs override-sort
+            // above the app UI), then higher graphic depth within a canvas — the same
+            // order GraphicRaycaster uses within one canvas.
+            m_Hits.Sort(CompareHits);
+        }
+
+        private static int CompareHits(RaycastResult a, RaycastResult b)
+        {
+            if (a.sortingOrder != b.sortingOrder)
+                return b.sortingOrder.CompareTo(a.sortingOrder);
+            return b.depth.CompareTo(a.depth);
+        }
+
+        private void SetHovered(GameObject hovered)
+        {
+            if (m_Hovered == hovered)
+                return;
+            if (m_Hovered != null && m_PointerData != null)
+                ExecuteEvents.ExecuteHierarchy(m_Hovered, m_PointerData, ExecuteEvents.pointerExitHandler);
+            m_Hovered = hovered;
+            if (m_Hovered != null && m_PointerData != null)
+            {
+                m_PointerData.pointerEnter = m_Hovered;
+                ExecuteEvents.ExecuteHierarchy(m_Hovered, m_PointerData, ExecuteEvents.pointerEnterHandler);
+            }
         }
 
         // Where the cursor is read from depends on where the woven output actually IS.

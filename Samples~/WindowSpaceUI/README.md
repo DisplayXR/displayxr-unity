@@ -24,21 +24,35 @@ This router bridges the two coordinate systems.
 3. If the automatic `GetComponentInChildren` lookup can't find your wsui, assign the
    **Window Space UI** field explicitly.
 
-That's it. Buttons, toggles, sliders and drags work.
+That's it. Buttons, toggles, sliders, drags, hover highlights and scroll wheels work —
+including inside **nested canvases** (a file browser, a modal dialog, a dropdown blocker)
+spawned under the wsui at runtime.
 
 ## What it does
 
 1. Reads the cursor in **fractional window coordinates**.
 2. Hit-tests the wsui layer's fractional rect (`positionX/Y`, `width`, `height`).
 3. Maps the hit to **canvas-pixel coordinates** inside the `OverlayTexture`.
-4. Synthesizes `PointerEventData` and dispatches click/drag events via `ExecuteEvents`.
+4. Raycasts **every** `GraphicRaycaster` under the wsui canvas — not just the root's — and
+   orders the hits by `sortingOrder` (override-sorted dialogs win) then graphic depth.
+5. Synthesizes `PointerEventData` and dispatches enter/exit, scroll, click and drag events
+   via `ExecuteEvents`.
 
 ## Things that will bite you if you fork it
 
-- **`ignoreReversedGraphics` must be `false`.** The wsui's overlay camera uses
-  `up = Vector3.down` to Y-flip the RT (the runtime's texture origin is top-left), which
-  makes `Dot(camera.forward, canvas.forward) == -1`. `GraphicRaycaster` reads that as "the
-  back of the graphic faces the camera" and silently skips **every** hit.
+- **`ignoreReversedGraphics` must be `false` — on every raycaster.** The wsui's overlay
+  camera uses `up = Vector3.down` to Y-flip the RT (the runtime's texture origin is
+  top-left), which makes `Dot(camera.forward, canvas.forward) == -1`. `GraphicRaycaster`
+  reads that as "the back of the graphic faces the camera" and silently skips **every**
+  hit. A nested canvas arrives with Unity's default of `true`, so set it per raycaster,
+  not once on the root.
+- **Raycast every raycaster, not only the root's.** A nested Canvas carries its own
+  `GraphicRaycaster`, and the root raycaster never sees its graphics. Anything that brings
+  its own Canvas — most third-party dialogs do — is dead to clicks otherwise, with no error.
+- **Nested canvases need the overlay camera as their `worldCamera`.** A child Canvas does
+  not inherit the root's `worldCamera`; its `GraphicRaycaster` then falls back to
+  `Camera.main` and projects with the wrong camera, so the dialog's graphics are never hit.
+  The router points every canvas under the wsui at the overlay camera each frame.
 - **No extra Y flip in the router.** That same flipped up-vector already inverts
   `ScreenPointToRay`'s Y, so layer-fraction `y = 0` (top) maps to `screenY = 0`. Flipping
   again in the router puts your cursor exactly upside-down about the panel's midline —
@@ -59,14 +73,20 @@ That's it. Buttons, toggles, sliders and drags work.
 
 ## Coordinating with your own input
 
-While the cursor is inside the panel the router sets
-`DisplayXRWindowSpaceUI.IsCursorOverInteractive = true`. Check that in your camera
-controller and skip mouse handling when it's set, or a slider drag will also rotate your
-scene. `Samples~/DefaultInputController` already does this.
+While the cursor is over an **actual UI graphic** (or a press begun on one is still held)
+the router sets `DisplayXRWindowSpaceUI.IsCursorOverInteractive = true`. Check that in your
+camera controller and skip mouse handling when it's set, or a slider drag will also rotate
+your scene. `Samples~/DefaultInputController` already does this.
+
+The flag is set from a real raycast hit, **not** from "the cursor is inside the wsui layer
+rect". The recommended 2D-scene recipe is a full-rect wsui (position `0,0`, size `1,1`),
+and the rect test would then be true over the entire window — every orbit, pan and zoom
+in your scene would be blocked while the panel is up. Empty space inside the layer passes
+input through to the scene; only graphics claim it.
 
 ## Why this is a sample, not a plugin component
 
 Input policy is app-owned — the plugin ships the hooks (the overlay camera wired as the
 canvas's event camera, and the `IsCursorOverInteractive` flag) and leaves the policy to you.
 Same reasoning as `Samples~/DefaultInputController`. Fork freely: if your input model isn't
-a mouse, steps 1 and 4 are the only parts you need to replace.
+a mouse, steps 1 and 5 are the only parts you need to replace.
