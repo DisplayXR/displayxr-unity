@@ -1094,9 +1094,12 @@ namespace DisplayXR
             // host.width*ppp it's already physical (×1). At ppp≈1 the two coincide. This is only
             // the BORN size; native converges to the authoritative mirror-RT panel px on frame 1.
             int rw, rh, rx, ry, toolbar;
+            // (#263) Hoisted: the letterbox step below needs it to recover the RT's
+            // physical pixel size, and it is otherwise scoped to the branch that sets it.
+            float sizeScale = 1f;
             if (size.x > 1f && size.y > 1f)
             {
-                float sizeScale = ppp; // bring `size` to physical px; default = treat as points
+                sizeScale = ppp; // bring `size` to physical px; default = treat as points
                 if (haveHost && host.width > 1f && ppp > 1.1f)
                 {
                     // Per-frame disambiguation on purpose — do NOT latch this decision: the
@@ -1211,14 +1214,21 @@ namespace DisplayXR
                     // rect demonstrably does not carry it.
                     if (size.x > 1f && size.y > 1f && rw > 0 && rh > 0)
                     {
-                        float rtAspect   = size.x / size.y;
-                        float areaAspect = (float)rw / rh;
-                        if (Mathf.Abs(rtAspect - areaAspect) > 0.001f)
+                        // Unity NEVER UPSCALES the render target past 1:1 here — when the
+                        // RT is smaller than the render area it is drawn at its native size
+                        // and centred, leaving grey bars, rather than stretched to fill.
+                        // Hence the min(1, ...): a pure fit-to-area was measured drawing a
+                        // 2560-wide RT into a 2893-wide rect, a uniform 1.13x enlargement
+                        // that placed correctly and still looked wrong. The scale is applied
+                        // to BOTH axes together so the aspect cannot drift.
+                        int rtW = Mathf.RoundToInt(size.x * sizeScale);
+                        int rtH = Mathf.RoundToInt(size.y * sizeScale);
+                        if (rtW > 0 && rtH > 0)
                         {
-                            int fitW = rw, fitH = rh;
-                            if (rtAspect > areaAspect) fitH = Mathf.RoundToInt(rw / rtAspect);
-                            else                       fitW = Mathf.RoundToInt(rh * rtAspect);
-                            if (fitW > 0 && fitH > 0)
+                            float fit = Mathf.Min(1f, Mathf.Min((float)rw / rtW, (float)rh / rtH));
+                            int fitW = Mathf.RoundToInt(rtW * fit);
+                            int fitH = Mathf.RoundToInt(rtH * fit);
+                            if (fitW > 0 && fitH > 0 && (fitW != rw || fitH != rh))
                             {
                                 rx += (rw - fitW) / 2;
                                 ry += (rh - fitH) / 2;
