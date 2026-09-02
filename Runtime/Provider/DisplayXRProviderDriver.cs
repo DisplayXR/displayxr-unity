@@ -777,7 +777,11 @@ namespace DisplayXR
                 System.IntPtr bestH = System.IntPtr.Zero;
                 bool bestIsGuiView = false;
                 uint myPid = (uint)System.Diagnostics.Process.GetCurrentProcess().Id;
-                var rejected = s_gvGeomGate == 1 ? new System.Text.StringBuilder() : null;
+                // GvGeomEnabled() RESOLVES the lazy gate; testing s_gvGeomGate directly
+                // reads -1 (unresolved) whenever this runs before the diagnostic has,
+                // which is always -- so the candidate log never printed at all. Reported
+                // from the field as "zero hits in all five logs".
+                var rejected = GvGeomEnabled() ? new System.Text.StringBuilder() : null;
                 Win32EnumProc collect = (h, l) =>
                 {
                     if (!IsWindowVisible(h)) return true;
@@ -867,6 +871,47 @@ namespace DisplayXR
                 rx = s_hwndCorrX;
                 ry = s_hwndCorrY + toolbar;
             }
+        }
+
+        // (#263) The Game view's own render-area rect WITHIN the pane, in points.
+        //
+        // This is the authoritative answer to "where inside the pane do the woven pixels
+        // actually land", and it is the one Unity itself draws to. It already accounts for
+        // BOTH the toolbar strip and any letterbox padding, which is what makes it the
+        // right source: the previously-derived `toolbar` term is computed as
+        // (pane height - mainSize height), so under a FIXED aspect ratio it silently
+        // absorbs the letterbox as well. Measured in the field: 141 px with Free Aspect
+        // (the real toolbar) versus 349 px with a fixed 2560x1600 in a 3840x1949 pane --
+        // the extra 208 being letterbox, mistaken for chrome. Deriving y and height from
+        // that number put the render rect 208 px low and 208 px short, and left the width
+        // at the full pane while the RT was only 2560 wide.
+        //
+        // Returns false when the member cannot be resolved (Unity version drift); callers
+        // then keep the mainSize-derived behaviour, which is correct for Free Aspect.
+        static bool TryGetPaneDrawRectPoints(out Rect drawPoints)
+        {
+            drawPoints = default;
+            if (s_matchedGameView == null) return false;
+            try
+            {
+                if (s_zoomAreaField == null)
+                    for (var t = s_gvType; t != null && s_zoomAreaField == null; t = t.BaseType)
+                        foreach (var fi in t.GetFields(BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public))
+                            if (fi.Name.ToLowerInvariant().Contains("zoomarea")) { s_zoomAreaField = fi; break; }
+                if (s_zoomAreaField == null) return false;
+                var za = s_zoomAreaField.GetValue(s_matchedGameView);
+                if (za == null) return false;
+                if (s_zoomDrawRectProp == null)
+                    for (var t = za.GetType(); t != null && s_zoomDrawRectProp == null; t = t.BaseType)
+                        s_zoomDrawRectProp = t.GetProperty("drawRect",
+                            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                if (s_zoomDrawRectProp == null) return false;
+                if (!(s_zoomDrawRectProp.GetValue(za, null) is Rect dr)) return false;
+                if (!(dr.width > 1f) || !(dr.height > 1f)) return false;
+                drawPoints = dr;
+                return true;
+            }
+            catch { return false; }
         }
 
         // (#740) RT-CENTRING offset — the docked-only interlace phase error, measured.
@@ -1126,17 +1171,36 @@ namespace DisplayXR
                 int pch = s_panePhysClient.bottom - s_panePhysClient.top;
                 if (pcw > 64 && pch > 64)
                 {
-                    // The toolbar is chrome measured in the virtualized space; scale it into
-                    // physical with the pane's own measured factor. Bounded quantity, so a
-                    // small error here cannot move the window off the panel.
-                    int toolbarPhys = Mathf.RoundToInt(toolbar * s_paneScaleK);
-                    if (toolbarPhys < 0) toolbarPhys = 0;
-                    if (toolbarPhys > pch / 2) toolbarPhys = 0;   // implausible: ignore it
+                    // Points -> physical for THIS pane, measured from its own two rects.
+                    float ptToPx = (host.width > 1f)
+                        ? (s_panePhysWin.right - s_panePhysWin.left) / host.width
+                        : ppp;
 
-                    rx = s_panePhysWin.left;
-                    ry = s_panePhysWin.top + toolbarPhys;
-                    rw = pcw;
-                    rh = pch - toolbarPhys;
+                    if (TryGetPaneDrawRectPoints(out Rect draw))
+                    {
+                        // (#263) Preferred: Unity's own render-area rect within the pane.
+                        // Accounts for the toolbar AND letterbox padding in one number, so
+                        // all four axes come from the pane and none from mainSize.
+                        rx = s_panePhysWin.left + Mathf.RoundToInt(draw.x * ptToPx);
+                        ry = s_panePhysWin.top  + Mathf.RoundToInt(draw.y * ptToPx);
+                        rw = Mathf.RoundToInt(draw.width  * ptToPx);
+                        rh = Mathf.RoundToInt(draw.height * ptToPx);
+                    }
+                    else
+                    {
+                        // Fallback when the zoom-area member cannot be resolved. Correct for
+                        // Free Aspect, where the RT fills the pane and `toolbar` really is
+                        // just the toolbar; wrong under a fixed aspect, which is the bug this
+                        // branch of the code used to have unconditionally.
+                        int toolbarPhys = Mathf.RoundToInt(toolbar * s_paneScaleK);
+                        if (toolbarPhys < 0) toolbarPhys = 0;
+                        if (toolbarPhys > pch / 2) toolbarPhys = 0;
+
+                        rx = s_panePhysWin.left;
+                        ry = s_panePhysWin.top + toolbarPhys;
+                        rw = pcw;
+                        rh = pch - toolbarPhys;
+                    }
 
                     // The RT-centring corrections (#740) are expressed in the same physical
                     // px as the client rect they were measured from, so they still apply.
