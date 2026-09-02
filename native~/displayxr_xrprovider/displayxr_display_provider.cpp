@@ -2054,8 +2054,28 @@ LifecycleStop(UnitySubsystemHandle handle, void *userData)
 	(void)handle; (void)userData;
 	// (#173) Editor Play Mode: destroy the dedicated weave window so it doesn't
 	// linger frozen after Play stops. Runs on the MAIN thread, after GfxStop already
-	// ran dxr_prov_session_stop (xrDestroySession unhooked the SR weaver subclass) —
-	// so the destroy is clean. Built-player overlay/self-host paths don't create it
+	// ran dxr_prov_session_stop.
+	//
+	// (#284) This comment used to say "xrDestroySession unhooked the SR weaver
+	// subclass", which compressed THREE hops into one and named the wrong owner for
+	// the one that actually fails:
+	//     xrDestroySession -> destroys the DP        runtime   — VERIFIED unconditional
+	//                                                            (d3d12_compositor_destroy ->
+	//                                                             xrt_display_processor_d3d12_destroy)
+	//     DP destroy       -> destroys the weaver    plug-in contract
+	//     weaver destroy   -> restores GWLP_WNDPROC  SR SDK contract  <-- NO OWNER ENFORCES THIS
+	// Only the first is ours to rely on. Field-measured on a partner rig: the SR
+	// wndproc was still installed on Unity's container window 25+ minutes after
+	// Lifecycle Shutdown with no session running, so hop 3 does not hold in practice.
+	//
+	// Our ORDERING here is still correct and should not change — but note what it does
+	// and does not buy on the docked path: in CHILD-GLUE (#740) this window is a
+	// WS_CHILD of Unity's container, and the SDK anchors to GA_ROOT == the CONTAINER,
+	// which is Unity's and which we never destroy. Destroying our child therefore does
+	// NOT take the subclass with it. Undocked PRESENT mode anchors to our own top-level
+	// window (GA_ROOT == self), where this teardown does dispose of it.
+	//
+	// Built-player overlay/self-host paths don't create it
 	// (the call is a no-op there). A re-Play recreates it in LifecycleStart.
 #ifdef _WIN32
 	if (prov_want_dedicated_window()) {
