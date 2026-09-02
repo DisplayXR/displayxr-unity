@@ -55,10 +55,32 @@ typedef struct XrDisplayDesktopPositionDXR {
     int32_t top;
 } XrDisplayDesktopPositionDXR;
 
-// SPEC_VERSION 18 will add XrDisplayDesktopInfoDXR (1004999211) with the full
-// desktopRect + GDI deviceName + isPrimary. Deliberately a SEPARATE struct rather
-// than an extension of this one, so it cannot overrun an allocation made by a client
-// compiled against v16. See DisplayXR/displayxr-runtime#1301.
+// (#266 / v18) XrDisplayDesktopInfoDXR (1004999211): the full panel desktop rect +
+// stable monitor device name + two booleans, superseding the origin-only v16 struct
+// above. Deliberately a SEPARATE struct rather than extra fields on XrDisplayDesktop-
+// PositionDXR, so it cannot overrun an allocation made by a client compiled against
+// v16 (the runtime writes chained output structs with its own compiled layout). Both
+// keep working; we chain BOTH and prefer v18 when it answers. Transcribed from
+// displayxr-runtime main (src/external/openxr_includes/openxr/XR_DXR_display_info.h),
+// NOT from the #1314 branch. See DisplayXR/displayxr-runtime#1301.
+//
+// Detection is on isPanelConfirmed, not on the rect: an all-zero rect can mean either
+// "not resolved" OR a panel that is genuinely primary at (0,0), and isPanelConfirmed
+// is the field that distinguishes them. isPanelConfirmed == XR_FALSE means the runtime
+// fell back to the primary monitor (sim_display, or a platform whose panel-origin
+// plumbing is still open, runtime#715) -- a valid monitor rect, but NOT evidence a 3D
+// panel is there, so we do not move the window onto it.
+#define XR_TYPE_DISPLAY_DESKTOP_INFO_DXR ((XrStructureType)1004999211)
+#define XR_MAX_DISPLAY_DEVICE_NAME_SIZE_DXR 128
+
+typedef struct XrDisplayDesktopInfoDXR {
+    XrStructureType type;   // XR_TYPE_DISPLAY_DESKTOP_INFO_DXR
+    void *next;
+    XrRect2Di       desktopRect;    // signed top-left offset + current-mode extent, physical px
+    char            deviceName[XR_MAX_DISPLAY_DEVICE_NAME_SIZE_DXR];  // stable OS monitor name, UTF-8
+    XrBool32        isPrimary;          // panel monitor is the desktop primary
+    XrBool32        isPanelConfirmed;   // runtime genuinely located the 3D panel (see above)
+} XrDisplayDesktopInfoDXR;
 
 typedef enum XrDisplayModeDXR {
     XR_DISPLAY_MODE_2D_DXR = 0,
