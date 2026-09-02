@@ -1176,30 +1176,56 @@ namespace DisplayXR
                         ? (s_panePhysWin.right - s_panePhysWin.left) / host.width
                         : ppp;
 
-                    if (TryGetPaneDrawRectPoints(out Rect draw))
-                    {
-                        // (#263) Preferred: Unity's own render-area rect within the pane.
-                        // Accounts for the toolbar AND letterbox padding in one number, so
-                        // all four axes come from the pane and none from mainSize.
-                        rx = s_panePhysWin.left + Mathf.RoundToInt(draw.x * ptToPx);
-                        ry = s_panePhysWin.top  + Mathf.RoundToInt(draw.y * ptToPx);
-                        rw = Mathf.RoundToInt(draw.width  * ptToPx);
-                        rh = Mathf.RoundToInt(draw.height * ptToPx);
-                    }
+                    // (#263) THE TOOLBAR, taken from Unity's own draw rect — and ONLY
+                    // the toolbar. Field data on three runs pinned down exactly what that
+                    // rect does and does not carry:
+                    //   host.height - draw.height  ==  the TRUE toolbar (measured 47.00 pt
+                    //     = 141 px), and it stays correct under a fixed aspect ratio.
+                    //   draw.y                     ==  21.00 pt, which is NOT the toolbar
+                    //     and is not an offset we want; using it put every config 78 px
+                    //     high (47 - 21 = 26 pt = 78 px at this scale).
+                    //   draw.width/height          ==  unchanged by a fixed aspect, so the
+                    //     rect carries no letterbox information at all.
+                    // So: use it for the toolbar, and never for placement. The previously
+                    // derived toolbar (pane height - mainSize height) is what silently
+                    // absorbed the letterbox; this one cannot, because mainSize is not in it.
+                    int toolbarPhys;
+                    if (TryGetPaneDrawRectPoints(out Rect draw) && host.height > draw.height)
+                        toolbarPhys = Mathf.RoundToInt((host.height - draw.height) * ptToPx);
                     else
-                    {
-                        // Fallback when the zoom-area member cannot be resolved. Correct for
-                        // Free Aspect, where the RT fills the pane and `toolbar` really is
-                        // just the toolbar; wrong under a fixed aspect, which is the bug this
-                        // branch of the code used to have unconditionally.
-                        int toolbarPhys = Mathf.RoundToInt(toolbar * s_paneScaleK);
-                        if (toolbarPhys < 0) toolbarPhys = 0;
-                        if (toolbarPhys > pch / 2) toolbarPhys = 0;
+                        toolbarPhys = Mathf.RoundToInt(toolbar * s_paneScaleK);
+                    if (toolbarPhys < 0) toolbarPhys = 0;
+                    if (toolbarPhys > pch / 2) toolbarPhys = 0;
 
-                        rx = s_panePhysWin.left;
-                        ry = s_panePhysWin.top + toolbarPhys;
-                        rw = pcw;
-                        rh = pch - toolbarPhys;
+                    // The pane's render area: the client, inset from the top by the toolbar.
+                    rx = s_panePhysWin.left;
+                    ry = s_panePhysWin.top + toolbarPhys;
+                    rw = pcw;
+                    rh = pch - toolbarPhys;
+
+                    // (#263) LETTERBOX. With a fixed aspect ratio selected, Unity fits the
+                    // render target into that area preserving ITS aspect and centres it,
+                    // leaving grey bars — so the woven pixels occupy less than the render
+                    // area. Free Aspect makes the RT track the pane, the ratios match, and
+                    // this collapses to a no-op. Derived rather than read, because the draw
+                    // rect demonstrably does not carry it.
+                    if (size.x > 1f && size.y > 1f && rw > 0 && rh > 0)
+                    {
+                        float rtAspect   = size.x / size.y;
+                        float areaAspect = (float)rw / rh;
+                        if (Mathf.Abs(rtAspect - areaAspect) > 0.001f)
+                        {
+                            int fitW = rw, fitH = rh;
+                            if (rtAspect > areaAspect) fitH = Mathf.RoundToInt(rw / rtAspect);
+                            else                       fitW = Mathf.RoundToInt(rh * rtAspect);
+                            if (fitW > 0 && fitH > 0)
+                            {
+                                rx += (rw - fitW) / 2;
+                                ry += (rh - fitH) / 2;
+                                rw = fitW;
+                                rh = fitH;
+                            }
+                        }
                     }
 
                     // The RT-centring corrections (#740) are expressed in the same physical
