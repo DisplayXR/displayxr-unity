@@ -5,6 +5,22 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.16.1] - 2026-09-02
+
+**The first external contribution to this plugin.** The shipped window-space-UI mouse router did not survive contact with an app that brings its own canvases — which is most apps — and the failure was silent in every case.
+
+### Fixed
+- **The wsui mouse router now works with nested canvases, claims input only over real UI, and routes hover and scroll** (#268, contributed by Byungju Lee). Found and fixed while porting a real app; four distinct defects, all of which a file browser or a modal dialog triggers immediately:
+  - **Nested-canvas graphics were never hit-tested.** The router raycast only the wsui root's `GraphicRaycaster`, and anything arriving with its own `Canvas` — a file browser, a modal, a dropdown's blocker — brings its own raycaster that the root never consults. Those dialogs were *entirely dead to clicks*, with no error and no warning. Every raycaster under the wsui is now collected each frame (so runtime-spawned canvases need no wiring) and hits are ordered by `sortingOrder`, then graphic depth — the same order `GraphicRaycaster` uses within a single canvas, so an override-sorted dialog correctly beats the app UI beneath it.
+  - **A nested WorldSpace canvas does not inherit the root's `worldCamera`.** `GraphicRaycaster` then falls back to `Camera.main` and projects with the wrong camera. Every canvas under the wsui is now pointed at the overlay camera.
+  - **`ignoreReversedGraphics` must be off on *every* raycaster, not just the root.** The wsui's overlay camera has `up = Vector3.down` and looks toward `-Z` to Y-flip the rendered RT, which makes `Dot(camera.forward, canvas.forward) == -1`; `GraphicRaycaster` reads that as "the back of the graphic faces the camera" and skips every hit. The root was already handled — a nested canvas arrives with Unity's default of `true` and silently matches nothing.
+  - **`IsCursorOverInteractive` was set from the layer rect rather than from an actual hit.** The recommended 2D-scene recipe is a *full-rect* wsui (position 0,0 / size 1,1), so "anywhere inside the layer rect" meant the entire window, and scene input — orbit, pan, zoom — was blocked everywhere, permanently. It is now true only over an actual graphic or while a press is held, which is what the flag's own doc comment always claimed. **This is a behaviour change for anything reading that flag**, and it is the behaviour the documentation described.
+  - **Pointer enter/exit and scroll were not routed at all**, so hover highlights, tooltips and `ScrollRect` lists did nothing. Both now dispatch; scroll divides by 120 (Windows reports one notch as 120, UGUI's `ScrollRect` expects roughly 1 and applies its own `scrollSensitivity`).
+  - Also: `OnDisable` now clears the hover, releases a held press and drops the input claim, so disabling the router cannot leave a `Selectable` stuck highlighted or scene controllers permanently blocked.
+
+### Documentation
+- **The `LifecycleStop` teardown comment names all three hops instead of one** (#284). It claimed "`xrDestroySession` unhooked the SR weaver subclass", which compresses `xrDestroySession → destroys the DP` (runtime, verified unconditional) / `DP destroy → destroys the weaver` (plug-in contract) / `weaver destroy → restores GWLP_WNDPROC` (SDK contract) into one, and names the wrong owner for the hop that actually fails. Field-measured: the SR wndproc was still installed on Unity's container window 25+ minutes after `Lifecycle Shutdown` with no session running. Comment only — no behaviour change, so the shipping binary is byte-identical to v2.16.0's apart from the rebuild.
+
 ## [2.16.0] - 2026-09-02
 
 Everything here was reported from real integrations and verified on real hardware — a partner's mixed-DPI two-monitor rig and a shipping desktop-avatar app — rather than on any maintainer's machine. Two of the three are defects that shipped in v2.13.x through v2.15.0.
