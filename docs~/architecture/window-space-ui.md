@@ -70,10 +70,18 @@ mouse.
 
 ### Traps if you write your own router
 
-- **`ignoreReversedGraphics` must be `false`.** The overlay camera uses `up = Vector3.down`
-  to Y-flip the RT (the runtime's texture origin is top-left), which makes
-  `Dot(camera.forward, canvas.forward) == -1`. `GraphicRaycaster` reads that as "the back of
-  the graphic faces the camera" and silently skips **every** hit.
+- **`ignoreReversedGraphics` must be `false` — on every raycaster.** The overlay camera uses
+  `up = Vector3.down` to Y-flip the RT (the runtime's texture origin is top-left), which
+  makes `Dot(camera.forward, canvas.forward) == -1`. `GraphicRaycaster` reads that as "the
+  back of the graphic faces the camera" and silently skips **every** hit. A nested canvas
+  arrives with Unity's default of `true`.
+- **Raycast every `GraphicRaycaster` under the wsui, and give nested canvases the overlay
+  camera.** A child Canvas (a file browser, a modal, a dropdown blocker) brings its own
+  raycaster the root never consults, and it does not inherit `worldCamera` — its raycaster
+  falls back to `Camera.main` and projects with the wrong camera. Either way the dialog is
+  dead to clicks with no error. The shipped router collects all raycasters each frame,
+  re-points every nested canvas at the overlay camera, and orders hits by `sortingOrder`
+  then depth.
 - **Do not add a second Y flip.** That same flipped up-vector already inverts
   `ScreenPointToRay`'s Y, so layer-fraction `y = 0` (top) maps to `screenY = 0`. Flipping
   again mirrors your cursor about the panel's midline, which presents as "clicks land on the
@@ -93,15 +101,17 @@ mouse.
 
 ### Coordinating with scene input
 
-Set `IsCursorOverInteractive` while the cursor is over the panel, and check it in your
-camera controller:
+Set `IsCursorOverInteractive` while the cursor is over an actual UI graphic (or a press is
+held), and check it in your camera controller:
 
 ```csharp
 if (DisplayXRWindowSpaceUI.IsCursorOverInteractive) return;  // UI owns the mouse
 ```
 
 Without this a slider drag also rotates your scene. `Samples~/DefaultInputController`
-already does it.
+already does it. Set the flag from a raycast **hit**, not from "inside the layer rect": the
+recommended 2D-scene recipe is a full-rect wsui, and the rect test would then block scene
+input over the entire window.
 
 ## See also
 
