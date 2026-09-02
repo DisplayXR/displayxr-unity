@@ -3709,6 +3709,45 @@ displayxr_set_overlay_position(int x, int y)
 // C# uses delta directly for drag rotation in shell mode.
 // ============================================================================
 
+// (#270) "Is the window/thread taking foreground one of OURS?" Used to decide whether
+// a deactivation is our own overlay stealing focus (suppress) or the user genuinely
+// switching away (allow). Conservative by design: anything we cannot positively
+// attribute to this process counts as NOT ours, so the failure mode is "the app
+// deactivates when it maybe did not need to" rather than "the app cannot be dismissed".
+static int s_focus_hook_legacy = -1;
+
+static int
+focus_hook_legacy(void)
+{
+	if (s_focus_hook_legacy < 0) {
+		const char *e = getenv("DXR_AVATAR_FOCUS_HOOK_LEGACY");
+		s_focus_hook_legacy = (e != NULL && e[0] == '1') ? 1 : 0;
+	}
+	return s_focus_hook_legacy;
+}
+
+static BOOL
+focus_other_is_ours_hwnd(HWND other)
+{
+	if (focus_hook_legacy()) return TRUE;   // escape hatch: suppress everything
+	if (other == NULL) return FALSE;
+	DWORD pid = 0;
+	GetWindowThreadProcessId(other, &pid);
+	return pid != 0 && pid == GetCurrentProcessId();
+}
+
+static BOOL
+focus_other_is_ours_thread(DWORD tid)
+{
+	if (focus_hook_legacy()) return TRUE;
+	if (tid == 0) return FALSE;
+	HANDLE th = OpenThread(THREAD_QUERY_LIMITED_INFORMATION, FALSE, tid);
+	if (th == NULL) return FALSE;
+	DWORD pid = GetProcessIdOfThread(th);
+	CloseHandle(th);
+	return pid != 0 && pid == GetCurrentProcessId();
+}
+
 static HWND s_shell_unity_hwnd = NULL;
 static WNDPROC s_shell_original_wndproc = NULL;
 // File scope (not function-local) so displayxr_uninstall_focus_hook can clear it —
@@ -3815,20 +3854,42 @@ shell_subclass_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		break;
 	}
 
-	// Suppress deactivation messages so Unity stays "active".
+	// Suppress deactivation messages so Unity stays "active" -- but ONLY when the
+	// window taking over is one of OURS.
+	//
+	// (#270) This hook exists because the overlay is WS_EX_NOACTIVATE + click-through,
+	// so Unity never takes OS foreground on its own and Windows delivers WM_INPUT only
+	// to the foreground HWND -- without the suppression, keyboard input is dead. But
+	// suppressing UNCONDITIONALLY also refuses the deactivation the user asks for, and
+	// minimising REQUIRES deactivation. Field-confirmed on a shipping app:
+	// Application.isFocused never went false across a 28 s session with several
+	// Alt+Tabs away, and the window could not be minimised from Alt+Tab or the taskbar
+	// while z-order behaved normally.
+	//
+	// The distinction is available at the point of decision: WM_ACTIVATE and
+	// WM_KILLFOCUS carry the HWND taking over, WM_ACTIVATEAPP the owning thread. If it
+	// belongs to this process it is our own overlay stealing foreground -- the case the
+	// hook was written for, suppress it. If it belongs to anyone else the user really
+	// is switching away, and we must let it through or the app becomes a window that
+	// cannot be dismissed.
+	//
+	// DXR_AVATAR_FOCUS_HOOK_LEGACY=1 restores the unconditional suppression, as an
+	// escape hatch if some input path turns out to depend on it.
 	switch (msg) {
 	case WM_ACTIVATEAPP:
-		if (!wParam)
+		if (!wParam && focus_other_is_ours_thread((DWORD)lParam))
 			return 0;
 		break;
 	case WM_ACTIVATE:
-		if (LOWORD(wParam) == WA_INACTIVE) {
+		if (LOWORD(wParam) == WA_INACTIVE && focus_other_is_ours_hwnd((HWND)lParam)) {
 			return CallWindowProcW(s_shell_original_wndproc, hwnd, msg,
 				MAKEWPARAM(WA_ACTIVE, HIWORD(wParam)), lParam);
 		}
 		break;
 	case WM_KILLFOCUS: {
 		// Reclaim focus on the window's thread (SetFocus is thread-local).
+		if (!focus_other_is_ours_hwnd((HWND)wParam))
+			break;   // a real switch away: let Unity see it
 		static int s_reclaiming = 0;
 		if (!s_reclaiming) {
 			s_reclaiming = 1;
@@ -3838,7 +3899,9 @@ shell_subclass_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		return 0;
 	}
 	case WM_NCACTIVATE:
-		if (!wParam)
+		// Title-bar paint only. Keep it drawn active while OUR overlay holds
+		// foreground; let a real switch away render inactive as the user expects.
+		if (!wParam && focus_other_is_ours_hwnd(GetForegroundWindow()))
 			return CallWindowProcW(s_shell_original_wndproc, hwnd, msg, TRUE, lParam);
 		break;
 	}
