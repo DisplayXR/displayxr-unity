@@ -70,6 +70,13 @@ spawned under the wsui at runtime.
   `ScreenPointToLocalPointInRectangle` project correctly.
 - **The EventSystem needs no input module** — and on Input System Package projects a
   `StandaloneInputModule` throws every frame. The router strips it.
+- **An `InputSystemUIInputModule` is a second, mirrored pointer.** It raycasts the wsui
+  canvas through `worldCamera` — the Y-flipped overlay camera — with raw screen coordinates,
+  so its hit lands mirrored about the panel's midline: hover one row, two highlight; clicks
+  go intermittent. The router disables it (not destroys — re-enable it yourself if non-wsui
+  UI elsewhere needs it). It was invisible while the RT aspect differed from the window's,
+  because the mirrored hit fell off-target; at the live panel aspect it lands on real
+  controls.
 
 ## Coordinating with your own input
 

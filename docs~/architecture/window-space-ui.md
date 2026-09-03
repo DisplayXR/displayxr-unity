@@ -111,6 +111,10 @@ mouse.
   `ScreenPointToLocalPointInRectangle` project correctly.
 - **The EventSystem needs no input module,** and on Input System Package projects a
   `StandaloneInputModule` throws every frame trying to read legacy `UnityEngine.Input`.
+  An `InputSystemUIInputModule` is worse than useless here: it raycasts the wsui canvas
+  through the Y-flipped overlay camera with raw screen coordinates and produces a **second,
+  mirrored pointer** (two rows highlight on hover, intermittent clicks). The shipped router
+  disables it on enable.
 
 ### Coordinating with scene input
 
