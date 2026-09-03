@@ -2344,6 +2344,37 @@ find_unity_main_hwnd_any(void)
 #define DISPLAYXR_EARLY_CLOAK_BACKSTOP_MS 20000
 static UINT_PTR s_early_cloak_backstop_timer = 0;
 
+// Milliseconds since THIS PROCESS was created. Stamped onto every cloak /
+// un-cloak / revert line so a customer's Player.log answers "how long did the
+// overlay take to come up on that machine" after the fact - the only instrument
+// we get on hardware we don't have (the 20 s backstop question, #295/#296).
+static unsigned long long
+dxr_since_process_start_ms(void)
+{
+	FILETIME created, exited, kernel, user, now;
+	ULARGE_INTEGER a, b;
+	if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user))
+		return 0;
+	GetSystemTimeAsFileTime(&now);
+	a.LowPart = created.dwLowDateTime; a.HighPart = created.dwHighDateTime;
+	b.LowPart = now.dwLowDateTime;     b.HighPart = now.dwHighDateTime;
+	return b.QuadPart > a.QuadPart ? (b.QuadPart - a.QuadPart) / 10000ULL : 0;
+}
+
+// The backstop timeout, with an env-var override (DISPLAYXR_EARLY_CLOAK_BACKSTOP_MS,
+// milliseconds, >= 1000) for boxes whose session start sits near the default.
+// Read from the process environment at arm time; set it before launch.
+static UINT
+early_cloak_backstop_ms(void)
+{
+	const char *v = getenv("DISPLAYXR_EARLY_CLOAK_BACKSTOP_MS");
+	if (v && v[0]) {
+		long ms = strtol(v, NULL, 10);
+		if (ms >= 1000) return (UINT)ms;
+	}
+	return (UINT)DISPLAYXR_EARLY_CLOAK_BACKSTOP_MS;
+}
+
 // Un-cloak AND un-park Unity's main window, and drop the backstop. Idempotent; a
 // no-op unless the early cloak is still in force and no overlay ever took over.
 static void
@@ -2387,9 +2418,10 @@ early_cloak_revert(const char *why)
 	RECT now_rc = {0, 0, 0, 0};
 	GetWindowRect(hwnd, &now_rc);
 	displayxr_log("[DisplayXR] early-cloak revert (%s): un-cloaked AND un-parked Unity "
-	              "main window %p back to (%d,%d), size kept at %dx%d\n", why, (void *)hwnd,
+	              "main window %p back to (%d,%d), size kept at %dx%d (t+%llu ms)\n", why, (void *)hwnd,
 	              (int)s_unity_saved_rect.left, (int)s_unity_saved_rect.top,
-	              (int)(now_rc.right - now_rc.left), (int)(now_rc.bottom - now_rc.top));
+	              (int)(now_rc.right - now_rc.left), (int)(now_rc.bottom - now_rc.top),
+	              dxr_since_process_start_ms());
 }
 
 static void CALLBACK
@@ -2402,14 +2434,14 @@ early_cloak_backstop_timerproc(HWND hwnd, UINT msg, UINT_PTR id, DWORD now)
 	}
 	int overlay_live = (s_overlay_hwnd != NULL && IsWindow(s_overlay_hwnd));
 	if (s_unity_early_cloaked && !s_overlay_active && !overlay_live) {
-		displayxr_log("[DisplayXR] early-cloak BACKSTOP: no overlay within %d ms of the "
+		displayxr_log("[DisplayXR] early-cloak BACKSTOP: no overlay within %u ms of the "
 		              "pre-cloak - restoring the window so the app is not left invisible "
-		              "(#295)\n", (int)DISPLAYXR_EARLY_CLOAK_BACKSTOP_MS);
+		              "(#295) (t+%llu ms)\n", early_cloak_backstop_ms(), dxr_since_process_start_ms());
 		early_cloak_revert("backstop timeout");
 	} else if (s_unity_early_cloaked) {
 		displayxr_log("[DisplayXR] early-cloak backstop: overlay is up (active=%d hwnd=%p) "
-		              "- leaving Unity cloaked, the overlay owns the window (#295)\n",
-		              s_overlay_active, (void *)s_overlay_hwnd);
+		              "- leaving Unity cloaked, the overlay owns the window (#295) (t+%llu ms)\n",
+		              s_overlay_active, (void *)s_overlay_hwnd, dxr_since_process_start_ms());
 	}
 }
 
@@ -2467,12 +2499,13 @@ displayxr_precloak_unity_main_window(void)
 		// runs on the window's owning thread and only once the app is actually
 		// pumping. A healthy session sets s_overlay_active long before 20 s and the
 		// proc finds nothing to do.
-		s_early_cloak_backstop_timer = SetTimer(NULL, 0, DISPLAYXR_EARLY_CLOAK_BACKSTOP_MS,
+		s_early_cloak_backstop_timer = SetTimer(NULL, 0, early_cloak_backstop_ms(),
 		                                        early_cloak_backstop_timerproc);
 	}
 	displayxr_log("[DisplayXR] Pre-cloaked Unity main window %p BEFORE its "
-		      "first ShowWindow: hr=0x%08X (backstop armed: %s)\n", (void *)hwnd,
-		      (unsigned)hr, s_early_cloak_backstop_timer ? "yes" : "no");
+		      "first ShowWindow: hr=0x%08X (backstop armed: %s, %u ms) (t+%llu ms)\n", (void *)hwnd,
+		      (unsigned)hr, s_early_cloak_backstop_timer ? "yes" : "no",
+		      early_cloak_backstop_ms(), dxr_since_process_start_ms());
 }
 
 static uint64_t
@@ -2744,8 +2777,8 @@ displayxr_set_transparent_overlay(int enabled, int topmost)
 			BOOL cloak = TRUE;
 			HRESULT hr = DwmSetWindowAttribute(hwnd, DWMWA_CLOAK,
 			                                   &cloak, sizeof(cloak));
-			displayxr_log("[DisplayXR] Cloaked Unity main window via DWMWA_CLOAK: hr=0x%08X\n",
-			              (unsigned)hr);
+			displayxr_log("[DisplayXR] Cloaked Unity main window via DWMWA_CLOAK: hr=0x%08X (t+%llu ms)\n",
+			              (unsigned)hr, dxr_since_process_start_ms());
 		}
 
 		// Move Unity's HWND off-screen at (-32000, -32000) — Approach A
