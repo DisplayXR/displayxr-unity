@@ -20,8 +20,10 @@ For a whole scene that should be flat, see [`two-dimensional-scenes.md`](two-dim
 | `positionX`, `positionY` | `0.02` | Top-left of the panel, as a **fraction** of the window, top-left origin |
 | `width`, `height` | `0.3`, `0.15` | Panel size, also fractional |
 | `disparity` | `0` | Stereo depth. `0` = the zero-disparity plane (at the screen) |
-| `resolution` | `1024x1024` | The RenderTexture the Canvas is rendered into |
-| `OverlayTexture` | — | The RenderTexture itself (read-only) |
+| `resolution` | `1024x1024` | Authored RenderTexture size. With `matchPanelAspect` (default) only the **height** is used |
+| `matchPanelAspect` | `true` | Derive the RT **width** from the live panel aspect, so the canvas is rendered at the panel's own aspect and the runtime's stretch is the identity. Off = legacy fixed-size RT with the camera pre-distorting |
+| `OverlayTexture` | — | The RenderTexture itself (read-only). **Re-created** when the panel aspect changes — read it each frame, don't cache it |
+| `OverlayResolution` | — | The RT's **actual** size in pixels (read-only). 1 px == 1 UI unit; input routers map into this, not `resolution` |
 | `IsCursorOverInteractive` | `false` | **Static.** Set by input routers; read by scene controllers |
 
 ## How it renders
@@ -35,10 +37,21 @@ The component does not render your Canvas where you put it. It:
    runtime (list items, tiles, a file dialog, a dropdown's blocker) is born on its prefab's
    layer and would otherwise be silently culled. You never need to set layers yourself;
    the first time the component has to fix a stray object it logs once.
-3. Sizes it so **1 RT pixel == 1 UI unit** (`sizeDelta = resolution`, `localScale = 0.01`).
+3. Sizes it so **1 RT pixel == 1 UI unit** (`sizeDelta = OverlayResolution`, `localScale = 0.01`).
 4. Renders it with a dedicated hidden orthographic camera into `OverlayTexture`.
 5. Hands that texture to the runtime as an `XrCompositionLayerWindowSpaceDXR` composition
    layer, which the runtime composites at your window-space rect and disparity.
+
+**Aspect.** The RT is created at the panel's own aspect: height = `resolution.y`, width
+derived from the live panel pixel size (`Screen.* × width/height`). The camera then renders
+1:1 and whatever the runtime does to fit the RT into the panel rect is the identity, so
+circles stay round on every compositor path. When the window or the rect changes, the RT
+(and with it the runtime's overlay swapchain and cross-device bridge) is re-created once the
+new size has been stable for a quarter second; a one-line log says so. Turning
+`matchPanelAspect` off restores the previous scheme — a fixed-size RT with the overlay camera
+*pre-distorting* (`camera.aspect = panelAspect`) on the assumption that the compositor's
+stretch cancels it exactly. That assumption held on the panel but not in the editor's weave
+window / Game view pane, where every round handle rendered as an ellipse.
 
 All of that is restored on `OnDisable` — original render mode, position, rotation, scale,
 layer and `worldCamera`.

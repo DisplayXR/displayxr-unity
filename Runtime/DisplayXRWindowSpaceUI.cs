@@ -60,11 +60,43 @@ namespace DisplayXR
 
         [Header("Render Settings")]
 
-        [Tooltip("Resolution of the overlay RenderTexture.")]
+        [Tooltip("Resolution of the overlay RenderTexture. With Match Panel Aspect on, only the " +
+                 "HEIGHT is used — the width follows the live panel aspect.")]
         public Vector2Int resolution = new Vector2Int(1024, 1024);
 
-        /// <summary>The RenderTexture used to capture the Canvas content.</summary>
+        [Tooltip("Derive the RenderTexture WIDTH from the live panel aspect (height stays " +
+                 "resolution.y), so the canvas is rendered at the panel's own aspect and the " +
+                 "runtime's stretch into the panel rect is the identity — no pre-distortion. " +
+                 "Off = legacy fixed-size RT with the overlay camera pre-distorting to compensate, " +
+                 "which is only correct when the compositor's stretch is exactly the inverse " +
+                 "(it isn't on every path: editor weave window / Game view pane).")]
+        public bool matchPanelAspect = true;
+
+        /// <summary>
+        /// The RenderTexture used to capture the Canvas content. With
+        /// <see cref="matchPanelAspect"/> on, this is RE-CREATED whenever the panel aspect
+        /// changes (window resize, rect edit) — read it each frame rather than caching it.
+        /// </summary>
         public RenderTexture OverlayTexture { get; private set; }
+
+        /// <summary>
+        /// Actual size of <see cref="OverlayTexture"/> in pixels. Equals <see cref="resolution"/>
+        /// unless <see cref="matchPanelAspect"/> derived the width. 1 pixel == 1 canvas UI unit,
+        /// so input routers must map cursor coordinates into THIS, not into
+        /// <see cref="resolution"/>.
+        /// </summary>
+        public Vector2Int OverlayResolution => m_RtSize;
+        private Vector2Int m_RtSize;
+
+        // matchPanelAspect: a derived size is applied only once it has been stable for
+        // kResizeSettleSeconds. A drag-resize emits a new size every frame, and each RT
+        // re-create also rebuilds the runtime's overlay swapchain + cross-device bridge.
+        private Vector2Int m_PendingRtSize;
+        private float m_PendingRtSince;
+        private const float kResizeSettleSeconds = 0.25f;
+        // Keep the current width while its aspect is within this of the panel's — a
+        // sub-pixel aspect wobble must not churn the RT.
+        private const float kAspectTolerance = 0.01f;
 
         // We park the WorldSpace canvas at this fixed position, far from any
         // scene content, so the dedicated camera looking at it sees nothing
@@ -126,16 +158,10 @@ namespace DisplayXR
             m_OrigCanvasWorldCamera = m_Canvas.worldCamera;
             m_StateSaved = true;
 
-            // ---- RT with explicit depth-stencil format (URP RenderGraph requirement) ----
-            var rtDesc = new RenderTextureDescriptor(resolution.x, resolution.y,
-                GraphicsFormat.B8G8R8A8_UNorm, GraphicsFormat.D24_UNorm_S8_UInt)
-            {
-                msaaSamples = 1,
-                useMipMap = false,
-                autoGenerateMips = false,
-            };
-            OverlayTexture = new RenderTexture(rtDesc) { name = "DisplayXR_Overlay" };
-            OverlayTexture.Create();
+            // ---- RT: authored height, width from the live panel aspect (see matchPanelAspect) ----
+            m_RtSize = ComputeRtSize();
+            m_PendingRtSize = m_RtSize;
+            CreateOverlayTexture(m_RtSize);
 
             // ---- Switch the canvas to WorldSpace + park it on the private layer ----
             m_Canvas.renderMode = RenderMode.WorldSpace;
@@ -148,8 +174,8 @@ namespace DisplayXR
             // resolution maps cleanly. Use 1/100 like a typical WorldSpace UI
             // setup (1 cm per UI unit).
             m_CanvasRect.localScale = new Vector3(0.01f, 0.01f, 0.01f);
-            // Canvas size in UI units = resolution (so 1 RT pixel = 1 UI unit).
-            m_CanvasRect.sizeDelta = resolution;
+            // Canvas size in UI units = RT size (so 1 RT pixel = 1 UI unit).
+            m_CanvasRect.sizeDelta = m_RtSize;
             SetLayerRecursive(gameObject, kPrivateLayer);
 
             // ---- Dedicated camera: orthographic, points at canvas, renders ONLY the private layer ----
@@ -171,10 +197,10 @@ namespace DisplayXR
             m_OverlayCamera.clearFlags = CameraClearFlags.SolidColor;
             m_OverlayCamera.backgroundColor = Color.clear;
             m_OverlayCamera.orthographic = true;
-            // Ortho size = half-height in world units. Canvas height = resolution.y * 0.01
-            // (because of localScale=0.01). So ortho size = resolution.y * 0.005 covers the canvas exactly.
-            m_OverlayCamera.orthographicSize = resolution.y * 0.005f;
-            m_OverlayCamera.aspect = (float)resolution.x / resolution.y;
+            // Ortho size = half-height in world units. Canvas height = m_RtSize.y * 0.01
+            // (because of localScale=0.01). So ortho size = m_RtSize.y * 0.005 covers the canvas exactly.
+            m_OverlayCamera.orthographicSize = m_RtSize.y * 0.005f;
+            m_OverlayCamera.aspect = (float)m_RtSize.x / m_RtSize.y;
             m_OverlayCamera.nearClipPlane = 0.01f;
             m_OverlayCamera.farClipPlane = 10f;
             m_OverlayCamera.targetTexture = OverlayTexture;
@@ -209,7 +235,7 @@ namespace DisplayXR
             DisplayXRNative.displayxr_window_space_ui_set_layer(
                 positionX, positionY, width, height, disparity);
             DisplayXRNative.displayxr_window_space_ui_set_texture(
-                OverlayTexture.GetNativeTexturePtr(), resolution.x, resolution.y);
+                OverlayTexture.GetNativeTexturePtr(), m_RtSize.x, m_RtSize.y);
 
             // ---- Windows-only: query the cross-device bridge ----
             // On Windows the provider session runs on its own D3D12 device;
@@ -226,8 +252,9 @@ namespace DisplayXR
             m_LastW = width;     m_LastH = height;
             m_LastDisparity = disparity;
 
-            Debug.Log($"[DisplayXR] WindowSpaceUI enabled: {resolution.x}x{resolution.y} " +
-                      $"(WorldSpace canvas, layer {kPrivateLayer}, dedicated camera)");
+            Debug.Log($"[DisplayXR] WindowSpaceUI enabled: {m_RtSize.x}x{m_RtSize.y} " +
+                      $"(WorldSpace canvas, layer {kPrivateLayer}, dedicated camera, " +
+                      $"matchPanelAspect={matchPanelAspect})");
         }
 
         // Re-acquires across session restarts. The provider destroys the wsui bridge with
@@ -247,7 +274,7 @@ namespace DisplayXR
                     // Custom display-provider mode: the provider owns a SEPARATE
                     // D3D12 device, so it exposes its own cross-device wsui bridge. (#166)
                     DisplayXRProviderNative.dxr_prov_get_wsui_bridge(
-                        (uint)resolution.x, (uint)resolution.y,
+                        (uint)m_RtSize.x, (uint)m_RtSize.y,
                         out bridgePtr, out bw, out bh);
                 }
                 if (bridgePtr == System.IntPtr.Zero || bw == 0 || bh == 0)
@@ -271,7 +298,7 @@ namespace DisplayXR
                 // change-detection cache below so LateUpdate re-pushes too.
                 DisplayXRNative.displayxr_window_space_ui_set_texture(
                     OverlayTexture != null ? OverlayTexture.GetNativeTexturePtr() : System.IntPtr.Zero,
-                    resolution.x, resolution.y);
+                    m_RtSize.x, m_RtSize.y);
                 DisplayXRNative.displayxr_window_space_ui_set_layer(
                     positionX, positionY, width, height, disparity);
                 m_LastX = positionX; m_LastY = positionY;
@@ -323,15 +350,7 @@ namespace DisplayXR
                     DestroyImmediate(m_OverlayCamera.gameObject);
             }
 
-            if (OverlayTexture != null)
-            {
-                OverlayTexture.Release();
-                if (Application.isPlaying)
-                    Destroy(OverlayTexture);
-                else
-                    DestroyImmediate(OverlayTexture);
-                OverlayTexture = null;
-            }
+            DestroyOverlayTexture();
 
             // Texture2D.CreateExternalTexture'd handles don't own the underlying native
             // resource — native keeps the bridge alive across enable/disable cycles. Just
@@ -342,7 +361,7 @@ namespace DisplayXR
 
         void LateUpdate()
         {
-            // Keep EVERYTHING under the canvas on the private layer, every frame.
+            // Keep EVERYTHING under the canvas on the private layer, every frame (#289).
             // OnEnable parks the hierarchy on kPrivateLayer once, but the overlay
             // camera culls to that layer alone — so anything Instantiated under the
             // canvas afterwards (list items, model tiles, a file dialog, a dropdown's
@@ -351,34 +370,72 @@ namespace DisplayXR
             // where the layer differs, so the steady-state cost is a read-only walk.
             EnforcePrivateLayer();
 
-            // Match the camera aspect to the live panel pixel aspect so UI
-            // content stays at correct aspect when the host window resizes
-            // OR when the wsui rect (positionX/Y/width/height) changes. The
-            // camera renders into a fixed-size RT, but the runtime stretches
-            // that RT into the panel rect — by setting camera.aspect to the
-            // panel's pixel aspect, the camera "pre-distorts" its rendering
-            // so the post-stretch result is aspect-correct in the panel.
             if (m_OverlayCamera != null && TryGetPanelPixelSize(out float pw, out float ph) &&
                 pw > 0f && ph > 0f)
             {
                 float panelAspect = pw / ph;
-                // ortho size is half the canvas height in world units (canvas
-                // sizeDelta.y * canvas.localScale.y / 2). Recompute each frame
-                // — cheap, and supports inspector edits to resolution.y too.
-                m_OverlayCamera.orthographicSize = resolution.y * 0.005f;
-                m_OverlayCamera.aspect = panelAspect;
-
-                // Dynamically resize the canvas's RectTransform to MATCH the
-                // camera view. Without this the canvas stays its initial
-                // (square) size and there's pillarboxing/letterboxing inside
-                // the panel rect — the panel image only fills the canvas, not
-                // the camera's full view. Since the runtime stretches the RT
-                // into the panel rect, we want the canvas (and its panel
-                // image) to fill the camera's view exactly so the resulting
-                // panel content has no internal margins.
-                if (m_CanvasRect != null)
+                if (matchPanelAspect)
                 {
-                    m_CanvasRect.sizeDelta = new Vector2(resolution.y * panelAspect, resolution.y);
+                    // No pre-distortion: the RT itself carries the panel's aspect (height =
+                    // resolution.y, width derived), the camera renders 1:1 into it, and the
+                    // runtime's stretch into the panel rect is the identity. Correct on every
+                    // compositor path, including the ones where the legacy pre-distortion did
+                    // not cancel (editor weave window / Game view pane: circles rendered as
+                    // ellipses, icons squashed). Re-create the RT only once the derived size
+                    // has settled — a drag-resize would otherwise rebuild the overlay
+                    // swapchain + bridge every frame.
+                    var wanted = ComputeRtSize();
+                    if (wanted != m_RtSize)
+                    {
+                        if (wanted != m_PendingRtSize)
+                        {
+                            m_PendingRtSize = wanted;
+                            m_PendingRtSince = Time.realtimeSinceStartup;
+                        }
+                        else if (Time.realtimeSinceStartup - m_PendingRtSince >= kResizeSettleSeconds)
+                        {
+                            ResizeOverlayTexture(wanted);
+                        }
+                    }
+                    else
+                    {
+                        m_PendingRtSize = m_RtSize;
+                    }
+                    m_OverlayCamera.orthographicSize = m_RtSize.y * 0.005f;
+                    m_OverlayCamera.aspect = (float)m_RtSize.x / m_RtSize.y;
+                    if (m_CanvasRect != null)
+                        m_CanvasRect.sizeDelta = m_RtSize;
+                }
+                else
+                {
+                    // Legacy path: match the camera aspect to the live panel pixel aspect
+                    // so UI content stays at correct aspect when the host window resizes
+                    // OR when the wsui rect (positionX/Y/width/height) changes. The
+                    // camera renders into a fixed-size RT, but the runtime stretches
+                    // that RT into the panel rect — by setting camera.aspect to the
+                    // panel's pixel aspect, the camera "pre-distorts" its rendering
+                    // so the post-stretch result is aspect-correct in the panel.
+                    // Only correct when that stretch is exactly the inverse, which is
+                    // why matchPanelAspect is the default.
+                    //
+                    // ortho size is half the canvas height in world units (canvas
+                    // sizeDelta.y * canvas.localScale.y / 2). Recompute each frame
+                    // — cheap, and supports inspector edits to resolution.y too.
+                    m_OverlayCamera.orthographicSize = m_RtSize.y * 0.005f;
+                    m_OverlayCamera.aspect = panelAspect;
+
+                    // Dynamically resize the canvas's RectTransform to MATCH the
+                    // camera view. Without this the canvas stays its initial
+                    // (square) size and there's pillarboxing/letterboxing inside
+                    // the panel rect — the panel image only fills the canvas, not
+                    // the camera's full view. Since the runtime stretches the RT
+                    // into the panel rect, we want the canvas (and its panel
+                    // image) to fill the camera's view exactly so the resulting
+                    // panel content has no internal margins.
+                    if (m_CanvasRect != null)
+                    {
+                        m_CanvasRect.sizeDelta = new Vector2(m_RtSize.y * panelAspect, m_RtSize.y);
+                    }
                 }
             }
 
@@ -426,6 +483,84 @@ namespace DisplayXR
             }
             pw = ph = 0f;
             return false;
+        }
+
+        // The RT size to use right now: authored resolution, or (matchPanelAspect) the
+        // authored HEIGHT with the width derived from the live panel aspect. Keeps the
+        // current width while its aspect is within kAspectTolerance of the panel's.
+        private Vector2Int ComputeRtSize()
+        {
+            int h = Mathf.Max(1, resolution.y);
+            var authored = new Vector2Int(Mathf.Max(1, resolution.x), h);
+            if (!matchPanelAspect) return authored;
+            // No window yet (headless / very first frame): authored size until we know.
+            if (!TryGetPanelPixelSize(out float pw, out float ph) || pw <= 0f || ph <= 0f)
+                return authored;
+            float panelAspect = pw / ph;
+            if (m_RtSize.y == h && m_RtSize.x > 0 &&
+                Mathf.Abs((float)m_RtSize.x / m_RtSize.y - panelAspect) <= kAspectTolerance)
+                return m_RtSize;
+            int w = Mathf.Clamp(Mathf.RoundToInt(h * panelAspect), 1, SystemInfo.maxTextureSize);
+            return new Vector2Int(w, h);
+        }
+
+        // Explicit depth-stencil format is a URP RenderGraph requirement; B8G8R8A8 matches
+        // the runtime's overlay swapchain format (CopyTextureRegion is invalid across formats).
+        private void CreateOverlayTexture(Vector2Int size)
+        {
+            var rtDesc = new RenderTextureDescriptor(size.x, size.y,
+                GraphicsFormat.B8G8R8A8_UNorm, GraphicsFormat.D24_UNorm_S8_UInt)
+            {
+                msaaSamples = 1,
+                useMipMap = false,
+                autoGenerateMips = false,
+            };
+            OverlayTexture = new RenderTexture(rtDesc) { name = "DisplayXR_Overlay" };
+            OverlayTexture.Create();
+
+            // Compatibility: a previously imported copy of the mouse-router sample maps the
+            // cursor with `resolution.x/y`. UPM samples are copied into Assets/ at import time
+            // and never live-update, so such a copy WILL be running against this component.
+            // Mirroring the actual size into `resolution` while playing keeps its horizontal
+            // mapping correct (only the derived width can differ; the height is authored).
+            // Play-mode only — never bakes a derived width into the serialized scene value.
+            if (Application.isPlaying)
+                resolution = size;
+        }
+
+        private void DestroyOverlayTexture()
+        {
+            if (OverlayTexture == null) return;
+            OverlayTexture.Release();
+            if (Application.isPlaying)
+                Destroy(OverlayTexture);
+            else
+                DestroyImmediate(OverlayTexture);
+            OverlayTexture = null;
+        }
+
+        // matchPanelAspect: swap in a fresh RT at the new size and re-register it. The
+        // runtime's overlay swapchain and the cross-device bridge are sized to the registered
+        // texture — native tears both down and recreates them when the size changes — so the
+        // bridge wrapper is dropped here and TryAcquireBridge re-wraps whatever comes back
+        // (the new pointer may or may not equal the old one, so "unchanged pointer" is not a
+        // safe shortcut across a resize).
+        private void ResizeOverlayTexture(Vector2Int size)
+        {
+            DestroyOverlayTexture();
+            m_RtSize = size;
+            m_PendingRtSize = size;
+            CreateOverlayTexture(size);
+            if (m_OverlayCamera != null)
+                m_OverlayCamera.targetTexture = OverlayTexture;
+            if (m_CanvasRect != null)
+                m_CanvasRect.sizeDelta = size;
+            DisplayXRNative.displayxr_window_space_ui_set_texture(
+                OverlayTexture.GetNativeTexturePtr(), size.x, size.y);
+            ReleaseBridgeTex();
+            TryAcquireBridge();
+            Debug.Log($"[DisplayXR] wsui: RT re-created at {size.x}x{size.y} to match the panel aspect " +
+                      $"({(float)size.x / size.y:F3})");
         }
 
         private static void SetLayerRecursive(GameObject go, int layer)
