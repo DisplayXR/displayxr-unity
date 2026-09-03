@@ -1,12 +1,12 @@
-# Pre-release visibility check (DisplayXR/displayxr-unity#295, #296).
+﻿# Pre-release visibility check (DisplayXR/displayxr-unity#295, #296).
 #
 # The property under test is the one the #277 pre-cloak broke and CI + a 3D-path
 # panel check both MISSED, twice: CAN A USER SEE THE APP? A cloaked, off-screen
-# window still runs, presents, and pumps — it passes every "did it start" assertion.
+# window still runs, presents, and pumps - it passes every "did it start" assertion.
 # So this asserts the STRONGER property: a window that is simultaneously
 #   visible  AND  not cloaked (DWMWA_CLOAKED)  AND  >200x200  AND  on-screen
 # and, when -GuardLog is given, that the plugin's OWN #295 guard produced it
-# (the 6th conjunct — an app may carry its own IsInstalled guard for this very
+# (the 6th conjunct - an app may carry its own IsInstalled guard for this very
 # bug and pass the arm while the plugin guard never ran; assert the plugin's line).
 #
 # Usage:
@@ -29,7 +29,7 @@ public class VZ {
  [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr h,int a,out int v,int s);
  public delegate bool EnumProc(IntPtr h, IntPtr p);
  public struct RECT { public int L,T,R,B; }
- // Enumerate ALL pids named the same (a re-exec — GPU pin / API fallback — moves the
+ // Enumerate ALL pids named the same (a re-exec - GPU pin / API fallback - moves the
  // visible window to a SECOND process; single-PID tracking passes for the wrong reason).
  public static string Shown(int[] pids) {
    var sb = new StringBuilder();
@@ -60,5 +60,5 @@ if ($GuardLog -ne "") {
 }
 Get-Process -Name $name -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 if ($shown -ne "" -and $guardOk) { Write-Output "PASS visible: $shown"; exit 0 }
-if ($shown -eq "") { Write-Output "FAIL INVISIBLE (no visible/uncloaked/on-screen window) — the #295 regression"; exit 1 }
-Write-Output "FAIL guard log line absent — the app's own guard may be masking a broken plugin guard (#295)"; exit 1
+if ($shown -eq "") { Write-Output "FAIL INVISIBLE (no visible/uncloaked/on-screen window) - the #295 regression"; exit 1 }
+Write-Output "FAIL guard log line absent - the app's own guard may be masking a broken plugin guard (#295)"; exit 1
