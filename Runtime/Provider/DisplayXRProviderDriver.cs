@@ -60,6 +60,17 @@ namespace DisplayXR
             IsActive = false;
         }
 
+        void OnDestroy()
+        {
+            // The loader destroys the driver on Stop. If a session was up, that's the
+            // falling edge too — LateUpdate won't run again to notice it.
+            if (m_SessionStarted)
+            {
+                m_SessionStarted = false;
+                DisplayXRProvider.OnSessionStopped();
+            }
+        }
+
         void LateUpdate()
         {
 #if UNITY_EDITOR_OSX || UNITY_STANDALONE_OSX
@@ -81,7 +92,12 @@ namespace DisplayXR
             }
             if (DisplayXRProviderNative.dxr_prov_session_is_running() == 0)
             {
-                m_SessionStarted = false;
+                // Falling edge: session lost / restarting (editor dock-undock) / stopping.
+                if (m_SessionStarted)
+                {
+                    m_SessionStarted = false;
+                    DisplayXRProvider.OnSessionStopped();
+                }
                 return;
             }
 

@@ -79,7 +79,10 @@ if (fire && mode != DisplayXRProvider.ActiveModeIndex)
 Behavioral notes worth knowing:
 
 - **`Apply()` is safe before the session exists.** The request is held and applied on the
-  first frame the provider reports a live session.
+  first frame the provider reports a live session. (A bare `DisplayXRProvider.RequestDisplayMode`
+  at that point returns false and is dropped — if you drive the provider directly instead of
+  through this component, use `DisplayXRProvider.WhenRunning` or subscribe to
+  `DisplayXRProvider.SessionStarted`.)
 - **It survives a subsystem restart.** The editor's dock/undock auto-switch stops and
   restarts the session mid-Play; a once-only push into a dead session succeeds *silently*,
   so the request is re-armed rather than dropped.

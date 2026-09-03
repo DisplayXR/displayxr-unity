@@ -207,6 +207,16 @@ rig**, not fixed defaults — so a tracked face gets correct depth/parallax.
   *keybinding* stays app policy — the plugin only exposes the API. The three event
   structs were added to `displayxr_extensions.h` verbatim from the runtime's
   `XR_DXR_display_info.h`.
+- **Session lifecycle events.** The session comes up on the render thread a frame or
+  two into Play, so a scene's `Start()` normally runs while `DisplayXRProvider.IsRunning`
+  is still false — and every request made then (`RequestDisplayMode`,
+  `RequestRenderingMode`, …) returns false and is **dropped**, with nothing else to say
+  so. The driver therefore raises `DisplayXRProvider.SessionStarted` on the rising edge
+  (after `Modes` is refreshed) and `SessionStopped` on the falling edge (session loss,
+  the editor's dock/undock restart, driver destroyed on Stop). `WhenRunning(Action)` is
+  the one-shot form: runs immediately if the session is already up, otherwise once on the
+  next `SessionStarted` — the supported way to make an initial request from `Start()`.
+  `DisplayXRSceneMode` is the held-and-re-armed version of the same idea for 2D/3D.
 
 ### Loader (XR Plug-in Management)
 
