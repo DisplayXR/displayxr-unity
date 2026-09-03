@@ -67,11 +67,27 @@ namespace DisplayXR
         public static event Action SessionStopped;
 
         /// <summary>
-        /// Run <paramref name="action"/> as soon as the session is running: immediately if it
-        /// already is, otherwise once, on the next <see cref="SessionStarted"/>. This is the
-        /// supported way to make an initial request from a scene's <c>Start()</c> — the plain
-        /// <see cref="RequestDisplayMode"/> / <see cref="RequestRenderingMode"/> are dropped
-        /// (return false) when the session isn't up yet, and at Start it usually isn't.
+        /// True between <see cref="SessionStarted"/> and <see cref="SessionStopped"/> — the
+        /// managed view of the session. Distinct from <see cref="IsRunning"/>, which is the
+        /// native flag and flips true on the render thread up to a frame before the driver has
+        /// noticed and refreshed <see cref="Modes"/> (measured in the editor: IsRunning already
+        /// true at frame 0, SessionStarted at frame 1). While this is true, <see cref="Modes"/>
+        /// has been refreshed at least once for the current session.
+        /// </summary>
+        public static bool IsSessionReady { get; private set; }
+
+        /// <summary>
+        /// Run <paramref name="action"/> as soon as the session is up: immediately if
+        /// <see cref="IsSessionReady"/>, otherwise once, on the next <see cref="SessionStarted"/>.
+        /// This is the supported way to make an initial request from a scene's <c>Start()</c> —
+        /// the plain <see cref="RequestDisplayMode"/> / <see cref="RequestRenderingMode"/> are
+        /// dropped (return false) when the session isn't up yet, and at Start it usually isn't.
+        /// <para>
+        /// Gated on <see cref="IsSessionReady"/> rather than <see cref="IsRunning"/> on purpose:
+        /// the native flag can be true before the driver's first <see cref="RefreshModes"/>, and
+        /// an action that looks its mode up in <see cref="Modes"/> would then see an empty table.
+        /// The cost is at most one frame of latency.
+        /// </para>
         /// <para>
         /// One-shot by design: it does not re-run after a session restart. If your request
         /// must survive a restart (it does not — the session state is gone), subscribe to
@@ -82,7 +98,7 @@ namespace DisplayXR
         public static void WhenRunning(Action action)
         {
             if (action == null) return;
-            if (IsRunning) { action(); return; }
+            if (IsSessionReady) { action(); return; }
             Action handler = null;
             handler = () =>
             {
@@ -327,6 +343,7 @@ namespace DisplayXR
         {
             IsEyeTracked = false;
             RefreshModes();
+            IsSessionReady = true;
             // After RefreshModes on purpose: a subscriber that wants a mode (e.g. the mono
             // one for a 2D scene) can look it up in Modes right here. Note the table can
             // still be empty/stale for a moment in a built player (see DisplayXRSceneMode's
@@ -337,6 +354,7 @@ namespace DisplayXR
 
         internal static void OnSessionStopped()
         {
+            IsSessionReady = false;
             IsEyeTracked = false;
             SessionStopped?.Invoke();
         }

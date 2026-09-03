@@ -213,9 +213,14 @@ rig**, not fixed defaults — so a tracked face gets correct depth/parallax.
   `RequestRenderingMode`, …) returns false and is **dropped**, with nothing else to say
   so. The driver therefore raises `DisplayXRProvider.SessionStarted` on the rising edge
   (after `Modes` is refreshed) and `SessionStopped` on the falling edge (session loss,
-  the editor's dock/undock restart, driver destroyed on Stop). `WhenRunning(Action)` is
-  the one-shot form: runs immediately if the session is already up, otherwise once on the
-  next `SessionStarted` — the supported way to make an initial request from `Start()`.
+  the editor's dock/undock restart, driver destroyed on Stop). `IsSessionReady` is true
+  between the two — the *managed* view of the session, as opposed to `IsRunning`, the
+  native flag, which flips true on the render thread up to a frame before the driver has
+  refreshed `Modes` (measured in the editor: `IsRunning` already true at frame 0,
+  `SessionStarted` at frame 1). `WhenRunning(Action)` is the one-shot form: runs
+  immediately if `IsSessionReady`, otherwise once on the next `SessionStarted` — the
+  supported way to make an initial request from `Start()`, and gated on the managed flag so
+  an action that looks its mode up in `Modes` never sees the pre-refresh table.
   `DisplayXRSceneMode` is the held-and-re-armed version of the same idea for 2D/3D.
 
 ### Loader (XR Plug-in Management)
