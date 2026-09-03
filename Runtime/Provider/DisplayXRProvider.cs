@@ -14,9 +14,14 @@ namespace DisplayXR
     ///
     /// Mode *keybinding* is app policy — the plugin only exposes the API (cf. the
     /// windowing primitives). Events are pumped each frame by
-    /// <see cref="DisplayXRProviderDriver"/>; they only fire while the provider
-    /// session is running. All members are inert (no-ops / empty) when the provider
-    /// isn't the active display subsystem.
+    /// <see cref="DisplayXRProviderDriver"/>; the mode/hardware/eye-tracking events only
+    /// fire while the provider session is running, and <see cref="SessionStarted"/> /
+    /// <see cref="SessionStopped"/> bracket that window. All members are inert (no-ops /
+    /// empty) when the provider isn't the active display subsystem.
+    ///
+    /// Requests (<see cref="RequestDisplayMode"/> etc.) made before the session is running
+    /// return false and are DROPPED — see <see cref="SessionStarted"/> and
+    /// <see cref="WhenRunning"/> for the supported way to make one at scene start.
     /// </summary>
     public static class DisplayXRProvider
     {
@@ -31,6 +36,77 @@ namespace DisplayXR
 
         /// <summary>Fired on every edge of the derived eye-tracking state (isTracking, activeMode 0=MANAGED/1=MANUAL).</summary>
         public static event Action<bool, int> EyeTrackingStateChanged;
+
+        /// <summary>
+        /// Fired once each time the provider's runtime session comes up — after
+        /// <see cref="Modes"/> has been refreshed for the new session, and again after a
+        /// restart (the editor's dock/undock auto-switch restarts the session mid-Play).
+        /// <para>
+        /// Why you want this: the session starts on the render thread a frame or two into
+        /// Play, so the first scene's <c>Start()</c> normally runs while <see cref="IsRunning"/>
+        /// is still false — and every request made then (<see cref="RequestDisplayMode"/>,
+        /// <see cref="RequestRenderingMode"/>, …) returns false and is dropped, with nothing
+        /// else to tell you it never landed. The panel boots in 3D, so a 2D scene that fires
+        /// its request once at Start silently stays 3D. Subscribe here, or use
+        /// <see cref="WhenRunning"/> for a one-shot.
+        /// </para>
+        /// <para>
+        /// Edge-triggered: if the session is already running when you subscribe, this has
+        /// already fired — check <see cref="IsRunning"/> too (or use <see cref="WhenRunning"/>,
+        /// which does exactly that).
+        /// </para>
+        /// </summary>
+        public static event Action SessionStarted;
+
+        /// <summary>
+        /// Fired once when a running session goes down — session loss, the editor's
+        /// dock/undock restart, or the provider stopping. Anything the app pushed into the
+        /// session (display mode, rendering mode, eye-tracking mode) is gone with it; expect a
+        /// <see cref="SessionStarted"/> to follow on a restart and re-apply there.
+        /// </summary>
+        public static event Action SessionStopped;
+
+        /// <summary>
+        /// True between <see cref="SessionStarted"/> and <see cref="SessionStopped"/> — the
+        /// managed view of the session. Distinct from <see cref="IsRunning"/>, which is the
+        /// native flag and flips true on the render thread up to a frame before the driver has
+        /// noticed and refreshed <see cref="Modes"/> (measured in the editor: IsRunning already
+        /// true at frame 0, SessionStarted at frame 1). While this is true, <see cref="Modes"/>
+        /// has been refreshed at least once for the current session.
+        /// </summary>
+        public static bool IsSessionReady { get; private set; }
+
+        /// <summary>
+        /// Run <paramref name="action"/> as soon as the session is up: immediately if
+        /// <see cref="IsSessionReady"/>, otherwise once, on the next <see cref="SessionStarted"/>.
+        /// This is the supported way to make an initial request from a scene's <c>Start()</c> —
+        /// the plain <see cref="RequestDisplayMode"/> / <see cref="RequestRenderingMode"/> are
+        /// dropped (return false) when the session isn't up yet, and at Start it usually isn't.
+        /// <para>
+        /// Gated on <see cref="IsSessionReady"/> rather than <see cref="IsRunning"/> on purpose:
+        /// the native flag can be true before the driver's first <see cref="RefreshModes"/>, and
+        /// an action that looks its mode up in <see cref="Modes"/> would then see an empty table.
+        /// The cost is at most one frame of latency.
+        /// </para>
+        /// <para>
+        /// One-shot by design: it does not re-run after a session restart. If your request
+        /// must survive a restart (it does not — the session state is gone), subscribe to
+        /// <see cref="SessionStarted"/> instead, or use <see cref="DisplayXRSceneMode"/>,
+        /// which holds and re-arms its target for you.
+        /// </para>
+        /// </summary>
+        public static void WhenRunning(Action action)
+        {
+            if (action == null) return;
+            if (IsSessionReady) { action(); return; }
+            Action handler = null;
+            handler = () =>
+            {
+                SessionStarted -= handler;
+                action();
+            };
+            SessionStarted += handler;
+        }
 
         /// <summary>
         /// Latest eye-tracking state, cached from <see cref="EyeTrackingStateChanged"/>
@@ -267,6 +343,20 @@ namespace DisplayXR
         {
             IsEyeTracked = false;
             RefreshModes();
+            IsSessionReady = true;
+            // After RefreshModes on purpose: a subscriber that wants a mode (e.g. the mono
+            // one for a 2D scene) can look it up in Modes right here. Note the table can
+            // still be empty/stale for a moment in a built player (see DisplayXRSceneMode's
+            // retry) — this event says "requests are no longer dropped", not "the mode table
+            // is final".
+            SessionStarted?.Invoke();
+        }
+
+        internal static void OnSessionStopped()
+        {
+            IsSessionReady = false;
+            IsEyeTracked = false;
+            SessionStopped?.Invoke();
         }
 
         internal static void PumpEvents()
