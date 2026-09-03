@@ -5,6 +5,16 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.16.2] - 2026-09-03
+
+**Fixes a shipped regression: a transparent app was permanently invisible on any machine with no DisplayXR runtime.** Customer-reported (Lenovo). Present since v2.15.0.
+
+### Fixed
+- **A transparent app no longer starts invisible when no OpenXR runtime is resolvable** (#295). `DisplayXRTransparentOverlay.RequestTransparentSession()` — which apps call from `[RuntimeInitializeOnLoadMethod(SubsystemRegistration)]`, before anything knows whether a runtime exists — requested a transparent session unconditionally, and that pre-cloaks Unity's window and parks it off-screen at (-32000,-32000) as the earliest native touchpoint (#277). Every revert of that state is gated on a session/overlay that a no-runtime machine never produces, so the window stayed cloaked and off-screen forever — nothing on screen, only a faint taskbar thumbnail (DWM composites cloaked windows).
+  - This **regressed the #256/#258 fix**, which had already made a no-runtime machine "run as a normal, visible 2D application" by session-gating the OnEnable cloak with a 5 s skip-entirely backstop. #277's pre-cloak is deliberately *earlier than the session* (to beat the startup white flash), so it bypassed that gate and shipped without the backstop.
+  - The request is now skipped when `DisplayXRRuntime.ProbeSupported && !DisplayXRRuntime.IsInstalled` — no runtime, no pre-cloak, an ordinary visible window. `IsInstalled` mirrors the native runtime resolution, so it matches exactly what session start would resolve; gated on `ProbeSupported` so a platform with no managed probe does not wrongly skip. **Hardware-verified** on the no-runtime path (window visible, not cloaked, on-screen) and the runtime-present path (session comes up unchanged).
+  - This is defense-in-depth, not the whole story: a #256-style timeout backstop on the pre-cloak itself (covering a runtime that resolves but whose session then fails, #296) is a tracked follow-up.
+
 ## [2.16.1] - 2026-09-02
 
 **The first external contribution to this plugin.** The shipped window-space-UI mouse router did not survive contact with an app that brings its own canvases — which is most apps — and the failure was silent in every case.
