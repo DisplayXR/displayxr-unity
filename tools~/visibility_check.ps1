@@ -10,7 +10,7 @@
 # bug and pass the arm while the plugin guard never ran; assert the plugin's line).
 #
 # Usage:
-#   visibility_check.ps1 -Exe <player.exe> [-Seconds 25] [-NoRuntime] [-GuardLog <displayxr.log>]
+#   visibility_check.ps1 -Exe <player.exe> [-Seconds 25] [-NoRuntime] [-GuardLog <Player.log>]  (the #295 guard is C#: %USERPROFILE%\AppData\LocalLow\<Company>\<Product>\Player.log)
 # -NoRuntime points XR_RUNTIME_JSON at a nonexistent path (the customer's config).
 # Exit 0 = shown; exit 1 = INVISIBLE (the regression).
 param(
@@ -27,6 +27,7 @@ public class VZ {
  [DllImport("user32.dll")] public static extern bool IsWindowVisible(IntPtr h);
  [DllImport("user32.dll")] public static extern bool GetWindowRect(IntPtr h, out RECT r);
  [DllImport("dwmapi.dll")] public static extern int DwmGetWindowAttribute(IntPtr h,int a,out int v,int s);
+ [DllImport("user32.dll")] public static extern bool SetProcessDpiAwarenessContext(IntPtr c);
  public delegate bool EnumProc(IntPtr h, IntPtr p);
  public struct RECT { public int L,T,R,B; }
  // Enumerate ALL pids named the same (a re-exec - GPU pin / API fallback - moves the
@@ -43,8 +44,26 @@ public class VZ {
          sb.Append(w+"x"+ht+"@"+r.L+","+r.T+";");
      } return true; }, IntPtr.Zero);
    return sb.ToString(); }
+ // Every top-level window of the pids, with its state - so a FAIL says WHICH conjunct
+ // failed (a 288x150 window is "too small", not "invisible"; a cloaked one is cloaked).
+ public static string Dump(int[] pids) {
+   var sb = new StringBuilder();
+   EnumWindows((h,p) => {
+     uint pid; GetWindowThreadProcessId(h, out pid);
+     bool mine=false; foreach(var q in pids){ if(q==(int)pid){mine=true;break;} }
+     if (mine) {
+       int cloaked=0; DwmGetWindowAttribute(h,14,out cloaked,4);
+       RECT r; GetWindowRect(h,out r);
+       sb.Append("  hwnd=0x"+h.ToInt64().ToString("X")+" visible="+IsWindowVisible(h)+" cloaked="+cloaked
+         +" size="+(r.R-r.L)+"x"+(r.B-r.T)+" at="+r.L+","+r.T+"\n");
+     } return true; }, IntPtr.Zero);
+   return sb.ToString(); }
 }
 "@
+# GetWindowRect answers in THIS process's DPI space. Unpinned, PowerShell is DPI-unaware and a
+# correct 288x216 physical window on a 225% panel reads 128x96 - failing the size conjunct on
+# a perfectly visible app. Pin PER_MONITOR_AWARE_V2 (-4) so sizes are physical px (CLAUDE.md DPI rule).
+[void][VZ]::SetProcessDpiAwarenessContext([IntPtr]::new(-4))
 if ($NoRuntime) { $env:XR_RUNTIME_JSON = "C:\displayxr-no-runtime-visibility-check.json" }
 $name = [IO.Path]::GetFileNameWithoutExtension($Exe)
 Start-Process -FilePath $Exe | Out-Null
@@ -58,7 +77,10 @@ $guardOk = $true
 if ($GuardLog -ne "") {
   $guardOk = (Select-String -Path $GuardLog -Pattern "no OpenXR runtime resolvable" -Quiet) -eq $true
 }
+$dump = ""
+if ($shown -eq "") { $pids = @(Get-Process -Name $name -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Id); if ($pids.Count -gt 0) { $dump = [VZ]::Dump($pids) } }
 Get-Process -Name $name -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
 if ($shown -ne "" -and $guardOk) { Write-Output "PASS visible: $shown"; exit 0 }
+if ($shown -eq "" -and $dump -ne "") { Write-Output "windows seen (need visible, cloaked=0, >200x200, on-screen):"; Write-Output $dump }
 if ($shown -eq "") { Write-Output "FAIL INVISIBLE (no visible/uncloaked/on-screen window) - the #295 regression"; exit 1 }
 Write-Output "FAIL guard log line absent - the app's own guard may be masking a broken plugin guard (#295)"; exit 1
