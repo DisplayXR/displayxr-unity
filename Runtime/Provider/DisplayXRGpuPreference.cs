@@ -92,6 +92,23 @@ namespace DisplayXR
         /// </summary>
         public static TargetGpu Target { get; set; } = TargetGpu.Auto;
 
+        /// <summary>
+        /// Whether the post-build processor stamps the per-exe Windows GPU preference
+        /// (<c>HKCU\Software\Microsoft\DirectX\UserGpuPreferences</c>) for the built
+        /// player. Default true; build-time only — it has no effect at runtime, where
+        /// nothing can move Unity's adapter any more.
+        ///
+        /// <para>Set it false from an editor/build script — or set the environment
+        /// variable <c>DISPLAYXR_GPU_PREF_NO_STAMP=1</c> for the editor or CI process —
+        /// when a harness manages that registry key itself (#306).</para>
+        ///
+        /// <para>Reaching for this switch is usually unnecessary: since #306 the
+        /// processor leaves an <i>existing</i> entry alone unless the project declares a
+        /// non-Auto Target GPU on the manifest settings asset, so a hand-set per-machine
+        /// pin (a developer emulating an iGPU-only box, say) already survives a rebuild.</para>
+        /// </summary>
+        public static bool StampRegistryOnBuild { get; set; } = true;
+
         // Was DXR_D3D_FORCE_GPU already set before the plugin ever touched it?
         // Latched on the first Apply() — see the comment there.
         static bool s_ExternalChecked;
