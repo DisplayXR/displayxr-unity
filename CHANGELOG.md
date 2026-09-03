@@ -5,6 +5,11 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.18.1] - 2026-09-03
+
+### Fixed
+- **Transparent overlay: keyboard no longer dies after clicking away and back** (#304). The overlay is `WS_EX_NOACTIVATE`; on a press it foregrounded *itself*, which keeps the process foreground but never activates Unity's cloaked window. That was fine while Unity was still active from launch (the #270 subclass rewrites the deactivation our own overlay causes), but after a real switch to another app — deliberately let through since #270 so the window can be minimised — nothing re-activated Unity: a click back on the avatar gave Unity no `WM_ACTIVATE`, `Application.isFocused` stayed false and every key (WASD, Space, Esc) was dead for the rest of the session, while Alt+Tab, which activates Unity's window directly, restored them. A press now activates **Unity's HWND** (`overlay_claim_keyboard`), falling back to the overlay only if that HWND is unknown or refused; at launch, with Unity already active, it is a no-op. Verified on desktop-avatar with a control: after click-away/click-back the foreground window is Unity's with the fix and the overlay's without it. Field-found on a shipping avatar app; no app-side workaround is needed (one would race the plugin's focus management).
+
 ## [2.18.0] - 2026-09-03
 
 ### Added
