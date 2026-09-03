@@ -138,8 +138,12 @@ namespace DisplayXR.Samples
             float panelFracY = (windowFrac.y - m_Wsui.positionY) / m_Wsui.height;
             // No extra flip here: OverlayCamera's flipped up-vector already inverts
             // ScreenPointToRay's Y, so fracY 0 (top of the layer) maps to screenY 0.
-            var canvasPos = new Vector2(panelFracX * m_Wsui.resolution.x,
-                                        panelFracY * m_Wsui.resolution.y);
+            // Map into the RT's ACTUAL size, not the authored `resolution`: with
+            // matchPanelAspect (default) the width is derived from the live panel aspect,
+            // and the canvas is sized 1 UI unit per RT pixel of that.
+            var rtSize = m_Wsui.OverlayResolution;
+            var canvasPos = new Vector2(panelFracX * rtSize.x,
+                                        panelFracY * rtSize.y);
 
             // ---- 4. Raycast every raycaster under the wsui canvas ---------------
             m_PointerData.Reset();
