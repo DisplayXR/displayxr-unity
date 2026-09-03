@@ -573,6 +573,31 @@ displayxr_install_ll_mouse_hook(void)
 	}
 }
 
+// A press on the overlay must hand KEYBOARD activation to Unity's (cloaked) HWND,
+// not to the overlay. The overlay is WS_EX_NOACTIVATE; foregrounding IT keeps our
+// process foreground but never ACTIVATES Unity's window. That was fine as long as
+// Unity was still active from launch - the #270 subclass rewrites the WA_INACTIVE
+// our own overlay causes - but after a REAL switch to another app (deliberately let
+// through since #270 so the window can be minimised) nothing ever re-activated
+// Unity: a click back on the avatar foregrounded the overlay, Unity got no
+// WM_ACTIVATE(WA_ACTIVE), Application.isFocused stayed false and every key was dead
+// for the rest of the session, while Alt+Tab (which activates Unity's HWND directly)
+// restored them. Field-found on a shipping avatar app.
+//
+// The click just made us "the process that received the last input event", so
+// SetForegroundWindow on Unity's HWND is permitted; it delivers a genuine
+// activation. Cloaked + parked is irrelevant to activation (Alt+Tab proves it) and
+// the overlay stays TOPMOST visually. When Unity is already active it is a no-op.
+// Fall back to the overlay only if Unity's HWND is unknown or the call is refused.
+static void
+overlay_claim_keyboard(HWND overlay)
+{
+	HWND unity = find_unity_hwnd();
+	if (unity != NULL && SetForegroundWindow(unity))
+		return;
+	SetForegroundWindow(overlay);
+}
+
 static LRESULT CALLBACK
 overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 {
@@ -751,8 +776,9 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		// to us (Unity via INPUTSINK). WS_EX_NOACTIVATE blocks
 		// click-driven activation, but programmatic SFW from "received
 		// last input event" is allowed. See
-		// displayxr_is_our_process_foreground.
-		SetForegroundWindow(hwnd);
+		// displayxr_is_our_process_foreground. Activates UNITY's HWND, not
+		// this overlay - see overlay_claim_keyboard.
+		overlay_claim_keyboard(hwnd);
 		// (#131) In app-managed fixed full-screen mode the app owns
 		// window translation (it moves a virtual rect, not the HWND),
 		// so skip the native capture-based MOVE. We still claimed
@@ -873,7 +899,7 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		// process (Unity via INPUTSINK).
 		if (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONDBLCLK ||
 		    msg == WM_MBUTTONDOWN) {
-			SetForegroundWindow(hwnd);
+			overlay_claim_keyboard(hwnd);   // activates Unity's HWND, not this overlay
 		}
 		HWND unity = find_unity_hwnd();
 		if (unity != NULL)
