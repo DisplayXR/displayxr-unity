@@ -342,6 +342,15 @@ namespace DisplayXR
 
         void LateUpdate()
         {
+            // Keep EVERYTHING under the canvas on the private layer, every frame.
+            // OnEnable parks the hierarchy on kPrivateLayer once, but the overlay
+            // camera culls to that layer alone — so anything Instantiated under the
+            // canvas afterwards (list items, model tiles, a file dialog, a dropdown's
+            // blocker) is born on its prefab's layer and silently culled: no error,
+            // no warning, just absent. Any app with dynamic UI hits this. Writes only
+            // where the layer differs, so the steady-state cost is a read-only walk.
+            EnforcePrivateLayer();
+
             // Match the camera aspect to the live panel pixel aspect so UI
             // content stays at correct aspect when the host window resizes
             // OR when the wsui rect (positionX/Y/width/height) changes. The
@@ -424,6 +433,39 @@ namespace DisplayXR
             go.layer = layer;
             foreach (Transform child in go.transform)
                 SetLayerRecursive(child.gameObject, layer);
+        }
+
+        private bool m_LoggedStrayLayer;
+
+        // Re-park runtime-spawned descendants on the private layer. Only writes where
+        // the layer actually differs (a pure read otherwise), and logs the first time it
+        // has to fix anything so the culling trap is visible in the console instead of
+        // presenting as "my UI didn't appear".
+        private void EnforcePrivateLayer()
+        {
+            if (!m_StateSaved) return; // not taken over (OnEnable hasn't run / OnDisable restored)
+            int fixedCount = EnforceLayerRecursive(transform, kPrivateLayer);
+            if (fixedCount > 0 && !m_LoggedStrayLayer)
+            {
+                m_LoggedStrayLayer = true;
+                Debug.Log($"[DisplayXR] wsui: moved {fixedCount} runtime-spawned object(s) under " +
+                          $"'{name}' to the private layer {kPrivateLayer} (they would otherwise be " +
+                          "culled by the overlay camera).");
+            }
+        }
+
+        private static int EnforceLayerRecursive(Transform t, int layer)
+        {
+            int fixedCount = 0;
+            var go = t.gameObject;
+            if (go.layer != layer)
+            {
+                go.layer = layer;
+                fixedCount++;
+            }
+            for (int i = 0; i < t.childCount; i++)
+                fixedCount += EnforceLayerRecursive(t.GetChild(i), layer);
+            return fixedCount;
         }
     }
 }
