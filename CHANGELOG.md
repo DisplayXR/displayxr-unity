@@ -5,6 +5,11 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.18.2] - 2026-09-03
+
+### Fixed
+- **The GPU-preference post-build processor no longer clobbers a deliberate per-machine `UserGpuPreferences` entry** (#306, #307). It re-stamped `GpuPreference=2` on every build, which silently broke a hybrid dev box pinned to `=1` to emulate an iGPU-only customer machine (Unity on the iGPU + `DXR_D3D_FORCE_GPU=scanout` on the runtime). An **existing entry is now kept** unless `DisplayXRGpuPreference.Target` is *explicitly* `Discrete`/`Integrated` (the no-settings-asset fallback counts as a default, not a declaration, and defers); an absent entry is written as before (fallback → Discrete for cross-adapter safety on a fresh box; `Auto` → nothing, Windows decides). **A deliberate per-machine pin therefore survives a rebuild by default** — no switch needed while `Target` is `Auto`/unset. The opt-out (`DisplayXRGpuPreference.StampRegistryOnBuild = false` or `DISPLAYXR_GPU_PREF_NO_STAMP=1`) is only for a project whose `Target` is set explicitly and still wants a per-machine override to win. One `[DisplayXR] GpuPreference:` line per build says which branch was taken. Behaviour change to know: `Auto` used to *delete* a leftover entry; it now keeps it (it cannot tell a stale pin from a human's) — a box stamped by an older build may need a one-time manual clear, visible in that log line.
+
 ## [2.18.1] - 2026-09-03
 
 ### Fixed
