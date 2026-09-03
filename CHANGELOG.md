@@ -5,6 +5,12 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.18.0] - 2026-09-03
+
+### Added
+- **`XR_DXR_display_info` v18 — the window move is gated on `isPanelConfirmed`** (#266, #287). The provider now chains the runtime's v18 `XrDisplayDesktopInfoDXR` (desktop rect, device name, `isPrimary`, `isPanelConfirmed`) alongside the v16 desktop-position struct. `DisplayXRTargetDisplay` moves the app window onto the panel only when the runtime *confirms* it resolved a real panel — so `sim_display` and non-DisplayXR runtimes (which report a fallback-to-primary rect) no longer drag the window somewhere it doesn't belong. Against a pre-v18 runtime the v16 path is used unchanged and the move keeps its previous behaviour. **Minimum runtime is unchanged** (the declared `XR_DXR_display_info` spec version is a floor and every path degrades); the v18 positive path was hardware-verified against runtime v2.16.2-class bits (`confirmed=1`, device name and rect deserialised correctly, so the wire layout matches the runtime's writer).
+- **Cloak / un-cloak / revert log lines carry `(t+NNNN ms)` since process start, and the backstop timeout is overridable** (#296, #300). The 20 s early-cloak backstop is only safe when the overlay comes up faster than that on the *customer's* hardware, and Player.log has no timestamps — so `[DisplayXR] Cloaked Unity main window via DWMWA_CLOAK … (t+5231 ms)` now answers "how long did the overlay take on that machine" from any post-hoc log, no harness needed. `DISPLAYXR_EARLY_CLOAK_BACKSTOP_MS` (milliseconds, ≥ 1000; set in the process environment before launch) overrides the default, and the pre-cloak line prints the timeout in force.
+
 ## [2.17.0] - 2026-09-03
 
 Every fix here was reproduced and verified on real hardware (a Leia panel, mixed-DPI rig, and the desktop-avatar / birp-multipass samples), not on a maintainer's machine. Two are follow-through on the transparent-app invisibility regression that v2.16.2 first guarded.
