@@ -2315,6 +2315,104 @@ find_unity_main_hwnd_any(void)
 // by eye). displayxr_set_transparent_background() is the app's first native call --
 // ~110 ms before the show -- so cloaking there closes the gap.
 //
+// (#295/#296) The pre-cloak MUST NOT be able to outlive the thing it was hiding. It
+// cloaks AND parks Unity's window at (-32000,-32000), and every normal revert is gated
+// on s_overlay_active — which a machine where the session never comes up (no runtime;
+// a runtime that resolves but whose session fails; a loader that dies before
+// LifecycleStart ever creates an overlay) never sets. That left the app PERMANENTLY
+// INVISIBLE: a customer-reported regression of the #256 fix, which had already
+// session-gated the later OnEnable cloak with a 5 s skip-entirely backstop that the
+// (deliberately earlier) pre-cloak bypassed.
+//
+// Two layers restore the #256 guarantee at this earlier call site:
+//   1. early_cloak_revert(): the ONE complete revert — un-cloak AND un-park (the old
+//      revert only un-cloaked, leaving the window off-screen: #296). Called on a KNOWN
+//      failure (session-start failure -> destroy_app_overlay -> set_transparent_
+//      overlay(0)), so that path recovers immediately.
+//   2. A thread-message timer armed at pre-cloak time: if NOTHING has come up after
+//      DISPLAYXR_EARLY_CLOAK_BACKSTOP_MS, revert anyway. This is the catch-all for
+//      "session never even attempted" — no code path exists to notice that case, so
+//      only a timeout can. It runs on the pre-cloaking (main) thread via the pump, so
+//      it never touches the window cross-thread and never fires into a dead pump.
+//
+// The timeout is deliberately LONGER than a legitimate slow startup (measured: overlay
+// birth ~1.7 s, ApplyWindowing ~10 s, a heavy avatar visible at 12-16 s). Firing early
+// on a healthy-but-slow session would un-cloak into the very white flash #277 exists to
+// hide, and then the session would re-hide it. 20 s = a no-runtime app is invisible for
+// 20 s instead of forever; a healthy session has long since taken over and the timer
+// finds s_overlay_active set and does nothing.
+#define DISPLAYXR_EARLY_CLOAK_BACKSTOP_MS 20000
+static UINT_PTR s_early_cloak_backstop_timer = 0;
+
+// Un-cloak AND un-park Unity's main window, and drop the backstop. Idempotent; a
+// no-op unless the early cloak is still in force and no overlay ever took over.
+static void
+early_cloak_revert(const char *why)
+{
+	// s_overlay_active gates this: on a healthy transparent app that completed
+	// ApplyWindowing it is 1 and Unity is meant to stay cloaked (the overlay owns the
+	// display), so a session-loss teardown there is handled by the normal un-cloak path,
+	// not here. This fires only when the early cloak is still in force and the full
+	// overlay windowing never ran (session failed early / never started). NB: the
+	// "don't touch a healthy-but-still-initialising overlay" check lives in the TIMER
+	// proc, NOT here — the explicit teardown caller (set_transparent_overlay(0)) invokes
+	// us BEFORE it nulls s_overlay_hwnd, so an overlay-live guard here would wrongly make
+	// the fast teardown revert wait for the 20 s backstop instead.
+	if (!s_unity_early_cloaked || s_overlay_active)
+		return;
+	HWND hwnd = find_unity_main_hwnd_any();
+	if (hwnd == NULL || !IsWindow(hwnd)) {
+		s_unity_early_cloaked = 0;
+		return;
+	}
+	BOOL cloak = FALSE;
+	DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &cloak, sizeof(cloak));
+	// The pre-cloak parked the window off-screen as well as cloaking it; un-cloaking
+	// alone leaves it invisible at (-32000,-32000). Move it back to the POSITION it
+	// saved -- and ONLY the position (SWP_NOSIZE). The saved rect's size is Unity's
+	// 320x240 placeholder captured at +0 ms, before Unity applied the project's
+	// resolution; Unity does that sizing while the window sits parked, so restoring
+	// w/h from the stale save would clobber the correct size back down to the
+	// placeholder (measured: the app then laid out into a 288x152 window). Keep
+	// whatever size the window has now.
+	if (s_unity_saved_rect.left > -30000) {
+		SetWindowPos(hwnd, NULL, s_unity_saved_rect.left, s_unity_saved_rect.top, 0, 0,
+		             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
+	}
+	s_unity_early_cloaked = 0;
+	if (s_early_cloak_backstop_timer != 0) {
+		KillTimer(NULL, s_early_cloak_backstop_timer);
+		s_early_cloak_backstop_timer = 0;
+	}
+	RECT now_rc = {0, 0, 0, 0};
+	GetWindowRect(hwnd, &now_rc);
+	displayxr_log("[DisplayXR] early-cloak revert (%s): un-cloaked AND un-parked Unity "
+	              "main window %p back to (%d,%d), size kept at %dx%d\n", why, (void *)hwnd,
+	              (int)s_unity_saved_rect.left, (int)s_unity_saved_rect.top,
+	              (int)(now_rc.right - now_rc.left), (int)(now_rc.bottom - now_rc.top));
+}
+
+static void CALLBACK
+early_cloak_backstop_timerproc(HWND hwnd, UINT msg, UINT_PTR id, DWORD now)
+{
+	(void)hwnd; (void)msg; (void)now;
+	if (id == s_early_cloak_backstop_timer) {
+		KillTimer(NULL, id);
+		s_early_cloak_backstop_timer = 0;
+	}
+	int overlay_live = (s_overlay_hwnd != NULL && IsWindow(s_overlay_hwnd));
+	if (s_unity_early_cloaked && !s_overlay_active && !overlay_live) {
+		displayxr_log("[DisplayXR] early-cloak BACKSTOP: no overlay within %d ms of the "
+		              "pre-cloak - restoring the window so the app is not left invisible "
+		              "(#295)\n", (int)DISPLAYXR_EARLY_CLOAK_BACKSTOP_MS);
+		early_cloak_revert("backstop timeout");
+	} else if (s_unity_early_cloaked) {
+		displayxr_log("[DisplayXR] early-cloak backstop: overlay is up (active=%d hwnd=%p) "
+		              "- leaving Unity cloaked, the overlay owns the window (#295)\n",
+		              s_overlay_active, (void *)s_overlay_hwnd);
+	}
+}
+
 // Idempotent, and safe to fail: if Unity's window does not exist yet the overlay-birth
 // cloak still runs as the backstop.
 void
@@ -2362,9 +2460,19 @@ displayxr_precloak_unity_main_window(void)
 		             SWP_NOZORDER | SWP_NOACTIVATE | SWP_ASYNCWINDOWPOS);
 		displayxr_log("[DisplayXR] Early-parked Unity main window off-screen so a hung "
 		              "pump cannot stall the cursor\n");
+
+		// (#295) Arm the catch-all: if no session/overlay has taken over by the time
+		// this fires, revert the cloak AND the park. Thread-message timer on THIS
+		// (pre-cloaking, main) thread — delivered through Unity's own pump, so it
+		// runs on the window's owning thread and only once the app is actually
+		// pumping. A healthy session sets s_overlay_active long before 20 s and the
+		// proc finds nothing to do.
+		s_early_cloak_backstop_timer = SetTimer(NULL, 0, DISPLAYXR_EARLY_CLOAK_BACKSTOP_MS,
+		                                        early_cloak_backstop_timerproc);
 	}
 	displayxr_log("[DisplayXR] Pre-cloaked Unity main window %p BEFORE its "
-		      "first ShowWindow: hr=0x%08X\n", (void *)hwnd, (unsigned)hr);
+		      "first ShowWindow: hr=0x%08X (backstop armed: %s)\n", (void *)hwnd,
+		      (unsigned)hr, s_early_cloak_backstop_timer ? "yes" : "no");
 }
 
 static uint64_t
@@ -2590,13 +2698,14 @@ displayxr_set_transparent_overlay(int enabled, int topmost)
 	// on s_overlay_active, which is still 0 when the main thread never freed up to
 	// run ApplyWindowing. Without this, a session-loss revert (or a teardown on
 	// that path) would leave Unity's window cloaked and the app invisible.
-	if (!enabled && s_unity_early_cloaked && !s_overlay_active) {
-		BOOL cloak = FALSE;
-		DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, &cloak, sizeof(cloak));
-		s_unity_early_cloaked = 0;
-		displayxr_log("[DisplayXR] transparent_overlay: reverted the EARLY "
-		              "cloak (ApplyWindowing never ran)\n");
-	}
+	//
+	// (#296) This used to un-cloak ONLY. The pre-cloak also parked the window at
+	// (-32000,-32000), so an un-cloaked-but-still-parked window was every bit as
+	// invisible — a second root cause with the identical field symptom, reached on
+	// the runtime-resolves-but-session-fails path (destroy_app_overlay -> here).
+	// early_cloak_revert() un-parks too.
+	if (!enabled && s_unity_early_cloaked && !s_overlay_active)
+		early_cloak_revert("session teardown before ApplyWindowing ran");
 
 	if (enabled && !s_overlay_active) {
 		s_saved_style   = (DWORD)GetWindowLongPtrW(hwnd, GWL_STYLE);
