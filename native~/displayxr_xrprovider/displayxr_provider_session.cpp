@@ -435,6 +435,13 @@ typedef struct ProviderSession {
 	// XR_DXR_display_info v16+.
 	int32_t desktop_origin_x, desktop_origin_y;
 	int     desktop_origin_valid;
+	// (#266 / v18) desktop_origin_valid says the runtime gave us AN origin; this says
+	// it CONFIRMED a 3D panel is there (XrDisplayDesktopInfoDXR::isPanelConfirmed). v16
+	// answers the first and not the second, so a v16 runtime leaves this 0 and the move
+	// is gated on origin-valid alone (unchanged v16 behaviour). Against v18 the move is
+	// gated on confirmation, so an unconfirmed fallback rect (sim_display, runtime#715)
+	// no longer drags the window onto the primary. -1 = not answered (runtime < v18).
+	int     panel_confirmed;   // 1 confirmed, 0 fallback rect, -1 no v18 answer
 
 	// Rendering modes
 	XrDisplayRenderingModeInfoDXR modes[PS_MAX_RENDERING_MODES];
@@ -4162,15 +4169,30 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	// --- Display info ---
 	XrDisplayInfoDXR di = {};
 	di.type = XR_TYPE_DISPLAY_INFO_DXR;
-	// (#266) Chain the panel's desktop position (XR_DXR_display_info v16). Sentinel
-	// first: an older runtime ignores a struct it does not recognise and leaves the
-	// fields untouched, and (0,0) is a LEGITIMATE value for a panel that IS primary --
-	// so "did we get an answer" cannot be inferred from the value being zero.
+	// (#266) Chain the panel's desktop position. Sentinel first: an older runtime
+	// ignores a struct it does not recognise and leaves the fields untouched, and
+	// (0,0) is a LEGITIMATE value for a panel that IS primary -- so "did we get an
+	// answer" cannot be inferred from the value being zero.
+	//
+	// Chain BOTH the v16 origin-only struct and the v18 full-info struct. A v18 runtime
+	// fills both; a v16 runtime fills only ddp and ignores ddi; a pre-v16 runtime fills
+	// neither. We prefer v18 (it carries isPanelConfirmed, which distinguishes a real
+	// panel from a fallback-to-primary rect) and fall back to v16's origin. Chaining an
+	// unknown struct is harmless -- the runtime skips what it does not recognise -- so
+	// this is safe against every runtime version.
+	XrDisplayDesktopInfoDXR ddi = {};
+	ddi.type = XR_TYPE_DISPLAY_DESKTOP_INFO_DXR;
+	ddi.desktopRect.offset.x = INT32_MIN;
+	ddi.desktopRect.offset.y = INT32_MIN;
+	ddi.isPanelConfirmed = XR_FALSE;
+
 	XrDisplayDesktopPositionDXR ddp = {};
 	ddp.type = XR_TYPE_DISPLAY_DESKTOP_POSITION_DXR;
 	ddp.left = INT32_MIN;
 	ddp.top  = INT32_MIN;
-	di.next = &ddp;
+
+	ddp.next = &ddi;   // di -> ddp -> ddi
+	di.next  = &ddp;
 	XrSystemProperties sp = {XR_TYPE_SYSTEM_PROPERTIES};
 	sp.next = &di;
 	if (XR_SUCCEEDED(s_ps.pfn_get_system_properties(s_ps.instance, s_ps.system_id, &sp))) {
@@ -4204,14 +4226,36 @@ int dxr_prov_session_start(const char *runtime_json_path,
 		sdi->recommended_view_scale_y = di.recommendedViewScaleY;
 		sdi->is_valid = 1;
 
-		// (#266) Store the desktop origin only if the runtime actually answered.
-		if (ddp.left != INT32_MIN && ddp.top != INT32_MIN) {
+		// (#266) Store the desktop origin, preferring v18 (XrDisplayDesktopInfoDXR)
+		// over v16 (XrDisplayDesktopPositionDXR). A v18 runtime answered iff its rect
+		// offset came back off-sentinel; use its origin AND its isPanelConfirmed. A v16
+		// runtime left ddi untouched but filled ddp -- use that and leave
+		// panel_confirmed at -1 (unknown), which the move function reads as "v16 rules:
+		// gate on origin-valid alone". A pre-v16 runtime filled neither.
+		bool v18 = (ddi.desktopRect.offset.x != INT32_MIN &&
+		            ddi.desktopRect.offset.y != INT32_MIN);
+		bool v16 = (ddp.left != INT32_MIN && ddp.top != INT32_MIN);
+		if (v18) {
+			s_ps.desktop_origin_x = ddi.desktopRect.offset.x;
+			s_ps.desktop_origin_y = ddi.desktopRect.offset.y;
+			s_ps.desktop_origin_valid = 1;
+			s_ps.panel_confirmed = (ddi.isPanelConfirmed == XR_TRUE) ? 1 : 0;
+			ps_log("[DisplayXR-PROV] Display desktop rect: (%d,%d %dx%d) confirmed=%d "
+			       "primary=%d dev='%.*s' [v18]\n",
+			       ddi.desktopRect.offset.x, ddi.desktopRect.offset.y,
+			       ddi.desktopRect.extent.width, ddi.desktopRect.extent.height,
+			       (int)ddi.isPanelConfirmed, (int)ddi.isPrimary,
+			       (int)sizeof(ddi.deviceName), ddi.deviceName);
+		} else if (v16) {
 			s_ps.desktop_origin_x = ddp.left;
 			s_ps.desktop_origin_y = ddp.top;
 			s_ps.desktop_origin_valid = 1;
-			ps_log("[DisplayXR-PROV] Display desktop origin: (%d,%d) [v16]\n", ddp.left, ddp.top);
+			s_ps.panel_confirmed = -1;   // v16 runtime: confirmation not available
+			ps_log("[DisplayXR-PROV] Display desktop origin: (%d,%d) [v16; no v18 "
+			       "confirmation]\n", ddp.left, ddp.top);
 		} else {
 			s_ps.desktop_origin_valid = 0;
+			s_ps.panel_confirmed = -1;
 			ps_log("[DisplayXR-PROV] Display desktop origin: NOT REPORTED - runtime predates "
 			       "v16; placing the window on the 3D display is unavailable (#266)\n");
 		}
@@ -6443,6 +6487,17 @@ int dxr_prov_move_window_to_display(void)
 #if defined(_WIN32)
 	if (!s_ps.desktop_origin_valid) {
 		ps_log("[DisplayXR-PROV] move_window_to_display: no desktop origin (runtime < v16)\n");
+		return 0;
+	}
+	// (#266 / v18) When the runtime advertises v18 it also tells us whether it genuinely
+	// located the panel. panel_confirmed == 0 means the origin is a fallback-to-primary
+	// rect (sim_display, or a platform whose panel plumbing is still open, runtime#715)
+	// -- a valid monitor rect, but NOT a 3D panel, so we must not drag the window onto
+	// it. panel_confirmed == -1 means a v16 runtime that cannot answer the question, so
+	// we keep the original v16 behaviour and move on origin-valid alone.
+	if (s_ps.panel_confirmed == 0) {
+		ps_log("[DisplayXR-PROV] move_window_to_display: runtime did not confirm a 3D panel "
+		       "(fallback-to-primary rect) - leaving the window where it is (#266 v18)\n");
 		return 0;
 	}
 	HWND hwnd = (HWND)displayxr_find_unity_hwnd();
