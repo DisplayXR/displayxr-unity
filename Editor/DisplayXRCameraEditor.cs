@@ -13,6 +13,7 @@ namespace DisplayXR.Editor
         private SerializedProperty m_IpdFactor;
         private SerializedProperty m_ParallaxFactor;
         private SerializedProperty m_InvConvergenceDistance;
+        private SerializedProperty m_AuthoredFov;
         private SerializedProperty m_PostProcessAntiAliasing;
         private SerializedProperty m_LogEyeTracking;
 
@@ -22,6 +23,7 @@ namespace DisplayXR.Editor
             m_IpdFactor = serializedObject.FindProperty("ipdFactor");
             m_ParallaxFactor = serializedObject.FindProperty("parallaxFactor");
             m_InvConvergenceDistance = serializedObject.FindProperty("invConvergenceDistance");
+            m_AuthoredFov = serializedObject.FindProperty("m_AuthoredFov");
             m_PostProcessAntiAliasing = serializedObject.FindProperty("postProcessAntiAliasing");
             m_LogEyeTracking = serializedObject.FindProperty("logEyeTracking");
         }
@@ -66,6 +68,24 @@ namespace DisplayXR.Editor
                 EditorGUILayout.LabelField(" ", "(\u221E)");
             }
             EditorGUI.indentLevel--;
+
+            EditorGUILayout.Space();
+            EditorGUILayout.LabelField("Field of View", EditorStyles.boldLabel);
+            using (new EditorGUI.DisabledScope(true))
+            {
+                float f = m_AuthoredFov.floatValue;
+                EditorGUILayout.FloatField(
+                    new GUIContent("Authored FOV (serialized)",
+                        "The FOV this rig projects with, captured from the Camera in edit mode " +
+                        "and serialized so it survives scene loads during a live session (#274). " +
+                        "Edit the Camera's Field of View to change it. 0 = not captured yet — " +
+                        "save the scene once."),
+                    f);
+            }
+            if (m_AuthoredFov.floatValue < 1.0f)
+                EditorGUILayout.HelpBox("Authored FOV not captured yet. Save the scene once so the rig " +
+                    "seeds from a serialized value instead of the XR-overwritten Camera FOV (#274).",
+                    MessageType.Info);
 
             EditorGUILayout.Space();
             EditorGUILayout.LabelField("Rendering", EditorStyles.boldLabel);
