@@ -86,6 +86,7 @@ static int   s_overlay_active = 0;
 // s_overlay_active because every existing un-cloak is gated on THAT flag, and an
 // early cloak that never got reverted would leave the app permanently invisible.
 static int   s_unity_early_cloaked = 0;
+static unsigned long long dxr_since_process_start_ms(void); // ms since process creation (defined with the backstop)
 
 // (startup curtain) The overlay is BORN CLOAKED and stays invisible until the app
 // is pacing steadily, so a user never sees the warm-up. Measured on the 3DLuma
@@ -1351,11 +1352,11 @@ displayxr_get_app_main_view(void)
 	// the desktop going jerky is not.
 	curtain_lower();
 
-	displayxr_log("[DisplayXR] Created overlay HWND (%dx%d at %d,%d) on Unity window %p — %s\n",
+	displayxr_log("[DisplayXR] Created overlay HWND (%dx%d at %d,%d) on Unity window %p — %s (t+%llu ms)\n",
 	              w, h, x, y, (void *)unity_hwnd,
 	              transparent_mode ? "TOP-LEVEL WS_POPUP + NOREDIRECTIONBITMAP (transparent)"
 	              : provider_opaque ? "TOP-LEVEL WS_POPUP + NOREDIRECTIONBITMAP (provider opaque)"
-	              : "WS_CHILD (opaque)");
+	              : "WS_CHILD (opaque)", dxr_since_process_start_ms());
 
 	displayxr_set_viewport_size_native(
 		(uint32_t)w, (uint32_t)h,

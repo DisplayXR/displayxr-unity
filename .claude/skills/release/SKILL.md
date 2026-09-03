@@ -67,7 +67,8 @@ Execute the DisplayXR Unity plugin release workflow for version [VERSION].
 > with the panel:**
 > ```
 > # build a transparent sample (desktop-avatar) against the release commit, then:
-> tools~/visibility_check.ps1 -Exe <player.exe> -NoRuntime -GuardLog <player>_Data/../displayxr.log
+> tools~/visibility_check.ps1 -Exe <player.exe> -NoRuntime -GuardLog "%USERPROFILE%\AppData\LocalLow\<Company>\<Product>\Player.log"
+> # (the #295 guard is a C# Debug.LogWarning -> Player.log, NOT displayxr.log; the tool pins DPI awareness itself)
 > ```
 > PASS requires a window that is visible AND not cloaked AND >200x200 AND on-screen, AND
 > (with `-GuardLog`) that the plugin's own `#295` guard line fired — the 6th conjunct: an
