@@ -5,6 +5,21 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.17.0] - 2026-09-03
+
+Every fix here was reproduced and verified on real hardware (a Leia panel, mixed-DPI rig, and the desktop-avatar / birp-multipass samples), not on a maintainer's machine. Two are follow-through on the transparent-app invisibility regression that v2.16.2 first guarded.
+
+### Fixed
+- **A transparent app can no longer be left invisible when a session never fully comes up** (#296, completing #295). v2.16.2 added a guard that skips the pre-cloak when no runtime is *provably* resolvable; this adds the durable cure for the cases the guard can't see (a runtime that resolves but whose session then fails). The pre-cloak's revert now **un-cloaks AND un-parks** Unity's window — the old revert un-cloaked only, leaving it parked off-screen and still invisible — and a 20 s timeout backstop reverts if no overlay ever materialises, the #256 design applied to the pre-cloak's earlier call site. The backstop abstains while a live overlay exists, so a healthy transparent session (where Unity's window stays cloaked on purpose) is untouched. Hardware-verified: session-fails reverts in ~422 ms, a healthy session's timer abstains, and the no-runtime guard path is unaffected.
+- **The camera-centric rig keeps its authored field of view across scene loads** (#274). `DisplayXRCamera` cached the authored FOV by reading `Camera.fieldOfView` in `OnEnable`, but on a scene loaded while a session is live, Unity's XR has already stamped the tracking-derived FOV onto the camera — so the cache seeded from a polluted value and the FOV walked every visit (a `Screen Space - Camera` canvas then rendered progressively wrong). The authored value is now serialized on the component and seeded from there. Scenes authored before this fix capture it on the next editor save; the rig logs once if it has to fall back. Hardware-verified: authored FOV held constant across six scene reloads while the raw camera FOV walked.
+
+### Changed
+- **`DisplayXRWindowSpaceUI` renders at the live panel aspect by default** (#291, `matchPanelAspect`). The overlay RT is created at the panel's own aspect (authored height, derived width) so the runtime's stretch into the panel rect is the identity — circles stay round on every compositor path, including the editor weave window / Game view pane where the old pre-distortion did not cancel. The RT (and its overlay swapchain + cross-device bridge) is re-created, debounced, when the window aspect changes; input routers map into the new `OverlayResolution`. The router also disables an `InputSystemUIInputModule` that would act as a mirrored second pointer. Turn `matchPanelAspect` off to restore the previous fixed-size-RT + camera pre-distortion. Contributed by Byungju Lee.
+- **The Local2D overlay can render only when its content changes** (#244, `renderOnlyWhenContentChanges`, opt-in). Registers Unity's Graphic dirty callbacks on the canvas so a static speech bubble / HUD renders zero times per frame instead of every frame; runtime-spawned children are re-tracked so they are not silently left stale. Hardware-verified: static content 0 renders/sec, a text change triggers exactly one. Off by default.
+
+### Added
+- **A pre-release visibility check** (`tools~/visibility_check.ps1`) and a required hardware step in the release process (#295). Asserts a transparent app on a no-runtime machine is visible, not cloaked, on-screen and >200×200 — and that the plugin's own guard produced it — because the invisibility regression passed CI and a 3D-path panel check both times it shipped.
+
 ## [2.16.2] - 2026-09-03
 
 **Fixes a shipped regression: a transparent app was permanently invisible on any machine with no DisplayXR runtime.** Customer-reported (Lenovo). Present since v2.15.0.
