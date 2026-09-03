@@ -286,6 +286,25 @@ namespace DisplayXR
         public static void RequestTransparentSession()
         {
 #if UNITY_STANDALONE_WIN || UNITY_STANDALONE_OSX
+            // (#295) Do NOT request a transparent session on a machine with no resolvable
+            // OpenXR runtime. The request pre-cloaks Unity's window and parks it off-screen
+            // at the earliest native touchpoint (#277), and every revert of that state is
+            // gated on a session/overlay that a no-runtime machine never produces — so the
+            // app is left PERMANENTLY INVISIBLE (only a faint taskbar thumbnail). Skip the
+            // whole request when we can prove no runtime is resolvable, so the app falls back
+            // to an ordinary visible window instead. Gated on ProbeSupported so a platform
+            // with no managed probe (where IsInstalled is always false) does not wrongly
+            // skip. Cannot detect a present-but-non-DisplayXR runtime here — that path is
+            // covered by the native revert in #296.
+            if (DisplayXRRuntime.ProbeSupported && !DisplayXRRuntime.IsInstalled)
+            {
+                Debug.LogWarning("[DisplayXR] RequestTransparentSession: no OpenXR runtime resolvable " +
+                    "(XR_RUNTIME_JSON / active-runtime record) — skipping the transparent-session request " +
+                    "so the app is not left invisible. Install a DisplayXR runtime or set XR_RUNTIME_JSON " +
+                    "to enable the transparent overlay (#295).");
+                return;
+            }
+
             // Set the shared-state flag the native win32/macOS overlay reads
             // (get_app_main_view → transparent_mode) so it builds the transparent
             // overlay and keeps it on-screen while Unity's real HWND is cloaked/

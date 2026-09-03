@@ -79,7 +79,10 @@ if (fire && mode != DisplayXRProvider.ActiveModeIndex)
 Behavioral notes worth knowing:
 
 - **`Apply()` is safe before the session exists.** The request is held and applied on the
-  first frame the provider reports a live session.
+  first frame the provider reports a live session. (A bare `DisplayXRProvider.RequestDisplayMode`
+  at that point returns false and is dropped — if you drive the provider directly instead of
+  through this component, use `DisplayXRProvider.WhenRunning` or subscribe to
+  `DisplayXRProvider.SessionStarted`.)
 - **It survives a subsystem restart.** The editor's dock/undock auto-switch stops and
   restarts the session mid-Play; a once-only push into a dead session succeeds *silently*,
   so the request is re-armed rather than dropped.
@@ -139,6 +142,16 @@ rig.AuthoredFieldOfView = 75f;         // change it at runtime
 Assigning `Camera.fieldOfView` while a session is running does **not** work — XR overwrites
 it each frame, and the rig projects from its own cache regardless. The setter above is the
 supported way to change FOV at runtime.
+
+**The authored FOV is serialized, so it survives a scene load (#274).** The rig captures it
+from the Camera in edit mode only and stores it on the component, so a scene loaded while a
+session is *already live* seeds from that stored value rather than from a
+`Camera.fieldOfView` that XR has already stamped with a tracking-derived number. Without
+this the cache seeded polluted, that value fed the next projection, and the FOV walked
+roughly 2× per scene visit — the scene rendered smaller on every home → viewer round trip.
+Scenes saved before this fix carry no captured value; open each one in the editor and save
+it once, and the rig logs a one-shot warning whenever it has to fall back. Reflecting into
+the private `m_CachedCameraFov` to work around the walk is no longer necessary.
 
 A camera with **no rig** has no such record: nothing captured its authored FOV before XR
 started, so the original is gone. Snapshot it yourself before the session comes up if you

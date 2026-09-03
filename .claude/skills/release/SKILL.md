@@ -59,6 +59,22 @@ Execute the DisplayXR Unity plugin release workflow for version [VERSION].
 
 ---
 
+> ### Pre-release visibility check (transparent apps) — HARDWARE, do before tagging
+> A transparent app was shipped **permanently invisible** on any no-runtime machine in
+> v2.15.0–v2.16.1 (#295), and it passed CI + a 3D-path panel check both times, because a
+> cloaked, off-screen window still runs, presents and pumps. **Before tagging a release
+> that touches the transparent/overlay/pre-cloak path, run the visibility check on the box
+> with the panel:**
+> ```
+> # build a transparent sample (desktop-avatar) against the release commit, then:
+> tools~/visibility_check.ps1 -Exe <player.exe> -NoRuntime -GuardLog <player>_Data/../displayxr.log
+> ```
+> PASS requires a window that is visible AND not cloaked AND >200x200 AND on-screen, AND
+> (with `-GuardLog`) that the plugin's own `#295` guard line fired — the 6th conjunct: an
+> app may carry its own `IsInstalled` guard for this bug and pass the arm while the plugin
+> guard never ran. This is a HARDWARE step (needs the box); it is not part of the CI build.
+> Skipping it is how this class shipped twice.
+
 ## PHASE 1: PRE-FLIGHT CHECKS
 
 ### Step 1.1: Verify clean state

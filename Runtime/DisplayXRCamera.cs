@@ -75,6 +75,13 @@ namespace DisplayXR
         public bool logEyeTracking;
 
         private float m_CachedCameraFov;
+        // (#274) The authored FOV, SERIALIZED so it survives a scene load during a live
+        // session. Written ONLY outside Play (OnValidate / Reset / the edit-mode sync in
+        // LateUpdate), so it can never be polluted by the XR-stamped Camera.fieldOfView.
+        // 0 = never captured (component authored before #274 and scene not re-saved since).
+        [SerializeField, HideInInspector] private float m_AuthoredFov = 0f;
+        // (#274) One-shot: warned that a rig had to fall back to the XR-written camera FOV.
+        private static bool s_WarnedUnseededFov;
         private Camera m_Camera;
         private DisplayXRPostAA m_PostAA;
         // True when running under URP/HDRP. BiRP fires Camera.onPreRender; SRP doesn't,
@@ -95,10 +102,27 @@ namespace DisplayXR
 #if UNITY_EDITOR
         void OnValidate()
         {
+            CaptureAuthoredFovFromCamera();
             if (GetComponent<DisplayXRDisplay>() != null)
                 Debug.LogError("[DisplayXR] DisplayXRCamera and DisplayXRDisplay cannot coexist on the same GameObject. Remove one.", this);
         }
+
+        void Reset()
+        {
+            CaptureAuthoredFovFromCamera();
+        }
 #endif
+
+        // (#274) Capture the Camera's FOV into the serialized authored value. EDIT MODE
+        // ONLY — in Play, Camera.fieldOfView is XR-written and must never be captured.
+        private void CaptureAuthoredFovFromCamera()
+        {
+            if (Application.isPlaying) return;
+            var c = m_Camera != null ? m_Camera : GetComponent<Camera>();
+            if (c == null) return;
+            float f = c.fieldOfView;
+            if (f >= 1.0f && f < 179.0f) m_AuthoredFov = f;
+        }
 
         void OnEnable()
         {
@@ -106,10 +130,37 @@ namespace DisplayXR
             // Cache the camera's FOV BEFORE XR overrides it. Once XR is active,
             // Camera.fieldOfView returns the Kooima FOV we set, creating a
             // feedback loop that collapses the FOV to zero.
-            m_CachedCameraFov = m_Camera.fieldOfView;
-            // Guard against XR having already overridden the FOV to near-zero
-            if (m_CachedCameraFov < 1.0f)
-                m_CachedCameraFov = 60.0f;
+            // (#274) Seed from the SERIALIZED authored value, not from the Camera. On a
+            // scene loaded while a session is live, Unity's XR has already stamped the
+            // tracking-derived FOV onto Camera.fieldOfView before OnEnable runs, so
+            // reading the camera here seeds the cache with a polluted value that then
+            // feeds the next projection — the FOV walks ~2x per scene visit (measured:
+            // 12.5 -> 24.3 -> ... -> 116.8 against an authored 35). The serialized value
+            // is only ever written outside Play, so it cannot be polluted.
+            if (m_AuthoredFov >= 1.0f && m_AuthoredFov < 179.0f)
+            {
+                m_CachedCameraFov = m_AuthoredFov;
+            }
+            else
+            {
+                // Never captured: component authored before #274 and the scene not
+                // re-saved since. Fall back to the Camera — correct on a first load,
+                // WRONG on a live-session scene reload (the pre-#274 behaviour). Say so
+                // once, because from here the symptom is "scene shrinks every visit"
+                // with nothing pointing at the cause.
+                m_CachedCameraFov = m_Camera.fieldOfView;
+                if (m_CachedCameraFov < 1.0f)
+                    m_CachedCameraFov = 60.0f;
+                if (DisplayXRProvider.IsRunning && !s_WarnedUnseededFov)
+                {
+                    s_WarnedUnseededFov = true;
+                    Debug.LogWarning("[DisplayXR] DisplayXRCamera on '" + name + "' has no serialized " +
+                        "authored FOV and was enabled while a session is already running, so its FOV " +
+                        "was read from a Camera that XR has already overwritten (#274). Open the scene " +
+                        "in the editor and save it once to capture the authored value; or set " +
+                        "DisplayXRCamera.AuthoredFieldOfView explicitly on scene entry.", this);
+                }
+            }
             m_UsingSRP = GraphicsSettings.currentRenderPipeline != null;
             if (m_UsingSRP)
                 RenderPipelineManager.beginCameraRendering += OnSRPBeginCamera;
@@ -215,7 +266,10 @@ namespace DisplayXR
             {
                 float currentFov = m_Camera.fieldOfView;
                 if (currentFov >= 1.0f)
+                {
                     m_CachedCameraFov = currentFov;
+                    if (currentFov < 179.0f) m_AuthoredFov = currentFov;   // (#274)
+                }
             }
         }
 
@@ -232,6 +286,14 @@ namespace DisplayXR
         /// what you set nor stable: a <c>Screen Space - Camera</c> canvas sizes itself from
         /// it and so renders too large and rescales as the viewer moves, and gameplay or
         /// cinematic code doing FOV maths silently drifts.
+        /// </para>
+        ///
+        /// <para>
+        /// <b>It survives scene loads (#274).</b> The value is serialized on the component
+        /// and captured only in edit mode, so a scene loaded while a session is already
+        /// running seeds from it rather than from the XR-overwritten <c>Camera.fieldOfView</c>.
+        /// Scenes authored before this fix have no captured value until they are opened and
+        /// saved once in the editor; the rig logs a one-shot warning when it has to fall back.
         /// </para>
         ///
         /// <para>
@@ -270,6 +332,10 @@ namespace DisplayXR
                 {
                     var c = m_Camera != null ? m_Camera : GetComponent<Camera>();
                     if (c != null) c.fieldOfView = value;
+                    // (#274) Keep the serialized authored value in step. Edit mode only:
+                    // a runtime FOV change is instance state and must not masquerade as
+                    // the authored value.
+                    m_AuthoredFov = value;
                 }
             }
         }

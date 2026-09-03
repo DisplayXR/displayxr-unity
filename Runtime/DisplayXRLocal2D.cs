@@ -1,9 +1,11 @@
 // Copyright 2024-2026, DisplayXR contributors
 // SPDX-License-Identifier: Apache-2.0
 
+using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.Experimental.Rendering;
 using UnityEngine.Rendering;
+using UnityEngine.UI;
 
 namespace DisplayXR
 {
@@ -72,12 +74,67 @@ namespace DisplayXR
             m_ForceRender = true;
         }
 
+        // #244 — the content-change dirty signal, wired to every Graphic's dirty
+        // callbacks below. Kept a plain instance method (not a lambda) so the matching
+        // Unregister* calls remove exactly what Register* added.
+        private void MarkContentDirty()
+        {
+            m_ForceRender = true;
+        }
+
+        // Register MarkContentDirty on every Graphic under the canvas (vertices,
+        // material and layout). Unregisters the previous set first, so this doubles as
+        // the re-scan when the hierarchy changed. includeInactive: an inactive graphic
+        // can be enabled later and must already be tracked when it is.
+        private void RegisterContentDirtyTracking()
+        {
+            UnregisterContentDirtyTracking();
+            GetComponentsInChildren(true, m_TrackedGraphics);
+            for (int i = 0; i < m_TrackedGraphics.Count; i++)
+            {
+                var g = m_TrackedGraphics[i];
+                if (g == null) continue;
+                g.RegisterDirtyVerticesCallback(MarkContentDirty);
+                g.RegisterDirtyMaterialCallback(MarkContentDirty);
+                g.RegisterDirtyLayoutCallback(MarkContentDirty);
+            }
+            m_ContentGateActive = true;
+        }
+
+        private void UnregisterContentDirtyTracking()
+        {
+            for (int i = 0; i < m_TrackedGraphics.Count; i++)
+            {
+                var g = m_TrackedGraphics[i];
+                if (g == null) continue;
+                g.UnregisterDirtyVerticesCallback(MarkContentDirty);
+                g.UnregisterDirtyMaterialCallback(MarkContentDirty);
+                g.UnregisterDirtyLayoutCallback(MarkContentDirty);
+            }
+            m_TrackedGraphics.Clear();
+            m_ContentGateActive = false;
+        }
+
         // #244 refresh throttle. m_ForceRender covers the first frame, explicit
         // SetDirty() calls, and geometry changes; m_BridgeDirty makes the provider
         // bridge copy follow the camera instead of running unconditionally.
         private float m_LastRenderTime = float.NegativeInfinity;
         private bool m_ForceRender = true;
         private bool m_BridgeDirty = true;
+
+        // #244 content-change gate (renderOnlyWhenContentChanges). We register Unity's
+        // public Graphic dirty callbacks on every Graphic under the canvas; each fires
+        // MarkDirty, so a text/sprite/layout change re-renders exactly one frame. New
+        // graphics spawned at runtime (a dialog, a list item) are caught by counting the
+        // Graphics in our subtree each frame (a no-alloc traversal, cheap next to the
+        // canvas render it gates) and re-registering when the count changes. A MISSED
+        // graphic would show stale content, so the check fails safe toward rendering.
+        // m_ContentGateActive tracks the mode so a runtime toggle registers/unregisters
+        // cleanly. Edge: swapping one graphic for another in one frame keeps the count
+        // equal and is not detected — call SetDirty() if you do that.
+        private readonly List<Graphic> m_TrackedGraphics = new List<Graphic>();
+        private readonly List<Graphic> m_ScanScratch = new List<Graphic>();
+        private bool m_ContentGateActive;
 
         public void SetExplicitRect(int x, int y, int w, int h)
         {
@@ -98,6 +155,19 @@ namespace DisplayXR
                  "1/N s, and SetDirty() forces an immediate refresh. 0 = every frame " +
                  "(default; unchanged behaviour). See displayxr-unity#244.")]
         public float maxRefreshHz = 0f;
+
+        [Tooltip("Render the overlay ONLY when the canvas content actually changes, " +
+                 "instead of every frame or on a fixed timer (#244). Discrete UI — text, " +
+                 "sprites, layout — dirties automatically via Unity's Graphic dirty " +
+                 "callbacks (registered on every Graphic under the canvas, re-scanned when " +
+                 "children are added or removed, so runtime-spawned dialogs are covered). " +
+                 "SetDirty() and a rect move also force a refresh. LIMITATION: a texture " +
+                 "whose PIXELS change without a Unity dirty signal — a VideoPlayer target, " +
+                 "a RenderTexture, an animated custom shader — will NOT auto-refresh; use " +
+                 "maxRefreshHz or EveryFrame (leave this off) for those, or call SetDirty() " +
+                 "each frame. When on, maxRefreshHz is ignored. Default off pending " +
+                 "hardware validation.")]
+        public bool renderOnlyWhenContentChanges = false;
 
         /// <summary>The RenderTexture capturing the Canvas content.</summary>
         public RenderTexture OverlayTexture { get; private set; }
@@ -334,6 +404,7 @@ namespace DisplayXR
 
         void OnDisable()
         {
+            UnregisterContentDirtyTracking();   // #244 — drop Graphic dirty callbacks
             ReleaseBridgeTex();
 
             if (m_CamRenderHooked)
@@ -410,20 +481,57 @@ namespace DisplayXR
             // ordering that OnEnable documents is untouched); we only choose
             // WHICH frames it runs on. Setting this in LateUpdate takes effect
             // for the render that follows later this same frame.
-            if (maxRefreshHz > 0f)
+            if (renderOnlyWhenContentChanges)
             {
-                float period = 1f / maxRefreshHz;
-                bool due = m_ForceRender || (Time.unscaledTime - m_LastRenderTime) >= period;
-                m_OverlayCamera.enabled = due;
-                if (due)
+                // Register dirty callbacks the first time the mode is seen (also after
+                // a runtime toggle from throttle/every-frame), and re-scan whenever the
+                // subtree's Graphic count changed so runtime-spawned graphics get tracked.
+                if (!m_ContentGateActive)
+                {
+                    RegisterContentDirtyTracking();
+                    m_ForceRender = true; // first frame under the mode
+                }
+                else
+                {
+                    GetComponentsInChildren(true, m_ScanScratch);
+                    if (m_ScanScratch.Count != m_TrackedGraphics.Count)
+                    {
+                        RegisterContentDirtyTracking(); // re-scan: children added/removed
+                        m_ForceRender = true;
+                    }
+                }
+
+                // Pure content gate: render exactly the frames marked dirty. A texture
+                // whose pixels change with no Unity dirty signal (video, custom shader)
+                // is the documented limitation — use a throttle or every-frame instead.
+                m_OverlayCamera.enabled = m_ForceRender;
+                if (m_ForceRender)
                 {
                     m_LastRenderTime = Time.unscaledTime;
                     m_ForceRender = false;
                 }
             }
-            else if (!m_OverlayCamera.enabled)
+            else
             {
-                m_OverlayCamera.enabled = true; // throttle turned off at runtime
+                // Left the content-gate mode (or never entered it): drop the callbacks.
+                if (m_ContentGateActive)
+                    UnregisterContentDirtyTracking();
+
+                if (maxRefreshHz > 0f)
+                {
+                    float period = 1f / maxRefreshHz;
+                    bool due = m_ForceRender || (Time.unscaledTime - m_LastRenderTime) >= period;
+                    m_OverlayCamera.enabled = due;
+                    if (due)
+                    {
+                        m_LastRenderTime = Time.unscaledTime;
+                        m_ForceRender = false;
+                    }
+                }
+                else if (!m_OverlayCamera.enabled)
+                {
+                    m_OverlayCamera.enabled = true; // throttle turned off at runtime
+                }
             }
 
             // Provider mode: mirror the overlay RT into the provider's cross-device

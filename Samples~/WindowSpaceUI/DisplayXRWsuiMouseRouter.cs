@@ -87,6 +87,23 @@ namespace DisplayXR.Samples
                               "EventSystem to silence Input-System exceptions.");
                     if (Application.isPlaying) Destroy(legacy); else DestroyImmediate(legacy);
                 }
+                // The Input System's own UI module is a SECOND pointer on this canvas: it
+                // raycasts through canvas.worldCamera — the wsui overlay camera, whose
+                // up-vector is flipped — with raw screen coordinates, so its hit lands
+                // MIRRORED about the panel's midline. Symptom: hovering one row highlights
+                // two, clicks land intermittently. It went unnoticed while the RT aspect
+                // differed from the window's (the mirrored hit fell off-target); with the RT
+                // at the live panel aspect it lands on real controls. This router is the only
+                // pointer path a wsui canvas needs, so the module is disabled (not destroyed:
+                // an app may still want it for non-wsui UI elsewhere and can re-enable it).
+                var uiModule = m_EventSystem.GetComponent<UnityEngine.InputSystem.UI.InputSystemUIInputModule>();
+                if (uiModule != null && uiModule.enabled)
+                {
+                    Debug.Log("[wsui-router] Disabling InputSystemUIInputModule on the existing " +
+                              "EventSystem — it would raycast the wsui canvas through the Y-flipped " +
+                              "overlay camera and produce a mirrored second pointer.");
+                    uiModule.enabled = false;
+                }
             }
             m_PointerData = new PointerEventData(m_EventSystem);
         }
@@ -138,8 +155,12 @@ namespace DisplayXR.Samples
             float panelFracY = (windowFrac.y - m_Wsui.positionY) / m_Wsui.height;
             // No extra flip here: OverlayCamera's flipped up-vector already inverts
             // ScreenPointToRay's Y, so fracY 0 (top of the layer) maps to screenY 0.
-            var canvasPos = new Vector2(panelFracX * m_Wsui.resolution.x,
-                                        panelFracY * m_Wsui.resolution.y);
+            // Map into the RT's ACTUAL size, not the authored `resolution`: with
+            // matchPanelAspect (default) the width is derived from the live panel aspect,
+            // and the canvas is sized 1 UI unit per RT pixel of that.
+            var rtSize = m_Wsui.OverlayResolution;
+            var canvasPos = new Vector2(panelFracX * rtSize.x,
+                                        panelFracY * rtSize.y);
 
             // ---- 4. Raycast every raycaster under the wsui canvas ---------------
             m_PointerData.Reset();
