@@ -106,8 +106,12 @@ path never runs on a BiRP project.
    `DISPLAYXR_SPI_EXPERIMENTAL`.
 3. Project Settings → XR Plug-in Management → OpenXR → **Render Mode = Single Pass
    Instanced**.
-4. Confirm `KooimaProjectionFixFeature` is on the URP renderer (it auto-wires; or
-   `DisplayXR > Setup URP Projection Fix`).
+4. ~~Confirm `KooimaProjectionFixFeature` is on the URP renderer (it auto-wires; or
+   `DisplayXR > Setup URP Projection Fix`).~~ **No longer applicable.** This step, and
+   every mention of that feature below, describes the code as it stood in June 2026.
+   The feature and both of its menu items were removed in **v2.2.0**: the provider now
+   hands Unity a full per-eye projection matrix, so URP consumes the off-center frustum
+   natively. Skip this step; there is nothing to wire.
 5. Build & run on the SR display (D3D12).
 
 ### Reading the result
