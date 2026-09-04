@@ -5,6 +5,15 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.18.4] - 2026-09-04
+
+### Added
+- **"Create Scene Content" button on the Basic Scene and URP Basic Scene samples** (#314). "Scene Setup" set up the Play session, not the scene: content was built in `Start()` and discarded on Stop, so nobody could move a cube or use the layout as a base. The inspector button authors the same cubes, floor and light as real scene objects (selectable, editable, saveable, one undo step), writes a material *asset* per colour into a `Materials/` folder beside the scene (an in-memory material would come back magenta on reload), then removes the setup component. Nothing authored is committed, so the shipped scenes stay pipeline-agnostic; Play without the button behaves exactly as before. Contributed by Byungju Lee.
+
+### Fixed
+- **Both basic-scene samples converged at infinity** (#314). `invConvergenceDistance` shipped as `0` — parallel projection — so cubes at 0.3/0.5/1.0 m all read as pure pop-out despite the script's own "at screen plane" / "behind screen" comments. Now `2` (plane at 0.5 m, the mid cube) in the shipped scenes and in both the button and runtime paths, applied only when the value is still 0 so a tuned scene keeps its value. Contributed by Byungju Lee.
+- **Four sample scripts had no committed `.meta`** (#313) — `DisplayScene`, `FaceViewer`, `MinimalTransparent`, `TransparentAvatar` regenerated their GUIDs on every import, the same defect that kept the URP sample from having a scene (#308). Pre-emptive; nothing referenced them yet. Contributed by Byungju Lee.
+
 ## [2.18.3] - 2026-09-04
 
 ### Fixed

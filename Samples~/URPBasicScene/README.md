@@ -42,6 +42,12 @@ fall back to mono.
 To try the display-centric rig instead, swap `DisplayXRCamera` on the Main Camera
 for `DisplayXRDisplay`.
 
+To turn the runtime-built content into real, editable scene objects, select the
+**Scene Setup** object and press **Create Scene Content** in the inspector: it authors
+the cubes, floor and light into the scene (material assets are written to a `Materials/`
+folder next to the scene), then removes the setup component. Press Play without it and
+the content is still built at runtime as before.
+
 ## Transparent overlays on URP
 
 Two extra steps for transparent-overlay apps (not needed for this opaque sample):

@@ -12,6 +12,12 @@ Minimal camera-centric stereo setup for testing the DisplayXR plugin.
 > falling back to Built-in `Standard`). That means the scene looks empty in the Scene
 > view and fills in the moment you enter Play Mode — that is expected.
 
+To turn the runtime-built content into real, editable scene objects, select the
+**Scene Setup** object and press **Create Scene Content** in the inspector: it authors
+the cubes, floor and light into the scene (material assets are written to a `Materials/`
+folder next to the scene), then removes the setup component. Press Play without it and
+the content is still built at runtime as before.
+
 ## Quick Start
 
 1. Import this sample via Package Manager > DisplayXR > Samples > Basic Scene
