@@ -9,6 +9,13 @@ namespace DisplayXR.Samples
     /// Creates a minimal stereo test scene with colored cubes at varying depths.
     /// Attach to any GameObject, or use the included BasicScene.unity scene file
     /// (where it sits on the "Scene Setup" object next to the Main Camera).
+    ///
+    /// Two ways to get the content. Press Play and it is built at runtime, then
+    /// discarded on Stop — the behaviour this sample has always had. Or press
+    /// <b>Create Scene Content</b> in the inspector, which authors the same objects
+    /// into the scene for real (selectable, editable, saveable, undoable) and removes
+    /// this component. Use the button if you want to move a cube, retint the floor,
+    /// or build your own scene on top of the layout.
     /// </summary>
     public class BasicSceneSetup : MonoBehaviour
     {
@@ -34,6 +41,14 @@ namespace DisplayXR.Samples
                 cam.transform.position = Vector3.zero;
                 cam.transform.rotation = Quaternion.identity;
             }
+
+            // Put the convergence plane on the mid cube (0.5 m) so the content
+            // straddles the display: near cube in front of the glass, far cube behind
+            // it. Left at its default of 0 the rig converges at infinity (parallel
+            // projection) and everything here reads as pure pop-out.
+            var rig = cam != null ? cam.GetComponent<DisplayXRCamera>() : null;
+            if (rig != null && rig.invConvergenceDistance == 0f)
+                rig.invConvergenceDistance = 1f / 0.5f;
 
             // Near cube (red) — pops out of screen
             CreateCube("NearCube", new Vector3(-0.3f, 0f, 0.3f), 0.15f, Color.red);

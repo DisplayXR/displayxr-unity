@@ -10,6 +10,11 @@ namespace DisplayXR.Samples
     /// to BasicScene, but assumes the project is configured with URP — verifies that
     /// DisplayXRCamera/DisplayXRDisplay drive stereo via RenderPipelineManager
     /// .beginCameraRendering rather than Camera.onPreRender (which URP does not fire).
+    ///
+    /// Two ways to get the content. Press Play and it is built at runtime, then
+    /// discarded on Stop. Or press <b>Create Scene Content</b> in the inspector, which
+    /// authors the same objects into the scene for real (selectable, editable,
+    /// saveable, undoable) and removes this component.
     /// </summary>
     public class URPBasicSceneSetup : MonoBehaviour
     {
@@ -40,6 +45,14 @@ namespace DisplayXR.Samples
                 cam.transform.position = Vector3.zero;
                 cam.transform.rotation = Quaternion.identity;
             }
+
+            // Put the convergence plane on the mid cube (0.5 m) so the content
+            // straddles the display: near cube in front of the glass, far cube behind
+            // it. Left at its default of 0 the rig converges at infinity (parallel
+            // projection) and everything here reads as pure pop-out.
+            var rig = cam != null ? cam.GetComponent<DisplayXRCamera>() : null;
+            if (rig != null && rig.invConvergenceDistance == 0f)
+                rig.invConvergenceDistance = 1f / 0.5f;
 
             CreateCube("NearCube", new Vector3(-0.3f, 0f, 0.3f), 0.15f, Color.red);
             CreateCube("MidCube", new Vector3(0f, 0f, 0.5f), 0.2f, Color.green);
