@@ -39,7 +39,7 @@
     },
     {
       "displayName": "URP Basic Scene",
-      "description": "URP smoke test for the stereo rig. Same content as Basic Scene; verifies the SRP camera-callback path. Requires URP installed in the host project.",
+      "description": "URP smoke test for the stereo rig. Same content as Basic Scene; open URPBasicScene.unity and press Play to verify the SRP camera-callback path. Requires URP installed in the host project.",
       "path": "Samples~/URPBasicScene"
     },
     {

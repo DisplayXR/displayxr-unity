@@ -11,8 +11,12 @@ fall back to mono.
 
 ## What's Included
 
-- `URPBasicSceneSetup.cs` — Spawns colored cubes at varying depths using
-  the URP/Lit shader. Attach to any GameObject in a fresh scene.
+- `URPBasicScene.unity` — The scene to open: a Main Camera carrying
+  `DisplayXRCamera`, and a **URP Scene Setup** object carrying the script below.
+- `URPBasicSceneSetup.cs` — Spawns colored cubes at varying depths using the
+  URP/Lit shader. It builds them in `Start()`, so **the content exists in Play
+  mode only** — a scene that looks empty when you stop is expected, not a broken
+  import.
 - `Editor/URPBasicSceneShaderRegistration.cs` — Editor-only. Before any
   standalone build (via `IPreprocessBuildWithReport`) and on demand via
   **Tools > DisplayXR > Register URP/Lit in Always Included Shaders**, adds
@@ -29,13 +33,14 @@ fall back to mono.
    - A URP Render Pipeline Asset assigned in Project Settings > Graphics
      (and Quality > Render Pipeline Asset).
 2. Import this sample via Package Manager > DisplayXR > Samples > URP Basic Scene.
-3. Open a new empty scene; add a Main Camera with `DisplayXRCamera` (or
-   `DisplayXRDisplay`) attached.
-4. Add an empty GameObject and attach `URPBasicSceneSetup`.
-5. Set `XR_RUNTIME_JSON` (with no 3D panel, sim_display is the automatic fallback; `SIM_DISPLAY_OUTPUT=sbs` optionally picks the sim output format).
-6. Enter Play Mode — left/right eye matrices should differ (visible parallax
+3. Open `Assets/Samples/DisplayXR/<version>/URP Basic Scene/URPBasicScene.unity`.
+4. Set `XR_RUNTIME_JSON` (with no 3D panel, sim_display is the automatic fallback; `SIM_DISPLAY_OUTPUT=sbs` optionally picks the sim output format).
+5. Enter Play Mode — left/right eye matrices should differ (visible parallax
    on the cubes); toggle `logEyeTracking` on the rig to confirm the per-frame
    stereo callback is firing.
+
+To try the display-centric rig instead, swap `DisplayXRCamera` on the Main Camera
+for `DisplayXRDisplay`.
 
 ## Off-axis projection fix (URP 17 / Unity 6)
 
