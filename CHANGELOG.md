@@ -5,6 +5,12 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.18.3] - 2026-09-04
+
+### Fixed
+- **The URP Basic Scene sample now ships a scene to open** (#308, #310). `Samples~/URPBasicScene/` had no `.unity` file while `package.json` called it "same content as Basic Scene"; following the README instead (empty scene + `URPBasicSceneSetup`) showed cubes in Play and an empty scene on Stop, which reads as a broken import. The root cause was that the sample's scripts had **no committed `.meta` files**, so their GUIDs were regenerated on every import and no committed scene could reference them — the same gap #261 closed for the BiRP sample. `URPBasicScene.unity` is `BasicScene.unity` with one line changed (the setup script's GUID), so camera settings and structure match by construction; both `.meta` files are added; the README's Quick Start opens the scene and says plainly that the content is runtime-built and Play-mode only. Contributed by Byungju Lee.
+- **The URP sample README no longer documents a projection fix that was removed in v2.2.0** (#309, #311). The "Off-axis projection fix" section described `KooimaProjectionFixFeature` and two menu items, none of which exist: the provider hands Unity a full per-eye projection matrix, so URP consumes the off-centre frustum natively and there is nothing to wire (and the feature must not come back — it would double-apply the projection). The section is deleted rather than rewritten, the HDRP paragraph loses its back-reference, and the June 2026 SPI experiment record is annotated. Contributed by Byungju Lee.
+
 ## [2.18.2] - 2026-09-03
 
 ### Fixed
