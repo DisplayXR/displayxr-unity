@@ -9,6 +9,13 @@ namespace DisplayXR.Samples
     /// Creates a minimal stereo test scene with colored cubes at varying depths.
     /// Attach to any GameObject, or use the included BasicScene.unity scene file
     /// (where it sits on the "Scene Setup" object next to the Main Camera).
+    ///
+    /// Two ways to get the content. Press Play and it is built at runtime, then
+    /// discarded on Stop — the behaviour this sample has always had. Or press
+    /// <b>Create Scene Content</b> in the inspector, which authors the same objects
+    /// into the scene for real (selectable, editable, saveable, undoable) and removes
+    /// this component. Use the button if you want to move a cube, retint the floor,
+    /// or build your own scene on top of the layout.
     /// </summary>
     public class BasicSceneSetup : MonoBehaviour
     {

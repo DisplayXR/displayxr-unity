@@ -10,6 +10,11 @@ namespace DisplayXR.Samples
     /// to BasicScene, but assumes the project is configured with URP — verifies that
     /// DisplayXRCamera/DisplayXRDisplay drive stereo via RenderPipelineManager
     /// .beginCameraRendering rather than Camera.onPreRender (which URP does not fire).
+    ///
+    /// Two ways to get the content. Press Play and it is built at runtime, then
+    /// discarded on Stop. Or press <b>Create Scene Content</b> in the inspector, which
+    /// authors the same objects into the scene for real (selectable, editable,
+    /// saveable, undoable) and removes this component.
     /// </summary>
     public class URPBasicSceneSetup : MonoBehaviour
     {
