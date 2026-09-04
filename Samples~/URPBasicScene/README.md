@@ -13,13 +13,10 @@ fall back to mono.
 
 - `URPBasicScene.unity` — The scene to open: a Main Camera carrying
   `DisplayXRCamera`, and a **URP Scene Setup** object carrying the script below.
-- `URPBasicSceneSetup.cs` — Spawns colored cubes at varying depths using
-  the URP/Lit shader, from `Start()`. The content is built at runtime on
-  purpose, so its materials resolve against whichever pipeline the host project
-  uses instead of shipping a serialized material that renders magenta on the
-  other one — the same arrangement as the Basic Scene sample. It follows that
-  the cubes exist **in Play mode only**: a scene that looks empty when you stop
-  is expected, not a broken import.
+- `URPBasicSceneSetup.cs` — Spawns colored cubes at varying depths using the
+  URP/Lit shader. It builds them in `Start()`, so **the content exists in Play
+  mode only** — a scene that looks empty when you stop is expected, not a broken
+  import.
 - `Editor/URPBasicSceneShaderRegistration.cs` — Editor-only. Before any
   standalone build (via `IPreprocessBuildWithReport`) and on demand via
   **Tools > DisplayXR > Register URP/Lit in Always Included Shaders**, adds
@@ -43,8 +40,7 @@ fall back to mono.
    stereo callback is firing.
 
 To try the display-centric rig instead, swap `DisplayXRCamera` on the Main Camera
-for `DisplayXRDisplay` — both drive stereo through the same SRP callback, which
-is what this sample exists to verify.
+for `DisplayXRDisplay`.
 
 ## Off-axis projection fix (URP 17 / Unity 6)
 
