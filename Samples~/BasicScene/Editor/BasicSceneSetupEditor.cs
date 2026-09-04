@@ -77,6 +77,18 @@ namespace DisplayXR.Samples.Editor
                 Undo.RecordObject(cam.transform, "Create Scene Content");
                 cam.transform.position = Vector3.zero;
                 cam.transform.rotation = Quaternion.identity;
+
+                // Put the convergence plane on the mid cube (0.5 m), so the content
+                // straddles the display: the near cube pops out, the far one sits
+                // behind. A camera-centric rig defaults to invConvergenceDistance = 0,
+                // which is infinity — parallel projection — and everything in front of
+                // it then reads as pure pop-out, which is a lot at these distances.
+                var rig = cam.GetComponent<DisplayXRCamera>();
+                if (rig != null && rig.invConvergenceDistance == 0f)
+                {
+                    Undo.RecordObject(rig, "Create Scene Content");
+                    rig.invConvergenceDistance = 1f / 0.5f;
+                }
             }
 
             int count = 0;

@@ -42,6 +42,14 @@ namespace DisplayXR.Samples
                 cam.transform.rotation = Quaternion.identity;
             }
 
+            // Put the convergence plane on the mid cube (0.5 m) so the content
+            // straddles the display: near cube in front of the glass, far cube behind
+            // it. Left at its default of 0 the rig converges at infinity (parallel
+            // projection) and everything here reads as pure pop-out.
+            var rig = cam != null ? cam.GetComponent<DisplayXRCamera>() : null;
+            if (rig != null && rig.invConvergenceDistance == 0f)
+                rig.invConvergenceDistance = 1f / 0.5f;
+
             // Near cube (red) — pops out of screen
             CreateCube("NearCube", new Vector3(-0.3f, 0f, 0.3f), 0.15f, Color.red);
 

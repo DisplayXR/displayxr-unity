@@ -226,7 +226,7 @@ MonoBehaviour:
   m_EditorClassIdentifier: com.displayxr.unity::DisplayXR.DisplayXRCamera
   ipdFactor: 1
   parallaxFactor: 1
-  invConvergenceDistance: 0
+  invConvergenceDistance: 2
   foregroundOnlyClip: 0
   postProcessAntiAliasing: 1
   logEyeTracking: 0
