@@ -85,6 +85,32 @@ build will tell you. One container run catches them all:
 - **Multi-camera support**: Multiple rigs coexist in one scene; `DisplayXRRigManager` coordinates which rig is active (see below)
 - **Play Mode == built app**: the `IUnityXRDisplay` provider runs identically in-editor and in a built player. Pressing Play *is* the preview — there is no separate preview window.
 - **2D UI overlay**: Canvas → `XrCompositionLayerWindowSpaceDXR` with stereo disparity
+- **Background-aware foreground clipping (`XR_DXR_depth_budget`, #318)**: a transparent
+  overlay no longer throws away *all* rear depth. The runtime measures the desktop behind
+  the app for **horizontal** luminance structure (text, icons, window edges — the only kind
+  that carries a disparity cue), and publishes a ramped advisory **rear depth budget** on
+  `XrViewState` at every `xrLocateViews`. The provider adds it to the per-eye foreground
+  far, so over a plain background the avatar's back grows in after ~0.4 s and slides shut
+  in ~0.15 s when a text window moves behind it. `foregroundOnlyClip` stays the app's
+  opt-in; the budget only says how much rear volume that clip currently allows. Both clip
+  paths honour it — BiRP through the native far (`dxr_prov_get_eye_clip`), URP through the
+  new `_DXRRearOffset` global (its shader derives the per-eye/per-zone plane distance
+  itself). **Apply it as delivered — never smooth it app-side**; the runtime already ramps
+  it, and a second filter fights that ramp. Add a **`DisplayXRContentBounds`** to the
+  content root so the runtime measures the desktop *behind the content* instead of behind
+  the whole window (without it, an empty Notepad's own menu bars keep the budget shut while
+  the avatar is in the opposite corner). Against a **spec v3** runtime the provider goes
+  further and chains the SILHOUETTE itself (`XrContentMaskDXR`): a rect around a character
+  is ~3x its area, so most of what a rect has the runtime measure is background the model
+  never covers. The producer is free - `DisplayXRTransparentOverlay` already renders,
+  unions and reads back exactly that mask for `SetWindowRgn`, already window-normalised -
+  so **no app needs a change**; the mask is chained BESIDE the bounds rect so a v2 runtime
+  still gets the rect. Precedence: mask -> bounds -> 3D zones -> whole canvas.
+  `DisplayXRDepthBudget` exposes state/value for HUDs and one log line per state change. Absent extension, older runtime, no background
+  source, or an **opaque** session → offset 0 = today's clip-at-the-plane, exactly. The
+  opaque case is deliberate: the runtime's transparent flag is fixed at `xrCreateSession`,
+  so a budget of 0 can arrive for a session that never composites over the desktop, and the
+  app's own state must win.
 - **Runtime-owned Kooima math (`XR_DXR_view_rig`, #396 W7)**: the plugin no longer computes Kooima. It chains an `XrDisplayRigDXR`/`XrCameraRigDXR` descriptor (the handful of tunables) onto `xrLocateViews` and consumes render-ready `XrView{pose, fov}` in the provider's per-frame pump (Play Mode and built player alike). **This requires a runtime that advertises `XR_DXR_view_rig` (SPEC_VERSION 2)**; against an older runtime the plugin emits a one-shot WARN and passes raw views through (no stereo). The former vendored/`displayxr::math` display3d/camera3d math is gone (do not re-add — see the `no-vendored-math` drift guard).
 
 ### Render Pipeline Support (BiRP / URP / HDRP)
@@ -218,6 +244,8 @@ Scenes can contain multiple cameras with different rig types (display-centric, c
 | `DisplayXRCamera` | One of | Camera-centric stereo rig (FOV-based) |
 | `DisplayXRRigManager` | Automatic | Static camera registry — no scene object, rigs self-register |
 | `DisplayXRInputController` | Optional | Sample WASD/mouse/scroll controller. Tab cycles cameras via `DisplayXRRigManager.CycleNext()`. Developers typically replace this with their own input. |
+| `DisplayXRContentBounds` | Optional (recommended for transparent overlays) | Reports the content's world AABB so the rear depth budget is judged from the desktop *behind the content*, not behind the whole window (`XR_DXR_depth_budget` v2). Drop it on the content root; nothing else to wire. |
+| `DisplayXRDepthBudget` | Automatic | Static read-only view of the rear depth budget (`State`, `FarOffsetVH`, `CueEnergy`, `RearOffsetWorld`) — no scene object; the provider driver publishes it each frame. |
 
 ### OpenXR path: the display provider
 
@@ -359,6 +387,10 @@ For detailed architecture and design decisions, see `docs~/`:
 
 - Understand the display provider → `docs~/architecture/xr-display-provider.md`
 - Understand stereo math → `docs~/architecture/kooima-pipeline.md`
+- Understand background-aware foreground clipping (rear depth budget) → the runtime's
+  [`docs/architecture/rear-depth-budget.md`](https://github.com/DisplayXR/displayxr-runtime/blob/main/docs/architecture/rear-depth-budget.md)
+  (plain-language) and [`docs/specs/extensions/XR_DXR_depth_budget.md`](https://github.com/DisplayXR/displayxr-runtime/blob/main/docs/specs/extensions/XR_DXR_depth_budget.md)
+  (the contract). Plugin side: `DisplayXRContentBounds` / `DisplayXRDepthBudget`.
 - Build a 2D scene / menu (a rig-less camera STILL renders stereo) → `docs~/architecture/two-dimensional-scenes.md`
 - Window-space 2D UI + why its buttons are dead without a router → `docs~/architecture/window-space-ui.md`
 - Transparent-overlay click-through mask (mask/weave rect-alignment invariant + debugging pitfalls) → `docs~/architecture/click-through-mask.md`

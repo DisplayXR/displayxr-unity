@@ -71,6 +71,14 @@ Shader "DisplayXR/ForegroundClipURP"
             // position, so it is correct for every zone AND eye with no L/R guessing.
             float4 _DXRRigPos; // xyz = rig world position
             float4 _DXRRigFwd; // xyz = rig forward (unit)
+            // x = REAR DEPTH BUDGET in world units (#318): how far behind the display
+            // plane the runtime says this transparent overlay may currently draw. The
+            // rig sets it every frame from XR_DXR_depth_budget, already time-ramped
+            // runtime-side. 0 (the default for an unset global, and what an older
+            // runtime yields) = clip exactly on the plane, i.e. the old behaviour.
+            // Only plane mode uses it: in legacy mode the per-eye fars in
+            // _DXRForegroundFar.xy already have the offset folded in natively.
+            float4 _DXRRearOffset;
 
             half4 Frag(Varyings input) : SV_Target
             {
@@ -103,8 +111,9 @@ Shader "DisplayXR/ForegroundClipURP"
                 if (_DXRForegroundFar.w > 0.5h)
                 {
                     // Plane mode (#166 provider display-centric): far = perpendicular
-                    // distance from THIS eye to the display plane. Per-zone-per-eye correct.
-                    farEff = abs(dot(curEye - _DXRRigPos.xyz, _DXRRigFwd.xyz));
+                    // distance from THIS eye to the display plane, plus whatever rear
+                    // volume the runtime currently allows (#318). Per-zone-per-eye correct.
+                    farEff = abs(dot(curEye - _DXRRigPos.xyz, _DXRRigFwd.xyz)) + _DXRRearOffset.x;
                 }
                 else
                 {

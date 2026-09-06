@@ -322,10 +322,91 @@ namespace DisplayXR
         /// (view-space display-plane distance, world units) + the eye WORLD position
         /// (Unity coords). DisplayXRDisplay publishes these to the URP ForegroundClipURP
         /// globals in provider mode (DisplayXRFeature.GetStereoMatrices is inert then).
+        /// <para>
+        /// Since #318 the far already includes the runtime's advisory rear depth budget
+        /// (see <see cref="dxr_prov_get_rear_budget"/>). That offset is 0 — so the far is
+        /// the display plane exactly, as before — whenever <c>XR_DXR_depth_budget</c> is
+        /// absent or the session is not transparent.
+        /// </para>
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern void dxr_prov_get_eye_clip(
             uint eye, out float outFar, out float outEx, out float outEy, out float outEz);
+
+        /// <summary>
+        /// The last locate's REAR DEPTH BUDGET (<c>XR_DXR_depth_budget</c>, #318): the
+        /// runtime's advisory answer to "may this transparent overlay draw behind the
+        /// display plane right now?", decided from the horizontal structure of the
+        /// desktop behind the content and already time-ramped runtime-side.
+        /// </summary>
+        /// <param name="outState">
+        /// <see cref="DisplayXRDepthBudget.BudgetState"/> as an int — why this value.
+        /// </param>
+        /// <param name="outFarOffsetVH">
+        /// Budget in virtual display heights: 0 = clip at the display plane,
+        /// &gt;= 1000 = unrestricted.
+        /// </param>
+        /// <param name="outCueEnergy">
+        /// 0..1 diagnostic: how much horizontal structure the runtime measured.
+        /// </param>
+        /// <param name="outRearOffsetWorld">
+        /// The budget resolved into APP WORLD UNITS — the distance behind each eye's
+        /// display-plane far that may now be drawn. Already folded into
+        /// <see cref="dxr_prov_get_eye_clip"/>'s far; the URP clip pass needs it
+        /// separately because its shader derives the per-eye display-plane distance
+        /// itself.
+        /// </param>
+        /// <returns>
+        /// 1 when the runtime filled the chained struct, 0 when the extension is absent
+        /// or untouched — in which case every out is 0, i.e. today's behaviour, so no
+        /// caller has to distinguish the two.
+        /// </returns>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int dxr_prov_get_rear_budget(
+            out int outState, out float outFarOffsetVH,
+            out float outCueEnergy, out float outRearOffsetWorld);
+
+        /// <summary>
+        /// Publish the app's content AABB (world space, Unity coords) so the runtime
+        /// measures only the desktop the content is actually drawn over
+        /// (<c>XR_DXR_depth_budget</c> v2, #318). Pushed every frame by
+        /// <see cref="DisplayXRContentBounds"/>. Without it — no component in the scene,
+        /// or <paramref name="enable"/> 0 — nothing is chained and the runtime judges the
+        /// whole canvas, which is the documented fallback rather than a failure.
+        /// </summary>
+        /// <param name="marginNormalized">
+        /// Extra dilation the app wants, in canvas-normalised units, ON TOP of the
+        /// runtime's own default. 0 = the runtime default alone.
+        /// </param>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void dxr_prov_set_content_bounds(
+            float minX, float minY, float minZ,
+            float maxX, float maxY, float maxZ,
+            float marginNormalized, int enable);
+
+        /// <summary>
+        /// Publish the app's content occupancy <b>mask</b> — the silhouette rather than
+        /// a box around it (<c>XR_DXR_depth_budget</c> v3, #318). A rectangle around a
+        /// character is roughly three times its area, so most of what the runtime would
+        /// measure is background the model never covers; the mask fixes that.
+        /// <para>
+        /// <paramref name="cells"/> is row-major, top-left origin, one byte per cell,
+        /// nonzero = occupied, normalised to the <b>window client rect</b> — which is
+        /// exactly what <see cref="DisplayXRTransparentOverlay"/>'s silhouette readback
+        /// already produces for <c>SetWindowRgn</c>. The bytes are copied (and reduced
+        /// to at most 256 per side with an any-coverage filter), so the buffer need only
+        /// live for the duration of the call: an <c>AsyncGPUReadback</c> NativeArray
+        /// qualifies, a retained pointer to one would not.
+        /// </para>
+        /// <para>
+        /// <paramref name="cells"/> <c>IntPtr.Zero</c>, or a degenerate size, clears it;
+        /// the runtime then falls back to the bounds rect, then the 3D zones, then the
+        /// whole canvas. Inert against a runtime older than spec v3.
+        /// </para>
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void dxr_prov_set_content_mask(
+            System.IntPtr cells, uint w, uint h, uint stride);
 
         /// <summary>Per-zone per-eye foreground clip (#166 multi-zone). Zone 0 = primary,
         /// i>=1 = extra zone i-1. Returns 1 on success.</summary>

@@ -38,7 +38,13 @@ namespace DisplayXR
                  "(i.e. the per-view distance from eye to display plane). Geometry " +
                  "past the display plane is clipped automatically. N-view safe — " +
                  "each view's projection uses its own eye-Z. Camera.farClipPlane is " +
-                 "ignored when this is enabled.")]
+                 "ignored when this is enabled.\n\n" +
+                 "On a transparent overlay the runtime may push this plane BACK when " +
+                 "the desktop behind the content carries no horizontal depth cue " +
+                 "(rear depth budget — see DisplayXRDepthBudget, and add a " +
+                 "DisplayXRContentBounds to the content root so the runtime looks in " +
+                 "the right place). Against a runtime without XR_DXR_depth_budget, or " +
+                 "an opaque session, the clip stays exactly on the plane.")]
         public bool foregroundOnlyClip = false;
 
         [Header("Rendering")]
@@ -73,6 +79,12 @@ namespace DisplayXR
         private static readonly int s_EyePosRId = Shader.PropertyToID("_DXREyePosR");
         private static readonly int s_RigPosId = Shader.PropertyToID("_DXRRigPos");
         private static readonly int s_RigFwdId = Shader.PropertyToID("_DXRRigFwd");
+        // Rear depth budget (#318): how far BEHIND the display plane the runtime says
+        // this transparent overlay may currently draw, in world units. The shader's
+        // plane mode derives each eye's display-plane distance itself, so unlike the
+        // BiRP pass (which reads the native far, offset already folded in) it needs
+        // this separately. 0 = clip on the plane, i.e. the pre-#318 behaviour.
+        private static readonly int s_RearOffsetId = Shader.PropertyToID("_DXRRearOffset");
 
         // Set by DisplayXRSplash on the boot-splash rig. Such a rig does NOT join
         // the rig registry — so app scripts that bind to DisplayXRRigManager
@@ -269,8 +281,16 @@ namespace DisplayXR
             if (!foregroundOnlyClip)
             {
                 Shader.SetGlobalVector(s_ForegroundFarId, Vector4.zero);
+                Shader.SetGlobalVector(s_RearOffsetId, Vector4.zero);
                 return;
             }
+            // Apply the runtime's rear depth budget AS DELIVERED — it is already
+            // time-ramped runtime-side (~300 ms opening, ~150 ms closing), and a second
+            // filter here would fight that ramp for a slower, less predictable plane.
+            // 0 whenever XR_DXR_depth_budget is absent or the session is opaque, which
+            // is exactly "clip at the display plane".
+            Shader.SetGlobalVector(s_RearOffsetId,
+                new Vector4(DisplayXRDepthBudget.RearOffsetWorld, 0f, 0f, 0f));
             DisplayXRProviderNative.dxr_prov_get_eye_clip(0, out float farL, out float lx, out float ly, out float lz);
             DisplayXRProviderNative.dxr_prov_get_eye_clip(1, out float farR, out float rx, out float ry, out float rz);
             float nz = m_Camera != null ? m_Camera.nearClipPlane : 0.3f;

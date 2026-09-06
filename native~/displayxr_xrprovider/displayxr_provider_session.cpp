@@ -29,6 +29,8 @@
 #include "displayxr_provider_gfx_metal.h" // Metal blit/texture glue (#204)
 #endif
 
+#include <mutex>
+
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -265,6 +267,57 @@ typedef struct ProviderSession {
 	XrTime predicted_display_time;
 
 	int has_view_rig;
+
+	// XR_DXR_depth_budget (#318): the runtime's advisory REAR DEPTH BUDGET - how far
+	// behind the display plane a transparent overlay may render right now, given what
+	// the desktop behind it looks like. Detected in the probe, enabled on the instance,
+	// chained on XrViewState::next beside XrViewDisplayRawDXR at every locate.
+	// budget_live: the runtime stamped the struct this frame (so the value is real and
+	// not our zero-init). rear_offset_world: farOffsetVH * vH resolved into WORLD
+	// units - exactly what ps_compute_eye_clip adds to the eye's display-plane
+	// distance. budget_state/_vh/_cue are diagnostics republished to C#.
+	int has_depth_budget;
+	int budget_live;
+	int budget_state;
+	int budget_state_logged;   // last state a log line was emitted for; -1 = none yet
+	int rear_offset_open_logged; // 1 while the last logged rear volume was non-zero
+	float budget_far_offset_vh;
+	float budget_cue_energy;
+	float rear_offset_world;
+
+	// App-reported content bounds (XR_DXR_depth_budget v2). World-space AABB in UNITY
+	// coordinates, pushed every frame by the DisplayXRContentBounds component; the
+	// submit path projects its 8 corners through every view and chains
+	// XrContentBoundsDXR so the runtime measures only the desktop the content is
+	// actually drawn over. content_bounds_valid == 0 -> nothing is chained and the
+	// runtime judges the whole canvas (v1 behaviour), the documented fallback.
+	int   content_bounds_valid;
+	float content_bounds_min[3];
+	float content_bounds_max[3];
+	float content_bounds_margin;
+
+	// App-reported content MASK (XR_DXR_depth_budget v3) - the silhouette rather
+	// than a box around it. Written on Unity's main thread from the transparent
+	// overlay's AsyncGPUReadback callback, read on the render thread at submit, so
+	// every access goes through s_mask_mutex. The bytes are OWNED here: the C#
+	// NativeArray backing the readback is valid only inside its callback, while
+	// xrEndFrame runs later on another thread, so the setter reduces and copies
+	// rather than retaining the caller's pointer.
+	// depth_budget_version gates the whole path - an older runtime never sees the
+	// struct, and falls back to the bounds rect it already understands.
+	int      depth_budget_version;
+	uint8_t *content_mask;      // owned, mask_w * mask_h bytes, row-major, top-left
+	uint32_t content_mask_w, content_mask_h;
+	uint32_t content_mask_cap;  // allocated bytes
+	int      content_mask_valid;
+	// Render-thread-private copy handed to xrEndFrame. The runtime reads the cells
+	// DURING that call, so the bytes must not move under it - but holding
+	// s_mask_mutex across xrEndFrame would park Unity's main thread in the readback
+	// callback for however long the compositor takes to weave and present. Copying
+	// ~64 KB under a short lock instead costs microseconds and keeps the two threads
+	// from ever waiting on each other.
+	uint8_t *content_mask_submit;
+	uint32_t content_mask_submit_cap;
 
 	// XR_DXR_atlas_capture (#140): app-facing atlas screenshot (the 'I' key /
 	// DisplayXRScreenshot). Detected in the probe, enabled on the instance, PFN
@@ -599,6 +652,11 @@ typedef struct ProviderSession {
 } ProviderSession;
 
 static ProviderSession s_ps;
+
+// Defined with the rest of the content-mask code further down; declared here because
+// the two s_ps resets (session start's re-seed and session stop) sit above it and
+// must release the mask allocation before memset drops the pointer.
+static void ps_free_content_mask(void);
 static DxrProvLogCallback s_log_cb = NULL;
 
 void dxr_prov_set_log_callback(DxrProvLogCallback cb) { s_log_cb = cb; }
@@ -3812,6 +3870,7 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	uint32_t saved_extra_count = s_ps.extra_zone_count;
 	ProviderExtraZone saved_extra[PS_MAX_ZONES - 1];
 	for (uint32_t i = 0; i < PS_MAX_ZONES - 1; i++) saved_extra[i] = s_ps.extra_zones[i];
+	ps_free_content_mask();
 	memset(&s_ps, 0, sizeof(s_ps));
 	s_ps.single_pass = saved_single_pass;
 	s_ps.single_pass_set = saved_single_pass_set;
@@ -3993,6 +4052,12 @@ int dxr_prov_session_start(const char *runtime_json_path,
 							s_ps.has_local_3d_zone = 1;
 						else if (strcmp(props[i].extensionName, XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME) == 0)
 							s_ps.has_atlas_capture = 1;
+						else if (strcmp(props[i].extensionName, XR_DXR_DEPTH_BUDGET_EXTENSION_NAME) == 0) {
+							s_ps.has_depth_budget = 1;
+							// The spec VERSION, not just the name: v3 adds the content
+							// mask, and chaining it at a v2 runtime would be dead weight.
+							s_ps.depth_budget_version = (int)props[i].extensionVersion;
+						}
 					}
 				}
 				free(props);
@@ -4005,6 +4070,14 @@ int dxr_prov_session_start(const char *runtime_json_path,
 		       s_ps.has_view_rig ? "AVAILABLE" : "not found (no stereo)");
 		ps_log("[DisplayXR-PROV] XR_DXR_atlas_capture: %s\n",
 		       s_ps.has_atlas_capture ? "AVAILABLE" : "no (screenshot inert)");
+		ps_log("[DisplayXR-PROV] XR_DXR_depth_budget: %s (spec v%d; content mask %s)\n",
+		       s_ps.has_depth_budget ? "AVAILABLE"
+		                             : "no (foreground clip stays at the display plane)",
+		       s_ps.depth_budget_version,
+		       s_ps.depth_budget_version >= 3 ? "supported" : "not supported, bounds rect only");
+		// -1 = "no state logged yet". 0 is a real state (UNRESTRICTED_OPAQUE), so the
+		// memset-to-zero s_ps cannot double as "unknown".
+		s_ps.budget_state_logged = -1;
 	}
 
 	// Re-apply the APP-AUTHORED 3D zone (if any) on EVERY session start, for BOTH
@@ -4039,7 +4112,7 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	}
 
 	// --- Create instance ---
-	const char *extensions[8];
+	const char *extensions[10];
 	uint32_t ext_count = 0;
 	extensions[ext_count++] = XR_DXR_DISPLAY_INFO_EXTENSION_NAME;
 #ifdef _WIN32
@@ -4072,6 +4145,13 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	// unconditionally-if-advertised — independent of transparency/zones.
 	if (s_ps.has_atlas_capture)
 		extensions[ext_count++] = XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME;
+	// Rear depth budget (#318): enabling it is the app's opt-in AND the runtime's
+	// gate - the runtime fetches + analyses the background only for sessions that
+	// asked. Enable whenever advertised; the budget is inert unless a rig actually
+	// runs the foreground clip, and an older runtime that never advertised it leaves
+	// has_depth_budget at 0, so nothing about today's behaviour changes.
+	if (s_ps.has_depth_budget)
+		extensions[ext_count++] = XR_DXR_DEPTH_BUDGET_EXTENSION_NAME;
 
 	PFN_xrVoidFunction fn_create = NULL;
 	s_ps.gipa(XR_NULL_HANDLE, "xrCreateInstance", &fn_create);
@@ -4648,6 +4728,7 @@ void dxr_prov_session_stop(void)
 	// Intentionally do NOT FreeLibrary(runtime_lib): background threads may still
 	// reference it (matches the standalone's deliberate leak).
 	void *lib = s_ps.runtime_lib;
+	ps_free_content_mask();
 	memset(&s_ps, 0, sizeof(s_ps));
 	s_ps.runtime_lib = lib;
 }
@@ -5213,6 +5294,194 @@ void dxr_prov_poll_events(void)
 static void ps_diag_preclear_bridge_green(void); // defined near submit_frame (probe)
 #endif
 
+// Longest side of the content mask handed to the runtime (XR_DXR_depth_budget v3).
+// The extension caps a side at 512; the runtime resamples onto its own (much
+// smaller) analysis grid anyway, so paying for more than this buys nothing.
+#define DXR_CONTENT_MASK_MAX 256u
+
+// Guards s_ps.content_mask* — written on Unity's main thread by the silhouette
+// readback, read on the render thread while building xrEndFrame.
+static std::mutex s_mask_mutex;
+
+// s_ps is memset wholesale on session stop and restart, which would drop the mask
+// allocation on the floor (a leak per dock<->undock cycle, and this provider restarts
+// its session on every one). Free it FIRST, under the lock.
+static void ps_free_content_mask(void)
+{
+	std::lock_guard<std::mutex> lk(s_mask_mutex);
+	free(s_ps.content_mask);
+	s_ps.content_mask = NULL;
+	s_ps.content_mask_cap = 0;
+	s_ps.content_mask_valid = 0;
+	free(s_ps.content_mask_submit);
+	s_ps.content_mask_submit = NULL;
+	s_ps.content_mask_submit_cap = 0;
+}
+
+// Take a private copy of the current mask for this frame's xrEndFrame. Returns the
+// cell count (0 = nothing to chain). See content_mask_submit for why this copies
+// rather than lending the producer's buffer under a held lock.
+static uint32_t ps_snapshot_content_mask(uint32_t *out_w, uint32_t *out_h)
+{
+	std::lock_guard<std::mutex> lk(s_mask_mutex);
+	if (!s_ps.content_mask_valid || s_ps.content_mask == NULL) return 0;
+
+	const uint32_t n = s_ps.content_mask_w * s_ps.content_mask_h;
+	if (n == 0) return 0;
+	if (n > s_ps.content_mask_submit_cap) {
+		uint8_t *nb = (uint8_t *)realloc(s_ps.content_mask_submit, n);
+		if (nb == NULL) return 0;
+		s_ps.content_mask_submit = nb;
+		s_ps.content_mask_submit_cap = n;
+	}
+	memcpy(s_ps.content_mask_submit, s_ps.content_mask, n);
+	*out_w = s_ps.content_mask_w;
+	*out_h = s_ps.content_mask_h;
+	return n;
+}
+
+
+// ============================================================================
+// XR_DXR_depth_budget (#318) — the runtime's advisory REAR DEPTH BUDGET.
+//
+// A transparent overlay composites over the live desktop. Content BEHIND the
+// display plane carries positive disparity while being drawn OVER desktop pixels
+// at zero disparity, and that occlusion-vs-disparity conflict is why the
+// foreground clip exists at all. But it is only perceptible when the desktop right
+// behind the content carries a HORIZONTAL luminance cue (text, icons, window
+// edges). The runtime measures that — off the background the display processor
+// already captures — and publishes a per-locate, already-ramped budget saying how
+// far behind the plane this session may render right now. The plugin's whole job
+// is to add that offset to the far it was already computing, and to NOT smooth it
+// (app-side smoothing fights the runtime's ramp; see the extension spec §4.2).
+// ============================================================================
+
+//! Human-readable state, for the one-line-per-transition log. Never returns null.
+static const char *ps_rear_budget_state_name(int state)
+{
+	switch (state) {
+	case XR_REAR_DEPTH_BUDGET_STATE_UNRESTRICTED_OPAQUE_DXR:    return "UnrestrictedOpaque";
+	case XR_REAR_DEPTH_BUDGET_STATE_UNRESTRICTED_WORKSPACE_DXR: return "UnrestrictedWorkspace";
+	case XR_REAR_DEPTH_BUDGET_STATE_OPEN_DXR:                   return "Open";
+	case XR_REAR_DEPTH_BUDGET_STATE_CLIPPED_BUSY_BACKGROUND_DXR: return "ClippedBusyBackground";
+	case XR_REAR_DEPTH_BUDGET_STATE_CLIPPED_NO_SOURCE_DXR:      return "ClippedNoSource";
+	case XR_REAR_DEPTH_BUDGET_STATE_FORCED_DXR:                 return "Forced";
+	default:                                                    return "Unknown";
+	}
+}
+
+// The virtual display height, in APP WORLD UNITS, that the display-centric locate
+// sends the runtime as XrDisplayRigDXR::virtualDisplayHeight. Factored out so the
+// locate and the budget's vH->world conversion cannot drift apart: a rear offset
+// scaled by a different height than the one the runtime framed Kooima with would
+// put the clip plane somewhere nobody asked for. (The C# driver has already
+// divided this by the rig's lossy scale, which is what makes scale-as-zoom work,
+// so it is in the same units as the eye positions the runtime hands back.)
+static float ps_display_rig_vh(void)
+{
+	float physical = (s_ps.display_info.is_valid && s_ps.display_info.height_m > 0.0f)
+	                     ? s_ps.display_info.height_m : 0.2f;
+	return (s_ps.tunables_set && s_ps.virtual_display_height > 0.0f)
+	           ? s_ps.virtual_display_height : physical;
+}
+
+/*
+ * Resolve this locate's budget into s_ps.rear_offset_world — the distance, in app
+ * world units, that ps_compute_eye_clip adds behind each eye's display-plane far.
+ *
+ * Absent extension, older runtime, or a struct the runtime did not stamp => offset
+ * 0, which is byte-for-byte today's behaviour (clip exactly at the display plane).
+ *
+ * THE APP'S TRANSPARENCY WINS over the runtime's (displayxr-common#41). The
+ * runtime's session-level transparent flag is fixed at xrCreateSession, so a
+ * busy-background budget of 0 can arrive for a session that is not compositing
+ * over the desktop at all. An opaque session therefore ignores the budget and
+ * keeps whatever clip the app asked for.
+ *
+ * Units: farOffsetVH is in virtual display heights, so it needs a height to become
+ * a distance. The runtime hands us one ready-made: farOffsetMeters is farOffsetVH
+ * pre-multiplied by the virtualDisplayHeight IT used for this locate — the value we
+ * sent, after its own clamp — so for a display-centric rig that number is already in
+ * app world units and is preferred over re-deriving it. It is 0 when the runtime has
+ * no height for the session, which is every camera-centric rig (XrCameraRigDXR
+ * carries no virtual display height): there the "virtual display" is the convergence
+ * plane, whose world height is 2 * d * tan(vfov/2), and s_ps.fov_override is already
+ * tan(vfov/2). ps_display_rig_vh() backs both up if the runtime reports nothing.
+ */
+static void ps_resolve_rear_budget_value(const XrRearDepthBudgetDXR *b)
+{
+	s_ps.budget_live = 0;
+	s_ps.rear_offset_world = 0.0f;
+	if (!s_ps.has_depth_budget || b == NULL) return;
+	// A runtime that recognised the chained struct always stamps `type`, so an
+	// untouched zero-init is distinguishable by that field alone.
+	if (b->type != (XrStructureType)XR_TYPE_REAR_DEPTH_BUDGET_DXR) return;
+
+	s_ps.budget_live = 1;
+	s_ps.budget_state = (int)b->state;
+	s_ps.budget_far_offset_vh = b->farOffsetVH;
+	s_ps.budget_cue_energy = b->backgroundCueEnergy;
+
+	// One line per STATE change — never per frame, never per ramp step.
+	if (s_ps.budget_state_logged != s_ps.budget_state) {
+		s_ps.budget_state_logged = s_ps.budget_state;
+		ps_log("[DisplayXR-PROV] REAR_BUDGET state=%s farOffsetVH=%.1f cue=%.2f transparent=%d\n",
+		       ps_rear_budget_state_name(s_ps.budget_state), b->farOffsetVH,
+		       b->backgroundCueEnergy, s_ps.transparent_requested ? 1 : 0);
+	}
+
+	if (!s_ps.transparent_requested) return;
+
+	if (b->farOffsetVH >= 1000.0f) {
+		// Unrestricted. Push the far past anything the camera can draw instead of
+		// threading a separate "no clip" boolean through three consumers (the
+		// native far, the BiRP blit and the URP shader) — Unity's own camera far
+		// is by definition the end of what it renders.
+		s_ps.rear_offset_world = s_ps.far_z > 0.0f ? s_ps.far_z : 1000.0f;
+		return;
+	}
+	if (!(b->farOffsetVH > 0.0f)) return; // 0 or NaN: clip at the plane, as today
+
+	// The runtime already did the conversion with the height it actually framed this
+	// locate with. Take it when it is there; it cannot drift from ps_display_rig_vh()
+	// the way an independently re-derived height can.
+	if (!s_ps.camera_centric && b->farOffsetMeters > 0.0f) {
+		s_ps.rear_offset_world = b->farOffsetMeters;
+		return;
+	}
+
+	float vh;
+	if (s_ps.camera_centric) {
+		float d = (s_ps.inv_convergence_distance > 1e-4f)
+		              ? (1.0f / s_ps.inv_convergence_distance) : 0.0f;
+		vh = (d > 0.0f && s_ps.fov_override > 0.0f) ? (2.0f * d * s_ps.fov_override) : 0.0f;
+	} else {
+		vh = ps_display_rig_vh();
+	}
+	if (vh > 0.0f) s_ps.rear_offset_world = b->farOffsetVH * vh;
+}
+
+//! Resolve, then say out loud what the renderer will actually do about it.
+static void ps_resolve_rear_budget(const XrRearDepthBudgetDXR *b)
+{
+	ps_resolve_rear_budget_value(b);
+
+	// The STATE line above says what the runtime decided; this one says what the clip
+	// plane does. They are not the same thing: a state of "Open" whose offset is still
+	// 0 (the ramp has not started, or the session is opaque so the app's own state
+	// won) reads in a log exactly like one that never moved, which makes "did the clip
+	// plane really shift, and by how much?" unanswerable after the fact. Edge-
+	// triggered — at most twice per open/close cycle, never per frame or ramp step.
+	const int now_open = s_ps.rear_offset_world > 0.0f ? 1 : 0;
+	if (now_open != s_ps.rear_offset_open_logged) {
+		s_ps.rear_offset_open_logged = now_open;
+		ps_log("[DisplayXR-PROV] REAR_BUDGET rear volume %s: %.3f world units behind the "
+		       "display plane (farOffsetVH=%.1f)\n",
+		       now_open ? "OPEN" : "CLOSED", s_ps.rear_offset_world,
+		       s_ps.budget_live ? s_ps.budget_far_offset_vh : 0.0f);
+	}
+}
+
 int dxr_prov_begin_frame(uint32_t *out_image_index, int *out_should_render)
 {
 	if (out_should_render) *out_should_render = 0;
@@ -5274,6 +5543,7 @@ int dxr_prov_begin_frame(uint32_t *out_image_index, int *out_should_render)
 		XrCameraRigDXR  camera_rig  = {XR_TYPE_CAMERA_RIG_DXR};
 		XrDisplayZoneDXR locate_zone = {XR_TYPE_DISPLAY_ZONE_DXR};
 		XrViewDisplayRawDXR raw = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
+		XrRearDepthBudgetDXR budget = {XR_TYPE_REAR_DEPTH_BUDGET_DXR};
 		XrPosef rig_pose = s_ps.display_pose_set ? s_ps.display_pose
 		                                         : XrPosef{{0, 0, 0, 1}, {0, 0, 0}};
 		if (s_ps.has_view_rig) {
@@ -5290,15 +5560,13 @@ int dxr_prov_begin_frame(uint32_t *out_image_index, int *out_should_render)
 				// window-as-portal 1:1 framing) so a scene with no DisplayXR rig
 				// pushing tunables still gets real stereo separation. Apps override
 				// via dxr_prov_set_tunables (wired from DisplayXRDisplay).
-				float vdh = s_ps.display_info.is_valid && s_ps.display_info.height_m > 0.0f
-				            ? s_ps.display_info.height_m : 0.2f;
 				display_rig.pose = rig_pose;
 				// vdh <= 0 always means "use the physical display height" (matches the
 				// rig's own resolution), so the C# driver can pass a raw 0 safely even
-				// before its display-info query resolves.
-				display_rig.virtualDisplayHeight =
-				    (s_ps.tunables_set && s_ps.virtual_display_height > 0.0f)
-				        ? s_ps.virtual_display_height : vdh;
+				// before its display-info query resolves. ps_display_rig_vh() is the ONE
+				// definition of that value - the rear depth budget scales its vH offset by
+				// the same number (#318).
+				display_rig.virtualDisplayHeight = ps_display_rig_vh();
 				display_rig.ipdFactor = s_ps.tunables_set ? s_ps.ipd_factor : 1.0f;
 				display_rig.parallaxFactor = s_ps.tunables_set ? s_ps.parallax_factor : 1.0f;
 				display_rig.perspectiveFactor = s_ps.tunables_set ? s_ps.perspective_factor : 1.0f;
@@ -5315,6 +5583,14 @@ int dxr_prov_begin_frame(uint32_t *out_image_index, int *out_should_render)
 				li.next = &locate_zone;
 			}
 			vstate.next = &raw;
+		}
+		// XR_DXR_depth_budget (#318): chain the advisory rear budget BESIDE the raw
+		// channel. Deliberately independent of has_view_rig - the two extensions are
+		// unrelated, and a runtime advertising one without the other still fills what
+		// it knows. Chaining at the head preserves whatever is already linked.
+		if (s_ps.has_depth_budget) {
+			budget.next = vstate.next;
+			vstate.next = &budget;
 		}
 
 		if (XR_SUCCEEDED(s_ps.pfn_locate_views(s_ps.session, &li, &vstate,
@@ -5337,6 +5613,10 @@ int dxr_prov_begin_frame(uint32_t *out_image_index, int *out_should_render)
 			// Ensure 2 views for stereo (duplicate if runtime returned 1).
 			if (n == 1) { s_ps.views[1] = s_ps.views[0]; n = 2; }
 			s_ps.view_count = n;
+
+			// Turn this locate's advisory budget into the world-unit far offset the
+			// foreground clip adds behind each eye's display-plane distance (#318).
+			ps_resolve_rear_budget(&budget);
 
 			// Publish the RAW (pre-Kooima) display-space eyes to shared state so
 			// the editor Scene-view gizmo (DisplayXRGizmoHelpers.TryGetLiveRawEyes)
@@ -5469,6 +5749,127 @@ static void ps_projection_from_fov(const float fov[4], float nz, float fz, float
 	out[14] = -2.0f * fz * nz / (fz - nz);
 }
 
+/*
+ * Project the app's content AABB into the canvas-normalised rect XrContentBoundsDXR
+ * wants (#318, XR_DXR_depth_budget v2). Returns 1 when something should be chained.
+ *
+ * Why the app has to do this at all: the runtime measures the desktop behind the
+ * window to decide the rear budget, and v1 measured ALL of it - so a busy patch
+ * anywhere under the window closed the budget even when the content sat in one
+ * corner nowhere near it. The app is the only party that knows where its geometry
+ * lands, so it says.
+ *
+ * Convention (mirrors dxr::ProjectAabbToCanvasBounds in displayxr-common): NDC
+ * (x,y) in [-1,1] -> u = (x+1)/2, v = (1-y)/2, i.e. origin TOP-LEFT with v pointing
+ * DOWN, the same convention as XrViewDisplayRawDXR::canvasRectPx.
+ *
+ * Conservative on every failure: whole canvas ({0,0,1,1}), never a partial rect and
+ * never "nothing here". A region too small or too empty to hold a measurement would
+ * read as neutral and open the budget over a desktop nobody looked at.
+ */
+static float ps_clamp01(float v)
+{
+	if (!(v > 0.0f)) return 0.0f; // NaN lands here too
+	return v > 1.0f ? 1.0f : v;
+}
+
+static int ps_build_content_bounds(XrRect2Df *out)
+{
+	if (out == NULL || !s_ps.has_depth_budget || !s_ps.content_bounds_valid) return 0;
+	if (s_ps.view_count < 1) return 0;
+
+	out->offset.x = 0.0f;
+	out->offset.y = 0.0f;
+	out->extent.width = 1.0f;
+	out->extent.height = 1.0f;
+
+	const float nz = s_ps.near_z > 0.0f ? s_ps.near_z : 0.01f;
+	const float fz = s_ps.far_z > nz ? s_ps.far_z : 1000.0f;
+
+	float u0 = 1.0f, v0 = 1.0f, u1 = 0.0f, v1 = 0.0f;
+	const uint32_t n = s_ps.view_count < DXR_PROV_MAX_VIEWS ? s_ps.view_count : DXR_PROV_MAX_VIEWS;
+	for (uint32_t e = 0; e < n; e++) {
+		float view[16], proj[16];
+		ps_view_matrix_from_pose(s_ps.views[e].position, s_ps.views[e].orientation, view);
+		ps_projection_from_fov(s_ps.views[e].fov, nz, fz, proj);
+		for (int c = 0; c < 8; c++) {
+			// Unity world (left-handed, +Z forward) -> OpenXR world (right-handed,
+			// -Z forward) is a Z negation - the same one ProjectThroughEye applies on
+			// the C# side. Negating all 8 corners of an axis-aligned box yields the
+			// same corner SET, so the box survives the flip intact.
+			const float wx = (c & 1) ? s_ps.content_bounds_max[0] : s_ps.content_bounds_min[0];
+			const float wy = (c & 2) ? s_ps.content_bounds_max[1] : s_ps.content_bounds_min[1];
+			const float wz = -((c & 4) ? s_ps.content_bounds_max[2] : s_ps.content_bounds_min[2]);
+			// Column-major 4x4 * (x,y,z,1). The view matrix's bottom row is (0,0,0,1)
+			// by construction, so the intermediate w is 1 and can be elided.
+			const float ex = view[0] * wx + view[4] * wy + view[8] * wz + view[12];
+			const float ey = view[1] * wx + view[5] * wy + view[9] * wz + view[13];
+			const float ez = view[2] * wx + view[6] * wy + view[10] * wz + view[14];
+			const float cx = proj[0] * ex + proj[4] * ey + proj[8] * ez + proj[12];
+			const float cy = proj[1] * ex + proj[5] * ey + proj[9] * ez + proj[13];
+			const float cw = proj[3] * ex + proj[7] * ey + proj[11] * ez + proj[15];
+			// cw <= 0 (corner behind this eye) and NaN both fail this test.
+			if (!(cw > 0.0f)) return 1; // keep the whole canvas
+			const float u = (cx / cw + 1.0f) * 0.5f;
+			const float v = (1.0f - cy / cw) * 0.5f;
+			if (u < u0) u0 = u;
+			if (v < v0) v0 = v;
+			if (u > u1) u1 = u;
+			if (v > v1) v1 = v;
+		}
+	}
+
+	// CLAMP FIRST, REBASE SECOND - the order is load-bearing (#318). These u/v come
+	// straight from NDC and are NOT yet bounded: a content AABB routinely projects
+	// outside its own frustum (a SkinnedMeshRenderer's animation bounds almost always
+	// do), giving values below 0 or above 1. Content outside the canvas is not drawn
+	// there, so the honest box is the clamped one.
+	//
+	// Clamping AFTER the zone rebase below would be far worse than merely sloppy: a
+	// negative v scaled by the zone rect and offset by the zone origin lands OUTSIDE
+	// the zone - for the avatar layout (3D zone in the bottom band, 2D speech bubble
+	// in the top band) it reaches up INTO THE BUBBLE BAND, so the runtime judges the
+	// desktop behind the 2D bubble and the 3D model's own background stops deciding
+	// its clip. Measured on the panel before this clamp: roi top 96 in a 210x362
+	// preview whose zone starts at 119.
+	u0 = ps_clamp01(u0);
+	v0 = ps_clamp01(v0);
+	u1 = ps_clamp01(u1);
+	v1 = ps_clamp01(v1);
+
+	// NDC spans the effective canvas the runtime framed this locate into - the ZONE
+	// rect when a 3D zone is active, the whole client area otherwise. The background
+	// preview the runtime measures is a downsample of the desktop under the WINDOW
+	// (measured: an 808x1280 window yields a 202x320 preview, exactly /4 of the
+	// WINDOW, not of the zone), so rebase zone-normalised coordinates onto the window
+	// before reporting them. Skipping this would report a zone-local rect as if it
+	// were window-local and point the analysis at the wrong pixels - exactly the
+	// mis-attribution this struct exists to prevent.
+	uint32_t ww = 0, wh = 0;
+	ps_window_size(&ww, &wh);
+	if (ps_zone_active() && ww > 0 && wh > 0 && s_ps.zone_w > 0 && s_ps.zone_h > 0) {
+		const float sx = (float)s_ps.zone_w / (float)ww;
+		const float sy = (float)s_ps.zone_h / (float)wh;
+		const float ox = (float)s_ps.zone_x / (float)ww;
+		const float oy = (float)s_ps.zone_y / (float)wh;
+		u0 = ox + u0 * sx; u1 = ox + u1 * sx;
+		v0 = oy + v0 * sy; v1 = oy + v1 * sy;
+	}
+
+	// Belt and braces: the rebase above maps [0,1] into the zone, which is inside the
+	// window, so this cannot fire after a rebase - it is here for the no-zone path.
+	u0 = ps_clamp01(u0);
+	v0 = ps_clamp01(v0);
+	u1 = ps_clamp01(u1);
+	v1 = ps_clamp01(v1);
+
+	out->offset.x = u0;
+	out->offset.y = v0;
+	out->extent.width = u1 > u0 ? (u1 - u0) : 0.0f;
+	out->extent.height = v1 > v0 ? (v1 - v0) : 0.0f;
+	return 1;
+}
+
 // Build a column-major GL-clip projection matrix from an XrFovf using the provider's
 // current near/far. Lets the frame-desc builder hand Unity a FULL projection matrix
 // (kUnityXRProjectionTypeMatrix) instead of half-angle tangents — an experiment to
@@ -5538,6 +5939,12 @@ static void ps_compute_eye_clip(const float *p, float *out_far,
 		float ez = fabsf(ps_rig_local_eye_z(&rig, p));
 		if (ez > near_z + 0.001f) far_eff = ez;
 	}
+	// Rear depth budget (#318): the runtime's advisory offset BEHIND the display
+	// plane, already time-ramped runtime-side and applied here AS IS - never
+	// smoothed, which would fight that ramp. 0 whenever the extension is absent, the
+	// runtime left the struct untouched, or the session is opaque, so the untouched
+	// path is exactly today's "clip at the display plane".
+	far_eff += s_ps.rear_offset_world;
 	if (out_far) *out_far = far_eff;
 }
 
@@ -5546,6 +5953,103 @@ void dxr_prov_get_eye_clip(uint32_t eye, float *out_far,
 {
 	if (eye >= DXR_PROV_MAX_VIEWS) eye = 0;
 	ps_compute_eye_clip(s_ps.views[eye].position, out_far, out_ex, out_ey, out_ez);
+}
+
+// Republish the last locate's rear depth budget to C# (#318). Returns 1 when the
+// runtime actually filled it this session, 0 when the extension is absent or the
+// runtime left the chained struct untouched - in which case every out is zeroed and
+// the caller is looking at exactly today's behaviour.
+//
+// out_rear_offset_world is the number that matters to a renderer: the distance, in
+// APP WORLD UNITS, behind each eye's display-plane far that may now be drawn. It is
+// already folded into dxr_prov_get_eye_clip's far (which is what the BiRP pass
+// reads); the URP pass needs it separately because its shader derives the eye's
+// display-plane distance itself, per eye and per zone, rather than taking ours.
+int dxr_prov_get_rear_budget(int *out_state, float *out_far_offset_vh,
+                             float *out_cue_energy, float *out_rear_offset_world)
+{
+	if (out_state) *out_state = s_ps.budget_live ? s_ps.budget_state : 0;
+	if (out_far_offset_vh) *out_far_offset_vh = s_ps.budget_live ? s_ps.budget_far_offset_vh : 0.0f;
+	if (out_cue_energy) *out_cue_energy = s_ps.budget_live ? s_ps.budget_cue_energy : 0.0f;
+	if (out_rear_offset_world) *out_rear_offset_world = s_ps.rear_offset_world;
+	return s_ps.budget_live ? 1 : 0;
+}
+
+// Publish the app's content AABB (WORLD space, UNITY coordinates) for
+// XR_DXR_depth_budget v2 (#318). Called every frame from DisplayXRContentBounds;
+// enable == 0 (or no component in the scene) stops the chaining, and the runtime
+// then measures the whole canvas, which is the v1 behaviour and the documented
+// fallback. Game thread -> render thread, like dxr_prov_set_tunables: plain scalar
+// stores, torn at worst by one frame of a slowly-moving box.
+// Publish the app's content occupancy MASK (XR_DXR_depth_budget v3, #318). Called
+// from the transparent overlay's silhouette readback, which already produces exactly
+// this artefact for SetWindowRgn - the union over both eyes of the rendered
+// silhouette, covering the whole window client rect.
+//
+// The caller's grid is whatever the overlay's hit mask happens to be (up to 640x512);
+// the extension caps a side at 512 and the runtime resamples anyway, so this reduces
+// by an integer factor to at most DXR_CONTENT_MASK_MAX per side using an ANY-COVERAGE
+// (max) filter. Any-coverage, never average: a thin limb that only partly covers a
+// cell still occupies it, and losing it would let the budget open over a background
+// the limb is actually drawn against.
+//
+// cells == NULL, or a degenerate size, clears the mask and the runtime falls back to
+// the bounds rect.
+void dxr_prov_set_content_mask(const uint8_t *cells, uint32_t w, uint32_t h, uint32_t stride)
+{
+	std::lock_guard<std::mutex> lk(s_mask_mutex);
+
+	if (cells == NULL || w == 0 || h == 0 || stride < w) {
+		s_ps.content_mask_valid = 0;
+		return;
+	}
+
+	// Integer reduction factor so both sides land within the cap.
+	uint32_t f = 1;
+	while ((w + f - 1) / f > DXR_CONTENT_MASK_MAX || (h + f - 1) / f > DXR_CONTENT_MASK_MAX) f++;
+	const uint32_t dw = (w + f - 1) / f;
+	const uint32_t dh = (h + f - 1) / f;
+
+	const uint32_t need = dw * dh;
+	if (need > s_ps.content_mask_cap) {
+		uint8_t *nb = (uint8_t *)realloc(s_ps.content_mask, need);
+		if (nb == NULL) { s_ps.content_mask_valid = 0; return; }
+		s_ps.content_mask = nb;
+		s_ps.content_mask_cap = need;
+	}
+	memset(s_ps.content_mask, 0, need);
+
+	// Max-filter reduce. One pass over the source, writing into the destination cell
+	// it falls in - cheaper than gathering per destination cell and handles a ragged
+	// last row/column without a special case.
+	int any = 0;
+	for (uint32_t y = 0; y < h; y++) {
+		const uint8_t *src = cells + (size_t)y * stride;
+		uint8_t *dst = s_ps.content_mask + (size_t)(y / f) * dw;
+		for (uint32_t x = 0; x < w; x++) {
+			if (src[x]) { dst[x / f] = 1; any = 1; }
+		}
+	}
+
+	s_ps.content_mask_w = dw;
+	s_ps.content_mask_h = dh;
+	// An all-zero mask is "nothing rendered", which the runtime would read as an
+	// empty region; report it as absent instead so it falls back to the bounds rect.
+	s_ps.content_mask_valid = any;
+}
+
+void dxr_prov_set_content_bounds(float min_x, float min_y, float min_z,
+                                 float max_x, float max_y, float max_z,
+                                 float margin_normalized, int enable)
+{
+	s_ps.content_bounds_min[0] = min_x;
+	s_ps.content_bounds_min[1] = min_y;
+	s_ps.content_bounds_min[2] = min_z;
+	s_ps.content_bounds_max[0] = max_x;
+	s_ps.content_bounds_max[1] = max_y;
+	s_ps.content_bounds_max[2] = max_z;
+	s_ps.content_bounds_margin = margin_normalized > 0.0f ? margin_normalized : 0.0f;
+	s_ps.content_bounds_valid = (enable && max_x >= min_x && max_y >= min_y && max_z >= min_z) ? 1 : 0;
 }
 
 // Per-zone per-eye foreground clip (#166). Zone 0 = primary; i>=1 = extra_zones[i-1].
@@ -6239,6 +6743,35 @@ int dxr_prov_submit_frame(uint32_t image_index)
 	        : XR_ENVIRONMENT_BLEND_MODE_OPAQUE;
 	ei.layerCount = lc;
 	ei.layers = layers;
+	// XR_DXR_depth_budget v2 (#318): tell the runtime WHERE this frame's content
+	// projects, so it measures only the desktop the content is drawn over. Purely
+	// advisory - no value of any field can fail xrEndFrame, and an app with no
+	// DisplayXRContentBounds component chains nothing and gets the whole canvas.
+	// Lifetime: `content_bounds` must outlive the xrEndFrame call below.
+	XrContentBoundsDXR content_bounds = {XR_TYPE_CONTENT_BOUNDS_DXR};
+	if (ps_build_content_bounds(&content_bounds.bounds)) {
+		content_bounds.marginNormalized = s_ps.content_bounds_margin;
+		content_bounds.next = ei.next;
+		ei.next = &content_bounds;
+	}
+	// v3 (#318): the silhouette itself, chained BESIDE the bounds rect rather than
+	// instead of it — the runtime prefers the mask and falls back to the rect, so a
+	// v2 runtime (which ignores the unknown struct) still gets the narrowing it
+	// understands. The lock is held across xrEndFrame because the runtime copies the
+	// cells during the call and the readback thread may otherwise realloc under it.
+	XrContentMaskDXR content_mask = {XR_TYPE_CONTENT_MASK_DXR};
+	if (s_ps.depth_budget_version >= 3) {
+		uint32_t mw = 0, mh = 0;
+		if (ps_snapshot_content_mask(&mw, &mh) != 0) {
+			content_mask.width = mw;
+			content_mask.height = mh;
+			content_mask.strideBytes = mw;
+			content_mask.cells = s_ps.content_mask_submit;
+			content_mask.marginNormalized = s_ps.content_bounds_margin;
+			content_mask.next = ei.next;
+			ei.next = &content_mask;
+		}
+	}
 	if (d11_diag) ps_log("[DisplayXR-PROV] D3D11 submit[%u]: pre-xrEndFrame (layers=%u)\n", d11_frames, lc);
 	if (subf_trace) ps_log("[DisplayXR-PROV] submit_frame[%u]: xrEndFrame layers=%u (views n=%u)\n", s_subf_n - 1, lc, n);
 	XrResult r = s_ps.pfn_end_frame(s_ps.session, &ei);
