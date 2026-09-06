@@ -36,10 +36,14 @@ typedef struct DisplayXRTunables {
     float near_z;               // Near clip plane (meters), from camera
     float far_z;                // Far clip plane (meters), from camera
     uint8_t camera_centric;     // Use camera-centric parameters
-    uint8_t clip_at_display_plane; // Per-view far override: clip each view at its own
-                                // |eye.z|*m2v (display-centric) or 1/invd (camera-centric).
-                                // Foreground-only render — Unity call-site policy applied
-                                // in displayxr_hooks.cpp on top of displayxr::math.
+    uint8_t clip_at_display_plane; // VESTIGIAL. Per-view far override: clip each view at
+                                // its own |eye.z|*m2v (display-centric) or 1/invd
+                                // (camera-centric). It was the hook path's channel and has
+                                // had no reader since #166 removed that path: under the
+                                // provider the foreground clip is a screen-space discard
+                                // driven by dxr_prov_get_eye_clip (whose far now also
+                                // carries the rear depth budget, #318), and the app's
+                                // opt-in lives in the rig's foregroundOnlyClip, not here.
 } DisplayXRTunables;
 
 // --- Display info (set from render thread, read from game thread) ---

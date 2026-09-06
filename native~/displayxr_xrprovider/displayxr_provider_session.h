@@ -425,8 +425,48 @@ void dxr_prov_get_view(uint32_t view_index, DxrProvView *out_view);
 /// (DisplayXRDisplay) publishes these to the URP DisplayXR/ForegroundClipURP globals
 /// (_DXRForegroundFar / _DXREyePosL/R), since DisplayXRFeature.GetStereoMatrices —
 /// the hook-path source — is inert in provider mode.
+///
+/// Since #318 the far already includes the runtime's advisory REAR DEPTH BUDGET —
+/// how far behind the display plane this transparent session may currently render.
+/// That offset is 0 (so the far is the display plane exactly, as before) whenever
+/// XR_DXR_depth_budget is absent or the session is not transparent.
 DISPLAYXR_EXPORT void dxr_prov_get_eye_clip(uint32_t eye, float *out_far,
                                             float *out_ex, float *out_ey, float *out_ez);
+
+/// The last locate's REAR DEPTH BUDGET (XR_DXR_depth_budget, #318) — the runtime's
+/// advisory answer to "may this transparent overlay draw behind the display plane
+/// right now?", decided from the horizontal structure of the desktop behind the
+/// content and already time-ramped runtime-side.
+///
+/// @param out_state              XrRearDepthBudgetStateDXR as an int (why this value).
+/// @param out_far_offset_vh      Budget in virtual display heights; 0 = clip at the
+///                               display plane, >= 1000 = unrestricted.
+/// @param out_cue_energy         0..1 diagnostic: how much horizontal structure the
+///                               runtime measured behind the content.
+/// @param out_rear_offset_world  The same budget resolved into APP WORLD UNITS — the
+///                               distance behind each eye's display-plane far that
+///                               may now be drawn. Already folded into
+///                               dxr_prov_get_eye_clip's far (what the BiRP clip
+///                               pass reads); the URP pass needs it separately
+///                               because its shader derives the per-eye, per-zone
+///                               display-plane distance itself.
+/// @return 1 when the runtime filled the chained struct, 0 when the extension is
+///         absent or untouched — in which case every out is 0, i.e. today's
+///         behaviour, and no caller has to distinguish the two.
+DISPLAYXR_EXPORT int dxr_prov_get_rear_budget(int *out_state, float *out_far_offset_vh,
+                                              float *out_cue_energy,
+                                              float *out_rear_offset_world);
+
+/// Publish the app's content AABB (WORLD space, UNITY coordinates) so the runtime
+/// measures only the desktop the content is actually drawn over (XR_DXR_depth_budget
+/// v2, #318). Called every frame by DisplayXRContentBounds. Without it — no
+/// component in the scene, or @p enable 0 — nothing is chained and the runtime judges
+/// the whole canvas, which is the documented fallback, not a failure.
+/// @param margin_normalized Extra dilation the app wants, in canvas-normalised units,
+///                          ON TOP of the runtime's own default. 0 = the default alone.
+DISPLAYXR_EXPORT void dxr_prov_set_content_bounds(float min_x, float min_y, float min_z,
+                                                  float max_x, float max_y, float max_z,
+                                                  float margin_normalized, int enable);
 
 /// Per-zone per-eye foreground clip (#166 multi-zone). Zone 0 = primary; i>=1 =
 /// extra zone i-1. Returns 1 on success. Same data as dxr_prov_get_eye_clip but for

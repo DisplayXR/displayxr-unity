@@ -464,6 +464,94 @@ typedef struct XrViewDisplayRawDXR {
 // never the workspace controller); typedef kept for header completeness.
 typedef XrResult(XRAPI_PTR *PFN_xrSetWorkspaceViewRigDXR)(XrSession session, const void *rig);
 
+// --- XR_DXR_depth_budget ---
+// The REAR DEPTH BUDGET: how far BEHIND the zero-disparity plane (the physical
+// display plane) a transparent-background app may render before the result reads
+// as wrong. A transparent overlay composites over the live desktop; content behind
+// the ZDP carries positive disparity yet is drawn OVER desktop pixels at zero
+// disparity, and that occlusion-vs-disparity conflict is only perceptible when the
+// desktop right behind the content carries a HORIZONTAL luminance cue (text, icons,
+// window borders). The RUNTIME measures that (via the display processor's existing
+// background capture) and publishes a per-locate, already-ramped advisory budget;
+// the APP just applies it as its far-plane offset and does NO analysis and NO
+// smoothing of its own (a second filter fights the runtime's ramp).
+//
+// Units: vH — virtual display heights. 0 = clip at the display plane (today's
+// foreground-only behaviour); >= 1000 = unrestricted. farOffsetMeters is the same
+// number pre-multiplied by the rig's virtualDisplayHeight — i.e. by the value THIS
+// plugin sent in XrDisplayRigDXR — so for a display-centric rig it is directly the
+// world-unit rear offset. It is 0 for a camera-centric rig (the runtime has no vH
+// there); the provider derives its own vH in that case.
+//
+// Source of truth: displayxr-runtime/src/external/openxr_includes/openxr/
+// XR_DXR_depth_budget.h (SPEC_VERSION 2). These declarations are byte-identical to
+// it. Enable ONLY when enumerated — the extension is the app's opt-in AND the
+// runtime's gate (a session that never enables it costs the runtime nothing).
+#define XR_DXR_DEPTH_BUDGET_EXTENSION_NAME "XR_DXR_depth_budget"
+#define XR_DXR_depth_budget_SPEC_VERSION 2
+
+#define XR_TYPE_REAR_DEPTH_BUDGET_DXR                          ((XrStructureType)1004999260)
+#define XR_TYPE_CONTENT_BOUNDS_DXR                             ((XrStructureType)1004999261)
+#define XR_TYPE_EVENT_DATA_REAR_DEPTH_BUDGET_STATE_CHANGED_DXR ((XrStructureType)1004999262)
+
+// Why the runtime is handing out the budget it is handing out.
+typedef enum XrRearDepthBudgetStateDXR {
+    // Session is not transparent - nothing composites over the desktop.
+    XR_REAR_DEPTH_BUDGET_STATE_UNRESTRICTED_OPAQUE_DXR = 0,
+    // Transparent, but running under a workspace controller (today's behaviour).
+    XR_REAR_DEPTH_BUDGET_STATE_UNRESTRICTED_WORKSPACE_DXR = 1,
+    // Transparent + standalone, background carries no horizontal cue.
+    XR_REAR_DEPTH_BUDGET_STATE_OPEN_DXR = 2,
+    // Transparent + standalone, background is busy - ramping shut.
+    XR_REAR_DEPTH_BUDGET_STATE_CLIPPED_BUSY_BACKGROUND_DXR = 3,
+    // No background preview available (no capture, client-present, stale).
+    XR_REAR_DEPTH_BUDGET_STATE_CLIPPED_NO_SOURCE_DXR = 4,
+    // An environment override (DXR_REAR_BUDGET=open|clip) is pinning the budget.
+    XR_REAR_DEPTH_BUDGET_STATE_FORCED_DXR = 5,
+    XR_REAR_DEPTH_BUDGET_STATE_MAX_ENUM_DXR = 0x7FFFFFFF
+} XrRearDepthBudgetStateDXR;
+
+// OUTPUT: chain on XrViewState::next (beside XrViewDisplayRawDXR) in xrLocateViews;
+// the runtime fills it on every locate. A runtime that recognises the struct always
+// stamps `type`, so an untouched zero-init is distinguishable by that field alone.
+typedef struct XrRearDepthBudgetDXR {
+    XrStructureType type; // Must be XR_TYPE_REAR_DEPTH_BUDGET_DXR
+    void *next;
+    float farOffsetVH;                   // >= 0; 0 = clip at ZDP, >= 1000 = unrestricted
+    float farOffsetMeters;               // farOffsetVH * virtual display height (0 if rig unknown)
+    XrRearDepthBudgetStateDXR state;     // why this value
+    float backgroundCueEnergy;           // 0..1 diagnostic; 0 when there is no source
+} XrRearDepthBudgetDXR;
+
+// INPUT (v2): chain on XrFrameEndInfo::next in xrEndFrame to say WHERE this frame's
+// content projects, so the runtime measures only the background it will be drawn
+// over. Optional and purely advisory - never chaining it (or stopping for more than
+// a second) is the v1 behaviour, the whole canvas, and a malformed value degrades to
+// "unknown" = whole canvas rather than failing xrEndFrame.
+typedef struct XrContentBoundsDXR {
+    XrStructureType type; // Must be XR_TYPE_CONTENT_BOUNDS_DXR
+    const void *next;
+    // CANVAS-NORMALISED: offset/extent in [0,1], origin top-left (u right, v DOWN -
+    // the same convention as XrViewDisplayRawDXR::canvasRectPx). The union over ALL
+    // views of the projected content AABB. extent <= 0, or any non-finite component,
+    // means "unknown" and the runtime measures the whole canvas.
+    XrRect2Df bounds;
+    // Extra dilation the app wants, in canvas-normalised units, ON TOP of the
+    // runtime's own default. 0 = the runtime default alone.
+    float marginNormalized;
+} XrContentBoundsDXR;
+
+// EVENT: emitted on every STATE change (never on ramp progress). The provider does
+// not consume it - the authoritative value is the one that came back from the
+// frame's own xrLocateViews - but the type is declared for completeness.
+typedef struct XrEventDataRearDepthBudgetStateChangedDXR {
+    XrStructureType type; // Must be XR_TYPE_EVENT_DATA_REAR_DEPTH_BUDGET_STATE_CHANGED_DXR
+    const void *next;
+    XrSession session;
+    XrRearDepthBudgetStateDXR previousState;
+    XrRearDepthBudgetStateDXR newState;
+} XrEventDataRearDepthBudgetStateChangedDXR;
+
 // --- XR_DXR_display_zones ---
 // Compose N 3D zones (each a window-pixel rect with its own view-rig framing and
 // its own projection layer) within the window. Built BY COMPOSITION on top of

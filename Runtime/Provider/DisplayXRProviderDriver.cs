@@ -69,6 +69,7 @@ namespace DisplayXR
                 m_SessionStarted = false;
                 DisplayXRProvider.OnSessionStopped();
             }
+            DisplayXRDepthBudget.Reset();
         }
 
         void LateUpdate()
@@ -97,6 +98,10 @@ namespace DisplayXR
                 {
                     m_SessionStarted = false;
                     DisplayXRProvider.OnSessionStopped();
+                    // A stale budget must not outlive its session: dock<->undock
+                    // restarts the provider, and a remembered "Open" would leave the
+                    // clip plane pushed back over a background nobody has measured.
+                    DisplayXRDepthBudget.Reset();
                 }
                 return;
             }
@@ -110,6 +115,11 @@ namespace DisplayXR
             }
 
             DisplayXRProvider.PumpEvents();
+            // Rear depth budget (#318): republish the last locate's advisory value
+            // BEFORE the rigs render, so the foreground clip this frame uses this
+            // frame's number. Cheap (one P/Invoke, no allocation) and inert on a
+            // runtime without XR_DXR_depth_budget.
+            DisplayXRDepthBudget.Poll();
             PushActiveRigTunables();
             PushGameViewRectEditorProbe();
         }

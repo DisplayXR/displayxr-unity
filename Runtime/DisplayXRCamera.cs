@@ -57,7 +57,13 @@ namespace DisplayXR
                  "(1/invConvergenceDistance). Geometry past the convergence plane is " +
                  "clipped. Single convergence is shared by all views, so per-view fars " +
                  "match each other. No-op when invConvergenceDistance == 0 (parallel " +
-                 "projection has no finite convergence point).")]
+                 "projection has no finite convergence point).\n\n" +
+                 "On a transparent overlay the runtime may push this plane BACK when " +
+                 "the desktop behind the content carries no horizontal depth cue " +
+                 "(rear depth budget — see DisplayXRDepthBudget, and add a " +
+                 "DisplayXRContentBounds to the content root so the runtime looks in " +
+                 "the right place). Against a runtime without XR_DXR_depth_budget, or " +
+                 "an opaque session, the clip stays exactly on the convergence plane.")]
         public bool foregroundOnlyClip = false;
 
         [Header("Rendering")]
