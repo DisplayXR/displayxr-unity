@@ -150,19 +150,39 @@ Use today's date.
 
 If unsure about grouping, just list all commits under "### Changed".
 
-### Step 2.3: Commit version bump — SKIP IF NOTHING CHANGED
+### Step 2.3: Commit the release — ALWAYS produce a `Release [VERSION]` commit
 ```bash
 git add package.json CHANGELOG.md
-git diff --cached --quiet && echo "NOTHING TO COMMIT - tagging HEAD as-is" \
-  || git commit -m "$(cat <<'EOF'
-Release [VERSION]
-EOF
-)"
+git diff --cached --quiet \
+  && git commit --allow-empty -m "Release [VERSION]" \
+  || git commit -m "Release [VERSION]"
 ```
-`git commit` fails on an empty index, so guard it: when steps 2.1 and 2.2 were both
-no-ops (the version and changelog arrived with the feature PR) there is no release
-commit and the tag simply lands on the current HEAD. Do **not** invent an empty
-commit to have something to tag.
+`git commit` fails on an empty index, so branch on whether anything is staged — but
+**produce the `Release [VERSION]` commit either way, empty if need be**, by adding
+`--allow-empty` on the nothing-staged path.
+
+**This is the org-wide rule, not a local preference.** The runtime hub's
+`/dxr-release` states it: *"Create a `Release vX.Y.Z` marker commit on the sibling's
+`main` and tag THAT commit — same pattern as `/release` on the runtime, so every
+repo's history shows an obvious release boundary (which release got which commits)."*
+For most components that marker is empty because their version lives elsewhere.
+
+**Unity is the exception: its marker is normally a REAL commit that bumps
+`package.json`** — `package.json`'s `version` is Unity's version of record, read by
+the website's org-sync `/platform-support` dashboard and resolved by UPM consumers.
+`build-native.yml` patches the version into the `.tgz` and the `upm` branch *from the
+tag* but never commits it back, so a `main` whose `package.json` still reads the
+previous version makes the website wrong. That is why steps 2.1/2.2 above normally
+DO the bump here rather than expecting a feature PR to have done it.
+
+The `--allow-empty` path exists for the case where the bump already landed upstream —
+then `main` is already correct and the marker is purely a history boundary. That is
+what happened for v2.19.0: the feature PR carried the bump and the changelog, this
+step had nothing to stage, an earlier revision of this skill therefore made no commit
+at all, and the tag landed on an unrelated docs commit. Nothing shipped wrong — main
+did show 2.19.0, so the website was right — but `git log` gave no sign the release
+existed. Prefer letting THIS step do the bump; accept the empty marker when it
+cannot, and never skip the commit entirely.
 
 Store the commit SHA to match the CI run against: `git rev-parse HEAD`
 
