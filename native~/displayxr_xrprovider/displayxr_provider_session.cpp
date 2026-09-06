@@ -5292,6 +5292,7 @@ void dxr_prov_poll_events(void)
 
 #ifdef _WIN32
 static void ps_diag_preclear_bridge_green(void); // defined near submit_frame (probe)
+#endif
 
 // Longest side of the content mask handed to the runtime (XR_DXR_depth_budget v3).
 // The extension caps a side at 512; the runtime resamples onto its own (much
@@ -5338,7 +5339,7 @@ static uint32_t ps_snapshot_content_mask(uint32_t *out_w, uint32_t *out_h)
 	*out_h = s_ps.content_mask_h;
 	return n;
 }
-#endif
+
 
 // ============================================================================
 // XR_DXR_depth_budget (#318) — the runtime's advisory REAR DEPTH BUDGET.
