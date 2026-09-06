@@ -5682,6 +5682,12 @@ static void ps_projection_from_fov(const float fov[4], float nz, float fz, float
  * never "nothing here". A region too small or too empty to hold a measurement would
  * read as neutral and open the budget over a desktop nobody looked at.
  */
+static float ps_clamp01(float v)
+{
+	if (!(v > 0.0f)) return 0.0f; // NaN lands here too
+	return v > 1.0f ? 1.0f : v;
+}
+
 static int ps_build_content_bounds(XrRect2Df *out)
 {
 	if (out == NULL || !s_ps.has_depth_budget || !s_ps.content_bounds_valid) return 0;
@@ -5728,13 +5734,32 @@ static int ps_build_content_bounds(XrRect2Df *out)
 		}
 	}
 
+	// CLAMP FIRST, REBASE SECOND - the order is load-bearing (#318). These u/v come
+	// straight from NDC and are NOT yet bounded: a content AABB routinely projects
+	// outside its own frustum (a SkinnedMeshRenderer's animation bounds almost always
+	// do), giving values below 0 or above 1. Content outside the canvas is not drawn
+	// there, so the honest box is the clamped one.
+	//
+	// Clamping AFTER the zone rebase below would be far worse than merely sloppy: a
+	// negative v scaled by the zone rect and offset by the zone origin lands OUTSIDE
+	// the zone - for the avatar layout (3D zone in the bottom band, 2D speech bubble
+	// in the top band) it reaches up INTO THE BUBBLE BAND, so the runtime judges the
+	// desktop behind the 2D bubble and the 3D model's own background stops deciding
+	// its clip. Measured on the panel before this clamp: roi top 96 in a 210x362
+	// preview whose zone starts at 119.
+	u0 = ps_clamp01(u0);
+	v0 = ps_clamp01(v0);
+	u1 = ps_clamp01(u1);
+	v1 = ps_clamp01(v1);
+
 	// NDC spans the effective canvas the runtime framed this locate into - the ZONE
 	// rect when a 3D zone is active, the whole client area otherwise. The background
-	// preview the runtime measures is a downsample of the desktop under the WINDOW,
-	// so rebase zone-normalised coordinates onto the window before reporting them.
-	// Skipping this would report a zone-local rect as if it were window-local and
-	// point the analysis at the wrong pixels - which is exactly the mis-attribution
-	// this struct exists to prevent.
+	// preview the runtime measures is a downsample of the desktop under the WINDOW
+	// (measured: an 808x1280 window yields a 202x320 preview, exactly /4 of the
+	// WINDOW, not of the zone), so rebase zone-normalised coordinates onto the window
+	// before reporting them. Skipping this would report a zone-local rect as if it
+	// were window-local and point the analysis at the wrong pixels - exactly the
+	// mis-attribution this struct exists to prevent.
 	uint32_t ww = 0, wh = 0;
 	ps_window_size(&ww, &wh);
 	if (ps_zone_active() && ww > 0 && wh > 0 && s_ps.zone_w > 0 && s_ps.zone_h > 0) {
@@ -5746,10 +5771,12 @@ static int ps_build_content_bounds(XrRect2Df *out)
 		v0 = oy + v0 * sy; v1 = oy + v1 * sy;
 	}
 
-	if (u0 < 0.0f) u0 = 0.0f; if (u0 > 1.0f) u0 = 1.0f;
-	if (v0 < 0.0f) v0 = 0.0f; if (v0 > 1.0f) v0 = 1.0f;
-	if (u1 < 0.0f) u1 = 0.0f; if (u1 > 1.0f) u1 = 1.0f;
-	if (v1 < 0.0f) v1 = 0.0f; if (v1 > 1.0f) v1 = 1.0f;
+	// Belt and braces: the rebase above maps [0,1] into the zone, which is inside the
+	// window, so this cannot fire after a rebase - it is here for the no-zone path.
+	u0 = ps_clamp01(u0);
+	v0 = ps_clamp01(v0);
+	u1 = ps_clamp01(u1);
+	v1 = ps_clamp01(v1);
 
 	out->offset.x = u0;
 	out->offset.y = v0;

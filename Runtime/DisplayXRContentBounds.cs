@@ -35,6 +35,25 @@ namespace DisplayXR
     /// reports bounds at all. Do not add ROI logic of your own on top; the dilation and
     /// the verdict are the runtime's.
     /// </para>
+    /// <para>
+    /// <b>List only what occupies the rear volume.</b> The reported region is a
+    /// <i>rectangle</i> — the union of the projected box over all eyes — so every extra
+    /// renderer widens the patch of desktop the runtime judges. Two cases cost you the
+    /// whole benefit:
+    /// <list type="bullet">
+    /// <item><description><b>Anything reaching behind the eye.</b> A ground plane or
+    /// skybox has AABB corners behind the camera, which cannot be projected, so the
+    /// provider conservatively reports the <i>whole canvas</i> — back to judging
+    /// everything. Measured on the panel: adding a floor quad to the list took a
+    /// narrowed region straight to <c>roi=0,0,202,320 (whole preview)</c>.</description></item>
+    /// <item><description><b>Geometry that is not the subject.</b> A backdrop that fills
+    /// the window makes the region the window. Report the avatar, the model, the thing
+    /// whose back you want to see — not its scenery.</description></item>
+    /// </list>
+    /// A rect is the granularity the extension offers today (<c>XrContentBoundsDXR</c>
+    /// carries an <c>XrRect2Df</c>), so it cannot express a silhouette; a finer channel
+    /// is under discussion for a future spec version.
+    /// </para>
     /// </summary>
     [AddComponentMenu("DisplayXR/DisplayXR Content Bounds")]
     [DisallowMultipleComponent]
