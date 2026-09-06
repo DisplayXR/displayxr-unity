@@ -78,6 +78,18 @@ Execute the DisplayXR Unity plugin release workflow for version [VERSION].
 
 ## PHASE 1: PRE-FLIGHT CHECKS
 
+### Step 1.0: Visibility gate (HARDWARE) — when the release touches the transparent path
+This is the boxed warning above, promoted to a numbered step **because a note above
+Phase 1 is easy to read past, and this class of bug shipped twice**. If any commit in
+this release touches the transparent / overlay / cloak / pre-cloak path
+(`DisplayXRTransparentOverlay*`, `displayxr_win32*`, the cloak/park code), build a
+transparent sample against the release commit and run, on the box with the panel:
+```
+tools~/visibility_check.ps1 -Exe <player.exe> -NoRuntime -GuardLog "%USERPROFILE%\AppData\LocalLow\<Company>\<Product>\Player.log"
+```
+Exit 0 = shown. A non-zero exit STOPS the release. If the change cannot touch that
+path, say so explicitly in the report rather than silently omitting it.
+
 ### Step 1.1: Verify clean state
 Run: `git status --short`
 - If dirty, report and STOP: "Working tree is not clean. Commit or stash changes first."
@@ -102,11 +114,21 @@ Store as PREV_TAG.
 
 ## PHASE 2: UPDATE VERSION AND CHANGELOG
 
-### Step 2.1: Bump package.json version
-Use Edit tool to change `"version": "X.Y.Z"` → `"version": "[VERSION_NUMBER]"`.
+### Step 2.1: Bump package.json version — IDEMPOTENT, this is usually a NO-OP
+Read `package.json`.
+- If `"version"` is **already** `[VERSION_NUMBER]`, **change nothing**. This is the
+  normal case in this repo, not an anomaly: the in-tree version is the version of
+  record, so a feature PR bumps it *before* the release runs (CLAUDE.md: "bump
+  `package.json` version per the repo rule").
+- Otherwise Edit `"version": "X.Y.Z"` → `"version": "[VERSION_NUMBER]"`.
 
-### Step 2.2: Add CHANGELOG.md entry
-Read CHANGELOG.md. Find the top header (after the file title).
+### Step 2.2: Add CHANGELOG.md entry — IDEMPOTENT, NEVER DUPLICATE A SECTION
+Read CHANGELOG.md.
+- **If a `## [[VERSION_NUMBER]]` section already exists, leave the file untouched**
+  and skip the rest of this step. A feature PR that documented its own release
+  section has already done this, and prepending a second one ships a changelog with
+  the same version twice — wrong, and the duplicate is the one readers hit first.
+- Otherwise, find the top header (after the file title).
 Generate commit summary since PREV_TAG:
 ```bash
 git log PREV_TAG..HEAD --oneline --no-merges
@@ -128,15 +150,21 @@ Use today's date.
 
 If unsure about grouping, just list all commits under "### Changed".
 
-### Step 2.3: Commit version bump
+### Step 2.3: Commit version bump — SKIP IF NOTHING CHANGED
 ```bash
 git add package.json CHANGELOG.md
-git commit -m "$(cat <<'EOF'
+git diff --cached --quiet && echo "NOTHING TO COMMIT - tagging HEAD as-is" \
+  || git commit -m "$(cat <<'EOF'
 Release [VERSION]
 EOF
 )"
 ```
-Store the commit SHA: `git rev-parse HEAD`
+`git commit` fails on an empty index, so guard it: when steps 2.1 and 2.2 were both
+no-ops (the version and changelog arrived with the feature PR) there is no release
+commit and the tag simply lands on the current HEAD. Do **not** invent an empty
+commit to have something to tag.
+
+Store the commit SHA to match the CI run against: `git rev-parse HEAD`
 
 ### Step 2.4: Create tag and push
 ```bash
@@ -197,6 +225,15 @@ version signs it in place — safe and idempotent — so a version cut without a
 signer can be signed later by simply re-running `/release [VERSION]`.
 
 ### Step 3.5.1: Capability check
+**Source the signer first.** `DXR_SIGN_REPO` is almost never already exported in a
+fresh shell, and an unset value silently downgrades the release to unsigned — so read
+it from the runtime repo's untracked `.env.local` before the check:
+```bash
+# Do NOT `source` the whole file (it holds other secrets); take only this one var.
+[ -z "$DXR_SIGN_REPO" ] && export DXR_SIGN_REPO=$(
+  grep -m1 '^DXR_SIGN_REPO=' ~/Documents/GitHub/displayxr-runtime/.env.local 2>/dev/null | cut -d= -f2- )
+```
+
 ```bash
 SIGN_REPO="${DXR_SIGN_REPO}"   # local env only; unset -> unsigned (public repo names no provider)
 if [ -n "$SIGN_REPO" ] && gh workflow view sign-artifact -R "$SIGN_REPO" >/dev/null 2>&1; then
