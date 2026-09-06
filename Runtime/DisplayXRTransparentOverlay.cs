@@ -211,6 +211,13 @@ namespace DisplayXR
         private const int  HIT_MASK_MIN_HEIGHT = 144;
         private const int  HIT_MASK_MAX_WIDTH  = 640;
         private const int  HIT_MASK_MAX_HEIGHT = 512;
+
+        [Tooltip("Also hand the silhouette above to the runtime as the rear-depth-" +
+                 "budget content mask (XR_DXR_depth_budget v3), so it judges the " +
+                 "desktop behind the CONTENT rather than behind a rectangle around " +
+                 "it. Free — it is the same mask this overlay already reads back for " +
+                 "SetWindowRgn. Turn it off only to A/B the rect path.")]
+        public bool reportContentMask = true;
         // Margin the dilation must reach in WINDOW pixels. Sized for the
         // visual consumer: it absorbs AA edges, sub-pixel mismatch, AND the
         // readback's 1-2 frames of latency while the silhouette moves (a
@@ -1736,6 +1743,22 @@ namespace DisplayXR
                     ptr,
                     m_HitMaskPendingW, m_HitMaskPendingH,
                     m_HitMaskPendingDstW, m_HitMaskPendingDstH);
+
+                // Rear depth budget v3 (#318): the very same silhouette. The runtime
+                // decides how much rear depth this overlay may draw from the desktop
+                // BEHIND THE CONTENT, and until v3 it could only be told a rectangle —
+                // which around a character is roughly three times its area, so most of
+                // what it measured was background the model never covers. This mask is
+                // already unioned over both eyes and already normalised to the window
+                // client rect, which is exactly the grid the extension asks for, so the
+                // whole producer is this call. Native copies and reduces it; inert
+                // against a runtime older than spec v3.
+                if (reportContentMask && DisplayXRProviderDriver.IsActive)
+                {
+                    DisplayXRProviderNative.dxr_prov_set_content_mask(
+                        ptr, (uint)m_HitMaskPendingW, (uint)m_HitMaskPendingH,
+                        (uint)m_HitMaskPendingW);
+                }
             }
             if (s_DumpHitMask && (m_HitMaskDumpCounter++ % 15) == 0)
                 DumpHitMaskPng(data, m_HitMaskPendingW, m_HitMaskPendingH);
@@ -1812,6 +1835,14 @@ namespace DisplayXR
 #if UNITY_STANDALONE_WIN
             if (!Application.isEditor)
                 DisplayXRNative.displayxr_set_overlay_hit_mask(IntPtr.Zero, 0, 0, 0, 0);
+#endif
+            // Drop the rear-depth-budget mask too, or the runtime keeps judging the
+            // desktop behind a silhouette that is no longer being drawn. It ages out
+            // on its own after a second; saying so now is free. Guarded to match the
+            // PUSH above, which is compiled for the editor as well — Play Mode runs
+            // the provider, so an editor session sets this and must also clear it.
+#if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
+            DisplayXRProviderNative.dxr_prov_set_content_mask(IntPtr.Zero, 0, 0, 0);
 #endif
         }
     }

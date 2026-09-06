@@ -99,8 +99,14 @@ build will tell you. One container run catches them all:
   it, and a second filter fights that ramp. Add a **`DisplayXRContentBounds`** to the
   content root so the runtime measures the desktop *behind the content* instead of behind
   the whole window (without it, an empty Notepad's own menu bars keep the budget shut while
-  the avatar is in the opposite corner). `DisplayXRDepthBudget` exposes state/value for
-  HUDs and one log line per state change. Absent extension, older runtime, no background
+  the avatar is in the opposite corner). Against a **spec v3** runtime the provider goes
+  further and chains the SILHOUETTE itself (`XrContentMaskDXR`): a rect around a character
+  is ~3x its area, so most of what a rect has the runtime measure is background the model
+  never covers. The producer is free - `DisplayXRTransparentOverlay` already renders,
+  unions and reads back exactly that mask for `SetWindowRgn`, already window-normalised -
+  so **no app needs a change**; the mask is chained BESIDE the bounds rect so a v2 runtime
+  still gets the rect. Precedence: mask -> bounds -> 3D zones -> whole canvas.
+  `DisplayXRDepthBudget` exposes state/value for HUDs and one log line per state change. Absent extension, older runtime, no background
   source, or an **opaque** session → offset 0 = today's clip-at-the-plane, exactly. The
   opaque case is deliberate: the runtime's transparent flag is fixed at `xrCreateSession`,
   so a budget of 0 can arrive for a session that never composites over the desktop, and the

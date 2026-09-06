@@ -384,6 +384,30 @@ namespace DisplayXR
             float maxX, float maxY, float maxZ,
             float marginNormalized, int enable);
 
+        /// <summary>
+        /// Publish the app's content occupancy <b>mask</b> — the silhouette rather than
+        /// a box around it (<c>XR_DXR_depth_budget</c> v3, #318). A rectangle around a
+        /// character is roughly three times its area, so most of what the runtime would
+        /// measure is background the model never covers; the mask fixes that.
+        /// <para>
+        /// <paramref name="cells"/> is row-major, top-left origin, one byte per cell,
+        /// nonzero = occupied, normalised to the <b>window client rect</b> — which is
+        /// exactly what <see cref="DisplayXRTransparentOverlay"/>'s silhouette readback
+        /// already produces for <c>SetWindowRgn</c>. The bytes are copied (and reduced
+        /// to at most 256 per side with an any-coverage filter), so the buffer need only
+        /// live for the duration of the call: an <c>AsyncGPUReadback</c> NativeArray
+        /// qualifies, a retained pointer to one would not.
+        /// </para>
+        /// <para>
+        /// <paramref name="cells"/> <c>IntPtr.Zero</c>, or a degenerate size, clears it;
+        /// the runtime then falls back to the bounds rect, then the 3D zones, then the
+        /// whole canvas. Inert against a runtime older than spec v3.
+        /// </para>
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void dxr_prov_set_content_mask(
+            System.IntPtr cells, uint w, uint h, uint stride);
+
         /// <summary>Per-zone per-eye foreground clip (#166 multi-zone). Zone 0 = primary,
         /// i>=1 = extra zone i-1. Returns 1 on success.</summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]

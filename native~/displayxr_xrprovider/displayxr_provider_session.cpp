@@ -29,6 +29,8 @@
 #include "displayxr_provider_gfx_metal.h" // Metal blit/texture glue (#204)
 #endif
 
+#include <mutex>
+
 #include <stdio.h>
 #include <stdarg.h>
 #include <stdlib.h>
@@ -293,6 +295,29 @@ typedef struct ProviderSession {
 	float content_bounds_min[3];
 	float content_bounds_max[3];
 	float content_bounds_margin;
+
+	// App-reported content MASK (XR_DXR_depth_budget v3) - the silhouette rather
+	// than a box around it. Written on Unity's main thread from the transparent
+	// overlay's AsyncGPUReadback callback, read on the render thread at submit, so
+	// every access goes through s_mask_mutex. The bytes are OWNED here: the C#
+	// NativeArray backing the readback is valid only inside its callback, while
+	// xrEndFrame runs later on another thread, so the setter reduces and copies
+	// rather than retaining the caller's pointer.
+	// depth_budget_version gates the whole path - an older runtime never sees the
+	// struct, and falls back to the bounds rect it already understands.
+	int      depth_budget_version;
+	uint8_t *content_mask;      // owned, mask_w * mask_h bytes, row-major, top-left
+	uint32_t content_mask_w, content_mask_h;
+	uint32_t content_mask_cap;  // allocated bytes
+	int      content_mask_valid;
+	// Render-thread-private copy handed to xrEndFrame. The runtime reads the cells
+	// DURING that call, so the bytes must not move under it - but holding
+	// s_mask_mutex across xrEndFrame would park Unity's main thread in the readback
+	// callback for however long the compositor takes to weave and present. Copying
+	// ~64 KB under a short lock instead costs microseconds and keeps the two threads
+	// from ever waiting on each other.
+	uint8_t *content_mask_submit;
+	uint32_t content_mask_submit_cap;
 
 	// XR_DXR_atlas_capture (#140): app-facing atlas screenshot (the 'I' key /
 	// DisplayXRScreenshot). Detected in the probe, enabled on the instance, PFN
@@ -627,6 +652,11 @@ typedef struct ProviderSession {
 } ProviderSession;
 
 static ProviderSession s_ps;
+
+// Defined with the rest of the content-mask code further down; declared here because
+// the two s_ps resets (session start's re-seed and session stop) sit above it and
+// must release the mask allocation before memset drops the pointer.
+static void ps_free_content_mask(void);
 static DxrProvLogCallback s_log_cb = NULL;
 
 void dxr_prov_set_log_callback(DxrProvLogCallback cb) { s_log_cb = cb; }
@@ -3840,6 +3870,7 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	uint32_t saved_extra_count = s_ps.extra_zone_count;
 	ProviderExtraZone saved_extra[PS_MAX_ZONES - 1];
 	for (uint32_t i = 0; i < PS_MAX_ZONES - 1; i++) saved_extra[i] = s_ps.extra_zones[i];
+	ps_free_content_mask();
 	memset(&s_ps, 0, sizeof(s_ps));
 	s_ps.single_pass = saved_single_pass;
 	s_ps.single_pass_set = saved_single_pass_set;
@@ -4021,8 +4052,12 @@ int dxr_prov_session_start(const char *runtime_json_path,
 							s_ps.has_local_3d_zone = 1;
 						else if (strcmp(props[i].extensionName, XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME) == 0)
 							s_ps.has_atlas_capture = 1;
-						else if (strcmp(props[i].extensionName, XR_DXR_DEPTH_BUDGET_EXTENSION_NAME) == 0)
+						else if (strcmp(props[i].extensionName, XR_DXR_DEPTH_BUDGET_EXTENSION_NAME) == 0) {
 							s_ps.has_depth_budget = 1;
+							// The spec VERSION, not just the name: v3 adds the content
+							// mask, and chaining it at a v2 runtime would be dead weight.
+							s_ps.depth_budget_version = (int)props[i].extensionVersion;
+						}
 					}
 				}
 				free(props);
@@ -4035,9 +4070,11 @@ int dxr_prov_session_start(const char *runtime_json_path,
 		       s_ps.has_view_rig ? "AVAILABLE" : "not found (no stereo)");
 		ps_log("[DisplayXR-PROV] XR_DXR_atlas_capture: %s\n",
 		       s_ps.has_atlas_capture ? "AVAILABLE" : "no (screenshot inert)");
-		ps_log("[DisplayXR-PROV] XR_DXR_depth_budget: %s\n",
+		ps_log("[DisplayXR-PROV] XR_DXR_depth_budget: %s (spec v%d; content mask %s)\n",
 		       s_ps.has_depth_budget ? "AVAILABLE"
-		                             : "no (foreground clip stays at the display plane)");
+		                             : "no (foreground clip stays at the display plane)",
+		       s_ps.depth_budget_version,
+		       s_ps.depth_budget_version >= 3 ? "supported" : "not supported, bounds rect only");
 		// -1 = "no state logged yet". 0 is a real state (UNRESTRICTED_OPAQUE), so the
 		// memset-to-zero s_ps cannot double as "unknown".
 		s_ps.budget_state_logged = -1;
@@ -4691,6 +4728,7 @@ void dxr_prov_session_stop(void)
 	// Intentionally do NOT FreeLibrary(runtime_lib): background threads may still
 	// reference it (matches the standalone's deliberate leak).
 	void *lib = s_ps.runtime_lib;
+	ps_free_content_mask();
 	memset(&s_ps, 0, sizeof(s_ps));
 	s_ps.runtime_lib = lib;
 }
@@ -5254,6 +5292,52 @@ void dxr_prov_poll_events(void)
 
 #ifdef _WIN32
 static void ps_diag_preclear_bridge_green(void); // defined near submit_frame (probe)
+
+// Longest side of the content mask handed to the runtime (XR_DXR_depth_budget v3).
+// The extension caps a side at 512; the runtime resamples onto its own (much
+// smaller) analysis grid anyway, so paying for more than this buys nothing.
+#define DXR_CONTENT_MASK_MAX 256u
+
+// Guards s_ps.content_mask* — written on Unity's main thread by the silhouette
+// readback, read on the render thread while building xrEndFrame.
+static std::mutex s_mask_mutex;
+
+// s_ps is memset wholesale on session stop and restart, which would drop the mask
+// allocation on the floor (a leak per dock<->undock cycle, and this provider restarts
+// its session on every one). Free it FIRST, under the lock.
+static void ps_free_content_mask(void)
+{
+	std::lock_guard<std::mutex> lk(s_mask_mutex);
+	free(s_ps.content_mask);
+	s_ps.content_mask = NULL;
+	s_ps.content_mask_cap = 0;
+	s_ps.content_mask_valid = 0;
+	free(s_ps.content_mask_submit);
+	s_ps.content_mask_submit = NULL;
+	s_ps.content_mask_submit_cap = 0;
+}
+
+// Take a private copy of the current mask for this frame's xrEndFrame. Returns the
+// cell count (0 = nothing to chain). See content_mask_submit for why this copies
+// rather than lending the producer's buffer under a held lock.
+static uint32_t ps_snapshot_content_mask(uint32_t *out_w, uint32_t *out_h)
+{
+	std::lock_guard<std::mutex> lk(s_mask_mutex);
+	if (!s_ps.content_mask_valid || s_ps.content_mask == NULL) return 0;
+
+	const uint32_t n = s_ps.content_mask_w * s_ps.content_mask_h;
+	if (n == 0) return 0;
+	if (n > s_ps.content_mask_submit_cap) {
+		uint8_t *nb = (uint8_t *)realloc(s_ps.content_mask_submit, n);
+		if (nb == NULL) return 0;
+		s_ps.content_mask_submit = nb;
+		s_ps.content_mask_submit_cap = n;
+	}
+	memcpy(s_ps.content_mask_submit, s_ps.content_mask, n);
+	*out_w = s_ps.content_mask_w;
+	*out_h = s_ps.content_mask_h;
+	return n;
+}
 #endif
 
 // ============================================================================
@@ -5896,6 +5980,63 @@ int dxr_prov_get_rear_budget(int *out_state, float *out_far_offset_vh,
 // then measures the whole canvas, which is the v1 behaviour and the documented
 // fallback. Game thread -> render thread, like dxr_prov_set_tunables: plain scalar
 // stores, torn at worst by one frame of a slowly-moving box.
+// Publish the app's content occupancy MASK (XR_DXR_depth_budget v3, #318). Called
+// from the transparent overlay's silhouette readback, which already produces exactly
+// this artefact for SetWindowRgn - the union over both eyes of the rendered
+// silhouette, covering the whole window client rect.
+//
+// The caller's grid is whatever the overlay's hit mask happens to be (up to 640x512);
+// the extension caps a side at 512 and the runtime resamples anyway, so this reduces
+// by an integer factor to at most DXR_CONTENT_MASK_MAX per side using an ANY-COVERAGE
+// (max) filter. Any-coverage, never average: a thin limb that only partly covers a
+// cell still occupies it, and losing it would let the budget open over a background
+// the limb is actually drawn against.
+//
+// cells == NULL, or a degenerate size, clears the mask and the runtime falls back to
+// the bounds rect.
+void dxr_prov_set_content_mask(const uint8_t *cells, uint32_t w, uint32_t h, uint32_t stride)
+{
+	std::lock_guard<std::mutex> lk(s_mask_mutex);
+
+	if (cells == NULL || w == 0 || h == 0 || stride < w) {
+		s_ps.content_mask_valid = 0;
+		return;
+	}
+
+	// Integer reduction factor so both sides land within the cap.
+	uint32_t f = 1;
+	while ((w + f - 1) / f > DXR_CONTENT_MASK_MAX || (h + f - 1) / f > DXR_CONTENT_MASK_MAX) f++;
+	const uint32_t dw = (w + f - 1) / f;
+	const uint32_t dh = (h + f - 1) / f;
+
+	const uint32_t need = dw * dh;
+	if (need > s_ps.content_mask_cap) {
+		uint8_t *nb = (uint8_t *)realloc(s_ps.content_mask, need);
+		if (nb == NULL) { s_ps.content_mask_valid = 0; return; }
+		s_ps.content_mask = nb;
+		s_ps.content_mask_cap = need;
+	}
+	memset(s_ps.content_mask, 0, need);
+
+	// Max-filter reduce. One pass over the source, writing into the destination cell
+	// it falls in - cheaper than gathering per destination cell and handles a ragged
+	// last row/column without a special case.
+	int any = 0;
+	for (uint32_t y = 0; y < h; y++) {
+		const uint8_t *src = cells + (size_t)y * stride;
+		uint8_t *dst = s_ps.content_mask + (size_t)(y / f) * dw;
+		for (uint32_t x = 0; x < w; x++) {
+			if (src[x]) { dst[x / f] = 1; any = 1; }
+		}
+	}
+
+	s_ps.content_mask_w = dw;
+	s_ps.content_mask_h = dh;
+	// An all-zero mask is "nothing rendered", which the runtime would read as an
+	// empty region; report it as absent instead so it falls back to the bounds rect.
+	s_ps.content_mask_valid = any;
+}
+
 void dxr_prov_set_content_bounds(float min_x, float min_y, float min_z,
                                  float max_x, float max_y, float max_z,
                                  float margin_normalized, int enable)
@@ -6611,6 +6752,24 @@ int dxr_prov_submit_frame(uint32_t image_index)
 		content_bounds.marginNormalized = s_ps.content_bounds_margin;
 		content_bounds.next = ei.next;
 		ei.next = &content_bounds;
+	}
+	// v3 (#318): the silhouette itself, chained BESIDE the bounds rect rather than
+	// instead of it — the runtime prefers the mask and falls back to the rect, so a
+	// v2 runtime (which ignores the unknown struct) still gets the narrowing it
+	// understands. The lock is held across xrEndFrame because the runtime copies the
+	// cells during the call and the readback thread may otherwise realloc under it.
+	XrContentMaskDXR content_mask = {XR_TYPE_CONTENT_MASK_DXR};
+	if (s_ps.depth_budget_version >= 3) {
+		uint32_t mw = 0, mh = 0;
+		if (ps_snapshot_content_mask(&mw, &mh) != 0) {
+			content_mask.width = mw;
+			content_mask.height = mh;
+			content_mask.strideBytes = mw;
+			content_mask.cells = s_ps.content_mask_submit;
+			content_mask.marginNormalized = s_ps.content_bounds_margin;
+			content_mask.next = ei.next;
+			ei.next = &content_mask;
+		}
 	}
 	if (d11_diag) ps_log("[DisplayXR-PROV] D3D11 submit[%u]: pre-xrEndFrame (layers=%u)\n", d11_frames, lc);
 	if (subf_trace) ps_log("[DisplayXR-PROV] submit_frame[%u]: xrEndFrame layers=%u (views n=%u)\n", s_subf_n - 1, lc, n);

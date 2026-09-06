@@ -488,11 +488,20 @@ typedef XrResult(XRAPI_PTR *PFN_xrSetWorkspaceViewRigDXR)(XrSession session, con
 // it. Enable ONLY when enumerated — the extension is the app's opt-in AND the
 // runtime's gate (a session that never enables it costs the runtime nothing).
 #define XR_DXR_DEPTH_BUDGET_EXTENSION_NAME "XR_DXR_depth_budget"
+// This is our FLOOR - the minimum runtime spec version this plugin is designed
+// against - NOT the latest version transcribed below. Do NOT bump it to match the
+// runtime header: the runtime's drift audit derives our published minimum-runtime
+// requirement from this constant, and claiming 3 would demand a runtime nobody
+// needs. v3's XrContentMaskDXR IS declared here, but it is chained only when the
+// runtime reports extensionVersion >= 3, and every path degrades (v3 -> mask,
+// v2 -> the bounds rect, v1 or absent -> the whole canvas).
 #define XR_DXR_depth_budget_SPEC_VERSION 2
 
 #define XR_TYPE_REAR_DEPTH_BUDGET_DXR                          ((XrStructureType)1004999260)
 #define XR_TYPE_CONTENT_BOUNDS_DXR                             ((XrStructureType)1004999261)
 #define XR_TYPE_EVENT_DATA_REAR_DEPTH_BUDGET_STATE_CHANGED_DXR ((XrStructureType)1004999262)
+// v3: the app's content OCCUPANCY MASK - the silhouette, not a box.
+#define XR_TYPE_CONTENT_MASK_DXR                               ((XrStructureType)1004999263)
 
 // Why the runtime is handing out the budget it is handing out.
 typedef enum XrRearDepthBudgetStateDXR {
@@ -540,6 +549,40 @@ typedef struct XrContentBoundsDXR {
     // runtime's own default. 0 = the runtime default alone.
     float marginNormalized;
 } XrContentBoundsDXR;
+
+// INPUT (v3): the app's content OCCUPANCY MASK for this frame - the union over ALL
+// views of its rendered silhouette. Chain on XrFrameEndInfo::next, beside or instead
+// of XrContentBoundsDXR.
+//
+// Why a mask at all: XrContentBoundsDXR is a RECTANGLE, and a rectangle around a
+// character-shaped silhouette is roughly three times its area, so most of what the
+// runtime measures is background the model never covers - and any horizontal
+// structure in that surplus closes the clip. Found on the panel: even a fully
+// tightened box was 146 of 202 preview cells wide around a humanoid.
+//
+// Grid: row-major, top-left origin, WINDOW-CLIENT-normalised extent - cell (x, y)
+// covers [x/width, (x+1)/width) x [y/height, (y+1)/height) of the window client rect
+// (the same frame as XrContentBoundsDXR; a zoned app writes its zone's silhouette
+// into the window grid and leaves the rest 0). Nonzero = content occupies the cell.
+// The runtime copies the cells during xrEndFrame, so the pointer need only stay
+// valid until xrEndFrame returns.
+//
+// Runtime precedence, most specific first, each falling back to the next when
+// absent, all-zero or stale (> 1 s): mask -> XrContentBoundsDXR -> the 3D display
+// zones -> the whole canvas. The runtime resamples onto its own analysis grid with
+// an any-coverage filter, clamps to the 3D zones and dilates by the disparity band
+// before measuring; only masked cells count.
+typedef struct XrContentMaskDXR {
+    XrStructureType type; // Must be XR_TYPE_CONTENT_MASK_DXR
+    const void *next;
+    uint32_t width;            // 1..512 cells
+    uint32_t height;           // 1..512 cells
+    uint32_t strideBytes;      // >= width
+    const uint8_t *cells;      // width x height bytes, nonzero = occupied
+    // Extra dilation the app wants, in window-normalised units. 0 = the runtime
+    // default alone.
+    float marginNormalized;
+} XrContentMaskDXR;
 
 // EVENT: emitted on every STATE change (never on ramp progress). The provider does
 // not consume it - the authoritative value is the one that came back from the
