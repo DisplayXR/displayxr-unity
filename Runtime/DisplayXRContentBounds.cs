@@ -86,6 +86,21 @@ namespace DisplayXR
         [Tooltip("Manual content box in this transform's LOCAL space (center + size).")]
         public Bounds manualBounds = new Bounds(Vector3.zero, Vector3.one);
 
+        [Tooltip("Ask skinned meshes for their REAL per-frame bounds instead of the " +
+                 "static import-time box.\n\n" +
+                 "Unity's default SkinnedMeshRenderer.bounds is the box baked at import " +
+                 "to cover the WHOLE animation set — for a humanoid that is arms-out, " +
+                 "which stays arms-out no matter what the avatar is doing. Reporting " +
+                 "that hands the runtime a region far wider than the character, so busy " +
+                 "desktop nowhere near the silhouette closes the clip. Setting " +
+                 "updateWhenOffscreen makes Unity compute the actual skinned bounds each " +
+                 "frame.\n\n" +
+                 "Cost: the real bounds are computed every frame and the renderer is no " +
+                 "longer frustum-culled. For the handful of avatars a transparent " +
+                 "overlay shows, that is the right trade; turn it off for a scene with " +
+                 "many skinned meshes that are usually off screen.")]
+        public bool tightSkinnedBounds = true;
+
         [Tooltip("Extra dilation to ask the runtime for, in canvas-normalised units " +
                  "(0.05 = 5% of the canvas), ON TOP of the runtime's own default " +
                  "margin. 0 = the runtime default alone, which is the right answer " +
@@ -110,6 +125,9 @@ namespace DisplayXR
         private readonly List<Renderer> m_Cache = new List<Renderer>();
         private float m_NextRescanTime;
         private bool m_WarnedNotOwner;
+        // Skinned meshes whose updateWhenOffscreen we turned on, with what it was, so
+        // OnDisable puts the scene back exactly as it was found.
+        private readonly List<SkinnedMeshRenderer> m_Tightened = new List<SkinnedMeshRenderer>();
 
         void OnEnable()
         {
@@ -140,6 +158,7 @@ namespace DisplayXR
                 PushDisable();
             }
             LastReportValid = false;
+            RestoreSkinnedBounds();
         }
 
         /// <summary>
@@ -150,9 +169,39 @@ namespace DisplayXR
         public void RefreshRenderers()
         {
             m_NextRescanTime = Time.unscaledTime + rendererRescanInterval;
-            if (renderers != null && renderers.Length > 0) return; // explicit list wins
-            m_Cache.Clear();
-            GetComponentsInChildren(includeInactiveRenderers, m_Cache);
+            if (renderers == null || renderers.Length == 0)
+            {
+                m_Cache.Clear();
+                GetComponentsInChildren(includeInactiveRenderers, m_Cache);
+            }
+            ApplyTightSkinnedBounds();
+        }
+
+        // Make SkinnedMeshRenderer.bounds mean "where this character actually is".
+        // Unity's default is the box baked at import to cover the whole animation set —
+        // arms-out for a humanoid — and it never changes as the avatar moves, so the
+        // reported region stays a T-pose-wide rectangle around a character standing with
+        // its arms down. Measured on the panel: 81% of the window width for an avatar
+        // occupying far less. updateWhenOffscreen makes Unity skin the real bounds each
+        // frame; the previous value is remembered so OnDisable can restore it.
+        private void ApplyTightSkinnedBounds()
+        {
+            if (!tightSkinnedBounds) return;
+            var list = (renderers != null && renderers.Length > 0) ? (IList<Renderer>)renderers : m_Cache;
+            for (int i = 0; i < list.Count; i++)
+            {
+                if (!(list[i] is SkinnedMeshRenderer smr)) continue;
+                if (smr.updateWhenOffscreen || m_Tightened.Contains(smr)) continue;
+                smr.updateWhenOffscreen = true;
+                m_Tightened.Add(smr);
+            }
+        }
+
+        private void RestoreSkinnedBounds()
+        {
+            for (int i = 0; i < m_Tightened.Count; i++)
+                if (m_Tightened[i] != null) m_Tightened[i].updateWhenOffscreen = false;
+            m_Tightened.Clear();
         }
 
         // LateUpdate, not Update: the content has finished moving for the frame, so the
