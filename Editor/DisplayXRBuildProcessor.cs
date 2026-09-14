@@ -128,6 +128,17 @@ namespace DisplayXR.Editor
             sb.AppendLine($"  \"name\": {JsonEscape(appName)},");
             sb.Append($"  \"type\": \"3d\"");
 
+            // (#322) Always declare that this engine gates rendering on a shown
+            // window. The shell launches a 3D app SW_HIDE unless the manifest says
+            // otherwise, and Unity does not draw while its main window is hidden —
+            // so a player without this key submits black eye slices with an
+            // otherwise perfect session. This processor only ever writes manifests
+            // for Unity players, so the flag is unconditional, and it must be in
+            // BOTH bodies: the sidecar feeds the CLI launch path, the registered
+            // manifest feeds the launcher path.
+            sb.AppendLine(",");
+            sb.Append($"  \"engine_render_gated\": true");
+
             if (!string.IsNullOrEmpty(exePath))
             {
                 sb.AppendLine(",");

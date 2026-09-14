@@ -5,6 +5,11 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **Every dev build launched by the shell rendered a black tile (#322).** The post-build processor wrote both manifest bodies — the `<exe>.displayxr.json` sidecar next to the player and the registered `%LOCALAPPDATA%\DisplayXR\apps\*.displayxr.json` — without `"engine_render_gated": true`. The shell launches a 3D app `SW_HIDE` unless that key says the engine gates rendering on a shown window, and Unity does: a hidden player keeps acquiring, releasing and `xrEndFrame`-ing the swapchain with a perfect-looking session while the eye slices stay black. Only the `displayxr-unity-samples` NSIS installer added the key by hand, which is why an installed sample worked and a fresh build of the same scene did not. The processor now emits the flag unconditionally in both bodies — it only ever writes manifests for Unity players, and the flag is harmless on the launcher path. Nothing else about the JSON shape or field order changes.
+
 ## [2.19.1] - 2026-09-07
 
 ### Fixed
