@@ -181,6 +181,20 @@ namespace DisplayXR
         public static extern void displayxr_get_overlay_size(out int width, out int height);
 
         /// <summary>
+        /// (issue #323) The size in pixels this app is actually composited at
+        /// when the runtime — not the OS window — owns it: the live workspace
+        /// tile canvas the provider polls and sizes the eye swapchain from.
+        /// Returns 1 with width/height filled when a tile size is known, 0
+        /// otherwise (no workspace controller, tile slot not bound yet, older
+        /// runtime) — then keep using Screen.*. Under the shell Unity's main
+        /// window is minimized and never follows the tile, so Screen.* is
+        /// frozen at the launch size. Pixels only; carries no DPI space.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int displayxr_get_render_canvas_size(
+            out uint width, out uint height);
+
+        /// <summary>
         /// Get shell-mode mouse button state from native WM_INPUT tracking.
         /// Buttons: bit 0 = left, bit 1 = right, bit 2 = middle.
         /// </summary>
