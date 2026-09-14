@@ -293,3 +293,27 @@ displayxr_set_transparent_background(int enabled)
 		displayxr_precloak_unity_main_window();
 #endif
 }
+
+// --- Render canvas size (C# P/Invoke, #323) ---
+// Provided by the provider session (#225): the last polled workspace-tile canvas
+// px, or 0 when this app is not a tile / the slot has not bound / the runtime is
+// older. The provider re-polls it every reconcile, so this is the same value the
+// eye swapchain is sized from — which is the point: under the shell Unity's own
+// window is minimized and Screen.* is frozen at the launch size, so anything that
+// needs the live composited size (the wsui overlay RT's aspect) has to read it
+// here instead. Pixels only — no Win32 geometry call, so no DPI-space question
+// for the managed caller. Plain reads of the provider's cached px, matching the
+// neighbouring displayxr_get_overlay_size which calls the same accessor from
+// Unity's main thread.
+extern "C" int dxr_prov_workspace_tile_size(uint32_t *w, uint32_t *h);
+
+DISPLAYXR_EXPORT int
+displayxr_get_render_canvas_size(uint32_t *out_w, uint32_t *out_h)
+{
+	uint32_t w = 0, h = 0;
+	if (!dxr_prov_workspace_tile_size(&w, &h) || w == 0 || h == 0)
+		return 0;
+	if (out_w) *out_w = w;
+	if (out_h) *out_h = h;
+	return 1;
+}

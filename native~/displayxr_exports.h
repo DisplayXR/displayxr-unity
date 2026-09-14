@@ -122,6 +122,17 @@ DISPLAYXR_EXPORT void displayxr_macos_set_window_borderless(int enabled);
 /// Callable from C# via P/Invoke.
 DISPLAYXR_EXPORT int displayxr_is_shell_mode(void);
 
+/// (#323) The size in pixels the app is actually composited at, when the
+/// runtime — not the OS window — owns it: the live workspace-tile canvas the
+/// provider polls (and sizes the eye swapchain from). Returns 1 and fills
+/// *w/*h when a tile size is known, 0 otherwise (not running under a
+/// workspace controller, tile slot not yet bound, or an older runtime) — in
+/// which case the caller keeps using its own window size. Under the shell
+/// Unity's main window is minimized and never follows the tile, so Screen.*
+/// is frozen at the launch size; this is the value to derive a panel aspect
+/// from. Pixels only, no Win32 geometry, so the answer carries no DPI space.
+DISPLAYXR_EXPORT int displayxr_get_render_canvas_size(uint32_t *w, uint32_t *h);
+
 /// Get shell-mode mouse button state (from WM_INPUT usButtonFlags).
 /// Returns current button mask: bit 0 = left, bit 1 = right, bit 2 = middle.
 /// Also returns mouse position (client coords from shell-forwarded WM_MOUSEMOVE).

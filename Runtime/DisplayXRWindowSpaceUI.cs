@@ -98,6 +98,14 @@ namespace DisplayXR
         // sub-pixel aspect wobble must not churn the RT.
         private const float kAspectTolerance = 0.01f;
 
+        // Where the live panel size comes from (#323): the workspace tile canvas the
+        // provider polls, or Unity's own window. Logged once per switch.
+        private const int kPanelSizeNone = 0;
+        private const int kPanelSizeTile = 1;
+        private const int kPanelSizeScreen = 2;
+        private int m_PanelSizeSource = kPanelSizeNone;
+        private int m_ShellMode = -1; // -1 = not yet queried
+
         // We park the WorldSpace canvas at this fixed position, far from any
         // scene content, so the dedicated camera looking at it sees nothing
         // else that might bleed into our RT.
@@ -473,16 +481,88 @@ namespace DisplayXR
 
         private bool TryGetPanelPixelSize(out float pw, out float ph)
         {
+            float cw = 0f, ch = 0f;
+            int source = kPanelSizeNone;
+
+            // Workspace tile (#323): under the shell Unity's window is launched
+            // minimized and never follows the tile, so Screen.* is frozen at the
+            // launch size while the runtime composites us into a tile of a
+            // different aspect — the eye swapchain tracks it (the provider polls
+            // the tile canvas every reconcile) and the overlay RT did not, so the
+            // runtime's stretch into the panel rect stopped being the identity and
+            // the UI came out squeezed. Read the same tile canvas the provider
+            // sizes the eye swapchain from. Returns 0 before the tile slot binds
+            // and on every non-shell path, which falls through to Screen.* below.
+            if (IsShellMode && TryGetTileCanvasSize(out float tw, out float th))
+            {
+                cw = tw; ch = th;
+                source = kPanelSizeTile;
+            }
             // Built-app / Play Mode: the runtime composites into Unity's main
             // window, so Screen.* is meaningful.
-            if (Screen.width > 0 && Screen.height > 0)
+            else if (Screen.width > 0 && Screen.height > 0)
             {
-                pw = Screen.width * Mathf.Clamp01(width);
-                ph = Screen.height * Mathf.Clamp01(height);
+                cw = Screen.width; ch = Screen.height;
+                source = kPanelSizeScreen;
+            }
+
+            if (source == kPanelSizeNone)
+            {
+                pw = ph = 0f;
+                return false;
+            }
+
+            // One line per switch (startup, and if the tile slot binds late) — never
+            // per frame: this runs twice a frame via ComputeRtSize.
+            if (source != m_PanelSizeSource)
+            {
+                m_PanelSizeSource = source;
+                Debug.Log($"[DisplayXR] wsui: panel size source = " +
+                          $"{(source == kPanelSizeTile ? "workspace tile" : "Screen.*")} " +
+                          $"({cw}x{ch})");
+            }
+
+            pw = cw * Mathf.Clamp01(width);
+            ph = ch * Mathf.Clamp01(height);
+            return true;
+        }
+
+        // The live workspace-tile canvas in px, or false when there is no tile size
+        // yet (slot not bound, older runtime, or no native binary at all in the
+        // editor before a Play session).
+        private bool TryGetTileCanvasSize(out float w, out float h)
+        {
+            w = h = 0f;
+            try
+            {
+                if (DisplayXRNative.displayxr_get_render_canvas_size(
+                        out uint tw, out uint th) == 0 || tw == 0 || th == 0)
+                    return false;
+                w = tw; h = th;
                 return true;
             }
-            pw = ph = 0f;
-            return false;
+            catch (System.EntryPointNotFoundException) { return false; }
+            catch (System.DllNotFoundException) { return false; }
+        }
+
+        // Shell mode is fixed for the process (an env var read at load), so cache it
+        // rather than P/Invoking twice a frame. An older native binary without the
+        // export would throw per call, so a missing entry point also latches here.
+        private bool IsShellMode
+        {
+            get
+            {
+                if (m_ShellMode < 0)
+                {
+                    try
+                    {
+                        m_ShellMode = DisplayXRNative.displayxr_is_shell_mode() != 0 ? 1 : 0;
+                    }
+                    catch (System.EntryPointNotFoundException) { m_ShellMode = 0; }
+                    catch (System.DllNotFoundException) { m_ShellMode = 0; }
+                }
+                return m_ShellMode > 0;
+            }
         }
 
         // The RT size to use right now: authored resolution, or (matchPanelAspect) the
