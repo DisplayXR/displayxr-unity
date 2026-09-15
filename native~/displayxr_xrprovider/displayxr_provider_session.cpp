@@ -1141,6 +1141,30 @@ static DXGI_FORMAT ps_sc_dxgi_format(int64_t f)
 	default: return DXGI_FORMAT_R8G8B8A8_UNORM; // 28
 	}
 }
+
+// Format for the D3D11 per-eye bridge textures Unity renders into, which submit copies into
+// the runtime's swapchain image with CopySubresourceRegion.
+//
+// The runtime hands out its swapchain images as TYPELESS (observed: R8G8B8A8_TYPELESS for a
+// swapchain created with either 28 or 29). Copying a *_UNORM source into that TYPELESS
+// destination is fine, but a *_UNORM_SRGB source — which is what a Linear project's sRGB
+// swapchain format produced here — faults inside the NVIDIA D3D11 UMD, taking the player
+// down (and showing a black panel on the frames before it does).
+//
+// Allocate the bridge as the TYPELESS parent of the swapchain format instead: it is the same
+// format family, so the copy is trivially legal, and TYPELESS is also what D3D11 requires of a
+// resource that must carry an sRGB render-target view — which is exactly what Unity builds
+// when the eye texture is declared with kUnityXRRenderTextureFlagsSRGB. Gamma projects are
+// unaffected: 28 and 29 both map to the same TYPELESS parent, so the copy they already did
+// keeps working.
+static DXGI_FORMAT ps_bridge_dxgi_format(int64_t f)
+{
+	switch (f) {
+	case 87:
+	case 91: return DXGI_FORMAT_B8G8R8A8_TYPELESS;
+	default: return DXGI_FORMAT_R8G8B8A8_TYPELESS; // 28 / 29
+	}
+}
 #endif
 
 static int ps_create_swapchain(void)
@@ -1743,12 +1767,16 @@ static int ps_alloc_shared_tex(uint32_t w, uint32_t h, UINT16 arr,
 // texture and submit does a SAME-device CopyResource into the acquired runtime swapchain
 // image (no own device, no shared handle, no fence — the session is already bound on
 // Unity's ID3D11Device, so the runtime and Unity share it). fmt: 87=BGRA8, else RGBA8.
-static ID3D11Texture2D *ps_alloc_unity_tex(uint32_t w, uint32_t h, uint32_t arr, int64_t fmt)
+// typeless: allocate the TYPELESS parent of fmt instead of the concrete format. Set for the
+// per-eye eye targets (see ps_bridge_dxgi_format); the secondary layers keep the concrete
+// format they have always used.
+static ID3D11Texture2D *ps_alloc_unity_tex(uint32_t w, uint32_t h, uint32_t arr, int64_t fmt,
+                                           int typeless = 0)
 {
 	if (!s_ps.unity_d3d11_device || w == 0 || h == 0 || arr == 0) return NULL;
 	D3D11_TEXTURE2D_DESC td = {};
 	td.Width = w; td.Height = h; td.MipLevels = 1; td.ArraySize = arr;
-	td.Format = ps_sc_dxgi_format(fmt);
+	td.Format = typeless ? ps_bridge_dxgi_format(fmt) : ps_sc_dxgi_format(fmt);
 	td.SampleDesc.Count = 1;
 	td.Usage = D3D11_USAGE_DEFAULT;
 	td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
@@ -1929,7 +1957,7 @@ static int ps_create_bridge_d3d11(void)
 	if (sp) return 1; // Unity renders straight into the runtime images; nothing to allocate.
 	if (s_ps.d3d11_bridge_unity_eye[0]) return 1; // already created
 	for (int e = 0; e < 2; e++) {
-		s_ps.d3d11_bridge_unity_eye[e] = ps_alloc_unity_tex(w, h, 1, s_ps.sc_format);
+		s_ps.d3d11_bridge_unity_eye[e] = ps_alloc_unity_tex(w, h, 1, s_ps.sc_format, /*typeless=*/1);
 		if (!s_ps.d3d11_bridge_unity_eye[e]) {
 			ps_log("[DisplayXR-PROV] D3D11 zero-copy MultiPass eye %d target alloc failed\n", e);
 			return 0;
