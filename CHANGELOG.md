@@ -5,6 +5,14 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.19.3] - 2026-09-15
+
+### Fixed
+- **D3D11 + Linear color space: black panel, then a crash inside the NVIDIA D3D11 driver (#326).** A Linear project takes the sRGB swapchain path (`dxr_prov_set_color_space_linear` → `want_srgb`), and the D3D11 zero-copy MultiPass path then allocated its per-eye bridge textures with that same concrete format, `R8G8B8A8_UNORM_SRGB`. But the runtime hands its swapchain images back as `R8G8B8A8_TYPELESS`, so submit ended up calling `CopySubresourceRegion` with an `_UNORM_SRGB` source against a TYPELESS destination — which faults inside `nvwgf2umx`, taking the player down, with a black panel on the frames before it goes because the eye content never reaches the swapchain image. The per-eye bridge is now allocated as the **TYPELESS parent** of the swapchain format: same format family, so the copy is trivially legal, and TYPELESS is also what D3D11 requires of a resource that has to carry the sRGB render-target view Unity builds for an eye texture declared `kUnityXRRenderTextureFlagsSRGB`. Gamma projects are unchanged (28 and 29 share that TYPELESS parent), and D3D12 was never affected — it uses the own-device shared bridge rather than this same-device copy. Scoped to the eye targets only: `ps_sc_dxgi_format()` is untouched, so the swapchain itself, wsui, Local2D and the zone layers keep the concrete formats they have always used. The editor own-device NT-handle bridge (`ps_alloc_shared_tex_d3d11`) is deliberately left alone. Contributed by Byungju Lee.
+
+### Changed
+- Documentation: the depth-budget content mask is the **unclipped** silhouette, not the click-through region (`displayxr-runtime#1470`, spec v4) — the plugin is v4-correct by construction because the shared producer rasterises pre-clip geometry with the far plane defeated, never a post-clip alpha readback (#325).
+
 ## [2.19.2] - 2026-09-14
 
 ### Fixed
