@@ -484,9 +484,12 @@ typedef XrResult(XRAPI_PTR *PFN_xrSetWorkspaceViewRigDXR)(XrSession session, con
 // there); the provider derives its own vH in that case.
 //
 // Source of truth: displayxr-runtime/src/external/openxr_includes/openxr/
-// XR_DXR_depth_budget.h (SPEC_VERSION 2). These declarations are byte-identical to
-// it. Enable ONLY when enumerated — the extension is the app's opt-in AND the
-// runtime's gate (a session that never enables it costs the runtime nothing).
+// XR_DXR_depth_budget.h (SPEC_VERSION 4). These declarations are byte-identical to
+// it - v3 added XrContentMaskDXR and v4 changed only the WORDING of what that mask
+// must contain (see the struct below), so no layout has moved since v2 and no
+// consumer needs a recompile. Enable ONLY when enumerated — the extension is the
+// app's opt-in AND the runtime's gate (a session that never enables it costs the
+// runtime nothing).
 #define XR_DXR_DEPTH_BUDGET_EXTENSION_NAME "XR_DXR_depth_budget"
 // This is our FLOOR - the minimum runtime spec version this plugin is designed
 // against - NOT the latest version transcribed below. Do NOT bump it to match the
@@ -550,9 +553,29 @@ typedef struct XrContentBoundsDXR {
     float marginNormalized;
 } XrContentBoundsDXR;
 
-// INPUT (v3): the app's content OCCUPANCY MASK for this frame - the union over ALL
-// views of its rendered silhouette. Chain on XrFrameEndInfo::next, beside or instead
-// of XrContentBoundsDXR.
+// INPUT (v3, semantics clarified in v4): the app's content OCCUPANCY MASK for this
+// frame - the union over ALL views of the silhouette of the content subject to the
+// rear budget, rasterised IGNORING the far clip, i.e. AS IT WOULD RENDER AT AN
+// UNRESTRICTED BUDGET. Chain on XrFrameEndInfo::next, beside or instead of
+// XrContentBoundsDXR.
+//
+// THE MASK MUST NOT BE A FUNCTION OF THE BUDGET THE RUNTIME PUBLISHED. v3's original
+// wording ("its rendered silhouette") made it one, and that closes a feedback loop:
+// clipped -> a small silhouette over a quiet patch of desktop -> the budget opens ->
+// the rear half appears -> the silhouette grows over a busy patch -> the budget
+// closes -> round again, roughly once a second on a STATIC desktop
+// (displayxr-runtime#1470; v4 says it explicitly, and runtimes ratchet the measured
+// region as a floor for apps still shipping the clipped one). This mirrors the
+// bounds rule exactly: geometry the CURRENT budget happens to be clipping away still
+// belongs in the mask.
+//
+// So the mask and the app's CLICK-THROUGH window region are NOT the same artefact in
+// general - the window region keeps the clipped alpha, because that one is about
+// which pixels were actually painted. They coincide in THIS plugin only because the
+// shared producer (DisplayXRTransparentOverlay's silhouette pass) rasterises PRE-CLIP
+// GEOMETRY rather than reading back post-clip alpha; see the z-pin in
+// Runtime/Resources/DisplayXRSilhouette.shader. Deriving either one from the swapchain
+// alpha would reintroduce #1470.
 //
 // Why a mask at all: XrContentBoundsDXR is a RECTANGLE, and a rectangle around a
 // character-shaped silhouette is roughly three times its area, so most of what the

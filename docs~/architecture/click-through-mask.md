@@ -53,6 +53,35 @@ DisplayXRTransparentOverlay.LateUpdate (C#)                 native (win32.c)
   displays a column-by-column union of the eyes; a cyclopean-only mask is narrower than the
   visible silhouette on high-disparity foreground geometry (hands, hat) and would clip.
 
+## The mask's second consumer: the rear depth budget
+
+The very same readback is chained to the runtime as **`XrContentMaskDXR`**
+(`XR_DXR_depth_budget` v3+, `DisplayXRTransparentOverlay.OnHitMaskReadback` →
+`dxr_prov_set_content_mask`, opt out with `reportContentMask`). It tells the runtime
+*which patch of desktop to measure* when deciding how much rear depth this overlay may
+draw. Sharing one artefact is what made v3 free here — but the two consumers have
+**different contracts**, and only one of them is satisfied by a rendered image:
+
+| Consumer | What it must describe |
+|---|---|
+| `SetWindowRgn` click-through region | which pixels were **actually painted** — post-clip alpha is correct |
+| `XrContentMaskDXR` (spec **v4**) | the silhouette **as it would render at an unrestricted budget** — the far clip must be **ignored** |
+
+If the depth-budget mask is derived from the *rendered* (post-far-clip) content, the clip
+state feeds back into the runtime's measurement and the rear clip oscillates roughly once
+a second on a completely static desktop — `DisplayXR/displayxr-runtime#1470`, which is
+what drove spec v4.
+
+**This plugin satisfies v4 by construction and must keep doing so.** The silhouette pass
+rasterises **pre-clip geometry** (`CommandBuffer.DrawRenderer` of `clickableRenderers`)
+with `ZTest Always` and the clip-space z pinned to mid-frustum, so no near/far plane can
+touch it (`Runtime/Resources/DisplayXRSilhouette.shader`); the depth-budget foreground
+clip is an entirely separate fragment-discard pass over the *camera's colour target*
+(`_DXRForegroundFar` / `_DXRRearOffset`) and never runs over the mask RT. **Do not
+replace this pass with a swapchain-alpha readback** to save a draw — that is precisely
+the change that reintroduces #1470. Content bounds (`DisplayXRContentBounds`) are
+likewise geometry-derived (`Renderer.bounds`) and clip-independent.
+
 ## The alignment invariant (the one thing that must hold)
 
 The mask is rasterized **full-window** (in overlay client pixels), but the woven 3D content
@@ -131,6 +160,8 @@ is woven.
 | File | Role |
 |---|---|
 | `Runtime/DisplayXRTransparentOverlay.cs` | C# per-eye silhouette render + async readback (`RenderHitMaskAndRequestReadback`, `OnHitMaskReadback`); `DumpHitMaskPng` (`DXR_DUMP_HIT_MASK=1`). |
+| `Runtime/Resources/DisplayXRSilhouette.shader` | The silhouette rasteriser. Its clip-space z pin is what keeps the mask independent of the near/far planes — and therefore of the rear depth budget (spec v4 / runtime#1470). |
+| `Runtime/DisplayXRDepthBudget.cs`, `Runtime/DisplayXRContentBounds.cs` | The other half of the second consumer: the published budget, and the (geometry-derived, clip-independent) bounds rect chained beside the mask. |
 | `native~/displayxr_win32.c` | `displayxr_set_overlay_hit_mask` — stamp mask into the target rect → `ExtCreateRegion` → `SetWindowRgn`; `region_target_hwnd`/`region_target_ready`. |
 | `native~/displayxr_native_shared.cpp` | `displayxr_get_canvas_rect_px` (reader) + `displayxr_set_canvas_rect` (writer, re-homed in #166) over the `s_canvas_rect` statics. |
 | `native~/displayxr_xrprovider/displayxr_provider_session.cpp` | `dxr_prov_get_zone_count`/`dxr_prov_get_zone_rect_px` (multi-zone rects); `dxr_prov_set_3d_zone_rect` (zone weave); publishes the stereo matrices the mask reads. |

@@ -106,6 +106,15 @@ build will tell you. One container run catches them all:
   unions and reads back exactly that mask for `SetWindowRgn`, already window-normalised -
   so **no app needs a change**; the mask is chained BESIDE the bounds rect so a v2 runtime
   still gets the rect. Precedence: mask -> bounds -> 3D zones -> whole canvas.
+  **The mask and the click-through region are not necessarily one artefact.** The window
+  region is about which pixels were *painted*, so post-clip alpha is right for it; the
+  depth-budget mask must be the silhouette at an **unrestricted** budget (spec v4), or the
+  clip state feeds back into what the runtime measures and the rear clip oscillates ~1 Hz
+  on a static desktop (`displayxr-runtime#1470`). They coincide here only because the
+  shared producer rasterises **pre-clip geometry** with the far defeated (the z-pin in
+  `Runtime/Resources/DisplayXRSilhouette.shader`) rather than reading back swapchain alpha
+  — so this plugin is v4-correct by construction. Do not "optimise" that pass into an
+  alpha readback.
   `DisplayXRDepthBudget` exposes state/value for HUDs and one log line per state change. Absent extension, older runtime, no background
   source, or an **opaque** session → offset 0 = today's clip-at-the-plane, exactly. The
   opaque case is deliberate: the runtime's transparent flag is fixed at `xrCreateSession`,
