@@ -6430,7 +6430,49 @@ int dxr_prov_submit_frame(uint32_t image_index)
 	}
 	s_ps.frame_begun = 0;
 
-	uint32_t submit_n = s_ps.sc_view_count >= 2 ? 2 : 1;
+	// How many views this frame's projection layer carries. Derived from the ACTIVE
+	// rendering mode HERE, at submit, NOT inherited from s_ps.sc_view_count.
+	//
+	// Why (runtime #1486): under XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO — which is
+	// what this provider begins with (dxr_prov_poll_events, SESSION_STATE_READY) —
+	// xrEndFrame now accepts exactly 2 views, or 1 ONLY while the active rendering mode
+	// is itself 1-view and the instance enabled XR_DXR_display_info (it always does).
+	// A 1-view submission in a 2-view mode is XR_ERROR_VALIDATION_FAILURE where it used
+	// to be silently flat-blitted. So 2 is always legal and 1 never is unless the mode
+	// says so — which makes the mode, not a latch, the only safe source for the count.
+	//
+	// s_ps.sc_view_count is a SHADOW of the mode latched at swapchain create
+	// (ps_create_swapchain) and refreshed only by ps_reconcile_primary(). That refresh
+	// is skippable and can lag by frames:
+	//   - ps_reconcile_primary() early-returns on a 0-size target (minimised window,
+	//     unresolved zone rect) BEFORE it ever compares the view count;
+	//   - dxr_prov_reconcile_size() returns early while a frame is begun;
+	//   - a failed ps_recreate_primary_swapchain() leaves the old value in place;
+	//   - on macOS the mode event is polled from the MAIN thread
+	//     (DisplayXRProviderDriver.LateUpdate) while this runs on the render thread.
+	// The mode read below is still the provider's cached active_mode_index, so the
+	// residual window is the event-delivery latency itself — but it is the freshest
+	// value we hold, and every path above that used to widen it is closed.
+	//
+	// Clamped to the slices we actually allocated (arraySize, always 2), so we can
+	// never submit more views than Unity rendered. Raising the count to 2 is always
+	// safe content-wise: the render topology is fixed at 2 (GfxPopulateNextFrameDesc
+	// always fills both SPI slices / both MultiPass passes) whatever the mode.
+	uint32_t submit_n = ps_active_view_count();
+	if (s_ps.sc_array > 0 && submit_n > s_ps.sc_array) submit_n = s_ps.sc_array;
+	if (submit_n < 1) submit_n = 1;
+	if (submit_n != s_ps.sc_view_count) {
+		// Transient by construction (the next reconcile reallocs the tile to match),
+		// but it is exactly the window that used to produce a rejected xrEndFrame —
+		// so record it, hard-capped so it can never become a per-frame log.
+		static unsigned s_vc_skew_logged = 0;
+		if (s_vc_skew_logged < 8) {
+			s_vc_skew_logged++;
+			ps_log("[DisplayXR-PROV] submit views %u (active mode) != swapchain latch %u "
+			       "— submitting the mode's count (#1486)\n",
+			       submit_n, s_ps.sc_view_count);
+		}
+	}
 	// D3D12: Unity rendered both eyes into the shared BRIDGE on its device (topology is
 	// fixed at 2 views). Copy the SUBMITTED slices into the acquired runtime swapchain
 	// image on our own device, fence-synced against Unity's render (shared fence below).
@@ -6614,8 +6656,8 @@ int dxr_prov_submit_frame(uint32_t image_index)
 	}
 	if (d11_diag) ps_log("[DisplayXR-PROV] D3D11 submit[%u]: released, building layers\n", d11_frames);
 
-	// Build the projection layer. Submit sc_view_count views (#172 P4): 2 in stereo 3D
-	// (array layers 0/1), 1 in hardware 2D (layer 0 only = a single full-res tile). The
+	// Build the projection layer. Submit the ACTIVE mode's view count (#172 P4, #1486):
+	// 2 in stereo 3D (array layers 0/1), 1 in hardware 2D (layer 0 only = a single tile). The
 	// runtime composites only the submitted views, so 2D shows one clean view (no weave
 	// ghost) even though Unity rendered both eyes into the 2-slice bridge.
 	uint32_t n = submit_n;

@@ -13,8 +13,14 @@ extern "C" {
 #endif
 
 // --- XR_DXR_display_info ---
+// This header is a HAND-WRITTEN mirror of the runtime's
+// src/external/openxr_includes/openxr/XR_DXR_display_info.h — it carries only the
+// constants and structs the provider actually uses, so the version below tracks the
+// runtime header it was last reconciled against, not everything that header defines.
+// The runtime spells the macro XR_DXR_display_info_SPEC_VERSION; the mirror's
+// all-caps spelling is kept for source compatibility with the provider TUs.
 #define XR_DXR_DISPLAY_INFO_EXTENSION_NAME "XR_DXR_display_info"
-#define XR_DXR_DISPLAY_INFO_SPEC_VERSION 12
+#define XR_DXR_DISPLAY_INFO_SPEC_VERSION 19
 
 #define XR_TYPE_DISPLAY_INFO_DXR ((XrStructureType)1004999003)
 
@@ -28,6 +34,26 @@ typedef struct XrDisplayInfoDXR {
     uint32_t displayPixelWidth;
     uint32_t displayPixelHeight;
 } XrDisplayInfoDXR;
+
+// --- N-view view configuration (XR_DXR_display_info SPEC_VERSION 19) ---
+// DisplayXR/displayxr-runtime#1486: PRIMARY_STEREO now reports EXACTLY 2 views and
+// xrEndFrame under it accepts exactly 2 — or 1, but only while the ACTIVE rendering
+// mode is itself 1-view AND the instance enabled XR_DXR_display_info. An app that
+// wants the device's N-view (quad / light-field) modes enables XR_DXR_display_info,
+// finds this type in xrEnumerateViewConfigurations, and begins its session with it.
+//
+// THIS PROVIDER DOES NOT USE IT, deliberately. Unity's stereo topology is fixed at 2
+// (DXR_PROV_MAX_VIEWS, one arraySize=2 swapchain, two render passes/params), so the
+// provider begins PRIMARY_STEREO (dxr_prov_poll_events, SESSION_STATE_READY) and gets
+// the 2 views it can fill. The define is mirrored for documentation value — so the
+// next reader does not have to go to the runtime to learn why PRIMARY_STEREO is a
+// choice here rather than the only option — and so a future N-view/quilt render path
+// (ADR-007) has the constant already in hand. It is a cast #define, not an
+// enumerator, so it is invisible to -Wswitch: any switch over XrViewConfigurationType
+// that must handle it needs an explicit case.
+//
+// Runtime reference: docs/reference/view-configuration-model.md.
+#define XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR ((XrViewConfigurationType)1004999212)
 
 // --- Desktop position of the 3D panel (XR_DXR_display_info SPEC_VERSION 16) ---
 // Chained onto XrSystemProperties (alongside XrDisplayInfoDXR) so a client can find
