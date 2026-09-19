@@ -5,11 +5,31 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.19.4] - 2026-09-18
 
 ### Changed
 - **The projection layer's view count now comes from the ACTIVE rendering mode at submit, not from the swapchain-create latch.** `displayxr-runtime#1486` tightened `xrEndFrame`: under `XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO` — which is what this provider begins with, and stays on, because Unity's stereo topology is fixed at 2 — a projection layer must carry exactly 2 views, or 1 **only** while the active rendering mode is itself 1-view (and the instance enabled `XR_DXR_display_info`, which the provider always does). A 1-view submission in a 2-view mode is now `XR_ERROR_VALIDATION_FAILURE` where the runtime used to silently flat-blit it. The provider derived that count from `s_ps.sc_view_count`, a shadow of the mode latched when the swapchain was created and refreshed only by `ps_reconcile_primary()` — a refresh that is skippable and can lag: it early-returns on a zero-size target (minimised window, unresolved zone rect) *before* it ever compares the view count, `dxr_prov_reconcile_size()` returns early while a frame is begun, a failed swapchain recreate leaves the stale value in place, and on macOS the mode event is polled from the main thread (`DisplayXRProviderDriver.LateUpdate`) while submit runs on the render thread. So a 2D→3D flip could leave a 1-view submission outliving its 1-view mode. `dxr_prov_submit_frame` now reads the active mode directly and clamps to the slices actually allocated (`arraySize`, always 2), so **2 — always legal — is the failure direction and a 1 is emitted only while the mode says 1-view**. Raising the count is safe content-wise: `GfxPopulateNextFrameDesc` fills both SPI slices / both MultiPass passes every frame whatever the mode, so slice 1 is never stale. A count/latch disagreement logs once (capped at 8 lines, never per frame). No behaviour change in the steady state of either mode.
 - **`native~/displayxr_extensions.h`: `XR_DXR_DISPLAY_INFO_SPEC_VERSION` 12 → 19**, and the hand-written mirror now carries `XR_VIEW_CONFIGURATION_TYPE_PRIMARY_MULTIVIEW_DXR` (`1004999212`) with a note that the provider deliberately does **not** use it — Unity's topology is fixed at 2 views, so `PRIMARY_STEREO` is the right type and now reports exactly that. Documentation value only; nothing compiles against the constant today, and a future N-view/quilt path (ADR-007) is the only consumer it anticipates. The mirror is otherwise complete for everything the provider references — audited by diffing every `XR_*_DXR` identifier used in `native~/` against what the header defines.
+
+### Compatibility
+- **⚠️ Requires DisplayXR Runtime `v2.17.1` or newer.** The view-count fix above narrows the
+  window in which the provider can submit a 1-view projection layer, but it cannot close it
+  entirely — the active mode can still flip between the provider reading it and the runtime
+  validating the submission. `displayxr-runtime#1528` (shipped in runtime `v2.17.1`) adds the
+  mode-switch grace on the runtime side that absorbs that last frame. Against an older
+  runtime a 2D→3D toggle can still surface `XR_ERROR_VALIDATION_FAILURE` at `xrEndFrame`.
+
+### Notes
+- Verified on **Windows** against runtime `v2.17.1` (#329, legs 1–4): **0 rejected frames**
+  across repeated 2D→3D mode toggles.
+- **Not tested:** the **Leia SR** arm (hardware weaving plug-in) and **macOS**. The macOS
+  `.bundle` was rebuilt for this release but has had no runtime verification pass.
+
+### Known limitations
+- `displayxr-unity-samples#17` — a sample-side V-cycle can re-request a **>2-view** mode that
+  the runtime denies (Unity's stereo topology is fixed at 2 views, so no provider-side change
+  can satisfy it). Cycling past the denied mode is harmless; the sample simply stays on the
+  last mode the runtime granted.
 
 ## [2.19.3] - 2026-09-15
 
