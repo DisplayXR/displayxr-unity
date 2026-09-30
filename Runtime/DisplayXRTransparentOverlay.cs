@@ -292,7 +292,11 @@ namespace DisplayXR
         /// </summary>
         public static void RequestTransparentSession()
         {
-#if UNITY_STANDALONE_WIN || UNITY_STANDALONE_OSX
+            // Linux players forward the request too (#249): the provider passes it on as
+            // XrXlibWindowBindingCreateInfoDXR.transparentBackgroundEnabled. Both natives
+            // below are exported from the Linux .so; there is no pre-cloak there.
+            // The Linux editor is left out so Play Mode keeps an opaque session.
+#if UNITY_STANDALONE_WIN || UNITY_STANDALONE_OSX || (UNITY_STANDALONE_LINUX && !UNITY_EDITOR)
             // (#295) Do NOT request a transparent session on a machine with no resolvable
             // OpenXR runtime. The request pre-cloaks Unity's window and parks it off-screen
             // at the earliest native touchpoint (#277), and every revert of that state is
