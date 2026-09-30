@@ -254,7 +254,9 @@ it from the runtime repo's untracked `.env.local` before the check:
 # sourced), so the grep MUST tolerate the `export ` prefix. A bare '^DXR_SIGN_REPO='
 # matches nothing, the substitution yields "", and the release silently ships
 # UNSIGNED on any box that has not already exported the var (caught on win, v2.19.1).
-[ -z "$DXR_SIGN_REPO" ] && export DXR_SIGN_REPO=$(grep -m1 -E '^(export[[:space:]]+)?DXR_SIGN_REPO=' ~/Documents/GitHub/displayxr-runtime/.env.local 2>/dev/null | cut -d= -f2- | tr -d '"'"'"')
+# The `tr` strips both quote kinds; keep it as `tr -d "\"'"` — the earlier
+# `tr -d '"'"'"'` spelling left a quote open and bash refused the line (v2.20.0).
+[ -z "$DXR_SIGN_REPO" ] && export DXR_SIGN_REPO=$(grep -m1 -E '^(export[[:space:]]+)?DXR_SIGN_REPO=' ~/Documents/GitHub/displayxr-runtime/.env.local 2>/dev/null | cut -d= -f2- | tr -d "\"'")
 [ -z "$DXR_SIGN_REPO" ] && echo "WARN: DXR_SIGN_REPO still unset after sourcing .env.local — release will be UNSIGNED"
 ```
 
@@ -369,13 +371,19 @@ world will actually install and check it. Both channels:
 V=$(mktemp -d); mkdir -p "$V/x"
 gh release download [VERSION] -R DisplayXR/displayxr-unity -p "com.displayxr.unity-[VERSION_NUMBER].tgz" -D "$V"
 tar xzf "$V/com.displayxr.unity-[VERSION_NUMBER].tgz" -C "$V/x"
-powershell -NoProfile -Command "(Get-AuthenticodeSignature '$(cygpath -w "$V/x/com.displayxr.unity-[VERSION_NUMBER]/Runtime/Plugins/Windows/x64/displayxr_unity.dll")').Status"
+pwsh -NoProfile -Command "(Get-AuthenticodeSignature '$(cygpath -w "$V/x/com.displayxr.unity-[VERSION_NUMBER]/Runtime/Plugins/Windows/x64/displayxr_unity.dll")').Status"
 git cat-file -p "origin/upm:Runtime/Plugins/Windows/x64/displayxr_unity.dll" > "$V/upm.dll"
-powershell -NoProfile -Command "(Get-AuthenticodeSignature '$(cygpath -w "$V/upm.dll")').Status"
+pwsh -NoProfile -Command "(Get-AuthenticodeSignature '$(cygpath -w "$V/upm.dll")').Status"
 rm -rf "$V"
 ```
 Both must print `Valid` (signer `Leia, Inc.`). Anything else → report SIGNED=no,
 whatever the script above claimed. (On macOS/Linux use `osslsigncode verify`.)
+
+Use `pwsh` (PowerShell 7), not `powershell` (Windows PowerShell 5.1): launched from
+a shell that inherited pwsh's `PSModulePath`, 5.1 cannot load
+`Microsoft.PowerShell.Security`, so `Get-AuthenticodeSignature` is "not recognized"
+and the check can never print `Valid` (hit on win, v2.20.0). It fails closed, not
+open — but it also cannot confirm a good signature.
 
 Note: the macOS `displayxr_unity.bundle` is signed with an Apple
 Developer ID cert + notarization (a separate track from the Windows EV
