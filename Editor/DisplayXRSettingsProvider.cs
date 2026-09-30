@@ -81,6 +81,12 @@ namespace DisplayXR.Editor
                         source = "Registry (Khronos\\OpenXR\\1\\ActiveRuntime)";
                 }
                 catch { }
+#elif UNITY_EDITOR_LINUX
+                // Same search order as the runtime probe and the native resolver (#330).
+                string linuxSource;
+                runtimeJson = DisplayXRRuntime.FindLinuxActiveRuntime(out linuxSource);
+                if (!string.IsNullOrEmpty(runtimeJson))
+                    source = linuxSource;
 #endif
             }
 

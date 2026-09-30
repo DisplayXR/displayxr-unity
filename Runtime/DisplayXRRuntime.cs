@@ -114,9 +114,12 @@ namespace DisplayXR
             string reg = ReadActiveRuntime(HKEY_CURRENT_USER)
                       ?? ReadActiveRuntime(HKEY_LOCAL_MACHINE);
             return (reg != null && SafeExists(reg)) ? reg : null;
-#elif UNITY_STANDALONE_OSX || UNITY_EDITOR_OSX || UNITY_STANDALONE_LINUX || UNITY_EDITOR_LINUX
-            // The single fixed path the native resolver's non-Windows branch checks.
+#elif UNITY_STANDALONE_OSX || UNITY_EDITOR_OSX
+            // The single fixed path the native resolver's macOS branch checks.
             return SafeExists(k_UnixActiveRuntime) ? k_UnixActiveRuntime : null;
+#elif UNITY_STANDALONE_LINUX || UNITY_EDITOR_LINUX
+            string source;
+            return FindLinuxActiveRuntime(out source);
 #else
             return null;
 #endif
@@ -130,6 +133,70 @@ namespace DisplayXR
 
 #if UNITY_STANDALONE_OSX || UNITY_EDITOR_OSX || UNITY_STANDALONE_LINUX || UNITY_EDITOR_LINUX
         const string k_UnixActiveRuntime = "/usr/local/share/openxr/1/active_runtime.json";
+#endif
+
+#if UNITY_STANDALONE_LINUX || UNITY_EDITOR_LINUX
+        const string k_ActiveRuntimeSuffix = "/openxr/1/active_runtime.json";
+
+        /// <summary>
+        /// OpenXR loader Linux search order for the active runtime manifest (#330):
+        /// <c>$XDG_CONFIG_HOME</c> (default <c>$HOME/.config</c>), then each
+        /// <c>$XDG_CONFIG_DIRS</c> entry in order (default <c>/etc/xdg</c>), then
+        /// <c>/etc</c>. <c>/usr/local/share</c> is checked last for backward
+        /// compatibility. Mirror of native <c>ps_find_linux_active_runtime</c>; keep
+        /// the two in step. Also used by the Editor Runtime Status panel.
+        /// </summary>
+        /// <param name="source">Where the manifest was found, for display; null when none.</param>
+        /// <returns>The first existing manifest path, or null.</returns>
+        internal static string FindLinuxActiveRuntime(out string source)
+        {
+            string path;
+
+            string configHome = Environment.GetEnvironmentVariable("XDG_CONFIG_HOME");
+            if (string.IsNullOrEmpty(configHome))
+            {
+                string home = Environment.GetEnvironmentVariable("HOME");
+                configHome = string.IsNullOrEmpty(home) ? null : home + "/.config";
+            }
+            if (TryActiveRuntime(configHome, out path))
+            {
+                source = "XDG config home (" + configHome + ")";
+                return path;
+            }
+
+            string configDirs = Environment.GetEnvironmentVariable("XDG_CONFIG_DIRS");
+            if (string.IsNullOrEmpty(configDirs))
+                configDirs = "/etc/xdg";
+            foreach (string dir in configDirs.Split(':'))
+            {
+                if (TryActiveRuntime(dir, out path))
+                {
+                    source = "XDG config (" + dir + ")";
+                    return path;
+                }
+            }
+
+            if (TryActiveRuntime("/etc", out path))
+            {
+                source = "System config (/etc)";
+                return path;
+            }
+
+            if (TryActiveRuntime("/usr/local/share", out path))
+            {
+                source = "Legacy path (/usr/local/share)";
+                return path;
+            }
+
+            source = null;
+            return null;
+        }
+
+        static bool TryActiveRuntime(string dir, out string path)
+        {
+            path = string.IsNullOrEmpty(dir) ? null : dir + k_ActiveRuntimeSuffix;
+            return path != null && SafeExists(path);
+        }
 #endif
 
 #if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN

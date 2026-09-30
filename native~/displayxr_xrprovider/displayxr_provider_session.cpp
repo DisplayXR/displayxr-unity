@@ -764,10 +764,62 @@ static char *ps_read_active_runtime(HKEY root)
 }
 #endif
 
+#if defined(__linux__) && !defined(__ANDROID__)
+// Return a heap copy of <dir>/openxr/1/active_runtime.json if that file exists,
+// else NULL. `dir` need not be NUL-terminated; an empty dir is skipped.
+static char *ps_try_active_runtime(const char *dir, size_t dir_len)
+{
+	if (!dir || dir_len == 0) return NULL;
+	char path[1024];
+	int n = snprintf(path, sizeof(path), "%.*s/openxr/1/active_runtime.json",
+	                 (int)dir_len, dir);
+	if (n < 0 || (size_t)n >= sizeof(path)) return NULL;
+	FILE *f = fopen(path, "r");
+	if (!f) return NULL;
+	fclose(f);
+	return _strdup(path);
+}
+
+// OpenXR loader Linux search order for the active runtime manifest:
+// $XDG_CONFIG_HOME (default $HOME/.config), then each $XDG_CONFIG_DIRS entry in
+// order (default /etc/xdg), then /etc. /usr/local/share is checked last for
+// backward compatibility. Keep in step with DisplayXRRuntime.FindLinuxActiveRuntime.
+static char *ps_find_linux_active_runtime(void)
+{
+	char *found = NULL;
+	char home_config[1024];
+	const char *config_home = getenv("XDG_CONFIG_HOME");
+	if (!config_home || !config_home[0]) {
+		config_home = NULL;
+		const char *home = getenv("HOME");
+		if (home && home[0]) {
+			int n = snprintf(home_config, sizeof(home_config), "%s/.config", home);
+			if (n > 0 && (size_t)n < sizeof(home_config)) config_home = home_config;
+		}
+	}
+	if (config_home && (found = ps_try_active_runtime(config_home, strlen(config_home))))
+		return found;
+
+	const char *config_dirs = getenv("XDG_CONFIG_DIRS");
+	if (!config_dirs || !config_dirs[0]) config_dirs = "/etc/xdg";
+	for (const char *p = config_dirs;;) {
+		const char *sep = strchr(p, ':');
+		size_t len = sep ? (size_t)(sep - p) : strlen(p);
+		if ((found = ps_try_active_runtime(p, len))) return found;
+		if (!sep) break;
+		p = sep + 1;
+	}
+
+	if ((found = ps_try_active_runtime("/etc", strlen("/etc")))) return found;
+	return ps_try_active_runtime("/usr/local/share", strlen("/usr/local/share"));
+}
+#endif
+
 // Resolve the active runtime manifest path: explicit arg → XR_RUNTIME_JSON →
-// installed-runtime fallback (#173): the Windows registry ActiveRuntime, or on
-// macOS the fixed /usr/local/share/openxr/1/active_runtime.json (the only path
-// the macOS OpenXR loader convention checks). The fallback lets the provider
+// installed-runtime fallback (#173): the Windows registry ActiveRuntime, on
+// Linux the OpenXR loader's XDG search order (#330, ps_find_linux_active_runtime),
+// or on macOS the fixed /usr/local/share/openxr/1/active_runtime.json (the only
+// path the macOS OpenXR loader convention checks). The fallback lets the provider
 // find the INSTALLED runtime with no env var; a newer dev runtime still needs
 // XR_RUNTIME_JSON (checked first). The loader passes NULL for the explicit
 // path, so GfxStart → session_start relies on this resolver.
@@ -784,6 +836,12 @@ static char *ps_resolve_runtime_json(const char *explicit_path)
 	if (reg) {
 		ps_log("[DisplayXR-PROV] runtime JSON from registry ActiveRuntime: %s\n", reg);
 		return reg;
+	}
+#elif defined(__linux__) && !defined(__ANDROID__)
+	char *found = ps_find_linux_active_runtime();
+	if (found) {
+		ps_log("[DisplayXR-PROV] runtime JSON from installed active_runtime: %s\n", found);
+		return found;
 	}
 #else
 	const char *fixed = "/usr/local/share/openxr/1/active_runtime.json";
