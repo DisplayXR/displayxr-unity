@@ -291,6 +291,10 @@ displayxr_set_transparent_background(int enabled)
 	// an empty white window on the panel; see the pre-cloak's own comment.
 	if (state->transparent_background_requested)
 		displayxr_precloak_unity_main_window();
+#elif defined(__linux__) && !defined(__ANDROID__)
+	// Picks the weave window's kind when LifecycleStart creates it: an ARGB
+	// top-level for a transparent session, the opaque child otherwise (#249).
+	displayxr_linux_set_transparent(state->transparent_background_requested);
 #endif
 }
 
