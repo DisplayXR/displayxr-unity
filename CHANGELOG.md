@@ -5,6 +5,14 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.20.0] - 2026-09-30
+
+### Added
+- **Linux transparent overlay (#332, PR #333).** A transparent app on a Linux player now floats over the desktop as it does on Windows. `DisplayXRTransparentOverlay.RequestTransparentSession()` now forwards the request on Linux players (it was compiled out, so the provider logged `transparent requested=0`), and when transparency is requested the weave window is a 32-bit ARGB override-redirect **top-level** parked over Unity's client area (a child of Unity's 24-bit window cannot carry alpha). It takes an empty XShape input region so clicks fall through to Unity, Unity's own window is cloaked with `_NET_WM_WINDOW_OPACITY` ≈ 1/255 (0 would make mutter drop it from picking), and it follows Unity's root-space origin/size every frame. Falls back to the opaque child when there is no compositing manager, no 32-bit visual, or no `libXext`, and logs why. New Xlib/XShape entry points are `dlsym`ed, so there is still no X11 build dependency. The Linux editor keeps an opaque session. Click-through and window drag are follow-ups in #332.
+
+### Fixed
+- **Linux runtime discovery follows the OpenXR loader search order (#330, PR #331).** With `XR_RUNTIME_JSON` unset, Linux only checked `/usr/local/share/openxr/1/active_runtime.json`, so the runtime `.deb`'s `/etc/xdg/openxr/1/active_runtime.json` was never found. Native (`ps_find_linux_active_runtime`) and managed (`DisplayXRRuntime.FindLinuxActiveRuntime`) now search `$XDG_CONFIG_HOME` (default `~/.config`) → each `$XDG_CONFIG_DIRS` entry (default `/etc/xdg`) → `/etc` → `/usr/local/share` (legacy). The Editor Runtime Status panel gains a Linux branch showing where the manifest was found. `XR_RUNTIME_JSON` still takes precedence; Windows/macOS resolution is unchanged.
+
 ## [2.19.4] - 2026-09-18
 
 ### Changed
