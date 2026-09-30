@@ -116,7 +116,65 @@ struct XlibApi {
 	int (*XDestroyWindow)(XDpy, XWin);
 	int (*XFlush)(XDpy);
 	int (*XDefaultScreen)(XDpy);
+	// Transparent (ARGB top-level) overlay
+	int (*XMatchVisualInfo)(XDpy, int, int, int, void *);
+	unsigned long (*XCreateColormap)(XDpy, XWin, void *, int);
+	int (*XFreeColormap)(XDpy, unsigned long);
+	XWin (*XCreateWindow)(XDpy, XWin, int, int, unsigned int, unsigned int, unsigned int,
+	                      int, unsigned int, void *, unsigned long, void *);
+	int (*XTranslateCoordinates)(XDpy, XWin, XWin, int, int, int *, int *, XWin *);
+	int (*XChangeProperty)(XDpy, XWin, XAtom, XAtom, int, int, const unsigned char *, int);
+	int (*XDeleteProperty)(XDpy, XWin, XAtom);
+	XWin (*XGetSelectionOwner)(XDpy, XAtom);
 };
+
+// Xlib structs the transparent overlay needs, mirrored so this TU keeps no X11
+// build dependency. Field ORDER and widths must match <X11/Xutil.h> / <X11/Xlib.h>
+// exactly (LP64: long/unsigned long/XID are 8 bytes, int/Bool 4).
+typedef struct {
+	void *visual;
+	unsigned long visualid;
+	int screen;
+	int depth;
+	int c_class;
+	unsigned long red_mask, green_mask, blue_mask;
+	int colormap_size;
+	int bits_per_rgb;
+} LinVisualInfo;
+
+typedef struct {
+	unsigned long background_pixmap;
+	unsigned long background_pixel;
+	unsigned long border_pixmap;
+	unsigned long border_pixel;
+	int bit_gravity;
+	int win_gravity;
+	int backing_store;
+	unsigned long backing_planes;
+	unsigned long backing_pixel;
+	int save_under;
+	long event_mask;
+	long do_not_propagate_mask;
+	int override_redirect;
+	unsigned long colormap;
+	unsigned long cursor;
+} LinSetWindowAttributes;
+
+#define LIN_TRUE_COLOR          4
+#define LIN_INPUT_OUTPUT        1
+#define LIN_CW_BACK_PIXEL       (1L << 1)
+#define LIN_CW_BORDER_PIXEL     (1L << 3)
+#define LIN_CW_OVERRIDE_REDIRECT (1L << 9)
+#define LIN_CW_COLORMAP         (1L << 13)
+#define LIN_PROP_MODE_REPLACE   0
+#define LIN_SHAPE_INPUT         2
+#define LIN_SHAPE_SET           0
+
+// libXext's XShapeCombineRectangles, resolved separately: it is the only libXext
+// entry point we need, and the transparent overlay is unusable without it (an
+// override-redirect window with the default input region swallows every click).
+typedef int (*PFN_XShapeCombineRectangles)(XDpy, XWin, int, int, int, void *, int, int, int);
+static PFN_XShapeCombineRectangles s_shape_combine_rects;
 
 static struct XlibApi s_x;
 static XDpy s_dpy;       // our own connection; must outlive the session
@@ -125,6 +183,10 @@ static int  s_attempts;  // bounded retry — see the note in the getter
 static int  s_gave_up;   // latched only after we stop trying
 static XWin s_overlay;   // OUR window — the one the runtime weaves into
 static unsigned int s_ow, s_oh; // last child size, to skip no-op resizes
+static int  s_ox, s_oy;  // last top-level overlay origin (transparent mode only)
+static int  s_transparent_requested; // set by displayxr_set_transparent_background
+static int  s_overlay_is_toplevel;   // 1 = ARGB top-level overlay, 0 = opaque child
+static unsigned long s_overlay_cmap; // colormap of the ARGB overlay
 
 // Don't latch a FAILURE forever. The window may simply not be mapped yet on the
 // first call (LifecycleStart can beat Unity's window creation depending on how
@@ -170,6 +232,14 @@ lin_load_xlib(void)
 	XL_SYM(XDestroyWindow);
 	XL_SYM(XFlush);
 	XL_SYM(XDefaultScreen);
+	XL_SYM(XMatchVisualInfo);
+	XL_SYM(XCreateColormap);
+	XL_SYM(XFreeColormap);
+	XL_SYM(XCreateWindow);
+	XL_SYM(XTranslateCoordinates);
+	XL_SYM(XChangeProperty);
+	XL_SYM(XDeleteProperty);
+	XL_SYM(XGetSelectionOwner);
 	return 1;
 }
 
@@ -293,6 +363,138 @@ lin_child_size(unsigned int *out_w, unsigned int *out_h)
 	return 1;
 }
 
+
+// ---------------------------------------------------------------------------
+// Transparent mode: an ARGB TOP-LEVEL overlay instead of the child
+// ---------------------------------------------------------------------------
+//
+// The child window above cannot show the desktop: it composites into Unity's
+// window, which is an opaque 24-bit top-level. X11 per-pixel transparency is a
+// property of a TOP-LEVEL window with a 32-bit TrueColor (ARGB) visual, so a
+// transparent session weaves into one of those instead, parked over Unity's
+// client area.
+//
+// Why the ARGB visual is the whole fix, on every vendor (measured, #249):
+//   - Mesa (Intel/AMD/llvmpipe) reports compositeAlpha OPAQUE|INHERIT for a
+//     default-visual window and PRE_MULTIPLIED|INHERIT for an ARGB one, so the
+//     runtime's transparent swapchain path simply engages.
+//   - NVIDIA reports OPAQUE only, for both. The runtime then falls back to an
+//     OPAQUE swapchain, but on an ARGB window the presented alpha still reaches
+//     the compositor — verified by eye on an RTX 4090 under GNOME/XWayland.
+//     On a default-visual window there is no alpha channel to carry it.
+//
+// The earlier top-level overlay lost a stacking fight: the WM raised Unity's
+// focused window over it (see the header). In transparent mode that fight is
+// moot. Unity's own window is made practically invisible, so whichever of the
+// two is on top, what you see is the overlay — and input should reach Unity
+// anyway. The overlay therefore takes an EMPTY input region (XShape) and every
+// click falls through to Unity's window beneath it.
+//
+// "Practically invisible" is _NET_WM_WINDOW_OPACITY = ~1/255, not 0: mutter
+// drops a fully transparent actor from picking, which would route the clicks
+// past Unity to the desktop.
+//
+// Any missing piece — no compositing manager, no 32-bit visual, no libXext —
+// falls back to the opaque child path rather than presenting a black box.
+
+#define LIN_UNITY_CLOAK_OPACITY 0x01010101UL
+
+// A compositing manager owns _NET_WM_CM_S<screen>. Without one, ARGB windows are
+// drawn with their alpha ignored, i.e. black where the content is clear.
+static int
+lin_have_compositor(void)
+{
+	char name[32];
+	snprintf(name, sizeof(name), "_NET_WM_CM_S%d", s_x.XDefaultScreen(s_dpy));
+	XAtom cm = s_x.XInternAtom(s_dpy, name, 0);
+	return cm && s_x.XGetSelectionOwner(s_dpy, cm) != 0;
+}
+
+static int
+lin_load_xshape(void)
+{
+	if (s_shape_combine_rects) return 1;
+	void *lib = dlopen("libXext.so.6", RTLD_NOW | RTLD_LOCAL);
+	if (!lib) lib = dlopen("libXext.so", RTLD_NOW | RTLD_LOCAL);
+	if (!lib) return 0;
+	*(void **)(&s_shape_combine_rects) = dlsym(lib, "XShapeCombineRectangles");
+	return s_shape_combine_rects != NULL;
+}
+
+// Unity's client-area origin in ROOT coordinates. Under a reparenting WM the
+// client's XGetGeometry x/y is relative to the frame, so translate instead.
+static int
+lin_app_origin(int *out_x, int *out_y)
+{
+	XWin child = 0;
+	return s_x.XTranslateCoordinates(s_dpy, s_win, s_x.XDefaultRootWindow(s_dpy), 0, 0,
+	                                 out_x, out_y, &child) != 0;
+}
+
+static void
+lin_set_unity_opacity(int cloak)
+{
+	XAtom op = s_x.XInternAtom(s_dpy, "_NET_WM_WINDOW_OPACITY", 0);
+	if (!op) return;
+	if (cloak) {
+		unsigned long v = LIN_UNITY_CLOAK_OPACITY; // format 32 props are longs in Xlib
+		s_x.XChangeProperty(s_dpy, s_win, op, (XAtom)XA_CARDINAL_, 32, LIN_PROP_MODE_REPLACE,
+		                    (const unsigned char *)&v, 1);
+	} else {
+		s_x.XDeleteProperty(s_dpy, s_win, op);
+	}
+}
+
+static XWin
+lin_create_argb_overlay(unsigned int w, unsigned int h, int *out_x, int *out_y)
+{
+	if (!lin_have_compositor()) {
+		lin_log("[DisplayXR-LNX] transparent: no compositing manager (_NET_WM_CM_Sn unowned) — "
+		        "using the opaque child window\n");
+		return 0;
+	}
+	if (!lin_load_xshape()) {
+		lin_log("[DisplayXR-LNX] transparent: libXext (XShape) unavailable — using the opaque "
+		        "child window\n");
+		return 0;
+	}
+	LinVisualInfo vi;
+	memset(&vi, 0, sizeof(vi));
+	if (!s_x.XMatchVisualInfo(s_dpy, s_x.XDefaultScreen(s_dpy), 32, LIN_TRUE_COLOR, &vi) ||
+	    !vi.visual) {
+		lin_log("[DisplayXR-LNX] transparent: no 32-bit TrueColor visual — using the opaque "
+		        "child window\n");
+		return 0;
+	}
+
+	int x = 0, y = 0;
+	lin_app_origin(&x, &y);
+
+	XWin root = s_x.XDefaultRootWindow(s_dpy);
+	LinSetWindowAttributes a;
+	memset(&a, 0, sizeof(a));
+	a.colormap = s_x.XCreateColormap(s_dpy, root, vi.visual, 0 /* AllocNone */);
+	a.background_pixel = 0; // fully clear until the first present
+	a.border_pixel = 0;     // required with a non-default visual, or BadMatch
+	a.override_redirect = 1;
+	XWin win = s_x.XCreateWindow(s_dpy, root, x, y, w, h, 0, 32, LIN_INPUT_OUTPUT, vi.visual,
+	                             LIN_CW_BACK_PIXEL | LIN_CW_BORDER_PIXEL |
+	                                 LIN_CW_OVERRIDE_REDIRECT | LIN_CW_COLORMAP,
+	                             &a);
+	if (!win) {
+		s_x.XFreeColormap(s_dpy, a.colormap);
+		lin_log("[DisplayXR-LNX] transparent: XCreateWindow (ARGB) failed — using the opaque "
+		        "child window\n");
+		return 0;
+	}
+	// Empty input region: clicks fall through to Unity's window beneath.
+	s_shape_combine_rects(s_dpy, win, LIN_SHAPE_INPUT, 0, 0, NULL, 0, LIN_SHAPE_SET, 0);
+	s_overlay_cmap = a.colormap;
+	*out_x = x;
+	*out_y = y;
+	return win;
+}
+
 // Create (once) the PLUGIN-OWNED overlay window the runtime weaves into, sized and
 // positioned over Unity's window. Returns 1 and fills the out-params on success.
 //
@@ -309,28 +511,53 @@ displayxr_linux_get_weave_window(void **out_display, unsigned long *out_window)
 		unsigned int w = 0, h = 0;
 		if (!lin_child_size(&w, &h) || w == 0 || h == 0) { w = 1920; h = 1080; }
 
-		// CHILD of Unity's window, at 0,0, full size. CopyFromParent for depth
-		// and visual so it matches whatever Unity negotiated. We deliberately
-		// select NO events: X then delivers pointer/keyboard to the deepest
-		// window that DID select them — Unity's — so input passes straight
-		// through and we never steal a click.
-		s_overlay = s_x.XCreateSimpleWindow(s_dpy, (XWin)unity_win, 0, 0, w, h, 0, 0, 0);
-		if (!s_overlay) {
-			lin_log("[DisplayXR-LNX] XCreateSimpleWindow (child) failed — the runtime "
-			        "will self-host its weave window\n");
-			return 0;
-		}
-		s_x.XMapWindow(s_dpy, s_overlay);
-		s_x.XFlush(s_dpy);
-		s_x.XSync(s_dpy, 0);
-		s_ow = w; s_oh = h;
+		if (s_transparent_requested) {
+			int x = 0, y = 0;
+			s_overlay = lin_create_argb_overlay(w, h, &x, &y);
+			if (s_overlay) {
+				s_overlay_is_toplevel = 1;
+				s_ox = x; s_oy = y;
+				lin_set_unity_opacity(1);
+				s_x.XMapWindow(s_dpy, s_overlay);
+				s_x.XFlush(s_dpy);
+				s_x.XSync(s_dpy, 0);
+				s_ow = w; s_oh = h;
 
-		char m[224];
-		snprintf(m, sizeof(m),
-		         "[DisplayXR-LNX] weave window 0x%lx created as a CHILD of Unity's window "
-		         "0x%lx (%ux%u) — in-window weave, input passes through\n",
-		         (unsigned long)s_overlay, unity_win, w, h);
-		lin_log(m);
+				char m[256];
+				snprintf(m, sizeof(m),
+				         "[DisplayXR-LNX] weave window 0x%lx created as an ARGB TOP-LEVEL over "
+				         "Unity's window 0x%lx at (%d,%d) %ux%u — transparent, input passes "
+				         "through, Unity's window cloaked\n",
+				         (unsigned long)s_overlay, unity_win, x, y, w, h);
+				lin_log(m);
+			}
+		}
+
+		if (!s_overlay) {
+			// CHILD of Unity's window, at 0,0, full size. CopyFromParent for depth
+			// and visual so it matches whatever Unity negotiated. We deliberately
+			// select NO events: X then delivers pointer/keyboard to the deepest
+			// window that DID select them — Unity's — so input passes straight
+			// through and we never steal a click.
+			s_overlay = s_x.XCreateSimpleWindow(s_dpy, (XWin)unity_win, 0, 0, w, h, 0, 0, 0);
+			if (!s_overlay) {
+				lin_log("[DisplayXR-LNX] XCreateSimpleWindow (child) failed — the runtime "
+				        "will self-host its weave window\n");
+				return 0;
+			}
+			s_overlay_is_toplevel = 0;
+			s_x.XMapWindow(s_dpy, s_overlay);
+			s_x.XFlush(s_dpy);
+			s_x.XSync(s_dpy, 0);
+			s_ow = w; s_oh = h;
+
+			char m[224];
+			snprintf(m, sizeof(m),
+			         "[DisplayXR-LNX] weave window 0x%lx created as a CHILD of Unity's window "
+			         "0x%lx (%ux%u) — in-window weave, input passes through\n",
+			         (unsigned long)s_overlay, unity_win, w, h);
+			lin_log(m);
+		}
 	}
 	if (!s_dpy || !s_overlay) return 0;
 	if (out_display) *out_display = s_dpy;
@@ -338,15 +565,24 @@ displayxr_linux_get_weave_window(void **out_display, unsigned long *out_window)
 	return 1;
 }
 
-// Keep the child matched to Unity's client area. POSITION needs no work — a child
-// is clipped to and moves with its parent — so this only ever resizes, and only
-// when the parent actually changed.
+// Keep the overlay matched to Unity's client area. For the child, POSITION needs
+// no work — a child is clipped to and moves with its parent — so it only ever
+// resizes. The transparent top-level has to follow Unity's origin as well.
 DISPLAYXR_EXPORT void
 displayxr_linux_track_window(void)
 {
 	if (!s_dpy || !s_overlay || !s_win) return;
 	unsigned int w = 0, h = 0;
 	if (!lin_child_size(&w, &h) || w == 0 || h == 0) return;
+	if (s_overlay_is_toplevel) {
+		int x = 0, y = 0;
+		if (!lin_app_origin(&x, &y)) return;
+		if (w == s_ow && h == s_oh && x == s_ox && y == s_oy) return;
+		s_ow = w; s_oh = h; s_ox = x; s_oy = y;
+		s_x.XMoveResizeWindow(s_dpy, s_overlay, x, y, w, h);
+		s_x.XFlush(s_dpy);
+		return;
+	}
 	if (w == s_ow && h == s_oh) return;
 	s_ow = w; s_oh = h;
 	s_x.XMoveResizeWindow(s_dpy, s_overlay, 0, 0, w, h);
@@ -376,12 +612,26 @@ DISPLAYXR_EXPORT void
 displayxr_linux_destroy_weave_window(void)
 {
 	if (s_dpy && s_overlay && s_x.XDestroyWindow) {
+		if (s_overlay_is_toplevel && s_win) lin_set_unity_opacity(0);
 		s_x.XDestroyWindow(s_dpy, s_overlay);
+		if (s_overlay_cmap) s_x.XFreeColormap(s_dpy, s_overlay_cmap);
 		s_x.XFlush(s_dpy);
 		lin_log("[DisplayXR-LNX] weave overlay window destroyed\n");
 	}
 	s_overlay = 0;
+	s_overlay_cmap = 0;
+	s_overlay_is_toplevel = 0;
 	s_ow = s_oh = 0;
+	s_ox = s_oy = 0;
+}
+
+// Transparent-background request, forwarded from displayxr_set_transparent_background
+// (the app's earliest native call, before LifecycleStart creates the overlay). Only
+// the NEXT overlay creation reads it; a live overlay keeps its kind.
+DISPLAYXR_EXPORT void
+displayxr_linux_set_transparent(int enabled)
+{
+	s_transparent_requested = enabled != 0;
 }
 
 #endif // __linux__ && !__ANDROID__

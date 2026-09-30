@@ -373,6 +373,13 @@ DISPLAYXR_EXPORT void displayxr_get_overlay_position(int *x, int *y);
 DISPLAYXR_EXPORT void displayxr_set_overlay_position(int x, int y);
 #endif // _WIN32
 
+#if defined(__linux__) && !defined(__ANDROID__)
+/// (#249) Forwarded from displayxr_set_transparent_background: a transparent
+/// session weaves into an ARGB top-level overlay instead of the opaque child of
+/// Unity's window. Read when the weave window is created (LifecycleStart).
+DISPLAYXR_EXPORT void displayxr_linux_set_transparent(int enabled);
+#endif
+
 #ifdef __cplusplus
 }
 #endif
