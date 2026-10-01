@@ -5,6 +5,14 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.20.1] - 2026-10-01
+
+### Fixed
+- **Linux: `displayxr_is_our_process_foreground` is now exported (#332, PR #335).** It existed only on Windows and macOS, so on Linux every call threw `EntryPointNotFoundException`; callers (`DisplayXRInputController`, app HUDs) caught it and assumed "foreground" — always focused, and one exception per caller per frame. The Linux version compares the root window's EWMH `_NET_ACTIVE_WINDOW` with Unity's window by XID (it never reads properties off the foreign active window, which could be destroyed mid-request and raise a fatal `BadWindow`), uses its own X connection rather than the one the runtime borrows for its Vulkan surface, caches the answer for 50 ms, and fails open (answers 1) when it cannot tell. Under XWayland a focused native Wayland window correctly reads as "not us".
+
+### Changed
+- **Linux transparent overlay: the un-cloak of Unity's window is logged on its own line (#332, PR #334).** `Unity's window 0x… un-cloaked (visible again)`, and the cloak site documents why the cloak cannot outlive the session on Linux: it is set only at LifecycleStart and cleared only at LifecycleStop, and every session failure after the cloak returns failure from GfxStart, which Unity answers with LifecycleStop (verified with a broken runtime manifest). Unlike Windows, there is no pre-LifecycleStart cloak, so no #295/#296-style backstop timer is needed. No behaviour change.
+
 ## [2.20.0] - 2026-09-30
 
 ### Added
