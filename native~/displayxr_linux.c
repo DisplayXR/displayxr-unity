@@ -396,6 +396,20 @@ lin_child_size(unsigned int *out_w, unsigned int *out_h)
 //
 // Any missing piece — no compositing manager, no 32-bit visual, no libXext —
 // falls back to the opaque child path rather than presenting a black box.
+//
+// THE CLOAK CANNOT OUTLIVE THE SESSION (#332; the Windows failure class is
+// #295/#296). Unity's window is cloaked in exactly one place — overlay creation in
+// LifecycleStart — and un-cloaked in exactly one — displayxr_linux_destroy_weave_
+// window, from LifecycleStop. Every way a session can fail after the cloak returns
+// kUnitySubsystemErrorCodeFailure from GfxStart (unsupported graphics API, every
+// dxr_prov_session_start failure — the session-stop calls all live inside it), and
+// Unity answers a failed GfxStart with LifecycleStop. Measured with a broken
+// runtime manifest: cloak, "dxr_prov_session_start failed", un-cloak, visible.
+// So unlike Windows, which pre-cloaks BEFORE LifecycleStart and needs a backstop
+// timer for the "session never attempted" case, there is no window here in which
+// the cloak exists without a LifecycleStop to undo it. Keep it that way: do not
+// move the cloak earlier (e.g. into displayxr_linux_set_transparent) without
+// adding a revert for that earlier point.
 
 #define LIN_UNITY_CLOAK_OPACITY 0x01010101UL
 
@@ -612,7 +626,15 @@ DISPLAYXR_EXPORT void
 displayxr_linux_destroy_weave_window(void)
 {
 	if (s_dpy && s_overlay && s_x.XDestroyWindow) {
-		if (s_overlay_is_toplevel && s_win) lin_set_unity_opacity(0);
+		if (s_overlay_is_toplevel && s_win) {
+			lin_set_unity_opacity(0);
+			// The one un-cloak (see the invariant above). Logged on its own line so a
+			// customer log shows the revert happened, not just that the overlay died.
+			char m[128];
+			snprintf(m, sizeof(m), "[DisplayXR-LNX] Unity's window 0x%lx un-cloaked (visible again)\n",
+			         (unsigned long)s_win);
+			lin_log(m);
+		}
 		s_x.XDestroyWindow(s_dpy, s_overlay);
 		if (s_overlay_cmap) s_x.XFreeColormap(s_dpy, s_overlay_cmap);
 		s_x.XFlush(s_dpy);
