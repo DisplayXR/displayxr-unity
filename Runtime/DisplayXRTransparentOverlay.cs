@@ -256,9 +256,10 @@ namespace DisplayXR
         private readonly float[] m_ZoneRV = new float[16], m_ZoneRP = new float[16];
 
         /// <summary>Cursor position in window-client pixels (top-left origin).
-        /// Only meaningful in standalone Windows build with transparent mode
-        /// active. Updated each frame from native polling — works regardless
-        /// of Unity input focus, unlike Mouse.current.position.</summary>
+        /// Meaningful in a standalone Windows or Linux build with transparent mode
+        /// active. Windows: updated each frame from native polling — works regardless
+        /// of Unity input focus, unlike Mouse.current.position. Linux: taken from the
+        /// Input System, which is live there.</summary>
         public Vector2 PointerPosition { get; private set; }
 
         /// <summary>Cursor movement this frame, in window pixels. Same axes as
@@ -513,6 +514,9 @@ namespace DisplayXR
         // (head bone moves more than hips per frame, so its drift is bigger).
         void LateUpdate()
         {
+#if UNITY_STANDALONE_LINUX && !UNITY_EDITOR
+            UpdatePointerFromInputSystem();
+#endif
 #if UNITY_STANDALONE_WIN
             if (Application.isEditor || m_Camera == null)
                 return;
@@ -1161,6 +1165,42 @@ namespace DisplayXR
         //
         // No-op for non-skinned renderers (regular MeshRenderer): they keep
         // whatever collider the user attached and use Physics.Raycast.
+#if UNITY_STANDALONE_LINUX && !UNITY_EDITOR
+        // Linux (#332): PointerPosition / PointerDelta / IsLeftPressed / IsRightPressed
+        // straight from the Input System. On Windows these come from a native poll
+        // (displayxr_get_overlay_pointer) because Unity's HWND is cloaked off-screen and
+        // its mouse state is frozen. On Linux Unity's window stays where it is (it is
+        // only made ~transparent) and the ARGB overlay takes no input, so Unity receives
+        // the real pointer events and Mouse.current is live. Without this, app code that
+        // routes HUD input through these properties (a slider drag) saw (0,0) and "up"
+        // forever. No injection back into Mouse.current: it is already correct here.
+        private void UpdatePointerFromInputSystem()
+        {
+            Vector2 pos;
+            bool left, right;
+#if HAS_INPUT_SYSTEM
+            var mouse = Mouse.current;
+            if (mouse == null) return;
+            pos = mouse.position.ReadValue();
+            left = mouse.leftButton.isPressed;
+            right = mouse.rightButton.isPressed;
+#else
+            pos = Input.mousePosition;
+            left = Input.GetMouseButton(0);
+            right = Input.GetMouseButton(1);
+#endif
+            // Unity screen space is bottom-left; these properties are window-client
+            // pixels, top-left origin (what the Windows native poll reports).
+            pos = new Vector2(pos.x, Screen.height - pos.y);
+            PointerDelta = m_HasPrevPointerPos ? (pos - m_PrevPointerPos) : Vector2.zero;
+            PointerPosition = pos;
+            m_PrevPointerPos = pos;
+            m_HasPrevPointerPos = true;
+            IsLeftPressed = left;
+            IsRightPressed = right;
+        }
+#endif
+
         private void UpdateBakedHitColliders()
         {
             if (clickableRenderers == null) return;
