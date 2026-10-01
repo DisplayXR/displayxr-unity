@@ -3,7 +3,7 @@
 
 using UnityEngine;
 using UnityEngine.Experimental.Rendering;
-using UnityEngine.Rendering;
+using UnityEngine.Rendering; // RenderPipelineManager, ScriptableRenderContext
 
 namespace DisplayXR
 {
@@ -113,6 +113,15 @@ namespace DisplayXR
         // This component's private stage (see DisplayXROverlayStage): its canvas and
         // camera sit there so no other overlay's camera sees this canvas.
         private int m_Stage = -1;
+
+        // The URP transparent-overlay foreground clip (DisplayXR/ForegroundClipURP) is a
+        // full-screen pass on the renderer, so it also runs for this overlay camera and,
+        // keyed on _DXRForegroundFar (z>0.5 = armed), discards the whole canvas: the RT
+        // comes out fully transparent and the HUD never shows. Same fix as
+        // DisplayXRLocal2D: zero the global for our camera's render, restore after.
+        private static readonly int s_ForegroundFarId = Shader.PropertyToID("_DXRForegroundFar");
+        private Vector4 m_SavedForegroundFar;
+        private bool m_CamRenderHooked;
         // Dedicated layer: we put the canvas + children on this layer and give
         // ONLY our overlay camera that layer in its cullingMask. We pick a
         // mid-range layer that's typically unused (Unity reserves 0-7 for
@@ -240,6 +249,12 @@ namespace DisplayXR
             // Mirrors DisplayXRLocal2D (which was migrated off manual Render for the
             // canvas-rebuild race — same enabled=true resolution).
             m_OverlayCamera.enabled = true;
+            if (!m_CamRenderHooked)
+            {
+                RenderPipelineManager.beginCameraRendering += OnBeginOverlayCamera;
+                RenderPipelineManager.endCameraRendering += OnEndOverlayCamera;
+                m_CamRenderHooked = true;
+            }
 
             // Wire OverlayCamera as the canvas's event camera. GraphicRaycaster
             // needs a camera reference to project screen-cursor input onto a
@@ -454,9 +469,32 @@ namespace DisplayXR
             m_BridgePtr = System.IntPtr.Zero;
         }
 
+        // Scope the URP foreground clip out of our overlay camera (see the field doc).
+        // Camera-identity gated, so other cameras are untouched.
+        void OnBeginOverlayCamera(ScriptableRenderContext ctx, Camera cam)
+        {
+            if (cam != m_OverlayCamera) return;
+            m_SavedForegroundFar = Shader.GetGlobalVector(s_ForegroundFarId);
+            if (m_SavedForegroundFar.z > 0.5f)
+                Shader.SetGlobalVector(s_ForegroundFarId, Vector4.zero);
+        }
+
+        void OnEndOverlayCamera(ScriptableRenderContext ctx, Camera cam)
+        {
+            if (cam != m_OverlayCamera) return;
+            if (m_SavedForegroundFar.z > 0.5f)
+                Shader.SetGlobalVector(s_ForegroundFarId, m_SavedForegroundFar);
+        }
+
         void OnDisable()
         {
             ReleaseSlot();
+            if (m_CamRenderHooked)
+            {
+                RenderPipelineManager.beginCameraRendering -= OnBeginOverlayCamera;
+                RenderPipelineManager.endCameraRendering -= OnEndOverlayCamera;
+                m_CamRenderHooked = false;
+            }
             DisplayXROverlayStage.Release(m_Stage);
             m_Stage = -1;
 
