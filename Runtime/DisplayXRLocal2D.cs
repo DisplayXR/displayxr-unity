@@ -201,6 +201,10 @@ namespace DisplayXR
         // the bridge is still live — it may wrap a dead pointer. Re-acquire when this
         // changes. See TryAcquireBridge.
         private System.IntPtr m_BridgePtr = System.IntPtr.Zero;
+        // (#336) Vulkan has no wrappable bridge: the getter returns a session token in
+        // place of m_BridgePtr, and the copy is a plugin event on the render thread.
+        private bool m_VulkanBridge;
+        private System.IntPtr m_RenderEventFunc = System.IntPtr.Zero;
 
         // The opt-in URP foreground clip (DisplayXR/ForegroundClipURP) is a built-in
         // FullScreenPassRendererFeature with NO XR-camera guard.
@@ -229,6 +233,8 @@ namespace DisplayXR
             // mode, or XR not started) stay inert — no RT, no submission — so the rest
             // of the scene renders normally.
             m_ProviderMode = DisplayXRProviderDriver.IsActive;
+            m_VulkanBridge = m_ProviderMode &&
+                             SystemInfo.graphicsDeviceType == GraphicsDeviceType.Vulkan;
             if (!m_ProviderMode)
                 return;
 
@@ -378,6 +384,17 @@ namespace DisplayXR
                     // Session down / not ready. Drop a stale wrapper so the next live
                     // bridge is picked up cleanly rather than copied into a dead one.
                     if (m_BridgeTex != null) ReleaseBridgeTex();
+                    m_BridgePtr = System.IntPtr.Zero;
+                    return;
+                }
+                if (m_VulkanBridge)
+                {
+                    // Vulkan (#336): bridgePtr is a session token, never a texture. A new
+                    // token is a new session — same rect re-push as the wrapper path below.
+                    if (bridgePtr == m_BridgePtr) return;
+                    m_BridgePtr = bridgePtr;
+                    m_LastRectX = m_LastRectY = m_LastRectW = m_LastRectH = int.MinValue;
+                    Debug.Log($"[DisplayXR] Local2D: provider session {(long)bridgePtr} (Vulkan overlay bridge, rect re-push armed)");
                     return;
                 }
                 if (m_BridgeTex != null && bridgePtr == m_BridgePtr) return; // unchanged
@@ -553,7 +570,44 @@ namespace DisplayXR
                 // actually re-rendered since the last one (OnEndOverlayCamera sets
                 // the flag). Unthrottled that is still every frame, so this is a
                 // no-op change at maxRefreshHz = 0.
-                if (m_BridgeTex != null && OverlayTexture != null && m_BridgeDirty)
+                if (m_VulkanBridge)
+                {
+                    // Vulkan (#336): the plugin event records the copy on Unity's render
+                    // thread. The provider owns the "a copy is wanted" state: it is set
+                    // when its bridge is (re)created and when we report a re-render, and
+                    // cleared only once a copy is actually recorded — so a skipped event
+                    // is retried and a bridge created after the last re-render still
+                    // gets filled.
+                    try
+                    {
+                        if (m_BridgePtr != System.IntPtr.Zero && OverlayTexture != null)
+                        {
+                            if (m_BridgeDirty)
+                            {
+                                DisplayXRProviderNative.dxr_prov_local2d_request_copy();
+                                m_BridgeDirty = false;
+                            }
+                            if (DisplayXRProviderNative.dxr_prov_local2d_needs_copy() != 0)
+                            {
+                                if (m_RenderEventFunc == System.IntPtr.Zero)
+                                    m_RenderEventFunc = DisplayXRProviderNative.dxr_prov_get_render_event_func();
+                                if (m_RenderEventFunc != System.IntPtr.Zero)
+                                    GL.IssuePluginEvent(m_RenderEventFunc,
+                                        DisplayXRProviderNative.kVkOverlayCopyLocal2DEvent);
+                            }
+                        }
+                    }
+                    catch (System.EntryPointNotFoundException)
+                    {
+                        // Native plugin older than the managed side: stay inert instead
+                        // of throwing every frame.
+                        Debug.LogWarning("[DisplayXR] Local2D: native plugin lacks the Vulkan overlay " +
+                                         "exports (#336) — Local2D disabled on Vulkan.");
+                        m_VulkanBridge = false;
+                        m_BridgePtr = System.IntPtr.Zero;
+                    }
+                }
+                else if (m_BridgeTex != null && OverlayTexture != null && m_BridgeDirty)
                 {
                     Graphics.CopyTexture(OverlayTexture, m_BridgeTex);
                     m_BridgeDirty = false;

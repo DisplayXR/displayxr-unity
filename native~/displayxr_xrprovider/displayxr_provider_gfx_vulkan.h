@@ -139,6 +139,64 @@ int dxr_pvk_copy_to_swapchain_image(int eye, uint32_t image_index);
 /// Unity has submitted the eye work.
 void dxr_pvk_signal_unity_done(void);
 
+// ---------------------------------------------------------------------------
+// 2D overlay layers (Local2D, window-space UI) — #336
+// ---------------------------------------------------------------------------
+//
+// Same bridge shape as the eye bridge (an external-memory image aliased on both
+// devices, parked in GENERAL), one per layer, but the UNITY side is filled
+// differently. The eyes are an XR render target Unity renders into directly; an
+// overlay's source is an ordinary Unity RenderTexture. Its layout is tracked by
+// Unity and only reachable through IUnityGraphicsVulkan::AccessTexture inside a
+// plugin event, so the Unity-side copy is recorded into Unity's own command
+// buffer from that event (dxr_pvk_overlay_record_unity_copy) rather than done
+// with Graphics.CopyTexture into a wrapped bridge. The session side then copies
+// the bridge into the layer's swapchain image at submit, exactly like the eyes.
+
+enum {
+	DXR_PVK_OVERLAY_LOCAL2D = 0,
+	DXR_PVK_OVERLAY_WSUI = 1,
+	DXR_PVK_OVERLAY_COUNT = 2,
+};
+
+/// Record the overlay layer's swapchain VkImages (session device) and format.
+void dxr_pvk_overlay_set_swapchain_images(int kind, const void *images, uint32_t count,
+                                          int64_t format);
+
+/// Create (or keep, if already that size) the overlay bridge. Must run on the
+/// render thread: it shares the session command buffer with the per-frame copy.
+int dxr_pvk_overlay_create_bridge(int kind, uint32_t width, uint32_t height, int64_t format);
+
+/// 1 while the overlay bridge exists. Safe from any thread.
+int dxr_pvk_overlay_ready(int kind);
+
+/// 1 once the bridge exists and Unity has copied into it at least once. Until
+/// then its memory is uninitialised, so the layer must not be submitted.
+/// Render thread only.
+int dxr_pvk_overlay_has_content(int kind);
+
+/// 1 while the bridge exists and wants a Unity copy: after it was created, or
+/// after dxr_pvk_overlay_request_copy, until a copy is actually RECORDED (an event
+/// that had to skip leaves it set, so the copy is retried). Safe from any thread.
+int dxr_pvk_overlay_needs_copy(int kind);
+
+/// Ask for a Unity copy (the canvas re-rendered). Safe from any thread.
+void dxr_pvk_overlay_request_copy(int kind);
+
+/// Plugin-event side (Unity's render thread): record a copy of `src_image` (a
+/// Unity RenderTexture already transitioned to TRANSFER_SRC_OPTIMAL by
+/// AccessTexture) into the overlay bridge's Unity-side alias, on Unity's
+/// `cmd_buf`. `src_format` is the source VkFormat; an RGBA source is blitted so
+/// the channels land right in a BGRA bridge. Returns 1 if a copy was recorded.
+int dxr_pvk_overlay_record_unity_copy(int kind, void *cmd_buf, void *src_image,
+                                      int64_t src_format, uint32_t src_w, uint32_t src_h);
+
+/// Per-frame session side: copy the overlay bridge into swapchain image `image_index`.
+int dxr_pvk_overlay_copy_to_swapchain_image(int kind, uint32_t image_index);
+
+/// Drop the overlay's bridge and swapchain images (layer resize / teardown).
+void dxr_pvk_overlay_destroy(int kind);
+
 /// Tear down every Vulkan object this TU owns (bridges, semaphores, command
 /// pool, device, instance). Safe to call when nothing was created.
 void dxr_pvk_destroy(void);
