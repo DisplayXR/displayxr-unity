@@ -670,9 +670,10 @@ displayxr_linux_set_transparent(int enabled)
 // window by XID. We deliberately never read a property off the ACTIVE window
 // itself (e.g. its _NET_WM_PID): it belongs to another client and can be
 // destroyed between our two requests, and the resulting BadWindow would go to
-// Xlib's default error handler, which exits the process. Under XWayland, mutter
-// sets _NET_ACTIVE_WINDOW to None while a native Wayland window has focus, so
-// that case correctly reads as "not us".
+// Xlib's default error handler, which exits the process. Under XWayland, while a
+// native Wayland window has focus, mutter points _NET_ACTIVE_WINDOW at a placeholder
+// window of its own (measured: 0x400003, no WM_NAME / _NET_WM_PID) rather than None.
+// Either way it is not Unity's XID, so that case correctly reads as "not us".
 //
 // A separate Display connection: s_dpy is borrowed by the runtime for its Vulkan
 // surface, so a per-frame query on it would share a connection with runtime
