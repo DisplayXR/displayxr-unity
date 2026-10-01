@@ -255,6 +255,15 @@ struct PvkState {
 	PvkBridge bridge_spi;
 	PvkBridge bridge_eye[2];
 
+	// --- 2D overlay layers (#336): Local2D, wsui. Own bridge + own swapchain each.
+	struct Overlay {
+		PvkBridge bridge;
+		VkImage   sc_images[PVK_MAX_SWAPCHAIN_IMAGES] = {};
+		uint32_t  sc_image_count = 0;
+		VkFormat  sc_format = VK_FORMAT_UNDEFINED;
+		bool      has_content = false; // Unity has copied into the bridge at least once
+	} overlay[DXR_PVK_OVERLAY_COUNT];
+
 	// Session binding storage, handed to xrCreateSession.
 	XrGraphicsBindingVulkanKHR binding = {};
 };
@@ -737,11 +746,10 @@ pvk_transition_to_general(PvkBridge *b)
 	return true;
 }
 
-int
-dxr_pvk_create_bridge(int eye, uint32_t width, uint32_t height,
-                      uint32_t array_size, int64_t format)
+static int
+pvk_create_bridge(PvkBridge *b, const char *label, uint32_t width, uint32_t height,
+                  uint32_t array_size, int64_t format)
 {
-	PvkBridge *b = pvk_slot(eye);
 	if (!b || !s_pvk.device_ready) return 0;
 	if (s_pvk.unity_device == VK_NULL_HANDLE) {
 		pvk_log("[DisplayXR-PROV-VK] bridge: Unity VkDevice not captured yet\n");
@@ -940,11 +948,19 @@ dxr_pvk_create_bridge(int eye, uint32_t width, uint32_t height,
 	b->unity_desc.mipCount = 1;
 
 	b->valid = true;
-	pvk_log("[DisplayXR-PROV-VK] bridge[%d]: %ux%u layers=%u fmt=%d shared (session=%p unity=%p handle="
+	pvk_log("[DisplayXR-PROV-VK] bridge[%s]: %ux%u layers=%u fmt=%d shared (session=%p unity=%p handle="
 	        PVK_HANDLE_FMT ")\n",
-	        eye, width, height, array_size, (int)fmt,
+	        label, width, height, array_size, (int)fmt,
 	        (void *)b->session_image, (void *)b->unity_image, PVK_HANDLE_ARG(b->shared_handle));
 	return 1;
+}
+
+int
+dxr_pvk_create_bridge(int eye, uint32_t width, uint32_t height,
+                      uint32_t array_size, int64_t format)
+{
+	const char *label = eye < 0 ? "spi" : (eye == 0 ? "eye0" : "eye1");
+	return pvk_create_bridge(pvk_slot(eye), label, width, height, array_size, format);
 }
 
 void *
@@ -1012,18 +1028,14 @@ dxr_pvk_signal_unity_done(void)
 		s_pvk.unity_api.vkDeviceWaitIdle(s_pvk.unity_device);
 }
 
-int
-dxr_pvk_copy_to_swapchain_image(int eye, uint32_t image_index)
+// Copy `layer_count` layers of bridge `b` (from layer 0) into `dst` starting at
+// `dst_base_layer`, on the session queue, and wait for it. Shared by the eye bridges
+// and the 2D overlay bridges — the copy, the GENERAL-parked source and the
+// COLOR_ATTACHMENT_OPTIMAL hand-back are identical for both.
+static int
+pvk_copy_bridge(PvkBridge *b, VkImage dst, uint32_t dst_base_layer, uint32_t layer_count)
 {
-	PvkBridge *b = pvk_slot(eye);
-	if (!b || !b->valid || !s_pvk.device_ready) return 0;
-	if (image_index >= s_pvk.sc_image_count) return 0;
-	VkImage dst = s_pvk.sc_images[image_index];
-	if (dst == VK_NULL_HANDLE) return 0;
-
-	// MultiPass writes eye e into swapchain array slice e; SPI copies both layers.
-	uint32_t dst_base_layer = (eye < 0) ? 0 : (uint32_t)eye;
-	uint32_t layer_count = (eye < 0) ? b->layers : 1;
+	if (!b || !b->valid || !s_pvk.device_ready || dst == VK_NULL_HANDLE) return 0;
 
 	VkCommandBufferBeginInfo bi = {};
 	bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
@@ -1102,6 +1114,22 @@ dxr_pvk_copy_to_swapchain_image(int eye, uint32_t image_index)
 	}
 	// xrReleaseSwapchainImage must not run before the copy lands.
 	s_pvk.api.vkWaitForFences(s_pvk.device, 1, &s_pvk.copy_fence, VK_TRUE, UINT64_MAX);
+	return 1;
+}
+
+int
+dxr_pvk_copy_to_swapchain_image(int eye, uint32_t image_index)
+{
+	PvkBridge *b = pvk_slot(eye);
+	if (!b || !b->valid || !s_pvk.device_ready) return 0;
+	if (image_index >= s_pvk.sc_image_count) return 0;
+	VkImage dst = s_pvk.sc_images[image_index];
+	if (dst == VK_NULL_HANDLE) return 0;
+
+	// MultiPass writes eye e into swapchain array slice e; SPI copies both layers.
+	uint32_t dst_base_layer = (eye < 0) ? 0 : (uint32_t)eye;
+	uint32_t layer_count = (eye < 0) ? b->layers : 1;
+	if (!pvk_copy_bridge(b, dst, dst_base_layer, layer_count)) return 0;
 
 	// Periodic proof-of-life for the bridge copy. Without it, "the panel is black"
 	// is ambiguous between "the runtime never presented", "it presented black" and
@@ -1141,14 +1169,209 @@ pvk_destroy_bridge(PvkBridge *b)
 	*b = PvkBridge{};
 }
 
+// ---------------------------------------------------------------------------
+// 2D overlay layers (#336)
+// ---------------------------------------------------------------------------
+
+static PvkState::Overlay *
+pvk_overlay(int kind)
+{
+	if (kind < 0 || kind >= DXR_PVK_OVERLAY_COUNT) return NULL;
+	return &s_pvk.overlay[kind];
+}
+
+static const char *
+pvk_overlay_label(int kind)
+{
+	return kind == DXR_PVK_OVERLAY_LOCAL2D ? "local2d" : "wsui";
+}
+
+void
+dxr_pvk_overlay_set_swapchain_images(int kind, const void *images, uint32_t count,
+                                     int64_t format)
+{
+	PvkState::Overlay *o = pvk_overlay(kind);
+	if (!o) return;
+	const XrSwapchainImageVulkanKHR *imgs = (const XrSwapchainImageVulkanKHR *)images;
+	if (count > PVK_MAX_SWAPCHAIN_IMAGES) count = PVK_MAX_SWAPCHAIN_IMAGES;
+	for (uint32_t i = 0; i < count; i++) o->sc_images[i] = imgs[i].image;
+	o->sc_image_count = count;
+	o->sc_format = pvk_format_from_xr(format);
+}
+
+int
+dxr_pvk_overlay_create_bridge(int kind, uint32_t width, uint32_t height, int64_t format)
+{
+	PvkState::Overlay *o = pvk_overlay(kind);
+	if (!o) return 0;
+	PvkBridge *b = &o->bridge;
+	if (b->valid && b->width == width && b->height == height &&
+	    b->format == pvk_format_from_xr(format))
+		return 1;
+	if (b->valid) {
+		// Resize: the old Unity-side alias may still be referenced by a Unity command
+		// buffer recorded this frame, so drain Unity's queue before freeing it.
+		if (s_pvk.unity_api.vkQueueWaitIdle && s_pvk.unity_queue != VK_NULL_HANDLE)
+			s_pvk.unity_api.vkQueueWaitIdle(s_pvk.unity_queue);
+		pvk_destroy_bridge(b);
+	}
+	o->has_content = false;
+	return pvk_create_bridge(b, pvk_overlay_label(kind), width, height, 1, format);
+}
+
+int
+dxr_pvk_overlay_has_content(int kind)
+{
+	PvkState::Overlay *o = pvk_overlay(kind);
+	return (o && o->bridge.valid && o->has_content) ? 1 : 0;
+}
+
+int
+dxr_pvk_overlay_needs_content(int kind)
+{
+	PvkState::Overlay *o = pvk_overlay(kind);
+	return (o && o->bridge.valid && !o->has_content) ? 1 : 0;
+}
+
+static bool
+pvk_is_rgba8(VkFormat f)
+{
+	return f == VK_FORMAT_R8G8B8A8_UNORM || f == VK_FORMAT_R8G8B8A8_SRGB;
+}
+
+static bool
+pvk_is_bgra8(VkFormat f)
+{
+	return f == VK_FORMAT_B8G8R8A8_UNORM || f == VK_FORMAT_B8G8R8A8_SRGB;
+}
+
+int
+dxr_pvk_overlay_record_unity_copy(int kind, void *cmd_buf, void *src_image,
+                                  int64_t src_format, uint32_t src_w, uint32_t src_h)
+{
+	PvkState::Overlay *o = pvk_overlay(kind);
+	if (!o || !o->bridge.valid || !cmd_buf || !src_image) return 0;
+	PvkBridge *b = &o->bridge;
+	VkCommandBuffer cb = (VkCommandBuffer)cmd_buf;
+	VkImage src = (VkImage)src_image;
+	VkFormat sf = (VkFormat)src_format;
+	VkApi *api = &s_pvk.unity_api;
+	if (!api->vkCmdPipelineBarrier || !api->vkCmdCopyImage || !api->vkCmdBlitImage) return 0;
+
+	// Same channel order: a raw copy (the bytes are what the D3D path's CopyTexture
+	// moves too — SRGB vs UNORM only changes how they are read, not what they are).
+	// Swapped order (an RGBA source into the BGRA bridge): blit, which converts.
+	// Anything else would need a shader; refuse it loudly once rather than garble it.
+	bool same_order = (pvk_is_bgra8(sf) && pvk_is_bgra8(b->format)) ||
+	                  (pvk_is_rgba8(sf) && pvk_is_rgba8(b->format));
+	bool swapped = (pvk_is_rgba8(sf) && pvk_is_bgra8(b->format)) ||
+	               (pvk_is_bgra8(sf) && pvk_is_rgba8(b->format));
+	if (!same_order && !swapped) {
+		static bool warned[DXR_PVK_OVERLAY_COUNT] = {};
+		if (!warned[kind]) {
+			warned[kind] = true;
+			pvk_log("[DisplayXR-PROV-VK] %s: source format %d can't be copied into the "
+			        "fmt=%d bridge — layer stays empty\n",
+			        pvk_overlay_label(kind), (int)sf, (int)b->format);
+		}
+		return 0;
+	}
+	uint32_t w = src_w < b->width ? src_w : b->width;
+	uint32_t h = src_h < b->height ? src_h : b->height;
+	if (w == 0 || h == 0) return 0;
+
+	// The bridge stays parked in GENERAL (see pvk_create_bridge). Make the session
+	// copy's earlier read of it finish before this write, then write, then make the
+	// write visible to the next session-side read.
+	VkImageMemoryBarrier pre = pvk_barrier(b->unity_image, VK_IMAGE_LAYOUT_GENERAL,
+	                                       VK_IMAGE_LAYOUT_GENERAL,
+	                                       VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_MEMORY_READ_BIT,
+	                                       VK_ACCESS_TRANSFER_WRITE_BIT, 0, 1);
+	api->vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+	                          VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, NULL, 0, NULL, 1, &pre);
+
+	if (same_order) {
+		VkImageCopy region = {};
+		region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		region.srcSubresource.layerCount = 1;
+		region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		region.dstSubresource.layerCount = 1;
+		region.extent.width = w;
+		region.extent.height = h;
+		region.extent.depth = 1;
+		api->vkCmdCopyImage(cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		                    b->unity_image, VK_IMAGE_LAYOUT_GENERAL, 1, &region);
+	} else {
+		VkImageBlit region = {};
+		region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		region.srcSubresource.layerCount = 1;
+		region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+		region.dstSubresource.layerCount = 1;
+		region.srcOffsets[1].x = (int32_t)w; region.srcOffsets[1].y = (int32_t)h;
+		region.srcOffsets[1].z = 1;
+		region.dstOffsets[1].x = (int32_t)w; region.dstOffsets[1].y = (int32_t)h;
+		region.dstOffsets[1].z = 1;
+		api->vkCmdBlitImage(cb, src, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+		                    b->unity_image, VK_IMAGE_LAYOUT_GENERAL, 1, &region,
+		                    VK_FILTER_NEAREST);
+	}
+
+	VkImageMemoryBarrier post = pvk_barrier(b->unity_image, VK_IMAGE_LAYOUT_GENERAL,
+	                                        VK_IMAGE_LAYOUT_GENERAL,
+	                                        VK_ACCESS_TRANSFER_WRITE_BIT,
+	                                        VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_MEMORY_READ_BIT,
+	                                        0, 1);
+	api->vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TRANSFER_BIT,
+	                          VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0, NULL, 0, NULL, 1, &post);
+
+	if (!o->has_content)
+		pvk_log("[DisplayXR-PROV-VK] %s: first Unity copy recorded (%ux%u, src fmt=%d -> "
+		        "bridge fmt=%d, %s)\n", pvk_overlay_label(kind), w, h, (int)sf,
+		        (int)b->format, same_order ? "copy" : "blit");
+	o->has_content = true;
+	return 1;
+}
+
+int
+dxr_pvk_overlay_copy_to_swapchain_image(int kind, uint32_t image_index)
+{
+	PvkState::Overlay *o = pvk_overlay(kind);
+	if (!o || image_index >= o->sc_image_count) return 0;
+	return pvk_copy_bridge(&o->bridge, o->sc_images[image_index], 0, 1);
+}
+
+static void
+pvk_overlay_reset(PvkState::Overlay *o)
+{
+	pvk_destroy_bridge(&o->bridge);
+	*o = PvkState::Overlay{};
+}
+
+void
+dxr_pvk_overlay_destroy(int kind)
+{
+	PvkState::Overlay *o = pvk_overlay(kind);
+	if (!o) return;
+	if (s_pvk.device && s_pvk.api.vkDeviceWaitIdle) s_pvk.api.vkDeviceWaitIdle(s_pvk.device);
+	if (o->bridge.valid && s_pvk.unity_api.vkQueueWaitIdle && s_pvk.unity_queue != VK_NULL_HANDLE)
+		s_pvk.unity_api.vkQueueWaitIdle(s_pvk.unity_queue);
+	pvk_overlay_reset(o);
+}
+
 void
 dxr_pvk_destroy(void)
 {
 	if (s_pvk.device && s_pvk.api.vkDeviceWaitIdle) s_pvk.api.vkDeviceWaitIdle(s_pvk.device);
+	// The overlay bridges' Unity-side aliases are written from Unity's own command
+	// buffers (the plugin-event copy), so let those finish before freeing them.
+	if (s_pvk.unity_api.vkQueueWaitIdle && s_pvk.unity_queue != VK_NULL_HANDLE &&
+	    (s_pvk.overlay[0].bridge.valid || s_pvk.overlay[1].bridge.valid))
+		s_pvk.unity_api.vkQueueWaitIdle(s_pvk.unity_queue);
 
 	pvk_destroy_bridge(&s_pvk.bridge_spi);
 	pvk_destroy_bridge(&s_pvk.bridge_eye[0]);
 	pvk_destroy_bridge(&s_pvk.bridge_eye[1]);
+	for (int k = 0; k < DXR_PVK_OVERLAY_COUNT; k++) pvk_overlay_reset(&s_pvk.overlay[k]);
 
 	if (s_pvk.copy_fence && s_pvk.api.vkDestroyFence)
 		s_pvk.api.vkDestroyFence(s_pvk.device, s_pvk.copy_fence, NULL);

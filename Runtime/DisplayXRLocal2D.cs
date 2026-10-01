@@ -201,6 +201,10 @@ namespace DisplayXR
         // the bridge is still live — it may wrap a dead pointer. Re-acquire when this
         // changes. See TryAcquireBridge.
         private System.IntPtr m_BridgePtr = System.IntPtr.Zero;
+        // (#336) Vulkan has no wrappable bridge: the getter returns a session token in
+        // place of m_BridgePtr, and the copy is a plugin event on the render thread.
+        private bool m_VulkanBridge;
+        private System.IntPtr m_RenderEventFunc = System.IntPtr.Zero;
 
         // The opt-in URP foreground clip (DisplayXR/ForegroundClipURP) is a built-in
         // FullScreenPassRendererFeature with NO XR-camera guard.
@@ -229,6 +233,8 @@ namespace DisplayXR
             // mode, or XR not started) stay inert — no RT, no submission — so the rest
             // of the scene renders normally.
             m_ProviderMode = DisplayXRProviderDriver.IsActive;
+            m_VulkanBridge = m_ProviderMode &&
+                             SystemInfo.graphicsDeviceType == GraphicsDeviceType.Vulkan;
             if (!m_ProviderMode)
                 return;
 
@@ -378,6 +384,18 @@ namespace DisplayXR
                     // Session down / not ready. Drop a stale wrapper so the next live
                     // bridge is picked up cleanly rather than copied into a dead one.
                     if (m_BridgeTex != null) ReleaseBridgeTex();
+                    m_BridgePtr = System.IntPtr.Zero;
+                    return;
+                }
+                if (m_VulkanBridge)
+                {
+                    // Vulkan (#336): bridgePtr is a session token, never a texture. A new
+                    // token is a new session — same rect re-push as the wrapper path below.
+                    if (bridgePtr == m_BridgePtr) return;
+                    m_BridgePtr = bridgePtr;
+                    m_LastRectX = m_LastRectY = m_LastRectW = m_LastRectH = int.MinValue;
+                    m_BridgeDirty = true; // the session's fresh bridge needs a first copy
+                    Debug.Log($"[DisplayXR] Local2D: provider session {(long)bridgePtr} (Vulkan overlay bridge, rect re-push armed)");
                     return;
                 }
                 if (m_BridgeTex != null && bridgePtr == m_BridgePtr) return; // unchanged
@@ -553,7 +571,27 @@ namespace DisplayXR
                 // actually re-rendered since the last one (OnEndOverlayCamera sets
                 // the flag). Unthrottled that is still every frame, so this is a
                 // no-op change at maxRefreshHz = 0.
-                if (m_BridgeTex != null && OverlayTexture != null && m_BridgeDirty)
+                if (m_VulkanBridge)
+                {
+                    // Vulkan (#336): the plugin event records the copy on Unity's render
+                    // thread. Also issue it while the provider reports a bridge that has
+                    // never been filled — it is created at submit, possibly after the
+                    // canvas last re-rendered, and a static canvas would otherwise never
+                    // reach it.
+                    if (m_BridgePtr != System.IntPtr.Zero && OverlayTexture != null &&
+                        (m_BridgeDirty || DisplayXRProviderNative.dxr_prov_local2d_needs_content() != 0))
+                    {
+                        if (m_RenderEventFunc == System.IntPtr.Zero)
+                            m_RenderEventFunc = DisplayXRProviderNative.dxr_prov_get_render_event_func();
+                        if (m_RenderEventFunc != System.IntPtr.Zero)
+                        {
+                            GL.IssuePluginEvent(m_RenderEventFunc,
+                                DisplayXRProviderNative.kVkOverlayCopyLocal2DEvent);
+                            m_BridgeDirty = false;
+                        }
+                    }
+                }
+                else if (m_BridgeTex != null && OverlayTexture != null && m_BridgeDirty)
                 {
                     Graphics.CopyTexture(OverlayTexture, m_BridgeTex);
                     m_BridgeDirty = false;

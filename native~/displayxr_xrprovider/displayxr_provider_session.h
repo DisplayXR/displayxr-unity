@@ -316,6 +316,12 @@ DISPLAYXR_EXPORT int dxr_prov_get_zone_rect_px(uint32_t zone, int *x, int *y, in
 DISPLAYXR_EXPORT void dxr_prov_get_local2d_bridge(uint32_t w, uint32_t h,
                                                   void **out_ptr, uint32_t *out_w, uint32_t *out_h);
 
+/// (#336) Vulkan only: 1 while the Local2D overlay bridge exists but Unity has not
+/// copied into it yet — C# must issue the copy plugin event even if its own
+/// "overlay re-rendered" flag is clear, or a static canvas would never appear.
+/// Always 0 on the other backends.
+DISPLAYXR_EXPORT int dxr_prov_local2d_needs_content(void);
+
 /// Set the Local2D dest rect in client-window PIXELS (post-DPI). w<=0||h<=0 clears
 /// (layer inactive). Cheap; safe to call every frame.
 DISPLAYXR_EXPORT void dxr_prov_set_local2d_rect(int32_t x, int32_t y, int32_t w, int32_t h);

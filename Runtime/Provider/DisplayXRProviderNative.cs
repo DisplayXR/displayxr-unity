@@ -318,6 +318,26 @@ namespace DisplayXR
         public static extern void dxr_prov_set_local2d_rect(int x, int y, int w, int h);
 
         /// <summary>
+        /// (#336) Vulkan: 1 while the Local2D overlay bridge exists but Unity hasn't
+        /// copied into it yet, so the copy event must be issued even if the canvas
+        /// hasn't re-rendered. Always 0 on the other backends.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int dxr_prov_local2d_needs_content();
+
+        /// <summary>
+        /// (#336) The plugin's render-event callback, for <c>GL.IssuePluginEvent</c>.
+        /// On Vulkan the 2D overlay layers are filled from that event instead of
+        /// <c>Graphics.CopyTexture</c> into a wrapped bridge.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern System.IntPtr dxr_prov_get_render_event_func();
+
+        /// <summary>Event id: copy the Local2D canvas RT into its Vulkan overlay bridge.
+        /// Keep in sync with DXR_EVENT_VK_OVERLAY_COPY_LOCAL2D (displayxr_unity_plugin.cpp).</summary>
+        public const int kVkOverlayCopyLocal2DEvent = 0x44585201;
+
+        /// <summary>
         /// Per-eye foreground-clip data (#166 Phase B): the eye's foreground far
         /// (view-space display-plane distance, world units) + the eye WORLD position
         /// (Unity coords). DisplayXRDisplay publishes these to the URP ForegroundClipURP

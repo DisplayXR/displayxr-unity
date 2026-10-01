@@ -46,6 +46,79 @@ static bool                  s_vk_captured = false;
 
 // IUnityGraphicsVulkan::Instance() is stable between device init and shutdown,
 // so we can capture it lazily on first request as well as on the init event.
+#if defined(ENABLE_VULKAN)
+// ---------------------------------------------------------------------------
+// 2D overlay copy event (#336)
+// ---------------------------------------------------------------------------
+//
+// On Vulkan the Local2D/wsui canvas RT can't be Graphics.CopyTexture'd into a
+// wrapped bridge the way the D3D path does (see displayxr_provider_gfx_vulkan.h).
+// C# issues this event instead (GL.IssuePluginEvent); on Unity's render thread we
+// let Unity transition the RT to TRANSFER_SRC (AccessTexture) and record the copy
+// into the overlay bridge on Unity's own command buffer.
+//
+// Keep the id in sync with DisplayXRProviderNative.kVkOverlayCopyLocal2DEvent.
+#define DXR_EVENT_VK_OVERLAY_COPY_LOCAL2D 0x44585201
+
+extern "C" int displayxr_local2d_get_pending(void **out_tex, int *out_w, int *out_h);
+extern "C" int dxr_pvk_overlay_has_content(int kind);
+extern "C" int dxr_pvk_overlay_needs_content(int kind);
+extern "C" int dxr_pvk_overlay_record_unity_copy(int kind, void *cmd_buf, void *src_image,
+                                                 int64_t src_format, uint32_t src_w, uint32_t src_h);
+
+static void configure_vulkan_events(void)
+{
+	// Outside a render pass (a transfer can't be recorded inside one), no queue
+	// access (we only record into Unity's command buffer), and no command-buffer
+	// state is changed, so ModifiesCommandBuffersState is left clear.
+	UnityVulkanPluginEventConfig cfg = {};
+	cfg.renderPassPrecondition = kUnityVulkanRenderPass_EnsureOutside;
+	cfg.graphicsQueueAccess = kUnityVulkanGraphicsQueueAccess_DontCare;
+	cfg.flags = kUnityVulkanEventConfigFlag_EnsurePreviousFrameSubmission;
+	s_unity_vk->ConfigureEvent(DXR_EVENT_VK_OVERLAY_COPY_LOCAL2D, &cfg);
+}
+
+static void vk_overlay_copy(int kind, void *tex, int w, int h)
+{
+	// Only once the provider has created the bridge (render thread, at submit).
+	if (!dxr_pvk_overlay_has_content(kind) && !dxr_pvk_overlay_needs_content(kind)) return;
+	UnityVulkanImage img = {};
+	if (!s_unity_vk->AccessTexture(tex, UnityVulkanWholeImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+	                               VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
+	                               kUnityVulkanResourceAccess_PipelineBarrier, &img)) {
+		static bool warned = false;
+		if (!warned) {
+			warned = true;
+			fprintf(stderr, "[DisplayXR] Vulkan overlay copy: AccessTexture failed (tex=%p)\n", tex);
+		}
+		return;
+	}
+	// After AccessTexture: resource access may record commands and invalidates any
+	// recording state fetched earlier.
+	UnityVulkanRecordingState st = {};
+	if (!s_unity_vk->CommandRecordingState(&st, kUnityVulkanGraphicsQueueAccess_DontCare) ||
+	    st.commandBuffer == VK_NULL_HANDLE)
+		return;
+	uint32_t sw = img.extent.width ? img.extent.width : (uint32_t)w;
+	uint32_t sh = img.extent.height ? img.extent.height : (uint32_t)h;
+	dxr_pvk_overlay_record_unity_copy(kind, (void *)st.commandBuffer, (void *)img.image,
+	                                  (int64_t)img.format, sw, sh);
+}
+#endif
+
+static void UNITY_INTERFACE_API on_render_event(int event_id)
+{
+#if defined(ENABLE_VULKAN)
+	if (!s_unity_vk || !s_vk_captured) return;
+	if (event_id == DXR_EVENT_VK_OVERLAY_COPY_LOCAL2D) {
+		void *tex = NULL; int w = 0, h = 0;
+		if (displayxr_local2d_get_pending(&tex, &w, &h)) vk_overlay_copy(0 /* LOCAL2D */, tex, w, h);
+	}
+#else
+	(void)event_id;
+#endif
+}
+
 static void capture_vulkan_instance(void)
 {
 	if (s_vk_captured || !s_unity_vk) return;
@@ -53,6 +126,9 @@ static void capture_vulkan_instance(void)
 	s_vk_inst = s_unity_vk->Instance();
 	if (s_vk_inst.device != VK_NULL_HANDLE) {
 		s_vk_captured = true;
+#if defined(ENABLE_VULKAN)
+		configure_vulkan_events();
+#endif
 		fprintf(stderr, "[DisplayXR] Unity Vulkan device captured: instance=%p physicalDevice=%p device=%p queue=%p qf=%u\n",
 		        (void *)s_vk_inst.instance, (void *)s_vk_inst.physicalDevice,
 		        (void *)s_vk_inst.device, (void *)s_vk_inst.graphicsQueue,
@@ -129,6 +205,18 @@ UnityPluginUnload(void)
 }
 
 // ---- C ABI exposed to the rest of the plugin --------------------------------
+
+// Render-event entry point for GL.IssuePluginEvent (#336). Valid on every backend;
+// the callback only does work on Vulkan.
+extern "C" UNITY_INTERFACE_EXPORT UnityRenderingEvent UNITY_INTERFACE_API
+dxr_prov_get_render_event_func(void)
+{
+#if defined(DXR_HAVE_UNITY_VULKAN)
+	return on_render_event;
+#else
+	return nullptr;
+#endif
+}
 
 extern "C" int
 displayxr_unity_get_renderer(void)
