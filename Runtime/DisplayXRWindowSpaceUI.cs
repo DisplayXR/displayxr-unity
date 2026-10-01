@@ -133,11 +133,11 @@ namespace DisplayXR
         // (#336) Vulkan has no wrappable bridge: the getter returns a session token in
         // place of m_BridgePtr, and the copy is a plugin event on the render thread.
         private bool m_VulkanBridge;
-        // This component's wsui slot (#336 follow-up): -1 = none (every slot taken, or
-        // not acquired yet). m_LegacySlot = the native plugin predates slots, so the
-        // slot-less API (one shared layer) is used.
+        // This component's wsui slot (#336 follow-up): -1 = none (every slot taken, edit
+        // mode, or not acquired yet).
         private int m_Slot = -1;
-        private bool m_LegacySlot;
+        private bool m_SlotApiMissing, m_WarnedNoSlot, m_VulkanCopyBroken;
+        private float m_NextSlotRetry;
         private System.IntPtr m_RenderEventFunc = System.IntPtr.Zero;
 
         // Saved state, restored in OnDisable.
@@ -293,14 +293,9 @@ namespace DisplayXR
                     // Custom display-provider mode: the provider owns a SEPARATE
                     // D3D12 device, so it exposes its own cross-device wsui bridge. (#166)
                     if (m_Slot < 0) return; // no slot: this layer isn't shown
-                    if (m_LegacySlot)
-                        DisplayXRProviderNative.dxr_prov_get_wsui_bridge(
-                            (uint)m_RtSize.x, (uint)m_RtSize.y,
-                            out bridgePtr, out bw, out bh);
-                    else
-                        DisplayXRProviderNative.dxr_prov_get_wsui_bridge_slot(
-                            m_Slot, (uint)m_RtSize.x, (uint)m_RtSize.y,
-                            out bridgePtr, out bw, out bh);
+                    DisplayXRProviderNative.dxr_prov_get_wsui_bridge_slot(
+                        m_Slot, (uint)m_RtSize.x, (uint)m_RtSize.y,
+                        out bridgePtr, out bw, out bh);
                 }
                 if (bridgePtr == System.IntPtr.Zero || bw == 0 || bh == 0)
                 {
@@ -310,7 +305,8 @@ namespace DisplayXR
                     m_BridgePtr = System.IntPtr.Zero;
                     return;
                 }
-                m_VulkanBridge = SystemInfo.graphicsDeviceType == GraphicsDeviceType.Vulkan;
+                m_VulkanBridge = !m_VulkanCopyBroken &&
+                                 SystemInfo.graphicsDeviceType == GraphicsDeviceType.Vulkan;
                 if (m_VulkanBridge)
                 {
                     // Vulkan (#336): bridgePtr is a session token, never a texture.
@@ -356,7 +352,7 @@ namespace DisplayXR
             if (m_BridgePtr == System.IntPtr.Zero) return;
             try
             {
-                if (m_Slot < 0 || m_LegacySlot) return;
+                if (m_Slot < 0) return;
                 DisplayXRProviderNative.dxr_prov_wsui_request_copy_slot(m_Slot);
                 if (DisplayXRProviderNative.dxr_prov_wsui_needs_copy_slot(m_Slot) == 0) return;
                 if (m_RenderEventFunc == System.IntPtr.Zero)
@@ -371,50 +367,77 @@ namespace DisplayXR
                 // throwing every frame.
                 Debug.LogWarning("[DisplayXR] wsui: native plugin lacks the Vulkan overlay " +
                                  "exports (#336) — window-space UI disabled on Vulkan.");
+                m_VulkanCopyBroken = true; // latch: TryAcquireBridge must not re-arm it
                 m_VulkanBridge = false;
-                m_BridgePtr = System.IntPtr.Zero;
             }
         }
 
-        // Take a wsui slot for this component. Idempotent.
-        private void AcquireSlot()
+        // Take a wsui slot for this component. Idempotent. Play mode only: there is no
+        // session in edit mode (Play Mode is the preview), and an [ExecuteAlways] edit-mode
+        // or prefab-stage instance holding a slot would starve the play-mode ones.
+        private bool AcquireSlot()
         {
-            if (m_Slot >= 0) return;
+            if (m_Slot >= 0) return true;
+            if (!Application.isPlaying || m_SlotApiMissing) return false;
             try
             {
                 m_Slot = DisplayXRNative.displayxr_window_space_ui_acquire_slot();
-                m_LegacySlot = false;
-                if (m_Slot < 0)
-                    Debug.LogWarning($"[DisplayXR] wsui: '{name}' has no free window-space slot — " +
-                                     "too many DisplayXRWindowSpaceUI components are enabled at once.");
             }
             catch (System.EntryPointNotFoundException)
             {
-                m_Slot = 0; // older native plugin: the single shared layer
-                m_LegacySlot = true;
+                // Native plugin older than the managed side (they ship together, so this is
+                // a stale local build): stay inert rather than half-work.
+                m_SlotApiMissing = true;
+                Debug.LogWarning("[DisplayXR] wsui: native plugin lacks the slot API — " +
+                                 "window-space UI disabled. Rebuild/refresh the native plugin.");
+                return false;
             }
+            if (m_Slot < 0 && !m_WarnedNoSlot)
+            {
+                m_WarnedNoSlot = true;
+                Debug.LogWarning($"[DisplayXR] wsui: '{name}' has no free window-space slot — " +
+                                 "too many DisplayXRWindowSpaceUI components are enabled at once. " +
+                                 "It will appear when another one is disabled.");
+            }
+            return m_Slot >= 0;
+        }
+
+        // A component that found every slot taken retries (about once a second), so it
+        // appears as soon as another HUD frees one instead of staying hidden until it is
+        // re-enabled.
+        private void RetryAcquireSlot()
+        {
+            if (m_Slot >= 0 || m_SlotApiMissing || !Application.isPlaying) return;
+            if (Time.unscaledTime < m_NextSlotRetry) return;
+            m_NextSlotRetry = Time.unscaledTime + 1f;
+            if (!AcquireSlot()) return;
+            m_WarnedNoSlot = false;
+            NativeSetLayer(positionX, positionY, width, height, disparity);
+            if (OverlayTexture != null)
+                NativeSetTexture(OverlayTexture.GetNativeTexturePtr(), m_RtSize.x, m_RtSize.y);
+            m_LastX = positionX; m_LastY = positionY;
+            m_LastW = width;     m_LastH = height;
+            m_LastDisparity = disparity;
+            Debug.Log($"[DisplayXR] wsui: '{name}' got slot {m_Slot}");
         }
 
         private void ReleaseSlot()
         {
             if (m_Slot < 0) return;
-            if (m_LegacySlot) DisplayXRNative.displayxr_window_space_ui_clear();
-            else DisplayXRNative.displayxr_window_space_ui_release_slot(m_Slot);
+            DisplayXRNative.displayxr_window_space_ui_release_slot(m_Slot);
             m_Slot = -1;
         }
 
         private void NativeSetTexture(System.IntPtr tex, int w, int h)
         {
             if (m_Slot < 0) return;
-            if (m_LegacySlot) DisplayXRNative.displayxr_window_space_ui_set_texture(tex, w, h);
-            else DisplayXRNative.displayxr_window_space_ui_set_texture_slot(m_Slot, tex, w, h);
+            DisplayXRNative.displayxr_window_space_ui_set_texture_slot(m_Slot, tex, w, h);
         }
 
         private void NativeSetLayer(float x, float y, float w, float h, float disparity)
         {
             if (m_Slot < 0) return;
-            if (m_LegacySlot) DisplayXRNative.displayxr_window_space_ui_set_layer(x, y, w, h, disparity);
-            else DisplayXRNative.displayxr_window_space_ui_set_layer_slot(m_Slot, x, y, w, h, disparity);
+            DisplayXRNative.displayxr_window_space_ui_set_layer_slot(m_Slot, x, y, w, h, disparity);
         }
 
         private void ReleaseBridgeTex()
@@ -465,6 +488,7 @@ namespace DisplayXR
 
         void LateUpdate()
         {
+            RetryAcquireSlot();
             // Keep EVERYTHING under the canvas on the private layer, every frame (#289).
             // OnEnable parks the hierarchy on kPrivateLayer once, but the overlay
             // camera culls to that layer alone — so anything Instantiated under the

@@ -263,6 +263,7 @@ struct PvkState {
 		uint32_t  sc_image_count = 0;
 		VkFormat  sc_format = VK_FORMAT_UNDEFINED;
 		bool      has_content = false; // Unity has copied into the bridge at least once
+		void     *content_src = nullptr; // registered texture that copy came from
 	} overlay[DXR_PVK_OVERLAY_COUNT];
 
 	// Session binding storage, handed to xrCreateSession.
@@ -1031,8 +1032,8 @@ dxr_pvk_signal_unity_done(void)
 		s_pvk.unity_api.vkDeviceWaitIdle(s_pvk.unity_device);
 
 	// Age the overlay graveyard here: this runs exactly once per frame. Ticking per
-	// overlay copy made the delay shrink with every extra layer (Local2D + a HUD = two
-	// "frames" per frame).
+	// overlay copy (as the first version did) made the delay shrink with every extra
+	// layer — with Local2D + 3 HUDs, 4 "frames" passed in one.
 	pvk_grave_tick();
 }
 
@@ -1275,9 +1276,13 @@ pvk_overlay(int kind)
 static const char *
 pvk_overlay_label(int kind)
 {
-	static const char *const names[DXR_PVK_OVERLAY_COUNT] = {"local2d", "wsui0", "wsui1",
-	                                                         "wsui2", "wsui3"};
-	return (kind >= 0 && kind < DXR_PVK_OVERLAY_COUNT) ? names[kind] : "?";
+	static char names[DXR_PVK_OVERLAY_COUNT][16];
+	if (kind < 0 || kind >= DXR_PVK_OVERLAY_COUNT) return "?";
+	if (!names[kind][0]) {
+		if (kind == DXR_PVK_OVERLAY_LOCAL2D) snprintf(names[kind], sizeof(names[kind]), "local2d");
+		else snprintf(names[kind], sizeof(names[kind]), "wsui%d", kind - DXR_PVK_OVERLAY_WSUI0);
+	}
+	return names[kind];
 }
 
 static void
@@ -1373,7 +1378,8 @@ pvk_is_srgb8(VkFormat f)
 
 int
 dxr_pvk_overlay_record_unity_copy(int kind, void *cmd_buf, void *src_image,
-                                  int64_t src_format, uint32_t src_w, uint32_t src_h)
+                                  int64_t src_format, uint32_t src_w, uint32_t src_h,
+                                  void *src_id)
 {
 	PvkState::Overlay *o = pvk_overlay(kind);
 	if (!o || !o->bridge.valid || !cmd_buf || !src_image) return 0;
@@ -1458,8 +1464,16 @@ dxr_pvk_overlay_record_unity_copy(int kind, void *cmd_buf, void *src_image,
 		        "bridge fmt=%d, %s)\n", pvk_overlay_label(kind), w, h, (int)sf,
 		        (int)b->format, same_order ? "copy" : "blit");
 	o->has_content = true;
+	o->content_src = src_id;
 	s_ov_want_copy[kind] = 0;
 	return 1;
+}
+
+void *
+dxr_pvk_overlay_content_source(int kind)
+{
+	PvkState::Overlay *o = pvk_overlay(kind);
+	return o ? o->content_src : NULL;
 }
 
 int

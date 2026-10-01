@@ -13,6 +13,7 @@
 #include <openxr/openxr.h>
 #include "../displayxr_extensions.h"
 #include "../displayxr_shared_state.h" // displayxr_state_set_stereo_matrices (overlay hit-test)
+#include "../displayxr_window_space_ui.h" // DXR_WSUI_MAX_SLOTS, get_pending_slot
 #include <atomic>     // s_session_generation (#336)
 
 #ifdef _WIN32
@@ -192,6 +193,7 @@ extern "C" int  dxr_pvk_overlay_needs_copy(int kind);
 extern "C" void dxr_pvk_overlay_request_copy(int kind);
 extern "C" int  dxr_pvk_overlay_copy_to_swapchain_image(int kind, uint32_t image_index);
 extern "C" void dxr_pvk_overlay_destroy(int kind);
+extern "C" void *dxr_pvk_overlay_content_source(int kind);
 #endif
 
 // Bumped each time a session reaches READY. File-scope on purpose: s_ps is
@@ -225,7 +227,7 @@ static int s_wsui_vk_disabled = 0;
 // canvas RT into bridge_unity each frame; submit copies bridge_own -> the acquired
 // swapchain image (own device) and submits one window-space composition layer.
 // One per wsui slot (#336 follow-up): several HUD components can be live at once.
-#define PS_MAX_WSUI 4 // == DXR_WSUI_MAX_SLOTS (displayxr_window_space_ui.h)
+#define PS_MAX_WSUI DXR_WSUI_MAX_SLOTS
 typedef struct ProviderWsui {
 	XrSwapchain swapchain;
 	uint32_t    w, h, image_count;
@@ -2403,9 +2405,6 @@ int dxr_prov_reconcile_size(void)
 // s_pending getter exported by the wsui module (displayxr_window_space_ui.cpp).
 // C# DisplayXRWindowSpaceUI sets it via set_texture/set_layer regardless of which
 // session is active, so the provider can drive its own window-space layer.
-extern "C" int displayxr_window_space_ui_get_pending_slot(int slot, void **out_tex, int *out_tex_w,
-                                                          int *out_tex_h, float *out_x, float *out_y,
-                                                          float *out_lw, float *out_lh, float *out_disp);
 
 // s_pending getter exported by the Local2D module (displayxr_local2d.cpp). The Metal
 // Local2D arm blits this Unity id<MTLTexture> straight into its overlay swapchain image
@@ -2739,7 +2738,11 @@ static int ps_submit_wsui(int slot, XrCompositionLayerWindowSpaceDXR *out_layer)
 		if (!displayxr_window_space_ui_get_pending_slot(slot, &tex, &tw, &th, &lx, &ly, &lw, &lh, &ldisp))
 			return 0;
 		if (!ps_create_wsui(slot, (uint32_t)tw, (uint32_t)th)) return 0;
-		if (!dxr_pvk_overlay_has_content((PS_PVK_OVERLAY_WSUI0 + slot))) return 0;
+		// Only content copied from the texture registered in this slot NOW: a slot taken
+		// over by another component must not show the previous owner's last image.
+		if (!dxr_pvk_overlay_has_content(PS_PVK_OVERLAY_WSUI0 + slot) ||
+		    dxr_pvk_overlay_content_source(PS_PVK_OVERLAY_WSUI0 + slot) != tex)
+			return 0;
 
 		uint32_t idx = 0;
 		XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
@@ -3208,8 +3211,11 @@ static int ps_submit_local2d(XrCompositionLayerLocal2DDXR *out_layer)
 		void *tex = NULL; int tw = 0, th = 0;
 		if (!displayxr_local2d_get_pending(&tex, &tw, &th)) return 0;
 		if (!ps_create_local2d((uint32_t)tw, (uint32_t)th)) return 0;
-		// A fresh bridge holds uninitialised memory until Unity's first copy lands.
-		if (!dxr_pvk_overlay_has_content(PS_PVK_OVERLAY_LOCAL2D)) return 0;
+		// A fresh bridge holds uninitialised memory until Unity's first copy lands, and
+		// content copied from a texture no longer registered is someone else's.
+		if (!dxr_pvk_overlay_has_content(PS_PVK_OVERLAY_LOCAL2D) ||
+		    dxr_pvk_overlay_content_source(PS_PVK_OVERLAY_LOCAL2D) != tex)
+			return 0;
 
 		uint32_t idx = 0;
 		XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
@@ -7219,8 +7225,8 @@ int dxr_prov_submit_frame(uint32_t image_index)
 		if (has_wsui && s_ps.graphics_api == DXR_GFX_VULKAN && r == XR_ERROR_LAYER_INVALID &&
 		    !s_wsui_vk_disabled) {
 			s_wsui_vk_disabled = 1;
-			ps_log("[DisplayXR-PROV] wsui: runtime rejected a frame carrying the window-space "
-			       "layer on Vulkan (XR_ERROR_LAYER_INVALID) — wsui disabled until the next "
+			ps_log("[DisplayXR-PROV] wsui: runtime rejected a frame carrying window-space "
+			       "layers on Vulkan (XR_ERROR_LAYER_INVALID) — wsui disabled until the next "
 			       "session\n");
 		}
 #endif

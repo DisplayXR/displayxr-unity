@@ -44,6 +44,7 @@
 #if defined(ENABLE_VULKAN)
 
 #include "../displayxr_vk_loader.h"
+#include "../displayxr_window_space_ui.h" // DXR_WSUI_MAX_SLOTS
 
 #define XR_USE_GRAPHICS_API_VULKAN 0 // types are inlined in the .cpp, like D3D11/D3D12
 #include <openxr/openxr.h>
@@ -156,7 +157,7 @@ void dxr_pvk_signal_unity_done(void);
 enum {
 	DXR_PVK_OVERLAY_LOCAL2D = 0,
 	DXR_PVK_OVERLAY_WSUI0 = 1,   // wsui slot N is DXR_PVK_OVERLAY_WSUI0 + N
-	DXR_PVK_OVERLAY_COUNT = 1 + 4, // Local2D + DXR_WSUI_MAX_SLOTS
+	DXR_PVK_OVERLAY_COUNT = 1 + DXR_WSUI_MAX_SLOTS, // Local2D + one per wsui slot
 };
 
 /// Record the overlay layer's swapchain VkImages (session device) and format.
@@ -187,9 +188,17 @@ void dxr_pvk_overlay_request_copy(int kind);
 /// Unity RenderTexture already transitioned to TRANSFER_SRC_OPTIMAL by
 /// AccessTexture) into the overlay bridge's Unity-side alias, on Unity's
 /// `cmd_buf`. `src_format` is the source VkFormat; an RGBA source is blitted so
-/// the channels land right in a BGRA bridge. Returns 1 if a copy was recorded.
+/// the channels land right in a BGRA bridge. `src_id` is the texture's registered
+/// native pointer, remembered as the bridge content's source (see
+/// dxr_pvk_overlay_content_source). Returns 1 if a copy was recorded.
 int dxr_pvk_overlay_record_unity_copy(int kind, void *cmd_buf, void *src_image,
-                                      int64_t src_format, uint32_t src_w, uint32_t src_h);
+                                      int64_t src_format, uint32_t src_w, uint32_t src_h,
+                                      void *src_id);
+
+/// The registered texture the bridge's current content was copied from. Submit
+/// compares it with the texture registered NOW, so a slot taken over by another
+/// component never shows the previous owner's last image. Render thread only.
+void *dxr_pvk_overlay_content_source(int kind);
 
 /// Per-frame session side: copy the overlay bridge into swapchain image `image_index`.
 int dxr_pvk_overlay_copy_to_swapchain_image(int kind, uint32_t image_index);
