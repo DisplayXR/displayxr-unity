@@ -3,7 +3,7 @@
 
 using UnityEngine;
 using UnityEngine.Experimental.Rendering;
-using UnityEngine.Rendering;
+using UnityEngine.Rendering; // RenderPipelineManager, ScriptableRenderContext
 
 namespace DisplayXR
 {
@@ -110,7 +110,18 @@ namespace DisplayXR
         // We park the WorldSpace canvas at this fixed position, far from any
         // scene content, so the dedicated camera looking at it sees nothing
         // else that might bleed into our RT.
-        private static readonly Vector3 kCanvasWorldPos = new Vector3(0, 100000f, 0);
+        // This component's private stage (see DisplayXROverlayStage): its canvas and
+        // camera sit there so no other overlay's camera sees this canvas.
+        private int m_Stage = -1;
+
+        // The URP transparent-overlay foreground clip (DisplayXR/ForegroundClipURP) is a
+        // full-screen pass on the renderer, so it also runs for this overlay camera and,
+        // keyed on _DXRForegroundFar (z>0.5 = armed), discards the whole canvas: the RT
+        // comes out fully transparent and the HUD never shows. Same fix as
+        // DisplayXRLocal2D: zero the global for our camera's render, restore after.
+        private static readonly int s_ForegroundFarId = Shader.PropertyToID("_DXRForegroundFar");
+        private Vector4 m_SavedForegroundFar;
+        private bool m_CamRenderHooked;
         // Dedicated layer: we put the canvas + children on this layer and give
         // ONLY our overlay camera that layer in its cullingMask. We pick a
         // mid-range layer that's typically unused (Unity reserves 0-7 for
@@ -185,7 +196,9 @@ namespace DisplayXR
             m_Canvas.renderMode = RenderMode.WorldSpace;
             // worldCamera is assigned to the OverlayCamera below (after creation)
             // so GraphicRaycaster can project screen-cursor input onto the canvas.
-            m_CanvasRect.position = kCanvasWorldPos;
+            if (m_Stage < 0) m_Stage = DisplayXROverlayStage.Acquire();
+            Vector3 stagePos = DisplayXROverlayStage.Position(m_Stage);
+            m_CanvasRect.position = stagePos;
             m_CanvasRect.rotation = Quaternion.identity;
             // Use the canvas's existing reference width as the scale baseline.
             // 1 world unit per UI unit at scale 1 → set scale so the RT
@@ -208,7 +221,7 @@ namespace DisplayXR
             // pipeline and the swapchain image our native blit feeds the
             // runtime compositor with. Without this the panel reads
             // upside-down in the runtime preview window.
-            camGO.transform.position = kCanvasWorldPos + new Vector3(0, 0, 1);
+            camGO.transform.position = stagePos + new Vector3(0, 0, 1);
             camGO.transform.rotation = Quaternion.LookRotation(Vector3.back, Vector3.down);
 
             m_OverlayCamera = camGO.AddComponent<Camera>();
@@ -236,6 +249,12 @@ namespace DisplayXR
             // Mirrors DisplayXRLocal2D (which was migrated off manual Render for the
             // canvas-rebuild race — same enabled=true resolution).
             m_OverlayCamera.enabled = true;
+            if (!m_CamRenderHooked)
+            {
+                RenderPipelineManager.beginCameraRendering += OnBeginOverlayCamera;
+                RenderPipelineManager.endCameraRendering += OnEndOverlayCamera;
+                m_CamRenderHooked = true;
+            }
 
             // Wire OverlayCamera as the canvas's event camera. GraphicRaycaster
             // needs a camera reference to project screen-cursor input onto a
@@ -450,9 +469,34 @@ namespace DisplayXR
             m_BridgePtr = System.IntPtr.Zero;
         }
 
+        // Scope the URP foreground clip out of our overlay camera (see the field doc).
+        // Camera-identity gated, so other cameras are untouched.
+        void OnBeginOverlayCamera(ScriptableRenderContext ctx, Camera cam)
+        {
+            if (cam != m_OverlayCamera) return;
+            m_SavedForegroundFar = Shader.GetGlobalVector(s_ForegroundFarId);
+            if (m_SavedForegroundFar.z > 0.5f)
+                Shader.SetGlobalVector(s_ForegroundFarId, Vector4.zero);
+        }
+
+        void OnEndOverlayCamera(ScriptableRenderContext ctx, Camera cam)
+        {
+            if (cam != m_OverlayCamera) return;
+            if (m_SavedForegroundFar.z > 0.5f)
+                Shader.SetGlobalVector(s_ForegroundFarId, m_SavedForegroundFar);
+        }
+
         void OnDisable()
         {
             ReleaseSlot();
+            if (m_CamRenderHooked)
+            {
+                RenderPipelineManager.beginCameraRendering -= OnBeginOverlayCamera;
+                RenderPipelineManager.endCameraRendering -= OnEndOverlayCamera;
+                m_CamRenderHooked = false;
+            }
+            DisplayXROverlayStage.Release(m_Stage);
+            m_Stage = -1;
 
             // Restore the canvas's original mode + transform + layer.
             if (m_StateSaved && m_Canvas != null)
