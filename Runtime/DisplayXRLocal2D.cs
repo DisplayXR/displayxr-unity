@@ -157,10 +157,21 @@ namespace DisplayXR
         [Range(0.1f, 2f)]
         public float renderScale = 1f;
 
-        // Pixel size of the overlay RT: resolution x renderScale (at least 1x1).
-        private Vector2Int RtSize => new Vector2Int(
-            Mathf.Max(1, Mathf.RoundToInt(resolution.x * renderScale)),
-            Mathf.Max(1, Mathf.RoundToInt(resolution.y * renderScale)));
+        // Pixel size of the overlay RT: resolution x renderScale, at least 1x1 and no
+        // larger than the GPU allows (scaled down uniformly, so the aspect is kept and
+        // what native/the bridge are told always matches the RT that really exists).
+        private Vector2Int RtSize
+        {
+            get
+            {
+                float w = Mathf.Max(1f, resolution.x * renderScale);
+                float h = Mathf.Max(1f, resolution.y * renderScale);
+                float max = SystemInfo.maxTextureSize;
+                float fit = Mathf.Min(1f, max / Mathf.Max(w, h));
+                return new Vector2Int(Mathf.Max(1, Mathf.RoundToInt(w * fit)),
+                                      Mathf.Max(1, Mathf.RoundToInt(h * fit)));
+            }
+        }
 
         [Tooltip("Maximum times per second the overlay re-renders. Local2D content is " +
                  "typically static (a speech bubble, a HUD), but an enabled offscreen " +
