@@ -167,13 +167,21 @@ void dxr_pvk_overlay_set_swapchain_images(int kind, const void *images, uint32_t
 /// render thread: it shares the session command buffer with the per-frame copy.
 int dxr_pvk_overlay_create_bridge(int kind, uint32_t width, uint32_t height, int64_t format);
 
+/// 1 while the overlay bridge exists. Safe from any thread.
+int dxr_pvk_overlay_ready(int kind);
+
 /// 1 once the bridge exists and Unity has copied into it at least once. Until
 /// then its memory is uninitialised, so the layer must not be submitted.
+/// Render thread only.
 int dxr_pvk_overlay_has_content(int kind);
 
-/// 1 when the bridge exists but has not been filled yet — the C# side must issue
-/// the copy event even if its own "content changed" flag is clear.
-int dxr_pvk_overlay_needs_content(int kind);
+/// 1 while the bridge exists and wants a Unity copy: after it was created, or
+/// after dxr_pvk_overlay_request_copy, until a copy is actually RECORDED (an event
+/// that had to skip leaves it set, so the copy is retried). Safe from any thread.
+int dxr_pvk_overlay_needs_copy(int kind);
+
+/// Ask for a Unity copy (the canvas re-rendered). Safe from any thread.
+void dxr_pvk_overlay_request_copy(int kind);
 
 /// Plugin-event side (Unity's render thread): record a copy of `src_image` (a
 /// Unity RenderTexture already transitioned to TRANSFER_SRC_OPTIMAL by

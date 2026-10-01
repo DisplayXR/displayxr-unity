@@ -318,12 +318,16 @@ namespace DisplayXR
         public static extern void dxr_prov_set_local2d_rect(int x, int y, int w, int h);
 
         /// <summary>
-        /// (#336) Vulkan: 1 while the Local2D overlay bridge exists but Unity hasn't
-        /// copied into it yet, so the copy event must be issued even if the canvas
-        /// hasn't re-rendered. Always 0 on the other backends.
+        /// (#336) Vulkan: 1 while the Local2D overlay bridge wants a copy from Unity —
+        /// right after it is created, and after <see cref="dxr_prov_local2d_request_copy"/>,
+        /// until a copy is actually recorded. Always 0 on the other backends.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern int dxr_prov_local2d_needs_content();
+        public static extern int dxr_prov_local2d_needs_copy();
+
+        /// <summary>(#336) Vulkan: the Local2D canvas re-rendered — ask for a copy.</summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void dxr_prov_local2d_request_copy();
 
         /// <summary>
         /// (#336) The plugin's render-event callback, for <c>GL.IssuePluginEvent</c>.

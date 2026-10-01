@@ -394,7 +394,6 @@ namespace DisplayXR
                     if (bridgePtr == m_BridgePtr) return;
                     m_BridgePtr = bridgePtr;
                     m_LastRectX = m_LastRectY = m_LastRectW = m_LastRectH = int.MinValue;
-                    m_BridgeDirty = true; // the session's fresh bridge needs a first copy
                     Debug.Log($"[DisplayXR] Local2D: provider session {(long)bridgePtr} (Vulkan overlay bridge, rect re-push armed)");
                     return;
                 }
@@ -574,21 +573,38 @@ namespace DisplayXR
                 if (m_VulkanBridge)
                 {
                     // Vulkan (#336): the plugin event records the copy on Unity's render
-                    // thread. Also issue it while the provider reports a bridge that has
-                    // never been filled — it is created at submit, possibly after the
-                    // canvas last re-rendered, and a static canvas would otherwise never
-                    // reach it.
-                    if (m_BridgePtr != System.IntPtr.Zero && OverlayTexture != null &&
-                        (m_BridgeDirty || DisplayXRProviderNative.dxr_prov_local2d_needs_content() != 0))
+                    // thread. The provider owns the "a copy is wanted" state: it is set
+                    // when its bridge is (re)created and when we report a re-render, and
+                    // cleared only once a copy is actually recorded — so a skipped event
+                    // is retried and a bridge created after the last re-render still
+                    // gets filled.
+                    try
                     {
-                        if (m_RenderEventFunc == System.IntPtr.Zero)
-                            m_RenderEventFunc = DisplayXRProviderNative.dxr_prov_get_render_event_func();
-                        if (m_RenderEventFunc != System.IntPtr.Zero)
+                        if (m_BridgePtr != System.IntPtr.Zero && OverlayTexture != null)
                         {
-                            GL.IssuePluginEvent(m_RenderEventFunc,
-                                DisplayXRProviderNative.kVkOverlayCopyLocal2DEvent);
-                            m_BridgeDirty = false;
+                            if (m_BridgeDirty)
+                            {
+                                DisplayXRProviderNative.dxr_prov_local2d_request_copy();
+                                m_BridgeDirty = false;
+                            }
+                            if (DisplayXRProviderNative.dxr_prov_local2d_needs_copy() != 0)
+                            {
+                                if (m_RenderEventFunc == System.IntPtr.Zero)
+                                    m_RenderEventFunc = DisplayXRProviderNative.dxr_prov_get_render_event_func();
+                                if (m_RenderEventFunc != System.IntPtr.Zero)
+                                    GL.IssuePluginEvent(m_RenderEventFunc,
+                                        DisplayXRProviderNative.kVkOverlayCopyLocal2DEvent);
+                            }
                         }
+                    }
+                    catch (System.EntryPointNotFoundException)
+                    {
+                        // Native plugin older than the managed side: stay inert instead
+                        // of throwing every frame.
+                        Debug.LogWarning("[DisplayXR] Local2D: native plugin lacks the Vulkan overlay " +
+                                         "exports (#336) — Local2D disabled on Vulkan.");
+                        m_VulkanBridge = false;
+                        m_BridgePtr = System.IntPtr.Zero;
                     }
                 }
                 else if (m_BridgeTex != null && OverlayTexture != null && m_BridgeDirty)

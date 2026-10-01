@@ -13,6 +13,7 @@
 #include <openxr/openxr.h>
 #include "../displayxr_extensions.h"
 #include "../displayxr_shared_state.h" // displayxr_state_set_stereo_matrices (overlay hit-test)
+#include <atomic>     // s_session_generation (#336)
 
 #ifdef _WIN32
 #include <windows.h>
@@ -187,7 +188,8 @@ extern "C" int  dxr_pvk_device_ready(void);
 extern "C" void dxr_pvk_overlay_set_swapchain_images(int kind, const void *, uint32_t, int64_t);
 extern "C" int  dxr_pvk_overlay_create_bridge(int kind, uint32_t, uint32_t, int64_t);
 extern "C" int  dxr_pvk_overlay_has_content(int kind);
-extern "C" int  dxr_pvk_overlay_needs_content(int kind);
+extern "C" int  dxr_pvk_overlay_needs_copy(int kind);
+extern "C" void dxr_pvk_overlay_request_copy(int kind);
 extern "C" int  dxr_pvk_overlay_copy_to_swapchain_image(int kind, uint32_t image_index);
 extern "C" void dxr_pvk_overlay_destroy(int kind);
 #endif
@@ -195,7 +197,8 @@ extern "C" void dxr_pvk_overlay_destroy(int kind);
 // Bumped each time a session reaches READY. File-scope on purpose: s_ps is
 // memset at every session start, and this must survive that to tell C# "this is a
 // different session than the one you last saw" (#336, Vulkan overlay getters).
-static uint32_t s_session_generation = 0;
+// Atomic: bumped on the thread that polls events, read by the C# main thread.
+static std::atomic<uint32_t> s_session_generation{0};
 
 // ============================================================================
 // Size constants
@@ -614,6 +617,7 @@ typedef struct ProviderSession {
 #endif // _WIN32
 	int32_t         l2d_rect_x, l2d_rect_y, l2d_rect_w, l2d_rect_h; // dest, client px
 	int             l2d_rect_set;
+	uint32_t        l2d_vk_failed_w, l2d_vk_failed_h; // Vulkan create failed at this size (#336)
 
 	// Per-frame located views (render-ready)
 	DxrProvView views[DXR_PROV_MAX_VIEWS];
@@ -2744,6 +2748,11 @@ static int ps_create_local2d(uint32_t w, uint32_t h)
 		if (w == 0 || h == 0 || !dxr_pvk_device_ready()) return 0;
 		if (s_ps.l2d_swapchain_created && s_ps.l2d_registered_w == w && s_ps.l2d_registered_h == h)
 			return 1;
+		// This runs from submit every frame. A failure for a given size is not going to
+		// heal by retrying (format, swapchain or external-memory import), and each retry
+		// costs a device-idle teardown, so remember it until the size changes.
+		if (s_ps.l2d_vk_failed_w == w && s_ps.l2d_vk_failed_h == h) return 0;
+		s_ps.l2d_vk_failed_w = w; s_ps.l2d_vk_failed_h = h; // cleared on success below
 		if (s_ps.l2d_swapchain && s_ps.pfn_destroy_swapchain) {
 			dxr_pvk_overlay_destroy(PS_PVK_OVERLAY_LOCAL2D);
 			s_ps.pfn_destroy_swapchain(s_ps.l2d_swapchain);
@@ -2804,6 +2813,7 @@ static int ps_create_local2d(uint32_t w, uint32_t h)
 		s_ps.l2d_image_count = count;
 		s_ps.l2d_registered_w = w; s_ps.l2d_registered_h = h;
 		s_ps.l2d_swapchain_created = 1;
+		s_ps.l2d_vk_failed_w = s_ps.l2d_vk_failed_h = 0;
 		ps_log("[DisplayXR-PROV] local2d: Vulkan swapchain %ux%u (%u imgs, fmt=%lld) + overlay bridge\n",
 		       w, h, count, (long long)format);
 		return 1;
@@ -2974,7 +2984,8 @@ void dxr_prov_get_local2d_bridge(uint32_t w, uint32_t h,
 		// plugin event instead. Hand back a non-zero SESSION token so its "new session
 		// -> re-push the rect" detection keeps working. The swapchain + bridge are
 		// created lazily on the render thread in ps_submit_local2d.
-		if (out_ptr) *out_ptr = (void *)(uintptr_t)(s_session_generation ? s_session_generation : 1);
+		uint32_t gen = s_session_generation.load();
+		if (out_ptr) *out_ptr = (void *)(uintptr_t)(gen ? gen : 1);
 		if (out_w) *out_w = w;
 		if (out_h) *out_h = h;
 		return;
@@ -2989,13 +3000,21 @@ void dxr_prov_get_local2d_bridge(uint32_t w, uint32_t h,
 #endif
 }
 
-int dxr_prov_local2d_needs_content(void)
+int dxr_prov_local2d_needs_copy(void)
 {
 #if defined(ENABLE_VULKAN)
 	if (s_ps.graphics_api == DXR_GFX_VULKAN)
-		return dxr_pvk_overlay_needs_content(PS_PVK_OVERLAY_LOCAL2D);
+		return dxr_pvk_overlay_needs_copy(PS_PVK_OVERLAY_LOCAL2D);
 #endif
 	return 0;
+}
+
+void dxr_prov_local2d_request_copy(void)
+{
+#if defined(ENABLE_VULKAN)
+	if (s_ps.graphics_api == DXR_GFX_VULKAN)
+		dxr_pvk_overlay_request_copy(PS_PVK_OVERLAY_LOCAL2D);
+#endif
 }
 
 void dxr_prov_set_local2d_rect(int32_t x, int32_t y, int32_t w, int32_t h)
@@ -3005,9 +3024,6 @@ void dxr_prov_set_local2d_rect(int32_t x, int32_t y, int32_t w, int32_t h)
 	s_ps.l2d_rect_set = 1;
 }
 
-// Per-frame: copy the Local2D bridge into its overlay swapchain image and fill the
-// layer (XrCompositionLayerLocal2DDXR, dest = client-window pixel rect). Returns 1
-// if the layer should be submitted. Called from submit after the projection copy.
 // The XrCompositionLayerLocal2DDXR fields every backend fills the same way.
 static void ps_fill_local2d_layer(XrCompositionLayerLocal2DDXR *out_layer)
 {
@@ -3026,10 +3042,16 @@ static void ps_fill_local2d_layer(XrCompositionLayerLocal2DDXR *out_layer)
 	out_layer->rect.extent = {s_ps.l2d_rect_w, s_ps.l2d_rect_h};
 }
 
+// Per-frame: copy the Local2D bridge into its overlay swapchain image and fill the
+// layer (XrCompositionLayerLocal2DDXR, dest = client-window pixel rect). Returns 1
+// if the layer should be submitted. Called from submit after the projection copy.
 static int ps_submit_local2d(XrCompositionLayerLocal2DDXR *out_layer)
 {
 	if (!out_layer) return 0;
 	memset(out_layer, 0, sizeof(*out_layer));
+	// A Local2D layer the runtime didn't enable fails the WHOLE xrEndFrame with
+	// XR_ERROR_LAYER_INVALID (black panel). Never submit one without the extension.
+	if (!s_ps.has_local_3d_zone) return 0;
 #if defined(ENABLE_VULKAN)
 	// Vulkan (#336): size from the C#-registered texture, create lazily (render
 	// thread), copy the overlay bridge into the acquired image. Unity's copy into the

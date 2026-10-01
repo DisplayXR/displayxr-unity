@@ -61,8 +61,7 @@ static bool                  s_vk_captured = false;
 #define DXR_EVENT_VK_OVERLAY_COPY_LOCAL2D 0x44585201
 
 extern "C" int displayxr_local2d_get_pending(void **out_tex, int *out_w, int *out_h);
-extern "C" int dxr_pvk_overlay_has_content(int kind);
-extern "C" int dxr_pvk_overlay_needs_content(int kind);
+extern "C" int dxr_pvk_overlay_ready(int kind);
 extern "C" int dxr_pvk_overlay_record_unity_copy(int kind, void *cmd_buf, void *src_image,
                                                  int64_t src_format, uint32_t src_w, uint32_t src_h);
 
@@ -81,7 +80,7 @@ static void configure_vulkan_events(void)
 static void vk_overlay_copy(int kind, void *tex, int w, int h)
 {
 	// Only once the provider has created the bridge (render thread, at submit).
-	if (!dxr_pvk_overlay_has_content(kind) && !dxr_pvk_overlay_needs_content(kind)) return;
+	if (!dxr_pvk_overlay_ready(kind)) return;
 	UnityVulkanImage img = {};
 	if (!s_unity_vk->AccessTexture(tex, UnityVulkanWholeImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 	                               VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
