@@ -326,6 +326,10 @@ DISPLAYXR_EXPORT int dxr_prov_local2d_needs_copy(void);
 /// No-op on the other backends.
 DISPLAYXR_EXPORT void dxr_prov_local2d_request_copy(void);
 
+/// (#336) wsui twins of the two Local2D calls above (Vulkan only, inert elsewhere).
+DISPLAYXR_EXPORT int dxr_prov_wsui_needs_copy(void);
+DISPLAYXR_EXPORT void dxr_prov_wsui_request_copy(void);
+
 /// Set the Local2D dest rect in client-window PIXELS (post-DPI). w<=0||h<=0 clears
 /// (layer inactive). Cheap; safe to call every frame.
 DISPLAYXR_EXPORT void dxr_prov_set_local2d_rect(int32_t x, int32_t y, int32_t w, int32_t h);

@@ -3,6 +3,7 @@
 
 using UnityEngine;
 using UnityEngine.Experimental.Rendering;
+using UnityEngine.Rendering;
 
 namespace DisplayXR
 {
@@ -129,6 +130,10 @@ namespace DisplayXR
         private Texture2D m_BridgeTex;
         // Native pointer m_BridgeTex wraps — a change means a new session. See TryAcquireBridge.
         private System.IntPtr m_BridgePtr = System.IntPtr.Zero;
+        // (#336) Vulkan has no wrappable bridge: the getter returns a session token in
+        // place of m_BridgePtr, and the copy is a plugin event on the render thread.
+        private bool m_VulkanBridge;
+        private System.IntPtr m_RenderEventFunc = System.IntPtr.Zero;
 
         // Saved state, restored in OnDisable.
         private RenderMode m_OrigRenderMode;
@@ -290,16 +295,27 @@ namespace DisplayXR
                     // Session down / not ready — drop a stale wrapper so the next live
                     // bridge is picked up cleanly instead of being copied into a dead one.
                     if (m_BridgeTex != null) ReleaseBridgeTex();
+                    m_BridgePtr = System.IntPtr.Zero;
                     return;
                 }
-                if (m_BridgeTex != null && bridgePtr == m_BridgePtr) return; // unchanged
+                m_VulkanBridge = SystemInfo.graphicsDeviceType == GraphicsDeviceType.Vulkan;
+                if (m_VulkanBridge)
+                {
+                    // Vulkan (#336): bridgePtr is a session token, never a texture.
+                    if (bridgePtr == m_BridgePtr) return; // same session
+                    m_BridgePtr = bridgePtr;
+                }
+                else
+                {
+                    if (m_BridgeTex != null && bridgePtr == m_BridgePtr) return; // unchanged
 
-                if (m_BridgeTex != null) ReleaseBridgeTex();
-                m_BridgeTex = Texture2D.CreateExternalTexture(
-                    (int)bw, (int)bh, TextureFormat.BGRA32, false, true,
-                    bridgePtr);
-                m_BridgeTex.name = "DisplayXR_WsuiBridge";
-                m_BridgePtr = bridgePtr;
+                    if (m_BridgeTex != null) ReleaseBridgeTex();
+                    m_BridgeTex = Texture2D.CreateExternalTexture(
+                        (int)bw, (int)bh, TextureFormat.BGRA32, false, true,
+                        bridgePtr);
+                    m_BridgeTex.name = "DisplayXR_WsuiBridge";
+                    m_BridgePtr = bridgePtr;
+                }
                 // A new pointer means a NEW SESSION. The layer descriptor lives in a native
                 // file static and survives, but re-push it anyway so a restart can never
                 // leave the runtime with a stale/never-seen layer, and invalidate the
@@ -318,6 +334,31 @@ namespace DisplayXR
             {
                 // Older plugin without the bridge API — non-Windows path or
                 // pre-bridge build. Stay on the direct unity_tex path.
+            }
+        }
+
+        // Vulkan (#336): the canvas re-renders every frame, so ask for a copy every frame;
+        // the provider clears the request only once a copy is actually recorded.
+        private void IssueVulkanCopy()
+        {
+            if (m_BridgePtr == System.IntPtr.Zero) return;
+            try
+            {
+                DisplayXRProviderNative.dxr_prov_wsui_request_copy();
+                if (DisplayXRProviderNative.dxr_prov_wsui_needs_copy() == 0) return;
+                if (m_RenderEventFunc == System.IntPtr.Zero)
+                    m_RenderEventFunc = DisplayXRProviderNative.dxr_prov_get_render_event_func();
+                if (m_RenderEventFunc != System.IntPtr.Zero)
+                    GL.IssuePluginEvent(m_RenderEventFunc, DisplayXRProviderNative.kVkOverlayCopyWsuiEvent);
+            }
+            catch (System.EntryPointNotFoundException)
+            {
+                // Native plugin older than the managed side: stay inert instead of
+                // throwing every frame.
+                Debug.LogWarning("[DisplayXR] wsui: native plugin lacks the Vulkan overlay " +
+                                 "exports (#336) — window-space UI disabled on Vulkan.");
+                m_VulkanBridge = false;
+                m_BridgePtr = System.IntPtr.Zero;
             }
         }
 
@@ -461,7 +502,11 @@ namespace DisplayXR
                 // TryAcquireBridge also detects a RESTART via the native pointer changing,
                 // which a "== null" guard would hide.
                 TryAcquireBridge();
-                if (m_BridgeTex != null)
+                if (m_VulkanBridge)
+                {
+                    IssueVulkanCopy();
+                }
+                else if (m_BridgeTex != null)
                 {
                     Graphics.CopyTexture(OverlayTexture, m_BridgeTex);
                 }

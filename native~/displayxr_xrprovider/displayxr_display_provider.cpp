@@ -784,7 +784,7 @@ prov_bind_vulkan_backend(void)
 	}
 	dxr_pvk_set_unity_objects(inst, phys, dev, (uint32_t)qf, queue);
 	prov_log("[DisplayXR-PROV] Renderer is Vulkan - using the enable2 own-device bridge "
-	         "backend (#247/#249). Primary stereo + Local2D (#336) are supported; wsui and "
+	         "backend (#247/#249). Primary stereo, Local2D and wsui (#336) are supported; "
 	         "extra 3D zones are inert on this backend.\n");
 	return true;
 }
