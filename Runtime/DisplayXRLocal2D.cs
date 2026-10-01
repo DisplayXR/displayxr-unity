@@ -144,8 +144,23 @@ namespace DisplayXR
 
         [Header("Render Settings")]
 
-        [Tooltip("Resolution of the overlay RenderTexture.")]
+        [Tooltip("Size of the canvas in canvas units — what its layout (paddings, font " +
+                 "sizes) is designed against. The overlay RenderTexture is this times " +
+                 "renderScale.")]
         public Vector2Int resolution = new Vector2Int(1024, 512);
+
+        [Tooltip("Overlay RenderTexture pixels per canvas unit. 1 = one pixel per unit " +
+                 "(the original behaviour). Lower it when the canvas is designed larger " +
+                 "than it appears on screen: the compositor then shrinks a smaller texture " +
+                 "instead of a big one, which keeps small text from breaking up, and the " +
+                 "layout stays exactly as designed. Read when the component enables.")]
+        [Range(0.1f, 2f)]
+        public float renderScale = 1f;
+
+        // Pixel size of the overlay RT: resolution x renderScale (at least 1x1).
+        private Vector2Int RtSize => new Vector2Int(
+            Mathf.Max(1, Mathf.RoundToInt(resolution.x * renderScale)),
+            Mathf.Max(1, Mathf.RoundToInt(resolution.y * renderScale)));
 
         [Tooltip("Maximum times per second the overlay re-renders. Local2D content is " +
                  "typically static (a speech bubble, a HUD), but an enabled offscreen " +
@@ -268,7 +283,8 @@ namespace DisplayXR
             // The _SRGB variant shares that bit layout, so the raw copy into the bridge and
             // the native swapchain stays valid while Unity encodes linear->sRGB on store.
             // Without it a Linear project's canvas is stored unencoded and reads too dark.
-            var rtDesc = new RenderTextureDescriptor(resolution.x, resolution.y,
+            Vector2Int rtSize = RtSize;
+            var rtDesc = new RenderTextureDescriptor(rtSize.x, rtSize.y,
                 QualitySettings.activeColorSpace == ColorSpace.Linear
                     ? GraphicsFormat.B8G8R8A8_SRGB
                     : GraphicsFormat.B8G8R8A8_UNorm,
@@ -328,7 +344,7 @@ namespace DisplayXR
             // D3D provider path uses the cross-device bridge below and never reads the
             // pending texture, so this registration is inert there.
             DisplayXRNative.displayxr_local2d_set_texture(
-                OverlayTexture.GetNativeTexturePtr(), resolution.x, resolution.y);
+                OverlayTexture.GetNativeTexturePtr(), OverlayTexture.width, OverlayTexture.height);
             if (m_ProviderMode)
                 TryAcquireBridge(); // Windows: provider owns its own cross-device Local2D bridge
 
@@ -337,7 +353,9 @@ namespace DisplayXR
             RenderPipelineManager.endCameraRendering += OnEndOverlayCamera;
             m_CamRenderHooked = true;
 
-            Debug.Log($"[DisplayXR] Local2D enabled: {resolution.x}x{resolution.y}");
+            Debug.Log($"[DisplayXR] Local2D enabled: {resolution.x}x{resolution.y}" +
+                      (Mathf.Approximately(renderScale, 1f) ? "" :
+                       $" canvas units, RT {OverlayTexture.width}x{OverlayTexture.height} (renderScale {renderScale:F2})"));
         }
 
         // Disable the foreground clip for the overlay camera's render, restore after,
@@ -373,10 +391,13 @@ namespace DisplayXR
         // avatar's speech bubble vanished on undock and stayed gone through re-dock).
         private void TryAcquireBridge()
         {
+            if (OverlayTexture == null) return;
             try
             {
+                // The bridge mirrors the RT pixel for pixel (CopyTexture needs equal
+                // sizes), so ask for the RT's size, not the canvas-unit resolution.
                 DisplayXRProviderNative.dxr_prov_get_local2d_bridge(
-                    (uint)resolution.x, (uint)resolution.y,
+                    (uint)OverlayTexture.width, (uint)OverlayTexture.height,
                     out System.IntPtr bridgePtr, out uint bw, out uint bh);
 
                 if (bridgePtr == System.IntPtr.Zero || bw == 0 || bh == 0)
