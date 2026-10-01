@@ -326,9 +326,10 @@ DISPLAYXR_EXPORT int dxr_prov_local2d_needs_copy(void);
 /// No-op on the other backends.
 DISPLAYXR_EXPORT void dxr_prov_local2d_request_copy(void);
 
-/// (#336) wsui twins of the two Local2D calls above (Vulkan only, inert elsewhere).
-DISPLAYXR_EXPORT int dxr_prov_wsui_needs_copy(void);
-DISPLAYXR_EXPORT void dxr_prov_wsui_request_copy(void);
+/// (#336) wsui twins of the two Local2D calls above, per wsui slot (Vulkan only,
+/// inert elsewhere).
+DISPLAYXR_EXPORT int dxr_prov_wsui_needs_copy_slot(int slot);
+DISPLAYXR_EXPORT void dxr_prov_wsui_request_copy_slot(int slot);
 
 /// Set the Local2D dest rect in client-window PIXELS (post-DPI). w<=0||h<=0 clears
 /// (layer inactive). Cheap; safe to call every frame.
@@ -567,6 +568,10 @@ DISPLAYXR_EXPORT void dxr_prov_get_render_rect(uint32_t *out_w, uint32_t *out_h)
 /// handle of the bridge. C# (DisplayXRWindowSpaceUI) Graphics.CopyTexture's its
 /// canvas RT into it each frame; the provider submits the wsui composition layer.
 /// Returns *out_ptr = NULL when no session is running.
+/// Per-slot form (one window-space layer per DisplayXRWindowSpaceUI). The slot-less
+/// call above/below addresses slot 0.
+DISPLAYXR_EXPORT void dxr_prov_get_wsui_bridge_slot(int slot, uint32_t w, uint32_t h,
+                                                    void **out_ptr, uint32_t *out_w, uint32_t *out_h);
 DISPLAYXR_EXPORT void dxr_prov_get_wsui_bridge(uint32_t w, uint32_t h,
                                                void **out_ptr, uint32_t *out_w, uint32_t *out_h);
 

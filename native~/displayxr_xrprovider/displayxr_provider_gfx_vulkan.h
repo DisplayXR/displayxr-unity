@@ -155,8 +155,8 @@ void dxr_pvk_signal_unity_done(void);
 
 enum {
 	DXR_PVK_OVERLAY_LOCAL2D = 0,
-	DXR_PVK_OVERLAY_WSUI = 1,
-	DXR_PVK_OVERLAY_COUNT = 2,
+	DXR_PVK_OVERLAY_WSUI0 = 1,   // wsui slot N is DXR_PVK_OVERLAY_WSUI0 + N
+	DXR_PVK_OVERLAY_COUNT = 1 + 4, // Local2D + DXR_WSUI_MAX_SLOTS
 };
 
 /// Record the overlay layer's swapchain VkImages (session device) and format.

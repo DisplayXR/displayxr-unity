@@ -59,12 +59,14 @@ static bool                  s_vk_captured = false;
 //
 // Keep the ids in sync with DisplayXRProviderNative.kVkOverlayCopy*Event.
 #define DXR_EVENT_VK_OVERLAY_COPY_LOCAL2D 0x44585201
-#define DXR_EVENT_VK_OVERLAY_COPY_WSUI    0x44585202
+// wsui slot N is DXR_EVENT_VK_OVERLAY_COPY_WSUI0 + N (N < DXR_WSUI_SLOTS).
+#define DXR_EVENT_VK_OVERLAY_COPY_WSUI0   0x44585210
+#define DXR_WSUI_SLOTS 4
 
 extern "C" int displayxr_local2d_get_pending(void **out_tex, int *out_w, int *out_h);
-extern "C" int displayxr_window_space_ui_get_pending(void **out_tex, int *out_tex_w, int *out_tex_h,
-                                                     float *out_x, float *out_y,
-                                                     float *out_lw, float *out_lh, float *out_disp);
+extern "C" int displayxr_window_space_ui_get_pending_slot(int slot, void **out_tex, int *out_tex_w,
+                                                          int *out_tex_h, float *out_x, float *out_y,
+                                                          float *out_lw, float *out_lh, float *out_disp);
 extern "C" int dxr_pvk_overlay_ready(int kind);
 extern "C" int dxr_pvk_overlay_record_unity_copy(int kind, void *cmd_buf, void *src_image,
                                                  int64_t src_format, uint32_t src_w, uint32_t src_h);
@@ -79,7 +81,8 @@ static void configure_vulkan_events(void)
 	cfg.graphicsQueueAccess = kUnityVulkanGraphicsQueueAccess_DontCare;
 	cfg.flags = kUnityVulkanEventConfigFlag_EnsurePreviousFrameSubmission;
 	s_unity_vk->ConfigureEvent(DXR_EVENT_VK_OVERLAY_COPY_LOCAL2D, &cfg);
-	s_unity_vk->ConfigureEvent(DXR_EVENT_VK_OVERLAY_COPY_WSUI, &cfg);
+	for (int i = 0; i < DXR_WSUI_SLOTS; i++)
+		s_unity_vk->ConfigureEvent(DXR_EVENT_VK_OVERLAY_COPY_WSUI0 + i, &cfg);
 }
 
 static void vk_overlay_copy(int kind, void *tex, int w, int h)
@@ -117,11 +120,13 @@ static void UNITY_INTERFACE_API on_render_event(int event_id)
 	if (event_id == DXR_EVENT_VK_OVERLAY_COPY_LOCAL2D) {
 		void *tex = NULL; int w = 0, h = 0;
 		if (displayxr_local2d_get_pending(&tex, &w, &h)) vk_overlay_copy(0 /* LOCAL2D */, tex, w, h);
-	} else if (event_id == DXR_EVENT_VK_OVERLAY_COPY_WSUI) {
+	} else if (event_id >= DXR_EVENT_VK_OVERLAY_COPY_WSUI0 &&
+	           event_id < DXR_EVENT_VK_OVERLAY_COPY_WSUI0 + DXR_WSUI_SLOTS) {
+		int slot = event_id - DXR_EVENT_VK_OVERLAY_COPY_WSUI0;
 		void *tex = NULL; int w = 0, h = 0;
 		float x, y, lw, lh, disp;
-		if (displayxr_window_space_ui_get_pending(&tex, &w, &h, &x, &y, &lw, &lh, &disp))
-			vk_overlay_copy(1 /* WSUI */, tex, w, h);
+		if (displayxr_window_space_ui_get_pending_slot(slot, &tex, &w, &h, &x, &y, &lw, &lh, &disp))
+			vk_overlay_copy(1 + slot /* DXR_PVK_OVERLAY_WSUI0 + slot */, tex, w, h);
 	}
 #else
 	(void)event_id;

@@ -184,7 +184,7 @@ extern "C" void dxr_pvk_destroy(void);
 extern "C" int  dxr_pvk_device_ready(void);
 // 2D overlay layers (#336). Kinds match DXR_PVK_OVERLAY_* in the VK header.
 #define PS_PVK_OVERLAY_LOCAL2D 0
-#define PS_PVK_OVERLAY_WSUI    1
+#define PS_PVK_OVERLAY_WSUI0   1 // wsui slot N is kind PS_PVK_OVERLAY_WSUI0 + N
 extern "C" void dxr_pvk_overlay_set_swapchain_images(int kind, const void *, uint32_t, int64_t);
 extern "C" int  dxr_pvk_overlay_create_bridge(int kind, uint32_t, uint32_t, int64_t);
 extern "C" int  dxr_pvk_overlay_has_content(int kind);
@@ -220,6 +220,45 @@ static int s_wsui_vk_disabled = 0;
 // which stay the validated Phase-B path. Each extra zone carries its OWN zone-sized
 // swapchain + cross-device bridge(s) + located views + Unity render pass, so N 3D
 // zones weave into N window-pixel rects (mirrors the runtime cube_zones handle test).
+// Window-space UI (HUD) overlay layer (#67/#166): own overlay swapchain +
+// cross-device bridge. C# (DisplayXRWindowSpaceUI) Graphics.CopyTexture's the
+// canvas RT into bridge_unity each frame; submit copies bridge_own -> the acquired
+// swapchain image (own device) and submits one window-space composition layer.
+// One per wsui slot (#336 follow-up): several HUD components can be live at once.
+#define PS_MAX_WSUI 4 // == DXR_WSUI_MAX_SLOTS (displayxr_window_space_ui.h)
+typedef struct ProviderWsui {
+	XrSwapchain swapchain;
+	uint32_t    w, h, image_count;
+	int64_t     format;
+	int         swapchain_created;
+	int         image_acquired;
+	uint32_t    acquired_index;
+	uint32_t        registered_w, registered_h; // bridge+swapchain sized for this
+	uint32_t        vk_failed_w, vk_failed_h;   // Vulkan create failed at this size (#336)
+#ifdef _WIN32
+	XrSwapchainImageD3D12KHR images[PS_MAX_SWAPCHAIN_IMAGES];
+	ID3D12Resource *bridge_own;    // own_device side (copy source)
+	ID3D12Resource *bridge_unity;  // Unity-device side (C# CopyTexture target)
+	HANDLE          bridge_handle;
+	// D3D11 (#195): images on the runtime's device. `unity_tex` is the Unity-side
+	// texture C# CopyTexture targets. PLAYER zero-copy: a plain Unity-device texture,
+	// submit same-device-copies it into the acquired image. EDITOR bridge: the
+	// Unity-opened side of a shared texture whose own-device side is `unity_tex_own`;
+	// submit copies own->image on the own context.
+	XrSwapchainImageD3D11KHR images_d3d11[PS_MAX_SWAPCHAIN_IMAGES];
+	ID3D11Texture2D *unity_tex;
+	ID3D11Texture2D *unity_tex_own;   // own-device side (editor bridge)
+	HANDLE           unity_tex_handle;
+#else
+	// Metal (#206): arraySize=1 overlay swapchain images (id<MTLTexture> in .texture).
+	// No cross-device bridge — the runtime compositor is on Unity's OWN MTLDevice, so
+	// submit blits the C#-registered Unity id<MTLTexture> straight into the acquired
+	// image (same device, session queue). Cousin of the projection sc_images_metal.
+	XrSwapchainImageMetalKHR images_metal[PS_MAX_SWAPCHAIN_IMAGES];
+#endif // _WIN32
+
+} ProviderWsui;
+
 typedef struct ProviderExtraZone {
 	int      valid;
 	uint32_t zone_id;
@@ -562,39 +601,8 @@ typedef struct ProviderSession {
 	uint32_t    realloc_pending_w, realloc_pending_h; // last-seen target awaiting stability
 	int         realloc_stable;                        // consecutive frames the target held
 
-	// Window-space UI (HUD) overlay layer (#67/#166): own overlay swapchain +
-	// cross-device bridge. C# (DisplayXRWindowSpaceUI) Graphics.CopyTexture's the
-	// canvas RT into wsui_bridge_unity each frame; submit copies wsui_bridge_own ->
-	// the acquired swapchain image (own device) and submits a 2nd composition layer.
-	XrSwapchain wsui_swapchain;
-	uint32_t    wsui_w, wsui_h, wsui_image_count;
-	int64_t     wsui_format;
-	int         wsui_swapchain_created;
-	int         wsui_image_acquired;
-	uint32_t    wsui_acquired_index;
-	uint32_t        wsui_registered_w, wsui_registered_h; // bridge+swapchain sized for this
-	uint32_t        wsui_vk_failed_w, wsui_vk_failed_h;   // Vulkan create failed at this size (#336)
-#ifdef _WIN32
-	XrSwapchainImageD3D12KHR wsui_images[PS_MAX_SWAPCHAIN_IMAGES];
-	ID3D12Resource *wsui_bridge_own;    // own_device side (copy source)
-	ID3D12Resource *wsui_bridge_unity;  // Unity-device side (C# CopyTexture target)
-	HANDLE          wsui_bridge_handle;
-	// D3D11 (#195): images on the runtime's device. `wsui_unity_tex` is the Unity-side
-	// texture C# CopyTexture targets. PLAYER zero-copy: a plain Unity-device texture,
-	// submit same-device-copies it into the acquired image. EDITOR bridge: the
-	// Unity-opened side of a shared texture whose own-device side is `wsui_unity_tex_own`;
-	// submit copies own->image on the own context.
-	XrSwapchainImageD3D11KHR wsui_images_d3d11[PS_MAX_SWAPCHAIN_IMAGES];
-	ID3D11Texture2D *wsui_unity_tex;
-	ID3D11Texture2D *wsui_unity_tex_own;   // own-device side (editor bridge)
-	HANDLE           wsui_unity_tex_handle;
-#else
-	// Metal (#206): arraySize=1 overlay swapchain images (id<MTLTexture> in .texture).
-	// No cross-device bridge — the runtime compositor is on Unity's OWN MTLDevice, so
-	// submit blits the C#-registered Unity id<MTLTexture> straight into the acquired
-	// image (same device, session queue). Cousin of the projection sc_images_metal.
-	XrSwapchainImageMetalKHR wsui_images_metal[PS_MAX_SWAPCHAIN_IMAGES];
-#endif // _WIN32
+	// Window-space UI (HUD) layers, one per wsui slot — see ProviderWsui.
+	ProviderWsui wsui[PS_MAX_WSUI];
 
 	// Local2D layer (#166 Phase B, XR_DXR_local_3d_zone) — post-weave 2D content at a
 	// client-window PIXEL rect (the 2D band). Same cross-device-bridge shape as wsui,
@@ -2395,9 +2403,9 @@ int dxr_prov_reconcile_size(void)
 // s_pending getter exported by the wsui module (displayxr_window_space_ui.cpp).
 // C# DisplayXRWindowSpaceUI sets it via set_texture/set_layer regardless of which
 // session is active, so the provider can drive its own window-space layer.
-extern "C" int displayxr_window_space_ui_get_pending(void **out_tex, int *out_tex_w, int *out_tex_h,
-                                                     float *out_x, float *out_y,
-                                                     float *out_lw, float *out_lh, float *out_disp);
+extern "C" int displayxr_window_space_ui_get_pending_slot(int slot, void **out_tex, int *out_tex_w,
+                                                          int *out_tex_h, float *out_x, float *out_y,
+                                                          float *out_lw, float *out_lh, float *out_disp);
 
 // s_pending getter exported by the Local2D module (displayxr_local2d.cpp). The Metal
 // Local2D arm blits this Unity id<MTLTexture> straight into its overlay swapchain image
@@ -2414,8 +2422,10 @@ extern "C" int displayxr_dedicated_parent_client_origin(int *ox, int *oy);
 // w×h. Format = B8G8R8A8_UNORM (87) to match Unity's URP wsui RT — CopyTextureRegion
 // is invalid across formats and the runtime's DComp path turns a mismatch into a
 // device-removal (#82 / runtime#216). Mirrors ps_create_bridge but arraySize=1.
-static int ps_create_wsui(uint32_t w, uint32_t h)
+static int ps_create_wsui(int slot, uint32_t w, uint32_t h)
 {
+	if (slot < 0 || slot >= PS_MAX_WSUI) return 0;
+	ProviderWsui *ws = &s_ps.wsui[slot];
 	// Vulkan (#247) Phase 1 covers the PRIMARY stereo path only. The secondary
 	// composition layers (wsui / Local2D / extra 3D zones) each need their own
 	// external-memory bridge and are not wired yet — bail cleanly rather than fall
@@ -2426,16 +2436,16 @@ static int ps_create_wsui(uint32_t w, uint32_t h)
 	// the render thread only, filled by the plugin-event copy.
 	if (s_ps.graphics_api == DXR_GFX_VULKAN) {
 		if (s_wsui_vk_disabled || w == 0 || h == 0 || !dxr_pvk_device_ready()) return 0;
-		if (s_ps.wsui_swapchain_created && s_ps.wsui_registered_w == w && s_ps.wsui_registered_h == h)
+		if (ws->swapchain_created && ws->registered_w == w && ws->registered_h == h)
 			return 1;
-		if (s_ps.wsui_vk_failed_w == w && s_ps.wsui_vk_failed_h == h) return 0;
-		s_ps.wsui_vk_failed_w = w; s_ps.wsui_vk_failed_h = h; // cleared on success below
-		if (s_ps.wsui_swapchain && s_ps.pfn_destroy_swapchain) {
-			dxr_pvk_overlay_destroy(PS_PVK_OVERLAY_WSUI);
-			s_ps.pfn_destroy_swapchain(s_ps.wsui_swapchain);
+		if (ws->vk_failed_w == w && ws->vk_failed_h == h) return 0;
+		ws->vk_failed_w = w; ws->vk_failed_h = h; // cleared on success below
+		if (ws->swapchain && s_ps.pfn_destroy_swapchain) {
+			dxr_pvk_overlay_destroy((PS_PVK_OVERLAY_WSUI0 + slot));
+			s_ps.pfn_destroy_swapchain(ws->swapchain);
 		}
-		s_ps.wsui_swapchain = XR_NULL_HANDLE;
-		s_ps.wsui_swapchain_created = 0;
+		ws->swapchain = XR_NULL_HANDLE;
+		ws->swapchain_created = 0;
 
 		uint32_t fmt_count = 0;
 		s_ps.pfn_enumerate_swapchain_formats(s_ps.session, 0, &fmt_count, NULL);
@@ -2459,13 +2469,13 @@ static int ps_create_wsui(uint32_t w, uint32_t h)
 		ci.format = format;
 		ci.sampleCount = 1; ci.width = w; ci.height = h;
 		ci.faceCount = 1; ci.arraySize = 1; ci.mipCount = 1;
-		if (XR_FAILED(s_ps.pfn_create_swapchain(s_ps.session, &ci, &s_ps.wsui_swapchain))) {
+		if (XR_FAILED(s_ps.pfn_create_swapchain(s_ps.session, &ci, &ws->swapchain))) {
 			ps_log("[DisplayXR-PROV] wsui: xrCreateSwapchain failed\n");
-			s_ps.wsui_swapchain = XR_NULL_HANDLE;
+			ws->swapchain = XR_NULL_HANDLE;
 			return 0;
 		}
 		uint32_t count = 0;
-		s_ps.pfn_enumerate_swapchain_images(s_ps.wsui_swapchain, 0, &count, NULL);
+		s_ps.pfn_enumerate_swapchain_images(ws->swapchain, 0, &count, NULL);
 		if (count > PS_MAX_SWAPCHAIN_IMAGES) count = PS_MAX_SWAPCHAIN_IMAGES;
 		XrSwapchainImageVulkanKHR_PS vk_imgs[PS_MAX_SWAPCHAIN_IMAGES] = {};
 		for (uint32_t i = 0; i < count; i++) {
@@ -2473,21 +2483,21 @@ static int ps_create_wsui(uint32_t w, uint32_t h)
 			vk_imgs[i].next = NULL;
 			vk_imgs[i].image = NULL;
 		}
-		if (XR_FAILED(s_ps.pfn_enumerate_swapchain_images(s_ps.wsui_swapchain, count, &count,
+		if (XR_FAILED(s_ps.pfn_enumerate_swapchain_images(ws->swapchain, count, &count,
 		        (XrSwapchainImageBaseHeader *)vk_imgs))) {
 			ps_log("[DisplayXR-PROV] wsui: enumerate images (Vulkan) failed\n");
 			return 0;
 		}
-		dxr_pvk_overlay_set_swapchain_images(PS_PVK_OVERLAY_WSUI, vk_imgs, count, format);
-		if (!dxr_pvk_overlay_create_bridge(PS_PVK_OVERLAY_WSUI, w, h, format)) {
+		dxr_pvk_overlay_set_swapchain_images((PS_PVK_OVERLAY_WSUI0 + slot), vk_imgs, count, format);
+		if (!dxr_pvk_overlay_create_bridge((PS_PVK_OVERLAY_WSUI0 + slot), w, h, format)) {
 			ps_log("[DisplayXR-PROV] wsui: Vulkan overlay bridge create failed\n");
 			return 0;
 		}
-		s_ps.wsui_w = w; s_ps.wsui_h = h; s_ps.wsui_format = format;
-		s_ps.wsui_image_count = count;
-		s_ps.wsui_registered_w = w; s_ps.wsui_registered_h = h;
-		s_ps.wsui_swapchain_created = 1;
-		s_ps.wsui_vk_failed_w = s_ps.wsui_vk_failed_h = 0;
+		ws->w = w; ws->h = h; ws->format = format;
+		ws->image_count = count;
+		ws->registered_w = w; ws->registered_h = h;
+		ws->swapchain_created = 1;
+		ws->vk_failed_w = ws->vk_failed_h = 0;
 		ps_log("[DisplayXR-PROV] wsui: Vulkan swapchain %ux%u (%u imgs, fmt=%lld) + overlay bridge\n",
 		       w, h, count, (long long)format);
 		return 1;
@@ -2498,13 +2508,13 @@ static int ps_create_wsui(uint32_t w, uint32_t h)
 	// submit blits the C#-registered Unity id<MTLTexture> straight in (same device).
 	if (w == 0 || h == 0) return 0;
 	if (s_ps.graphics_api != DXR_GFX_METAL || !s_ps.metal_queue) return 0;
-	if (s_ps.wsui_swapchain_created && s_ps.wsui_registered_w == w && s_ps.wsui_registered_h == h)
+	if (ws->swapchain_created && ws->registered_w == w && ws->registered_h == h)
 		return 1; // already sized for this RT
 
-	if (s_ps.wsui_swapchain && s_ps.pfn_destroy_swapchain) s_ps.pfn_destroy_swapchain(s_ps.wsui_swapchain);
-	s_ps.wsui_swapchain = XR_NULL_HANDLE;
-	s_ps.wsui_swapchain_created = 0;
-	s_ps.wsui_image_acquired = 0;
+	if (ws->swapchain && s_ps.pfn_destroy_swapchain) s_ps.pfn_destroy_swapchain(ws->swapchain);
+	ws->swapchain = XR_NULL_HANDLE;
+	ws->swapchain_created = 0;
+	ws->image_acquired = 0;
 
 	// Prefer BGRA8Unorm (80) to match Unity's B8G8R8A8_UNorm OverlayTexture so the
 	// submit blit is same-format; fall back to the first enumerated format.
@@ -2525,24 +2535,24 @@ static int ps_create_wsui(uint32_t w, uint32_t h)
 	ci.sampleCount = 1;
 	ci.width = w; ci.height = h;
 	ci.faceCount = 1; ci.arraySize = 1; ci.mipCount = 1;
-	if (XR_FAILED(s_ps.pfn_create_swapchain(s_ps.session, &ci, &s_ps.wsui_swapchain))) {
-		ps_log("[DisplayXR-PROV] wsui: xrCreateSwapchain failed\n"); s_ps.wsui_swapchain = XR_NULL_HANDLE; return 0;
+	if (XR_FAILED(s_ps.pfn_create_swapchain(s_ps.session, &ci, &ws->swapchain))) {
+		ps_log("[DisplayXR-PROV] wsui: xrCreateSwapchain failed\n"); ws->swapchain = XR_NULL_HANDLE; return 0;
 	}
 	uint32_t count = 0;
-	s_ps.pfn_enumerate_swapchain_images(s_ps.wsui_swapchain, 0, &count, NULL);
+	s_ps.pfn_enumerate_swapchain_images(ws->swapchain, 0, &count, NULL);
 	if (count > PS_MAX_SWAPCHAIN_IMAGES) count = PS_MAX_SWAPCHAIN_IMAGES;
 	for (uint32_t i = 0; i < count; i++) {
-		s_ps.wsui_images_metal[i].type = XR_TYPE_SWAPCHAIN_IMAGE_METAL_KHR;
-		s_ps.wsui_images_metal[i].next = NULL; s_ps.wsui_images_metal[i].texture = NULL;
+		ws->images_metal[i].type = XR_TYPE_SWAPCHAIN_IMAGE_METAL_KHR;
+		ws->images_metal[i].next = NULL; ws->images_metal[i].texture = NULL;
 	}
-	if (XR_FAILED(s_ps.pfn_enumerate_swapchain_images(s_ps.wsui_swapchain, count, &count,
-	        (XrSwapchainImageBaseHeader *)s_ps.wsui_images_metal))) {
+	if (XR_FAILED(s_ps.pfn_enumerate_swapchain_images(ws->swapchain, count, &count,
+	        (XrSwapchainImageBaseHeader *)ws->images_metal))) {
 		ps_log("[DisplayXR-PROV] wsui: enumerate images (Metal) failed\n"); return 0;
 	}
-	s_ps.wsui_w = w; s_ps.wsui_h = h; s_ps.wsui_format = format;
-	s_ps.wsui_image_count = count;
-	s_ps.wsui_registered_w = w; s_ps.wsui_registered_h = h;
-	s_ps.wsui_swapchain_created = 1;
+	ws->w = w; ws->h = h; ws->format = format;
+	ws->image_count = count;
+	ws->registered_w = w; ws->registered_h = h;
+	ws->swapchain_created = 1;
 	ps_log("[DisplayXR-PROV] wsui: Metal swapchain %ux%u (%u imgs, fmt=%lld)\n",
 	       w, h, count, (long long)format);
 	return 1;
@@ -2550,20 +2560,20 @@ static int ps_create_wsui(uint32_t w, uint32_t h)
 	int is_d3d11 = (s_ps.graphics_api == DXR_GFX_D3D11);
 	if (w == 0 || h == 0) return 0;
 	if (is_d3d11 ? !s_ps.unity_d3d11_device : (!s_ps.own_device || !s_ps.unity_device)) return 0;
-	if (s_ps.wsui_swapchain_created && s_ps.wsui_registered_w == w && s_ps.wsui_registered_h == h)
+	if (ws->swapchain_created && ws->registered_w == w && ws->registered_h == h)
 		return 1; // already sized for this RT
 
 	// Tear down any previous (RT resized).
-	if (s_ps.wsui_swapchain && s_ps.pfn_destroy_swapchain) s_ps.pfn_destroy_swapchain(s_ps.wsui_swapchain);
-	if (s_ps.wsui_bridge_unity) { s_ps.wsui_bridge_unity->Release(); s_ps.wsui_bridge_unity = NULL; }
-	if (s_ps.wsui_bridge_own)   { s_ps.wsui_bridge_own->Release();   s_ps.wsui_bridge_own = NULL; }
-	if (s_ps.wsui_bridge_handle) { CloseHandle(s_ps.wsui_bridge_handle); s_ps.wsui_bridge_handle = NULL; }
-	if (s_ps.wsui_unity_tex)    { s_ps.wsui_unity_tex->Release();    s_ps.wsui_unity_tex = NULL; }
-	if (s_ps.wsui_unity_tex_own){ s_ps.wsui_unity_tex_own->Release(); s_ps.wsui_unity_tex_own = NULL; }
-	s_ps.wsui_unity_tex_handle = NULL; // NT handle already closed in ps_alloc_shared_tex_d3d11
-	s_ps.wsui_swapchain = XR_NULL_HANDLE;
-	s_ps.wsui_swapchain_created = 0;
-	s_ps.wsui_image_acquired = 0;
+	if (ws->swapchain && s_ps.pfn_destroy_swapchain) s_ps.pfn_destroy_swapchain(ws->swapchain);
+	if (ws->bridge_unity) { ws->bridge_unity->Release(); ws->bridge_unity = NULL; }
+	if (ws->bridge_own)   { ws->bridge_own->Release();   ws->bridge_own = NULL; }
+	if (ws->bridge_handle) { CloseHandle(ws->bridge_handle); ws->bridge_handle = NULL; }
+	if (ws->unity_tex)    { ws->unity_tex->Release();    ws->unity_tex = NULL; }
+	if (ws->unity_tex_own){ ws->unity_tex_own->Release(); ws->unity_tex_own = NULL; }
+	ws->unity_tex_handle = NULL; // NT handle already closed in ps_alloc_shared_tex_d3d11
+	ws->swapchain = XR_NULL_HANDLE;
+	ws->swapchain_created = 0;
+	ws->image_acquired = 0;
 
 	// --- Overlay swapchain (arraySize=1, format 87 to match Unity URP wsui RT) ---
 	uint32_t fmt_count = 0;
@@ -2583,43 +2593,43 @@ static int ps_create_wsui(uint32_t w, uint32_t h)
 	ci.sampleCount = 1;
 	ci.width = w; ci.height = h;
 	ci.faceCount = 1; ci.arraySize = 1; ci.mipCount = 1;
-	if (XR_FAILED(s_ps.pfn_create_swapchain(s_ps.session, &ci, &s_ps.wsui_swapchain))) {
-		ps_log("[DisplayXR-PROV] wsui: xrCreateSwapchain failed\n"); s_ps.wsui_swapchain = XR_NULL_HANDLE; return 0;
+	if (XR_FAILED(s_ps.pfn_create_swapchain(s_ps.session, &ci, &ws->swapchain))) {
+		ps_log("[DisplayXR-PROV] wsui: xrCreateSwapchain failed\n"); ws->swapchain = XR_NULL_HANDLE; return 0;
 	}
 	uint32_t count = 0;
-	s_ps.pfn_enumerate_swapchain_images(s_ps.wsui_swapchain, 0, &count, NULL);
+	s_ps.pfn_enumerate_swapchain_images(ws->swapchain, 0, &count, NULL);
 	if (count > PS_MAX_SWAPCHAIN_IMAGES) count = PS_MAX_SWAPCHAIN_IMAGES;
 	if (is_d3d11) {
 		for (uint32_t i = 0; i < count; i++) {
-			s_ps.wsui_images_d3d11[i].type = XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR;
-			s_ps.wsui_images_d3d11[i].next = NULL; s_ps.wsui_images_d3d11[i].texture = NULL;
+			ws->images_d3d11[i].type = XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR;
+			ws->images_d3d11[i].next = NULL; ws->images_d3d11[i].texture = NULL;
 		}
-		if (XR_FAILED(s_ps.pfn_enumerate_swapchain_images(s_ps.wsui_swapchain, count, &count,
-		        (XrSwapchainImageBaseHeader *)s_ps.wsui_images_d3d11))) {
+		if (XR_FAILED(s_ps.pfn_enumerate_swapchain_images(ws->swapchain, count, &count,
+		        (XrSwapchainImageBaseHeader *)ws->images_d3d11))) {
 			ps_log("[DisplayXR-PROV] wsui: enumerate images (D3D11) failed\n"); return 0;
 		}
 	} else {
 		for (uint32_t i = 0; i < count; i++) {
-			s_ps.wsui_images[i].type = XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR;
-			s_ps.wsui_images[i].next = NULL; s_ps.wsui_images[i].texture = NULL;
+			ws->images[i].type = XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR;
+			ws->images[i].next = NULL; ws->images[i].texture = NULL;
 		}
-		if (XR_FAILED(s_ps.pfn_enumerate_swapchain_images(s_ps.wsui_swapchain, count, &count,
-		        (XrSwapchainImageBaseHeader *)s_ps.wsui_images))) {
+		if (XR_FAILED(s_ps.pfn_enumerate_swapchain_images(ws->swapchain, count, &count,
+		        (XrSwapchainImageBaseHeader *)ws->images))) {
 			ps_log("[DisplayXR-PROV] wsui: enumerate images failed\n"); return 0;
 		}
 	}
-	s_ps.wsui_image_count = count;
+	ws->image_count = count;
 
 	if (is_d3d11 && s_ps.d3d11_bridge) {
 		// D3D11 editor bridge: an own-device shared BGRA8 texture opened on Unity's device
 		// (the C# CopyTexture target); submit copies own->image on the own context.
-		if (!ps_alloc_shared_tex_d3d11(w, h, 1, &s_ps.wsui_unity_tex_own, &s_ps.wsui_unity_tex,
-		                               &s_ps.wsui_unity_tex_handle, 87, "wsui bridge (D3D11)")) return 0;
+		if (!ps_alloc_shared_tex_d3d11(w, h, 1, &ws->unity_tex_own, &ws->unity_tex,
+		                               &ws->unity_tex_handle, 87, "wsui bridge (D3D11)")) return 0;
 	} else if (is_d3d11) {
 		// D3D11 zero-copy: a plain Unity-device BGRA8 texture as the C# CopyTexture target;
 		// submit same-device-copies it into the acquired image (no bridge).
-		s_ps.wsui_unity_tex = ps_alloc_unity_tex(w, h, 1, 87);
-		if (!s_ps.wsui_unity_tex) { ps_log("[DisplayXR-PROV] wsui: Unity-device target alloc failed\n"); return 0; }
+		ws->unity_tex = ps_alloc_unity_tex(w, h, 1, 87);
+		if (!ws->unity_tex) { ps_log("[DisplayXR-PROV] wsui: Unity-device target alloc failed\n"); return 0; }
 	} else {
 		// --- Cross-device bridge (own_device shared BGRA8, opened on Unity's device) ---
 		D3D12_HEAP_PROPERTIES heap = {}; heap.Type = D3D12_HEAP_TYPE_DEFAULT;
@@ -2631,21 +2641,21 @@ static int ps_create_wsui(uint32_t w, uint32_t h)
 		bd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
 		bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
 		HRESULT hr = s_ps.own_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &bd,
-		        D3D12_RESOURCE_STATE_COMMON, NULL, __uuidof(ID3D12Resource), (void **)&s_ps.wsui_bridge_own);
+		        D3D12_RESOURCE_STATE_COMMON, NULL, __uuidof(ID3D12Resource), (void **)&ws->bridge_own);
 		if (FAILED(hr)) { ps_log("[DisplayXR-PROV] wsui bridge create failed: 0x%08lx\n", hr); return 0; }
-		hr = s_ps.own_device->CreateSharedHandle(s_ps.wsui_bridge_own, NULL, GENERIC_ALL, NULL, &s_ps.wsui_bridge_handle);
-		if (FAILED(hr) || !s_ps.wsui_bridge_handle) { ps_log("[DisplayXR-PROV] wsui bridge share failed\n"); return 0; }
-		hr = s_ps.unity_device->OpenSharedHandle(s_ps.wsui_bridge_handle, __uuidof(ID3D12Resource),
-		        (void **)&s_ps.wsui_bridge_unity);
-		if (FAILED(hr) || !s_ps.wsui_bridge_unity) { ps_log("[DisplayXR-PROV] wsui bridge open(Unity) failed\n"); return 0; }
+		hr = s_ps.own_device->CreateSharedHandle(ws->bridge_own, NULL, GENERIC_ALL, NULL, &ws->bridge_handle);
+		if (FAILED(hr) || !ws->bridge_handle) { ps_log("[DisplayXR-PROV] wsui bridge share failed\n"); return 0; }
+		hr = s_ps.unity_device->OpenSharedHandle(ws->bridge_handle, __uuidof(ID3D12Resource),
+		        (void **)&ws->bridge_unity);
+		if (FAILED(hr) || !ws->bridge_unity) { ps_log("[DisplayXR-PROV] wsui bridge open(Unity) failed\n"); return 0; }
 	}
 
-	s_ps.wsui_w = w; s_ps.wsui_h = h; s_ps.wsui_format = format;
-	s_ps.wsui_registered_w = w; s_ps.wsui_registered_h = h;
-	s_ps.wsui_swapchain_created = 1;
+	ws->w = w; ws->h = h; ws->format = format;
+	ws->registered_w = w; ws->registered_h = h;
+	ws->swapchain_created = 1;
 	ps_log("[DisplayXR-PROV] wsui: swapchain %ux%u (%u imgs, fmt=%lld) target=%p (%s)\n",
 	       w, h, count, (long long)format,
-	       is_d3d11 ? (void *)s_ps.wsui_unity_tex : (void *)s_ps.wsui_bridge_unity,
+	       is_d3d11 ? (void *)ws->unity_tex : (void *)ws->bridge_unity,
 	       is_d3d11 ? "D3D11 zero-copy" : "D3D12 bridge");
 	return 1;
 #else
@@ -2659,8 +2669,8 @@ static int ps_create_wsui(uint32_t w, uint32_t h)
 // bridge, then Graphics.CopyTexture's its canvas RT into it each frame. Lazily
 // creates the swapchain+bridge sized to w×h. Returns the Unity-side ID3D12Resource*
 // (or NULL). Declared DISPLAYXR_EXPORT in the header so it's exported for P/Invoke.
-void dxr_prov_get_wsui_bridge(uint32_t w, uint32_t h,
-                              void **out_ptr, uint32_t *out_w, uint32_t *out_h)
+void dxr_prov_get_wsui_bridge_slot(int slot, uint32_t w, uint32_t h,
+                                   void **out_ptr, uint32_t *out_w, uint32_t *out_h)
 {
 	if (out_ptr) *out_ptr = NULL;
 	if (out_w) *out_w = 0;
@@ -2677,13 +2687,21 @@ void dxr_prov_get_wsui_bridge(uint32_t w, uint32_t h,
 		return;
 	}
 #endif
-	if (!ps_create_wsui(w, h)) return;
+	if (slot < 0 || slot >= PS_MAX_WSUI) return;
+	ProviderWsui *ws = &s_ps.wsui[slot];
+	if (!ps_create_wsui(slot, w, h)) return;
 #ifdef _WIN32
 	if (out_ptr) *out_ptr = (s_ps.graphics_api == DXR_GFX_D3D11)
-	                            ? (void *)s_ps.wsui_unity_tex : (void *)s_ps.wsui_bridge_unity;
-	if (out_w) *out_w = s_ps.wsui_w;
-	if (out_h) *out_h = s_ps.wsui_h;
+	                            ? (void *)ws->unity_tex : (void *)ws->bridge_unity;
+	if (out_w) *out_w = ws->w;
+	if (out_h) *out_h = ws->h;
 #endif
+}
+
+void dxr_prov_get_wsui_bridge(uint32_t w, uint32_t h,
+                              void **out_ptr, uint32_t *out_w, uint32_t *out_h)
+{
+	dxr_prov_get_wsui_bridge_slot(0, w, h, out_ptr, out_w, out_h);
 }
 
 // Per-frame: if a wsui texture is registered and the bridge is ready, copy
@@ -2692,24 +2710,25 @@ void dxr_prov_get_wsui_bridge(uint32_t w, uint32_t h,
 // dxr_prov_submit_frame AFTER the projection bridge copy (own_cmd_list is free and
 // the shared-fence wait already ordered the own queue after Unity's writes).
 // The XrCompositionLayerWindowSpaceDXR fields every backend fills the same way.
-static void ps_fill_wsui_layer(XrCompositionLayerWindowSpaceDXR *out_layer,
+static void ps_fill_wsui_layer(const ProviderWsui *ws, XrCompositionLayerWindowSpaceDXR *out_layer,
                                float lx, float ly, float lw, float lh, float ldisp)
 {
 	out_layer->type = XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR;
 	out_layer->next = NULL;
 	out_layer->layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
-	out_layer->subImage.swapchain = s_ps.wsui_swapchain;
+	out_layer->subImage.swapchain = ws->swapchain;
 	out_layer->subImage.imageRect.offset = {0, 0};
-	out_layer->subImage.imageRect.extent = {(int32_t)s_ps.wsui_w, (int32_t)s_ps.wsui_h};
+	out_layer->subImage.imageRect.extent = {(int32_t)ws->w, (int32_t)ws->h};
 	out_layer->subImage.imageArrayIndex = 0;
 	out_layer->x = lx; out_layer->y = ly;
 	out_layer->width = lw; out_layer->height = lh;
 	out_layer->disparity = ldisp;
 }
 
-static int ps_submit_wsui(XrCompositionLayerWindowSpaceDXR *out_layer)
+static int ps_submit_wsui(int slot, XrCompositionLayerWindowSpaceDXR *out_layer)
 {
-	if (!out_layer) return 0;
+	if (!out_layer || slot < 0 || slot >= PS_MAX_WSUI) return 0;
+	ProviderWsui *ws = &s_ps.wsui[slot];
 	memset(out_layer, 0, sizeof(*out_layer));
 #if defined(ENABLE_VULKAN)
 	// Vulkan (#336): twin of the Local2D arm in ps_submit_local2d.
@@ -2717,25 +2736,25 @@ static int ps_submit_wsui(XrCompositionLayerWindowSpaceDXR *out_layer)
 		if (s_wsui_vk_disabled) return 0;
 		void *tex = NULL; int tw = 0, th = 0;
 		float lx = 0, ly = 0, lw = 0, lh = 0, ldisp = 0;
-		if (!displayxr_window_space_ui_get_pending(&tex, &tw, &th, &lx, &ly, &lw, &lh, &ldisp))
+		if (!displayxr_window_space_ui_get_pending_slot(slot, &tex, &tw, &th, &lx, &ly, &lw, &lh, &ldisp))
 			return 0;
-		if (!ps_create_wsui((uint32_t)tw, (uint32_t)th)) return 0;
-		if (!dxr_pvk_overlay_has_content(PS_PVK_OVERLAY_WSUI)) return 0;
+		if (!ps_create_wsui(slot, (uint32_t)tw, (uint32_t)th)) return 0;
+		if (!dxr_pvk_overlay_has_content((PS_PVK_OVERLAY_WSUI0 + slot))) return 0;
 
 		uint32_t idx = 0;
 		XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-		if (XR_FAILED(s_ps.pfn_acquire_swapchain_image(s_ps.wsui_swapchain, &ai, &idx)) ||
-		    idx >= s_ps.wsui_image_count)
+		if (XR_FAILED(s_ps.pfn_acquire_swapchain_image(ws->swapchain, &ai, &idx)) ||
+		    idx >= ws->image_count)
 			return 0;
 		XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
 		wi.timeout = 1000000000;
-		s_ps.pfn_wait_swapchain_image(s_ps.wsui_swapchain, &wi);
-		int copied = dxr_pvk_overlay_copy_to_swapchain_image(PS_PVK_OVERLAY_WSUI, idx);
+		s_ps.pfn_wait_swapchain_image(ws->swapchain, &wi);
+		int copied = dxr_pvk_overlay_copy_to_swapchain_image((PS_PVK_OVERLAY_WSUI0 + slot), idx);
 		XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-		s_ps.pfn_release_swapchain_image(s_ps.wsui_swapchain, &ri);
+		s_ps.pfn_release_swapchain_image(ws->swapchain, &ri);
 		if (!copied) return 0;
 
-		ps_fill_wsui_layer(out_layer, lx, ly, lw, lh, ldisp);
+		ps_fill_wsui_layer(ws, out_layer, lx, ly, lw, lh, ldisp);
 		return 1;
 	}
 #endif
@@ -2745,77 +2764,77 @@ static int ps_submit_wsui(XrCompositionLayerWindowSpaceDXR *out_layer)
 	if (s_ps.graphics_api != DXR_GFX_METAL) return 0;
 	void *tex = NULL; int tw = 0, th = 0;
 	float lx = 0, ly = 0, lw = 0, lh = 0, ldisp = 0;
-	if (!displayxr_window_space_ui_get_pending(&tex, &tw, &th, &lx, &ly, &lw, &lh, &ldisp))
+	if (!displayxr_window_space_ui_get_pending_slot(slot, &tex, &tw, &th, &lx, &ly, &lw, &lh, &ldisp))
 		return 0; // no UI texture registered this frame
-	if (!ps_create_wsui((uint32_t)tw, (uint32_t)th)) return 0;
-	if (!s_ps.wsui_swapchain_created || s_ps.wsui_image_count == 0) return 0;
+	if (!ps_create_wsui(slot, (uint32_t)tw, (uint32_t)th)) return 0;
+	if (!ws->swapchain_created || ws->image_count == 0) return 0;
 
 	uint32_t idx = 0;
 	XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-	if (XR_FAILED(s_ps.pfn_acquire_swapchain_image(s_ps.wsui_swapchain, &ai, &idx)) ||
-	    idx >= s_ps.wsui_image_count)
+	if (XR_FAILED(s_ps.pfn_acquire_swapchain_image(ws->swapchain, &ai, &idx)) ||
+	    idx >= ws->image_count)
 		return 0;
 	XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
 	wi.timeout = 1000000000;
-	s_ps.pfn_wait_swapchain_image(s_ps.wsui_swapchain, &wi);
+	s_ps.pfn_wait_swapchain_image(ws->swapchain, &wi);
 
 	// Same-device blit Unity UI texture -> acquired image on the session queue.
 	// Ordered after Unity's OverlayCamera render by the frame's order_weave wait
 	// CB (session-queue FIFO — order_weave is committed earlier in submit); the
 	// compositor's weave at xrEndFrame is FIFO after this blit on the same queue.
-	if (s_ps.wsui_images_metal[idx].texture)
-		displayxr_metal_blit_textures(s_ps.metal_queue, tex, s_ps.wsui_images_metal[idx].texture);
+	if (ws->images_metal[idx].texture)
+		displayxr_metal_blit_textures(s_ps.metal_queue, tex, ws->images_metal[idx].texture);
 
 	XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-	s_ps.pfn_release_swapchain_image(s_ps.wsui_swapchain, &ri);
+	s_ps.pfn_release_swapchain_image(ws->swapchain, &ri);
 
-	ps_fill_wsui_layer(out_layer, lx, ly, lw, lh, ldisp);
+	ps_fill_wsui_layer(ws, out_layer, lx, ly, lw, lh, ldisp);
 	return 1;
 #elif defined(_WIN32)
 
 	void *tex = NULL; int tw = 0, th = 0;
 	float lx = 0, ly = 0, lw = 0, lh = 0, ldisp = 0;
-	if (!displayxr_window_space_ui_get_pending(&tex, &tw, &th, &lx, &ly, &lw, &lh, &ldisp))
+	if (!displayxr_window_space_ui_get_pending_slot(slot, &tex, &tw, &th, &lx, &ly, &lw, &lh, &ldisp))
 		return 0;
 	int is_d3d11 = (s_ps.graphics_api == DXR_GFX_D3D11);
-	if (!s_ps.wsui_swapchain_created || s_ps.wsui_image_count == 0 ||
-	    (is_d3d11 ? !s_ps.wsui_unity_tex : !s_ps.wsui_bridge_own))
+	if (!ws->swapchain_created || ws->image_count == 0 ||
+	    (is_d3d11 ? !ws->unity_tex : !ws->bridge_own))
 		return 0; // C# hasn't requested the target yet (no get_wsui_bridge call)
 
 	// Acquire + wait an overlay swapchain image.
 	uint32_t idx = 0;
 	XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
-	if (XR_FAILED(s_ps.pfn_acquire_swapchain_image(s_ps.wsui_swapchain, &ai, &idx)) ||
-	    idx >= s_ps.wsui_image_count)
+	if (XR_FAILED(s_ps.pfn_acquire_swapchain_image(ws->swapchain, &ai, &idx)) ||
+	    idx >= ws->image_count)
 		return 0;
 	XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
 	wi.timeout = 1000000000;
-	s_ps.pfn_wait_swapchain_image(s_ps.wsui_swapchain, &wi);
+	s_ps.pfn_wait_swapchain_image(ws->swapchain, &wi);
 
 	if (is_d3d11 && s_ps.d3d11_bridge) {
 		// D3D11 editor bridge: own-context copy own-side shared tex -> acquired image
 		// (the frame's single fence Wait already ordered the own context after Unity).
-		if (s_ps.wsui_images_d3d11[idx].texture && s_ps.wsui_unity_tex_own && s_ps.own_d3d11_context)
-			s_ps.own_d3d11_context->CopyResource(s_ps.wsui_images_d3d11[idx].texture, s_ps.wsui_unity_tex_own);
+		if (ws->images_d3d11[idx].texture && ws->unity_tex_own && s_ps.own_d3d11_context)
+			s_ps.own_d3d11_context->CopyResource(ws->images_d3d11[idx].texture, ws->unity_tex_own);
 	} else if (is_d3d11) {
 		// D3D11 zero-copy: same-device copy Unity target -> acquired image (no bridge/fence).
-		if (s_ps.wsui_images_d3d11[idx].texture && s_ps.wsui_unity_tex && s_ps.unity_d3d11_context)
-			s_ps.unity_d3d11_context->CopyResource(s_ps.wsui_images_d3d11[idx].texture, s_ps.wsui_unity_tex);
+		if (ws->images_d3d11[idx].texture && ws->unity_tex && s_ps.unity_d3d11_context)
+			s_ps.unity_d3d11_context->CopyResource(ws->images_d3d11[idx].texture, ws->unity_tex);
 	} else
 	// own_device copy bridge -> swapchain image (single subresource).
-	if (s_ps.wsui_images[idx].texture && s_ps.own_cmd_list) {
+	if (ws->images[idx].texture && s_ps.own_cmd_list) {
 		s_ps.own_cmd_alloc->Reset();
 		s_ps.own_cmd_list->Reset(s_ps.own_cmd_alloc, NULL);
-		ps_sc_image_barrier(s_ps.own_cmd_list, s_ps.wsui_images[idx].texture,
+		ps_sc_image_barrier(s_ps.own_cmd_list, ws->images[idx].texture,
 		                    D3D12_RESOURCE_STATE_RENDER_TARGET, D3D12_RESOURCE_STATE_COPY_DEST);
 		D3D12_TEXTURE_COPY_LOCATION dl = {};
-		dl.pResource = s_ps.wsui_images[idx].texture;
+		dl.pResource = ws->images[idx].texture;
 		dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; dl.SubresourceIndex = 0;
 		D3D12_TEXTURE_COPY_LOCATION sl = {};
-		sl.pResource = s_ps.wsui_bridge_own;
+		sl.pResource = ws->bridge_own;
 		sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX; sl.SubresourceIndex = 0;
 		s_ps.own_cmd_list->CopyTextureRegion(&dl, 0, 0, 0, &sl, NULL);
-		ps_sc_image_barrier(s_ps.own_cmd_list, s_ps.wsui_images[idx].texture,
+		ps_sc_image_barrier(s_ps.own_cmd_list, ws->images[idx].texture,
 		                    D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_RENDER_TARGET);
 		s_ps.own_cmd_list->Close();
 		ID3D12CommandList *lists[] = { s_ps.own_cmd_list };
@@ -2829,9 +2848,9 @@ static int ps_submit_wsui(XrCompositionLayerWindowSpaceDXR *out_layer)
 	}
 
 	XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
-	s_ps.pfn_release_swapchain_image(s_ps.wsui_swapchain, &ri);
+	s_ps.pfn_release_swapchain_image(ws->swapchain, &ri);
 
-	ps_fill_wsui_layer(out_layer, lx, ly, lw, lh, ldisp);
+	ps_fill_wsui_layer(ws, out_layer, lx, ly, lw, lh, ldisp);
 	return 1;
 #else
 	// Linux without ENABLE_VULKAN: no backend can submit wsui.
@@ -3117,21 +3136,23 @@ int dxr_prov_local2d_needs_copy(void)
 	return 0;
 }
 
-int dxr_prov_wsui_needs_copy(void)
+int dxr_prov_wsui_needs_copy_slot(int slot)
 {
 #if defined(ENABLE_VULKAN)
-	if (s_ps.graphics_api == DXR_GFX_VULKAN)
-		return dxr_pvk_overlay_needs_copy(PS_PVK_OVERLAY_WSUI);
+	if (s_ps.graphics_api == DXR_GFX_VULKAN && slot >= 0 && slot < PS_MAX_WSUI)
+		return dxr_pvk_overlay_needs_copy(PS_PVK_OVERLAY_WSUI0 + slot);
 #endif
+	(void)slot;
 	return 0;
 }
 
-void dxr_prov_wsui_request_copy(void)
+void dxr_prov_wsui_request_copy_slot(int slot)
 {
 #if defined(ENABLE_VULKAN)
-	if (s_ps.graphics_api == DXR_GFX_VULKAN)
-		dxr_pvk_overlay_request_copy(PS_PVK_OVERLAY_WSUI);
+	if (s_ps.graphics_api == DXR_GFX_VULKAN && slot >= 0 && slot < PS_MAX_WSUI)
+		dxr_pvk_overlay_request_copy(PS_PVK_OVERLAY_WSUI0 + slot);
 #endif
+	(void)slot;
 }
 
 void dxr_prov_local2d_request_copy(void)
@@ -4995,14 +5016,17 @@ int dxr_prov_session_start(const char *runtime_json_path,
 
 void dxr_prov_session_stop(void)
 {
-	if (s_ps.wsui_swapchain && s_ps.pfn_destroy_swapchain) s_ps.pfn_destroy_swapchain(s_ps.wsui_swapchain);
+	for (int i = 0; i < PS_MAX_WSUI; i++) {
+		ProviderWsui *ws = &s_ps.wsui[i];
+		if (ws->swapchain && s_ps.pfn_destroy_swapchain) s_ps.pfn_destroy_swapchain(ws->swapchain);
 #ifdef _WIN32
-	if (s_ps.wsui_bridge_unity)  s_ps.wsui_bridge_unity->Release();
-	if (s_ps.wsui_bridge_handle) CloseHandle(s_ps.wsui_bridge_handle);
-	if (s_ps.wsui_bridge_own)    s_ps.wsui_bridge_own->Release();
-	if (s_ps.wsui_unity_tex)     s_ps.wsui_unity_tex->Release();
-	if (s_ps.wsui_unity_tex_own) s_ps.wsui_unity_tex_own->Release(); // D3D11 editor bridge (NT handle closed at alloc)
+		if (ws->bridge_unity)  ws->bridge_unity->Release();
+		if (ws->bridge_handle) CloseHandle(ws->bridge_handle);
+		if (ws->bridge_own)    ws->bridge_own->Release();
+		if (ws->unity_tex)     ws->unity_tex->Release();
+		if (ws->unity_tex_own) ws->unity_tex_own->Release(); // D3D11 editor bridge (NT handle closed at alloc)
 #endif
+	}
 	if (s_ps.l2d_swapchain && s_ps.pfn_destroy_swapchain) s_ps.pfn_destroy_swapchain(s_ps.l2d_swapchain);
 #ifdef _WIN32
 	if (s_ps.l2d_bridge_unity)  s_ps.l2d_bridge_unity->Release();
@@ -7107,19 +7131,25 @@ int dxr_prov_submit_frame(uint32_t image_index)
 	int has_l2d = ps_submit_local2d(&l2d_layer);
 
 	// Window-space UI (HUD). Composites over everything (fractional coords + disparity).
-	XrCompositionLayerWindowSpaceDXR wsui_layer = {};
-	int has_wsui = ps_submit_wsui(&wsui_layer);
+	XrCompositionLayerWindowSpaceDXR wsui_layer[PS_MAX_WSUI] = {};
+	int wsui_has[PS_MAX_WSUI] = {};
+	int has_wsui = 0;
+	for (int i = 0; i < PS_MAX_WSUI; i++) {
+		wsui_has[i] = ps_submit_wsui(i, &wsui_layer[i]);
+		has_wsui |= wsui_has[i];
+	}
 
 	// Order: 3D projections (primary + extra zones) under, Local2D bands over the 3D,
 	// HUD on top (canonical zones rule — 1 zone projection per 3D zone + 1 Local2D per
 	// 2D band, all ALPHA_BLEND).
-	const XrCompositionLayerBaseHeader *layers[PS_MAX_ZONES + 2];
+	const XrCompositionLayerBaseHeader *layers[PS_MAX_ZONES + 1 + PS_MAX_WSUI]; // zones + Local2D + wsui slots
 	uint32_t lc = 0;
 	layers[lc++] = (const XrCompositionLayerBaseHeader *)&layer;
 	for (uint32_t i = 0; i < s_ps.extra_zone_count; i++)
 		if (extra_has[i]) layers[lc++] = (const XrCompositionLayerBaseHeader *)&extra_layer[i];
 	if (has_l2d)  layers[lc++] = (const XrCompositionLayerBaseHeader *)&l2d_layer;
-	if (has_wsui) layers[lc++] = (const XrCompositionLayerBaseHeader *)&wsui_layer;
+	for (int i = 0; i < PS_MAX_WSUI; i++)
+		if (wsui_has[i]) layers[lc++] = (const XrCompositionLayerBaseHeader *)&wsui_layer[i];
 
 	// D3D11 (#195): make sure the runtime's weave in xrEndFrame reads FINISHED content.
 	// EDITOR bridge: the primary + secondary copies all ran on the OWN immediate context —

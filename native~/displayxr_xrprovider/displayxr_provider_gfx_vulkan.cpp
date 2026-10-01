@@ -1275,7 +1275,9 @@ pvk_overlay(int kind)
 static const char *
 pvk_overlay_label(int kind)
 {
-	return kind == DXR_PVK_OVERLAY_LOCAL2D ? "local2d" : "wsui";
+	static const char *const names[DXR_PVK_OVERLAY_COUNT] = {"local2d", "wsui0", "wsui1",
+	                                                         "wsui2", "wsui3"};
+	return (kind >= 0 && kind < DXR_PVK_OVERLAY_COUNT) ? names[kind] : "?";
 }
 
 static void
