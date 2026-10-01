@@ -1008,6 +1008,8 @@ pvk_barrier(VkImage img, VkImageLayout old_layout, VkImageLayout new_layout,
 	return b;
 }
 
+static void pvk_grave_tick(void); // overlay graveyard (see the 2D overlay section)
+
 void
 dxr_pvk_signal_unity_done(void)
 {
@@ -1027,6 +1029,11 @@ dxr_pvk_signal_unity_done(void)
 		s_pvk.unity_api.vkQueueWaitIdle(s_pvk.unity_queue);
 	else if (s_pvk.unity_api.vkDeviceWaitIdle && s_pvk.unity_device != VK_NULL_HANDLE)
 		s_pvk.unity_api.vkDeviceWaitIdle(s_pvk.unity_device);
+
+	// Age the overlay graveyard here: this runs exactly once per frame. Ticking per
+	// overlay copy made the delay shrink with every extra layer (Local2D + a HUD = two
+	// "frames" per frame).
+	pvk_grave_tick();
 }
 
 // Copy `layer_count` layers of bridge `b` (from layer 0) into `dst` starting at
@@ -1456,7 +1463,6 @@ dxr_pvk_overlay_record_unity_copy(int kind, void *cmd_buf, void *src_image,
 int
 dxr_pvk_overlay_copy_to_swapchain_image(int kind, uint32_t image_index)
 {
-	pvk_grave_tick(); // once per overlay frame
 	PvkState::Overlay *o = pvk_overlay(kind);
 	if (!o || image_index >= o->sc_image_count) return 0;
 	return pvk_copy_bridge(&o->bridge, o->sc_images[image_index], 0, 1);

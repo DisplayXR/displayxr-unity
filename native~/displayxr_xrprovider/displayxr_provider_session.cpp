@@ -200,6 +200,12 @@ extern "C" void dxr_pvk_overlay_destroy(int kind);
 // Atomic: bumped on the thread that polls events, read by the C# main thread.
 static std::atomic<uint32_t> s_session_generation{0};
 
+// Set if xrEndFrame rejects a frame that carried a Vulkan wsui layer: the runtime may
+// not take window-space layers on this backend, and every further frame would be
+// rejected WHOLE (black panel). It can't tell which layer was rejected, so it is reset
+// at every session start rather than latched for the process (editor Play sessions).
+static int s_wsui_vk_disabled = 0;
+
 // ============================================================================
 // Size constants
 // ============================================================================
@@ -567,6 +573,7 @@ typedef struct ProviderSession {
 	int         wsui_image_acquired;
 	uint32_t    wsui_acquired_index;
 	uint32_t        wsui_registered_w, wsui_registered_h; // bridge+swapchain sized for this
+	uint32_t        wsui_vk_failed_w, wsui_vk_failed_h;   // Vulkan create failed at this size (#336)
 #ifdef _WIN32
 	XrSwapchainImageD3D12KHR wsui_images[PS_MAX_SWAPCHAIN_IMAGES];
 	ID3D12Resource *wsui_bridge_own;    // own_device side (copy source)
@@ -2413,15 +2420,79 @@ static int ps_create_wsui(uint32_t w, uint32_t h)
 	// composition layers (wsui / Local2D / extra 3D zones) each need their own
 	// external-memory bridge and are not wired yet — bail cleanly rather than fall
 	// into the D3D12 arm below and dereference a NULL own_device.
+#if defined(ENABLE_VULKAN)
+	// Vulkan (#336): same shape as the Local2D arm (see ps_create_local2d) — an
+	// arraySize=1 swapchain on the session device plus an overlay bridge, created on
+	// the render thread only, filled by the plugin-event copy.
 	if (s_ps.graphics_api == DXR_GFX_VULKAN) {
-		static int warned = 0;
-		if (!warned) {
-			warned = 1;
-			ps_log("[DisplayXR-PROV] wsui: not supported on the Vulkan backend yet (#247 Phase 1 "
-			       "is the primary stereo path only) — 2D UI layer inert\n");
+		if (s_wsui_vk_disabled || w == 0 || h == 0 || !dxr_pvk_device_ready()) return 0;
+		if (s_ps.wsui_swapchain_created && s_ps.wsui_registered_w == w && s_ps.wsui_registered_h == h)
+			return 1;
+		if (s_ps.wsui_vk_failed_w == w && s_ps.wsui_vk_failed_h == h) return 0;
+		s_ps.wsui_vk_failed_w = w; s_ps.wsui_vk_failed_h = h; // cleared on success below
+		if (s_ps.wsui_swapchain && s_ps.pfn_destroy_swapchain) {
+			dxr_pvk_overlay_destroy(PS_PVK_OVERLAY_WSUI);
+			s_ps.pfn_destroy_swapchain(s_ps.wsui_swapchain);
 		}
-		return 0;
+		s_ps.wsui_swapchain = XR_NULL_HANDLE;
+		s_ps.wsui_swapchain_created = 0;
+
+		uint32_t fmt_count = 0;
+		s_ps.pfn_enumerate_swapchain_formats(s_ps.session, 0, &fmt_count, NULL);
+		if (fmt_count == 0) { ps_log("[DisplayXR-PROV] wsui: no swapchain formats\n"); return 0; }
+		int64_t formats[32];
+		if (fmt_count > 32) fmt_count = 32;
+		s_ps.pfn_enumerate_swapchain_formats(s_ps.session, fmt_count, &fmt_count, formats);
+		int64_t format = 0;
+		for (uint32_t i = 0; i < fmt_count && !format; i++) if (formats[i] == 44) format = 44;
+		for (uint32_t i = 0; i < fmt_count && !format; i++) if (formats[i] == 37) format = 37;
+		if (!format) {
+			ps_log("[DisplayXR-PROV] wsui: runtime offers neither B8G8R8A8_UNORM nor "
+			       "R8G8B8A8_UNORM — layer disabled\n");
+			return 0;
+		}
+
+		XrSwapchainCreateInfo ci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+		ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
+		                XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT |
+		                XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+		ci.format = format;
+		ci.sampleCount = 1; ci.width = w; ci.height = h;
+		ci.faceCount = 1; ci.arraySize = 1; ci.mipCount = 1;
+		if (XR_FAILED(s_ps.pfn_create_swapchain(s_ps.session, &ci, &s_ps.wsui_swapchain))) {
+			ps_log("[DisplayXR-PROV] wsui: xrCreateSwapchain failed\n");
+			s_ps.wsui_swapchain = XR_NULL_HANDLE;
+			return 0;
+		}
+		uint32_t count = 0;
+		s_ps.pfn_enumerate_swapchain_images(s_ps.wsui_swapchain, 0, &count, NULL);
+		if (count > PS_MAX_SWAPCHAIN_IMAGES) count = PS_MAX_SWAPCHAIN_IMAGES;
+		XrSwapchainImageVulkanKHR_PS vk_imgs[PS_MAX_SWAPCHAIN_IMAGES] = {};
+		for (uint32_t i = 0; i < count; i++) {
+			vk_imgs[i].type = XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR_PS;
+			vk_imgs[i].next = NULL;
+			vk_imgs[i].image = NULL;
+		}
+		if (XR_FAILED(s_ps.pfn_enumerate_swapchain_images(s_ps.wsui_swapchain, count, &count,
+		        (XrSwapchainImageBaseHeader *)vk_imgs))) {
+			ps_log("[DisplayXR-PROV] wsui: enumerate images (Vulkan) failed\n");
+			return 0;
+		}
+		dxr_pvk_overlay_set_swapchain_images(PS_PVK_OVERLAY_WSUI, vk_imgs, count, format);
+		if (!dxr_pvk_overlay_create_bridge(PS_PVK_OVERLAY_WSUI, w, h, format)) {
+			ps_log("[DisplayXR-PROV] wsui: Vulkan overlay bridge create failed\n");
+			return 0;
+		}
+		s_ps.wsui_w = w; s_ps.wsui_h = h; s_ps.wsui_format = format;
+		s_ps.wsui_image_count = count;
+		s_ps.wsui_registered_w = w; s_ps.wsui_registered_h = h;
+		s_ps.wsui_swapchain_created = 1;
+		s_ps.wsui_vk_failed_w = s_ps.wsui_vk_failed_h = 0;
+		ps_log("[DisplayXR-PROV] wsui: Vulkan swapchain %ux%u (%u imgs, fmt=%lld) + overlay bridge\n",
+		       w, h, count, (long long)format);
+		return 1;
 	}
+#endif
 #if defined(__APPLE__)
 	// Metal (#206): an arraySize=1 overlay swapchain on Unity's device. No bridge —
 	// submit blits the C#-registered Unity id<MTLTexture> straight in (same device).
@@ -2595,6 +2666,17 @@ void dxr_prov_get_wsui_bridge(uint32_t w, uint32_t h,
 	if (out_w) *out_w = 0;
 	if (out_h) *out_h = 0;
 	if (!s_ps.running || !s_ps.session_ready) return;
+#if defined(ENABLE_VULKAN)
+	if (s_ps.graphics_api == DXR_GFX_VULKAN) {
+		// Session token, not a texture — see dxr_prov_get_local2d_bridge (#336).
+		if (s_wsui_vk_disabled) return;
+		uint32_t gen = s_session_generation.load();
+		if (out_ptr) *out_ptr = (void *)(uintptr_t)(gen ? gen : 1);
+		if (out_w) *out_w = w;
+		if (out_h) *out_h = h;
+		return;
+	}
+#endif
 	if (!ps_create_wsui(w, h)) return;
 #ifdef _WIN32
 	if (out_ptr) *out_ptr = (s_ps.graphics_api == DXR_GFX_D3D11)
@@ -2609,10 +2691,54 @@ void dxr_prov_get_wsui_bridge(uint32_t w, uint32_t h,
 // out_layer. Returns 1 if the layer should be submitted, else 0. Called from
 // dxr_prov_submit_frame AFTER the projection bridge copy (own_cmd_list is free and
 // the shared-fence wait already ordered the own queue after Unity's writes).
+// The XrCompositionLayerWindowSpaceDXR fields every backend fills the same way.
+static void ps_fill_wsui_layer(XrCompositionLayerWindowSpaceDXR *out_layer,
+                               float lx, float ly, float lw, float lh, float ldisp)
+{
+	out_layer->type = XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR;
+	out_layer->next = NULL;
+	out_layer->layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
+	out_layer->subImage.swapchain = s_ps.wsui_swapchain;
+	out_layer->subImage.imageRect.offset = {0, 0};
+	out_layer->subImage.imageRect.extent = {(int32_t)s_ps.wsui_w, (int32_t)s_ps.wsui_h};
+	out_layer->subImage.imageArrayIndex = 0;
+	out_layer->x = lx; out_layer->y = ly;
+	out_layer->width = lw; out_layer->height = lh;
+	out_layer->disparity = ldisp;
+}
+
 static int ps_submit_wsui(XrCompositionLayerWindowSpaceDXR *out_layer)
 {
 	if (!out_layer) return 0;
 	memset(out_layer, 0, sizeof(*out_layer));
+#if defined(ENABLE_VULKAN)
+	// Vulkan (#336): twin of the Local2D arm in ps_submit_local2d.
+	if (s_ps.graphics_api == DXR_GFX_VULKAN) {
+		if (s_wsui_vk_disabled) return 0;
+		void *tex = NULL; int tw = 0, th = 0;
+		float lx = 0, ly = 0, lw = 0, lh = 0, ldisp = 0;
+		if (!displayxr_window_space_ui_get_pending(&tex, &tw, &th, &lx, &ly, &lw, &lh, &ldisp))
+			return 0;
+		if (!ps_create_wsui((uint32_t)tw, (uint32_t)th)) return 0;
+		if (!dxr_pvk_overlay_has_content(PS_PVK_OVERLAY_WSUI)) return 0;
+
+		uint32_t idx = 0;
+		XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+		if (XR_FAILED(s_ps.pfn_acquire_swapchain_image(s_ps.wsui_swapchain, &ai, &idx)) ||
+		    idx >= s_ps.wsui_image_count)
+			return 0;
+		XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+		wi.timeout = 1000000000;
+		s_ps.pfn_wait_swapchain_image(s_ps.wsui_swapchain, &wi);
+		int copied = dxr_pvk_overlay_copy_to_swapchain_image(PS_PVK_OVERLAY_WSUI, idx);
+		XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+		s_ps.pfn_release_swapchain_image(s_ps.wsui_swapchain, &ri);
+		if (!copied) return 0;
+
+		ps_fill_wsui_layer(out_layer, lx, ly, lw, lh, ldisp);
+		return 1;
+	}
+#endif
 #if defined(__APPLE__)
 	// Metal (#206): blit the C#-registered Unity id<MTLTexture> into the acquired
 	// overlay swapchain image (same device, session queue), then submit the layer.
@@ -2643,16 +2769,7 @@ static int ps_submit_wsui(XrCompositionLayerWindowSpaceDXR *out_layer)
 	XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
 	s_ps.pfn_release_swapchain_image(s_ps.wsui_swapchain, &ri);
 
-	out_layer->type = XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR;
-	out_layer->next = NULL;
-	out_layer->layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
-	out_layer->subImage.swapchain = s_ps.wsui_swapchain;
-	out_layer->subImage.imageRect.offset = {0, 0};
-	out_layer->subImage.imageRect.extent = {(int32_t)s_ps.wsui_w, (int32_t)s_ps.wsui_h};
-	out_layer->subImage.imageArrayIndex = 0;
-	out_layer->x = lx; out_layer->y = ly;
-	out_layer->width = lw; out_layer->height = lh;
-	out_layer->disparity = ldisp;
+	ps_fill_wsui_layer(out_layer, lx, ly, lw, lh, ldisp);
 	return 1;
 #elif defined(_WIN32)
 
@@ -2714,19 +2831,10 @@ static int ps_submit_wsui(XrCompositionLayerWindowSpaceDXR *out_layer)
 	XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
 	s_ps.pfn_release_swapchain_image(s_ps.wsui_swapchain, &ri);
 
-	out_layer->type = XR_TYPE_COMPOSITION_LAYER_WINDOW_SPACE_DXR;
-	out_layer->next = NULL;
-	out_layer->layerFlags = XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;
-	out_layer->subImage.swapchain = s_ps.wsui_swapchain;
-	out_layer->subImage.imageRect.offset = {0, 0};
-	out_layer->subImage.imageRect.extent = {(int32_t)s_ps.wsui_w, (int32_t)s_ps.wsui_h};
-	out_layer->subImage.imageArrayIndex = 0;
-	out_layer->x = lx; out_layer->y = ly;
-	out_layer->width = lw; out_layer->height = lh;
-	out_layer->disparity = ldisp;
+	ps_fill_wsui_layer(out_layer, lx, ly, lw, lh, ldisp);
 	return 1;
 #else
-	// Linux (#249): wsui inert — nothing to submit.
+	// Linux without ENABLE_VULKAN: no backend can submit wsui.
 	return 0;
 #endif // _WIN32
 }
@@ -3007,6 +3115,23 @@ int dxr_prov_local2d_needs_copy(void)
 		return dxr_pvk_overlay_needs_copy(PS_PVK_OVERLAY_LOCAL2D);
 #endif
 	return 0;
+}
+
+int dxr_prov_wsui_needs_copy(void)
+{
+#if defined(ENABLE_VULKAN)
+	if (s_ps.graphics_api == DXR_GFX_VULKAN)
+		return dxr_pvk_overlay_needs_copy(PS_PVK_OVERLAY_WSUI);
+#endif
+	return 0;
+}
+
+void dxr_prov_wsui_request_copy(void)
+{
+#if defined(ENABLE_VULKAN)
+	if (s_ps.graphics_api == DXR_GFX_VULKAN)
+		dxr_pvk_overlay_request_copy(PS_PVK_OVERLAY_WSUI);
+#endif
 }
 
 void dxr_prov_local2d_request_copy(void)
@@ -4105,6 +4230,7 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	for (uint32_t i = 0; i < PS_MAX_ZONES - 1; i++) saved_extra[i] = s_ps.extra_zones[i];
 	ps_free_content_mask();
 	memset(&s_ps, 0, sizeof(s_ps));
+	s_wsui_vk_disabled = 0; // a new session gets a fresh chance (see its declaration)
 	s_ps.single_pass = saved_single_pass;
 	s_ps.single_pass_set = saved_single_pass_set;
 	s_ps.transparent_requested = saved_transparent;
@@ -7054,7 +7180,22 @@ int dxr_prov_submit_frame(uint32_t image_index)
 	if (subf_trace) ps_log("[DisplayXR-PROV] submit_frame[%u]: post-xrEndFrame r=%d\n", s_subf_n - 1, r);
 	if (d11_diag) ps_log("[DisplayXR-PROV] D3D11 submit[%u]: post-xrEndFrame r=%d\n", d11_frames, r);
 	if (s_ps.graphics_api == DXR_GFX_D3D11 && d11_frames < 100000) d11_frames++;
-	if (XR_FAILED(r)) { ps_log("[DisplayXR-PROV] xrEndFrame failed: %d\n", r); return 0; }
+	if (XR_FAILED(r)) {
+		ps_log("[DisplayXR-PROV] xrEndFrame failed: %d\n", r);
+#if defined(ENABLE_VULKAN)
+		// #336 safety net: window-space layers are new on Vulkan. If the runtime rejects a
+		// frame that carried one, stop sending it — otherwise every frame is rejected
+		// whole and the panel stays black.
+		if (has_wsui && s_ps.graphics_api == DXR_GFX_VULKAN && r == XR_ERROR_LAYER_INVALID &&
+		    !s_wsui_vk_disabled) {
+			s_wsui_vk_disabled = 1;
+			ps_log("[DisplayXR-PROV] wsui: runtime rejected a frame carrying the window-space "
+			       "layer on Vulkan (XR_ERROR_LAYER_INVALID) — wsui disabled until the next "
+			       "session\n");
+		}
+#endif
+		return 0;
+	}
 
 #ifdef _WIN32
 	// PROBE (DISPLAYXR_PROV_BRIDGE_READBACK=1): once, read back the copy-source bridge to
