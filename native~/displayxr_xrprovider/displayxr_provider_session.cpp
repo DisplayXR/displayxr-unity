@@ -200,9 +200,10 @@ extern "C" void dxr_pvk_overlay_destroy(int kind);
 // Atomic: bumped on the thread that polls events, read by the C# main thread.
 static std::atomic<uint32_t> s_session_generation{0};
 
-// Set once if xrEndFrame rejects a frame that carried a Vulkan wsui layer: the runtime
-// does not take window-space layers on this backend, and every further frame would be
-// rejected WHOLE (black panel). Process-lifetime on purpose — the runtime won't change.
+// Set if xrEndFrame rejects a frame that carried a Vulkan wsui layer: the runtime may
+// not take window-space layers on this backend, and every further frame would be
+// rejected WHOLE (black panel). It can't tell which layer was rejected, so it is reset
+// at every session start rather than latched for the process (editor Play sessions).
 static int s_wsui_vk_disabled = 0;
 
 // ============================================================================
@@ -4229,6 +4230,7 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	for (uint32_t i = 0; i < PS_MAX_ZONES - 1; i++) saved_extra[i] = s_ps.extra_zones[i];
 	ps_free_content_mask();
 	memset(&s_ps, 0, sizeof(s_ps));
+	s_wsui_vk_disabled = 0; // a new session gets a fresh chance (see its declaration)
 	s_ps.single_pass = saved_single_pass;
 	s_ps.single_pass_set = saved_single_pass_set;
 	s_ps.transparent_requested = saved_transparent;
@@ -7187,8 +7189,9 @@ int dxr_prov_submit_frame(uint32_t image_index)
 		if (has_wsui && s_ps.graphics_api == DXR_GFX_VULKAN && r == XR_ERROR_LAYER_INVALID &&
 		    !s_wsui_vk_disabled) {
 			s_wsui_vk_disabled = 1;
-			ps_log("[DisplayXR-PROV] wsui: runtime rejected the window-space layer on Vulkan "
-			       "(XR_ERROR_LAYER_INVALID) — wsui disabled for this process\n");
+			ps_log("[DisplayXR-PROV] wsui: runtime rejected a frame carrying the window-space "
+			       "layer on Vulkan (XR_ERROR_LAYER_INVALID) — wsui disabled until the next "
+			       "session\n");
 		}
 #endif
 		return 0;
