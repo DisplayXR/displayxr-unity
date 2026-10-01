@@ -198,7 +198,9 @@ namespace DisplayXR
         /// <summary>The RenderTexture capturing the Canvas content.</summary>
         public RenderTexture OverlayTexture { get; private set; }
 
-        private static readonly Vector3 kCanvasWorldPos = new Vector3(0, 100000f, 0);
+        // This component's private stage (see DisplayXROverlayStage): its canvas and
+        // camera sit there so no other overlay's camera sees this canvas.
+        private int m_Stage = -1;
         private const int kPrivateLayer = 30;
 
         private Canvas m_Canvas;
@@ -310,7 +312,9 @@ namespace DisplayXR
 
             // WorldSpace canvas parked far away on a private layer.
             m_Canvas.renderMode = RenderMode.WorldSpace;
-            m_CanvasRect.position = kCanvasWorldPos;
+            if (m_Stage < 0) m_Stage = DisplayXROverlayStage.Acquire();
+            Vector3 stagePos = DisplayXROverlayStage.Position(m_Stage);
+            m_CanvasRect.position = stagePos;
             m_CanvasRect.rotation = Quaternion.identity;
             m_CanvasRect.localScale = new Vector3(0.01f, 0.01f, 0.01f);
             m_CanvasRect.sizeDelta = resolution;
@@ -321,7 +325,7 @@ namespace DisplayXR
             var camGO = new GameObject("DisplayXR_Local2DCam");
             camGO.transform.SetParent(transform, false);
             camGO.hideFlags = HideFlags.HideAndDontSave;
-            camGO.transform.position = kCanvasWorldPos + new Vector3(0, 0, 1);
+            camGO.transform.position = stagePos + new Vector3(0, 0, 1);
             camGO.transform.rotation = Quaternion.LookRotation(Vector3.back, Vector3.down);
 
             m_OverlayCamera = camGO.AddComponent<Camera>();
@@ -459,6 +463,8 @@ namespace DisplayXR
 
         void OnDisable()
         {
+            DisplayXROverlayStage.Release(m_Stage);
+            m_Stage = -1;
             UnregisterContentDirtyTracking();   // #244 — drop Graphic dirty callbacks
             ReleaseBridgeTex();
 

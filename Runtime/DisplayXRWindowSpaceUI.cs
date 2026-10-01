@@ -110,7 +110,9 @@ namespace DisplayXR
         // We park the WorldSpace canvas at this fixed position, far from any
         // scene content, so the dedicated camera looking at it sees nothing
         // else that might bleed into our RT.
-        private static readonly Vector3 kCanvasWorldPos = new Vector3(0, 100000f, 0);
+        // This component's private stage (see DisplayXROverlayStage): its canvas and
+        // camera sit there so no other overlay's camera sees this canvas.
+        private int m_Stage = -1;
         // Dedicated layer: we put the canvas + children on this layer and give
         // ONLY our overlay camera that layer in its cullingMask. We pick a
         // mid-range layer that's typically unused (Unity reserves 0-7 for
@@ -185,7 +187,9 @@ namespace DisplayXR
             m_Canvas.renderMode = RenderMode.WorldSpace;
             // worldCamera is assigned to the OverlayCamera below (after creation)
             // so GraphicRaycaster can project screen-cursor input onto the canvas.
-            m_CanvasRect.position = kCanvasWorldPos;
+            if (m_Stage < 0) m_Stage = DisplayXROverlayStage.Acquire();
+            Vector3 stagePos = DisplayXROverlayStage.Position(m_Stage);
+            m_CanvasRect.position = stagePos;
             m_CanvasRect.rotation = Quaternion.identity;
             // Use the canvas's existing reference width as the scale baseline.
             // 1 world unit per UI unit at scale 1 → set scale so the RT
@@ -208,7 +212,7 @@ namespace DisplayXR
             // pipeline and the swapchain image our native blit feeds the
             // runtime compositor with. Without this the panel reads
             // upside-down in the runtime preview window.
-            camGO.transform.position = kCanvasWorldPos + new Vector3(0, 0, 1);
+            camGO.transform.position = stagePos + new Vector3(0, 0, 1);
             camGO.transform.rotation = Quaternion.LookRotation(Vector3.back, Vector3.down);
 
             m_OverlayCamera = camGO.AddComponent<Camera>();
@@ -453,6 +457,8 @@ namespace DisplayXR
         void OnDisable()
         {
             ReleaseSlot();
+            DisplayXROverlayStage.Release(m_Stage);
+            m_Stage = -1;
 
             // Restore the canvas's original mode + transform + layer.
             if (m_StateSaved && m_Canvas != null)
