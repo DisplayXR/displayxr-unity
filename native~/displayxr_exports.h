@@ -378,6 +378,12 @@ DISPLAYXR_EXPORT void displayxr_set_overlay_position(int x, int y);
 /// session weaves into an ARGB top-level overlay instead of the opaque child of
 /// Unity's window. Read when the weave window is created (LifecycleStart).
 DISPLAYXR_EXPORT void displayxr_linux_set_transparent(int enabled);
+
+/// (#332) Linux counterpart of the Windows/macOS export: 1 when the EWMH active
+/// window (_NET_ACTIVE_WINDOW) is Unity's window, 0 when another window is.
+/// Answers 1 when it cannot tell (no libX11/display, no EWMH, Unity's window not
+/// found yet) — the fail-open the C# callers already assume.
+DISPLAYXR_EXPORT int displayxr_is_our_process_foreground(void);
 #endif
 
 #ifdef __cplusplus

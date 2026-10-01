@@ -60,6 +60,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 #include "displayxr_exports.h"
@@ -654,6 +655,86 @@ DISPLAYXR_EXPORT void
 displayxr_linux_set_transparent(int enabled)
 {
 	s_transparent_requested = enabled != 0;
+}
+
+// ---------------------------------------------------------------------------
+// Foreground query (#332)
+// ---------------------------------------------------------------------------
+//
+// Apps gate keyboard shortcuts on displayxr_is_our_process_foreground(). It had
+// no Linux export, so every call threw EntryPointNotFoundException — caught by
+// the callers' fail-open, i.e. "always foreground", at the cost of an exception
+// per caller per frame.
+//
+// The answer is the EWMH _NET_ACTIVE_WINDOW on the root, compared with Unity's
+// window by XID. We deliberately never read a property off the ACTIVE window
+// itself (e.g. its _NET_WM_PID): it belongs to another client and can be
+// destroyed between our two requests, and the resulting BadWindow would go to
+// Xlib's default error handler, which exits the process. Under XWayland, mutter
+// sets _NET_ACTIVE_WINDOW to None while a native Wayland window has focus, so
+// that case correctly reads as "not us".
+//
+// A separate Display connection: s_dpy is borrowed by the runtime for its Vulkan
+// surface, so a per-frame query on it would share a connection with runtime
+// threads. Results are cached briefly because several scripts ask every frame.
+
+#define XA_WINDOW_ 33L // <X11/Xatom.h>
+#define LIN_FOREGROUND_CACHE_NS 50000000LL
+
+static XDpy s_focus_dpy;
+static XAtom s_active_atom;
+static int s_focus_unavailable;
+static int s_focus_cached = 1;
+static long long s_focus_cached_at_ns = -1;
+
+static long long
+lin_now_ns(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+static int
+lin_query_foreground(void)
+{
+	if (s_focus_unavailable || !s_win) return 1; // cannot tell: fail open
+	if (!s_focus_dpy) {
+		s_focus_dpy = s_x.XOpenDisplay(NULL);
+		if (s_focus_dpy)
+			s_active_atom = s_x.XInternAtom(s_focus_dpy, "_NET_ACTIVE_WINDOW", 1);
+		if (!s_focus_dpy || !s_active_atom) {
+			lin_log("[DisplayXR-LNX] foreground query: no EWMH _NET_ACTIVE_WINDOW — "
+			        "reporting foreground unconditionally\n");
+			s_focus_unavailable = 1;
+			return 1;
+		}
+	}
+
+	XAtom actual_type = 0;
+	int actual_format = 0;
+	unsigned long nitems = 0, bytes_after = 0;
+	unsigned char *prop = NULL;
+	if (s_x.XGetWindowProperty(s_focus_dpy, s_x.XDefaultRootWindow(s_focus_dpy), s_active_atom,
+	                           0, 1, 0, (XAtom)XA_WINDOW_, &actual_type, &actual_format,
+	                           &nitems, &bytes_after, &prop) != 0 /* Success == 0 */)
+		return 1;
+	if (!prop) return 1; // property absent: the WM does not publish it
+	XWin active = (nitems >= 1 && actual_format == 32) ? (XWin)(*(unsigned long *)prop) : 0;
+	s_x.XFree(prop);
+	return active == s_win;
+}
+
+DISPLAYXR_EXPORT int
+displayxr_is_our_process_foreground(void)
+{
+	if (!lin_load_xlib()) return 1;
+	long long now = lin_now_ns();
+	if (s_focus_cached_at_ns >= 0 && now - s_focus_cached_at_ns < LIN_FOREGROUND_CACHE_NS)
+		return s_focus_cached;
+	s_focus_cached = lin_query_foreground();
+	s_focus_cached_at_ns = now;
+	return s_focus_cached;
 }
 
 #endif // __linux__ && !__ANDROID__
