@@ -44,6 +44,25 @@ extern "C" {
 //   - Windows D3D11: ID3D11Texture2D*
 //   - Windows D3D12: ID3D12Resource*
 // Pass NULL to deregister.
+// Window-space layers that can be live at once. Each DisplayXRWindowSpaceUI takes a
+// slot of its own (acquire_slot) so two HUDs no longer overwrite each other's
+// registration; the provider submits one layer per registered slot.
+#define DXR_WSUI_MAX_SLOTS 4
+
+// Slot API. acquire returns -1 when every slot is taken. Main thread.
+DISPLAYXR_EXPORT int  displayxr_window_space_ui_acquire_slot(void);
+DISPLAYXR_EXPORT void displayxr_window_space_ui_release_slot(int slot);
+DISPLAYXR_EXPORT void displayxr_window_space_ui_set_texture_slot(int slot, void *nativeTex,
+                                                                 int width, int height);
+DISPLAYXR_EXPORT void displayxr_window_space_ui_set_layer_slot(int slot, float x, float y,
+                                                               float width, float height,
+                                                               float disparity);
+DISPLAYXR_EXPORT void displayxr_window_space_ui_clear_slot(int slot);
+int displayxr_window_space_ui_get_pending_slot(int slot, void **out_tex, int *out_tex_w,
+                                               int *out_tex_h, float *out_x, float *out_y,
+                                               float *out_lw, float *out_lh, float *out_disp);
+
+// Single-layer API, kept for existing callers: these address slot 0.
 DISPLAYXR_EXPORT void displayxr_window_space_ui_set_texture(void *nativeTex, int width, int height);
 
 // Update the layer descriptor (fractional window coords + per-eye disparity).

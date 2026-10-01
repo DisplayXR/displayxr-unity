@@ -341,17 +341,23 @@ namespace DisplayXR
         /// Keep in sync with DXR_EVENT_VK_OVERLAY_COPY_LOCAL2D (displayxr_unity_plugin.cpp).</summary>
         public const int kVkOverlayCopyLocal2DEvent = 0x44585201;
 
-        /// <summary>(#336) wsui twin of <see cref="dxr_prov_local2d_needs_copy"/>.</summary>
+        /// <summary>(#336) wsui twin of <see cref="dxr_prov_local2d_needs_copy"/>, per slot.</summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern int dxr_prov_wsui_needs_copy();
+        public static extern int dxr_prov_wsui_needs_copy_slot(int slot);
 
-        /// <summary>(#336) wsui twin of <see cref="dxr_prov_local2d_request_copy"/>.</summary>
+        /// <summary>(#336) wsui twin of <see cref="dxr_prov_local2d_request_copy"/>, per slot.</summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void dxr_prov_wsui_request_copy();
+        public static extern void dxr_prov_wsui_request_copy_slot(int slot);
 
-        /// <summary>Event id: copy the wsui canvas RT into its Vulkan overlay bridge.
-        /// Keep in sync with DXR_EVENT_VK_OVERLAY_COPY_WSUI (displayxr_unity_plugin.cpp).</summary>
-        public const int kVkOverlayCopyWsuiEvent = 0x44585202;
+        /// <summary>Event id for wsui slot 0; slot N is this + N. Keep in sync with
+        /// DXR_EVENT_VK_OVERLAY_COPY_WSUI0 (displayxr_unity_plugin.cpp).</summary>
+        public const int kVkOverlayCopyWsuiEvent0 = 0x44585210;
+
+        /// <summary>Per-slot form of <see cref="dxr_prov_get_wsui_bridge"/>.</summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void dxr_prov_get_wsui_bridge_slot(
+            int slot, uint width, uint height,
+            out System.IntPtr nativePtr, out uint outWidth, out uint outHeight);
 
         /// <summary>
         /// Per-eye foreground-clip data (#166 Phase B): the eye's foreground far

@@ -247,6 +247,23 @@ namespace DisplayXR
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern void displayxr_window_space_ui_clear();
 
+        // Per-slot window-space UI (#336 follow-up). Several DisplayXRWindowSpaceUI
+        // components can be live at once; each takes a slot so they no longer overwrite
+        // each other. The slot-less calls above address slot 0.
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int displayxr_window_space_ui_acquire_slot();
+
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void displayxr_window_space_ui_release_slot(int slot);
+
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void displayxr_window_space_ui_set_texture_slot(
+            int slot, IntPtr nativeTex, int width, int height);
+
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void displayxr_window_space_ui_set_layer_slot(
+            int slot, float x, float y, float width, float height, float disparity);
+
         // ====================================================================
         // Local2D overlay (#439/#491) — modern mask-based 2D-over-3D layer
         // (XrCompositionLayerLocal2DDXR, "glass over 3D"). Replaces the legacy
