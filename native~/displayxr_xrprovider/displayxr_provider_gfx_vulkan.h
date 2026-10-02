@@ -80,7 +80,7 @@ int dxr_pvk_create_device(XrInstance instance, XrSystemId system_id,
 
 /// Fill an XrGraphicsBindingVulkan2KHR for xrCreateSession, chaining `next`
 /// (the win32 window binding). Returns a pointer to storage owned by this TU,
-/// valid until dxr_pvk_destroy(). NULL if the device was never created.
+/// valid until dxr_pvk_destroy_device(). NULL if the device was never created.
 const void *dxr_pvk_session_binding(const void *next);
 
 /// Adopt Unity's Vulkan objects, captured from IUnityGraphicsVulkan by
@@ -206,9 +206,16 @@ int dxr_pvk_overlay_copy_to_swapchain_image(int kind, uint32_t image_index);
 /// Drop the overlay's bridge and swapchain images (layer resize / teardown).
 void dxr_pvk_overlay_destroy(int kind);
 
-/// Tear down every Vulkan object this TU owns (bridges, semaphores, command
-/// pool, device, instance). Safe to call when nothing was created.
+/// Tear down the per-session objects (bridges, overlays, fence, command pool).
+/// Call BEFORE xrEndSession. Leaves the device and instance alive: the session
+/// still runs on them (DisplayXR/displayxr-runtime#1779). Safe to call when
+/// nothing was created.
 void dxr_pvk_destroy(void);
+
+/// Destroy the VkDevice + VkInstance made through XR_KHR_vulkan_enable2. Call
+/// only AFTER xrDestroySession: the runtime's compositor (its repaint thread
+/// included) uses them until then. Safe to call when nothing was created.
+void dxr_pvk_destroy_device(void);
 
 /// 1 once dxr_pvk_create_device() has succeeded.
 int dxr_pvk_device_ready(void);

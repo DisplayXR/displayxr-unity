@@ -182,6 +182,7 @@ extern "C" void *dxr_pvk_unity_image_ptr(int eye);
 extern "C" int  dxr_pvk_copy_to_swapchain_image(int eye, uint32_t image_index);
 extern "C" void dxr_pvk_signal_unity_done(void);
 extern "C" void dxr_pvk_destroy(void);
+extern "C" void dxr_pvk_destroy_device(void);
 extern "C" int  dxr_pvk_device_ready(void);
 // 2D overlay layers (#336). Kinds match DXR_PVK_OVERLAY_* in the VK header.
 #define PS_PVK_OVERLAY_LOCAL2D 0
@@ -5060,14 +5061,19 @@ void dxr_prov_session_stop(void)
 	ps_probe_cleanup(); // weave-to-texture PROBE shared texture + handle (experiment)
 	if (s_ps.swapchain && s_ps.pfn_destroy_swapchain) s_ps.pfn_destroy_swapchain(s_ps.swapchain);
 #if defined(ENABLE_VULKAN)
-	// Vulkan (#247/#249): drop the bridges BEFORE xrDestroySession — the bridge images live
-	// on the session device, which the runtime tears down with the session. Unity's own
-	// objects are only dereferenced, never destroyed. No-op on the D3D paths.
+	// Vulkan (#247/#249): drop the bridges BEFORE xrDestroySession, while their device is
+	// still current for the session. Unity's own objects are only dereferenced, never
+	// destroyed. No-op on the D3D paths.
 	if (s_ps.graphics_api == DXR_GFX_VULKAN) dxr_pvk_destroy();
 #endif
 	if (s_ps.session && s_ps.session_ready && s_ps.pfn_end_session) s_ps.pfn_end_session(s_ps.session);
 	if (s_ps.session && s_ps.pfn_destroy_session) s_ps.pfn_destroy_session(s_ps.session);
 	if (s_ps.instance && s_ps.pfn_destroy_instance) s_ps.pfn_destroy_instance(s_ps.instance);
+#if defined(ENABLE_VULKAN)
+	// ...and the enable2 device + instance only now: the runtime's compositor, repaint
+	// thread included, uses them until the session is gone (DisplayXR/displayxr-runtime#1779).
+	if (s_ps.graphics_api == DXR_GFX_VULKAN) dxr_pvk_destroy_device();
+#endif
 
 #ifdef _WIN32
 	// Bridge + cross-device fence + own-device resources.

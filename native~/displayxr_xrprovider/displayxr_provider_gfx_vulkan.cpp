@@ -1507,6 +1507,21 @@ dxr_pvk_destroy(void)
 		s_pvk.api.vkDestroyFence(s_pvk.device, s_pvk.copy_fence, NULL);
 	if (s_pvk.cmd_pool && s_pvk.api.vkDestroyCommandPool)
 		s_pvk.api.vkDestroyCommandPool(s_pvk.device, s_pvk.cmd_pool, NULL);
+	s_pvk.copy_fence = VK_NULL_HANDLE;
+	s_pvk.cmd_pool = VK_NULL_HANDLE;
+
+	// NOT the device or the instance (DisplayXR/displayxr-runtime#1779): we made
+	// them through XR_KHR_vulkan_enable2 and the session still runs on them. The
+	// runtime's repaint thread keeps presenting the last frame on that device
+	// until xrEndSession; destroying it here crashed every session stop / quit
+	// in vkQueuePresentKHR. dxr_pvk_destroy_device() runs after xrDestroySession.
+	pvk_log("[DisplayXR-PROV-VK] session objects destroyed (device kept until xrDestroySession)\n");
+}
+
+void
+dxr_pvk_destroy_device(void)
+{
+	if (s_pvk.device && s_pvk.api.vkDeviceWaitIdle) s_pvk.api.vkDeviceWaitIdle(s_pvk.device);
 	if (s_pvk.device && s_pvk.api.vkDestroyDevice)
 		s_pvk.api.vkDestroyDevice(s_pvk.device, NULL);
 	if (s_pvk.instance && s_pvk.api.vkDestroyInstance)
