@@ -1172,8 +1172,9 @@ namespace DisplayXR
             right = Input.GetMouseButton(1);
 #endif
             // Unity screen space is bottom-left; these properties are window-client
-            // pixels, top-left origin (what the Windows native poll reports).
-            pos = new Vector2(pos.x, Screen.height - pos.y);
+            // pixels, top-left origin (what the Windows native poll reports). Rounded
+            // to whole pixels like the macOS path, so PointerDelta is whole pixels too.
+            pos = new Vector2(Mathf.RoundToInt(pos.x), Mathf.RoundToInt(Screen.height - pos.y));
             PointerDelta = m_HasPrevPointerPos ? (pos - m_PrevPointerPos) : Vector2.zero;
             PointerPosition = pos;
             m_PrevPointerPos = pos;
