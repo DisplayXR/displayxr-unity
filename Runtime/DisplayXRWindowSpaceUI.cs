@@ -28,6 +28,14 @@ namespace DisplayXR
     /// from its loop). WorldSpace + dedicated camera with targetTexture is the
     /// canonical Unity recipe for "render UI to a texture" and works
     /// identically across BiRP / URP / HDRP.
+    ///
+    /// Several of these can be live at once (one native wsui slot each). They are
+    /// composited in slot order, lowest slot at the bottom, and a component takes the
+    /// lowest FREE slot on enable — so the draw order of overlapping HUDs is not
+    /// something the app controls (enable A, enable B, disable A, enable C: C takes
+    /// slot 0 and draws under B). Keep HUDs from overlapping. Under the DisplayXR
+    /// shell (workspace tile) the runtime composites only the first window-space
+    /// layer, so only the lowest-slot HUD shows there.
     /// </summary>
     [AddComponentMenu("DisplayXR/Window Space UI")]
     [RequireComponent(typeof(Canvas))]
@@ -107,11 +115,9 @@ namespace DisplayXR
         private int m_PanelSizeSource = kPanelSizeNone;
         private int m_ShellMode = -1; // -1 = not yet queried
 
-        // We park the WorldSpace canvas at this fixed position, far from any
-        // scene content, so the dedicated camera looking at it sees nothing
-        // else that might bleed into our RT.
         // This component's private stage (see DisplayXROverlayStage): its canvas and
-        // camera sit there so no other overlay's camera sees this canvas.
+        // camera sit there, far from any scene content and from every other overlay's
+        // stage, so no other camera sees this canvas and nothing bleeds into our RT.
         private int m_Stage = -1;
 
         // The URP transparent-overlay foreground clip (DisplayXR/ForegroundClipURP) is a
@@ -394,6 +400,9 @@ namespace DisplayXR
         // Take a wsui slot for this component. Idempotent. Play mode only: there is no
         // session in edit mode (Play Mode is the preview), and an [ExecuteAlways] edit-mode
         // or prefab-stage instance holding a slot would starve the play-mode ones.
+        // The native side hands out the LOWEST free slot, and layers are composited in
+        // slot order (lowest = bottom), so stacking follows enable/disable history, not
+        // anything the app sets — see the class doc.
         private bool AcquireSlot()
         {
             if (m_Slot >= 0) return true;

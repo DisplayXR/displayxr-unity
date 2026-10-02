@@ -1147,24 +1147,6 @@ namespace DisplayXR
             return any;
         }
 
-        // For each SkinnedMeshRenderer in clickableRenderers, BakeMesh the
-        // current animated pose and cache the verts/tris arrays. The actual
-        // hit test (TryRayHitBakedSkinnedMesh) walks the triangles and
-        // transforms each through the SMR's localToWorldMatrix at test time,
-        // so the visible silhouette is what's hit-tested — no MeshCollider
-        // needed and no transform-pairing to get wrong. Transparent gaps
-        // inside the AABB (between legs, around hat tip, AABB corners)
-        // register as misses, which the native overlay routes via
-        // WM_NCHITTEST = HTTRANSPARENT.
-        //
-        // BakeMesh costs ~1–3 ms per frame for a typical character mesh, so
-        // this only runs for renderers that are actually being drawn (#254) —
-        // a list holding four characters of which three are deactivated used
-        // to skin all four. The vertex fetch and the topology check are
-        // steady-state alloc-free; see BakedHit.
-        //
-        // No-op for non-skinned renderers (regular MeshRenderer): they keep
-        // whatever collider the user attached and use Physics.Raycast.
 #if UNITY_STANDALONE_LINUX && !UNITY_EDITOR
         // Linux (#332): PointerPosition / PointerDelta / IsLeftPressed / IsRightPressed
         // straight from the Input System. On Windows these come from a native poll
@@ -1190,8 +1172,9 @@ namespace DisplayXR
             right = Input.GetMouseButton(1);
 #endif
             // Unity screen space is bottom-left; these properties are window-client
-            // pixels, top-left origin (what the Windows native poll reports).
-            pos = new Vector2(pos.x, Screen.height - pos.y);
+            // pixels, top-left origin (what the Windows native poll reports). Rounded
+            // to whole pixels like the macOS path, so PointerDelta is whole pixels too.
+            pos = new Vector2(Mathf.RoundToInt(pos.x), Mathf.RoundToInt(Screen.height - pos.y));
             PointerDelta = m_HasPrevPointerPos ? (pos - m_PrevPointerPos) : Vector2.zero;
             PointerPosition = pos;
             m_PrevPointerPos = pos;
@@ -1201,6 +1184,24 @@ namespace DisplayXR
         }
 #endif
 
+        // For each SkinnedMeshRenderer in clickableRenderers, BakeMesh the
+        // current animated pose and cache the verts/tris arrays. The actual
+        // hit test (TryRayHitBakedSkinnedMesh) walks the triangles and
+        // transforms each through the SMR's localToWorldMatrix at test time,
+        // so the visible silhouette is what's hit-tested — no MeshCollider
+        // needed and no transform-pairing to get wrong. Transparent gaps
+        // inside the AABB (between legs, around hat tip, AABB corners)
+        // register as misses, which the native overlay routes via
+        // WM_NCHITTEST = HTTRANSPARENT.
+        //
+        // BakeMesh costs ~1–3 ms per frame for a typical character mesh, so
+        // this only runs for renderers that are actually being drawn (#254) —
+        // a list holding four characters of which three are deactivated used
+        // to skin all four. The vertex fetch and the topology check are
+        // steady-state alloc-free; see BakedHit.
+        //
+        // No-op for non-skinned renderers (regular MeshRenderer): they keep
+        // whatever collider the user attached and use Physics.Raycast.
         private void UpdateBakedHitColliders()
         {
             if (clickableRenderers == null) return;

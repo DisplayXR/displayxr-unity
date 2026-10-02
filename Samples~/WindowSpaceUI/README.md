@@ -7,8 +7,10 @@ Makes the UI rendered by `DisplayXRWindowSpaceUI` **clickable**.
 `DisplayXRWindowSpaceUI` submits your Canvas to the runtime as an
 `XrCompositionLayerWindowSpaceDXR` composition layer. That layer carries **pixels, not
 input**. To render it, the component takes over your Canvas: switches it to `WorldSpace`,
-parks it at world `(0, 100000, 0)` on a private layer, and renders it with a hidden
-offscreen camera into a RenderTexture.
+parks it on its own private "stage" far from your scene (each Local2D / window-space UI
+canvas gets one from `DisplayXROverlayStage`: the first at world `(0, 100000, 0)`, the next
+ones 1000 units apart along x) on a private layer, and renders it with a hidden offscreen
+camera into a RenderTexture.
 
 After that, the mouse position in your app window and the overlay camera's screen space are
 two different coordinate systems. `GraphicRaycaster` never hits anything, so **buttons and

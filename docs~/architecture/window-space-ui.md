@@ -31,12 +31,16 @@ For a whole scene that should be flat, see [`two-dimensional-scenes.md`](two-dim
 The component does not render your Canvas where you put it. It:
 
 1. Switches the Canvas to `RenderMode.WorldSpace`.
-2. Parks it at world **`(0, 100000, 0)`** on **layer 30**, a private layer, well away from
-   your scene. The overlay camera culls to that layer alone, so the layer is **re-applied
+2. Parks it on its own private **stage**, well away from your scene, on **layer 30**, a
+   private layer. The overlay camera culls to that layer alone, so the layer is **re-applied
    to every descendant each `LateUpdate`** — anything you `Instantiate` under the canvas at
    runtime (list items, tiles, a file dialog, a dropdown's blocker) is born on its prefab's
    layer and would otherwise be silently culled. You never need to set layers yourself;
    the first time the component has to fix a stray object it logs once.
+   Every Local2D / window-space UI canvas gets its own stage from `DisplayXROverlayStage`:
+   the first at world **`(0, 100000, 0)`**, the next ones 1000 units apart along x. They all
+   share layer 30, so the separate stages are what stop each overlay camera from also
+   rendering the other canvases (#342).
 3. Sizes it so **1 RT pixel == 1 UI unit** (`sizeDelta = OverlayResolution`, `localScale = 0.01`).
 4. Renders it with a dedicated hidden orthographic camera into `OverlayTexture`.
 5. Hands that texture to the runtime as an `XrCompositionLayerWindowSpaceDXR` composition
@@ -62,6 +66,16 @@ camera with a `targetTexture` is the arrangement that renders predictably on BiR
 HDRP alike. The overlay camera is left **enabled** deliberately (rather than driven by a
 manual `Camera.Render()`), because under URP's RenderGraph a manual render targets the
 backbuffer and blanks the whole XR mirror — a pure-black docked Game view.
+
+**Several HUDs at once (#336).** Up to four `DisplayXRWindowSpaceUI` components can be live
+at the same time. Each one takes a native **slot** on enable — always the **lowest free**
+one — and gives it back on disable; a fifth waits (it retries about once a second) and
+appears when one is freed. The layers are composited in **slot order: lowest slot at the
+bottom**, higher slots on top. The app does not control that order: enable A, enable B,
+disable A, enable C — C takes slot 0 and now draws **under** B. So the stacking of
+**overlapping** HUDs is not guaranteed; keep your HUDs from overlapping. Under the DisplayXR
+**shell** (workspace tile) the runtime composites only the first window-space layer, so only
+the lowest-slot HUD shows there.
 
 ## Input
 
