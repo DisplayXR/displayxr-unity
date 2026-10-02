@@ -5,6 +5,24 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.21.0] - 2026-10-02
+
+### Fixed
+- **Colour no longer washed out on format-honest runtimes (#347, PR #348).** Since runtime v2.21.0 (D3D11), v2.21.1 (D3D12) and v2.21.7 (Vulkan) the runtime treats a UNORM swapchain as LINEAR and sRGB-encodes it (runtime ADR-044 / INV-4.6, pinned by the OpenXR CTS). The plugin put already-encoded bytes into UNORM swapchains: the primary layer of every Gamma-colour-space project, and every window-space UI / Local2D canvas in all projects. The bytes were encoded twice, giving lifted blacks and desaturated colour. On a format-honest runtime the swapchains are now `_SRGB`. A Gamma project renders into the UNORM sibling and the encoded bytes are copied in raw (CopyResource / CopyTextureRegion / vkCmdCopyImage). A Linear project keeps encoding on store. The runtime version comes from `xrGetInstanceProperties`, falling back to the `'vX.Y.Z'` tag in `runtimeName` because Linux runtimes report 1.6.0 (DisplayXR/displayxr-runtime#1790). The runtime's `DXR_COLOR_LEGACY_UNORM_ENCODED=1` hatch is honoured. Metal and older runtimes are byte-identical to before. Verified on the Windows Leia panel (D3D12, D3D11; Gamma and Linear) and on Linux/Vulkan (DS1).
+- **Window-space UI no longer squeezed in transparent-overlay apps (#291, PR #349).** `DisplayXRWindowSpaceUI` derived its RT aspect from `Screen.*`, which in a transparent-overlay app is Unity's own cloaked window at whatever size Unity persisted. It was seen at 3872x2248 and 512x728 next to an 808x1280 overlay, and it grows by the frame size each run. The provider now publishes the composited window size it sizes the eyes from, as a cached value (`dxr_prov_get_composited_size`), never a live window query from the main thread. Window-space UI prefers it over `Screen.*`. **New API:** `DisplayXRWindowSpaceUI.TryGetWindowPixelSize`, the frame HUD rects are fractions of. Apps that lay out HUDs or map the pointer onto them should use it instead of `Screen.*`.
+- **Windows: HUDs no longer clipped by the click-through silhouette (#350, PR #351).** `SetWindowRgn` is a visual clip as well as a hit mask, so window-space layers outside the avatar's silhouette were cut away. A semi-transparent HUD backdrop clipped that way read as a dark "halo" around the avatar. Live window-space UI slots are now unioned into the overlay region, using the full-window frame the runtime compositors use. Hidden HUDs are excluded, and static ones don't cause per-frame region updates.
+- **Vulkan: no crash on session stop or quit (#345).** The enable2 `VkDevice`/`VkInstance` were destroyed before `xrEndSession` while the runtime's repaint thread was still presenting on them. They are now destroyed after `xrDestroySession` (DisplayXR/displayxr-runtime#1779).
+- **Overlay canvases no longer bleed into each other, and window-space UI is no longer blank under the URP foreground clip (#342).** Each Local2D / window-space UI canvas gets its own stage (`DisplayXROverlayStage`). Window-space UI zeroes the foreground-clip global around its own camera.
+
+### Added
+- **Linux: transparent-overlay click-through and right-drag move (#332, PR #346).** The Windows click-through exports now exist on Linux as an XShape input region on Unity's window (silhouette mask, AABB, surround rect/mask, plus live HUD slots). Unity's window is undecorated while cloaked, with its geometry restored, and kept above. Right-drag moves the window via `_NET_MOVERESIZE_WINDOW`.
+- **Vulkan: Local2D and window-space UI layers (#336, PRs #337, #339).** Filled through a plugin render event that copies into an external-memory overlay bridge on Unity's command buffer. Includes an `xrEndFrame` guard that disables wsui if a frame carrying it is rejected.
+- **Several window-space UI layers at once (#336, PR #341):** up to four `DisplayXRWindowSpaceUI` slots, composited in slot order. Previously only the last registered one showed.
+- **`DisplayXRLocal2D.renderScale` (#340):** render the canvas at the size it is shown.
+
+### Changed
+- Linux pointer position and delta from `DisplayXRTransparentOverlay` are rounded to whole pixels, like macOS (#344). Docs and comments follow-ups from the #341–#343 review.
+
 ## [2.20.1] - 2026-10-01
 
 ### Fixed
