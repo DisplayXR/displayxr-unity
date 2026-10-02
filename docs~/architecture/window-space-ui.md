@@ -67,6 +67,16 @@ HDRP alike. The overlay camera is left **enabled** deliberately (rather than dri
 manual `Camera.Render()`), because under URP's RenderGraph a manual render targets the
 backbuffer and blanks the whole XR mirror — a pure-black docked Game view.
 
+**Several HUDs at once (#336).** Up to four `DisplayXRWindowSpaceUI` components can be live
+at the same time. Each one takes a native **slot** on enable — always the **lowest free**
+one — and gives it back on disable; a fifth waits (it retries about once a second) and
+appears when one is freed. The layers are composited in **slot order: lowest slot at the
+bottom**, higher slots on top. The app does not control that order: enable A, enable B,
+disable A, enable C — C takes slot 0 and now draws **under** B. So the stacking of
+**overlapping** HUDs is not guaranteed; keep your HUDs from overlapping. Under the DisplayXR
+**shell** (workspace tile) the runtime composites only the first window-space layer, so only
+the lowest-slot HUD shows there.
+
 ## Input
 
 **The composition layer carries pixels, not input.** Nothing about submitting a layer tells
