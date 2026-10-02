@@ -22,6 +22,9 @@ namespace DisplayXR
     {
         static readonly Vector3 kOrigin = new Vector3(0f, 100000f, 0f);
         // A 4096-unit canvas at the 0.01 canvas scale is ~41 world units wide.
+        // Stages sit side by side along x, so this holds while each overlay camera's
+        // ortho half-width stays under kSpacing (half-width = RT width * 0.005, so an
+        // RT under ~200000 px wide). Fine in practice.
         const float kSpacing = 1000f;
 
         static readonly HashSet<int> s_Used = new HashSet<int>();

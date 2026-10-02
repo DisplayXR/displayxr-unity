@@ -107,11 +107,9 @@ namespace DisplayXR
         private int m_PanelSizeSource = kPanelSizeNone;
         private int m_ShellMode = -1; // -1 = not yet queried
 
-        // We park the WorldSpace canvas at this fixed position, far from any
-        // scene content, so the dedicated camera looking at it sees nothing
-        // else that might bleed into our RT.
         // This component's private stage (see DisplayXROverlayStage): its canvas and
-        // camera sit there so no other overlay's camera sees this canvas.
+        // camera sit there, far from any scene content and from every other overlay's
+        // stage, so no other camera sees this canvas and nothing bleeds into our RT.
         private int m_Stage = -1;
 
         // The URP transparent-overlay foreground clip (DisplayXR/ForegroundClipURP) is a
