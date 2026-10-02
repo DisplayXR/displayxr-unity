@@ -525,6 +525,35 @@ lin_move_client(XDpy dpy, int x, int y)
 	lin_moveresize_client(dpy, x, y, 0, 0);
 }
 
+// Keep Unity's window above normal windows while it is cloaked (#332), as the Windows
+// overlay HWND is WS_EX_TOPMOST. What the user sees is the override-redirect overlay,
+// which is always on top; what takes the clicks is Unity's window beneath it. Once the
+// user focused another window, the WM raised that window over Unity's, so a click on a
+// HUD or the bubble the user could see went to the window "behind" it instead. EWMH
+// _NET_WM_STATE_ABOVE keeps the two in the same stacking place. Same lifetime as the
+// cloak (set at overlay creation, cleared in displayxr_linux_destroy_weave_window).
+static void
+lin_set_unity_above(int above)
+{
+	XAtom state = s_x.XInternAtom(s_dpy, "_NET_WM_STATE", 0);
+	XAtom above_atom = s_x.XInternAtom(s_dpy, "_NET_WM_STATE_ABOVE", 0);
+	if (!state || !above_atom) return;
+	LinClientMessage e;
+	memset(&e, 0, sizeof(e));
+	e.type = LIN_CLIENT_MESSAGE;
+	e.window = s_win;
+	e.message_type = state;
+	e.format = 32;
+	e.l[0] = above ? 1 /* _NET_WM_STATE_ADD */ : 0 /* _NET_WM_STATE_REMOVE */;
+	e.l[1] = (long)above_atom;
+	e.l[2] = 0;
+	e.l[3] = 2; // source: pager/tool
+	s_x.XSendEvent(s_dpy, s_x.XDefaultRootWindow(s_dpy), 0, LIN_SUBSTRUCTURE_MASK, &e);
+	s_x.XFlush(s_dpy);
+	lin_log(above ? "[DisplayXR-LNX] Unity's window kept above while cloaked (click-through)\n"
+	              : "[DisplayXR-LNX] Unity's window no longer kept above\n");
+}
+
 // Undecorate Unity's window while it is cloaked (#332), restore it after.
 //
 // A decorated X11 window sits inside the WM's frame window, and mutter takes input
@@ -668,6 +697,7 @@ displayxr_linux_get_weave_window(void **out_display, unsigned long *out_window)
 				lin_set_unity_opacity(1);
 				// Size only when measured: never "restore" Unity to the 1920x1080 guess.
 				lin_set_unity_undecorated(1, x, y, measured ? w : 0, measured ? h : 0);
+				lin_set_unity_above(1);
 				lin_enable_click_through();
 				s_x.XMapWindow(s_dpy, s_overlay);
 				s_x.XFlush(s_dpy);
@@ -777,6 +807,7 @@ displayxr_linux_destroy_weave_window(void)
 			unsigned int cw = 0, ch = 0;
 			lin_app_origin(&cx, &cy); // keep the client where the user left it
 			lin_child_size(&cw, &ch);
+			lin_set_unity_above(0);
 			lin_set_unity_undecorated(0, cx, cy, cw, ch);
 			lin_set_unity_opacity(0);
 			// The one un-cloak (see the invariant above). Logged on its own line so a
