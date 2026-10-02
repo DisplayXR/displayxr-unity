@@ -313,6 +313,15 @@ namespace DisplayXR
             uint width, uint height,
             out System.IntPtr nativePtr, out uint outWidth, out uint outHeight);
 
+        /// <summary>
+        /// Live size in px of the window (or workspace tile) the runtime composites this app
+        /// into, as last measured by the provider; 0 when no session runs or no size is known.
+        /// In a transparent-overlay app Unity's own window is cloaked, so <c>Screen.*</c> does
+        /// not describe it. Use the aspect; the absolute values are native-DPI pixels.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int dxr_prov_get_composited_size(out uint width, out uint height);
+
         /// <summary>Set the Local2D dest rect in client-window pixels. w&lt;=0||h&lt;=0 clears.</summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern void dxr_prov_set_local2d_rect(int x, int y, int w, int h);
