@@ -384,6 +384,30 @@ DISPLAYXR_EXPORT void displayxr_linux_set_transparent(int enabled);
 /// Answers 1 when it cannot tell (no libX11/display, no EWMH, Unity's window not
 /// found yet) — the fail-open the C# callers already assume.
 DISPLAYXR_EXPORT int displayxr_is_our_process_foreground(void);
+
+/// (#332) Linux counterparts of the Windows click-through exports above, with the
+/// same arguments and semantics. In transparent mode they shape the INPUT region
+/// of Unity's (cloaked) window with XShape instead of calling SetWindowRgn: the
+/// silhouette mask, the 2D surround rect/mask, and — Linux only — every live
+/// window-space UI layer's rect are unioned. hit_active is a no-op (the input
+/// region needs no per-cursor flag). No-ops outside transparent mode.
+DISPLAYXR_EXPORT void displayxr_set_overlay_hit_mask(const uint8_t *mask, int mask_w, int mask_h,
+                                                     int dst_w, int dst_h);
+DISPLAYXR_EXPORT void displayxr_set_overlay_hit_rect(int x, int y, int w, int h);
+DISPLAYXR_EXPORT void displayxr_set_overlay_hit_active(int active);
+DISPLAYXR_EXPORT void displayxr_set_overlay_surround_rect(int x, int y, int w, int h);
+DISPLAYXR_EXPORT void displayxr_set_overlay_surround_mask(const uint8_t *mask, int mask_w,
+                                                          int mask_h, int dst_x, int dst_y,
+                                                          int dst_w, int dst_h);
+
+/// (#332) Right-drag move of the transparent overlay. Call every frame with the
+/// right button's state; returns 1 while a drag is in progress. Moves Unity's
+/// window (the overlay follows it). No-op outside transparent mode.
+DISPLAYXR_EXPORT int displayxr_linux_drag_window(int right_pressed);
+
+/// (#332) 1 while the transparent overlay is up and the click-through exports act; 0 for
+/// the opaque child or without X. Cached state only — cheap to poll every frame.
+DISPLAYXR_EXPORT int displayxr_linux_click_through_active(void);
 #endif
 
 #ifdef __cplusplus

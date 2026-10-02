@@ -307,6 +307,17 @@ DISPLAYXR_EXPORT int dxr_prov_get_zone_stereo_matrices(uint32_t zone, float *lv,
                                                        float *rv, float *rp);
 /// Fill `zone`'s window-client pixel rect (top-left origin). Returns 1 on success.
 DISPLAYXR_EXPORT int dxr_prov_get_zone_rect_px(uint32_t zone, int *x, int *y, int *w, int *h);
+/// Zone 0's rect only while a 3D zone is active (returns 0 otherwise). Cached state only:
+/// never queries the window, so it is safe from Unity's main thread (#332).
+DISPLAYXR_EXPORT int dxr_prov_get_active_zone_rect_px(int *x, int *y, int *w, int *h);
+
+/// The live size in pixels of the window (or workspace tile) the runtime composites this
+/// app into — the size the eye swapchain is derived from — as last measured by the provider.
+/// Returns 1 and fills *w/*h while a session runs and a real size is known; 0 otherwise.
+/// In a transparent-overlay app Unity's own window is cloaked and Screen.* does not describe
+/// it, so a window-space UI derives its panel aspect from this instead. Pixels of one window,
+/// so the ASPECT is DPI-independent; don't mix the absolute values with managed geometry.
+DISPLAYXR_EXPORT int dxr_prov_get_composited_size(uint32_t *w, uint32_t *h);
 
 /// Local2D layer (#166 Phase B): lazily create the provider's Local2D overlay
 /// swapchain + cross-device bridge sized to w×h and return the Unity-device handle

@@ -356,97 +356,6 @@ namespace DisplayXR
         public static extern void displayxr_set_window_decorated(int decorated);
 
         /// <summary>
-        /// Set the rectangular hit-test region of the overlay. Coords
-        /// are overlay client-space pixels (top-left origin).
-        ///
-        /// In transparent WS_POPUP + NOREDIRECTIONBITMAP mode (#57),
-        /// this also drives SetWindowRgn — outside the rect the OS
-        /// treats our window as if it didn't exist (both rendering and
-        /// hit-testing), so input is routed natively to whichever
-        /// desktop window is at the cursor with full fidelity (real
-        /// DefWindowProc modal SC_MOVE/SC_SIZE/SC_CLOSE loops, native
-        /// cursor adaptation, native menu activation, native hover).
-        /// Push the cube/avatar silhouette's screen-space AABB each
-        /// frame. w &lt;= 0 or h &lt;= 0 clears the region (overlay
-        /// catches everywhere — used as init default).
-        ///
-        /// In opaque WS_CHILD mode (legacy/Game-View overlay), this
-        /// updates the rect used by WM_NCHITTEST as a fast
-        /// HTCLIENT-vs-HTTRANSPARENT discriminator.
-        /// </summary>
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void displayxr_set_overlay_hit_rect(
-            int x, int y, int w, int h);
-
-        /// <summary>
-        /// Per-pixel hit-test state from the C# raycast. Tracks "is the
-        /// cursor over a clickable renderer?" for callers that want to
-        /// know — but no longer drives the OS hit-test routing. OS
-        /// routing is owned by displayxr_set_overlay_hit_rect (AABB-
-        /// region path) or displayxr_set_overlay_hit_mask (per-pixel
-        /// silhouette path, takes over once any mask has been pushed).
-        /// Kept callable for backward compat.
-        /// </summary>
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void displayxr_set_overlay_hit_active(int active);
-
-        /// <summary>
-        /// (issue #57 Approach B+) Per-pixel silhouette mask drives
-        /// SetWindowRgn for cross-process click-through. <paramref name="mask"/>
-        /// is mask_w*mask_h bytes (non-zero = opaque/overlay catches,
-        /// zero = transparent/OS routes past to whatever desktop window
-        /// is at the cursor), conceptually scaled to overlay client
-        /// size dst_w*dst_h. The native side walks the mask row-by-row,
-        /// RLE-encodes opaque runs as RECTs, ExtCreateRegion's the
-        /// union, and SetWindowRgn's it onto the overlay HWND. Outside
-        /// the silhouette the OS treats our window as if it didn't
-        /// exist — including concavities the AABB swallows (between
-        /// the tiger's legs, around the tail, etc.).
-        ///
-        /// Push from an AsyncGPUReadback callback each frame. NULL
-        /// mask reverts to the AABB-region path. Once any mask is
-        /// applied, displayxr_set_overlay_hit_rect stops driving
-        /// SetWindowRgn — callers committed to the mask path must
-        /// keep it fresh each frame.
-        /// </summary>
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void displayxr_set_overlay_hit_mask(
-            IntPtr mask, int mask_w, int mask_h, int dst_w, int dst_h);
-
-        /// <summary>
-        /// (#131) Register an opaque rect (overlay client pixels, top-left
-        /// origin) that must catch clicks even though it lives in the 2D
-        /// surround region outside the 3D silhouette — e.g. a high-res text
-        /// bubble. It is UNION-ed into the SetWindowRgn region built by
-        /// displayxr_set_overlay_hit_mask each frame, so the bubble catches
-        /// clicks while the empty surround keeps routing past to the desktop.
-        /// Pass w&lt;=0 || h&lt;=0 to clear. Takes effect on the next hit-mask
-        /// update. Transparent overlay (hooked) path only.
-        /// </summary>
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void displayxr_set_overlay_surround_rect(
-            int x, int y, int w, int h);
-
-        /// <summary>
-        /// (#131) Per-pixel variant of displayxr_set_overlay_surround_rect:
-        /// register the EXACT shape of a 2D surround element (e.g. a comic
-        /// bubble with a triangular tail) as an alpha mask (mask_w*mask_h
-        /// bytes, non-zero = opaque/catch) mapped over the dst rect (overlay
-        /// client px, top-left). RLE-unioned into the SetWindowRgn region each
-        /// frame, so the element catches clicks while the empty area beside it
-        /// (e.g. the corners next to the tail) keeps routing to the desktop —
-        /// which a single bounding rect can't express. The surround is flat
-        /// post-weave 2D, so the caller rasterizes the mask directly (no
-        /// disparity / per-view math). The plugin copies the bytes. Pass
-        /// mask = IntPtr.Zero or any dim &lt;= 0 to clear. Transparent overlay
-        /// (hooked) path only.
-        /// </summary>
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void displayxr_set_overlay_surround_mask(
-            IntPtr mask, int mask_w, int mask_h,
-            int dst_x, int dst_y, int dst_w, int dst_h);
-
-        /// <summary>
         /// (#131) Put the transparent overlay into fixed full-screen,
         /// app-managed window mode. enabled=1 sizes the overlay HWND to its
         /// monitor at the aligned origin and DISABLES the native right-drag
@@ -537,6 +446,123 @@ namespace DisplayXR
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern void displayxr_set_overlay_position(int x, int y);
+#endif
+
+        // Click-through region (#57/#131 on Windows, #332 on Linux). Same exports
+        // on both: Windows builds a SetWindowRgn on the overlay HWND, Linux an XShape
+        // input region on Unity's window (see displayxr_linux.c). On Linux they are
+        // no-ops outside transparent mode.
+#if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN || UNITY_STANDALONE_LINUX
+        /// <summary>
+        /// Set the rectangular hit-test region of the overlay. Coords
+        /// are overlay client-space pixels (top-left origin).
+        ///
+        /// In transparent WS_POPUP + NOREDIRECTIONBITMAP mode (#57),
+        /// this also drives SetWindowRgn — outside the rect the OS
+        /// treats our window as if it didn't exist (both rendering and
+        /// hit-testing), so input is routed natively to whichever
+        /// desktop window is at the cursor with full fidelity (real
+        /// DefWindowProc modal SC_MOVE/SC_SIZE/SC_CLOSE loops, native
+        /// cursor adaptation, native menu activation, native hover).
+        /// Push the cube/avatar silhouette's screen-space AABB each
+        /// frame. w &lt;= 0 or h &lt;= 0 clears the region (overlay
+        /// catches everywhere — used as init default).
+        ///
+        /// In opaque WS_CHILD mode (legacy/Game-View overlay), this
+        /// updates the rect used by WM_NCHITTEST as a fast
+        /// HTCLIENT-vs-HTTRANSPARENT discriminator.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void displayxr_set_overlay_hit_rect(
+            int x, int y, int w, int h);
+
+        /// <summary>
+        /// Per-pixel hit-test state from the C# raycast. Tracks "is the
+        /// cursor over a clickable renderer?" for callers that want to
+        /// know — but no longer drives the OS hit-test routing. OS
+        /// routing is owned by displayxr_set_overlay_hit_rect (AABB-
+        /// region path) or displayxr_set_overlay_hit_mask (per-pixel
+        /// silhouette path, takes over once any mask has been pushed).
+        /// Kept callable for backward compat.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void displayxr_set_overlay_hit_active(int active);
+
+        /// <summary>
+        /// (issue #57 Approach B+) Per-pixel silhouette mask drives
+        /// SetWindowRgn for cross-process click-through. <paramref name="mask"/>
+        /// is mask_w*mask_h bytes (non-zero = opaque/overlay catches,
+        /// zero = transparent/OS routes past to whatever desktop window
+        /// is at the cursor), conceptually scaled to overlay client
+        /// size dst_w*dst_h. The native side walks the mask row-by-row,
+        /// RLE-encodes opaque runs as RECTs, ExtCreateRegion's the
+        /// union, and SetWindowRgn's it onto the overlay HWND. Outside
+        /// the silhouette the OS treats our window as if it didn't
+        /// exist — including concavities the AABB swallows (between
+        /// the tiger's legs, around the tail, etc.).
+        ///
+        /// Push from an AsyncGPUReadback callback each frame. NULL
+        /// mask reverts to the AABB-region path. Once any mask is
+        /// applied, displayxr_set_overlay_hit_rect stops driving
+        /// SetWindowRgn — callers committed to the mask path must
+        /// keep it fresh each frame.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void displayxr_set_overlay_hit_mask(
+            IntPtr mask, int mask_w, int mask_h, int dst_w, int dst_h);
+
+        /// <summary>
+        /// (#131) Register an opaque rect (overlay client pixels, top-left
+        /// origin) that must catch clicks even though it lives in the 2D
+        /// surround region outside the 3D silhouette — e.g. a high-res text
+        /// bubble. It is UNION-ed into the SetWindowRgn region built by
+        /// displayxr_set_overlay_hit_mask each frame, so the bubble catches
+        /// clicks while the empty surround keeps routing past to the desktop.
+        /// Pass w&lt;=0 || h&lt;=0 to clear. Takes effect on the next hit-mask
+        /// update. Transparent overlay (hooked) path only.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void displayxr_set_overlay_surround_rect(
+            int x, int y, int w, int h);
+
+        /// <summary>
+        /// (#131) Per-pixel variant of displayxr_set_overlay_surround_rect:
+        /// register the EXACT shape of a 2D surround element (e.g. a comic
+        /// bubble with a triangular tail) as an alpha mask (mask_w*mask_h
+        /// bytes, non-zero = opaque/catch) mapped over the dst rect (overlay
+        /// client px, top-left). RLE-unioned into the SetWindowRgn region each
+        /// frame, so the element catches clicks while the empty area beside it
+        /// (e.g. the corners next to the tail) keeps routing to the desktop —
+        /// which a single bounding rect can't express. The surround is flat
+        /// post-weave 2D, so the caller rasterizes the mask directly (no
+        /// disparity / per-view math). The plugin copies the bytes. Pass
+        /// mask = IntPtr.Zero or any dim &lt;= 0 to clear. Transparent overlay
+        /// (hooked) path only.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void displayxr_set_overlay_surround_mask(
+            IntPtr mask, int mask_w, int mask_h,
+            int dst_x, int dst_y, int dst_w, int dst_h);
+#endif
+
+#if UNITY_STANDALONE_LINUX && !UNITY_EDITOR
+        /// <summary>
+        /// (#332) Right-drag move of the Linux transparent overlay. Call every
+        /// frame with the right button's state; the first pressed call starts
+        /// the drag, later ones move Unity's window (the overlay follows) by
+        /// how far the pointer has moved, the first released call ends it.
+        /// Returns 1 while a drag is in progress. No-op outside transparent mode.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int displayxr_linux_drag_window(int right_pressed);
+
+        /// <summary>
+        /// (#332) 1 while the Linux transparent overlay is up and the click-through
+        /// exports act; 0 for the opaque child window or without X. Cached state,
+        /// cheap to poll every frame.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int displayxr_linux_click_through_active();
 #endif
 
     }

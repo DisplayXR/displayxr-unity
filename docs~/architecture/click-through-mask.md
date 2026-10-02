@@ -178,6 +178,46 @@ is woven.
    the divergence is real source/state, not compiler nondeterminism. (For #166, the local rebuild
    of v1.24.1 was byte-size-identical to the shipped one — toolchain ruled out in one build.)
 
+## Linux (#332)
+
+Same C# producer, same exports, different OS primitive. On Linux the weave overlay is an
+ARGB override-redirect top-level that takes **no** input (empty XShape input region), and
+Unity's cloaked window beneath it is the one clicks reach. So `displayxr_linux.c` builds the
+region from the same inputs — silhouette mask, AABB until the first mask, surround
+rect/mask — and installs it as the **XShape input region of Unity's window**
+(`XShapeCombineRectangles(…, ShapeInput, …)`). Visibility needs nothing: the overlay's alpha
+already decides it.
+
+Differences from Windows, all deliberate:
+
+- **Live window-space UI layers are unioned in.** A HUD is drawn wherever its rect is, inside
+  the avatar or not, and must take its own clicks; native knows every slot's rect, so no app
+  call is needed. The rect is in **window** fractions (as the layer and the apps' HUD routers
+  read it — not zone fractions), widened by ±disparity/2, and covers the whole layer rect
+  whatever its alpha.
+- **A single zone with a sub-rect maps the mask into that zone's rect**, not the full client.
+  The mask is rendered through zone 0's frustum, so an app that keeps a 2D band beside one
+  zone (lenovo-avatar's bubble) would otherwise get a silhouette stretched over the band.
+  (Windows maps that case to the full client — untested there.)
+- **Unity's window is undecorated while cloaked.** mutter takes input over a decorated
+  window's whole frame, ignoring the client's input shape — clicks beside the avatar never
+  reached the desktop, and the invisible title bar caught clicks too. Undecorating unframes
+  the window; its client origin and size are put back (unframing hands it the frame's
+  geometry: +74 px tall on GNOME, which Unity then saved every launch). Restored with the
+  cloak.
+- **Unity's window is kept above other windows while cloaked** (`_NET_WM_STATE_ABOVE`), as the
+  Windows overlay HWND is `WS_EX_TOPMOST`. The visible overlay is override-redirect and always
+  on top; without this, focusing another window raised it over Unity's, and clicks on a HUD or
+  the bubble the user could see went to that window instead.
+- **Threads.** The exports run on Unity's main thread and use their own X connection
+  (`s_hit_dpy`, mutex-guarded). Nothing reachable from them may touch `s_dpy` (the graphics
+  thread's and the runtime's connection) — including `dxr_prov_get_zone_rect_px(0)`, which falls
+  back to a live `XGetGeometry(s_dpy)` without a zone; they read the cached
+  `dxr_prov_get_active_zone_rect_px`.
+- **Right-drag move** is native too (`displayxr_linux_drag_window`, called every frame with
+  the right button's state): it follows the root pointer and moves Unity's window with
+  `_NET_MOVERESIZE_WINDOW`; the overlay follows it in `displayxr_linux_track_window`.
+
 ## Key files
 
 | File | Role |
@@ -186,6 +226,7 @@ is woven.
 | `Runtime/Resources/DisplayXRSilhouette.shader` | The silhouette rasteriser. Its clip-space z pin is what keeps the mask independent of the near/far planes — and therefore of the rear depth budget (spec v4 / runtime#1470). |
 | `Runtime/DisplayXRDepthBudget.cs`, `Runtime/DisplayXRContentBounds.cs` | The other half of the second consumer: the published budget, and the (geometry-derived, clip-independent) bounds rect chained beside the mask. |
 | `native~/displayxr_win32.c` | `displayxr_set_overlay_hit_mask` — stamp mask into the target rect → `ExtCreateRegion` → `SetWindowRgn`; `region_target_hwnd`/`region_target_ready`. |
+| `native~/displayxr_linux.c` | Linux: the same exports → XShape input region on Unity's window; undecorate-while-cloaked; right-drag move (#332). |
 | `native~/displayxr_native_shared.cpp` | `displayxr_get_canvas_rect_px` (reader) + `displayxr_set_canvas_rect` (writer, re-homed in #166) over the `s_canvas_rect` statics. |
 | `native~/displayxr_xrprovider/displayxr_provider_session.cpp` | `dxr_prov_get_zone_count`/`dxr_prov_get_zone_rect_px` (multi-zone rects); `dxr_prov_set_3d_zone_rect` (zone weave); publishes the stereo matrices the mask reads. |
 

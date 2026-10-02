@@ -112,8 +112,9 @@ namespace DisplayXR
         private const int kPanelSizeNone = 0;
         private const int kPanelSizeTile = 1;
         private const int kPanelSizeScreen = 2;
+        private const int kPanelSizeComposited = 3;
         private int m_PanelSizeSource = kPanelSizeNone;
-        private int m_ShellMode = -1; // -1 = not yet queried
+        private static int s_ShellMode = -1; // -1 = not yet queried (fixed for the process)
 
         // This component's private stage (see DisplayXROverlayStage): its canvas and
         // camera sit there, far from any scene content and from every other overlay's
@@ -656,9 +657,23 @@ namespace DisplayXR
             }
         }
 
-        private bool TryGetPanelPixelSize(out float pw, out float ph)
+        /// <summary>
+        /// The size in pixels of the window this app's window-space UI is composited into —
+        /// the frame <see cref="positionX"/>/<see cref="width"/> etc. are fractions of, and the
+        /// size the HUD RT aspect is derived from. Lay out HUD rects against THIS, not
+        /// <c>Screen.*</c>: in a transparent-overlay app on Windows <c>Screen.*</c> is Unity's
+        /// own cloaked window, which can have any size (#291). Source order: workspace tile
+        /// (shell) → the provider's composited window → <c>Screen.*</c>. Only the aspect is
+        /// meaningful across sources (native-DPI pixels). Returns false when nothing is known.
+        /// </summary>
+        public static bool TryGetWindowPixelSize(out float width, out float height)
         {
-            float cw = 0f, ch = 0f;
+            return GetWindowPixelSize(out width, out height) != kPanelSizeNone;
+        }
+
+        private static int GetWindowPixelSize(out float cw, out float ch)
+        {
+            cw = 0f; ch = 0f;
             int source = kPanelSizeNone;
 
             // Workspace tile (#323): under the shell Unity's window is launched
@@ -675,13 +690,32 @@ namespace DisplayXR
                 cw = tw; ch = th;
                 source = kPanelSizeTile;
             }
-            // Built-app / Play Mode: the runtime composites into Unity's main
-            // window, so Screen.* is meaningful.
+            // The window the runtime actually composites into, as the provider last
+            // measured it (the eye swapchain is sized from the same number). In a
+            // transparent-overlay app that is the visible overlay window, while Unity's own
+            // window is cloaked/parked at whatever size Unity persisted (observed 512x728 and
+            // 3872x2248 next to a 3840x2160 overlay; it grows by the frame size each run) —
+            // so Screen.* gave a wrong aspect and squeezed the HUD. Only the ASPECT is used
+            // (see ComputeRtSize), so the native-DPI pixels need no conversion.
+            else if (TryGetCompositedSize(out float qw, out float qh))
+            {
+                cw = qw; ch = qh;
+                source = kPanelSizeComposited;
+            }
+            // No provider session (or an older native plugin): Screen.*, which is right
+            // whenever the runtime composites into Unity's main window.
             else if (Screen.width > 0 && Screen.height > 0)
             {
                 cw = Screen.width; ch = Screen.height;
                 source = kPanelSizeScreen;
             }
+
+            return source;
+        }
+
+        private bool TryGetPanelPixelSize(out float pw, out float ph)
+        {
+            int source = GetWindowPixelSize(out float cw, out float ch);
 
             if (source == kPanelSizeNone)
             {
@@ -695,7 +729,7 @@ namespace DisplayXR
             {
                 m_PanelSizeSource = source;
                 Debug.Log($"[DisplayXR] wsui: panel size source = " +
-                          $"{(source == kPanelSizeTile ? "workspace tile" : "Screen.*")} " +
+                          $"{(source == kPanelSizeTile ? "workspace tile" : source == kPanelSizeComposited ? "composited window" : "Screen.*")} " +
                           $"({cw}x{ch})");
             }
 
@@ -704,10 +738,33 @@ namespace DisplayXR
             return true;
         }
 
+        // The provider's last measured composited window size; false with no provider
+        // session, before the first measurement, or against a native plugin without the
+        // export (then never asked again).
+        private static bool s_CompositedSizeMissing;
+        private static bool TryGetCompositedSize(out float w, out float h)
+        {
+            w = h = 0f;
+            if (s_CompositedSizeMissing || !DisplayXRProviderDriver.IsActive) return false;
+            try
+            {
+                if (DisplayXRProviderNative.dxr_prov_get_composited_size(out uint cw, out uint ch) == 0 ||
+                    cw == 0 || ch == 0)
+                    return false;
+                w = cw; h = ch;
+                return true;
+            }
+            catch (System.EntryPointNotFoundException)
+            {
+                s_CompositedSizeMissing = true;
+                return false;
+            }
+        }
+
         // The live workspace-tile canvas in px, or false when there is no tile size
         // yet (slot not bound, older runtime, or no native binary at all in the
         // editor before a Play session).
-        private bool TryGetTileCanvasSize(out float w, out float h)
+        private static bool TryGetTileCanvasSize(out float w, out float h)
         {
             w = h = 0f;
             try
@@ -725,20 +782,20 @@ namespace DisplayXR
         // Shell mode is fixed for the process (an env var read at load), so cache it
         // rather than P/Invoking twice a frame. An older native binary without the
         // export would throw per call, so a missing entry point also latches here.
-        private bool IsShellMode
+        private static bool IsShellMode
         {
             get
             {
-                if (m_ShellMode < 0)
+                if (s_ShellMode < 0)
                 {
                     try
                     {
-                        m_ShellMode = DisplayXRNative.displayxr_is_shell_mode() != 0 ? 1 : 0;
+                        s_ShellMode = DisplayXRNative.displayxr_is_shell_mode() != 0 ? 1 : 0;
                     }
-                    catch (System.EntryPointNotFoundException) { m_ShellMode = 0; }
-                    catch (System.DllNotFoundException) { m_ShellMode = 0; }
+                    catch (System.EntryPointNotFoundException) { s_ShellMode = 0; }
+                    catch (System.DllNotFoundException) { s_ShellMode = 0; }
                 }
-                return m_ShellMode > 0;
+                return s_ShellMode > 0;
             }
         }
 

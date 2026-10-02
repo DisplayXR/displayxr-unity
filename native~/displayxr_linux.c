@@ -63,7 +63,10 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <pthread.h>
+
 #include "displayxr_exports.h"
+#include "displayxr_window_space_ui.h"
 
 extern void dxr_prov_file_log(const char *s);
 
@@ -127,6 +130,9 @@ struct XlibApi {
 	int (*XChangeProperty)(XDpy, XWin, XAtom, XAtom, int, int, const unsigned char *, int);
 	int (*XDeleteProperty)(XDpy, XWin, XAtom);
 	XWin (*XGetSelectionOwner)(XDpy, XAtom);
+	// Click-through + right-drag move (#332)
+	int (*XQueryPointer)(XDpy, XWin, XWin *, XWin *, int *, int *, int *, int *, unsigned int *);
+	int (*XSendEvent)(XDpy, XWin, int, long, void *);
 };
 
 // Xlib structs the transparent overlay needs, mirrored so this TU keeps no X11
@@ -176,6 +182,10 @@ typedef struct {
 // override-redirect window with the default input region swallows every click).
 typedef int (*PFN_XShapeCombineRectangles)(XDpy, XWin, int, int, int, void *, int, int, int);
 static PFN_XShapeCombineRectangles s_shape_combine_rects;
+// XShapeCombineMask with a None mask resets a shape to the default (unshaped) — how
+// Unity's window gets its full input region back when the overlay goes away (#332).
+typedef int (*PFN_XShapeCombineMask)(XDpy, XWin, int, int, int, unsigned long, int);
+static PFN_XShapeCombineMask s_shape_combine_mask;
 
 static struct XlibApi s_x;
 static XDpy s_dpy;       // our own connection; must outlive the session
@@ -188,6 +198,10 @@ static int  s_ox, s_oy;  // last top-level overlay origin (transparent mode only
 static int  s_transparent_requested; // set by displayxr_set_transparent_background
 static int  s_overlay_is_toplevel;   // 1 = ARGB top-level overlay, 0 = opaque child
 static unsigned long s_overlay_cmap; // colormap of the ARGB overlay
+
+static void lin_reset_input_region(void); // click-through (#332), below
+static void lin_enable_click_through(void);
+static long long lin_now_ns(void);
 
 // Don't latch a FAILURE forever. The window may simply not be mapped yet on the
 // first call (LifecycleStart can beat Unity's window creation depending on how
@@ -241,6 +255,8 @@ lin_load_xlib(void)
 	XL_SYM(XChangeProperty);
 	XL_SYM(XDeleteProperty);
 	XL_SYM(XGetSelectionOwner);
+	XL_SYM(XQueryPointer);
+	XL_SYM(XSendEvent);
 	return 1;
 }
 
@@ -433,6 +449,7 @@ lin_load_xshape(void)
 	if (!lib) lib = dlopen("libXext.so", RTLD_NOW | RTLD_LOCAL);
 	if (!lib) return 0;
 	*(void **)(&s_shape_combine_rects) = dlsym(lib, "XShapeCombineRectangles");
+	*(void **)(&s_shape_combine_mask) = dlsym(lib, "XShapeCombineMask");
 	return s_shape_combine_rects != NULL;
 }
 
@@ -458,6 +475,150 @@ lin_set_unity_opacity(int cloak)
 	} else {
 		s_x.XDeleteProperty(s_dpy, s_win, op);
 	}
+}
+
+// EWMH _NET_MOVERESIZE_WINDOW for Unity's window, as a client message to the root.
+// StaticGravity (10): x/y are the CLIENT origin, whatever frame the WM adds. Bits
+// 8/9: x and y present. Bits 12-13 = 2: from a pager/tool, so the WM honours it
+// rather than treating it as an application placement request.
+typedef struct {
+	int type;
+	unsigned long serial;
+	int send_event;
+	void *display;
+	XWin window;
+	XAtom message_type;
+	int format;
+	long l[5];
+	long pad[12]; // XEvent is 24 longs
+} LinClientMessage;
+
+#define LIN_CLIENT_MESSAGE 33
+#define LIN_SUBSTRUCTURE_MASK ((1L << 19) | (1L << 20)) // Notify | Redirect
+
+static void
+lin_moveresize_client(XDpy dpy, int x, int y, unsigned int w, unsigned int h)
+{
+	XAtom atom = s_x.XInternAtom(dpy, "_NET_MOVERESIZE_WINDOW", 0);
+	if (!atom) return;
+	LinClientMessage e;
+	memset(&e, 0, sizeof(e));
+	e.type = LIN_CLIENT_MESSAGE;
+	e.window = s_win;
+	e.message_type = atom;
+	e.format = 32;
+	e.l[0] = 10 | (1L << 8) | (1L << 9) | (2L << 12);
+	e.l[1] = x;
+	e.l[2] = y;
+	if (w > 0 && h > 0) { // bits 10/11: width and height present
+		e.l[0] |= (1L << 10) | (1L << 11);
+		e.l[3] = (long)w;
+		e.l[4] = (long)h;
+	}
+	s_x.XSendEvent(dpy, s_x.XDefaultRootWindow(dpy), 0, LIN_SUBSTRUCTURE_MASK, &e);
+	s_x.XFlush(dpy);
+}
+
+static void
+lin_move_client(XDpy dpy, int x, int y)
+{
+	lin_moveresize_client(dpy, x, y, 0, 0);
+}
+
+// Keep Unity's window above normal windows while it is cloaked (#332), as the Windows
+// overlay HWND is WS_EX_TOPMOST. What the user sees is the override-redirect overlay,
+// which is always on top; what takes the clicks is Unity's window beneath it. Once the
+// user focused another window, the WM raised that window over Unity's, so a click on a
+// HUD or the bubble the user could see went to the window "behind" it instead. EWMH
+// _NET_WM_STATE_ABOVE keeps the two in the same stacking place. Same lifetime as the
+// cloak (set at overlay creation, cleared in displayxr_linux_destroy_weave_window).
+static void
+lin_set_unity_above(int above)
+{
+	XAtom state = s_x.XInternAtom(s_dpy, "_NET_WM_STATE", 0);
+	XAtom above_atom = s_x.XInternAtom(s_dpy, "_NET_WM_STATE_ABOVE", 0);
+	if (!state || !above_atom) return;
+	LinClientMessage e;
+	memset(&e, 0, sizeof(e));
+	e.type = LIN_CLIENT_MESSAGE;
+	e.window = s_win;
+	e.message_type = state;
+	e.format = 32;
+	e.l[0] = above ? 1 /* _NET_WM_STATE_ADD */ : 0 /* _NET_WM_STATE_REMOVE */;
+	e.l[1] = (long)above_atom;
+	e.l[2] = 0;
+	e.l[3] = 2; // source: pager/tool
+	s_x.XSendEvent(s_dpy, s_x.XDefaultRootWindow(s_dpy), 0, LIN_SUBSTRUCTURE_MASK, &e);
+	s_x.XFlush(s_dpy);
+	lin_log(above ? "[DisplayXR-LNX] Unity's window kept above while cloaked (click-through)\n"
+	              : "[DisplayXR-LNX] Unity's window no longer kept above\n");
+}
+
+// Undecorate Unity's window while it is cloaked (#332), restore it after.
+//
+// A decorated X11 window sits inside the WM's frame window, and mutter takes input
+// over the WHOLE frame: the input region we give Unity's window (click-through,
+// below) was ignored — measured on GNOME/XWayland, a click beside the avatar never
+// reached the desktop — and the invisible title bar above the client caught clicks
+// as well. Without decorations mutter unframes the window and honours its input
+// shape. Unframing hands the client the frame's geometry — up by the title bar and
+// taller by as much (measured: +74 px, and Unity saves the size, so it grew on
+// every launch) — so the client is put back at its own origin AND size; the
+// overlay follows it as always.
+//
+// Same lifetime as the cloak, for the same reason (see the invariant above): set
+// with it at overlay creation, restored with it in displayxr_linux_destroy_weave_window.
+static int s_geom_check_ticks; // track_window ticks until the size check (0 = none)
+static unsigned int s_geom_expect_w, s_geom_expect_h;
+static int s_motif_saved;      // 1 = s_motif holds the window's own hints
+static int s_motif_had;        // the window had _MOTIF_WM_HINTS before we touched it
+static long s_motif[5];
+static int s_undecorated;
+
+static void
+lin_set_unity_undecorated(int undecorate, int keep_x, int keep_y, unsigned int keep_w,
+                          unsigned int keep_h)
+{
+	XAtom hints = s_x.XInternAtom(s_dpy, "_MOTIF_WM_HINTS", 0);
+	if (!hints) return;
+	if (undecorate) {
+		if (s_undecorated) return;
+		XAtom type = 0;
+		int format = 0;
+		unsigned long n = 0, after = 0;
+		unsigned char *prop = NULL;
+		s_motif_had = 0;
+		if (s_x.XGetWindowProperty(s_dpy, s_win, hints, 0, 5, 0, 0 /* AnyPropertyType */, &type,
+		                           &format, &n, &after, &prop) == 0 /* Success */ &&
+		    prop && format == 32 && n == 5) {
+			memcpy(s_motif, prop, sizeof(s_motif));
+			s_motif_had = 1;
+		}
+		if (prop) s_x.XFree(prop);
+		s_motif_saved = 1;
+		long v[5] = {2 /* MWM_HINTS_DECORATIONS */, 0, 0 /* none */, 0, 0};
+		s_x.XChangeProperty(s_dpy, s_win, hints, hints, 32, LIN_PROP_MODE_REPLACE,
+		                    (const unsigned char *)v, 5);
+		lin_moveresize_client(s_dpy, keep_x, keep_y, keep_w, keep_h);
+		s_undecorated = 1;
+		if (keep_w && keep_h) { // check the WM honoured the size (+74 px growth regression)
+			s_geom_expect_w = keep_w;
+			s_geom_expect_h = keep_h;
+			s_geom_check_ticks = 60;
+		}
+		lin_log("[DisplayXR-LNX] Unity's window undecorated while cloaked (click-through)\n");
+		return;
+	}
+	if (!s_undecorated) return;
+	if (s_motif_saved && s_motif_had)
+		s_x.XChangeProperty(s_dpy, s_win, hints, hints, 32, LIN_PROP_MODE_REPLACE,
+		                    (const unsigned char *)s_motif, 5);
+	else
+		s_x.XDeleteProperty(s_dpy, s_win, hints);
+	lin_moveresize_client(s_dpy, keep_x, keep_y, keep_w, keep_h);
+	s_undecorated = 0;
+	s_motif_saved = 0;
+	lin_log("[DisplayXR-LNX] Unity's window decorations restored\n");
 }
 
 static XWin
@@ -524,7 +685,8 @@ displayxr_linux_get_weave_window(void **out_display, unsigned long *out_window)
 		if (!displayxr_linux_get_app_window(&dpy, &unity_win)) return 0;
 
 		unsigned int w = 0, h = 0;
-		if (!lin_child_size(&w, &h) || w == 0 || h == 0) { w = 1920; h = 1080; }
+		int measured = lin_child_size(&w, &h) && w != 0 && h != 0;
+		if (!measured) { w = 1920; h = 1080; }
 
 		if (s_transparent_requested) {
 			int x = 0, y = 0;
@@ -533,6 +695,10 @@ displayxr_linux_get_weave_window(void **out_display, unsigned long *out_window)
 				s_overlay_is_toplevel = 1;
 				s_ox = x; s_oy = y;
 				lin_set_unity_opacity(1);
+				// Size only when measured: never "restore" Unity to the 1920x1080 guess.
+				lin_set_unity_undecorated(1, x, y, measured ? w : 0, measured ? h : 0);
+				lin_set_unity_above(1);
+				lin_enable_click_through();
 				s_x.XMapWindow(s_dpy, s_overlay);
 				s_x.XFlush(s_dpy);
 				s_x.XSync(s_dpy, 0);
@@ -590,6 +756,15 @@ displayxr_linux_track_window(void)
 	unsigned int w = 0, h = 0;
 	if (!lin_child_size(&w, &h) || w == 0 || h == 0) return;
 	if (s_overlay_is_toplevel) {
+		if (s_geom_check_ticks > 0 && --s_geom_check_ticks == 0 &&
+		    (w != s_geom_expect_w || h != s_geom_expect_h)) {
+			char m[192];
+			snprintf(m, sizeof(m),
+			         "[DisplayXR-LNX] WARNING: Unity's window is %ux%u after undecorating, "
+			         "expected %ux%u — the WM did not honour the size (it will persist)\n",
+			         w, h, s_geom_expect_w, s_geom_expect_h);
+			lin_log(m);
+		}
 		int x = 0, y = 0;
 		if (!lin_app_origin(&x, &y)) return;
 		if (w == s_ow && h == s_oh && x == s_ox && y == s_oy) return;
@@ -628,6 +803,12 @@ displayxr_linux_destroy_weave_window(void)
 {
 	if (s_dpy && s_overlay && s_x.XDestroyWindow) {
 		if (s_overlay_is_toplevel && s_win) {
+			int cx = s_ox, cy = s_oy;
+			unsigned int cw = 0, ch = 0;
+			lin_app_origin(&cx, &cy); // keep the client where the user left it
+			lin_child_size(&cw, &ch);
+			lin_set_unity_above(0);
+			lin_set_unity_undecorated(0, cx, cy, cw, ch);
 			lin_set_unity_opacity(0);
 			// The one un-cloak (see the invariant above). Logged on its own line so a
 			// customer log shows the revert happened, not just that the overlay died.
@@ -636,6 +817,7 @@ displayxr_linux_destroy_weave_window(void)
 			         (unsigned long)s_win);
 			lin_log(m);
 		}
+		lin_reset_input_region(); // with the cloak: Unity takes clicks everywhere again
 		s_x.XDestroyWindow(s_dpy, s_overlay);
 		if (s_overlay_cmap) s_x.XFreeColormap(s_dpy, s_overlay_cmap);
 		s_x.XFlush(s_dpy);
@@ -655,6 +837,462 @@ DISPLAYXR_EXPORT void
 displayxr_linux_set_transparent(int enabled)
 {
 	s_transparent_requested = enabled != 0;
+}
+
+// ---------------------------------------------------------------------------
+// Click-through + right-drag move (#332)
+// ---------------------------------------------------------------------------
+//
+// CLICK-THROUGH. In transparent mode the overlay takes no input (empty XShape
+// input region, above) and Unity's cloaked window beneath it catches every click
+// over its whole client area, so nothing outside the avatar reaches the desktop.
+// Windows solves this with SetWindowRgn on its overlay; the X11 analogue is an
+// XShape INPUT region on Unity's window — only the input shape: what is VISIBLE
+// is already decided by the overlay's alpha, and Unity's window is cloaked.
+//
+// The region is built from the same inputs as the Windows one, with the same
+// exports and semantics, so DisplayXRTransparentOverlay and the apps drive both
+// the same way:
+//   - displayxr_set_overlay_hit_mask: the per-pixel silhouette (C# renders it each
+//     frame), RLE'd into rects and stamped into each 3D zone's rect, or the canvas
+//     rect, like displayxr_win32.c — except that a single zone with a sub-rect uses
+//     that rect where Windows uses the full client (see the mask function).
+//   - displayxr_set_overlay_hit_rect: the AABB, used only until the first mask.
+//   - displayxr_set_overlay_surround_rect / _mask: 2D surround elements (the
+//     speech bubble) unioned in.
+// Plus one Linux addition: every live window-space UI layer (HUD) is unioned in.
+// A HUD is drawn wherever its rect is, inside the avatar or not, and must take
+// its own clicks; on Linux the HUD's own rect is known natively, so no app call
+// is needed for it.
+//
+// Only in transparent top-level mode. The opaque child path keeps Unity's
+// default input region: there is nothing to click through to.
+//
+// RIGHT-DRAG MOVE. Windows moves the overlay on a right-button drag inside the
+// region (custom capture drag, #57/#61). Here Unity's window gets the press — the
+// region decides that, so a press can only start on the avatar, a HUD or the
+// bubble — and DisplayXRTransparentOverlay calls displayxr_linux_drag_window each
+// frame while the right button is down. We follow the ROOT pointer (XQueryPointer)
+// and move Unity's window with _NET_MOVERESIZE_WINDOW (lin_move_client); the
+// overlay follows it in
+// displayxr_linux_track_window, and the runtime snaps the weave phase to the
+// reachable placement lattice (its x11_placement rule).
+//
+// THREADS. The exports below run on Unity's main thread (C# P/Invoke), so they use a
+// connection of their own, s_hit_dpy. NOTHING reachable from the main thread may touch
+// s_dpy: it is used every frame by the graphics thread (displayxr_linux_track_window)
+// and borrowed by the runtime's Vulkan surface, and nothing calls XInitThreads. That
+// includes indirect paths — dxr_prov_get_zone_rect_px(0) falls back to a live
+// XGetGeometry(s_dpy) when no zone is active, so the region code reads the cached
+// dxr_prov_get_active_zone_rect_px instead. The one s_hit_dpy request that comes from
+// another thread — the input-region reset at overlay teardown — takes s_hit_mutex,
+// as does every main-thread use.
+//
+// HUD rects are the layer's whole rect (widened by +-disparity/2), whatever its alpha:
+// the transparent margin of a HUD canvas catches clicks too. Fine at today's HUD
+// sizes; a per-pixel HUD mask would need the RT read back.
+
+typedef struct {
+	short x, y;
+	unsigned short width, height;
+} LinXRect;
+
+#define LIN_SHAPE_UNSORTED 0
+#define LIN_HIT_MAX_RECTS  32768 // X request size cap; a real silhouette is far below
+
+static XDpy s_hit_dpy;
+static pthread_mutex_t s_hit_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int s_hit_enabled; // overlay up; cleared at teardown so a late push can't re-shape
+static int s_drag_active;
+static int s_drag_px, s_drag_py;           // root pointer at the press
+static int s_drag_wx, s_drag_wy;           // Unity's client origin at the press
+static int s_drag_last_dx, s_drag_last_dy; // last offset sent, to skip repeats
+static int s_hit_unavailable;
+static int s_hit_mask_active;         // a mask has been applied; the AABB stops driving
+static unsigned long long s_hit_hash; // last applied region, 0 = none/unknown
+static int s_hit_shaped;              // Unity's input region is ours (needs a reset)
+static int s_surround_valid;
+static LinXRect s_surround_rect;
+static uint8_t *s_surround_mask;
+static int s_surround_mask_w, s_surround_mask_h;
+static int s_surround_dst_x, s_surround_dst_y, s_surround_dst_w, s_surround_dst_h;
+
+extern uint32_t dxr_prov_get_zone_count(void);
+extern int dxr_prov_get_zone_rect_px(uint32_t zone, int *x, int *y, int *w, int *h);
+extern int dxr_prov_get_active_zone_rect_px(int *x, int *y, int *w, int *h);
+
+static void lin_reset_input_region_locked(void);
+
+static int
+lin_hit_ready(void)
+{
+	if (s_hit_unavailable || !s_hit_enabled || !s_overlay_is_toplevel || !s_overlay || !s_win)
+		return 0;
+	// The reset needs XShapeCombineMask: never shape what we could not unshape.
+	if (!s_shape_combine_rects || !s_shape_combine_mask) return 0;
+	if (!s_hit_dpy) {
+		s_hit_dpy = s_x.XOpenDisplay(NULL);
+		if (!s_hit_dpy) {
+			lin_log("[DisplayXR-LNX] click-through: XOpenDisplay failed — the whole window "
+			        "keeps catching clicks\n");
+			s_hit_unavailable = 1;
+			return 0;
+		}
+	}
+	return 1;
+}
+
+typedef struct {
+	LinXRect *r;
+	int n, cap, oom;
+} LinRects;
+
+static void
+lin_rects_push(LinRects *v, long x0, long y0, long x1, long y1)
+{
+	if (v->oom || x1 <= x0 || y1 <= y0) return;
+	if (v->n >= LIN_HIT_MAX_RECTS) { v->oom = 1; return; }
+	if (v->n >= v->cap) {
+		int nc = v->cap ? v->cap * 2 : 1024;
+		LinXRect *nr = (LinXRect *)realloc(v->r, (size_t)nc * sizeof(LinXRect));
+		if (!nr) { v->oom = 1; return; }
+		v->r = nr;
+		v->cap = nc;
+	}
+	if (x0 < -32768) x0 = -32768;
+	if (y0 < -32768) y0 = -32768;
+	if (x1 > 32767) x1 = 32767;
+	if (y1 > 32767) y1 = 32767;
+	v->r[v->n].x = (short)x0;
+	v->r[v->n].y = (short)y0;
+	v->r[v->n].width = (unsigned short)(x1 - x0);
+	v->r[v->n].height = (unsigned short)(y1 - y0);
+	v->n++;
+}
+
+// RLE a mask (non-zero = catch) into rects over [dx,dy,dw,dh], rounding OUTWARD
+// (leading edges floor, trailing edges ceil) so the region covers the silhouette —
+// the same mapping displayxr_win32.c uses for SetWindowRgn.
+static void
+lin_rects_from_mask(LinRects *v, const uint8_t *mask, int mw, int mh, long dx, long dy, long dw,
+                    long dh)
+{
+	for (int my = 0; my < mh; my++) {
+		const uint8_t *row = mask + (size_t)my * (size_t)mw;
+		long top = dy + (long long)my * dh / mh;
+		long bottom = dy + ((long long)(my + 1) * dh + mh - 1) / mh;
+		int mx = 0;
+		while (mx < mw) {
+			while (mx < mw && row[mx] == 0) mx++;
+			if (mx >= mw) break;
+			int x0 = mx;
+			while (mx < mw && row[mx] != 0) mx++;
+			lin_rects_push(v, dx + (long long)x0 * dw / mw, top,
+			               dx + ((long long)mx * dw + mw - 1) / mw, bottom);
+		}
+	}
+}
+
+// Live HUD rects. A window-space layer's x/y/width/height are fractions of the
+// WINDOW (DisplayXRWindowSpaceUI and the apps' HUD routers both read them against
+// Screen.*), not of the 3D zone — measured on lenovo-avatar, where a zone-relative
+// rect landed ~200 px below the drawn HUD and its clicks fell through. Each eye is
+// shifted by +-disparity/2, so widen by that much on each side.
+static void
+lin_rects_add_wsui(LinRects *v, int win_w, int win_h)
+{
+	if (win_w <= 0 || win_h <= 0) return;
+	for (int slot = 0; slot < DXR_WSUI_MAX_SLOTS; slot++) {
+		float fx = 0, fy = 0, fw = 0, fh = 0, disp = 0;
+		if (!displayxr_window_space_ui_get_pending_slot(slot, NULL, NULL, NULL, &fx, &fy, &fw, &fh,
+		                                                &disp))
+			continue;
+		if (fw <= 0.0f || fh <= 0.0f) continue;
+		float half = (disp < 0 ? -disp : disp) * 0.5f;
+		long x0 = (long)((fx - half) * (float)win_w);
+		long y0 = (long)(fy * (float)win_h);
+		long x1 = (long)((fx + fw + half) * (float)win_w + 0.999f);
+		long y1 = (long)((fy + fh) * (float)win_h + 0.999f);
+		lin_rects_push(v, x0, y0, x1, y1);
+	}
+}
+
+static void
+lin_rects_add_surround(LinRects *v)
+{
+	if (s_surround_valid)
+		lin_rects_push(v, s_surround_rect.x, s_surround_rect.y,
+		               (long)s_surround_rect.x + s_surround_rect.width,
+		               (long)s_surround_rect.y + s_surround_rect.height);
+	if (s_surround_mask)
+		lin_rects_from_mask(v, s_surround_mask, s_surround_mask_w, s_surround_mask_h,
+		                    s_surround_dst_x, s_surround_dst_y, s_surround_dst_w,
+		                    s_surround_dst_h);
+}
+
+// Install `v` as Unity's input region, unless it is the region already there.
+static void
+lin_apply_input_region(LinRects *v, const char *what)
+{
+	unsigned long long h = 1469598103934665603ULL; // FNV-1a 64
+	const unsigned char *b = (const unsigned char *)v->r;
+	size_t nb = (size_t)v->n * sizeof(LinXRect);
+	for (size_t i = 0; i < nb; i++) { h ^= b[i]; h *= 1099511628211ULL; }
+	h ^= (unsigned long long)(unsigned)v->n; h *= 1099511628211ULL;
+	if (h == 0) h = 1;
+	if (s_hit_shaped && h == s_hit_hash) return;
+	s_hit_hash = h;
+
+	// n == 0 is a valid region: nothing catches (an empty frame of the avatar).
+	s_shape_combine_rects(s_hit_dpy, s_win, LIN_SHAPE_INPUT, 0, 0, v->r, v->n, LIN_SHAPE_SET,
+	                      LIN_SHAPE_UNSORTED);
+	s_x.XFlush(s_hit_dpy);
+	if (!s_hit_shaped) {
+		char m[160];
+		snprintf(m, sizeof(m), "[DisplayXR-LNX] click-through: %s input region on 0x%lx (%d rects)\n",
+		         what, (unsigned long)s_win, v->n);
+		lin_log(m);
+	}
+	s_hit_shaped = 1;
+}
+
+DISPLAYXR_EXPORT void
+displayxr_set_overlay_hit_mask(const uint8_t *mask, int mask_w, int mask_h, int dst_w, int dst_h)
+{
+	pthread_mutex_lock(&s_hit_mutex);
+	if (!lin_hit_ready()) goto out;
+	if (mask == NULL || mask_w <= 0 || mask_h <= 0 || dst_w <= 0 || dst_h <= 0) {
+		// As on Windows (SetWindowRgn(NULL)): the whole window catches again, until the
+		// next hit_rect / hit_mask push shapes it.
+		lin_reset_input_region_locked();
+		goto out;
+	}
+
+	LinRects v = {0};
+	int zone_count = 1, use_zones = 0;
+	uint32_t pzc = dxr_prov_get_zone_count();
+	if (pzc > 1) { zone_count = (int)pzc; use_zones = 1; }
+	for (int zi = 0; zi < zone_count; zi++) {
+		int32_t cvx = 0, cvy = 0;
+		uint32_t cvw = (uint32_t)dst_w, cvh = (uint32_t)dst_h;
+		int rx = 0, ry = 0, rw = 0, rh = 0;
+		if (use_zones && zi > 0) {
+			// Extra zones: cached rects, no window query.
+			if (!dxr_prov_get_zone_rect_px((uint32_t)zi, &rx, &ry, &rw, &rh) || rw <= 0 || rh <= 0)
+				continue;
+			cvx = rx; cvy = ry; cvw = (uint32_t)rw; cvh = (uint32_t)rh;
+		} else if (use_zones || !displayxr_get_canvas_rect_px(&cvx, &cvy, &cvw, &cvh)) {
+			// Zone 0, or no canvas sub-rect: the active zone's own rect, else the whole
+			// window (dst). The mask is rendered through zone 0's frustum, so it belongs in
+			// that rect — an app that keeps a 2D band beside a single zone (the
+			// lenovo-avatar bubble) otherwise gets a silhouette stretched over the band.
+			// displayxr_win32.c maps the single-zone case to the full client instead.
+			// NOT dxr_prov_get_zone_rect_px(0): without a zone it queries s_dpy (THREADS).
+			if (dxr_prov_get_active_zone_rect_px(&rx, &ry, &rw, &rh) && rw > 0 && rh > 0) {
+				cvx = rx; cvy = ry; cvw = (uint32_t)rw; cvh = (uint32_t)rh;
+			}
+		}
+		lin_rects_from_mask(&v, mask, mask_w, mask_h, cvx, cvy, cvw, cvh);
+	}
+	int n_sil = v.n;
+	lin_rects_add_surround(&v);
+	int n_sur = v.n - n_sil;
+	lin_rects_add_wsui(&v, dst_w, dst_h);
+	int n_ws = v.n - n_sil - n_sur;
+	if (v.oom) {
+		// Better too much than too little: keep the last region rather than cut the avatar.
+		free(v.r);
+		goto out;
+	}
+	lin_apply_input_region(&v, "silhouette");
+	s_hit_mask_active = 1;
+
+	// ~1 Hz, like the Windows hit_mask log: it runs every frame.
+	static long long s_last_log_ns;
+	long long now = lin_now_ns();
+	if (now - s_last_log_ns >= 1000000000LL) {
+		s_last_log_ns = now;
+		char m[160];
+		snprintf(m, sizeof(m),
+		         "[DisplayXR-LNX] hit_mask: mask=%dx%d rects=%d (silhouette %d, surround %d, "
+		         "wsui %d) dst=%dx%d\n",
+		         mask_w, mask_h, v.n, n_sil, n_sur, n_ws, dst_w, dst_h);
+		lin_log(m);
+	}
+	free(v.r);
+out:
+	pthread_mutex_unlock(&s_hit_mutex);
+}
+
+DISPLAYXR_EXPORT void
+displayxr_set_overlay_hit_rect(int x, int y, int w, int h)
+{
+	if (w <= 0 || h <= 0) return;
+	pthread_mutex_lock(&s_hit_mutex);
+	if (lin_hit_ready() && !s_hit_mask_active) { // the mask owns the region once it runs
+		LinRects v = {0};
+		lin_rects_push(&v, x, y, (long)x + w, (long)y + h);
+		lin_rects_add_surround(&v);
+		lin_rects_add_wsui(&v, (int)s_ow, (int)s_oh);
+		if (!v.oom) lin_apply_input_region(&v, "AABB");
+		free(v.r);
+	}
+	pthread_mutex_unlock(&s_hit_mutex);
+}
+
+// Windows answers WM_NCHITTEST from this; the X input region needs no per-cursor
+// flag. Exported so the shared C# call site binds on Linux too.
+DISPLAYXR_EXPORT void
+displayxr_set_overlay_hit_active(int active)
+{
+	(void)active;
+}
+
+DISPLAYXR_EXPORT void
+displayxr_set_overlay_surround_rect(int x, int y, int w, int h)
+{
+	pthread_mutex_lock(&s_hit_mutex);
+	if (w <= 0 || h <= 0) {
+		s_surround_valid = 0;
+	} else {
+		s_surround_rect.x = (short)x;
+		s_surround_rect.y = (short)y;
+		s_surround_rect.width = (unsigned short)w;
+		s_surround_rect.height = (unsigned short)h;
+		s_surround_valid = 1;
+	}
+	pthread_mutex_unlock(&s_hit_mutex);
+}
+
+DISPLAYXR_EXPORT void
+displayxr_set_overlay_surround_mask(const uint8_t *mask, int mask_w, int mask_h, int dst_x,
+                                    int dst_y, int dst_w, int dst_h)
+{
+	pthread_mutex_lock(&s_hit_mutex);
+	free(s_surround_mask);
+	s_surround_mask = NULL;
+	size_t n = (size_t)mask_w * (size_t)mask_h;
+	if (mask != NULL && mask_w > 0 && mask_h > 0 && dst_w > 0 && dst_h > 0 &&
+	    (s_surround_mask = (uint8_t *)malloc(n)) != NULL) {
+		memcpy(s_surround_mask, mask, n);
+		s_surround_mask_w = mask_w;
+		s_surround_mask_h = mask_h;
+		s_surround_dst_x = dst_x;
+		s_surround_dst_y = dst_y;
+		s_surround_dst_w = dst_w;
+		s_surround_dst_h = dst_h;
+	}
+	pthread_mutex_unlock(&s_hit_mutex);
+}
+
+// Give Unity's window its default input region back (the whole window catches).
+// Caller holds s_hit_mutex. On s_hit_dpy, the connection every region set went out
+// on, so the reset cannot overtake a set still in flight.
+static void
+lin_reset_input_region_locked(void)
+{
+	if (s_hit_shaped && s_hit_dpy && s_win && s_shape_combine_mask) {
+		s_shape_combine_mask(s_hit_dpy, s_win, LIN_SHAPE_INPUT, 0, 0, 0 /* None */, LIN_SHAPE_SET);
+		s_x.XSync(s_hit_dpy, 0);
+		lin_log("[DisplayXR-LNX] click-through: Unity's input region reset\n");
+	}
+	s_hit_shaped = 0;
+	s_hit_hash = 0;
+	s_hit_mask_active = 0;
+}
+
+// Overlay creation (the provider's thread): from here the main thread may shape.
+static void
+lin_enable_click_through(void)
+{
+	pthread_mutex_lock(&s_hit_mutex);
+	s_hit_enabled = 1;
+	pthread_mutex_unlock(&s_hit_mutex);
+}
+
+/// (#332) 1 while the transparent overlay is up and the click-through exports act,
+/// 0 otherwise (opaque child, no overlay, X unavailable). Cached state only.
+DISPLAYXR_EXPORT int
+displayxr_linux_click_through_active(void)
+{
+	return s_hit_enabled && s_overlay_is_toplevel && !s_hit_unavailable;
+}
+
+// Overlay teardown (the provider's thread): the region must not outlive the cloak it
+// was made for. Also ends a drag still in progress.
+static void
+lin_reset_input_region(void)
+{
+	pthread_mutex_lock(&s_hit_mutex);
+	s_hit_enabled = 0;
+	lin_reset_input_region_locked();
+	s_drag_active = 0;
+	pthread_mutex_unlock(&s_hit_mutex);
+}
+
+// --- right-drag move --------------------------------------------------------
+
+
+#define LIN_BUTTON3_MASK (1u << 10)
+
+static int
+lin_root_pointer(int *x, int *y, unsigned int *mask)
+{
+	XWin r = 0, c = 0;
+	int wx = 0, wy = 0;
+	*mask = 0;
+	return s_x.XQueryPointer(s_hit_dpy, s_win, &r, &c, x, y, &wx, &wy, mask) != 0;
+}
+
+/// (#332) Right-drag move for the transparent overlay. Call every frame with the
+/// right button's state: the first pressed call starts the drag, later ones move
+/// Unity's window by how far the pointer has moved, the first released call ends
+/// it. Returns 1 while a drag is in progress. No-op outside transparent mode.
+DISPLAYXR_EXPORT int
+displayxr_linux_drag_window(int right_pressed)
+{
+	int active = 0;
+	pthread_mutex_lock(&s_hit_mutex);
+	if (!right_pressed) {
+		if (s_drag_active) lin_log("[DisplayXR-LNX] drag: end\n");
+		s_drag_active = 0;
+		goto out;
+	}
+	if (!lin_hit_ready()) goto out;
+	int px = 0, py = 0;
+	unsigned int buttons = 0;
+	if (!lin_root_pointer(&px, &py, &buttons)) { active = s_drag_active; goto out; }
+	if (!(buttons & LIN_BUTTON3_MASK)) {
+		// The server says the button is up even though Unity still reports it held — a
+		// WM grab (Super, a keybinding) ate the release. End here, or the window would
+		// follow the cursor with no button down.
+		if (s_drag_active) lin_log("[DisplayXR-LNX] drag: end (button already released)\n");
+		s_drag_active = 0;
+		goto out;
+	}
+	if (!s_drag_active) {
+		XWin child = 0;
+		if (!s_x.XTranslateCoordinates(s_hit_dpy, s_win, s_x.XDefaultRootWindow(s_hit_dpy), 0, 0,
+		                               &s_drag_wx, &s_drag_wy, &child))
+			goto out;
+		s_drag_px = px;
+		s_drag_py = py;
+		s_drag_last_dx = s_drag_last_dy = 0;
+		s_drag_active = 1;
+		lin_log("[DisplayXR-LNX] drag: start\n");
+		active = 1;
+		goto out;
+	}
+	active = 1;
+	int dx = px - s_drag_px, dy = py - s_drag_py;
+	if (dx != s_drag_last_dx || dy != s_drag_last_dy) {
+		s_drag_last_dx = dx;
+		s_drag_last_dy = dy;
+		lin_move_client(s_hit_dpy, s_drag_wx + dx, s_drag_wy + dy);
+	}
+out:
+	pthread_mutex_unlock(&s_hit_mutex);
+	return active;
 }
 
 // ---------------------------------------------------------------------------
