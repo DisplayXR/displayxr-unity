@@ -891,6 +891,10 @@ static char *ps_resolve_runtime_json(const char *explicit_path)
 	return NULL;
 }
 
+// XrInstanceProperties.runtimeVersion of the loaded runtime (0 = unknown). Read by
+// ps_runtime_format_honest (#347).
+static uint64_t s_runtime_version = 0;
+
 #define PS_RESOLVE(name, field, type) do { \
 	PFN_xrVoidFunction _fn = NULL; \
 	s_ps.gipa(s_ps.instance, name, &_fn); \
@@ -952,6 +956,18 @@ static int ps_resolve_functions(void)
 		_fn = NULL;
 		s_ps.gipa(s_ps.instance, "xrCaptureAtlasDXR", &_fn);
 		s_ps.pfn_capture_atlas = (PFN_xrCaptureAtlasDXR)_fn;
+	}
+	// Runtime version — decides whether the runtime is format-honest (#347, ADR-044).
+	{
+		PFN_xrVoidFunction _fn = NULL;
+		s_ps.gipa(s_ps.instance, "xrGetInstanceProperties", &_fn);
+		s_runtime_version = 0;
+		XrInstanceProperties ip = {XR_TYPE_INSTANCE_PROPERTIES};
+		if (_fn && XR_SUCCEEDED(((PFN_xrGetInstanceProperties)_fn)(s_ps.instance, &ip)))
+			s_runtime_version = ip.runtimeVersion;
+		ps_log("[DisplayXR-PROV] runtime: %s %u.%u.%u\n", s_runtime_version ? ip.runtimeName : "(unknown)",
+		       (unsigned)XR_VERSION_MAJOR(s_runtime_version), (unsigned)XR_VERSION_MINOR(s_runtime_version),
+		       (unsigned)XR_VERSION_PATCH(s_runtime_version));
 	}
 	return 1;
 }
@@ -1210,8 +1226,25 @@ static void ps_publish_stereo_matrices(void); // defined after dxr_prov_begin_fr
 // correctly-encoded pixels (the standard OpenXR sRGB contract). Gamma projects and the docked
 // path keep UNORM. Safe fallback: if the runtime advertises no sRGB format, s_swapchain_srgb
 // stays 0 and everything is byte-identical to before.
+//
+// FORMAT-HONEST RUNTIMES (#347, runtime ADR-044 / INV-4.6). Since runtime v2.21.0 (D3D11),
+// v2.21.1 (D3D12) and v2.21.7 (Vulkan) the runtime believes the swapchain format: an _SRGB
+// swapchain holds ENCODED colour, and a UNORM one holds LINEAR values that it sRGB-encodes on
+// the way to the panel (OpenXR's rule, pinned by the CTS). A Gamma project's eye textures and
+// every overlay canvas hold already-ENCODED bytes, so in a UNORM swapchain they were encoded a
+// second time — washed out. On such a runtime the swapchains are therefore _SRGB, and what
+// Unity renders into is split from the swapchain format:
+//   - Linear project: Unity renders into the _SRGB format and encodes on store (as before).
+//   - Gamma project:  Unity renders into the UNORM sibling (s_unity_format) and submit's raw
+//                     copy (CopyResource / CopyTextureRegion / vkCmdCopyImage — never a blit)
+//                     moves those encoded bytes into the _SRGB image unchanged.
+// Metal is not format-honest yet (ADR-044 §7) and keeps the old rule. On an older runtime, or
+// under the runtime's own escape hatch DXR_COLOR_LEGACY_UNORM_ENCODED=1, everything stays as it
+// was before #347.
 static int s_color_space_linear = 0; // Unity project color space (C# pushes pre-session)
 static int s_swapchain_srgb     = 0; // primary swapchain created with an sRGB format
+static int s_unity_rt_srgb      = 0; // Unity encodes on store (sRGB-flagged eye textures)
+static int64_t s_unity_format   = 0; // format of what Unity renders into (bridges / eye targets)
 static int s_sc_present_path    = 1; // 1 = runtime presents (no shared texture bound); set in
                                      // session_start before ps_create_swapchain (s_probe_handle
                                      // is declared later in the file, so route it through this).
@@ -1221,7 +1254,74 @@ void dxr_prov_set_color_space_linear(int linear)
 	ps_log("[DisplayXR-PROV] color space: %s\n", linear ? "Linear" : "Gamma");
 }
 int dxr_prov_get_color_space_linear(void) { return s_color_space_linear; }
-int dxr_prov_swapchain_is_srgb(void) { return s_swapchain_srgb; }
+// "Should Unity's eye textures be sRGB-flagged" (encode on store) — NOT "is the swapchain
+// sRGB": on a format-honest runtime a Gamma project has an _SRGB swapchain but must not encode.
+int dxr_prov_swapchain_is_srgb(void) { return s_unity_rt_srgb; }
+
+// 1 when the runtime reads a UNORM swapchain as LINEAR (ADR-044), for the current graphics API.
+static int ps_runtime_format_honest(void)
+{
+	const char *legacy = getenv("DXR_COLOR_LEGACY_UNORM_ENCODED");
+	if (legacy && legacy[0]) {
+		// The runtime's own passthrough hatch (it reads the same variable, as a bool).
+		char v[8] = {0};
+		for (int i = 0; i < 7 && legacy[i]; i++)
+			v[i] = (char)((legacy[i] >= 'A' && legacy[i] <= 'Z') ? legacy[i] + 32 : legacy[i]);
+		if (strcmp(v, "0") != 0 && strcmp(v, "false") != 0 && strcmp(v, "no") != 0 &&
+		    strcmp(v, "off") != 0)
+			return 0;
+	}
+	if (s_runtime_version == 0) return 0;
+	uint64_t need;
+	switch (s_ps.graphics_api) {
+	case DXR_GFX_D3D11:  need = XR_MAKE_VERSION(2, 21, 0); break;
+	case DXR_GFX_D3D12:  need = XR_MAKE_VERSION(2, 21, 1); break;
+	case DXR_GFX_VULKAN: need = XR_MAKE_VERSION(2, 21, 7); break;
+	default:             return 0; // Metal: not migrated (ADR-044 §7)
+	}
+	return s_runtime_version >= need;
+}
+
+// The _SRGB / UNORM sibling of an 8-bit RGBA/BGRA swapchain format, in the current API's
+// numbering (DXGI and VkFormat ids collide — see ps_create_swapchain). Unknown → unchanged.
+static int64_t ps_srgb_sibling(int64_t f)
+{
+	if (s_ps.graphics_api == DXR_GFX_VULKAN) {
+		if (f == 37) return 43; // R8G8B8A8_UNORM -> _SRGB
+		if (f == 44) return 50; // B8G8R8A8_UNORM -> _SRGB
+		return f;
+	}
+	if (s_ps.graphics_api == DXR_GFX_D3D11 || s_ps.graphics_api == DXR_GFX_D3D12) {
+		if (f == 28) return 29; // R8G8B8A8_UNORM -> _UNORM_SRGB
+		if (f == 87) return 91; // B8G8R8A8_UNORM -> _UNORM_SRGB
+	}
+	return f;
+}
+static int64_t ps_unorm_sibling(int64_t f)
+{
+	if (s_ps.graphics_api == DXR_GFX_VULKAN) {
+		if (f == 43) return 37;
+		if (f == 50) return 44;
+		return f;
+	}
+	if (s_ps.graphics_api == DXR_GFX_D3D11 || s_ps.graphics_api == DXR_GFX_D3D12) {
+		if (f == 29) return 28;
+		if (f == 91) return 87;
+	}
+	return f;
+}
+
+// Pick an overlay/zone swapchain format that holds ENCODED bytes: on a format-honest runtime
+// the _SRGB sibling of `unorm` if advertised, else `unorm` itself (byte-identical to before).
+static int64_t ps_encoded_bytes_format(int64_t unorm, const int64_t *formats, uint32_t count)
+{
+	if (!ps_runtime_format_honest()) return unorm;
+	int64_t s = ps_srgb_sibling(unorm);
+	if (s == unorm) return unorm;
+	for (uint32_t i = 0; i < count; i++)
+		if (formats[i] == s) return s;
+	return unorm;
+}
 #ifdef _WIN32
 // Map the chosen XR swapchain format id to the DXGI format for the paired bridge/staging
 // resources (Unity renders into the bridge; it must match the swapchain). Pure refactor for
@@ -1315,7 +1415,10 @@ static int ps_create_swapchain(void)
 	// sRGB format so Unity encodes linear→sRGB on store (else the runtime present is too dark).
 	// Docked texture path (shared texture bound → s_probe_handle set) and Gamma projects keep UNORM.
 	int present_path = s_sc_present_path;
-	int want_srgb = s_color_space_linear && present_path;
+	// Format-honest runtime (#347): _SRGB in both colour spaces — a Gamma project's encoded
+	// bytes are copied in raw from a UNORM-sibling bridge (s_unity_format below).
+	int format_honest = ps_runtime_format_honest();
+	int want_srgb = format_honest || (s_color_space_linear && present_path);
 	int64_t format = formats[0];
 	// The int64 swapchain format is API-SPECIFIC: DXGI_FORMAT under D3D, VkFormat under
 	// Vulkan, MTLPixelFormat on Metal. They are NOT interchangeable and the numbers
@@ -1373,10 +1476,19 @@ static int ps_create_swapchain(void)
 		s_swapchain_srgb = (format == 71 || format == 81);
 #endif
 	}
-	if (want_srgb && !s_swapchain_srgb)
+	if (s_color_space_linear && present_path && !s_swapchain_srgb)
 		ps_log("[DisplayXR-PROV] WARN: Linear project but runtime advertised NO sRGB swapchain format — present stays too dark (needs a runtime-side present encode)\n");
-	ps_log("[DisplayXR-PROV] swapchain format=%lld srgb=%d (linear=%d present_path=%d)\n",
-	       (long long)format, s_swapchain_srgb, s_color_space_linear, present_path);
+	if (format_honest && !s_color_space_linear && !s_swapchain_srgb)
+		ps_log("[DisplayXR-PROV] WARN: format-honest runtime advertised NO sRGB swapchain format — "
+		       "a Gamma project's encoded bytes go into UNORM and look washed out (#347)\n");
+	// What Unity renders into: the swapchain format when Unity encodes (Linear + _SRGB), else its
+	// UNORM sibling so the encoded bytes reach the _SRGB swapchain by a raw copy (#347).
+	s_unity_rt_srgb = s_swapchain_srgb && s_color_space_linear;
+	s_unity_format = s_unity_rt_srgb ? format : ps_unorm_sibling(format);
+	ps_log("[DisplayXR-PROV] swapchain format=%lld srgb=%d unity_format=%lld unity_encodes=%d "
+	       "(linear=%d present_path=%d format_honest=%d)\n",
+	       (long long)format, s_swapchain_srgb, (long long)s_unity_format, s_unity_rt_srgb,
+	       s_color_space_linear, present_path, format_honest);
 
 	XrSwapchainCreateInfo ci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
 	ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
@@ -1546,10 +1658,10 @@ static int ps_create_bridge_vk(void)
 	if (!dxr_pvk_device_ready()) return 0;
 
 	if (dxr_prov_get_single_pass())
-		return dxr_pvk_create_bridge(-1, w, h, 2, s_ps.sc_format);
+		return dxr_pvk_create_bridge(-1, w, h, 2, s_unity_format);
 
 	for (int e = 0; e < 2; e++) {
-		if (!dxr_pvk_create_bridge(e, w, h, 1, s_ps.sc_format)) {
+		if (!dxr_pvk_create_bridge(e, w, h, 1, s_unity_format)) {
 			ps_log("[DisplayXR-PROV] Vulkan MultiPass eye %d bridge alloc failed\n", e);
 			return 0;
 		}
@@ -1814,7 +1926,7 @@ static int ps_alloc_shared_tex(uint32_t w, uint32_t h, UINT16 arr,
 		D3D12_RESOURCE_DESC pd = {};
 		pd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
 		pd.Width = w; pd.Height = h; pd.DepthOrArraySize = arr; pd.MipLevels = 1;
-		pd.Format = ps_sc_dxgi_format(s_ps.sc_format);
+		pd.Format = ps_sc_dxgi_format(s_unity_format); // what Unity renders into (#347)
 		pd.SampleDesc.Count = 1;
 		pd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
 		pd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
@@ -1839,7 +1951,7 @@ static int ps_alloc_shared_tex(uint32_t w, uint32_t h, UINT16 arr,
 	bd.Height = h;
 	bd.DepthOrArraySize = arr;
 	bd.MipLevels = 1;
-	bd.Format = ps_sc_dxgi_format(s_ps.sc_format);
+	bd.Format = ps_sc_dxgi_format(s_unity_format); // what Unity renders into (#347)
 	bd.SampleDesc.Count = 1;
 	bd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
 	bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
@@ -2033,14 +2145,14 @@ static int ps_create_bridge_d3d11(void)
 		if (sp) {
 			if (s_ps.d3d11_bridge_own) return 1; // already created (realloc releases first)
 			return ps_alloc_shared_tex_d3d11(w, h, 2, &s_ps.d3d11_bridge_own, &s_ps.d3d11_bridge_unity,
-			                                 &s_ps.d3d11_bridge_handle, s_ps.sc_format,
+			                                 &s_ps.d3d11_bridge_handle, s_unity_format,
 			                                 "Bridge D3D11 (SPI 2-slice array)");
 		}
 		if (s_ps.d3d11_bridge_own_eye[0]) return 1; // already created
 		for (int e = 0; e < 2; e++) {
 			if (!ps_alloc_shared_tex_d3d11(w, h, 1, &s_ps.d3d11_bridge_own_eye[e],
 			                               &s_ps.d3d11_bridge_unity_eye[e], &s_ps.d3d11_bridge_handle_eye[e],
-			                               s_ps.sc_format,
+			                               s_unity_format,
 			                               e == 0 ? "Bridge D3D11 (MultiPass left)" : "Bridge D3D11 (MultiPass right)"))
 				return 0;
 		}
@@ -2051,7 +2163,7 @@ static int ps_create_bridge_d3d11(void)
 	if (sp) return 1; // Unity renders straight into the runtime images; nothing to allocate.
 	if (s_ps.d3d11_bridge_unity_eye[0]) return 1; // already created
 	for (int e = 0; e < 2; e++) {
-		s_ps.d3d11_bridge_unity_eye[e] = ps_alloc_unity_tex(w, h, 1, s_ps.sc_format, /*typeless=*/1);
+		s_ps.d3d11_bridge_unity_eye[e] = ps_alloc_unity_tex(w, h, 1, s_unity_format, /*typeless=*/1);
 		if (!s_ps.d3d11_bridge_unity_eye[e]) {
 			ps_log("[DisplayXR-PROV] D3D11 zero-copy MultiPass eye %d target alloc failed\n", e);
 			return 0;
@@ -2461,6 +2573,10 @@ static int ps_create_wsui(int slot, uint32_t w, uint32_t h)
 			       "R8G8B8A8_UNORM — layer disabled\n");
 			return 0;
 		}
+		// #347: the bridge holds ENCODED canvas bytes (Unity copies them in raw); on a
+		// format-honest runtime the swapchain is their _SRGB sibling, filled by a raw copy.
+		int64_t bridge_format = format;
+		format = ps_encoded_bytes_format(bridge_format, formats, fmt_count);
 
 		XrSwapchainCreateInfo ci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
 		ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
@@ -2489,7 +2605,7 @@ static int ps_create_wsui(int slot, uint32_t w, uint32_t h)
 			return 0;
 		}
 		dxr_pvk_overlay_set_swapchain_images((PS_PVK_OVERLAY_WSUI0 + slot), vk_imgs, count, format);
-		if (!dxr_pvk_overlay_create_bridge((PS_PVK_OVERLAY_WSUI0 + slot), w, h, format)) {
+		if (!dxr_pvk_overlay_create_bridge((PS_PVK_OVERLAY_WSUI0 + slot), w, h, bridge_format)) {
 			ps_log("[DisplayXR-PROV] wsui: Vulkan overlay bridge create failed\n");
 			return 0;
 		}
@@ -2584,6 +2700,9 @@ static int ps_create_wsui(int slot, uint32_t w, uint32_t h)
 	s_ps.pfn_enumerate_swapchain_formats(s_ps.session, fmt_count, &fmt_count, formats);
 	int64_t format = formats[0];
 	for (uint32_t i = 0; i < fmt_count; i++) { if (formats[i] == 87) { format = 87; break; } }
+	// #347: encoded canvas bytes, copied raw (CopyResource / CopyTextureRegion) from the
+	// B8G8R8A8_UNORM target — so the _SRGB sibling on a format-honest runtime.
+	format = ps_encoded_bytes_format(format, formats, fmt_count);
 
 	XrSwapchainCreateInfo ci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
 	ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
@@ -2908,6 +3027,10 @@ static int ps_create_local2d(uint32_t w, uint32_t h)
 			       "R8G8B8A8_UNORM — layer disabled\n");
 			return 0;
 		}
+		// #347: the bridge holds ENCODED canvas bytes (Unity copies them in raw); on a
+		// format-honest runtime the swapchain is their _SRGB sibling, filled by a raw copy.
+		int64_t bridge_format = format;
+		format = ps_encoded_bytes_format(bridge_format, formats, fmt_count);
 
 		XrSwapchainCreateInfo ci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
 		ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
@@ -2936,7 +3059,7 @@ static int ps_create_local2d(uint32_t w, uint32_t h)
 			return 0;
 		}
 		dxr_pvk_overlay_set_swapchain_images(PS_PVK_OVERLAY_LOCAL2D, vk_imgs, count, format);
-		if (!dxr_pvk_overlay_create_bridge(PS_PVK_OVERLAY_LOCAL2D, w, h, format)) {
+		if (!dxr_pvk_overlay_create_bridge(PS_PVK_OVERLAY_LOCAL2D, w, h, bridge_format)) {
 			ps_log("[DisplayXR-PROV] local2d: Vulkan overlay bridge create failed\n");
 			return 0;
 		}
@@ -3027,6 +3150,9 @@ static int ps_create_local2d(uint32_t w, uint32_t h)
 	s_ps.pfn_enumerate_swapchain_formats(s_ps.session, fmt_count, &fmt_count, formats);
 	int64_t format = formats[0];
 	for (uint32_t i = 0; i < fmt_count; i++) { if (formats[i] == 87) { format = 87; break; } }
+	// #347: encoded canvas bytes, copied raw (CopyResource / CopyTextureRegion) from the
+	// B8G8R8A8_UNORM target — so the _SRGB sibling on a format-honest runtime.
+	format = ps_encoded_bytes_format(format, formats, fmt_count);
 
 	XrSwapchainCreateInfo ci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
 	ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
@@ -3418,10 +3544,14 @@ static int ps_create_extra_zone(ProviderExtraZone *z)
 	s_ps.pfn_enumerate_swapchain_formats(s_ps.session, fmt_count, &fmt_count, formats);
 	int64_t format = formats[0];
 	for (uint32_t i = 0; i < fmt_count; i++) { if (formats[i] == 28) { format = 28; break; } if (formats[i] == 87) format = 87; }
+	// #347: a Gamma project's zone targets hold ENCODED bytes (raw-copied below), so on a
+	// format-honest runtime the zone swapchain is their _SRGB sibling. Unity's targets keep
+	// `format`. Linear projects are unchanged (their zone targets are not sRGB-flagged).
+	int64_t zone_sc_format = s_color_space_linear ? format : ps_encoded_bytes_format(format, formats, fmt_count);
 
 	XrSwapchainCreateInfo ci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
 	ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
-	ci.format = format; ci.sampleCount = 1; ci.width = w; ci.height = h;
+	ci.format = zone_sc_format; ci.sampleCount = 1; ci.width = w; ci.height = h;
 	ci.faceCount = 1; ci.arraySize = 2; ci.mipCount = 1;
 	if (XR_FAILED(s_ps.pfn_create_swapchain(s_ps.session, &ci, &z->swapchain))) { z->swapchain = XR_NULL_HANDLE; return 0; }
 	z->sc_width = w; z->sc_height = h; z->sc_format = format;
@@ -6622,7 +6752,7 @@ static void ps_diag_fill_bridge_colors(UINT n)
 		}
 		bsz = s_ps.own_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 	}
-	DXGI_FORMAT rtvFmt = (s_ps.sc_format == 87) ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
+	DXGI_FORMAT rtvFmt = (ps_unorm_sibling(s_unity_format) == 87) ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
 	const float colors[2][4] = { {0.0f, 0.0f, 1.0f, 1.0f},   // eye 0 = BLUE
 	                             {1.0f, 0.0f, 0.0f, 1.0f} };  // eye 1 = RED
 	int sp = dxr_prov_get_single_pass();
@@ -6691,7 +6821,7 @@ static void ps_diag_readback_bridge_once(void)
 	s_ps.own_cmd_list->ResourceBarrier(1, &b);
 	D3D12_TEXTURE_COPY_LOCATION dl = {}; dl.pResource = rb;
 	dl.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
-	dl.PlacedFootprint.Footprint.Format = (s_ps.sc_format == 87) ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
+	dl.PlacedFootprint.Footprint.Format = (ps_unorm_sibling(s_unity_format) == 87) ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
 	dl.PlacedFootprint.Footprint.Width = (UINT)rd.Width;
 	dl.PlacedFootprint.Footprint.Height = 1;
 	dl.PlacedFootprint.Footprint.Depth = 1;
@@ -6737,7 +6867,7 @@ static void ps_diag_preclear_bridge_green(void)
 		if (FAILED(s_ps.own_device->CreateDescriptorHeap(&hd, __uuidof(ID3D12DescriptorHeap), (void **)&gh)) || !gh) return;
 		gsz = s_ps.own_device->GetDescriptorHandleIncrementSize(D3D12_DESCRIPTOR_HEAP_TYPE_RTV);
 	}
-	DXGI_FORMAT rtvFmt = (s_ps.sc_format == 87) ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
+	DXGI_FORMAT rtvFmt = (ps_unorm_sibling(s_unity_format) == 87) ? DXGI_FORMAT_B8G8R8A8_UNORM : DXGI_FORMAT_R8G8B8A8_UNORM;
 	const float green[4] = {0.0f, 1.0f, 0.0f, 1.0f};
 	int sp = dxr_prov_get_single_pass();
 	s_ps.own_cmd_alloc->Reset();
