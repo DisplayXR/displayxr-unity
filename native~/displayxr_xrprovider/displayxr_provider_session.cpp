@@ -1094,6 +1094,25 @@ extern "C" int dxr_prov_workspace_tile_size(uint32_t *w, uint32_t *h)
 	return 0;
 }
 
+// The last LIVE size ps_window_size measured (tile canvas or the bound window's client),
+// packed w<<32|h; 0 = none yet / only the display-dims fallback. Published for C#
+// (dxr_prov_get_composited_size): DisplayXRWindowSpaceUI derives its panel aspect from it,
+// because in a transparent-overlay app Screen.* is the size of Unity's own CLOAKED window,
+// which has nothing to do with the window the runtime composites into. A cached value, not a
+// live query, on purpose: on Linux the measurement goes through the X connection the runtime
+// borrows (see displayxr_linux.c), which must not be driven from Unity's main thread.
+static std::atomic<uint64_t> s_live_window_px{0};
+
+int dxr_prov_get_composited_size(uint32_t *w, uint32_t *h)
+{
+	uint64_t v = s_live_window_px.load();
+	uint32_t ww = (uint32_t)(v >> 32), hh = (uint32_t)(v & 0xffffffffu);
+	if (!s_ps.running || ww == 0 || hh == 0) return 0;
+	if (w) *w = ww;
+	if (h) *h = hh;
+	return 1;
+}
+
 // The size the app + provider render/author for. In workspace-tile mode (#225)
 // this is the shell-driven tile canvas (so the render follows 3D-window resize);
 // otherwise the bound overlay's live client size (= Unity's window client area).
@@ -1108,6 +1127,7 @@ static void ps_window_size(uint32_t *w, uint32_t *h)
 			ps_query_tile_size(); // lazy first fetch until the slot binds
 		if (s_ps.tile_px_w > 0 && s_ps.tile_px_h > 0) {
 			*w = s_ps.tile_px_w; *h = s_ps.tile_px_h;
+			s_live_window_px.store(((uint64_t)s_ps.tile_px_w << 32) | s_ps.tile_px_h);
 			return;
 		}
 	}
@@ -1130,6 +1150,7 @@ static void ps_window_size(uint32_t *w, uint32_t *h)
 	// self-hosting), which falls through to the display-info default below.
 	displayxr_linux_window_size(&ww, &hh);
 #endif
+	if (ww > 0 && hh > 0) s_live_window_px.store(((uint64_t)ww << 32) | hh); // a real measurement
 	if (ww == 0 || hh == 0) {
 		ww = s_ps.display_info.is_valid ? s_ps.display_info.pixel_width : 1920;
 		hh = s_ps.display_info.is_valid ? s_ps.display_info.pixel_height : 1080;
@@ -5023,6 +5044,7 @@ int dxr_prov_session_start(const char *runtime_json_path,
 
 void dxr_prov_session_stop(void)
 {
+	s_live_window_px.store(0); // the next session measures its own window
 	for (int i = 0; i < PS_MAX_WSUI; i++) {
 		ProviderWsui *ws = &s_ps.wsui[i];
 		if (ws->swapchain && s_ps.pfn_destroy_swapchain) s_ps.pfn_destroy_swapchain(ws->swapchain);

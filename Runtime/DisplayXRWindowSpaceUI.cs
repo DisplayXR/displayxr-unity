@@ -112,6 +112,7 @@ namespace DisplayXR
         private const int kPanelSizeNone = 0;
         private const int kPanelSizeTile = 1;
         private const int kPanelSizeScreen = 2;
+        private const int kPanelSizeComposited = 3;
         private int m_PanelSizeSource = kPanelSizeNone;
         private int m_ShellMode = -1; // -1 = not yet queried
 
@@ -675,8 +676,20 @@ namespace DisplayXR
                 cw = tw; ch = th;
                 source = kPanelSizeTile;
             }
-            // Built-app / Play Mode: the runtime composites into Unity's main
-            // window, so Screen.* is meaningful.
+            // The window the runtime actually composites into, as the provider last
+            // measured it (the eye swapchain is sized from the same number). In a
+            // transparent-overlay app that is the visible overlay window, while Unity's own
+            // window is cloaked/parked at whatever size Unity persisted (observed 512x728 and
+            // 3872x2248 next to a 3840x2160 overlay; it grows by the frame size each run) —
+            // so Screen.* gave a wrong aspect and squeezed the HUD. Only the ASPECT is used
+            // (see ComputeRtSize), so the native-DPI pixels need no conversion.
+            else if (TryGetCompositedSize(out float qw, out float qh))
+            {
+                cw = qw; ch = qh;
+                source = kPanelSizeComposited;
+            }
+            // No provider session (or an older native plugin): Screen.*, which is right
+            // whenever the runtime composites into Unity's main window.
             else if (Screen.width > 0 && Screen.height > 0)
             {
                 cw = Screen.width; ch = Screen.height;
@@ -695,13 +708,36 @@ namespace DisplayXR
             {
                 m_PanelSizeSource = source;
                 Debug.Log($"[DisplayXR] wsui: panel size source = " +
-                          $"{(source == kPanelSizeTile ? "workspace tile" : "Screen.*")} " +
+                          $"{(source == kPanelSizeTile ? "workspace tile" : source == kPanelSizeComposited ? "composited window" : "Screen.*")} " +
                           $"({cw}x{ch})");
             }
 
             pw = cw * Mathf.Clamp01(width);
             ph = ch * Mathf.Clamp01(height);
             return true;
+        }
+
+        // The provider's last measured composited window size; false with no provider
+        // session, before the first measurement, or against a native plugin without the
+        // export (then never asked again).
+        private static bool s_CompositedSizeMissing;
+        private bool TryGetCompositedSize(out float w, out float h)
+        {
+            w = h = 0f;
+            if (s_CompositedSizeMissing || !DisplayXRProviderDriver.IsActive) return false;
+            try
+            {
+                if (DisplayXRProviderNative.dxr_prov_get_composited_size(out uint cw, out uint ch) == 0 ||
+                    cw == 0 || ch == 0)
+                    return false;
+                w = cw; h = ch;
+                return true;
+            }
+            catch (System.EntryPointNotFoundException)
+            {
+                s_CompositedSizeMissing = true;
+                return false;
+            }
         }
 
         // The live workspace-tile canvas in px, or false when there is no tile size
