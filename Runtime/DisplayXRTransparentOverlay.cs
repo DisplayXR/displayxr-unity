@@ -951,8 +951,129 @@ namespace DisplayXR
             }
             MAC_HITTEST_DONE:;
             #endif
+#elif UNITY_STANDALONE_LINUX && !UNITY_EDITOR
+            LinuxClickThroughAndDrag();
 #endif
         }
+
+#if UNITY_STANDALONE_LINUX && !UNITY_EDITOR
+        bool m_LinuxNativeMissing;
+
+        // (#332) Linux transparent overlay: click-through + right-drag move.
+        //
+        // Unity's window is the one that takes input here (the weave overlay above
+        // it takes none), and the pointer is live (UpdatePointerFromInputSystem).
+        // So this is the macOS path — cyclopean hit-test, hover and button events —
+        // plus the two native pieces Windows does in its overlay WndProc:
+        //  - the click-through region: the same AABB + per-pixel silhouette mask the
+        //    Windows path pushes, which native turns into an XShape INPUT region on
+        //    Unity's window (outside it, clicks reach the desktop);
+        //  - right-drag move: native follows the root pointer and moves Unity's
+        //    window while the right button is held. A press can only reach us
+        //    inside the region, so a drag starts on the avatar, a HUD or the bubble.
+        // Native no-ops all of it outside transparent mode.
+        void LinuxClickThroughAndDrag()
+        {
+            if (m_Camera == null || m_LinuxNativeMissing) return;
+            if (DisplayXRRigManager.ActiveCamera != null
+                && DisplayXRRigManager.ActiveCamera != m_Camera)
+                return;
+
+            try
+            {
+                DisplayXRNative.displayxr_linux_drag_window(IsRightPressed ? 1 : 0);
+            }
+            catch (EntryPointNotFoundException)
+            {
+                // Older native plugin: no click-through or drag on Linux.
+                m_LinuxNativeMissing = true;
+                return;
+            }
+
+            if (clickableRenderers == null || clickableRenderers.Length == 0)
+                return;
+
+            int overlayW = Screen.width, overlayH = Screen.height;
+            int clientX = Mathf.RoundToInt(PointerPosition.x);
+            int clientY = Mathf.RoundToInt(PointerPosition.y);
+            int buttons = (IsLeftPressed ? 1 : 0) | (IsRightPressed ? 2 : 0);
+            UpdateBakedHitColliders();
+
+            Renderer hitRenderer = null;
+            if (clientX >= 0 && clientY >= 0
+                && TryGetStereoMatrices(out Matrix4x4 lv, out Matrix4x4 lp,
+                                         out Matrix4x4 rv, out Matrix4x4 rp))
+            {
+                BuildCyclopean(lv, lp, rv, rp, out Matrix4x4 cv, out Matrix4x4 cp);
+                GetStereoViewport(overlayW, overlayH,
+                                  out int vpX, out int vpY, out int vpW, out int vpH);
+                if (TryBuildEyeRay(clientX, clientY, vpX, vpY, vpW, vpH, cv, cp, out Ray ray))
+                {
+                    float bestT = m_Camera.farClipPlane;
+                    for (int i = 0; i < clickableRenderers.Length; i++)
+                    {
+                        var r = clickableRenderers[i];
+                        if (!IsHitTestable(r)) continue;
+                        if (r is SkinnedMeshRenderer smr)
+                        {
+                            if (TryRayHitBakedSkinnedMesh(ray, bestT, smr, out float t))
+                            {
+                                hitRenderer = r;
+                                bestT = t;
+                            }
+                        }
+                        else if (Physics.Raycast(ray, out RaycastHit info, bestT)
+                                 && info.collider != null
+                                 && info.collider.transform.IsChildOf(r.transform))
+                        {
+                            hitRenderer = r;
+                            bestT = info.distance;
+                        }
+                    }
+                }
+            }
+
+            // Same sticky-frame hysteresis as Win32 / macOS.
+            const int STICKY_FRAMES_LINUX = 8;
+            if (hitRenderer != null)
+            {
+                m_LastHitRenderer = hitRenderer;
+                m_LastHitFrame = Time.frameCount;
+            }
+            else if (m_LastHitRenderer != null
+                     && Time.frameCount - m_LastHitFrame <= STICKY_FRAMES_LINUX)
+            {
+                hitRenderer = m_LastHitRenderer;
+            }
+            else
+            {
+                m_LastHitRenderer = null;
+            }
+
+            if (hitRenderer != m_HoverRenderer)
+            {
+                if (m_HoverRenderer != null) onPointerExit?.Invoke(m_HoverRenderer);
+                if (hitRenderer != null) onPointerEnter?.Invoke(hitRenderer);
+                m_HoverRenderer = hitRenderer;
+            }
+            DispatchButton(buttons, 1, ref m_LeftWasDown, hitRenderer);
+            DispatchButton(buttons, 2, ref m_RightWasDown, hitRenderer);
+
+            // The click-through region: AABB until the first silhouette readback
+            // lands, then the per-pixel mask (OnHitMaskReadback) — as on Windows.
+            if (TryGetStereoMatrices(out Matrix4x4 lv2, out Matrix4x4 lp2,
+                                     out Matrix4x4 rv2, out Matrix4x4 rp2))
+            {
+                BuildCyclopean(lv2, lp2, rv2, rp2, out Matrix4x4 cv2, out Matrix4x4 cp2);
+                if (TryGetUnionScreenRect(overlayW, overlayH, cv2, cp2,
+                                          out int rx, out int ry, out int rw, out int rh))
+                {
+                    DisplayXRNative.displayxr_set_overlay_hit_rect(rx, ry, rw, rh);
+                }
+                RenderHitMaskAndRequestReadback(lv2, lp2, rv2, rp2, overlayW, overlayH);
+            }
+        }
+#endif
 
         private void DispatchButton(int buttons, int mask, ref bool wasDown, Renderer hit)
         {
@@ -1779,7 +1900,7 @@ namespace DisplayXR
             if (m_HitMaskRT == null) return;
 
             var data = req.GetData<byte>();
-#if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
+#if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN || (UNITY_STANDALONE_LINUX && !UNITY_EDITOR)
             unsafe
             {
                 IntPtr ptr = (IntPtr)Unity.Collections.LowLevel.Unsafe
@@ -1788,6 +1909,7 @@ namespace DisplayXR
                     ptr,
                     m_HitMaskPendingW, m_HitMaskPendingH,
                     m_HitMaskPendingDstW, m_HitMaskPendingDstH);
+#if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
 
                 // Rear depth budget v3 (#318): the very same silhouette. The runtime
                 // decides how much rear depth this overlay may draw from the desktop
@@ -1804,6 +1926,7 @@ namespace DisplayXR
                         ptr, (uint)m_HitMaskPendingW, (uint)m_HitMaskPendingH,
                         (uint)m_HitMaskPendingW);
                 }
+#endif
             }
             if (s_DumpHitMask && (m_HitMaskDumpCounter++ % 15) == 0)
                 DumpHitMaskPng(data, m_HitMaskPendingW, m_HitMaskPendingH);
@@ -1877,7 +2000,7 @@ namespace DisplayXR
             }
             // Tell native to drop the mask region (reverts to AABB-
             // region path for the next hit_rect push).
-#if UNITY_STANDALONE_WIN
+#if UNITY_STANDALONE_WIN || (UNITY_STANDALONE_LINUX && !UNITY_EDITOR)
             if (!Application.isEditor)
                 DisplayXRNative.displayxr_set_overlay_hit_mask(IntPtr.Zero, 0, 0, 0, 0);
 #endif
