@@ -965,6 +965,16 @@ static int ps_resolve_functions(void)
 		XrInstanceProperties ip = {XR_TYPE_INSTANCE_PROPERTIES};
 		if (_fn && XR_SUCCEEDED(((PFN_xrGetInstanceProperties)_fn)(s_ps.instance, &ip)))
 			s_runtime_version = ip.runtimeVersion;
+		// Linux runtimes report runtimeVersion 1.6.0 (DisplayXR/displayxr-runtime#1790 — the
+		// Linux build never syncs its CMake VERSION from the release tag), and every Linux
+		// .deb shipped so far carries it, so fall back to the 'vX.Y.Z' tag the runtime puts
+		// in runtimeName ("DisplayXR Runtime (...) 'v2.21.11'"). Found by Byungju on #348.
+		if (s_runtime_version && XR_VERSION_MAJOR(s_runtime_version) < 2) {
+			const char *q = strstr(ip.runtimeName, "'v");
+			unsigned a = 0, b = 0, c = 0;
+			if (q && sscanf(q + 2, "%u.%u.%u", &a, &b, &c) == 3 && a >= 2)
+				s_runtime_version = XR_MAKE_VERSION(a, b, c);
+		}
 		ps_log("[DisplayXR-PROV] runtime: %s %u.%u.%u\n", s_runtime_version ? ip.runtimeName : "(unknown)",
 		       (unsigned)XR_VERSION_MAJOR(s_runtime_version), (unsigned)XR_VERSION_MINOR(s_runtime_version),
 		       (unsigned)XR_VERSION_PATCH(s_runtime_version));
