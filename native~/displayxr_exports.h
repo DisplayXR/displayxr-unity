@@ -404,6 +404,10 @@ DISPLAYXR_EXPORT void displayxr_set_overlay_surround_mask(const uint8_t *mask, i
 /// right button's state; returns 1 while a drag is in progress. Moves Unity's
 /// window (the overlay follows it). No-op outside transparent mode.
 DISPLAYXR_EXPORT int displayxr_linux_drag_window(int right_pressed);
+
+/// (#332) 1 while the transparent overlay is up and the click-through exports act; 0 for
+/// the opaque child or without X. Cached state only — cheap to poll every frame.
+DISPLAYXR_EXPORT int displayxr_linux_click_through_active(void);
 #endif
 
 #ifdef __cplusplus

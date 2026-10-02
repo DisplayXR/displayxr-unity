@@ -555,6 +555,14 @@ namespace DisplayXR
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern int displayxr_linux_drag_window(int right_pressed);
+
+        /// <summary>
+        /// (#332) 1 while the Linux transparent overlay is up and the click-through
+        /// exports act; 0 for the opaque child window or without X. Cached state,
+        /// cheap to poll every frame.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int displayxr_linux_click_through_active();
 #endif
 
     }

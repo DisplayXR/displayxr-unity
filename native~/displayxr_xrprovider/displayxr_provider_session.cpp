@@ -6531,6 +6531,19 @@ int dxr_prov_get_zone_rect_px(uint32_t zone, int *x, int *y, int *w, int *h)
 	return 1;
 }
 
+// Zone 0's rect, only while a 3D zone is active; 0 otherwise. Unlike
+// dxr_prov_get_zone_rect_px(0) it never falls back to the live window size, so it never
+// reaches the platform window query — on Linux an XGetGeometry on the connection the
+// graphics thread and the runtime share. Reads cached state only; any thread (#332).
+int dxr_prov_get_active_zone_rect_px(int *x, int *y, int *w, int *h)
+{
+	if (!s_ps.zone_valid || s_ps.zone_caps_ok <= 0) return 0;
+	if (s_ps.zone_w == 0 || s_ps.zone_h == 0) return 0;
+	if (x) *x = s_ps.zone_x; if (y) *y = s_ps.zone_y;
+	if (w) *w = s_ps.zone_w; if (h) *h = s_ps.zone_h;
+	return 1;
+}
+
 // DIAGNOSTIC (DISPLAYXR_PROV_SLICE_COLORS=1): record clears of the acquired swapchain image's
 // array slice 0 = solid BLUE and slice 1 = solid RED onto the own command list (caller has
 // already Reset it and will Close + execute). Used to test whether the runtime's texture-mode

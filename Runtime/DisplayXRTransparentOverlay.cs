@@ -981,6 +981,9 @@ namespace DisplayXR
 
             try
             {
+                // Opaque child window (no compositor, …): nothing to click through to.
+                if (DisplayXRNative.displayxr_linux_click_through_active() == 0)
+                    return;
                 DisplayXRNative.displayxr_linux_drag_window(IsRightPressed ? 1 : 0);
             }
             catch (EntryPointNotFoundException)
@@ -999,12 +1002,14 @@ namespace DisplayXR
             int buttons = (IsLeftPressed ? 1 : 0) | (IsRightPressed ? 2 : 0);
             UpdateBakedHitColliders();
 
+            bool haveViews = TryGetStereoMatrices(out Matrix4x4 lv, out Matrix4x4 lp,
+                                                  out Matrix4x4 rv, out Matrix4x4 rp);
+            Matrix4x4 cv = Matrix4x4.identity, cp = Matrix4x4.identity;
+            if (haveViews) BuildCyclopean(lv, lp, rv, rp, out cv, out cp);
+
             Renderer hitRenderer = null;
-            if (clientX >= 0 && clientY >= 0
-                && TryGetStereoMatrices(out Matrix4x4 lv, out Matrix4x4 lp,
-                                         out Matrix4x4 rv, out Matrix4x4 rp))
+            if (clientX >= 0 && clientY >= 0 && haveViews)
             {
-                BuildCyclopean(lv, lp, rv, rp, out Matrix4x4 cv, out Matrix4x4 cp);
                 GetStereoViewport(overlayW, overlayH,
                                   out int vpX, out int vpY, out int vpW, out int vpH);
                 if (TryBuildEyeRay(clientX, clientY, vpX, vpY, vpW, vpH, cv, cp, out Ray ray))
@@ -1061,16 +1066,14 @@ namespace DisplayXR
 
             // The click-through region: AABB until the first silhouette readback
             // lands, then the per-pixel mask (OnHitMaskReadback) — as on Windows.
-            if (TryGetStereoMatrices(out Matrix4x4 lv2, out Matrix4x4 lp2,
-                                     out Matrix4x4 rv2, out Matrix4x4 rp2))
+            if (haveViews)
             {
-                BuildCyclopean(lv2, lp2, rv2, rp2, out Matrix4x4 cv2, out Matrix4x4 cp2);
-                if (TryGetUnionScreenRect(overlayW, overlayH, cv2, cp2,
+                if (TryGetUnionScreenRect(overlayW, overlayH, cv, cp,
                                           out int rx, out int ry, out int rw, out int rh))
                 {
                     DisplayXRNative.displayxr_set_overlay_hit_rect(rx, ry, rw, rh);
                 }
-                RenderHitMaskAndRequestReadback(lv2, lp2, rv2, rp2, overlayW, overlayH);
+                RenderHitMaskAndRequestReadback(lv, lp, rv, rp, overlayW, overlayH);
             }
         }
 #endif
