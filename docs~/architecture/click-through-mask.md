@@ -53,6 +53,29 @@ DisplayXRTransparentOverlay.LateUpdate (C#)                 native (win32.c)
   displays a column-by-column union of the eyes; a cyclopean-only mask is narrower than the
   visible silhouette on high-disparity foreground geometry (hands, hat) and would clip.
 
+## Window-space UI HUDs are part of the region (#350)
+
+`SetWindowRgn` is a **visual clip, not only a hit mask**: a pixel outside the region does not
+exist for the window, post-weave composition layers included. A `DisplayXRWindowSpaceUI` HUD
+(an `XrCompositionLayerWindowSpaceDXR` layer) anywhere off the silhouette was therefore cut
+away. Native now unions the rect of every **live** wsui slot into every region it builds
+(the hit-mask region, which also carries the surround rect/mask, and the AABB hit-rect
+region used before the first mask), with **no app call**, which is the same rule as the Linux input region (#346).
+
+- **Frame:** a slot's fractions are of the **whole window client**, not of zone 0 or the canvas
+  sub-rect. The runtime draws the layer into each per-view tile, and the tile spans the full
+  window both in a plain projection frame and in a zones frame (it composes each zone *into*
+  a window-spanning tile). The rect is widened by `|disparity|/2` on each side (the per-eye shift)
+  and rounded outward. The runtime citation is in `wsui_region_rects` (`displayxr_win32.c`).
+- **Space:** the rect is scaled by the same client size the silhouette uses (`dst_w`/`dst_h`, or
+  `displayxr_get_overlay_size` on the hit-rect path), never by managed `Screen.*`.
+- **Live:** a slot counts only while a texture is registered, which is exactly when the
+  provider submits the layer. A disabled HUD (slot released) leaves the region on the next
+  rebuild. Because the HUD rects feed the region hash (and bypass the hit-rect hysteresis), a
+  show or hide re-applies the region, while a static HUD costs no extra `SetWindowRgn`.
+- **Clicks** inside a HUD reach the app by the same token: the borderless overlay's
+  `WM_NCHITTEST` claims `HTCLIENT` for any hit the OS delivers.
+
 ## The mask's second consumer: the rear depth budget
 
 The very same readback is chained to the runtime as **`XrContentMaskDXR`**
