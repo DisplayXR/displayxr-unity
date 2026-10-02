@@ -26,6 +26,7 @@
 #include "displayxr_exports.h"
 #include "displayxr_shared_state.h"
 #include "displayxr_win32.h" // own decls — newer GCC (MinGW cross-check) errors on implicit declarations
+#include "displayxr_window_space_ui.h" // DXR_WSUI_MAX_SLOTS, get_pending_slot (#350 HUD rects in the region)
 
 #pragma comment(lib, "dwmapi.lib")
 
@@ -3297,6 +3298,89 @@ managed_window_hwnd(void)
 	return NULL;
 }
 
+// (#350) Window-space UI HUDs are part of the region.
+//
+// SetWindowRgn is a VISUAL clip, not only a hit mask: a pixel outside the region
+// does not exist for the window, post-weave composition layers included. Every
+// region below is built around the avatar silhouette, so a HUD
+// (DisplayXRWindowSpaceUI -> XrCompositionLayerWindowSpaceDXR) anywhere off the
+// silhouette was cut away. Native already knows every live HUD's placement (the
+// wsui slot registry), so each live slot's rect is unioned into the region here,
+// with no app call -- the same rule as the Linux input region (#346,
+// lin_rects_add_wsui) and the model viewer's "chrome" rects
+// (displayxr-common vk_clickthrough_region.h). Clicks inside a HUD then reach the
+// app by the same token: the borderless overlay's WM_NCHITTEST claims HTCLIENT for
+// every hit the OS delivers, so nothing rejects them separately.
+//
+// FRAME: a slot's x/y/w/h/disparity are fractions of the WHOLE window client, not
+// of zone 0 or a canvas sub-rect. The runtime draws a window-space layer into each
+// per-view tile of the atlas at tile_origin + (x +- disparity/2) * tile_w
+// (displayxr-runtime de3f621, comp_d3d12_renderer.cpp render_window_space_layer +
+// comp_d3d12_renderer_draw_window_space_pass; comp_d3d11_renderer.cpp
+// render_window_space_layer, frac -> NDC of the view viewport; vk_native
+// comp_vk_native_compositor.c ~2660, dx = tile_origin_x + (ws->x + eye_shift) *
+// tile_w), and the tile is the whole window in BOTH frame kinds the provider
+// submits: a plain projection frame weaves the tile over the full target (no
+// effective canvas -> full-target fallback, d3d12_effective_canvas), and a zones
+// frame -- what the provider sends whenever a 3D zone is set -- composes each zone
+// INTO a window-spanning tile ("in zones frames the tile spans the full window",
+// comp_d3d12_renderer.cpp ~3245 / comp_d3d11_renderer.cpp ~1897). So zone 0's
+// rect is the wrong frame whenever the zone is a sub-rect (an avatar app keeps its
+// bubble band beside it).
+//
+// Each eye is shifted by +-disparity/2 (graded across views for >2, same
+// extremes), so the rect is widened by |disparity|/2 on each side and rounded
+// OUTWARD, like the silhouette rects.
+//
+// SPACE: client_w/client_h must be the SAME client size the caller maps the
+// silhouette with (displayxr_get_overlay_size's GetClientRect, on the thread that
+// calls SetWindowRgn), so the HUD rects live in exactly the space as the rest of
+// the region whatever DPI awareness that thread has. Never Screen.* from managed.
+//
+// LIVE: get_pending_slot returns 1 only while a texture is registered in the slot
+// (release_slot / clear_slot null it), which is exactly when the provider submits
+// the layer. A HUD that is disabled (OnDisable -> release) therefore drops out of
+// the region on the next rebuild. Cost: <= DXR_WSUI_MAX_SLOTS volatile reads.
+//
+// THREAD: the slot registry is written from managed on the main thread
+// (DisplayXRWindowSpaceUI), and both region builders run on the main thread too
+// (LateUpdate / the AsyncGPUReadback callback), so these reads never race a
+// writer. No provider state is read and no window query is made here.
+static int
+wsui_region_rects(int client_w, int client_h, RECT out[DXR_WSUI_MAX_SLOTS])
+{
+	int n = 0;
+	if (client_w <= 0 || client_h <= 0)
+		return 0;
+	for (int slot = 0; slot < DXR_WSUI_MAX_SLOTS; slot++) {
+		float fx = 0, fy = 0, fw = 0, fh = 0, disp = 0;
+		if (!displayxr_window_space_ui_get_pending_slot(slot, NULL, NULL, NULL,
+		                                                &fx, &fy, &fw, &fh, &disp))
+			continue;
+		if (!(fw > 0.0f) || !(fh > 0.0f)) // also rejects NaN
+			continue;
+		double half = (disp < 0.0f ? -(double)disp : (double)disp) * 0.5;
+		double l = ((double)fx - half) * client_w;
+		double t = (double)fy * client_h;
+		double r = ((double)fx + fw + half) * client_w;
+		double b = ((double)fy + fh) * client_h;
+		// Clamp to the client (also keeps garbage fractions out of LONG range).
+		if (l < 0) l = 0;
+		if (t < 0) t = 0;
+		if (r > client_w) r = client_w;
+		if (b > client_h) b = client_h;
+		LONG il = (LONG)l, it = (LONG)t;                 // floor (non-negative)
+		LONG ir = (LONG)r, ib = (LONG)b;
+		if ((double)ir < r) ir++;                        // ceil
+		if ((double)ib < b) ib++;
+		if (ir <= il || ib <= it)
+			continue;
+		out[n].left = il; out[n].top = it; out[n].right = ir; out[n].bottom = ib;
+		n++;
+	}
+	return n;
+}
+
 void
 displayxr_set_overlay_hit_rect(int x, int y, int w, int h)
 {
@@ -3320,12 +3404,37 @@ displayxr_set_overlay_hit_rect(int x, int y, int w, int h)
 	// {INT_MIN,...} so the first call always goes through. Also reset
 	// to sentinel when we clear the region (w<=0 path below).
 	static RECT s_last_rgn_rect = { INT_MIN, INT_MIN, INT_MIN, INT_MIN };
+	// (#350) Hash of the HUD rects in the last applied region. A HUD shown, hidden
+	// or moved changes it and bypasses the hysteresis below; a static HUD does not.
+	static unsigned long long s_last_hud_hash = 0;
 
 	if (w <= 0 || h <= 0) {
 		SetWindowRgn(target, NULL, TRUE);
 		s_last_rgn_rect.left = INT_MIN;
+		s_last_hud_hash = 0;
 		displayxr_log("[DisplayXR] hit_region: cleared (overlay catches everywhere)\n");
 		return;
+	}
+
+	// (#350) Live HUD rects, in the same client space C# computed (x,y,w,h) in:
+	// its overlayW/H come from displayxr_get_overlay_size on this thread.
+	RECT hud[DXR_WSUI_MAX_SLOTS];
+	int  n_hud = 0;
+	{
+		int cw = 0, ch = 0;
+		displayxr_get_overlay_size(&cw, &ch);
+		n_hud = wsui_region_rects(cw, ch, hud);
+	}
+	unsigned long long hud_hash = 1469598103934665603ULL; /* FNV-1a 64 */
+	{
+		const unsigned char *hb = (const unsigned char *)hud;
+		size_t hn = (size_t)n_hud * sizeof(RECT);
+		for (size_t hi = 0; hi < hn; hi++) {
+			hud_hash ^= hb[hi];
+			hud_hash *= 1099511628211ULL;
+		}
+		hud_hash ^= (unsigned long long)(unsigned)n_hud;
+		hud_hash *= 1099511628211ULL;
 	}
 
 	// Pad — gives the cursor a hysteresis margin outside the silhouette.
@@ -3340,7 +3449,7 @@ displayxr_set_overlay_hit_rect(int x, int y, int w, int h)
 	// threshold of the last applied rect. Compares against the PADDED
 	// rect so the comparison is in the same coordinate space as what
 	// we'd push.
-	if (s_last_rgn_rect.left != INT_MIN) {
+	if (s_last_rgn_rect.left != INT_MIN && hud_hash == s_last_hud_hash) {
 		LONG dl = padded.left   - s_last_rgn_rect.left;
 		LONG dt = padded.top    - s_last_rgn_rect.top;
 		LONG dr = padded.right  - s_last_rgn_rect.right;
@@ -3365,6 +3474,14 @@ displayxr_set_overlay_hit_rect(int x, int y, int w, int h)
 		              (unsigned long)GetLastError());
 		return;
 	}
+	// (#350) Union the live HUD rects: the region is also the visual clip.
+	for (int i = 0; i < n_hud; i++) {
+		HRGN hr = CreateRectRgn(hud[i].left, hud[i].top, hud[i].right, hud[i].bottom);
+		if (hr == NULL)
+			continue;
+		CombineRgn(rgn, rgn, hr, RGN_OR);
+		DeleteObject(hr);
+	}
 	// SetWindowRgn takes ownership of rgn on success.
 	if (!SetWindowRgn(target, rgn, TRUE)) {
 		DeleteObject(rgn);
@@ -3375,6 +3492,7 @@ displayxr_set_overlay_hit_rect(int x, int y, int w, int h)
 		return;
 	}
 	s_last_rgn_rect = padded;
+	s_last_hud_hash = hud_hash;
 
 	// Throttle the log to ~1 Hz — even with hysteresis a moving cube
 	// re-pushes regularly.
@@ -3382,11 +3500,11 @@ displayxr_set_overlay_hit_rect(int x, int y, int w, int h)
 	DWORD now = GetTickCount();
 	if (now - s_last_log_tick >= 1000) {
 		s_last_log_tick = now;
-		displayxr_log("[DisplayXR] hit_region: raw=(%d,%d %dx%d) padded=(%ld,%ld %ldx%ld) on hwnd=%p\n",
+		displayxr_log("[DisplayXR] hit_region: raw=(%d,%d %dx%d) padded=(%ld,%ld %ldx%ld) hud=%d on hwnd=%p\n",
 		              x, y, w, h,
 		              padded.left, padded.top,
 		              padded.right - padded.left, padded.bottom - padded.top,
-		              (void *)target);
+		              n_hud, (void *)target);
 	}
 }
 
@@ -3581,6 +3699,25 @@ displayxr_set_overlay_hit_mask(const uint8_t *mask, int mask_w, int mask_h,
 				n++;
 			}
 		}
+	}
+
+	// (#350) Union every live window-space UI HUD (see wsui_region_rects), in
+	// the SAME dst_w x dst_h client space the silhouette is mapped with. Appended
+	// before the hash below, so showing/hiding/moving a HUD changes the hash and
+	// re-applies the region, while a static HUD keeps it identical (no per-frame
+	// SetWindowRgn).
+	{
+		RECT hud[DXR_WSUI_MAX_SLOTS];
+		int n_hud = wsui_region_rects(dst_w, dst_h, hud);
+		if (n_hud > 0 && n + n_hud > cap) {
+			int new_cap = n + n_hud;
+			RECT *nr = (RECT *)realloc(rects, (size_t)new_cap * sizeof(RECT));
+			if (nr == NULL) { free(rects); return; }
+			rects = nr;
+			cap = new_cap;
+		}
+		for (int i = 0; i < n_hud; i++)
+			rects[n++] = hud[i];
 	}
 
 	// (#259) Skip identical regions: hash the final rect list + dst size and
