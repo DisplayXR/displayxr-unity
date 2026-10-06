@@ -413,6 +413,12 @@ namespace DisplayXR
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern int displayxr_consume_overlay_wheel_delta();
 
+#endif
+
+        // Window controls (display-zones port on Windows; #332 on Linux, where they
+        // act on Unity's own window and the transparent overlay follows it). Same
+        // exports and semantics on both.
+#if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN || UNITY_STANDALONE_LINUX
         /// <summary>
         /// (display-zones port) Atomically read + zero the overlay's close-
         /// request flag. Returns 1 once after the user pressed the decorated
@@ -421,6 +427,8 @@ namespace DisplayXR
         /// leave cloaked Unity running headless) and raises this flag instead.
         /// Apps poll it each frame and call Application.Quit() so the whole
         /// process shuts down cleanly. Always 0 when no transparent overlay.
+        /// On Linux always 0: Unity's own (managed) window takes the WM close
+        /// (Alt+F4) and quits by itself, and it has no title bar while cloaked.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern int displayxr_consume_overlay_close_request();
@@ -431,7 +439,8 @@ namespace DisplayXR
         /// The reliable resize path on the SR display — the weaver subclass eats
         /// mouse edge interactions on the non-activating overlay, but
         /// SetWindowPos is never intercepted. Apps drive it from a keyboard
-        /// shortcut. No-op when there is no managed overlay window.
+        /// shortcut. No-op when there is no managed overlay window. On Linux it
+        /// resizes Unity's window; the weave window and swapchain follow it.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern void displayxr_resize_overlay(int width, int height);
@@ -446,13 +455,11 @@ namespace DisplayXR
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern void displayxr_set_overlay_position(int x, int y);
-#endif
 
         // Click-through region (#57/#131 on Windows, #332 on Linux). Same exports
         // on both: Windows builds a SetWindowRgn on the overlay HWND, Linux an XShape
         // input region on Unity's window (see displayxr_linux.c). On Linux they are
         // no-ops outside transparent mode.
-#if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN || UNITY_STANDALONE_LINUX
         /// <summary>
         /// Set the rectangular hit-test region of the overlay. Coords
         /// are overlay client-space pixels (top-left origin).

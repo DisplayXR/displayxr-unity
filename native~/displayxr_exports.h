@@ -413,6 +413,18 @@ DISPLAYXR_EXPORT int displayxr_linux_click_through_active(void);
 /// already there. Called by dxr_prov_move_window_to_display with the panel rect the
 /// runtime reported. Returns 1 when the window is on (or was moved to) the rect.
 DISPLAYXR_EXPORT int displayxr_linux_move_app_window_to_rect(int x, int y, int w, int h);
+
+/// (#332) Linux counterparts of the Windows window-control exports above, same
+/// arguments. They act on Unity's own window (the weave window and the swapchain
+/// follow it): size and position answer from the per-frame tracking (no X round
+/// trip), set_overlay_position / resize_overlay move or resize it (resize clamps to
+/// 200 px like Windows). consume_overlay_close_request is always 0: the WM close
+/// reaches Unity's own window, which quits by itself.
+DISPLAYXR_EXPORT void displayxr_get_overlay_size(int *width, int *height);
+DISPLAYXR_EXPORT void displayxr_get_overlay_position(int *x, int *y);
+DISPLAYXR_EXPORT void displayxr_set_overlay_position(int x, int y);
+DISPLAYXR_EXPORT void displayxr_resize_overlay(int width, int height);
+DISPLAYXR_EXPORT int displayxr_consume_overlay_close_request(void);
 #endif
 
 #ifdef __cplusplus
