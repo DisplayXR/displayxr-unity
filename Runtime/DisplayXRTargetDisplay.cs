@@ -27,7 +27,8 @@ namespace DisplayXR
     /// <para>
     /// <b>Requires a runtime advertising <c>XR_DXR_display_info</c> v16+.</b> Against an
     /// older one the panel's desktop position is simply not reported; the component logs
-    /// once and does nothing. It is also Windows-only today.
+    /// once and does nothing. It works on Windows and Linux (X11/XWayland); macOS is not
+    /// implemented yet.
     /// </para>
     ///
     /// <para>
@@ -66,7 +67,7 @@ namespace DisplayXR
 
         /// <summary>
         /// Move now, if the session is running. Returns false when it is not, when the
-        /// runtime does not report the panel position, or off Windows.
+        /// runtime does not report the panel position, or on macOS.
         /// </summary>
         public bool MoveNow()
         {
@@ -87,7 +88,7 @@ namespace DisplayXR
                     Debug.LogWarning(
                         "[DisplayXR] TargetDisplay: the runtime did not report the panel's " +
                         "desktop position (needs XR_DXR_display_info v16+), so the window was " +
-                        "left where Windows opened it. Making the panel the Windows main " +
+                        "left where the OS opened it. Making the panel the main " +
                         "display remains the workaround.");
                 }
             }

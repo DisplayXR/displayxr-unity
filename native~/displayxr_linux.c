@@ -1296,6 +1296,61 @@ out:
 }
 
 // ---------------------------------------------------------------------------
+// Move the app window onto the 3D panel (#266)
+// ---------------------------------------------------------------------------
+//
+// dxr_prov_move_window_to_display (DisplayXRProvider.MoveWindowToDisplay /
+// DisplayXRTargetDisplay) hands us the panel rect the runtime reported, in X root
+// coordinates. Centre Unity's window on it (its client area; the WM keeps any frame),
+// clamped so a window larger than the panel keeps its top-left on the panel. Already
+// on the panel (its centre inside the rect): leave it, as Windows does — a pointless
+// move is a window jump the user did not have before.
+//
+// C# main thread: the main-thread connection and its mutex, never s_dpy (THREADS,
+// above). Works for the opaque child path too; in transparent mode the overlay
+// follows Unity's window in displayxr_linux_track_window.
+DISPLAYXR_EXPORT int
+displayxr_linux_move_app_window_to_rect(int px, int py, int pw, int ph)
+{
+	if (!lin_load_xlib() || !s_win || pw <= 0 || ph <= 0) {
+		lin_log("[DisplayXR-LNX] move_to_display: no app window\n");
+		return 0;
+	}
+	int rc = 0;
+	pthread_mutex_lock(&s_hit_mutex);
+	if (!s_hit_dpy) s_hit_dpy = s_x.XOpenDisplay(NULL);
+	if (s_hit_dpy) {
+		XWin child = 0, gr = 0;
+		int cx = 0, cy = 0, gx = 0, gy = 0;
+		unsigned int cw = 0, ch = 0, gb = 0, gd = 0;
+		if (s_x.XTranslateCoordinates(s_hit_dpy, s_win, s_x.XDefaultRootWindow(s_hit_dpy), 0, 0,
+		                              &cx, &cy, &child) &&
+		    s_x.XGetGeometry(s_hit_dpy, s_win, &gr, &gx, &gy, &cw, &ch, &gb, &gd)) {
+			char m[224];
+			int mx = cx + (int)cw / 2, my = cy + (int)ch / 2;
+			if (mx >= px && mx < px + pw && my >= py && my < py + ph) {
+				lin_log("[DisplayXR-LNX] move_to_display: already on the 3D display\n");
+				rc = 1;
+			} else {
+				int x = px + (pw - (int)cw) / 2;
+				int y = py + (ph - (int)ch) / 2;
+				if (x < px) x = px;
+				if (y < py) y = py;
+				lin_move_client(s_hit_dpy, x, y);
+				snprintf(m, sizeof(m),
+				         "[DisplayXR-LNX] move_to_display: (%d,%d) %ux%u -> (%d,%d) on the panel "
+				         "(%d,%d %dx%d)\n",
+				         cx, cy, cw, ch, x, y, px, py, pw, ph);
+				lin_log(m);
+				rc = 1;
+			}
+		}
+	}
+	pthread_mutex_unlock(&s_hit_mutex);
+	return rc;
+}
+
+// ---------------------------------------------------------------------------
 // Foreground query (#332)
 // ---------------------------------------------------------------------------
 //
