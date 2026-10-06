@@ -5,6 +5,14 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.22.0] - 2026-10-05
+
+### Added
+- **Linux: move the window onto the 3D panel (#266, PR #352).** `DisplayXRTargetDisplay` / `DisplayXRProvider.MoveWindowToDisplay` now work on Linux (X11/XWayland). On Linux the runtime reports the panel's desktop rect through `XR_DXR_display_info` v18 in X root coordinates; the provider now stores its extent too, falling back to the panel's native pixel size on a v16 runtime. The plugin centres Unity's window on the panel with `_NET_MOVERESIZE_WINDOW` (client origin, StaticGravity, clamped), with the same gating as Windows: no move without a reported origin, none onto an unconfirmed fallback rect, and none when the window is already on the panel. It runs on Unity's main thread on the main-thread X connection under its mutex, never the connection the runtime borrows. In transparent mode the overlay follows. Opt-in: only apps using these APIs are affected, and Windows and macOS are unchanged.
+
+### Changed
+- **Correction to the 2.21.0 notes:** they said Local2D canvases were "encoded twice". That held only for window-space UI. At the time the runtime flattened Local2D layers as an sRGB passthrough on every in-process backend, so Local2D was never washed out; 2.21.0's switch of Local2D to `_SRGB` was correct but had no visible effect then. Runtime v2.26.0 (DisplayXR/displayxr-runtime#1809) makes Local2D format-honest. Plugin ≥ 2.21.0 is unaffected (verified on the panel), but Unity builds on an older plugin now show washed-out Local2D (and 3D, in Gamma projects) and should be rebuilt on ≥ 2.21.0.
+
 ## [2.21.0] - 2026-10-02
 
 ### Fixed
