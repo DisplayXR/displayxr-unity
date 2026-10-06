@@ -5,6 +5,11 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.23.0] - 2026-10-06
+
+### Added
+- **Linux: window size, position, keyboard resize and close request (#332, PR #353).** `displayxr_get_overlay_size`, `displayxr_get_overlay_position` / `displayxr_set_overlay_position`, `displayxr_resize_overlay` and `displayxr_consume_overlay_close_request` now exist on Linux, and their C# bindings are enabled for Linux players, so app window controls (keyboard resize, saving and restoring window size and position) work there. They act on Unity's own X11 window: the weave window (transparent overlay or opaque child) follows it every frame, and the provider's reconcile resizes the swapchain. The getters answer from the per-frame tracking (no X round trip). Move and resize use `_NET_MOVERESIZE_WINDOW` on the main-thread X connection under its mutex. Resize keeps the origin and clamps to a 200 px minimum, as on Windows. The close request is always 0 on Linux, because the window manager's close reaches Unity's own window, which quits by itself. Windows and macOS are unchanged.
+
 ## [2.22.0] - 2026-10-05
 
 ### Added
