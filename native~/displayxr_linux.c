@@ -1351,6 +1351,117 @@ displayxr_linux_move_app_window_to_rect(int px, int py, int pw, int ph)
 }
 
 // ---------------------------------------------------------------------------
+// Window controls (#332): size, position, keyboard resize, close request
+// ---------------------------------------------------------------------------
+//
+// The Windows exports of the same names act on the overlay HWND. On Linux the
+// window the user sees and moves is Unity's own X11 window: the weave window
+// (transparent overlay or opaque child) follows it every frame in
+// displayxr_linux_track_window, and the provider's per-frame reconcile resizes the
+// swapchain to match. So acting on Unity's window moves or resizes all three.
+//
+// Size and position are answered from what displayxr_linux_track_window last saw
+// (graphics thread, s_dpy), so the per-frame getters cost no X round trip and never
+// touch s_dpy from the main thread (THREADS, above). Requests go out on the
+// main-thread connection under its mutex.
+
+#define LIN_MIN_WINDOW_PX 200 // matches DXR_MIN_WINDOW_PX in displayxr_win32.c
+
+// Caller holds s_hit_mutex.
+static XDpy
+lin_main_dpy_locked(void)
+{
+	if (!s_hit_dpy) s_hit_dpy = s_x.XOpenDisplay(NULL);
+	return s_hit_dpy;
+}
+
+/// Unity's window client size, as last tracked. (0, 0) without a weave window.
+DISPLAYXR_EXPORT void
+displayxr_get_overlay_size(int *width, int *height)
+{
+	int have = s_overlay != 0;
+	if (width) *width = have ? (int)s_ow : 0;
+	if (height) *height = have ? (int)s_oh : 0;
+}
+
+/// Unity's window client origin in X root coordinates. (0, 0) when unknown.
+DISPLAYXR_EXPORT void
+displayxr_get_overlay_position(int *x, int *y)
+{
+	if (x) *x = 0;
+	if (y) *y = 0;
+	if (!s_overlay || !s_win) return;
+	if (s_overlay_is_toplevel) { // the transparent overlay tracks the origin every frame
+		if (x) *x = s_ox;
+		if (y) *y = s_oy;
+		return;
+	}
+	// Opaque child: nothing tracks the origin (the child moves with its parent), so ask.
+	if (!lin_load_xlib()) return;
+	pthread_mutex_lock(&s_hit_mutex);
+	XDpy d = lin_main_dpy_locked();
+	if (d) {
+		XWin child = 0;
+		int cx = 0, cy = 0;
+		if (s_x.XTranslateCoordinates(d, s_win, s_x.XDefaultRootWindow(d), 0, 0, &cx, &cy, &child)) {
+			if (x) *x = cx;
+			if (y) *y = cy;
+		}
+	}
+	pthread_mutex_unlock(&s_hit_mutex);
+}
+
+/// Move Unity's window so its client origin is at (x, y), size unchanged.
+DISPLAYXR_EXPORT void
+displayxr_set_overlay_position(int x, int y)
+{
+	if (!s_overlay || !s_win || !lin_load_xlib()) return;
+	pthread_mutex_lock(&s_hit_mutex);
+	XDpy d = lin_main_dpy_locked();
+	if (d) lin_move_client(d, x, y);
+	pthread_mutex_unlock(&s_hit_mutex);
+	char m[96];
+	snprintf(m, sizeof(m), "[DisplayXR-LNX] set_overlay_position -> (%d,%d)\n", x, y);
+	lin_log(m);
+}
+
+/// Resize Unity's window to width x height (client px), position unchanged, clamped
+/// to a minimum like Windows.
+DISPLAYXR_EXPORT void
+displayxr_resize_overlay(int width, int height)
+{
+	if (!s_overlay || !s_win || !lin_load_xlib()) return;
+	if (width < LIN_MIN_WINDOW_PX) width = LIN_MIN_WINDOW_PX;
+	if (height < LIN_MIN_WINDOW_PX) height = LIN_MIN_WINDOW_PX;
+	pthread_mutex_lock(&s_hit_mutex);
+	XDpy d = lin_main_dpy_locked();
+	if (d) {
+		// Keep the client where it is: the tracked origin for the transparent overlay,
+		// a fresh query otherwise.
+		int x = s_ox, y = s_oy;
+		if (!s_overlay_is_toplevel) {
+			XWin child = 0;
+			s_x.XTranslateCoordinates(d, s_win, s_x.XDefaultRootWindow(d), 0, 0, &x, &y, &child);
+		}
+		lin_moveresize_client(d, x, y, (unsigned int)width, (unsigned int)height);
+	}
+	pthread_mutex_unlock(&s_hit_mutex);
+	char m[96];
+	snprintf(m, sizeof(m), "[DisplayXR-LNX] resize_overlay -> %dx%d\n", width, height);
+	lin_log(m);
+}
+
+/// Always 0 on Linux. On Windows the plugin swallows the overlay HWND's WM_CLOSE (a
+/// separate window from Unity's) and raises this flag so the app quits. Here the
+/// window the WM closes is Unity's own: Alt+F4 / a close button reach Unity, which
+/// quits by itself, and while cloaked the window has no title bar to click.
+DISPLAYXR_EXPORT int
+displayxr_consume_overlay_close_request(void)
+{
+	return 0;
+}
+
+// ---------------------------------------------------------------------------
 // Foreground query (#332)
 // ---------------------------------------------------------------------------
 //
