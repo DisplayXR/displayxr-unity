@@ -142,8 +142,9 @@ namespace DisplayXR
         /// including the no-op case where it is already there.
         /// <para>
         /// Needs a runtime advertising <c>XR_DXR_display_info</c> v16+; returns false
-        /// against anything older, and false off Windows. Call it once the session is
-        /// running — the panel's desktop position is read at session start.
+        /// against anything older, and false on macOS (Windows and Linux are supported).
+        /// Call it once the session is running — the panel's desktop position is read at
+        /// session start.
         /// </para>
         /// <para>
         /// The move is performed in native inside a per-monitor-DPI-aware context on

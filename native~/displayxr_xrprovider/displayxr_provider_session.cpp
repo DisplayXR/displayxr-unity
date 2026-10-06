@@ -552,6 +552,7 @@ typedef struct ProviderSession {
 	// per-monitor-aware process sees them. Valid only against a runtime advertising
 	// XR_DXR_display_info v16+.
 	int32_t desktop_origin_x, desktop_origin_y;
+	uint32_t desktop_w, desktop_h; // panel extent (v18 only; 0 = unknown)
 	int     desktop_origin_valid;
 	// (#266 / v18) desktop_origin_valid says the runtime gave us AN origin; this says
 	// it CONFIRMED a 3D panel is there (XrDisplayDesktopInfoDXR::isPanelConfirmed). v16
@@ -4866,6 +4867,8 @@ int dxr_prov_session_start(const char *runtime_json_path,
 		if (v18) {
 			s_ps.desktop_origin_x = ddi.desktopRect.offset.x;
 			s_ps.desktop_origin_y = ddi.desktopRect.offset.y;
+			s_ps.desktop_w = (uint32_t)ddi.desktopRect.extent.width;
+			s_ps.desktop_h = (uint32_t)ddi.desktopRect.extent.height;
 			s_ps.desktop_origin_valid = 1;
 			s_ps.panel_confirmed = (ddi.isPanelConfirmed == XR_TRUE) ? 1 : 0;
 			ps_log("[DisplayXR-PROV] Display desktop rect: (%d,%d %dx%d) confirmed=%d "
@@ -4877,6 +4880,7 @@ int dxr_prov_session_start(const char *runtime_json_path,
 		} else if (v16) {
 			s_ps.desktop_origin_x = ddp.left;
 			s_ps.desktop_origin_y = ddp.top;
+			s_ps.desktop_w = s_ps.desktop_h = 0;
 			s_ps.desktop_origin_valid = 1;
 			s_ps.panel_confirmed = -1;   // v16 runtime: confirmation not available
 			ps_log("[DisplayXR-PROV] Display desktop origin: (%d,%d) [v16; no v18 "
@@ -7640,6 +7644,9 @@ uint32_t dxr_prov_get_active_mode_index(void) { return s_ps.active_mode_index; }
 // inside a per-monitor-aware context removes that failure mode by construction rather
 // than by remembering to convert at each call site.
 extern "C" void *displayxr_find_unity_hwnd(void);
+#if defined(__linux__) && !defined(__ANDROID__)
+extern "C" int displayxr_linux_move_app_window_to_rect(int x, int y, int w, int h);
+#endif
 
 int dxr_prov_get_display_desktop_origin(int *out_x, int *out_y)
 {
@@ -7721,6 +7728,28 @@ int dxr_prov_move_window_to_display(void)
 
 	if (prev) SetThreadDpiAwarenessContext(prev);
 	return rc;
+#elif defined(__linux__) && !defined(__ANDROID__)
+	// (#266, Linux) The runtime reports the panel rect in X root coordinates (its desktop
+	// resolver matches the panel to an XRandR output), which is the space Unity's X11
+	// window lives in under X11 and XWayland alike — no DPI virtualisation to undo here.
+	// Same gating as Windows; the move itself is in displayxr_linux.c, on the main-thread
+	// X connection.
+	if (!s_ps.desktop_origin_valid) {
+		ps_log("[DisplayXR-PROV] move_window_to_display: no desktop origin (runtime < v16)\n");
+		return 0;
+	}
+	if (s_ps.panel_confirmed == 0) {
+		ps_log("[DisplayXR-PROV] move_window_to_display: runtime did not confirm a 3D panel "
+		       "(fallback-to-primary rect) - leaving the window where it is (#266 v18)\n");
+		return 0;
+	}
+	uint32_t pw = s_ps.desktop_w, ph = s_ps.desktop_h;
+	if (pw == 0 || ph == 0) { // v16: no extent reported; the panel's native size is the best guess
+		pw = s_ps.display_info.pixel_width;
+		ph = s_ps.display_info.pixel_height;
+	}
+	return displayxr_linux_move_app_window_to_rect((int)s_ps.desktop_origin_x,
+	                                               (int)s_ps.desktop_origin_y, (int)pw, (int)ph);
 #else
 	return 0;
 #endif
