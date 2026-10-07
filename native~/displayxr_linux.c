@@ -923,9 +923,19 @@ extern int dxr_prov_get_active_zone_rect_px(int *x, int *y, int *w, int *h);
 
 static void lin_reset_input_region_locked(void);
 
+// Native-Wayland player (displayxr_linux_wayland.c): the same rects, applied to the
+// player's own Wayland surface instead of an X11 window.
+extern int dxr_wl_click_through_wanted(void);
+extern int dxr_wl_set_player_input_region(const void *rects, int n);
+extern int dxr_wl_unity_swapchain_size(int *out_w, int *out_h);
+extern int dxr_wl_begin_pointer_drag(unsigned button);
+extern void dxr_wl_end_pointer_drag(void);
+
 static int
 lin_hit_ready(void)
 {
+	if (dxr_wl_click_through_wanted())
+		return 1;
 	if (s_hit_unavailable || !s_hit_enabled || !s_overlay_is_toplevel || !s_overlay || !s_win)
 		return 0;
 	// The reset needs XShapeCombineMask: never shape what we could not unshape.
@@ -1043,6 +1053,18 @@ lin_apply_input_region(LinRects *v, const char *what)
 	if (s_hit_shaped && h == s_hit_hash) return;
 	s_hit_hash = h;
 
+	if (dxr_wl_click_through_wanted()) {
+		dxr_wl_set_player_input_region(v->r, v->n);
+		if (!s_hit_shaped) {
+			char m[160];
+			snprintf(m, sizeof(m), "[DisplayXR-LNX] click-through: %s input region on the player's "
+			         "Wayland surface (%d rects)\n", what, v->n);
+			lin_log(m);
+		}
+		s_hit_shaped = 1;
+		return;
+	}
+
 	// n == 0 is a valid region: nothing catches (an empty frame of the avatar).
 	s_shape_combine_rects(s_hit_dpy, s_win, LIN_SHAPE_INPUT, 0, 0, v->r, v->n, LIN_SHAPE_SET,
 	                      LIN_SHAPE_UNSORTED);
@@ -1133,7 +1155,10 @@ displayxr_set_overlay_hit_rect(int x, int y, int w, int h)
 		LinRects v = {0};
 		lin_rects_push(&v, x, y, (long)x + w, (long)y + h);
 		lin_rects_add_surround(&v);
-		lin_rects_add_wsui(&v, (int)s_ow, (int)s_oh);
+		int ww = (int)s_ow, wh = (int)s_oh;
+		if (dxr_wl_click_through_wanted())
+			dxr_wl_unity_swapchain_size(&ww, &wh); // the player's window, logical px
+		lin_rects_add_wsui(&v, ww, wh);
 		if (!v.oom) lin_apply_input_region(&v, "AABB");
 		free(v.r);
 	}
@@ -1191,6 +1216,14 @@ displayxr_set_overlay_surround_mask(const uint8_t *mask, int mask_w, int mask_h,
 static void
 lin_reset_input_region_locked(void)
 {
+	if (s_hit_shaped && dxr_wl_click_through_wanted()) {
+		dxr_wl_set_player_input_region(NULL, -1);
+		lin_log("[DisplayXR-LNX] click-through: the player's Wayland input region reset\n");
+		s_hit_shaped = 0;
+		s_hit_hash = 0;
+		s_hit_mask_active = 0;
+		return;
+	}
 	if (s_hit_shaped && s_hit_dpy && s_win && s_shape_combine_mask) {
 		s_shape_combine_mask(s_hit_dpy, s_win, LIN_SHAPE_INPUT, 0, 0, 0 /* None */, LIN_SHAPE_SET);
 		s_x.XSync(s_hit_dpy, 0);
@@ -1215,6 +1248,8 @@ lin_enable_click_through(void)
 DISPLAYXR_EXPORT int
 displayxr_linux_click_through_active(void)
 {
+	if (dxr_wl_click_through_wanted())
+		return 1;
 	return s_hit_enabled && s_overlay_is_toplevel && !s_hit_unavailable;
 }
 
@@ -1253,6 +1288,19 @@ displayxr_linux_drag_window(int right_pressed)
 {
 	int active = 0;
 	pthread_mutex_lock(&s_hit_mutex);
+	if (dxr_wl_click_through_wanted()) {
+		// Native Wayland: the compositor moves the window while the button is held
+		// (the DisplayXR GNOME extension); we only start and end it.
+		if (right_pressed && !s_drag_active)
+			s_drag_active = dxr_wl_begin_pointer_drag(3) ? 1 : -1; // -1: refused, don't retry until released
+		else if (!right_pressed && s_drag_active) {
+			if (s_drag_active == 1)
+				dxr_wl_end_pointer_drag();
+			s_drag_active = 0;
+		}
+		active = s_drag_active == 1;
+		goto out;
+	}
 	if (!right_pressed) {
 		if (s_drag_active) lin_log("[DisplayXR-LNX] drag: end\n");
 		s_drag_active = 0;

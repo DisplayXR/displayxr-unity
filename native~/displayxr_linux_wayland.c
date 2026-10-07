@@ -317,3 +317,195 @@ dxr_wl_weave_poll(int *out_w, int *out_h)
 	pthread_mutex_unlock(&s_wl_mutex);
 	return dirty;
 }
+
+/*
+ *
+ * Click-through and moving the window (transparent avatar), the Wayland
+ * equivalents of the XShape input region and the X11 right-drag in
+ * displayxr_linux.c, which computes the rects and calls these.
+ *
+ */
+
+extern int dxr_wl_unity_surface(struct wl_display **out_display, struct wl_surface **out_surface);
+
+static int s_wl_transparent;
+
+void
+dxr_wl_weave_set_transparent(int transparent)
+{
+	s_wl_transparent = transparent;
+}
+
+//! The weave is in the player's window and the session is transparent: clicks
+//! outside the avatar should reach the desktop.
+int
+dxr_wl_click_through_wanted(void)
+{
+	return s_wl.surface && s_wl_transparent;
+}
+
+//! Layout-compatible with XRectangle (displayxr_linux.c's LinXRect).
+typedef struct DxrWlRect {
+	short x, y;
+	unsigned short w, h;
+} DxrWlRect;
+
+//! Set the PLAYER's window input region (surface-local logical px), or reset it
+//! to the whole window when n < 0. Double-buffered: it applies at the player's
+//! next commit, which comes every frame. Our sub-surface takes no input, so a
+//! click outside this region falls through to whatever is below the window.
+int
+dxr_wl_set_player_input_region(const void *rects, int n)
+{
+	struct wl_display *d = NULL;
+	struct wl_surface *player = NULL;
+	if (!dxr_wl_unity_surface(&d, &player) || !dxr_wl_connect(d))
+		return 0;
+	if (n < 0) {
+		wl_surface_set_input_region(player, NULL);
+	} else {
+		struct wl_region *region = wl_compositor_create_region(s_wl.compositor);
+		const DxrWlRect *r = (const DxrWlRect *)rects;
+		for (int i = 0; i < n; i++)
+			wl_region_add(region, r[i].x, r[i].y, r[i].w, r[i].h);
+		wl_surface_set_input_region(player, region);
+		wl_region_destroy(region);
+	}
+	wl_display_flush(d);
+	return 1;
+}
+
+/*
+ * The window move goes through the DisplayXR GNOME Shell extension
+ * (window-geometry@displayxr.org, org.displayxr.WindowPlacement1): a Wayland client
+ * cannot move its own toplevel without the press's serial, which the player's SDL
+ * consumed, and the extension moves the caller's window with the pointer while the
+ * button is held. libdbus is loaded at run time, like libX11 in displayxr_linux.c.
+ */
+
+typedef struct DxrDBusConnection DxrDBusConnection;
+typedef struct DxrDBusMessage DxrDBusMessage;
+typedef struct DxrDBusError { // DBusError's layout
+	const char *name;
+	const char *message;
+	unsigned int dummy1 : 1, dummy2 : 1, dummy3 : 1, dummy4 : 1, dummy5 : 1;
+	void *padding1;
+} DxrDBusError;
+
+#define DXR_DBUS_BUS_SESSION 0
+#define DXR_DBUS_TYPE_INVALID 0
+#define DXR_DBUS_TYPE_BOOLEAN ((int)'b')
+#define DXR_DBUS_TYPE_UINT32 ((int)'u')
+
+static struct {
+	int tried, ok;
+	uint32_t (*threads_init_default)(void);
+	void (*error_init)(DxrDBusError *);
+	void (*error_free)(DxrDBusError *);
+	DxrDBusConnection *(*bus_get_private)(int, DxrDBusError *);
+	void (*set_exit_on_disconnect)(DxrDBusConnection *, uint32_t);
+	DxrDBusMessage *(*new_method_call)(const char *, const char *, const char *, const char *);
+	uint32_t (*append_args)(DxrDBusMessage *, int, ...);
+	DxrDBusMessage *(*send_with_reply_and_block)(DxrDBusConnection *, DxrDBusMessage *, int, DxrDBusError *);
+	uint32_t (*get_args)(DxrDBusMessage *, DxrDBusError *, int, ...);
+	void (*unref)(DxrDBusMessage *);
+	DxrDBusConnection *conn;
+} s_dbus;
+
+#include <dlfcn.h>
+
+static int
+dbus_ready(void)
+{
+	if (s_dbus.tried)
+		return s_dbus.ok;
+	s_dbus.tried = 1;
+	void *lib = dlopen("libdbus-1.so.3", RTLD_NOW | RTLD_LOCAL);
+	if (!lib) {
+		fprintf(stderr, "[DisplayXR-WL] libdbus-1 not found: no window drag\n");
+		return 0;
+	}
+#define DXR_DBUS_SYM(field, name) *(void **)&s_dbus.field = dlsym(lib, name)
+	DXR_DBUS_SYM(threads_init_default, "dbus_threads_init_default");
+	DXR_DBUS_SYM(error_init, "dbus_error_init");
+	DXR_DBUS_SYM(error_free, "dbus_error_free");
+	DXR_DBUS_SYM(bus_get_private, "dbus_bus_get_private");
+	DXR_DBUS_SYM(set_exit_on_disconnect, "dbus_connection_set_exit_on_disconnect");
+	DXR_DBUS_SYM(new_method_call, "dbus_message_new_method_call");
+	DXR_DBUS_SYM(append_args, "dbus_message_append_args");
+	DXR_DBUS_SYM(send_with_reply_and_block, "dbus_connection_send_with_reply_and_block");
+	DXR_DBUS_SYM(get_args, "dbus_message_get_args");
+	DXR_DBUS_SYM(unref, "dbus_message_unref");
+#undef DXR_DBUS_SYM
+	if (!s_dbus.threads_init_default || !s_dbus.error_init || !s_dbus.error_free || !s_dbus.bus_get_private ||
+	    !s_dbus.set_exit_on_disconnect || !s_dbus.new_method_call || !s_dbus.append_args ||
+	    !s_dbus.send_with_reply_and_block || !s_dbus.get_args || !s_dbus.unref)
+		return 0;
+	s_dbus.threads_init_default();
+	DxrDBusError err;
+	s_dbus.error_init(&err);
+	s_dbus.conn = s_dbus.bus_get_private(DXR_DBUS_BUS_SESSION, &err);
+	if (!s_dbus.conn) {
+		fprintf(stderr, "[DisplayXR-WL] session bus unavailable: %s\n", err.message ? err.message : "?");
+		s_dbus.error_free(&err);
+		return 0;
+	}
+	// A bus connection _exit()s the process when the bus goes away, by default.
+	s_dbus.set_exit_on_disconnect(s_dbus.conn, 0);
+	s_dbus.ok = 1;
+	return 1;
+}
+
+//! Call org.displayxr.WindowPlacement1.<method>(u pid = 0 [the caller], u arg?).
+//! Returns the boolean result, or -1 when the call failed.
+static int
+placement_call(const char *method, int with_arg, uint32_t arg)
+{
+	if (!dbus_ready())
+		return -1;
+	DxrDBusMessage *msg = s_dbus.new_method_call("org.displayxr.WindowGeometry", "/org/displayxr/WindowPlacement",
+	                                             "org.displayxr.WindowPlacement1", method);
+	if (!msg)
+		return -1;
+	uint32_t pid = 0;
+	if (with_arg)
+		s_dbus.append_args(msg, DXR_DBUS_TYPE_UINT32, &pid, DXR_DBUS_TYPE_UINT32, &arg, DXR_DBUS_TYPE_INVALID);
+	else
+		s_dbus.append_args(msg, DXR_DBUS_TYPE_UINT32, &pid, DXR_DBUS_TYPE_INVALID);
+	DxrDBusError err;
+	s_dbus.error_init(&err);
+	DxrDBusMessage *reply = s_dbus.send_with_reply_and_block(s_dbus.conn, msg, 500, &err);
+	s_dbus.unref(msg);
+	int result = -1;
+	if (!reply) {
+		fprintf(stderr, "[DisplayXR-WL] WindowPlacement1.%s failed: %s (is the DisplayXR GNOME extension on?)\n",
+		        method, err.message ? err.message : "?");
+		s_dbus.error_free(&err);
+		return -1;
+	}
+	uint32_t b = 0;
+	if (s_dbus.get_args(reply, &err, DXR_DBUS_TYPE_BOOLEAN, &b, DXR_DBUS_TYPE_INVALID))
+		result = b ? 1 : 0;
+	else
+		result = 0; // a method with no return value (EndPointerDrag)
+	s_dbus.error_free(&err);
+	s_dbus.unref(reply);
+	return result;
+}
+
+//! Start moving the player's window with the pointer while `button` (1 left,
+//! 2 middle, 3 right) is held. Returns 1 when the compositor took the drag.
+int
+dxr_wl_begin_pointer_drag(unsigned button)
+{
+	int r = placement_call("BeginPointerDrag", 1, button);
+	fprintf(stderr, "[DisplayXR-WL] window drag: %s\n", r == 1 ? "start" : "refused");
+	return r == 1;
+}
+
+void
+dxr_wl_end_pointer_drag(void)
+{
+	placement_call("EndPointerDrag", 0, 0);
+	fprintf(stderr, "[DisplayXR-WL] window drag: end\n");
+}

@@ -38,7 +38,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/prctl.h>
 #include <sys/stat.h>
+#include <time.h>
 #include <unistd.h>
 
 #define DXR_WLCAP_EXPORT extern "C" __attribute__((visibility("default")))
@@ -60,8 +62,20 @@ typedef VkResult(VKAPI_PTR *PFN_dxrCreateWaylandSurface)(VkInstance, const DxrVk
 
 static struct wl_display *s_wl_display = nullptr;
 static struct wl_surface *s_wl_surface = nullptr;
+// The runtime's Wayland surface (the weave sub-surface) and the instance it was
+// made on: see layer_DestroySurfaceKHR.
+static VkSurfaceKHR s_other_wl_surface = VK_NULL_HANDLE;
+static void *s_other_wl_instance_key = nullptr;
+// Instances whose destruction is held back until the player's window surface is
+// gone (see layer_DestroyInstance).
+struct DxrDeferredInstance {
+	VkInstance instance;
+	PFN_vkDestroyInstance destroy;
+};
+static DxrDeferredInstance s_deferred[8];
 static VkSurfaceKHR s_vk_surface = VK_NULL_HANDLE; // the player's window surface
 static uint32_t s_swap_w = 0, s_swap_h = 0;        // its latest swapchain extent
+static VkSwapchainKHR s_player_swapchain = VK_NULL_HANDLE;
 
 extern "C" int dxr_wl_test_subsurface(struct wl_display *display, struct wl_surface *parent, int width, int height);
 
@@ -86,6 +100,7 @@ struct DxrLayerInstance {
 struct DxrLayerDevice {
 	void *key;
 	PFN_vkGetDeviceProcAddr next_gdpa;
+	PFN_vkQueuePresentKHR next_present; // per device: queues share their device's key
 };
 
 static std::mutex s_layer_mutex;
@@ -143,8 +158,29 @@ static VKAPI_ATTR void VKAPI_CALL
 layer_DestroyInstance(VkInstance instance, const VkAllocationCallbacks *alloc)
 {
 	PFN_vkGetInstanceProcAddr gipa = next_gipa_for(instance);
+	fprintf(stderr, "[DisplayXR-WL] teardown: vkDestroyInstance(%p%s) ...\n", (void *)instance,
+	        dispatch_key(instance) == s_other_wl_instance_key ? " WEAVE" : "");
+	fflush(stderr);
+	// NVIDIA's Wayland WSI keeps state per wl_display that every instance on it
+	// shares, and destroying an instance that made a surface there tears that state
+	// down: the player's own later swapchain teardown then calls a NULL pointer in
+	// the driver and the player segfaults at exit (measured, driver 595.91). So the
+	// instance that made the weave surface on the player's connection outlives the
+	// player's window surface, and goes right after it.
+	if (dispatch_key(instance) == s_other_wl_instance_key && s_vk_surface != VK_NULL_HANDLE && gipa) {
+		for (auto &d : s_deferred)
+			if (!d.instance) {
+				d.instance = instance;
+				d.destroy = (PFN_vkDestroyInstance)gipa(instance, "vkDestroyInstance");
+				fprintf(stderr, "[DisplayXR-WL] teardown: WEAVE instance held back until the player's window "
+				        "surface is destroyed (NVIDIA shared Wayland state)\n");
+				return;
+			}
+	}
 	if (gipa)
 		((PFN_vkDestroyInstance)gipa(instance, "vkDestroyInstance"))(instance, alloc);
+	fprintf(stderr, "[DisplayXR-WL] teardown: vkDestroyInstance done\n");
+	fflush(stderr);
 	std::lock_guard<std::mutex> lock(s_layer_mutex);
 	void *key = dispatch_key(instance);
 	for (auto &i : s_instances)
@@ -183,8 +219,12 @@ static VKAPI_ATTR void VKAPI_CALL
 layer_DestroyDevice(VkDevice device, const VkAllocationCallbacks *alloc)
 {
 	PFN_vkGetDeviceProcAddr gdpa = next_gdpa_for(device);
+	fprintf(stderr, "[DisplayXR-WL] teardown: vkDestroyDevice(%p) ...\n", (void *)device);
+	fflush(stderr);
 	if (gdpa)
 		((PFN_vkDestroyDevice)gdpa(device, "vkDestroyDevice"))(device, alloc);
+	fprintf(stderr, "[DisplayXR-WL] teardown: vkDestroyDevice done\n");
+	fflush(stderr);
 	std::lock_guard<std::mutex> lock(s_layer_mutex);
 	void *key = dispatch_key(device);
 	for (auto &d : s_devices)
@@ -202,6 +242,10 @@ layer_CreateWaylandSurfaceKHR(VkInstance instance, const DxrVkWaylandSurfaceCrea
 	if (!next)
 		return VK_ERROR_EXTENSION_NOT_PRESENT;
 	VkResult r = next(instance, ci, alloc, out);
+	if (r == VK_SUCCESS && ci && s_wl_surface && ci->surface != s_wl_surface) {
+		s_other_wl_surface = *out;
+		s_other_wl_instance_key = dispatch_key(instance);
+	}
 	if (r == VK_SUCCESS && ci && !s_wl_surface) {
 		// The first Wayland surface in the process is the player's window: the
 		// runtime's own surfaces are only made later, for a session.
@@ -247,6 +291,7 @@ layer_CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *ci, co
 	if (r != VK_SUCCESS)
 		r = next(device, ci, alloc, out);
 	if (r == VK_SUCCESS && ci && s_vk_surface != VK_NULL_HANDLE && ci->surface == s_vk_surface) {
+		s_player_swapchain = *out;
 		s_swap_w = ci->imageExtent.width;
 		s_swap_h = ci->imageExtent.height;
 		char v[32];
@@ -261,6 +306,90 @@ layer_CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *ci, co
 	return r;
 }
 
+// Diagnostic: the exit-time teardown order (the native-Wayland session crashes in
+// the driver at exit).
+static VKAPI_ATTR void VKAPI_CALL
+layer_DestroySwapchainKHR(VkDevice device, VkSwapchainKHR swapchain, const VkAllocationCallbacks *alloc)
+{
+	PFN_vkGetDeviceProcAddr gdpa = next_gdpa_for(device);
+	PFN_vkDestroySwapchainKHR next = gdpa ? (PFN_vkDestroySwapchainKHR)gdpa(device, "vkDestroySwapchainKHR") : nullptr;
+	int player = swapchain == s_player_swapchain;
+	fprintf(stderr, "[DisplayXR-WL] teardown: vkDestroySwapchainKHR(%s 0x%llx) ...\n", player ? "PLAYER" : "other",
+	        (unsigned long long)swapchain);
+	fflush(stderr);
+	if (next)
+		next(device, swapchain, alloc);
+	if (player)
+		s_player_swapchain = VK_NULL_HANDLE;
+	fprintf(stderr, "[DisplayXR-WL] teardown: vkDestroySwapchainKHR done\n");
+	fflush(stderr);
+}
+
+static VKAPI_ATTR void VKAPI_CALL
+layer_DestroySurfaceKHR(VkInstance instance, VkSurfaceKHR surface, const VkAllocationCallbacks *alloc)
+{
+	PFN_vkGetInstanceProcAddr gipa = next_gipa_for(instance);
+	PFN_vkDestroySurfaceKHR next = gipa ? (PFN_vkDestroySurfaceKHR)gipa(instance, "vkDestroySurfaceKHR") : nullptr;
+	fprintf(stderr, "[DisplayXR-WL] teardown: vkDestroySurfaceKHR(%s 0x%llx) ...\n",
+	        surface == s_vk_surface ? "PLAYER" : (surface == s_other_wl_surface ? "WEAVE" : "other"),
+	        (unsigned long long)surface);
+	fflush(stderr);
+	if (next)
+		next(instance, surface, alloc);
+	if (surface == s_vk_surface) {
+		// The player's window is gone: now the held-back instances can go too.
+		s_vk_surface = VK_NULL_HANDLE;
+		for (auto &d : s_deferred)
+			if (d.instance) {
+				fprintf(stderr, "[DisplayXR-WL] teardown: destroying the held-back instance %p\n",
+				        (void *)d.instance);
+				void *key = dispatch_key(d.instance); // before the instance is freed
+				d.destroy(d.instance, nullptr);
+				std::lock_guard<std::mutex> lock(s_layer_mutex);
+				for (auto &i : s_instances)
+					if (i.key == key)
+						i = DxrLayerInstance{};
+				d = DxrDeferredInstance{};
+			}
+	}
+	fprintf(stderr, "[DisplayXR-WL] teardown: vkDestroySurfaceKHR done\n");
+	fflush(stderr);
+}
+
+// Diagnostic: how often the player presents its own window. Its input region
+// (click-through) is double-buffered state that only applies at its next commit.
+static VKAPI_ATTR VkResult VKAPI_CALL
+layer_QueuePresentKHR(VkQueue queue, const VkPresentInfoKHR *info)
+{
+	static unsigned long long s_player_presents = 0, s_window_start_ns = 0;
+	PFN_vkQueuePresentKHR next = nullptr;
+	{
+		std::lock_guard<std::mutex> lock(s_layer_mutex);
+		void *key = dispatch_key(queue);
+		for (auto &d : s_devices)
+			if (d.key == key)
+				next = d.next_present;
+	}
+	if (info && s_player_swapchain != VK_NULL_HANDLE) {
+		for (uint32_t i = 0; i < info->swapchainCount; i++)
+			if (info->pSwapchains[i] == s_player_swapchain)
+				s_player_presents++;
+		struct timespec ts;
+		clock_gettime(CLOCK_MONOTONIC, &ts);
+		unsigned long long now = (unsigned long long)ts.tv_sec * 1000000000ULL + (unsigned long long)ts.tv_nsec;
+		if (!s_window_start_ns)
+			s_window_start_ns = now;
+		if (now - s_window_start_ns >= 5000000000ULL) {
+			fprintf(stderr, "[DisplayXR-WL] the player presented its window %llu times in the last 5 s\n",
+			        s_player_presents);
+			fflush(stderr);
+			s_player_presents = 0;
+			s_window_start_ns = now;
+		}
+	}
+	return next ? next(queue, info) : VK_ERROR_DEVICE_LOST;
+}
+
 static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL layer_GetInstanceProcAddr(VkInstance instance, const char *name);
 
 static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL
@@ -272,6 +401,20 @@ layer_GetDeviceProcAddr(VkDevice device, const char *name)
 		return (PFN_vkVoidFunction)layer_DestroyDevice;
 	if (!strcmp(name, "vkCreateSwapchainKHR"))
 		return (PFN_vkVoidFunction)layer_CreateSwapchainKHR;
+	if (!strcmp(name, "vkDestroySwapchainKHR"))
+		return (PFN_vkVoidFunction)layer_DestroySwapchainKHR;
+	if (!strcmp(name, "vkQueuePresentKHR")) {
+		PFN_vkGetDeviceProcAddr g = next_gdpa_for(device);
+		PFN_vkVoidFunction f = g ? g(device, name) : nullptr;
+		if (!f)
+			return nullptr;
+		std::lock_guard<std::mutex> lock(s_layer_mutex);
+		void *key = dispatch_key(device);
+		for (auto &d : s_devices)
+			if (d.key == key)
+				d.next_present = (PFN_vkQueuePresentKHR)f;
+		return (PFN_vkVoidFunction)layer_QueuePresentKHR;
+	}
 	PFN_vkGetDeviceProcAddr gdpa = next_gdpa_for(device);
 	return gdpa ? gdpa(device, name) : nullptr;
 }
@@ -293,6 +436,8 @@ layer_GetInstanceProcAddr(VkInstance instance, const char *name)
 		return (PFN_vkVoidFunction)layer_DestroyDevice;
 	if (!strcmp(name, "vkCreateWaylandSurfaceKHR"))
 		return (PFN_vkVoidFunction)layer_CreateWaylandSurfaceKHR;
+	if (!strcmp(name, "vkDestroySurfaceKHR"))
+		return (PFN_vkVoidFunction)layer_DestroySurfaceKHR;
 	if (instance == VK_NULL_HANDLE)
 		return nullptr;
 	PFN_vkGetInstanceProcAddr gipa = next_gipa_for(instance);
@@ -363,6 +508,13 @@ dxr_wl_capture_install(IUnityInterfaces *ifaces, const char *when)
 	(void)ifaces;
 	if (!started_with_force_wayland())
 		return;
+	const char *dbg = getenv("DXR_WL_DEBUG_PTRACE");
+	if (dbg && *dbg == '1') {
+		// Debug only: let a debugger attach to the running player (Yama
+		// ptrace_scope=1 otherwise allows only a parent to trace it).
+		prctl(PR_SET_PTRACER, PR_SET_PTRACER_ANY, 0, 0, 0);
+		fprintf(stderr, "[DisplayXR-WL] %s: debugger attach allowed (DXR_WL_DEBUG_PTRACE)\n", when);
+	}
 	char lib[PATH_MAX];
 	if (!plugin_module_path(lib, sizeof(lib))) {
 		fprintf(stderr, "[DisplayXR-WL] %s: cannot locate the plug-in library; capture off\n", when);

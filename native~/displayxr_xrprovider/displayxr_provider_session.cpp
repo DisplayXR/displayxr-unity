@@ -193,6 +193,7 @@ extern "C" int dxr_wl_weave_surface_create(struct wl_display *display, struct wl
                                            int logical_h, struct wl_surface **out_surface, int *out_w, int *out_h);
 extern "C" int dxr_wl_weave_poll(int *out_w, int *out_h);
 extern "C" void dxr_wl_weave_on_player_resize(int logical_w, int logical_h);
+extern "C" void dxr_wl_weave_set_transparent(int transparent);
 #endif
 extern "C" int  dxr_pvk_device_ready(void);
 // 2D overlay layers (#336). Kinds match DXR_PVK_OVERLAY_* in the VK header.
@@ -5146,6 +5147,7 @@ int dxr_prov_session_start(const char *runtime_json_path,
 				wl_binding.transparentBackgroundEnabled = use_transparent ? 1 : 0;
 				win_chain = &wl_binding;
 				s_ps.wl_weave = 1;
+				dxr_wl_weave_set_transparent(use_transparent ? 1 : 0); // click-through + window drag
 				ps_log("[DisplayXR-PROV] Linux/Wayland: binding the runtime's weave to a sub-surface of the "
 				       "player's window (window %dx%d logical, weave buffer %dx%d, transparent=%d)\n",
 				       lw, lh, dw, dh, (int)use_transparent);
