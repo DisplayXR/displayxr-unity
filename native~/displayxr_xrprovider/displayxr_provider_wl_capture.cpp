@@ -230,7 +230,22 @@ layer_CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *ci, co
 	PFN_vkCreateSwapchainKHR next = gdpa ? (PFN_vkCreateSwapchainKHR)gdpa(device, "vkCreateSwapchainKHR") : nullptr;
 	if (!next)
 		return VK_ERROR_INITIALIZATION_FAILED;
-	VkResult r = next(device, ci, alloc, out);
+	VkResult r = VK_ERROR_INITIALIZATION_FAILED;
+	// Transparent avatar: the player's own window sits under the weave sub-surface.
+	// Ask the compositor to honour its alpha (the player presents it OPAQUE), so a
+	// window the player leaves at alpha 0 shows the desktop. Falls back to the
+	// player's own request if the surface can't do it.
+	if (ci && s_vk_surface != VK_NULL_HANDLE && ci->surface == s_vk_surface &&
+	    ci->compositeAlpha != VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR) {
+		VkSwapchainCreateInfoKHR alpha_ci = *ci;
+		alpha_ci.compositeAlpha = VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR;
+		r = next(device, &alpha_ci, alloc, out);
+		fprintf(stderr, "[DisplayXR-WL] the player's window swapchain: compositeAlpha 0x%x -> PRE_MULTIPLIED %s "
+		        "(format %d)\n", (unsigned)ci->compositeAlpha, r == VK_SUCCESS ? "OK" : "REFUSED", (int)ci->imageFormat);
+		fflush(stderr);
+	}
+	if (r != VK_SUCCESS)
+		r = next(device, ci, alloc, out);
 	if (r == VK_SUCCESS && ci && s_vk_surface != VK_NULL_HANDLE && ci->surface == s_vk_surface) {
 		s_swap_w = ci->imageExtent.width;
 		s_swap_h = ci->imageExtent.height;
