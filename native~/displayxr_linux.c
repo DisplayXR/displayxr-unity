@@ -55,6 +55,8 @@
 
 #if defined(__linux__) && !defined(__ANDROID__)
 
+#include "displayxr_linux_wayland.h"
+
 #include <dlfcn.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -926,17 +928,6 @@ static void lin_reset_input_region_locked(void);
 
 // Native-Wayland player (displayxr_linux_wayland.c): the same rects, applied to the
 // player's own Wayland surface instead of an X11 window.
-extern int dxr_wl_click_through_wanted(void);
-extern int dxr_wl_set_player_input_region(const void *rects, int n);
-extern int dxr_wl_unity_swapchain_size(int *out_w, int *out_h);
-extern int dxr_wl_begin_pointer_drag(unsigned button);
-extern void dxr_wl_end_pointer_drag(void);
-extern double dxr_wl_ui_scale(void);
-extern int dxr_wl_weave_device_size(int *out_w, int *out_h);
-extern void dxr_wl_request_player_size(int logical_w, int logical_h);
-extern int dxr_wl_take_player_size(int *out_w, int *out_h);
-extern int dxr_wl_move_player_to_output_with_mode(int pw, int ph, int win_logical_w, int win_logical_h);
-extern unsigned dxr_wl_player_generation(void);
 
 static int
 lin_hit_ready(void)
@@ -1314,21 +1305,22 @@ lin_root_pointer(int *x, int *y, unsigned int *mask)
 DISPLAYXR_EXPORT int
 displayxr_linux_drag_window(int right_pressed)
 {
-	int active = 0;
-	pthread_mutex_lock(&s_hit_mutex);
 	if (dxr_wl_click_through_wanted()) {
 		// Native Wayland: the compositor moves the window while the button is held
-		// (the DisplayXR GNOME extension); we only start and end it.
-		if (right_pressed && !s_drag_active)
-			s_drag_active = dxr_wl_begin_pointer_drag(3) ? 1 : -1; // -1: refused, don't retry until released
-		else if (!right_pressed && s_drag_active) {
-			if (s_drag_active == 1)
+		// (the DisplayXR GNOME extension); we only start and end it. C# main thread
+		// only, and outside s_hit_mutex: these are D-Bus round trips.
+		static int s_wl_drag; // 1 dragging, -1 refused: don't retry until released
+		if (right_pressed && !s_wl_drag)
+			s_wl_drag = dxr_wl_begin_pointer_drag(3) ? 1 : -1;
+		else if (!right_pressed && s_wl_drag) {
+			if (s_wl_drag == 1)
 				dxr_wl_end_pointer_drag();
-			s_drag_active = 0;
+			s_wl_drag = 0;
 		}
-		active = s_drag_active == 1;
-		goto out;
+		return s_wl_drag == 1;
 	}
+	int active = 0;
+	pthread_mutex_lock(&s_hit_mutex);
 	if (!right_pressed) {
 		if (s_drag_active) lin_log("[DisplayXR-LNX] drag: end\n");
 		s_drag_active = 0;
@@ -1388,13 +1380,6 @@ out:
 DISPLAYXR_EXPORT int
 displayxr_linux_move_app_window_to_rect(int px, int py, int pw, int ph)
 {
-	int dw = 0, dh = 0;
-	if (dxr_wl_weave_device_size(&dw, &dh)) {
-		// Native Wayland: find the panel's output by its mode and centre the window on
-		// it through the DisplayXR GNOME extension.
-		double scale = dxr_wl_ui_scale();
-		return dxr_wl_move_player_to_output_with_mode(pw, ph, (int)(dw / scale + 0.5), (int)(dh / scale + 0.5));
-	}
 	if (!lin_load_xlib() || !s_win || pw <= 0 || ph <= 0) {
 		lin_log("[DisplayXR-LNX] move_to_display: no app window\n");
 		return 0;
@@ -1481,6 +1466,16 @@ displayxr_get_overlay_position(int *x, int *y)
 {
 	if (x) *x = 0;
 	if (y) *y = 0;
+	if (dxr_wl_weave_active()) {
+		// Native-Wayland player: from the compositor, converted into X root
+		// coordinates so a saved position means the same place under X11.
+		int wx = 0, wy = 0;
+		if (dxr_wl_get_player_position_x11(&wx, &wy)) {
+			if (x) *x = wx;
+			if (y) *y = wy;
+		}
+		return;
+	}
 	if (!s_overlay || !s_win) return;
 	if (s_overlay_is_toplevel) { // the transparent overlay tracks the origin every frame
 		if (x) *x = s_ox;
@@ -1506,10 +1501,10 @@ displayxr_get_overlay_position(int *x, int *y)
 DISPLAYXR_EXPORT void
 displayxr_set_overlay_position(int x, int y)
 {
-	int dw = 0, dh = 0;
-	if (dxr_wl_weave_device_size(&dw, &dh)) {
-		// Native Wayland: there is no global coordinate space to restore a saved
-		// position into; the window goes onto the 3D panel instead (TargetDisplay).
+	if (dxr_wl_weave_active()) {
+		// Native-Wayland player: (x, y) are X root coordinates, as from
+		// displayxr_get_overlay_position; the GNOME extension moves the window.
+		dxr_wl_set_player_position_x11(x, y);
 		return;
 	}
 	if (!s_overlay || !s_win || !lin_load_xlib()) return;
@@ -1527,18 +1522,14 @@ displayxr_set_overlay_position(int x, int y)
 DISPLAYXR_EXPORT void
 displayxr_resize_overlay(int width, int height)
 {
-	int dw = 0, dh = 0;
-	if (dxr_wl_weave_device_size(&dw, &dh)) {
-		// Native Wayland: the player sizes its own toplevel; hand the size (device px
-		// -> logical) to the plug-in's C#, which applies it with Screen.SetResolution.
-		double scale = dxr_wl_ui_scale();
+	if (dxr_wl_weave_active()) {
+		// Native-Wayland player: it sizes its own toplevel; the plug-in's C# applies
+		// the size (in logical px) with Screen.SetResolution.
 		if (width < LIN_MIN_WINDOW_PX) width = LIN_MIN_WINDOW_PX;
 		if (height < LIN_MIN_WINDOW_PX) height = LIN_MIN_WINDOW_PX;
-		int lw = (int)(width / scale + 0.5), lh = (int)(height / scale + 0.5);
-		dxr_wl_request_player_size(lw, lh);
-		char m[128];
-		snprintf(m, sizeof(m), "[DisplayXR-LNX] resize_overlay -> %dx%d px (Wayland: %dx%d logical)\n", width,
-		         height, lw, lh);
+		dxr_wl_request_player_size(width, height);
+		char m[96];
+		snprintf(m, sizeof(m), "[DisplayXR-LNX] resize_overlay -> %dx%d px (Wayland)\n", width, height);
 		lin_log(m);
 		return;
 	}

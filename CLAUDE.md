@@ -32,7 +32,7 @@ Use the platform build scripts (they wrap CMake and place the shipping binary):
 - **macOS (shipping binary):** `native~/build-mac.sh` → Universal (x86_64 + arm64) `Runtime/Plugins/macOS/displayxr_unity.bundle`.
 - **Windows (shipping binary, MSVC):** `native~\build-win.bat` → `Runtime/Plugins/Windows/x64/displayxr_unity.dll`. Needs VS 2022 (or Build Tools) + "Desktop development with C++"; run from a Developer Command Prompt or any shell with MSVC on PATH.
 - **Windows (MinGW, compile-check only):** `native~/build-win.sh` → leaves the DLL in `build-win/` (MinGW ABI, not shipped). Run on macOS as a cross-compile check.
-- **Linux (shipping binary):** `native~/build-linux.sh` → `Runtime/Plugins/Linux/x86_64/libdisplayxr_unity.so`. Needs only cmake + a C++17 compiler (no Vulkan SDK — headers are fetched, entry points are `dlopen`ed). **The `.so` is deliberately NOT committed** (gitignored): no maintainer box builds it, so CI's `build-linux` job is the only trustworthy source and the release/package jobs download it from there. Its `.meta` **is** committed. From macOS you can reproduce the CI build exactly with `docker run --rm -v "$PWD":/src ubuntu:22.04` (colima works).
+- **Linux (shipping binary):** `native~/build-linux.sh` → `Runtime/Plugins/Linux/x86_64/libdisplayxr_unity.so`. Needs cmake, a C++17 compiler, `pkg-config` and `libwayland-dev` (no Vulkan SDK — headers are fetched, entry points are `dlopen`ed; `libwayland-client.so.0` is the one deliberate link dependency, for the native-Wayland player path). **The `.so` is deliberately NOT committed** (gitignored): no maintainer box builds it, so CI's `build-linux` job is the only trustworthy source and the release/package jobs download it from there. Its `.meta` **is** committed. From macOS you can reproduce the CI build exactly with `docker run --rm -v "$PWD":/src ubuntu:22.04` (colima works).
 
 Raw CMake (`cd native~ && mkdir build && cd build && cmake .. -DCMAKE_BUILD_TYPE=Release && cmake --build . --config Release`) works too, but the scripts handle output placement.
 
@@ -69,7 +69,7 @@ Rules of thumb:
 littered with `#ifdef _WIN32 … #else` blocks whose `#else` historically meant "macOS" — a third
 platform turns every one of those into a latent build break, and neither the macOS nor the Windows
 build will tell you. One container run catches them all:
-`docker run --rm -v "$PWD":/src ubuntu:22.04 bash -c 'apt-get update -qq && apt-get install -y -qq build-essential cmake git ca-certificates && cmake -S /src/native~ -B /tmp/b -DCMAKE_BUILD_TYPE=Release && cmake --build /tmp/b -j4'`
+`docker run --rm -v "$PWD":/src ubuntu:22.04 bash -c 'apt-get update -qq && apt-get install -y -qq build-essential cmake git ca-certificates pkg-config libwayland-dev && cmake -S /src/native~ -B /tmp/b -DCMAKE_BUILD_TYPE=Release && cmake --build /tmp/b -j4'`
 
 ## Key Architecture
 

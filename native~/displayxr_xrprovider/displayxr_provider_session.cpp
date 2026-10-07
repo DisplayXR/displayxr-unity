@@ -184,18 +184,9 @@ extern "C" void dxr_pvk_signal_unity_done(void);
 extern "C" void dxr_pvk_destroy(void);
 extern "C" void dxr_pvk_destroy_device(void);
 #if defined(__linux__) && !defined(__ANDROID__)
-// Native-Wayland player (experiment): displayxr_provider_wl_capture.cpp + displayxr_linux_wayland.c.
-struct wl_display;
-struct wl_surface;
-extern "C" int dxr_wl_unity_surface(struct wl_display **out_display, struct wl_surface **out_surface);
-extern "C" int dxr_wl_unity_swapchain_size(int *out_w, int *out_h);
-extern "C" int dxr_wl_weave_surface_create(struct wl_display *display, struct wl_surface *parent, int logical_w,
-                                           int logical_h, struct wl_surface **out_surface, int *out_w, int *out_h);
-extern "C" int dxr_wl_weave_poll(int *out_w, int *out_h);
-extern "C" void dxr_wl_weave_on_player_resize(int logical_w, int logical_h);
-extern "C" void dxr_wl_weave_set_transparent(int transparent);
-extern "C" double dxr_wl_ui_scale(void);
-extern "C" int dxr_wl_weave_device_size(int *out_w, int *out_h);
+// Native-Wayland player: displayxr_provider_wl_capture.cpp + displayxr_linux_wayland.c.
+#include "../displayxr_linux_wayland.h"
+extern "C" void dxr_pvk_keep_instance_alive(void);
 #endif
 extern "C" int  dxr_pvk_device_ready(void);
 // 2D overlay layers (#336). Kinds match DXR_PVK_OVERLAY_* in the VK header.
@@ -347,12 +338,15 @@ typedef struct ProviderSession {
 
 	int has_view_rig;
 
-	// Native-Wayland player (experiment): the runtime advertises
-	// XR_DXR_wayland_surface_binding, and this session weaves into a sub-surface
-	// of the player's own window (displayxr_linux_wayland.c).
+	// Native-Wayland player: the runtime advertises XR_DXR_wayland_surface_binding,
+	// and this session weaves into a sub-surface of the player's own window
+	// (displayxr_linux_wayland.c). panel_connector: the 3D panel's output name
+	// (XrDisplayDesktopInfoDXR.deviceName, e.g. "HDMI-1") to find it among the
+	// Wayland outputs.
 	int has_wayland_binding;
 	int wl_weave;
 	PFN_xrSetWaylandSurfaceGeometryDXR pfn_set_wl_geometry;
+	char panel_connector[160]; // > deviceName[128]
 
 	// XR_DXR_depth_budget (#318): the runtime's advisory REAR DEPTH BUDGET - how far
 	// behind the display plane a transparent overlay may render right now, given what
@@ -4709,10 +4703,14 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	// runtime self-hosts (enabling an extension we then don't use is harmless).
 	extensions[ext_count++] = "XR_KHR_vulkan_enable2";
 	extensions[ext_count++] = XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME;
-	// The native-Wayland player weaves through the Wayland binding instead; enabled
-	// whenever advertised, chained only when the player really is on Wayland.
-	if (s_ps.has_wayland_binding)
+	// The native-Wayland player weaves through the Wayland binding instead. Only
+	// when the player really is on Wayland (the capture layer saw its window, which
+	// it only looks for under -force-wayland): an X11 player's instance stays exactly
+	// what it was.
+	if (s_ps.has_wayland_binding && dxr_wl_unity_surface(NULL, NULL))
 		extensions[ext_count++] = XR_DXR_WAYLAND_SURFACE_BINDING_EXTENSION_NAME;
+	else
+		s_ps.has_wayland_binding = 0;
 #else
 	extensions[ext_count++] = XR_KHR_METAL_ENABLE_EXTENSION_NAME;
 	extensions[ext_count++] = XR_DXR_COCOA_WINDOW_BINDING_EXTENSION_NAME;
@@ -4905,6 +4903,10 @@ int dxr_prov_session_start(const char *runtime_json_path,
 			s_ps.desktop_h = (uint32_t)ddi.desktopRect.extent.height;
 			s_ps.desktop_origin_valid = 1;
 			s_ps.panel_confirmed = (ddi.isPanelConfirmed == XR_TRUE) ? 1 : 0;
+#if defined(__linux__) && !defined(__ANDROID__)
+			snprintf(s_ps.panel_connector, sizeof(s_ps.panel_connector), "%.*s",
+			         (int)sizeof(ddi.deviceName), ddi.deviceName);
+#endif
 			ps_log("[DisplayXR-PROV] Display desktop rect: (%d,%d %dx%d) confirmed=%d "
 			       "primary=%d dev='%.*s' [v18]\n",
 			       ddi.desktopRect.offset.x, ddi.desktopRect.offset.y,
@@ -5128,18 +5130,18 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	XrWaylandSurfaceGeometryDXR wl_geometry = {};
 	const void *win_chain = NULL;
 	s_ps.wl_weave = 0;
-	// Native-Wayland player (experiment): the player has no X11 window, but the
-	// capture layer saw its Wayland window. Weave into a sub-surface of it, so the
-	// weave lands in the player's window and the runtime opens no window of its own.
+	// Native-Wayland player: the player has no X11 window, but the capture layer saw
+	// its Wayland window. Weave into a sub-surface of it, so the weave lands in the
+	// player's window and the runtime opens no window of its own.
 	{
 		struct wl_display *wd = NULL;
 		struct wl_surface *ws = NULL;
 		int lw = 0, lh = 0;
 		int have_surface = dxr_wl_unity_surface(&wd, &ws);
 		int have_size = dxr_wl_unity_swapchain_size(&lw, &lh);
-		if (have_surface || s_ps.has_wayland_binding)
-			ps_log("[DisplayXR-PROV] Linux/Wayland check: runtime binding=%d player surface=%d (%p) size=%dx%d\n",
-			       s_ps.has_wayland_binding, have_surface, (void *)ws, lw, lh);
+		if (have_surface)
+			ps_log("[DisplayXR-PROV] Linux/Wayland: runtime binding=%d player surface=%p size=%dx%d\n",
+			       s_ps.has_wayland_binding, (void *)ws, lw, lh);
 		if (s_ps.has_wayland_binding && have_surface && have_size) {
 			struct wl_surface *weave = NULL;
 			int dw = 0, dh = 0;
@@ -5157,6 +5159,7 @@ int dxr_prov_session_start(const char *runtime_json_path,
 				win_chain = &wl_binding;
 				s_ps.wl_weave = 1;
 				dxr_wl_weave_set_transparent(use_transparent ? 1 : 0); // click-through + window drag
+				dxr_pvk_keep_instance_alive(); // see displayxr_provider_gfx_vulkan.h
 				ps_log("[DisplayXR-PROV] Linux/Wayland: binding the runtime's weave to a sub-surface of the "
 				       "player's window (window %dx%d logical, weave buffer %dx%d, transparent=%d)\n",
 				       lw, lh, dw, dh, (int)use_transparent);
@@ -5316,6 +5319,11 @@ void dxr_prov_session_stop(void)
 	// ...and the enable2 device + instance only now: the runtime's compositor, repaint
 	// thread included, uses them until the session is gone (DisplayXR/displayxr-runtime#1779).
 	if (s_ps.graphics_api == DXR_GFX_VULKAN) dxr_pvk_destroy_device();
+#endif
+#if defined(__linux__) && !defined(__ANDROID__)
+	// The runtime's surface on the weave sub-surface went with the session.
+	if (s_ps.wl_weave) dxr_wl_weave_destroy();
+	s_ps.wl_weave = 0;
 #endif
 
 #ifdef _WIN32
@@ -6128,11 +6136,9 @@ int dxr_prov_begin_frame(uint32_t *out_image_index, int *out_should_render)
 	if (!s_ps.running || !s_ps.session_ready) return 0;
 
 #if defined(__linux__) && !defined(__ANDROID__)
-	// Native-Wayland player: follow the player's window size and output scale.
+	// Native-Wayland player: follow the player's window size, scale and recreation.
 	if (s_ps.wl_weave) {
-		int lw = 0, lh = 0, dw = 0, dh = 0;
-		if (dxr_wl_unity_swapchain_size(&lw, &lh))
-			dxr_wl_weave_on_player_resize(lw, lh); // no-op when unchanged
+		int dw = 0, dh = 0;
 		if (dxr_wl_weave_poll(&dw, &dh) && s_ps.pfn_set_wl_geometry) {
 			XrResult gr = s_ps.pfn_set_wl_geometry(s_ps.session, (uint32_t)dw, (uint32_t)dh, 0);
 			ps_log("[DisplayXR-PROV] Linux/Wayland: weave buffer -> %dx%d (r=%d)\n", dw, dh, (int)gr);
@@ -7823,15 +7829,16 @@ int dxr_prov_move_window_to_display(void)
 	if (prev) SetThreadDpiAwarenessContext(prev);
 	return rc;
 #elif defined(__linux__) && !defined(__ANDROID__)
-	// Native-Wayland player: no X11 desktop coordinates are needed (or meaningful —
-	// at a fractional scale the runtime's X11 rect is the scaled XWayland one and is
-	// not panel-confirmed). The panel's device-pixel mode identifies its output;
-	// displayxr_linux.c centres the window on it through the GNOME extension.
+	// Native-Wayland player: no X11 desktop coordinates are needed (or meaningful:
+	// at a fractional scale the runtime's X11 rect is the scaled XWayland one). The
+	// panel's connector name (else its device-pixel mode) identifies its output, and
+	// the window is centred on it through the GNOME extension.
 	if (s_ps.wl_weave) {
-		int moved = displayxr_linux_move_app_window_to_rect(0, 0, (int)s_ps.display_info.pixel_width,
-		                                                    (int)s_ps.display_info.pixel_height);
-		ps_log("[DisplayXR-PROV] move_window_to_display (Wayland): panel %ux%u px -> %s\n",
-		       s_ps.display_info.pixel_width, s_ps.display_info.pixel_height, moved ? "moved" : "not moved");
+		int moved = dxr_wl_move_player_to_panel(s_ps.panel_connector, (int)s_ps.display_info.pixel_width,
+		                                        (int)s_ps.display_info.pixel_height);
+		ps_log("[DisplayXR-PROV] move_window_to_display (Wayland): panel '%s' %ux%u px -> %s\n",
+		       s_ps.panel_connector, s_ps.display_info.pixel_width, s_ps.display_info.pixel_height,
+		       moved ? "on it" : "not moved");
 		return moved;
 	}
 	// (#266, Linux) The runtime reports the panel rect in X root coordinates (its desktop

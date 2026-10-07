@@ -4,10 +4,11 @@
 # Produces Runtime/Plugins/Linux/x86_64/libdisplayxr_unity.so — the shipping
 # binary, with the provider Vulkan backend compiled in (ENABLE_VULKAN).
 #
-# Needs only cmake + a C++17 compiler. There is NO Vulkan SDK requirement: the
-# Vulkan headers are fetched by CMake and every entry point is resolved from
-# libvulkan.so.1 at runtime (displayxr_vk_loader.cpp), so the .so carries no
-# hard dependency on a Vulkan ICD being installed.
+# Needs cmake, a C++17 compiler, pkg-config and libwayland-dev (the native-Wayland
+# player path links libwayland-client and runs wayland-scanner). There is NO Vulkan
+# SDK requirement: the Vulkan headers are fetched by CMake and every entry point is
+# resolved from libvulkan.so.1 at runtime (displayxr_vk_loader.cpp), so the .so
+# carries no hard dependency on a Vulkan ICD being installed.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"

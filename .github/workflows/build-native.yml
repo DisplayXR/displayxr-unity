@@ -147,8 +147,11 @@ jobs:
         run: |
           export DEBIAN_FRONTEND=noninteractive
           apt-get update -qq
+          # pkg-config + libwayland-dev: the native-Wayland player path links
+          # libwayland-client and runs wayland-scanner (DisplayXR/displayxr-runtime#1831).
           apt-get install -y --no-install-recommends \
-            build-essential cmake git ca-certificates binutils file
+            build-essential cmake git ca-certificates binutils file \
+            pkg-config libwayland-dev
           # actions/checkout needs a git new enough for its safe.directory handling
           git --version
 
@@ -189,6 +192,9 @@ jobs:
           # The plugin must resolve Vulkan and Xlib through dlopen
           # (displayxr_vk_loader / displayxr_linux.c), never by linking them —
           # otherwise it fails to load on a box with no Vulkan ICD or no X11.
+          # libwayland-client.so.0 IS linked, deliberately: the native-Wayland
+          # path uses it on the player's own connection, and every box that can
+          # run the plugin has it (the DisplayXR runtime package depends on it).
           for lib in libvulkan libX11; do
             if readelf -d "$SO" | grep -q "$lib"; then
               echo "ERROR: .so has a hard dependency on $lib — it must dlopen it instead"
