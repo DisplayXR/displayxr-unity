@@ -210,7 +210,7 @@ if(UNIX AND NOT APPLE AND NOT ANDROID)
     find_program(DXR_WAYLAND_SCANNER wayland-scanner REQUIRED)
     set(DXR_WL_GEN ${CMAKE_CURRENT_BINARY_DIR}/wayland-generated)
     file(MAKE_DIRECTORY ${DXR_WL_GEN})
-    foreach(proto viewporter fractional-scale-v1)
+    foreach(proto viewporter fractional-scale-v1 xdg-output-unstable-v1)
         set(xml ${CMAKE_CURRENT_SOURCE_DIR}/wayland-protocols/${proto}.xml)
         add_custom_command(OUTPUT ${DXR_WL_GEN}/${proto}-client-protocol.h ${DXR_WL_GEN}/${proto}-protocol.c
             COMMAND ${DXR_WAYLAND_SCANNER} client-header ${xml} ${DXR_WL_GEN}/${proto}-client-protocol.h

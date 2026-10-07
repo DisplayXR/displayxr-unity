@@ -63,6 +63,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include <math.h>
 #include <pthread.h>
 
 #include "displayxr_exports.h"
@@ -930,6 +931,12 @@ extern int dxr_wl_set_player_input_region(const void *rects, int n);
 extern int dxr_wl_unity_swapchain_size(int *out_w, int *out_h);
 extern int dxr_wl_begin_pointer_drag(unsigned button);
 extern void dxr_wl_end_pointer_drag(void);
+extern double dxr_wl_ui_scale(void);
+extern int dxr_wl_weave_device_size(int *out_w, int *out_h);
+extern void dxr_wl_request_player_size(int logical_w, int logical_h);
+extern int dxr_wl_take_player_size(int *out_w, int *out_h);
+extern int dxr_wl_move_player_to_output_with_mode(int pw, int ph, int win_logical_w, int win_logical_h);
+extern unsigned dxr_wl_player_generation(void);
 
 static int
 lin_hit_ready(void)
@@ -1050,10 +1057,31 @@ lin_apply_input_region(LinRects *v, const char *what)
 	for (size_t i = 0; i < nb; i++) { h ^= b[i]; h *= 1099511628211ULL; }
 	h ^= (unsigned long long)(unsigned)v->n; h *= 1099511628211ULL;
 	if (h == 0) h = 1;
+	// A recreated player window has no input region yet: apply even an unchanged one.
+	static unsigned s_region_generation;
+	if (dxr_wl_click_through_wanted() && dxr_wl_player_generation() != s_region_generation) {
+		s_region_generation = dxr_wl_player_generation();
+		s_hit_hash = 0;
+	}
 	if (s_hit_shaped && h == s_hit_hash) return;
 	s_hit_hash = h;
 
 	if (dxr_wl_click_through_wanted()) {
+		// The rects are window DEVICE px, like on X11; the player's surface is in
+		// LOGICAL px. Convert, rounding outward so the region still covers them.
+		double scale = dxr_wl_ui_scale();
+		if (scale != 1.0) {
+			for (int i = 0; i < v->n; i++) {
+				LinXRect *r = &v->r[i];
+				long x0 = (long)floor(r->x / scale), y0 = (long)floor(r->y / scale);
+				long x1 = (long)ceil((r->x + (long)r->width) / scale);
+				long y1 = (long)ceil((r->y + (long)r->height) / scale);
+				r->x = (short)x0;
+				r->y = (short)y0;
+				r->width = (unsigned short)(x1 - x0);
+				r->height = (unsigned short)(y1 - y0);
+			}
+		}
 		dxr_wl_set_player_input_region(v->r, v->n);
 		if (!s_hit_shaped) {
 			char m[160];
@@ -1157,7 +1185,7 @@ displayxr_set_overlay_hit_rect(int x, int y, int w, int h)
 		lin_rects_add_surround(&v);
 		int ww = (int)s_ow, wh = (int)s_oh;
 		if (dxr_wl_click_through_wanted())
-			dxr_wl_unity_swapchain_size(&ww, &wh); // the player's window, logical px
+			dxr_wl_weave_device_size(&ww, &wh); // the player's window, device px
 		lin_rects_add_wsui(&v, ww, wh);
 		if (!v.oom) lin_apply_input_region(&v, "AABB");
 		free(v.r);
@@ -1360,6 +1388,13 @@ out:
 DISPLAYXR_EXPORT int
 displayxr_linux_move_app_window_to_rect(int px, int py, int pw, int ph)
 {
+	int dw = 0, dh = 0;
+	if (dxr_wl_weave_device_size(&dw, &dh)) {
+		// Native Wayland: find the panel's output by its mode and centre the window on
+		// it through the DisplayXR GNOME extension.
+		double scale = dxr_wl_ui_scale();
+		return dxr_wl_move_player_to_output_with_mode(pw, ph, (int)(dw / scale + 0.5), (int)(dh / scale + 0.5));
+	}
 	if (!lin_load_xlib() || !s_win || pw <= 0 || ph <= 0) {
 		lin_log("[DisplayXR-LNX] move_to_display: no app window\n");
 		return 0;
@@ -1427,6 +1462,14 @@ lin_main_dpy_locked(void)
 DISPLAYXR_EXPORT void
 displayxr_get_overlay_size(int *width, int *height)
 {
+	// Native-Wayland player: the window in DEVICE px, the same unit as on X11 and
+	// Windows (the player itself only knows logical px).
+	int dw = 0, dh = 0;
+	if (dxr_wl_weave_device_size(&dw, &dh)) {
+		if (width) *width = dw;
+		if (height) *height = dh;
+		return;
+	}
 	int have = s_overlay != 0;
 	if (width) *width = have ? (int)s_ow : 0;
 	if (height) *height = have ? (int)s_oh : 0;
@@ -1463,6 +1506,12 @@ displayxr_get_overlay_position(int *x, int *y)
 DISPLAYXR_EXPORT void
 displayxr_set_overlay_position(int x, int y)
 {
+	int dw = 0, dh = 0;
+	if (dxr_wl_weave_device_size(&dw, &dh)) {
+		// Native Wayland: there is no global coordinate space to restore a saved
+		// position into; the window goes onto the 3D panel instead (TargetDisplay).
+		return;
+	}
 	if (!s_overlay || !s_win || !lin_load_xlib()) return;
 	pthread_mutex_lock(&s_hit_mutex);
 	XDpy d = lin_main_dpy_locked();
@@ -1478,6 +1527,21 @@ displayxr_set_overlay_position(int x, int y)
 DISPLAYXR_EXPORT void
 displayxr_resize_overlay(int width, int height)
 {
+	int dw = 0, dh = 0;
+	if (dxr_wl_weave_device_size(&dw, &dh)) {
+		// Native Wayland: the player sizes its own toplevel; hand the size (device px
+		// -> logical) to the plug-in's C#, which applies it with Screen.SetResolution.
+		double scale = dxr_wl_ui_scale();
+		if (width < LIN_MIN_WINDOW_PX) width = LIN_MIN_WINDOW_PX;
+		if (height < LIN_MIN_WINDOW_PX) height = LIN_MIN_WINDOW_PX;
+		int lw = (int)(width / scale + 0.5), lh = (int)(height / scale + 0.5);
+		dxr_wl_request_player_size(lw, lh);
+		char m[128];
+		snprintf(m, sizeof(m), "[DisplayXR-LNX] resize_overlay -> %dx%d px (Wayland: %dx%d logical)\n", width,
+		         height, lw, lh);
+		lin_log(m);
+		return;
+	}
 	if (!s_overlay || !s_win || !lin_load_xlib()) return;
 	if (width < LIN_MIN_WINDOW_PX) width = LIN_MIN_WINDOW_PX;
 	if (height < LIN_MIN_WINDOW_PX) height = LIN_MIN_WINDOW_PX;
@@ -1507,6 +1571,26 @@ DISPLAYXR_EXPORT int
 displayxr_consume_overlay_close_request(void)
 {
 	return 0;
+}
+
+/// Native-Wayland player: device px per logical px of Unity's window (Unity's Screen
+/// and pointer are logical there, the window-pixel API is device px). 1 otherwise.
+DISPLAYXR_EXPORT float
+displayxr_linux_ui_scale(void)
+{
+	return (float)dxr_wl_ui_scale();
+}
+
+/// Native-Wayland player: a window size requested through displayxr_resize_overlay,
+/// in LOGICAL px, for C# to apply with Screen.SetResolution. 1 when one is pending.
+DISPLAYXR_EXPORT int
+displayxr_linux_take_pending_resize(int *width, int *height)
+{
+	int w = 0, h = 0;
+	int have = dxr_wl_take_player_size(&w, &h);
+	if (width) *width = w;
+	if (height) *height = h;
+	return have;
 }
 
 // ---------------------------------------------------------------------------

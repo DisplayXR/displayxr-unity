@@ -408,6 +408,10 @@ DISPLAYXR_EXPORT int displayxr_linux_drag_window(int right_pressed);
 /// (#332) 1 while the transparent overlay is up and the click-through exports act; 0 for
 /// the opaque child or without X. Cached state only — cheap to poll every frame.
 DISPLAYXR_EXPORT int displayxr_linux_click_through_active(void);
+/// Native-Wayland player: device px per logical px of Unity's window (1 elsewhere).
+DISPLAYXR_EXPORT float displayxr_linux_ui_scale(void);
+/// Native-Wayland player: a pending window size (logical px) for Screen.SetResolution.
+DISPLAYXR_EXPORT int displayxr_linux_take_pending_resize(int *width, int *height);
 
 /// (#266) Centre Unity's window on the given rect (X root coordinates), unless it is
 /// already there. Called by dxr_prov_move_window_to_display with the panel rect the

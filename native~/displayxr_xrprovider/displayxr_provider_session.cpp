@@ -194,6 +194,8 @@ extern "C" int dxr_wl_weave_surface_create(struct wl_display *display, struct wl
 extern "C" int dxr_wl_weave_poll(int *out_w, int *out_h);
 extern "C" void dxr_wl_weave_on_player_resize(int logical_w, int logical_h);
 extern "C" void dxr_wl_weave_set_transparent(int transparent);
+extern "C" double dxr_wl_ui_scale(void);
+extern "C" int dxr_wl_weave_device_size(int *out_w, int *out_h);
 #endif
 extern "C" int  dxr_pvk_device_ready(void);
 // 2D overlay layers (#336). Kinds match DXR_PVK_OVERLAY_* in the VK header.
@@ -1194,7 +1196,14 @@ static void ps_window_size(uint32_t *w, uint32_t *h)
 	// Linux (#249): live geometry of the bound X11 window, same role as the
 	// macOS backing size above. Returns 0 when no window is bound (runtime
 	// self-hosting), which falls through to the display-info default below.
-	displayxr_linux_window_size(&ww, &hh);
+	{
+		int dw = 0, dh = 0;
+		if (s_ps.wl_weave && dxr_wl_weave_device_size(&dw, &dh)) {
+			ww = (uint32_t)dw; hh = (uint32_t)dh; // native-Wayland player: device px
+		} else {
+			displayxr_linux_window_size(&ww, &hh);
+		}
+	}
 #endif
 	if (ww > 0 && hh > 0) s_live_window_px.store(((uint64_t)ww << 32) | hh); // a real measurement
 	if (ww == 0 || hh == 0) {
@@ -6127,6 +6136,10 @@ int dxr_prov_begin_frame(uint32_t *out_image_index, int *out_should_render)
 		if (dxr_wl_weave_poll(&dw, &dh) && s_ps.pfn_set_wl_geometry) {
 			XrResult gr = s_ps.pfn_set_wl_geometry(s_ps.session, (uint32_t)dw, (uint32_t)dh, 0);
 			ps_log("[DisplayXR-PROV] Linux/Wayland: weave buffer -> %dx%d (r=%d)\n", dw, dh, (int)gr);
+			// The device size of every app rect changed with it: re-ask the runtime
+			// for the zones' render sizes (the eye swapchain follows).
+			if (s_ps.zone_valid) ps_query_zone_rec_size();
+			for (uint32_t i = 0; i < s_ps.extra_zone_count; i++) ps_query_extra_zone_rec(&s_ps.extra_zones[i]);
 		}
 	}
 #endif
@@ -7810,6 +7823,17 @@ int dxr_prov_move_window_to_display(void)
 	if (prev) SetThreadDpiAwarenessContext(prev);
 	return rc;
 #elif defined(__linux__) && !defined(__ANDROID__)
+	// Native-Wayland player: no X11 desktop coordinates are needed (or meaningful —
+	// at a fractional scale the runtime's X11 rect is the scaled XWayland one and is
+	// not panel-confirmed). The panel's device-pixel mode identifies its output;
+	// displayxr_linux.c centres the window on it through the GNOME extension.
+	if (s_ps.wl_weave) {
+		int moved = displayxr_linux_move_app_window_to_rect(0, 0, (int)s_ps.display_info.pixel_width,
+		                                                    (int)s_ps.display_info.pixel_height);
+		ps_log("[DisplayXR-PROV] move_window_to_display (Wayland): panel %ux%u px -> %s\n",
+		       s_ps.display_info.pixel_width, s_ps.display_info.pixel_height, moved ? "moved" : "not moved");
+		return moved;
+	}
 	// (#266, Linux) The runtime reports the panel rect in X root coordinates (its desktop
 	// resolver matches the panel to an XRandR output), which is the space Unity's X11
 	// window lives in under X11 and XWayland alike — no DPI virtualisation to undo here.

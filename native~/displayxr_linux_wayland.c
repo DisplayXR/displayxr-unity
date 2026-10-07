@@ -26,6 +26,7 @@
 #include <wayland-client.h>
 #include "viewporter-client-protocol.h"
 #include "fractional-scale-v1-client-protocol.h"
+#include "xdg-output-unstable-v1-client-protocol.h"
 
 #include <math.h>
 #include <pthread.h>
@@ -47,8 +48,10 @@ struct dxr_wl {
 	struct wl_shm *shm;
 	struct wp_viewporter *viewporter;
 	struct wp_fractional_scale_manager_v1 *frac_manager;
+	struct zxdg_output_manager_v1 *xdg_output_manager;
 
 	struct wl_surface *surface;
+	struct wl_surface *parent; // the player's window it is a sub-surface of
 	struct wl_subsurface *subsurface;
 	struct wp_viewport *viewport;
 	struct wp_fractional_scale_v1 *frac;
@@ -65,6 +68,60 @@ static struct dxr_wl s_wl;
 // provider's frame thread polls.
 static pthread_mutex_t s_wl_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+// Outputs: the device-pixel mode (wl_output) and the logical rect (xdg-output), to
+// find the 3D panel by its mode and place the window on it in logical coordinates.
+#define DXR_WL_MAX_OUTPUTS 8
+struct dxr_wl_output {
+	struct wl_output *output;
+	struct zxdg_output_v1 *xdg;
+	int mode_w, mode_h;           // current mode, device px
+	int lx, ly, lw, lh;           // logical rect (compositor stage coordinates)
+};
+static struct dxr_wl_output s_outputs[DXR_WL_MAX_OUTPUTS];
+static int s_output_count;
+
+static void out_geometry(void *d, struct wl_output *o, int32_t x, int32_t y, int32_t pw, int32_t ph, int32_t sub,
+                         const char *make, const char *model, int32_t tr)
+{
+	(void)d; (void)o; (void)x; (void)y; (void)pw; (void)ph; (void)sub; (void)make; (void)model; (void)tr;
+}
+static void out_mode(void *d, struct wl_output *o, uint32_t flags, int32_t w, int32_t h, int32_t refresh)
+{
+	(void)o; (void)refresh;
+	struct dxr_wl_output *out = d;
+	if (flags & WL_OUTPUT_MODE_CURRENT) {
+		out->mode_w = w;
+		out->mode_h = h;
+	}
+}
+static void out_done(void *d, struct wl_output *o) { (void)d; (void)o; }
+static void out_scale(void *d, struct wl_output *o, int32_t f) { (void)d; (void)o; (void)f; }
+static const struct wl_output_listener s_output_listener = {
+    .geometry = out_geometry, .mode = out_mode, .done = out_done, .scale = out_scale,
+};
+
+static void xo_position(void *d, struct zxdg_output_v1 *x, int32_t px, int32_t py)
+{
+	(void)x;
+	struct dxr_wl_output *out = d;
+	out->lx = px;
+	out->ly = py;
+}
+static void xo_size(void *d, struct zxdg_output_v1 *x, int32_t w, int32_t h)
+{
+	(void)x;
+	struct dxr_wl_output *out = d;
+	out->lw = w;
+	out->lh = h;
+}
+static void xo_done(void *d, struct zxdg_output_v1 *x) { (void)d; (void)x; }
+static void xo_name(void *d, struct zxdg_output_v1 *x, const char *n) { (void)d; (void)x; (void)n; }
+static void xo_description(void *d, struct zxdg_output_v1 *x, const char *n) { (void)d; (void)x; (void)n; }
+static const struct zxdg_output_v1_listener s_xdg_output_listener = {
+    .logical_position = xo_position, .logical_size = xo_size, .done = xo_done,
+    .name = xo_name, .description = xo_description,
+};
+
 static void
 registry_global(void *data, struct wl_registry *reg, uint32_t name, const char *iface, uint32_t version)
 {
@@ -79,6 +136,13 @@ registry_global(void *data, struct wl_registry *reg, uint32_t name, const char *
 		w->viewporter = wl_registry_bind(reg, name, &wp_viewporter_interface, 1);
 	else if (strcmp(iface, wp_fractional_scale_manager_v1_interface.name) == 0)
 		w->frac_manager = wl_registry_bind(reg, name, &wp_fractional_scale_manager_v1_interface, 1);
+	else if (strcmp(iface, zxdg_output_manager_v1_interface.name) == 0)
+		w->xdg_output_manager = wl_registry_bind(reg, name, &zxdg_output_manager_v1_interface, version < 3 ? version : 3);
+	else if (strcmp(iface, wl_output_interface.name) == 0 && s_output_count < DXR_WL_MAX_OUTPUTS) {
+		struct dxr_wl_output *out = &s_outputs[s_output_count++];
+		out->output = wl_registry_bind(reg, name, &wl_output_interface, version < 2 ? version : 2);
+		wl_output_add_listener(out->output, &s_output_listener, out);
+	}
 }
 
 static void
@@ -110,6 +174,8 @@ update_device_size(void)
 	}
 }
 
+static void rerequest_player_size_for_scale(void); // below
+
 static void
 frac_preferred_scale(void *data, struct wp_fractional_scale_v1 *frac, uint32_t scale)
 {
@@ -119,6 +185,7 @@ frac_preferred_scale(void *data, struct wp_fractional_scale_v1 *frac, uint32_t s
 		return;
 	s_wl.scale120 = scale;
 	update_device_size();
+	rerequest_player_size_for_scale();
 }
 
 static const struct wp_fractional_scale_v1_listener s_frac_listener = {
@@ -141,6 +208,16 @@ dxr_wl_connect(struct wl_display *display)
 		fprintf(stderr, "[DisplayXR-WL] roundtrip on the player's connection failed\n");
 		return 0;
 	}
+	if (s_wl.xdg_output_manager) {
+		for (int i = 0; i < s_output_count; i++) {
+			s_outputs[i].xdg = zxdg_output_manager_v1_get_xdg_output(s_wl.xdg_output_manager, s_outputs[i].output);
+			zxdg_output_v1_add_listener(s_outputs[i].xdg, &s_xdg_output_listener, &s_outputs[i]);
+		}
+		wl_display_roundtrip_queue(display, s_wl.queue);
+	}
+	for (int i = 0; i < s_output_count; i++)
+		fprintf(stderr, "[DisplayXR-WL] output %d: mode %dx%d px, logical %dx%d at (%d,%d)\n", i, s_outputs[i].mode_w,
+		        s_outputs[i].mode_h, s_outputs[i].lw, s_outputs[i].lh, s_outputs[i].lx, s_outputs[i].ly);
 	fprintf(stderr, "[DisplayXR-WL] globals on the player's connection: compositor=%p subcompositor=%p shm=%p "
 	        "viewporter=%p fractional_scale=%p\n", (void *)s_wl.compositor, (void *)s_wl.subcompositor,
 	        (void *)s_wl.shm, (void *)s_wl.viewporter, (void *)s_wl.frac_manager);
@@ -181,17 +258,30 @@ make_shm_buffer(int width, int height, uint32_t fill_argb, uint32_t border_argb)
 	return buf;
 }
 
-//! A sub-surface of `parent` at its top-left, above it, taking no input.
+//! Make our surface a sub-surface of `parent` at its top-left, above it.
 static void
-create_subsurface(struct wl_surface *parent)
+attach_to_parent(struct wl_surface *parent)
 {
-	s_wl.surface = wl_compositor_create_surface(s_wl.compositor);
 	s_wl.subsurface = wl_subcompositor_get_subsurface(s_wl.subcompositor, s_wl.surface, parent);
 	wl_subsurface_set_position(s_wl.subsurface, 0, 0);
 	wl_subsurface_place_above(s_wl.subsurface, parent);
 	// Desync: our commits (the runtime's presents) show at once, without waiting
 	// for the player's own commits.
 	wl_subsurface_set_desync(s_wl.subsurface);
+	s_wl.parent = parent;
+}
+
+//! A sub-surface of `parent` at its top-left, above it, taking no input.
+static void
+create_subsurface(struct wl_surface *parent)
+{
+	s_wl.surface = wl_compositor_create_surface(s_wl.compositor);
+	attach_to_parent(parent);
+	// Tell the capture layer (maybe in the other copy of this library) which
+	// Wayland surface is the weave's, so it never mistakes it for the player's.
+	char v[32];
+	snprintf(v, sizeof(v), "%p", (void *)s_wl.surface);
+	setenv("DXR_WL_WEAVE_SURFACE", v, 1);
 	// Pointer input goes through to the player's window underneath.
 	struct wl_region *empty = wl_compositor_create_region(s_wl.compositor);
 	wl_surface_set_input_region(s_wl.surface, empty);
@@ -203,29 +293,6 @@ create_subsurface(struct wl_surface *parent)
  * Exports.
  *
  */
-
-//! Step 3 of the experiment: a test pattern in a sub-surface of the player's
-//! window, buffer scale 1. (DXR_WL_TEST_SUBSURFACE=1)
-int
-dxr_wl_test_subsurface(struct wl_display *display, struct wl_surface *parent, int width, int height)
-{
-	if (s_wl.subsurface)
-		return 1;
-	if (!display || !parent || width <= 0 || height <= 0 || !dxr_wl_connect(display))
-		return 0;
-	create_subsurface(parent);
-	struct wl_buffer *buf = make_shm_buffer(width, height, 0x40400040u, 0xFFFF00FFu);
-	if (buf) {
-		wl_surface_attach(s_wl.surface, buf, 0, 0);
-		wl_surface_damage(s_wl.surface, 0, 0, width, height);
-	}
-	wl_surface_commit(s_wl.surface);
-	wl_display_flush(display);
-	fprintf(stderr, "[DisplayXR-WL] test sub-surface on the player's window: %dx%d buffer (scale 1) at (0,0)%s\n",
-	        width, height, buf ? "" : " (NO test buffer: wl_shm missing)");
-	fflush(stderr);
-	return 1;
-}
 
 //! The weave target: a sub-surface of the player's window, sized to its LOGICAL
 //! size (the player's swapchain extent) through a viewport, with the DEVICE size
@@ -299,6 +366,9 @@ dxr_wl_weave_on_player_resize(int logical_w, int logical_h)
 	pthread_mutex_unlock(&s_wl_mutex);
 }
 
+extern int dxr_wl_unity_surface(struct wl_display **out_display, struct wl_surface **out_surface);
+static void dxr_wl_after_player_window_recreated(void); // below
+
 //! Per frame: dispatch our queue (scale changes). Returns 1, with the new device
 //! size, when the runtime must be told (xrSetWaylandSurfaceGeometryDXR).
 int
@@ -306,6 +376,25 @@ dxr_wl_weave_poll(int *out_w, int *out_h)
 {
 	if (!s_wl.surface)
 		return 0;
+	// The player recreated its window (Unity does on a resolution change): our
+	// sub-surface went inert with the old one. Re-attach the same surface to the new
+	// window: the runtime keeps presenting into it, so the session carries on.
+	struct wl_display *pd = NULL;
+	struct wl_surface *player = NULL;
+	int moved_window = 0;
+	if (dxr_wl_unity_surface(&pd, &player) && player && player != s_wl.parent) {
+		pthread_mutex_lock(&s_wl_mutex);
+		if (s_wl.subsurface)
+			wl_subsurface_destroy(s_wl.subsurface);
+		attach_to_parent(player);
+		wl_display_flush(s_wl.display);
+		pthread_mutex_unlock(&s_wl_mutex);
+		fprintf(stderr, "[DisplayXR-WL] the player recreated its window: weave re-attached to wl_surface=%p\n",
+		        (void *)player);
+		moved_window = 1;
+	}
+	if (moved_window)
+		dxr_wl_after_player_window_recreated();
 	pthread_mutex_lock(&s_wl_mutex);
 	wl_display_dispatch_queue_pending(s_wl.display, s_wl.queue);
 	int dirty = s_wl.geometry_dirty;
@@ -325,8 +414,6 @@ dxr_wl_weave_poll(int *out_w, int *out_h)
  * displayxr_linux.c, which computes the rects and calls these.
  *
  */
-
-extern int dxr_wl_unity_surface(struct wl_display **out_display, struct wl_surface **out_surface);
 
 static int s_wl_transparent;
 
@@ -396,6 +483,7 @@ typedef struct DxrDBusError { // DBusError's layout
 #define DXR_DBUS_TYPE_INVALID 0
 #define DXR_DBUS_TYPE_BOOLEAN ((int)'b')
 #define DXR_DBUS_TYPE_UINT32 ((int)'u')
+#define DXR_DBUS_TYPE_INT32 ((int)'i')
 
 static struct {
 	int tried, ok;
@@ -493,6 +581,37 @@ placement_call(const char *method, int with_arg, uint32_t arg)
 	return result;
 }
 
+//! WindowPlacement1.MoveWindow(u pid = 0, i x, i y): the caller's window frame to
+//! a logical position. Returns 1 when moved, 0 when refused, -1 on failure.
+static int
+placement_move(int x, int y)
+{
+	if (!dbus_ready())
+		return -1;
+	DxrDBusMessage *msg = s_dbus.new_method_call("org.displayxr.WindowGeometry", "/org/displayxr/WindowPlacement",
+	                                             "org.displayxr.WindowPlacement1", "MoveWindow");
+	if (!msg)
+		return -1;
+	uint32_t pid = 0;
+	int32_t ix = x, iy = y;
+	s_dbus.append_args(msg, DXR_DBUS_TYPE_UINT32, &pid, DXR_DBUS_TYPE_INT32, &ix, DXR_DBUS_TYPE_INT32, &iy,
+	                   DXR_DBUS_TYPE_INVALID);
+	DxrDBusError err;
+	s_dbus.error_init(&err);
+	DxrDBusMessage *reply = s_dbus.send_with_reply_and_block(s_dbus.conn, msg, 500, &err);
+	s_dbus.unref(msg);
+	if (!reply) {
+		fprintf(stderr, "[DisplayXR-WL] WindowPlacement1.MoveWindow failed: %s\n", err.message ? err.message : "?");
+		s_dbus.error_free(&err);
+		return -1;
+	}
+	uint32_t b = 0;
+	int r = s_dbus.get_args(reply, &err, DXR_DBUS_TYPE_BOOLEAN, &b, DXR_DBUS_TYPE_INVALID) && b ? 1 : 0;
+	s_dbus.error_free(&err);
+	s_dbus.unref(reply);
+	return r;
+}
+
 //! Start moving the player's window with the pointer while `button` (1 left,
 //! 2 middle, 3 right) is held. Returns 1 when the compositor took the drag.
 int
@@ -508,4 +627,145 @@ dxr_wl_end_pointer_drag(void)
 {
 	placement_call("EndPointerDrag", 0, 0);
 	fprintf(stderr, "[DisplayXR-WL] window drag: end\n");
+}
+
+/*
+ *
+ * Units. The player works in LOGICAL px (Unity's Wayland window has no HiDPI
+ * support), the runtime and the X11/Windows window-pixel API in DEVICE px. The
+ * provider and displayxr_linux.c convert at their edges with this scale.
+ *
+ */
+
+//! Device px per logical px of the player's window; 1.0 when the weave is not on
+//! a Wayland sub-surface (X11, Windows, macOS: Unity is already in device px).
+double
+dxr_wl_ui_scale(void)
+{
+	if (!s_wl.surface || !s_wl.scale120)
+		return 1.0;
+	return s_wl.scale120 / 120.0;
+}
+
+//! The weave buffer size (the player's window in device px). 0 when not active.
+int
+dxr_wl_weave_device_size(int *out_w, int *out_h)
+{
+	if (!s_wl.surface || s_wl.device_w <= 0 || s_wl.device_h <= 0)
+		return 0;
+	pthread_mutex_lock(&s_wl_mutex);
+	*out_w = s_wl.device_w;
+	*out_h = s_wl.device_h;
+	pthread_mutex_unlock(&s_wl_mutex);
+	return 1;
+}
+
+static int s_panel_mode_w, s_panel_mode_h; // the output we last moved the window onto
+static unsigned s_player_generation_seen;
+
+// A resize the app asked for (displayxr_resize_overlay), in LOGICAL px, for the
+// plug-in's C# to apply with Screen.SetResolution: a Wayland client sizes its own
+// toplevel, and the player's toplevel belongs to its SDL.
+static int s_pending_w, s_pending_h;
+static int s_wanted_device_w, s_wanted_device_h; // the app's last size, device px
+
+void
+dxr_wl_request_player_size(int logical_w, int logical_h)
+{
+	pthread_mutex_lock(&s_wl_mutex);
+	s_pending_w = logical_w;
+	s_pending_h = logical_h;
+	double scale = s_wl.scale120 ? s_wl.scale120 / 120.0 : 1.0;
+	s_wanted_device_w = (int)lround(logical_w * scale);
+	s_wanted_device_h = (int)lround(logical_h * scale);
+	pthread_mutex_unlock(&s_wl_mutex);
+}
+
+// The window moved to an output with another scale (e.g. from the laptop onto the
+// 3D panel at session start): keep the size the app asked for in DEVICE px, as on
+// X11, by asking for the logical size that gives it at the new scale. Called with
+// s_wl_mutex held (from our queue's dispatch) or before the session (no contention).
+static void
+rerequest_player_size_for_scale(void)
+{
+	if (s_wanted_device_w <= 0 || s_wanted_device_h <= 0 || !s_wl.scale120)
+		return;
+	double scale = s_wl.scale120 / 120.0;
+	s_pending_w = (int)lround(s_wanted_device_w / scale);
+	s_pending_h = (int)lround(s_wanted_device_h / scale);
+	fprintf(stderr, "[DisplayXR-WL] scale %.4f: keeping the app's %dx%d px window -> %dx%d logical\n", scale,
+	        s_wanted_device_w, s_wanted_device_h, s_pending_w, s_pending_h);
+}
+
+int
+dxr_wl_take_player_size(int *out_w, int *out_h)
+{
+	pthread_mutex_lock(&s_wl_mutex);
+	int have = s_pending_w > 0 && s_pending_h > 0;
+	if (have) {
+		*out_w = s_pending_w;
+		*out_h = s_pending_h;
+		s_pending_w = s_pending_h = 0;
+	}
+	pthread_mutex_unlock(&s_wl_mutex);
+	return have;
+}
+
+//! Put the player's window in the middle of the output whose mode is pw x ph
+//! device px (the 3D panel), through the GNOME extension's MoveWindow (a Wayland
+//! client cannot place its own toplevel). Returns 1 when moved.
+int
+dxr_wl_move_player_to_output_with_mode(int pw, int ph, int win_logical_w, int win_logical_h)
+{
+	if (!s_wl.registry)
+		return 0;
+	pthread_mutex_lock(&s_wl_mutex);
+	wl_display_dispatch_queue_pending(s_wl.display, s_wl.queue);
+	pthread_mutex_unlock(&s_wl_mutex);
+	const struct dxr_wl_output *panel = NULL;
+	for (int i = 0; i < s_output_count; i++)
+		if (s_outputs[i].mode_w == pw && s_outputs[i].mode_h == ph && s_outputs[i].lw > 0) {
+			panel = &s_outputs[i];
+			break;
+		}
+	if (!panel) {
+		fprintf(stderr, "[DisplayXR-WL] move to the 3D panel: no output with a %dx%d mode\n", pw, ph);
+		return 0;
+	}
+	int x = panel->lx + (panel->lw - win_logical_w) / 2;
+	int y = panel->ly + (panel->lh - win_logical_h) / 2;
+	if (x < panel->lx) x = panel->lx;
+	if (y < panel->ly) y = panel->ly;
+	int moved = placement_move(x, y);
+	fprintf(stderr, "[DisplayXR-WL] move to the 3D panel: output %dx%d at (%d,%d) logical -> window at (%d,%d): %s\n",
+	        panel->lw, panel->lh, panel->lx, panel->ly, x, y, moved == 1 ? "moved" : "NOT moved");
+	if (moved == 1) {
+		s_panel_mode_w = pw;
+		s_panel_mode_h = ph;
+	}
+	return moved == 1;
+}
+
+extern int dxr_wl_unity_swapchain_size(int *out_w, int *out_h);
+
+// A recreated player window opens wherever the compositor puts it: if we had put
+// the old one on the 3D panel, put this one there too.
+static void
+dxr_wl_after_player_window_recreated(void)
+{
+	s_player_generation_seen++;
+	if (s_panel_mode_w <= 0)
+		return;
+	int lw = 0, lh = 0;
+	if (!dxr_wl_unity_swapchain_size(&lw, &lh))
+		return;
+	dxr_wl_move_player_to_output_with_mode(s_panel_mode_w, s_panel_mode_h, lw, lh);
+}
+
+//! Bumps whenever the player's window was recreated (displayxr_linux.c re-applies
+//! the input region to the new window).
+unsigned
+dxr_wl_player_generation(void)
+{
+	return s_player_generation_seen;
 }
