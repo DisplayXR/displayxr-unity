@@ -315,6 +315,10 @@ static UnityXRPreInitProvider s_preinit_provider = {
 // The engine-called entry point (boot.config xrsdk-pre-init-library). Present on
 // every platform so the boot.config entry the C# loader emits never dangles; a
 // no-op where the VK backend doesn't exist.
+#if defined(ENABLE_VULKAN) && defined(__linux__) && !defined(__ANDROID__)
+extern "C" void dxr_wl_capture_install(IUnityInterfaces *ifaces, const char *when);
+#endif
+
 extern "C" UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API
 XRSDKPreInit(IUnityInterfaces *interfaces)
 {
@@ -327,6 +331,10 @@ XRSDKPreInit(IUnityInterfaces *interfaces)
 	}
 	preinit->RegisterPreInitProvider(&s_preinit_provider);
 	pre_log("[DisplayXR-PREINIT] XRSDKPreInit: provider registered (pre-graphics-init)\n");
+#if defined(__linux__) && !defined(__ANDROID__)
+	// Native-Wayland player: watch for its window surface (displayxr_provider_wl_capture.cpp).
+	dxr_wl_capture_install(interfaces, "pre-init");
+#endif
 #else
 	(void)interfaces;
 	pre_log("[DisplayXR-PREINIT] XRSDKPreInit: no-op on this platform\n");

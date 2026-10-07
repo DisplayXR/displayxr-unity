@@ -144,7 +144,11 @@ elseif(UNIX AND NOT APPLE AND NOT ANDROID)
     # code references unconditionally (macOS ships the same stub), plus the X11
     # helper that finds the player's own window so Linux can be a HANDLE app
     # (XR_DXR_xlib_window_binding) like Windows and macOS.
-    list(APPEND SOURCES displayxr_linux.c)
+    list(APPEND SOURCES displayxr_linux.c
+        # Native-Wayland player experiment: capture its wl_surface at Vulkan init.
+        displayxr_xrprovider/displayxr_provider_wl_capture.cpp
+        # ... and a sub-surface of the player's window for the weave.
+        displayxr_linux_wayland.c)
 endif()
 
 # Provider Vulkan backend (#247 Windows, #249 Linux): enable2 session device +
@@ -193,6 +197,29 @@ endif()
 # desktop Linux #249). Excludes Apple — Metal is the macOS backend (#202/#204).
 if(DXR_VULKAN_BACKEND)
     target_compile_definitions(displayxr_unity PRIVATE ENABLE_VULKAN)
+endif()
+
+# Native-Wayland player experiment: the sub-surface code talks to the player's
+# own Wayland connection (libwayland-client).
+if(UNIX AND NOT APPLE AND NOT ANDROID)
+    find_package(PkgConfig REQUIRED)
+    pkg_check_modules(DXR_WAYLAND_CLIENT REQUIRED IMPORTED_TARGET wayland-client)
+    target_link_libraries(displayxr_unity PRIVATE PkgConfig::DXR_WAYLAND_CLIENT)
+    # viewporter + fractional-scale glue, generated from the vendored XML
+    # (wayland-protocols is not installed everywhere; see wayland-protocols/README.md).
+    find_program(DXR_WAYLAND_SCANNER wayland-scanner REQUIRED)
+    set(DXR_WL_GEN ${CMAKE_CURRENT_BINARY_DIR}/wayland-generated)
+    file(MAKE_DIRECTORY ${DXR_WL_GEN})
+    foreach(proto viewporter fractional-scale-v1)
+        set(xml ${CMAKE_CURRENT_SOURCE_DIR}/wayland-protocols/${proto}.xml)
+        add_custom_command(OUTPUT ${DXR_WL_GEN}/${proto}-client-protocol.h ${DXR_WL_GEN}/${proto}-protocol.c
+            COMMAND ${DXR_WAYLAND_SCANNER} client-header ${xml} ${DXR_WL_GEN}/${proto}-client-protocol.h
+            COMMAND ${DXR_WAYLAND_SCANNER} private-code ${xml} ${DXR_WL_GEN}/${proto}-protocol.c
+            DEPENDS ${xml} VERBATIM)
+        target_sources(displayxr_unity PRIVATE
+            ${DXR_WL_GEN}/${proto}-client-protocol.h ${DXR_WL_GEN}/${proto}-protocol.c)
+    endforeach()
+    target_include_directories(displayxr_unity PRIVATE ${DXR_WL_GEN})
 endif()
 
 # --- Apple framework linking ---
