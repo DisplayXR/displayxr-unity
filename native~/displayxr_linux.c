@@ -1569,6 +1569,7 @@ displayxr_consume_overlay_close_request(void)
 DISPLAYXR_EXPORT float
 displayxr_linux_ui_scale(void)
 {
+	dxr_wl_capture_note_caller("displayxr_linux_ui_scale");
 	return (float)dxr_wl_ui_scale();
 }
 

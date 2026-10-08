@@ -4419,6 +4419,11 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	DxrGfxKind gfx = (DxrGfxKind)backend_kind;
 	int is_d3d11 = (gfx == DXR_GFX_D3D11);
 	int is_vk = (gfx == DXR_GFX_VULKAN);
+#if defined(__linux__) && !defined(__ANDROID__)
+	// Native-Wayland capture layer: the runtime's own Vulkan instances must never
+	// load it (normally it was disarmed when Unity's device came up already).
+	dxr_wl_capture_disarm("XR session start");
+#endif
 	// D3D11 sub-mode (#195): the EDITOR (dedicated-window selector, set by C# on
 	// Application.isEditor / the DISPLAYXR_PROV_EDITOR_WINDOW diagnostic) uses an
 	// OWN-DEVICE bridge; the built PLAYER keeps the verified zero-copy path. The
@@ -5142,6 +5147,13 @@ int dxr_prov_session_start(const char *runtime_json_path,
 		if (have_surface)
 			ps_log("[DisplayXR-PROV] Linux/Wayland: runtime binding=%d player surface=%p size=%dx%d\n",
 			       s_ps.has_wayland_binding, (void *)ws, lw, lh);
+		if (have_surface && !s_ps.has_wayland_binding)
+			ps_log("[DisplayXR-PROV] WARN: native-Wayland player, but the runtime has no "
+			       "XR_DXR_wayland_surface_binding (needs 2.28.0+): it will open its own window\n");
+		else if (!have_surface && dxr_wl_capture_wanted())
+			ps_log("[DisplayXR-PROV] WARN: native-Wayland player (-force-wayland), but its window was not "
+			       "captured (did the Vulkan loader load VK_LAYER_DXR_unity_wayland_capture?): the runtime "
+			       "will open its own window\n");
 		if (s_ps.has_wayland_binding && have_surface && have_size) {
 			struct wl_surface *weave = NULL;
 			int dw = 0, dh = 0;

@@ -11,6 +11,9 @@
 
 #include "displayxr_unity_plugin.h"
 #include "displayxr_window_space_ui.h" // DXR_WSUI_MAX_SLOTS, get_pending_slot
+#if defined(__linux__) && !defined(__ANDROID__)
+#include "displayxr_linux_wayland.h"
+#endif
 
 #include <stdio.h>
 
@@ -140,6 +143,11 @@ static void capture_vulkan_instance(void)
 		s_vk_captured = true;
 #if defined(ENABLE_VULKAN)
 		configure_vulkan_events();
+#endif
+#if defined(__linux__) && !defined(__ANDROID__)
+		// Unity's real VkInstance exists, with the native-Wayland capture layer in
+		// its chain if it was armed: take the layer out of the environment now.
+		dxr_wl_capture_disarm("Unity's graphics device is up");
 #endif
 		fprintf(stderr, "[DisplayXR] Unity Vulkan device captured: instance=%p physicalDevice=%p device=%p queue=%p qf=%u\n",
 		        (void *)s_vk_inst.instance, (void *)s_vk_inst.physicalDevice,

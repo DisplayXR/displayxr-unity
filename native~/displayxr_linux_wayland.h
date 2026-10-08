@@ -30,6 +30,16 @@ struct wl_surface;
 //! Arm the capture layer from XRSDKPreInit, before Unity creates its real
 //! VkInstance. No-op unless the player was started with -force-wayland.
 void dxr_wl_capture_install(void);
+//! Take the layer out of the environment again (idempotent). Called once Unity's
+//! graphics device exists, and before the XR session creates the runtime's
+//! instances. `why` is logged.
+void dxr_wl_capture_disarm(const char *why);
+//! The player was started with -force-wayland and capture is not disabled
+//! (DXR_WL_CAPTURE_DISABLE=1).
+int dxr_wl_capture_wanted(void);
+//! Warn (once) if `what`, a P/Invoke entry point, runs in a copy of the plugin
+//! that did not arm the capture (Unity loads the library twice).
+void dxr_wl_capture_note_caller(const char *what);
 
 //! The player's window: its Wayland connection and surface. 1 when known.
 int dxr_wl_unity_surface(struct wl_display **out_display, struct wl_surface **out_surface);

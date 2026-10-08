@@ -13,10 +13,14 @@
 //
 // A Vulkan layer sits in the loader, under every caller. The player creates its
 // real VkInstance AFTER XRSDKPreInit (a second instance, after device detection),
-// so pre-init writes a layer manifest and points the loader at it with
-// VK_ADD_IMPLICIT_LAYER_PATH. That instance carries the layer; the variable and
-// the manifest are removed right after it is created, so no other instance (the
-// runtime's) and no child process loads it.
+// so pre-init writes a layer manifest and enables it as an EXPLICIT layer through
+// the environment (VK_LAYER_PATH + VK_INSTANCE_LAYERS: every Vulkan loader has
+// them; VK_ADD_IMPLICIT_LAYER_PATH only exists from loader 1.3.296, newer than
+// Ubuntu 22.04's and 24.04's). That instance carries the layer. The variables and
+// the manifest are restored/removed once Unity's graphics device exists (and at
+// the latest when the XR session starts), so the runtime's instance never loads
+// the layer; and its hooks only act in the process that armed it, so a child
+// process that inherited the environment in that window gets a pass-through.
 //
 // What the layer does on the player's instance, and nothing else:
 //  - records the wl_display + wl_surface of every VkSurfaceKHR the player makes
@@ -38,9 +42,11 @@
 
 #include <vulkan/vk_layer.h>
 
+#include <atomic>
 #include <dlfcn.h>
 #include <limits.h>
 #include <mutex>
+#include <string>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -127,17 +133,28 @@ dispatch_key(const void *handle)
 	return *(void *const *)handle;
 }
 
+// The next functions down the chain for what we hook, resolved ONCE, at
+// vkCreateInstance / vkCreateDevice, as the layer interface intends. Never at
+// call time: an older loader (Ubuntu 22.04's 1.3.204) hands the last layer a
+// next-gipa that answers from the instance's dispatch table, which after creation
+// holds the TOP of the chain - this layer - so asking it then for a function we
+// hook returns our own hook, and the call recurses until the stack overflows.
 struct DxrLayerInstance {
 	void *key;
 	VkInstance instance;
 	PFN_vkGetInstanceProcAddr next_gipa;
+	PFN_vkDestroyInstance destroy_instance;
+	PFN_dxrCreateWaylandSurface create_wayland_surface;
+	PFN_vkDestroySurfaceKHR destroy_surface;
+	PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR surface_caps;
 };
 struct DxrLayerDevice {
 	void *key;
-	VkInstance instance;
 	VkPhysicalDevice physical_device;
-	PFN_vkGetInstanceProcAddr next_gipa;
 	PFN_vkGetDeviceProcAddr next_gdpa;
+	PFN_vkDestroyDevice destroy_device;
+	PFN_vkCreateSwapchainKHR create_swapchain;
+	PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR surface_caps;
 };
 
 static std::mutex s_layer_mutex;
@@ -154,12 +171,15 @@ instance_for_locked(const void *dispatchable)
 	return nullptr;
 }
 
-static PFN_vkGetInstanceProcAddr
-next_gipa_for(const void *dispatchable)
+//! The instance an instance or physical device belongs to (a copy). 1 if known.
+static int
+instance_for(const void *dispatchable, DxrLayerInstance *out)
 {
 	std::lock_guard<std::mutex> lock(s_layer_mutex);
 	const DxrLayerInstance *i = instance_for_locked(dispatchable);
-	return i ? i->next_gipa : nullptr;
+	if (i)
+		*out = *i;
+	return i != nullptr;
 }
 
 static int
@@ -175,7 +195,7 @@ device_for(VkDevice device, DxrLayerDevice *out)
 	return 0;
 }
 
-static void layer_disarm(void); // below: the env var and the manifest go
+static std::atomic<int> s_installed{0}; // armed in THIS process (below): the hooks act only then
 
 static VKAPI_ATTR VkResult VKAPI_CALL
 layer_CreateInstance(const VkInstanceCreateInfo *ci, const VkAllocationCallbacks *alloc, VkInstance *out)
@@ -191,19 +211,28 @@ layer_CreateInstance(const VkInstanceCreateInfo *ci, const VkAllocationCallbacks
 	PFN_vkCreateInstance next_create = (PFN_vkCreateInstance)next_gipa(VK_NULL_HANDLE, "vkCreateInstance");
 	VkResult r = next_create(ci, alloc, out);
 	if (r == VK_SUCCESS) {
+		DxrLayerInstance e = {};
+		e.key = dispatch_key(*out);
+		e.instance = *out;
+		e.next_gipa = next_gipa;
+		e.destroy_instance = (PFN_vkDestroyInstance)next_gipa(*out, "vkDestroyInstance");
+		e.create_wayland_surface = (PFN_dxrCreateWaylandSurface)next_gipa(*out, "vkCreateWaylandSurfaceKHR");
+		e.destroy_surface = (PFN_vkDestroySurfaceKHR)next_gipa(*out, "vkDestroySurfaceKHR");
+		e.surface_caps = (PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR)next_gipa(
+		    *out, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
 		std::lock_guard<std::mutex> lock(s_layer_mutex);
 		bool stored = false;
 		for (auto &i : s_instances)
 			if (!i.key) {
-				i = DxrLayerInstance{dispatch_key(*out), *out, next_gipa};
+				i = e;
 				stored = true;
 				break;
 			}
 		if (!stored)
 			fprintf(stderr, "[DisplayXR-WL] layer: instance table full; this instance is not tracked\n");
+		fprintf(stderr, "[DisplayXR-WL] capture layer is in VkInstance %p%s\n", (void *)*out,
+		        s_installed ? "" : " (not armed in this process: pass-through)");
 	}
-	// This is the player's real instance: nothing else needs the layer.
-	layer_disarm();
 	return r;
 }
 
@@ -211,9 +240,9 @@ static VKAPI_ATTR void VKAPI_CALL
 layer_DestroyInstance(VkInstance instance, const VkAllocationCallbacks *alloc)
 {
 	void *key = dispatch_key(instance); // before the instance is freed
-	PFN_vkGetInstanceProcAddr gipa = next_gipa_for(instance);
-	if (gipa)
-		((PFN_vkDestroyInstance)gipa(instance, "vkDestroyInstance"))(instance, alloc);
+	DxrLayerInstance e = {};
+	if (instance_for(instance, &e) && e.destroy_instance)
+		e.destroy_instance(instance, alloc);
 	std::lock_guard<std::mutex> lock(s_layer_mutex);
 	for (auto &i : s_instances)
 		if (i.key == key)
@@ -233,24 +262,25 @@ layer_CreateDevice(VkPhysicalDevice pd, const VkDeviceCreateInfo *ci, const VkAl
 	PFN_vkGetInstanceProcAddr next_gipa = chain->u.pLayerInfo->pfnNextGetInstanceProcAddr;
 	PFN_vkGetDeviceProcAddr next_gdpa = chain->u.pLayerInfo->pfnNextGetDeviceProcAddr;
 	chain->u.pLayerInfo = chain->u.pLayerInfo->pNext;
-	VkInstance instance = VK_NULL_HANDLE;
-	{
-		// A physical device shares its instance's dispatch key.
-		std::lock_guard<std::mutex> lock(s_layer_mutex);
-		const DxrLayerInstance *i = instance_for_locked(pd);
-		if (i)
-			instance = i->instance;
-	}
-	PFN_vkCreateDevice next_create = (PFN_vkCreateDevice)next_gipa(instance, "vkCreateDevice");
+	DxrLayerInstance inst = {}; // a physical device shares its instance's dispatch key
+	instance_for(pd, &inst);
+	PFN_vkCreateDevice next_create = (PFN_vkCreateDevice)next_gipa(inst.instance, "vkCreateDevice");
 	if (!next_create)
 		return VK_ERROR_INITIALIZATION_FAILED;
 	VkResult r = next_create(pd, ci, alloc, out);
 	if (r == VK_SUCCESS) {
+		DxrLayerDevice e = {};
+		e.key = dispatch_key(*out);
+		e.physical_device = pd;
+		e.next_gdpa = next_gdpa;
+		e.destroy_device = (PFN_vkDestroyDevice)next_gdpa(*out, "vkDestroyDevice");
+		e.create_swapchain = (PFN_vkCreateSwapchainKHR)next_gdpa(*out, "vkCreateSwapchainKHR");
+		e.surface_caps = inst.surface_caps;
 		std::lock_guard<std::mutex> lock(s_layer_mutex);
 		bool stored = false;
 		for (auto &d : s_devices)
 			if (!d.key) {
-				d = DxrLayerDevice{dispatch_key(*out), instance, pd, next_gipa, next_gdpa};
+				d = e;
 				stored = true;
 				break;
 			}
@@ -265,8 +295,8 @@ layer_DestroyDevice(VkDevice device, const VkAllocationCallbacks *alloc)
 {
 	void *key = dispatch_key(device); // before the device is freed
 	DxrLayerDevice d = {};
-	if (device_for(device, &d))
-		((PFN_vkDestroyDevice)d.next_gdpa(device, "vkDestroyDevice"))(device, alloc);
+	if (device_for(device, &d) && d.destroy_device)
+		d.destroy_device(device, alloc);
 	std::lock_guard<std::mutex> lock(s_layer_mutex);
 	for (auto &e : s_devices)
 		if (e.key == key)
@@ -277,14 +307,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL
 layer_CreateWaylandSurfaceKHR(VkInstance instance, const DxrVkWaylandSurfaceCreateInfo *ci,
                               const VkAllocationCallbacks *alloc, VkSurfaceKHR *out)
 {
-	PFN_vkGetInstanceProcAddr gipa = next_gipa_for(instance);
-	PFN_dxrCreateWaylandSurface next =
-	    gipa ? (PFN_dxrCreateWaylandSurface)gipa(instance, "vkCreateWaylandSurfaceKHR") : nullptr;
-	if (!next)
+	DxrLayerInstance e = {};
+	if (!instance_for(instance, &e) || !e.create_wayland_surface)
 		return VK_ERROR_EXTENSION_NOT_PRESENT;
-	VkResult r = next(instance, ci, alloc, out);
-	if (r != VK_SUCCESS || !ci)
-		return r;
+	VkResult r = e.create_wayland_surface(instance, ci, alloc, out);
+	if (r != VK_SUCCESS || !ci || !s_installed)
+		return r; // not ours to record (e.g. a child process that inherited the layer)
 	// Only the player's instance carries this layer, and the only surface it
 	// presents to is its window.
 	unsigned generation;
@@ -321,10 +349,9 @@ layer_DestroySurfaceKHR(VkInstance instance, VkSurfaceKHR surface, const VkAlloc
 		if (!live)
 			s_player_surface = nullptr;
 	}
-	PFN_vkGetInstanceProcAddr gipa = next_gipa_for(instance);
-	PFN_vkDestroySurfaceKHR next = gipa ? (PFN_vkDestroySurfaceKHR)gipa(instance, "vkDestroySurfaceKHR") : nullptr;
-	if (next)
-		next(instance, surface, alloc);
+	DxrLayerInstance e = {};
+	if (instance_for(instance, &e) && e.destroy_surface)
+		e.destroy_surface(instance, surface, alloc);
 }
 
 static VKAPI_ATTR VkResult VKAPI_CALL
@@ -332,11 +359,9 @@ layer_CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *ci, co
                          VkSwapchainKHR *out)
 {
 	DxrLayerDevice d = {};
-	if (!device_for(device, &d))
+	if (!device_for(device, &d) || !d.create_swapchain)
 		return VK_ERROR_INITIALIZATION_FAILED;
-	PFN_vkCreateSwapchainKHR next = (PFN_vkCreateSwapchainKHR)d.next_gdpa(device, "vkCreateSwapchainKHR");
-	if (!next)
-		return VK_ERROR_INITIALIZATION_FAILED;
+	PFN_vkCreateSwapchainKHR next = d.create_swapchain;
 	int player;
 	{
 		std::lock_guard<std::mutex> lock(s_player_mutex);
@@ -349,12 +374,9 @@ layer_CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *ci, co
 	// asks for OPAQUE), so what the player leaves at alpha 0 shows the desktop.
 	// Only where the surface supports it.
 	VkSwapchainCreateInfoKHR alpha_ci = *ci;
-	if (ci->compositeAlpha != VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR && d.instance) {
-		PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR caps_fn =
-		    (PFN_vkGetPhysicalDeviceSurfaceCapabilitiesKHR)d.next_gipa(
-		        d.instance, "vkGetPhysicalDeviceSurfaceCapabilitiesKHR");
+	if (ci->compositeAlpha != VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR && d.surface_caps) {
 		VkSurfaceCapabilitiesKHR caps = {};
-		if (caps_fn && caps_fn(d.physical_device, ci->surface, &caps) == VK_SUCCESS &&
+		if (d.surface_caps(d.physical_device, ci->surface, &caps) == VK_SUCCESS &&
 		    (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR))
 			alpha_ci.compositeAlpha = VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR;
 	}
@@ -412,8 +434,10 @@ layer_GetInstanceProcAddr(VkInstance instance, const char *name)
 		return (PFN_vkVoidFunction)layer_DestroySurfaceKHR;
 	if (instance == VK_NULL_HANDLE)
 		return nullptr;
-	PFN_vkGetInstanceProcAddr gipa = next_gipa_for(instance);
-	return gipa ? gipa(instance, name) : nullptr;
+	// Everything else passes straight through to the next gipa, as layers do. (The
+	// call-time recursion above only bites for a function we hook ourselves.)
+	DxrLayerInstance e = {};
+	return instance_for(instance, &e) ? e.next_gipa(instance, name) : nullptr;
 }
 
 DXR_WLCAP_EXPORT VKAPI_ATTR VkResult VKAPI_CALL
@@ -431,52 +455,121 @@ dxr_wlcap_NegotiateLoaderLayerInterfaceVersion(VkNegotiateLayerInterface *v)
 
 /*
  *
- * Arming from XRSDKPreInit, and disarming once the player's instance exists.
+ * Arming from XRSDKPreInit, disarming once Unity's graphics device exists.
  *
  */
 
+#define DXR_WLCAP_LAYER_NAME "VK_LAYER_DXR_unity_wayland_capture"
+
+static std::mutex s_arm_mutex;
 static char s_manifest_dir[PATH_MAX];
 static char s_manifest_path[PATH_MAX + 32];
-static char *s_prev_layer_path; // VK_ADD_IMPLICIT_LAYER_PATH before we armed (malloc'd)
-static int s_armed;
+// The variables as they were before we armed (malloc'd; NULL = unset).
+static char *s_prev_layer_path;
+static char *s_prev_instance_layers;
+static int s_armed; // the environment points the loader at the layer right now
 
 static bool
 started_with_force_wayland(void)
 {
+	static int cached = -1;
+	if (cached >= 0)
+		return cached != 0;
+	int found = 0;
 	FILE *f = fopen("/proc/self/cmdline", "rb");
-	if (!f)
-		return false;
-	char buf[8192];
-	size_t n = fread(buf, 1, sizeof(buf) - 1, f);
-	fclose(f);
-	buf[n] = 0;
-	for (size_t i = 0; i < n; i += strlen(buf + i) + 1)
-		if (!strcmp(buf + i, "-force-wayland"))
-			return true;
-	return false;
+	if (f) {
+		char buf[8192];
+		size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+		fclose(f);
+		buf[n] = 0;
+		for (size_t i = 0; i < n && !found; i += strlen(buf + i) + 1)
+			found = !strcmp(buf + i, "-force-wayland");
+	}
+	cached = found;
+	return found != 0;
+}
+
+extern "C" int
+dxr_wl_capture_wanted(void)
+{
+	const char *off = getenv("DXR_WL_CAPTURE_DISABLE");
+	return started_with_force_wayland() && !(off && !strcmp(off, "1"));
+}
+
+//! The loader's default explicit-layer folders: VK_LAYER_PATH REPLACES them, so
+//! they go after ours, or an explicit layer Unity asks for (validation) would
+//! not be found while we are armed.
+static std::string
+default_explicit_layer_dirs(void)
+{
+	const char *home = getenv("HOME");
+	auto dir_or = [&](const char *var, const char *home_rel) -> std::string {
+		const char *v = getenv(var);
+		if (v && *v)
+			return v;
+		return home && *home ? std::string(home) + home_rel : std::string();
+	};
+	auto list_or = [](const char *var, const char *dflt) -> std::string {
+		const char *v = getenv(var);
+		return v && *v ? v : dflt;
+	};
+	std::string out;
+	auto add = [&](const std::string &base) {
+		if (base.empty())
+			return;
+		if (!out.empty())
+			out += ':';
+		out += base + "/vulkan/explicit_layer.d";
+	};
+	auto add_list = [&](const std::string &list) {
+		size_t start = 0;
+		while (start <= list.size()) {
+			size_t end = list.find(':', start);
+			if (end == std::string::npos)
+				end = list.size();
+			add(list.substr(start, end - start));
+			start = end + 1;
+		}
+	};
+	add(dir_or("XDG_CONFIG_HOME", "/.config"));
+	add_list(list_or("XDG_CONFIG_DIRS", "/etc/xdg"));
+	add("/etc");
+	add(dir_or("XDG_DATA_HOME", "/.local/share"));
+	add_list(list_or("XDG_DATA_DIRS", "/usr/local/share:/usr/share"));
+	return out;
 }
 
 static void
-layer_disarm(void)
+restore_env(const char *name, char **prev)
 {
+	if (*prev) {
+		setenv(name, *prev, 1);
+		free(*prev);
+		*prev = nullptr;
+	} else {
+		unsetenv(name);
+	}
+}
+
+extern "C" void
+dxr_wl_capture_disarm(const char *why)
+{
+	std::lock_guard<std::mutex> lock(s_arm_mutex);
 	if (!s_armed)
 		return;
 	s_armed = 0;
-	if (s_prev_layer_path) {
-		setenv("VK_ADD_IMPLICIT_LAYER_PATH", s_prev_layer_path, 1);
-		free(s_prev_layer_path);
-		s_prev_layer_path = nullptr;
-	} else {
-		unsetenv("VK_ADD_IMPLICIT_LAYER_PATH");
-	}
+	restore_env("VK_LAYER_PATH", &s_prev_layer_path);
+	restore_env("VK_INSTANCE_LAYERS", &s_prev_instance_layers);
 	unlink(s_manifest_path);
 	rmdir(s_manifest_dir);
+	fprintf(stderr, "[DisplayXR-WL] window capture layer disarmed (%s)\n", why ? why : "?");
 }
 
 extern "C" void
 dxr_wl_capture_install(void)
 {
-	if (s_armed || !started_with_force_wayland())
+	std::lock_guard<std::mutex> lock(s_arm_mutex);
+	if (s_installed || !dxr_wl_capture_wanted())
 		return;
 	Dl_info self;
 	if (!dladdr((void *)&dxr_wl_capture_install, &self) || !self.dli_fname) {
@@ -509,7 +602,7 @@ dxr_wl_capture_install(void)
 	        "{\n"
 	        "  \"file_format_version\": \"1.1.2\",\n"
 	        "  \"layer\": {\n"
-	        "    \"name\": \"VK_LAYER_DXR_unity_wayland_capture\",\n"
+	        "    \"name\": \"" DXR_WLCAP_LAYER_NAME "\",\n"
 	        "    \"type\": \"GLOBAL\",\n"
 	        "    \"library_path\": \"%s\",\n"
 	        "    \"api_version\": \"1.3.0\",\n"
@@ -517,22 +610,42 @@ dxr_wl_capture_install(void)
 	        "    \"description\": \"DisplayXR: finds the Unity player's Wayland window\",\n"
 	        "    \"functions\": {\n"
 	        "      \"vkNegotiateLoaderLayerInterfaceVersion\": \"dxr_wlcap_NegotiateLoaderLayerInterfaceVersion\"\n"
-	        "    },\n"
-	        "    \"disable_environment\": { \"DXR_WL_CAPTURE_DISABLE\": \"1\" }\n"
+	        "    }\n"
 	        "  }\n"
 	        "}\n",
 	        lib);
 	fclose(f);
-	const char *prev = getenv("VK_ADD_IMPLICIT_LAYER_PATH");
-	s_prev_layer_path = prev ? strdup(prev) : nullptr;
-	char paths[2 * PATH_MAX];
-	if (prev && *prev)
-		snprintf(paths, sizeof(paths), "%s:%s", s_manifest_dir, prev);
-	else
-		snprintf(paths, sizeof(paths), "%s", s_manifest_dir);
-	setenv("VK_ADD_IMPLICIT_LAYER_PATH", paths, 1);
+
+	const char *prev_path = getenv("VK_LAYER_PATH");
+	const char *prev_layers = getenv("VK_INSTANCE_LAYERS");
+	s_prev_layer_path = prev_path ? strdup(prev_path) : nullptr;
+	s_prev_instance_layers = prev_layers ? strdup(prev_layers) : nullptr;
+	std::string path = std::string(s_manifest_dir) + ":" +
+	                   (prev_path && *prev_path ? std::string(prev_path) : default_explicit_layer_dirs());
+	std::string layers = std::string(DXR_WLCAP_LAYER_NAME) +
+	                     (prev_layers && *prev_layers ? ":" + std::string(prev_layers) : std::string());
+	setenv("VK_LAYER_PATH", path.c_str(), 1);
+	setenv("VK_INSTANCE_LAYERS", layers.c_str(), 1);
 	s_armed = 1;
-	fprintf(stderr, "[DisplayXR-WL] native-Wayland player: window capture layer armed\n");
+	s_installed = 1;
+	fprintf(stderr, "[DisplayXR-WL] native-Wayland player: window capture layer armed (%s)\n", self.dli_fname);
+}
+
+extern "C" void
+dxr_wl_capture_note_caller(const char *what)
+{
+	// Unity loads this library twice (Plugins/ and Plugins/x86_64/), as separate
+	// modules. Pre-init, the provider and the C# P/Invokes have always resolved to
+	// the same one; if a P/Invoke ever lands in the other copy, it sees no Wayland
+	// window (ui_scale 1, no resizes) without any error. Say so, once.
+	static std::atomic<bool> s_checked{false};
+	if (s_checked.exchange(true) || s_installed || !dxr_wl_capture_wanted())
+		return;
+	Dl_info self;
+	fprintf(stderr,
+	        "[DisplayXR-WL] WARN: %s resolved to a copy of the plugin that did not arm the window capture (%s): "
+	        "Unity loaded the plugin twice and this copy sees no Wayland window\n",
+	        what ? what : "a call", dladdr((void *)&dxr_wl_capture_note_caller, &self) && self.dli_fname ? self.dli_fname : "?");
 }
 
 #elif defined(__linux__) && !defined(__ANDROID__)
@@ -547,6 +660,24 @@ dxr_wl_capture_install(void)
 extern "C" void
 dxr_wl_capture_install(void)
 {
+}
+
+extern "C" void
+dxr_wl_capture_disarm(const char *why)
+{
+	(void)why;
+}
+
+extern "C" int
+dxr_wl_capture_wanted(void)
+{
+	return 0;
+}
+
+extern "C" void
+dxr_wl_capture_note_caller(const char *what)
+{
+	(void)what;
 }
 
 extern "C" int
