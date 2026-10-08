@@ -20,6 +20,7 @@ Unity plugin for rendering on eye-tracked 3D light field displays via the Displa
 - [Building Your App](#building-your-app)
   - [Windows Standalone](#windows-standalone)
   - [macOS Standalone](#macOS-standalone)
+  - [Linux Standalone](#linux-standalone)
   - [Cross-Compiling (macOS Editor to Windows Build)](#cross-compiling-macos-editor-to-windows-build)
 - [Deploying to End Users](#deploying-to-end-users)
 - [Testing Without Hardware](#testing-without-hardware)
@@ -63,6 +64,7 @@ DisplayXR ships as a custom **Unity display provider** (`IUnityXRDisplay`, the s
 | Windows | Windows x64 | `displayxr_unity.dll` | Supported |
 | macOS | macOS | `libdisplayxr_unity.dylib` | Supported |
 | macOS | Windows x64 | `displayxr_unity.dll` | Supported (cross-compile) |
+| Linux | Linux x86_64 (Vulkan) | `libdisplayxr_unity.so` (+ `libdisplayxr_unity_wayland.so`) | Supported: X11/XWayland and native Wayland |
 
 ---
 
@@ -294,6 +296,20 @@ The build output includes `displayxr_unity.dll` in the `Plugins/` folder alongsi
 4. Click **Build**
 
 The `.app` bundle includes `libdisplayxr_unity.dylib` in the plugins folder.
+
+### Linux Standalone
+
+1. **File > Build Settings**, platform **Windows, Mac, Linux**, Target Platform **Linux**, Architecture **x86_64**; Graphics API **Vulkan**
+2. Verify **DisplayXR Display** is enabled in Standalone XR settings
+3. A transparent overlay app (one that asks for a transparent background, like a desktop avatar): tick **Transparent Overlay App** in the DisplayXR Manifest Settings asset
+4. Click **Build**
+
+Next to the player, the build writes **`<name>.sh`**, a launcher: start the app with it, and point the app's `.desktop` `Exec=` line at it. At launch time it picks:
+
+- **Native Wayland** (`-force-wayland`), which gives correct 3D at fractional display scaling (e.g. 150 %), when all of these hold: a GNOME Wayland session; the DisplayXR GNOME Shell extension running, with window drag (it ships with the `displayxr-runtime` package); DisplayXR runtime 2.28.0 or newer; a Vulkan loader. A transparent overlay app also gets `-popupwindow`, so its transparent window has no title bar or shadow around it.
+- **X11 (XWayland)** otherwise (KDE, wlroots, no extension, an older runtime), and says why on stderr.
+
+`DISPLAYXR_LINUX_BACKEND=wayland` or `=x11` forces one. Other arguments are passed through to the player.
 
 ### Cross-Compiling (macOS Editor to Windows Build)
 

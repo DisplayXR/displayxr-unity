@@ -103,8 +103,57 @@ namespace DisplayXR.Editor
                 bool transparent = settings != null && settings.transparentOverlay;
                 WriteTextInto(Path.Combine(dataDir, "DisplayXR", "linux_player.json"),
                               "{\n  \"transparent_overlay\": " + (transparent ? "true" : "false") + "\n}\n");
+                // The launcher that picks native Wayland or X11 at launch time
+                // (Editor/DisplayXRLinuxLauncher.sh): <name>.sh next to the player,
+                // for the app's .desktop Exec= line.
+                WriteLinuxLauncher(pkgRoot, exeDir, exeName, Path.GetFileName(outputPath));
             }
             // Other standalone targets are not shipped for the provider today.
+        }
+
+        static void WriteLinuxLauncher(string pkgRoot, string exeDir, string exeName, string playerFile)
+        {
+            string template = Path.Combine(pkgRoot, "Editor", "DisplayXRLinuxLauncher.sh");
+            if (!File.Exists(template))
+            {
+                Debug.LogWarning($"[DisplayXR] Provider deploy: launcher template missing, not written: {template}");
+                return;
+            }
+            // Inside the script these sit in double quotes: escape what is special there.
+            string Quote(string v) => v.Replace("\\", "\\\\").Replace("\"", "\\\"").Replace("$", "\\$").Replace("`", "\\`");
+            string product = PlayerSettings.productName.Replace("\r", " ").Replace("\n", " ");
+            string script = File.ReadAllText(template).Replace("\r\n", "\n")
+                .Replace("@PRODUCT@", product)
+                .Replace("@PLAYER@", Quote(playerFile))
+                .Replace("@DATA@", Quote(exeName + "_Data"));
+            string dst = Path.Combine(exeDir, exeName + ".sh");
+            WriteTextInto(dst, script);
+            MakeExecutable(dst);
+        }
+
+        static void MakeExecutable(string path)
+        {
+            if (Application.platform == RuntimePlatform.WindowsEditor)
+            {
+                Debug.Log($"[DisplayXR] Provider deploy: built on Windows, so {Path.GetFileName(path)} is not " +
+                          "executable yet: chmod +x it on the Linux box (or run it with sh).");
+                return;
+            }
+            try
+            {
+                var p = System.Diagnostics.Process.Start(new System.Diagnostics.ProcessStartInfo
+                {
+                    FileName = "/bin/chmod",
+                    Arguments = "+x \"" + path + "\"",
+                    UseShellExecute = false,
+                    CreateNoWindow = true,
+                });
+                p?.WaitForExit(5000);
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning($"[DisplayXR] Provider deploy: could not make {path} executable: {e.Message}");
+            }
         }
 
         static void WriteTextInto(string dst, string text)
