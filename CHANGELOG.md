@@ -5,6 +5,22 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.24.1] - 2026-10-08
+
+### Fixed
+- Linux native-Wayland player (`-force-wayland`) hardening (#355, DisplayXR/displayxr-runtime#1831):
+  - All GNOME-extension D-Bus calls moved to one worker thread; none on the render thread. Window placement is now an intent enforced when the window is mapped (replaces the 3–5 s position hold); compositor constraints are accepted, user moves followed.
+  - Requests on the player's `wl_surface` are made under the capture layer's lock, closing a use-after-free window when the player destroys its surface.
+  - Works without the DisplayXR GNOME extension (KDE/wlroots/disabled/locked screen): calls refused immediately, availability followed via `NameOwnerChanged`, window placed when it comes back.
+  - Coordinate spaces: layout mode read from the extension (v11+) and cross-checked; output transforms honoured; X root ↔ stage conversion uses the runtime's panel rect; `BeginPointerDrag` only with the drag capability.
+  - Window size keeps device px across scale changes (no 4/3 growth moving from a 133% laptop to a 200% panel).
+
+### Added
+- `displayxr_linux_overlay_position_known()` (Linux): says whether `displayxr_get_overlay_position` returned the current position or the last known one, since (0,0) is a legitimate position.
+
+### Changed
+- The VkInstance kept alive per native-Wayland session (driver crash at exit otherwise) is now held and counted in the log.
+
 ## [2.24.0] - 2026-10-07
 
 ### Added
