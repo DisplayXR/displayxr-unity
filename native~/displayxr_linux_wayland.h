@@ -40,6 +40,9 @@ int dxr_wl_capture_wanted(void);
 //! Warn (once) if `what`, a P/Invoke entry point, runs in a copy of the plugin
 //! that did not arm the capture (Unity loads the library twice).
 void dxr_wl_capture_note_caller(const char *what);
+//! The build is marked as a transparent overlay app, so the player's window is
+//! presented with alpha (DisplayXRManifestSettings; <Data>/DisplayXR/linux_player.json).
+int dxr_wl_capture_transparent_window(void);
 
 //! The player's window: its Wayland connection and surface. 1 when known.
 int dxr_wl_unity_surface(struct wl_display **out_display, struct wl_surface **out_surface);

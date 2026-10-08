@@ -26,9 +26,13 @@
 //  - records the wl_display + wl_surface of every VkSurfaceKHR the player makes
 //    (it makes a new one on a resolution change, and may recreate the window);
 //  - records the size of the player's window swapchain (its logical size);
-//  - presents that swapchain PRE_MULTIPLIED when the surface supports it, so a
-//    transparent app shows the desktop through the parts of the window the
-//    player leaves at alpha 0 (the weave sub-surface sits on top).
+//  - for a build marked as a transparent overlay app (DisplayXRManifestSettings,
+//    written to <Data>/DisplayXR/linux_player.json by the provider deploy step),
+//    presents that swapchain PRE_MULTIPLIED when the surface supports it, so the
+//    desktop shows through what the player leaves at alpha 0 (the weave
+//    sub-surface sits on top). Any other app keeps the OPAQUE window it asked for:
+//    an opaque app writing alpha < 1 would otherwise turn see-through wherever no
+//    weave covers it (no runtime, splash, a failed session).
 //
 // The manifest points at THIS module: Unity loads the library twice (Plugins/ for
 // pre-init and the provider, Plugins/x86_64/ as well), as separate modules, and
@@ -196,6 +200,7 @@ device_for(VkDevice device, DxrLayerDevice *out)
 }
 
 static std::atomic<int> s_installed{0}; // armed in THIS process (below): the hooks act only then
+static std::atomic<int> s_transparent_window{0}; // the build is a transparent overlay app (below)
 
 static VKAPI_ATTR VkResult VKAPI_CALL
 layer_CreateInstance(const VkInstanceCreateInfo *ci, const VkAllocationCallbacks *alloc, VkInstance *out)
@@ -370,11 +375,11 @@ layer_CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *ci, co
 	if (!player)
 		return next(device, ci, alloc, out);
 
-	// Transparent avatar: let the compositor honour the window's alpha (the player
-	// asks for OPAQUE), so what the player leaves at alpha 0 shows the desktop.
-	// Only where the surface supports it.
+	// Transparent overlay app: let the compositor honour the window's alpha (the
+	// player asks for OPAQUE), so what the player leaves at alpha 0 shows the
+	// desktop. Only for a build marked as one, and where the surface supports it.
 	VkSwapchainCreateInfoKHR alpha_ci = *ci;
-	if (ci->compositeAlpha != VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR && d.surface_caps) {
+	if (s_transparent_window && ci->compositeAlpha != VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR && d.surface_caps) {
 		VkSurfaceCapabilitiesKHR caps = {};
 		if (d.surface_caps(d.physical_device, ci->surface, &caps) == VK_SUCCESS &&
 		    (caps.supportedCompositeAlpha & VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR))
@@ -539,6 +544,44 @@ default_explicit_layer_dirs(void)
 	return out;
 }
 
+//! Whether this build is marked as a transparent overlay app: the provider deploy
+//! step writes <Data>/DisplayXR/linux_player.json from DisplayXRManifestSettings,
+//! and <Data> is the player executable's name without its extension + "_Data".
+static bool
+build_is_transparent_overlay(char *path, size_t path_size)
+{
+	char exe[PATH_MAX];
+	ssize_t len = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+	if (len <= 0)
+		return false;
+	exe[len] = 0;
+	char *slash = strrchr(exe, '/');
+	char *dot = strrchr(exe, '.');
+	if (dot && slash && dot > slash)
+		*dot = 0;
+	snprintf(path, path_size, "%s_Data/DisplayXR/linux_player.json", exe);
+	FILE *f = fopen(path, "rb");
+	if (!f)
+		return false;
+	char buf[1024];
+	size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+	fclose(f);
+	buf[n] = 0;
+	const char *key = strstr(buf, "\"transparent_overlay\"");
+	const char *colon = key ? strchr(key, ':') : nullptr;
+	if (!colon)
+		return false;
+	for (colon++; *colon == ' ' || *colon == '\t' || *colon == '\n' || *colon == '\r'; colon++) {
+	}
+	return !strncmp(colon, "true", 4);
+}
+
+extern "C" int
+dxr_wl_capture_transparent_window(void)
+{
+	return s_transparent_window.load();
+}
+
 static void
 restore_env(const char *name, char **prev)
 {
@@ -629,6 +672,12 @@ dxr_wl_capture_install(void)
 	s_armed = 1;
 	s_installed = 1;
 	fprintf(stderr, "[DisplayXR-WL] native-Wayland player: window capture layer armed (%s)\n", self.dli_fname);
+	char flag_path[PATH_MAX + 64];
+	s_transparent_window = build_is_transparent_overlay(flag_path, sizeof(flag_path)) ? 1 : 0;
+	fprintf(stderr, "[DisplayXR-WL] %s (%s)\n",
+	        s_transparent_window ? "transparent overlay app: the window will be presented with alpha"
+	                             : "not marked as a transparent overlay app: the window stays opaque",
+	        flag_path);
 }
 
 extern "C" void
@@ -678,6 +727,12 @@ extern "C" void
 dxr_wl_capture_note_caller(const char *what)
 {
 	(void)what;
+}
+
+extern "C" int
+dxr_wl_capture_transparent_window(void)
+{
+	return 0;
 }
 
 extern "C" int

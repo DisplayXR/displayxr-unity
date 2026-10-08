@@ -96,8 +96,29 @@ namespace DisplayXR.Editor
                 CopyFileInto(Path.Combine(soDir, "libdisplayxr_unity_wayland.so"),
                              Path.Combine(dataDir, "Plugins", "x86_64", "libdisplayxr_unity_wayland.so"));
                 CopyFileInto(manifestSrc, Path.Combine(dataDir, "UnitySubsystems", SubsystemName, "UnitySubsystemsManifest.json"));
+                // Build-time facts the native plugin needs before any script runs (read by
+                // pre-init from <Data>/DisplayXR/linux_player.json): a transparent overlay
+                // app gets a window presented with alpha on native Wayland.
+                var settings = DisplayXRManifestSettings.Find();
+                bool transparent = settings != null && settings.transparentOverlay;
+                WriteTextInto(Path.Combine(dataDir, "DisplayXR", "linux_player.json"),
+                              "{\n  \"transparent_overlay\": " + (transparent ? "true" : "false") + "\n}\n");
             }
             // Other standalone targets are not shipped for the provider today.
+        }
+
+        static void WriteTextInto(string dst, string text)
+        {
+            try
+            {
+                Directory.CreateDirectory(Path.GetDirectoryName(dst));
+                File.WriteAllText(dst, text);
+                Debug.Log($"[DisplayXR] Provider deploy: wrote {dst}");
+            }
+            catch (Exception e)
+            {
+                Debug.LogWarning($"[DisplayXR] Provider deploy: failed to write {dst}: {e.Message}");
+            }
         }
 
         static void CopyFileInto(string src, string dst)

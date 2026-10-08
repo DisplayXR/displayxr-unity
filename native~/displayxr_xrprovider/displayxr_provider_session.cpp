@@ -5171,6 +5171,10 @@ int dxr_prov_session_start(const char *runtime_json_path,
 				win_chain = &wl_binding;
 				s_ps.wl_weave = 1;
 				dxr_wl_weave_set_transparent(use_transparent ? 1 : 0); // click-through + window drag
+				if (use_transparent && !dxr_wl_capture_transparent_window())
+					ps_log("[DisplayXR-PROV] WARN: this app asks for a transparent background, but the build "
+					       "is not marked as a transparent overlay app (DisplayXR Manifest Settings > "
+					       "Transparent overlay app): on native Wayland its window stays opaque\n");
 				dxr_pvk_keep_instance_alive(); // see displayxr_provider_gfx_vulkan.h
 				ps_log("[DisplayXR-PROV] Linux/Wayland: binding the runtime's weave to a sub-surface of the "
 				       "player's window (window %dx%d logical, weave buffer %dx%d, transparent=%d)\n",
