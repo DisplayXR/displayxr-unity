@@ -5,6 +5,14 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.24.0] - 2026-10-07
+
+### Added
+- Native-Wayland Linux player support (`-force-wayland`) (#354, DisplayXR/displayxr-runtime#1831): weave into a sub-surface of the player's own window via `XR_DXR_wayland_surface_binding` (runtime ≥ 2.28.0), correct 3D at fractional scaling (wp_viewporter + wp_fractional_scale_v1), click-through, drag/move/position via the DisplayXR GNOME extension. Wayland code ships in a separate `libdisplayxr_unity_wayland.so`, dlopened only for a native-Wayland player; the main plugin does not link libwayland. A capture Vulkan explicit layer is armed only under `-force-wayland` and disarmed once Unity's device is up. X11, Windows and macOS paths unchanged.
+
+### Changed
+- New `DisplayXRManifestSettings.transparentOverlay` (default off): on a native-Wayland player, only builds marked as transparent-overlay apps present their window with premultiplied alpha. Transparent Linux apps that run under `-force-wayland` must tick it. (X11 unaffected.)
+
 ## [2.23.0] - 2026-10-06
 
 ### Added
