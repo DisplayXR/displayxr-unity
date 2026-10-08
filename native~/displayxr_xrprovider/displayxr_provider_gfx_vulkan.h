@@ -220,9 +220,9 @@ void dxr_pvk_destroy_device(void);
 /// Leak this session's VkInstance instead of destroying it in
 /// dxr_pvk_destroy_device() (the device still goes). For the native-Wayland
 /// player only: the runtime made its weave surface with that instance on the
-/// PLAYER's wl_display, and destroying it tears down WSI state the driver shares
-/// per wl_display (NVIDIA 595): the player's own swapchain destroy then crashes at
-/// exit. Reset by dxr_pvk_destroy_device().
+/// PLAYER's wl_display, and with at least one current desktop driver destroying it
+/// tears down WSI state the driver shares per wl_display: the player's own
+/// swapchain destroy then crashes at exit. Reset by dxr_pvk_destroy_device().
 void dxr_pvk_keep_instance_alive(void);
 
 /// 1 once dxr_pvk_create_device() has succeeded.
