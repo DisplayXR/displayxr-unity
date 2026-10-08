@@ -160,6 +160,16 @@ static void capture_vulkan_instance(void)
 static void UNITY_INTERFACE_API
 on_graphics_device_event(UnityGfxDeviceEventType eventType)
 {
+#if defined(__linux__) && !defined(__ANDROID__)
+	// The native-Wayland capture layer is disarmed once Unity's Vulkan device is
+	// captured (capture_vulkan_instance). A player that fell back to OpenGL never
+	// gets there, so disarm on its device instead: the layer is of no use to it.
+	if (eventType == kUnityGfxDeviceEventInitialize && s_unity_gfx) {
+		UnityGfxRenderer renderer = s_unity_gfx->GetRenderer();
+		if (renderer == kUnityGfxRendererOpenGLCore || renderer == kUnityGfxRendererOpenGLES30)
+			dxr_wl_capture_disarm("Unity's graphics device is OpenGL");
+	}
+#endif
 #if defined(DXR_HAVE_UNITY_VULKAN)
 	if (eventType == kUnityGfxDeviceEventInitialize) {
 		capture_vulkan_instance();

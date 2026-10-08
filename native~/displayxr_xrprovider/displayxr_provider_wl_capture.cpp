@@ -671,6 +671,10 @@ dxr_wl_capture_install(void)
 	setenv("VK_INSTANCE_LAYERS", layers.c_str(), 1);
 	s_armed = 1;
 	s_installed = 1;
+	// A player that quits before its graphics device is up (e.g. a forced API it
+	// was not built with) never reaches the disarm calls: don't leave the manifest
+	// behind in XDG_RUNTIME_DIR.
+	atexit([] { dxr_wl_capture_disarm("process exit"); });
 	fprintf(stderr, "[DisplayXR-WL] native-Wayland player: window capture layer armed (%s)\n", self.dli_fname);
 	char flag_path[PATH_MAX + 64];
 	s_transparent_window = build_is_transparent_overlay(flag_path, sizeof(flag_path)) ? 1 : 0;
