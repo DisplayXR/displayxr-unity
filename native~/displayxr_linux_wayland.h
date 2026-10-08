@@ -6,6 +6,12 @@
 // design and displayxr_xrprovider/displayxr_provider_wl_capture.cpp for how the
 // player's Wayland window is found.
 //
+// The capture functions are in the main plugin. The weave and window-control
+// functions are implemented in libdisplayxr_unity_wayland.so (the only binary
+// that links libwayland-client); the main plugin's definitions of them are the
+// forwarders in displayxr_linux_wayland_shim.c, which load that library on the
+// first dxr_wl_weave_surface_create.
+//
 // Every entry point is inert (returns 0 / 1.0 / does nothing) unless the player
 // runs natively on Wayland and the weave was bound to its window, so the X11,
 // Windows and macOS paths never reach this code with any effect.
@@ -35,7 +41,7 @@ int dxr_wl_unity_swapchain_size(int *out_w, int *out_h);
 //! a resolution change, and may recreate the wl_surface itself).
 unsigned dxr_wl_player_surface_generation(void);
 
-// --- Weave sub-surface (displayxr_linux_wayland.c) -------------------------
+// --- Weave sub-surface (libdisplayxr_unity_wayland.so, via the shim) -------
 
 //! Create the weave sub-surface of the player's window (logical size lw x lh)
 //! and return it with the device-pixel buffer size the runtime should present.

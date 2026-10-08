@@ -535,4 +535,44 @@ dxr_wl_capture_install(void)
 	fprintf(stderr, "[DisplayXR-WL] native-Wayland player: window capture layer armed\n");
 }
 
+#elif defined(__linux__) && !defined(__ANDROID__)
+
+// Built without the Vulkan backend: no capture layer, so never a native-Wayland
+// player window. The accessors still exist for the shim and the provider.
+
+#include "../displayxr_linux_wayland.h"
+
+#include <stddef.h>
+
+extern "C" void
+dxr_wl_capture_install(void)
+{
+}
+
+extern "C" int
+dxr_wl_unity_surface(struct wl_display **out_display, struct wl_surface **out_surface)
+{
+	if (out_display)
+		*out_display = NULL;
+	if (out_surface)
+		*out_surface = NULL;
+	return 0;
+}
+
+extern "C" int
+dxr_wl_unity_swapchain_size(int *out_w, int *out_h)
+{
+	if (out_w)
+		*out_w = 0;
+	if (out_h)
+		*out_h = 0;
+	return 0;
+}
+
+extern "C" unsigned
+dxr_wl_player_surface_generation(void)
+{
+	return 0;
+}
+
 #endif

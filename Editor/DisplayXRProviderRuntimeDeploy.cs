@@ -87,9 +87,14 @@ namespace DisplayXR.Editor
                 string exeDir = Path.GetDirectoryName(outputPath);
                 string exeName = Path.GetFileNameWithoutExtension(outputPath);
                 string dataDir = Path.Combine(exeDir, exeName + "_Data");
-                string soSrc = Path.Combine(pkgRoot, "Runtime", "Plugins", "Linux", "x86_64", "libdisplayxr_unity.so");
+                string soDir = Path.Combine(pkgRoot, "Runtime", "Plugins", "Linux", "x86_64");
 
-                CopyFileInto(soSrc, Path.Combine(dataDir, "Plugins", "x86_64", "libdisplayxr_unity.so"));
+                CopyFileInto(Path.Combine(soDir, "libdisplayxr_unity.so"),
+                             Path.Combine(dataDir, "Plugins", "x86_64", "libdisplayxr_unity.so"));
+                // The native-Wayland support library goes beside it: the plugin dlopens it
+                // from its own folder, and only for a native-Wayland player.
+                CopyFileInto(Path.Combine(soDir, "libdisplayxr_unity_wayland.so"),
+                             Path.Combine(dataDir, "Plugins", "x86_64", "libdisplayxr_unity_wayland.so"));
                 CopyFileInto(manifestSrc, Path.Combine(dataDir, "UnitySubsystems", SubsystemName, "UnitySubsystemsManifest.json"));
             }
             // Other standalone targets are not shipped for the provider today.

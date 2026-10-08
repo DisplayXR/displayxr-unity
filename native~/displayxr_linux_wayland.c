@@ -4,7 +4,11 @@
 // Native-Wayland player (`-force-wayland`): the weave goes into a sub-surface of
 // the player's own window.
 //
-// The player's wl_display / wl_surface come from the capture layer
+// Part of libdisplayxr_unity_wayland.so, which the main plugin dlopens only once
+// it has found a native-Wayland player window (displayxr_linux_wayland_lib.h,
+// displayxr_linux_wayland_shim.c), so that only this library links libwayland.
+//
+// The player's wl_display / wl_surface come from the main plugin's capture layer
 // (displayxr_xrprovider/displayxr_provider_wl_capture.cpp). Everything here runs
 // on the player's connection but on a PRIVATE event queue, so the player's SDL
 // (which dispatches the default queue on its main thread) never sees our events
@@ -25,10 +29,9 @@
 //
 // The window controls a Wayland client cannot do for itself (moving its toplevel,
 // learning its position) go through the DisplayXR GNOME Shell extension
-// (window-geometry@displayxr.org) over D-Bus; libdbus is loaded at run time.
+// (window-geometry@displayxr.org) over D-Bus: displayxr_linux_wayland_dbus.c.
 //
-// Every entry point is inert unless a weave sub-surface exists, so the X11 path
-// never gets here with any effect.
+// Every entry point is inert unless a weave sub-surface exists.
 
 #define _GNU_SOURCE // memfd_create
 #include <wayland-client.h>
@@ -36,9 +39,9 @@
 #include "fractional-scale-v1-client-protocol.h"
 #include "xdg-output-unstable-v1-client-protocol.h"
 
-#include "displayxr_linux_wayland.h"
+#include "displayxr_linux_wayland_dbus.h"
+#include "displayxr_linux_wayland_lib.h"
 
-#include <dlfcn.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -78,7 +81,7 @@ static struct {
 	// The weave (NULL surface = no native-Wayland session).
 	struct wl_surface *surface;
 	struct wl_surface *parent; // the player's window it is a sub-surface of
-	unsigned parent_generation; // dxr_wl_player_surface_generation() it was attached at
+	unsigned parent_generation; // host player_surface_generation() it was attached at
 	unsigned attach_count;      // bumps per (re-)attach: the input region is re-sent
 	struct wl_subsurface *subsurface;
 	struct wp_viewport *viewport;
@@ -117,6 +120,9 @@ static struct {
 // Guards s_wl: the provider's frame thread polls, C#'s main thread asks for
 // resizes, positions and input regions.
 static pthread_mutex_t s_wl_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// The main plugin's side (displayxr_linux_wayland_lib.h), set once by dxr_wl_lib_init.
+static const DxrWlHost *s_host;
 
 static double
 now_s(void)
@@ -429,7 +435,7 @@ attach_to_parent_locked(struct wl_surface *parent)
 	s_wl.attach_count++;
 }
 
-int
+static int
 dxr_wl_weave_surface_create(struct wl_display *display, struct wl_surface *parent, int lw, int lh,
                             struct wl_surface **out_surface, int *out_w, int *out_h)
 {
@@ -448,7 +454,7 @@ dxr_wl_weave_surface_create(struct wl_display *display, struct wl_surface *paren
 	s_wl.surface = wl_compositor_create_surface(s_wl.compositor);
 	wl_surface_add_listener(s_wl.surface, &s_surface_listener, NULL);
 	attach_to_parent_locked(parent);
-	s_wl.parent_generation = dxr_wl_player_surface_generation();
+	s_wl.parent_generation = s_host->player_surface_generation();
 	// Pointer input goes through to the player's window underneath.
 	struct wl_region *empty = wl_compositor_create_region(s_wl.compositor);
 	wl_surface_set_input_region(s_wl.surface, empty);
@@ -489,7 +495,7 @@ dxr_wl_weave_surface_create(struct wl_display *display, struct wl_surface *paren
 	return 1;
 }
 
-void
+static void
 dxr_wl_weave_destroy(void)
 {
 	pthread_mutex_lock(&s_wl_mutex);
@@ -499,7 +505,7 @@ dxr_wl_weave_destroy(void)
 	}
 	struct wl_display *d = NULL;
 	struct wl_surface *player = NULL;
-	if (dxr_wl_unity_surface(&d, &player) && player)
+	if (s_host->unity_surface(&d, &player) && player)
 		wl_surface_set_input_region(player, NULL); // the whole window catches again
 	if (s_wl.frac)
 		wp_fractional_scale_v1_destroy(s_wl.frac);
@@ -531,7 +537,7 @@ dxr_wl_weave_destroy(void)
 	fprintf(stderr, "[DisplayXR-WL] weave sub-surface destroyed\n");
 }
 
-void
+static void
 dxr_wl_weave_set_transparent(int transparent)
 {
 	pthread_mutex_lock(&s_wl_mutex);
@@ -539,7 +545,7 @@ dxr_wl_weave_set_transparent(int transparent)
 	pthread_mutex_unlock(&s_wl_mutex);
 }
 
-int
+static int
 dxr_wl_weave_active(void)
 {
 	pthread_mutex_lock(&s_wl_mutex);
@@ -548,7 +554,7 @@ dxr_wl_weave_active(void)
 	return active;
 }
 
-static int placement_move(int x, int y);       // below
+static int placement_move(int x, int y); // below
 static int query_frame_origin(int *out_x, int *out_y);
 
 static void
@@ -601,7 +607,7 @@ restore_step(int rx, int ry)
 	placement_move(rx, ry);
 }
 
-int
+static int
 dxr_wl_weave_poll(int *out_w, int *out_h)
 {
 	pthread_mutex_lock(&s_wl_mutex);
@@ -613,11 +619,11 @@ dxr_wl_weave_poll(int *out_w, int *out_h)
 	// may recreate the wl_surface itself, possibly at the same address): re-attach.
 	// The sub-surface of a destroyed parent is inert, and re-attaching to a live
 	// one is harmless (it maps again on the runtime's next present).
-	unsigned generation = dxr_wl_player_surface_generation();
+	unsigned generation = s_host->player_surface_generation();
 	if (generation != s_wl.parent_generation) {
 		struct wl_display *pd = NULL;
 		struct wl_surface *player = NULL;
-		if (dxr_wl_unity_surface(&pd, &player) && player) { // else: between surfaces, retry
+		if (s_host->unity_surface(&pd, &player) && player) { // else: between surfaces, retry
 			int recreated = player != s_wl.parent;
 			attach_to_parent_locked(player);
 			s_wl.parent_generation = generation;
@@ -632,7 +638,7 @@ dxr_wl_weave_poll(int *out_w, int *out_h)
 	}
 	// The player's window size (its swapchain extent, logical px).
 	int lw = 0, lh = 0;
-	if (dxr_wl_unity_swapchain_size(&lw, &lh) && (lw != s_wl.logical_w || lh != s_wl.logical_h)) {
+	if (s_host->unity_swapchain_size(&lw, &lh) && (lw != s_wl.logical_w || lh != s_wl.logical_h)) {
 		s_wl.logical_w = lw;
 		s_wl.logical_h = lh;
 		wp_viewport_set_destination(s_wl.viewport, lw, lh);
@@ -664,7 +670,7 @@ dxr_wl_weave_poll(int *out_w, int *out_h)
 	return dirty;
 }
 
-double
+static double
 dxr_wl_ui_scale(void)
 {
 	pthread_mutex_lock(&s_wl_mutex);
@@ -673,7 +679,7 @@ dxr_wl_ui_scale(void)
 	return scale;
 }
 
-int
+static int
 dxr_wl_weave_device_size(int *out_w, int *out_h)
 {
 	pthread_mutex_lock(&s_wl_mutex);
@@ -686,7 +692,7 @@ dxr_wl_weave_device_size(int *out_w, int *out_h)
 	return have;
 }
 
-unsigned
+static unsigned
 dxr_wl_player_generation(void)
 {
 	pthread_mutex_lock(&s_wl_mutex);
@@ -701,7 +707,7 @@ dxr_wl_player_generation(void)
  *
  */
 
-int
+static int
 dxr_wl_click_through_wanted(void)
 {
 	pthread_mutex_lock(&s_wl_mutex);
@@ -716,12 +722,12 @@ typedef struct DxrWlRect {
 	unsigned short w, h;
 } DxrWlRect;
 
-int
+static int
 dxr_wl_set_player_input_region(const void *rects, int n)
 {
 	struct wl_display *d = NULL;
 	struct wl_surface *player = NULL;
-	if (!dxr_wl_unity_surface(&d, &player) || !player)
+	if (!s_host->unity_surface(&d, &player) || !player)
 		return 0; // the player is between window surfaces
 	pthread_mutex_lock(&s_wl_mutex);
 	if (!s_wl.surface || !s_wl.compositor) {
@@ -744,7 +750,7 @@ dxr_wl_set_player_input_region(const void *rects, int n)
 	return 1;
 }
 
-void
+static void
 dxr_wl_request_player_size(int device_w, int device_h)
 {
 	pthread_mutex_lock(&s_wl_mutex);
@@ -755,7 +761,7 @@ dxr_wl_request_player_size(int device_w, int device_h)
 	pthread_mutex_unlock(&s_wl_mutex);
 }
 
-int
+static int
 dxr_wl_take_player_size(int *out_w, int *out_h)
 {
 	pthread_mutex_lock(&s_wl_mutex);
@@ -782,158 +788,41 @@ dxr_wl_take_player_size(int *out_w, int *out_h)
 
 /*
  *
- * D-Bus: the DisplayXR GNOME Shell extension (window-geometry@displayxr.org).
+ * Window controls through the DisplayXR GNOME Shell extension
+ * (displayxr_linux_wayland_dbus.c), and what they tell us about our position.
  *
  */
 
-typedef struct DxrDBusConnection DxrDBusConnection;
-typedef struct DxrDBusMessage DxrDBusMessage;
-typedef struct DxrDBusError { // DBusError's layout
-	const char *name;
-	const char *message;
-	unsigned int dummy1 : 1, dummy2 : 1, dummy3 : 1, dummy4 : 1, dummy5 : 1;
-	void *padding1;
-} DxrDBusError;
-
-#define DXR_DBUS_BUS_SESSION 0
-#define DXR_DBUS_TYPE_INVALID 0
-#define DXR_DBUS_TYPE_BOOLEAN ((int)'b')
-#define DXR_DBUS_TYPE_INT32 ((int)'i')
-#define DXR_DBUS_TYPE_UINT32 ((int)'u')
-#define DXR_DBUS_TYPE_STRING ((int)'s')
-
-#define DXR_EXT_NAME "org.displayxr.WindowGeometry"
-#define DXR_EXT_PLACEMENT_PATH "/org/displayxr/WindowPlacement"
-#define DXR_EXT_PLACEMENT_IFACE "org.displayxr.WindowPlacement1"
-#define DXR_EXT_GEOMETRY_PATH "/org/displayxr/WindowGeometry"
-#define DXR_EXT_GEOMETRY_IFACE "org.displayxr.WindowGeometry1"
-
-static struct {
-	int ok;
-	uint32_t (*threads_init_default)(void);
-	void (*error_init)(DxrDBusError *);
-	void (*error_free)(DxrDBusError *);
-	DxrDBusConnection *(*bus_get_private)(int, DxrDBusError *);
-	void (*set_exit_on_disconnect)(DxrDBusConnection *, uint32_t);
-	DxrDBusMessage *(*new_method_call)(const char *, const char *, const char *, const char *);
-	uint32_t (*append_args)(DxrDBusMessage *, int, ...);
-	DxrDBusMessage *(*send_with_reply_and_block)(DxrDBusConnection *, DxrDBusMessage *, int, DxrDBusError *);
-	uint32_t (*get_args)(DxrDBusMessage *, DxrDBusError *, int, ...);
-	void (*unref)(DxrDBusMessage *);
-	DxrDBusConnection *conn;
-} s_dbus;
-static pthread_once_t s_dbus_once = PTHREAD_ONCE_INIT;
-
 static void
-dbus_init(void)
+note_position(int x, int y)
 {
-	void *lib = dlopen("libdbus-1.so.3", RTLD_NOW | RTLD_LOCAL);
-	if (!lib) {
-		fprintf(stderr, "[DisplayXR-WL] libdbus-1 not found: no window drag or placement\n");
-		return;
-	}
-#define DXR_DBUS_SYM(field, name) *(void **)&s_dbus.field = dlsym(lib, name)
-	DXR_DBUS_SYM(threads_init_default, "dbus_threads_init_default");
-	DXR_DBUS_SYM(error_init, "dbus_error_init");
-	DXR_DBUS_SYM(error_free, "dbus_error_free");
-	DXR_DBUS_SYM(bus_get_private, "dbus_bus_get_private");
-	DXR_DBUS_SYM(set_exit_on_disconnect, "dbus_connection_set_exit_on_disconnect");
-	DXR_DBUS_SYM(new_method_call, "dbus_message_new_method_call");
-	DXR_DBUS_SYM(append_args, "dbus_message_append_args");
-	DXR_DBUS_SYM(send_with_reply_and_block, "dbus_connection_send_with_reply_and_block");
-	DXR_DBUS_SYM(get_args, "dbus_message_get_args");
-	DXR_DBUS_SYM(unref, "dbus_message_unref");
-#undef DXR_DBUS_SYM
-	if (!s_dbus.threads_init_default || !s_dbus.error_init || !s_dbus.error_free || !s_dbus.bus_get_private ||
-	    !s_dbus.set_exit_on_disconnect || !s_dbus.new_method_call || !s_dbus.append_args ||
-	    !s_dbus.send_with_reply_and_block || !s_dbus.get_args || !s_dbus.unref)
-		return;
-	s_dbus.threads_init_default();
-	DxrDBusError err;
-	s_dbus.error_init(&err);
-	s_dbus.conn = s_dbus.bus_get_private(DXR_DBUS_BUS_SESSION, &err);
-	if (!s_dbus.conn) {
-		fprintf(stderr, "[DisplayXR-WL] session bus unavailable: %s\n", err.message ? err.message : "?");
-		s_dbus.error_free(&err);
-		return;
-	}
-	// A bus connection _exit()s the process when the bus goes away, by default.
-	s_dbus.set_exit_on_disconnect(s_dbus.conn, 0);
-	s_dbus.ok = 1;
+	pthread_mutex_lock(&s_wl_mutex);
+	s_wl.pos_valid = 1;
+	s_wl.pos_x = x;
+	s_wl.pos_y = y;
+	s_wl.pos_at = now_s();
+	pthread_mutex_unlock(&s_wl_mutex);
 }
-
-//! A method call to the extension, or NULL.
-static DxrDBusMessage *
-ext_call(const char *path, const char *iface, const char *method)
-{
-	pthread_once(&s_dbus_once, dbus_init);
-	return s_dbus.ok ? s_dbus.new_method_call(DXR_EXT_NAME, path, iface, method) : NULL;
-}
-
-//! Send it (consumes msg); the reply, or NULL after logging why.
-static DxrDBusMessage *
-ext_send(DxrDBusMessage *msg, const char *method)
-{
-	DxrDBusError err;
-	s_dbus.error_init(&err);
-	DxrDBusMessage *reply = s_dbus.send_with_reply_and_block(s_dbus.conn, msg, 500, &err);
-	s_dbus.unref(msg);
-	if (!reply)
-		fprintf(stderr, "[DisplayXR-WL] %s failed: %s (is the DisplayXR GNOME extension on?)\n", method,
-		        err.message ? err.message : "?");
-	s_dbus.error_free(&err);
-	return reply;
-}
-
-//! The reply's boolean (consumes reply): 1 / 0.
-static int
-ext_reply_bool(DxrDBusMessage *reply)
-{
-	DxrDBusError err;
-	s_dbus.error_init(&err);
-	uint32_t b = 0;
-	int ok = s_dbus.get_args(reply, &err, DXR_DBUS_TYPE_BOOLEAN, &b, DXR_DBUS_TYPE_INVALID) && b;
-	s_dbus.error_free(&err);
-	s_dbus.unref(reply);
-	return ok;
-}
-
-// pid 0 = "the caller": the extension takes the PID from the bus connection and
-// only ever moves the caller's own window.
 
 static int
 placement_move(int x, int y)
 {
-	DxrDBusMessage *msg = ext_call(DXR_EXT_PLACEMENT_PATH, DXR_EXT_PLACEMENT_IFACE, "MoveWindow");
-	if (!msg)
-		return 0;
-	uint32_t pid = 0;
-	int32_t ix = x, iy = y;
-	s_dbus.append_args(msg, DXR_DBUS_TYPE_UINT32, &pid, DXR_DBUS_TYPE_INT32, &ix, DXR_DBUS_TYPE_INT32, &iy,
-	                   DXR_DBUS_TYPE_INVALID);
-	DxrDBusMessage *reply = ext_send(msg, "MoveWindow");
-	int moved = reply ? ext_reply_bool(reply) : 0;
-	if (moved) {
-		pthread_mutex_lock(&s_wl_mutex);
-		s_wl.pos_valid = 1;
-		s_wl.pos_x = x;
-		s_wl.pos_y = y;
-		s_wl.pos_at = now_s();
-		pthread_mutex_unlock(&s_wl_mutex);
-	}
+	int moved = dxr_wl_ext_move_window(x, y);
+	if (moved)
+		note_position(x, y);
 	return moved;
 }
 
-int
+static int
+query_frame_origin(int *out_x, int *out_y)
+{
+	return dxr_wl_ext_frame_origin(out_x, out_y);
+}
+
+static int
 dxr_wl_begin_pointer_drag(unsigned button)
 {
-	DxrDBusMessage *msg = ext_call(DXR_EXT_PLACEMENT_PATH, DXR_EXT_PLACEMENT_IFACE, "BeginPointerDrag");
-	if (!msg)
-		return 0;
-	uint32_t pid = 0, b = button;
-	s_dbus.append_args(msg, DXR_DBUS_TYPE_UINT32, &pid, DXR_DBUS_TYPE_UINT32, &b, DXR_DBUS_TYPE_INVALID);
-	DxrDBusMessage *reply = ext_send(msg, "BeginPointerDrag");
-	int started = reply ? ext_reply_bool(reply) : 0;
+	int started = dxr_wl_ext_begin_pointer_drag(button);
 	if (started) {
 		pthread_mutex_lock(&s_wl_mutex);
 		s_wl.dragging = 1;
@@ -943,28 +832,17 @@ dxr_wl_begin_pointer_drag(unsigned button)
 	return started;
 }
 
-void
+static void
 dxr_wl_end_pointer_drag(void)
 {
-	DxrDBusMessage *msg = ext_call(DXR_EXT_PLACEMENT_PATH, DXR_EXT_PLACEMENT_IFACE, "EndPointerDrag");
-	if (!msg)
-		return;
-	uint32_t pid = 0;
-	s_dbus.append_args(msg, DXR_DBUS_TYPE_UINT32, &pid, DXR_DBUS_TYPE_INVALID);
-	DxrDBusMessage *reply = ext_send(msg, "EndPointerDrag");
-	if (reply)
-		s_dbus.unref(reply);
+	dxr_wl_ext_end_pointer_drag();
 	int x = 0, y = 0;
 	int have = query_frame_origin(&x, &y); // where the user left it
 	pthread_mutex_lock(&s_wl_mutex);
 	s_wl.dragging = 0;
-	if (have) {
-		s_wl.pos_valid = 1;
-		s_wl.pos_x = x;
-		s_wl.pos_y = y;
-		s_wl.pos_at = now_s();
-	}
 	pthread_mutex_unlock(&s_wl_mutex);
+	if (have)
+		note_position(x, y);
 	fprintf(stderr, "[DisplayXR-WL] window drag: end at (%d,%d)\n", x, y);
 }
 
@@ -973,38 +851,6 @@ dxr_wl_end_pointer_drag(void)
  * Placement: onto the 3D panel, and positions in X root coordinates.
  *
  */
-
-//! Our window's frame origin (logical stage px) from the extension.
-static int
-query_frame_origin(int *out_x, int *out_y)
-{
-	DxrDBusMessage *msg = ext_call(DXR_EXT_GEOMETRY_PATH, DXR_EXT_GEOMETRY_IFACE, "GetWindows");
-	if (!msg)
-		return 0;
-	DxrDBusMessage *reply = ext_send(msg, "GetWindows");
-	if (!reply)
-		return 0;
-	DxrDBusError err;
-	s_dbus.error_init(&err);
-	const char *json = NULL;
-	int found = 0;
-	if (s_dbus.get_args(reply, &err, DXR_DBUS_TYPE_STRING, &json, DXR_DBUS_TYPE_INVALID) && json) {
-		// {"windows":[{"pid":N,...,"frame":[x,y,w,h],...},...]}: find our pid's.
-		long self = (long)getpid();
-		for (const char *p = strstr(json, "\"pid\""); p && !found; p = strstr(p + 5, "\"pid\"")) {
-			const char *c = strchr(p, ':');
-			if (!c || strtol(c + 1, NULL, 10) != self)
-				continue;
-			const char *f = strstr(p, "\"frame\"");
-			const char *b = f ? strchr(f, '[') : NULL;
-			if (b && sscanf(b + 1, " %d , %d", out_x, out_y) == 2)
-				found = 1;
-		}
-	}
-	s_dbus.error_free(&err);
-	s_dbus.unref(reply);
-	return found;
-}
 
 //! The scale (x 120) of the output containing logical point (x, y); 0 if none.
 static uint32_t
@@ -1039,7 +885,7 @@ place_and_hold(int x, int y)
 	return 1;
 }
 
-int
+static int
 dxr_wl_move_player_to_panel(const char *connector, int panel_w, int panel_h)
 {
 	pthread_mutex_lock(&s_wl_mutex);
@@ -1115,7 +961,7 @@ xwayland_scale_locked(void)
 	return (int)ceil(max_scale - 1e-3);
 }
 
-int
+static int
 dxr_wl_get_player_position_x11(int *out_x, int *out_y)
 {
 	pthread_mutex_lock(&s_wl_mutex);
@@ -1149,7 +995,7 @@ dxr_wl_get_player_position_x11(int *out_x, int *out_y)
 	return have;
 }
 
-int
+static int
 dxr_wl_set_player_position_x11(int x, int y)
 {
 	pthread_mutex_lock(&s_wl_mutex);
@@ -1164,4 +1010,41 @@ dxr_wl_set_player_position_x11(int x, int y)
 	fprintf(stderr, "[DisplayXR-WL] window -> X (%d,%d) = logical (%d,%d) %s\n", x, y, lx, ly,
 	        moved ? "moved" : "NOT moved");
 	return moved;
+}
+
+/*
+ *
+ * The library's one export (displayxr_linux_wayland_lib.h).
+ *
+ */
+
+static const DxrWlApi s_api = {
+    .abi = DXR_WL_LIB_ABI,
+    .weave_surface_create = dxr_wl_weave_surface_create,
+    .weave_destroy = dxr_wl_weave_destroy,
+    .weave_set_transparent = dxr_wl_weave_set_transparent,
+    .weave_poll = dxr_wl_weave_poll,
+    .weave_active = dxr_wl_weave_active,
+    .weave_device_size = dxr_wl_weave_device_size,
+    .ui_scale = dxr_wl_ui_scale,
+    .click_through_wanted = dxr_wl_click_through_wanted,
+    .set_player_input_region = dxr_wl_set_player_input_region,
+    .begin_pointer_drag = dxr_wl_begin_pointer_drag,
+    .end_pointer_drag = dxr_wl_end_pointer_drag,
+    .request_player_size = dxr_wl_request_player_size,
+    .take_player_size = dxr_wl_take_player_size,
+    .move_player_to_panel = dxr_wl_move_player_to_panel,
+    .get_player_position_x11 = dxr_wl_get_player_position_x11,
+    .set_player_position_x11 = dxr_wl_set_player_position_x11,
+    .player_generation = dxr_wl_player_generation,
+};
+
+__attribute__((visibility("default"))) const DxrWlApi *
+dxr_wl_lib_init(const DxrWlHost *host)
+{
+	if (!host || host->abi != DXR_WL_LIB_ABI || !host->unity_surface || !host->unity_swapchain_size ||
+	    !host->player_surface_generation)
+		return NULL;
+	s_host = host;
+	return &s_api;
 }

@@ -145,10 +145,11 @@ elseif(UNIX AND NOT APPLE AND NOT ANDROID)
     # helper that finds the player's own window so Linux can be a HANDLE app
     # (XR_DXR_xlib_window_binding) like Windows and macOS.
     list(APPEND SOURCES displayxr_linux.c
-        # Native-Wayland player experiment: capture its wl_surface at Vulkan init.
+        # Native-Wayland player: find its window at Vulkan init (a Vulkan layer)...
         displayxr_xrprovider/displayxr_provider_wl_capture.cpp
-        # ... and a sub-surface of the player's window for the weave.
-        displayxr_linux_wayland.c)
+        # ... and forward the weave to libdisplayxr_unity_wayland.so (below), which
+        # is dlopened only then, so this library never links libwayland-client.
+        displayxr_linux_wayland_shim.c)
 endif()
 
 # Provider Vulkan backend (#247 Windows, #249 Linux): enable2 session device +
@@ -199,27 +200,52 @@ if(DXR_VULKAN_BACKEND)
     target_compile_definitions(displayxr_unity PRIVATE ENABLE_VULKAN)
 endif()
 
-# Native-Wayland player experiment: the sub-surface code talks to the player's
-# own Wayland connection (libwayland-client).
+# Native-Wayland player: the Wayland support library, libdisplayxr_unity_wayland.so
+# (displayxr_linux_wayland_lib.h). It holds everything that links libwayland-client
+# (the weave sub-surface, the generated protocol glue, the GNOME-extension D-Bus
+# client), so the main plugin keeps loading where libwayland-client is missing.
+# Optional for a local build (needs pkg-config + libwayland-dev + wayland-scanner);
+# CI requires it.
 if(UNIX AND NOT APPLE AND NOT ANDROID)
-    find_package(PkgConfig REQUIRED)
-    pkg_check_modules(DXR_WAYLAND_CLIENT REQUIRED IMPORTED_TARGET wayland-client)
-    target_link_libraries(displayxr_unity PRIVATE PkgConfig::DXR_WAYLAND_CLIENT)
-    # viewporter + fractional-scale glue, generated from the vendored XML
-    # (wayland-protocols is not installed everywhere; see wayland-protocols/README.md).
-    find_program(DXR_WAYLAND_SCANNER wayland-scanner REQUIRED)
-    set(DXR_WL_GEN ${CMAKE_CURRENT_BINARY_DIR}/wayland-generated)
-    file(MAKE_DIRECTORY ${DXR_WL_GEN})
-    foreach(proto viewporter fractional-scale-v1 xdg-output-unstable-v1)
-        set(xml ${CMAKE_CURRENT_SOURCE_DIR}/wayland-protocols/${proto}.xml)
-        add_custom_command(OUTPUT ${DXR_WL_GEN}/${proto}-client-protocol.h ${DXR_WL_GEN}/${proto}-protocol.c
-            COMMAND ${DXR_WAYLAND_SCANNER} client-header ${xml} ${DXR_WL_GEN}/${proto}-client-protocol.h
-            COMMAND ${DXR_WAYLAND_SCANNER} private-code ${xml} ${DXR_WL_GEN}/${proto}-protocol.c
-            DEPENDS ${xml} VERBATIM)
-        target_sources(displayxr_unity PRIVATE
-            ${DXR_WL_GEN}/${proto}-client-protocol.h ${DXR_WL_GEN}/${proto}-protocol.c)
-    endforeach()
-    target_include_directories(displayxr_unity PRIVATE ${DXR_WL_GEN})
+    find_package(PkgConfig QUIET)
+    if(PkgConfig_FOUND)
+        pkg_check_modules(DXR_WAYLAND_CLIENT QUIET IMPORTED_TARGET wayland-client)
+    endif()
+    find_program(DXR_WAYLAND_SCANNER wayland-scanner)
+    if(DXR_WAYLAND_CLIENT_FOUND AND DXR_WAYLAND_SCANNER)
+        add_library(displayxr_unity_wayland SHARED
+            displayxr_linux_wayland.c
+            displayxr_linux_wayland_dbus.c)
+        # viewporter + fractional-scale + xdg-output glue, generated from the vendored
+        # XML (wayland-protocols is not installed everywhere; see wayland-protocols/README.md).
+        set(DXR_WL_GEN ${CMAKE_CURRENT_BINARY_DIR}/wayland-generated)
+        file(MAKE_DIRECTORY ${DXR_WL_GEN})
+        foreach(proto viewporter fractional-scale-v1 xdg-output-unstable-v1)
+            set(xml ${CMAKE_CURRENT_SOURCE_DIR}/wayland-protocols/${proto}.xml)
+            add_custom_command(OUTPUT ${DXR_WL_GEN}/${proto}-client-protocol.h ${DXR_WL_GEN}/${proto}-protocol.c
+                COMMAND ${DXR_WAYLAND_SCANNER} client-header ${xml} ${DXR_WL_GEN}/${proto}-client-protocol.h
+                COMMAND ${DXR_WAYLAND_SCANNER} private-code ${xml} ${DXR_WL_GEN}/${proto}-protocol.c
+                DEPENDS ${xml} VERBATIM)
+            target_sources(displayxr_unity_wayland PRIVATE
+                ${DXR_WL_GEN}/${proto}-client-protocol.h ${DXR_WL_GEN}/${proto}-protocol.c)
+        endforeach()
+        target_include_directories(displayxr_unity_wayland PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${DXR_WL_GEN})
+        target_compile_options(displayxr_unity_wayland PRIVATE -fvisibility=hidden)
+        find_package(Threads REQUIRED)
+        # libdbus is dlopened (displayxr_linux_wayland_dbus.c), like Vulkan and Xlib
+        # in the main plugin; libwayland-client is this library's one real dependency.
+        target_link_libraries(displayxr_unity_wayland PRIVATE
+            PkgConfig::DXR_WAYLAND_CLIENT Threads::Threads ${CMAKE_DL_LIBS} m)
+        target_link_options(displayxr_unity_wayland PRIVATE -Wl,--no-undefined)
+        set_target_properties(displayxr_unity_wayland PROPERTIES
+            LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../Runtime/Plugins/Linux/x86_64"
+            LIBRARY_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/../Runtime/Plugins/Linux/x86_64"
+            LIBRARY_OUTPUT_DIRECTORY_DEBUG "${CMAKE_CURRENT_SOURCE_DIR}/../Runtime/Plugins/Linux/x86_64")
+    else()
+        message(WARNING "displayxr_unity: wayland-client (pkg-config) or wayland-scanner not found - "
+                        "building WITHOUT libdisplayxr_unity_wayland.so (no native-Wayland player support). "
+                        "Install pkg-config and libwayland-dev for it.")
+    endif()
 endif()
 
 # --- Apple framework linking ---
