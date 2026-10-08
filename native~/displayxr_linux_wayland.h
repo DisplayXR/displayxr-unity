@@ -53,6 +53,14 @@ int dxr_wl_unity_swapchain_size(int *out_w, int *out_h);
 //! Bumps every time the player makes a new VkSurfaceKHR for its window (it does on
 //! a resolution change, and may recreate the wl_surface itself).
 unsigned dxr_wl_player_surface_generation(void);
+//! Lock the player's window record and return its wl_surface (NULL while it has
+//! none) and generation. Requests on that surface are safe until
+//! dxr_wl_unlock_player_surface(): the capture layer forgets the surface under the
+//! same lock before the player can destroy it. Always unlock, also on NULL. Lock
+//! order: the Wayland library's own lock first, then this one; and never call the
+//! other capture accessors while holding it.
+struct wl_surface *dxr_wl_lock_player_surface(unsigned *out_generation);
+void dxr_wl_unlock_player_surface(void);
 
 // --- Weave sub-surface (libdisplayxr_unity_wayland.so, via the shim) -------
 

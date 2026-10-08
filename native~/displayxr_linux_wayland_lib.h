@@ -22,7 +22,7 @@ extern "C" {
 struct wl_display;
 struct wl_surface;
 
-#define DXR_WL_LIB_ABI 1
+#define DXR_WL_LIB_ABI 2
 #define DXR_WL_LIB_NAME "libdisplayxr_unity_wayland.so"
 #define DXR_WL_LIB_INIT "dxr_wl_lib_init"
 
@@ -33,6 +33,9 @@ typedef struct DxrWlHost {
 	int (*unity_surface)(struct wl_display **out_display, struct wl_surface **out_surface);
 	int (*unity_swapchain_size)(int *out_w, int *out_h);
 	unsigned (*player_surface_generation)(void);
+	//! Use the player's wl_surface only between these (displayxr_linux_wayland.h).
+	struct wl_surface *(*lock_player_surface)(unsigned *out_generation);
+	void (*unlock_player_surface)(void);
 } DxrWlHost;
 
 //! What the library provides: the weave and window-control half of

@@ -28,6 +28,8 @@ static const DxrWlHost s_host = {
     .unity_surface = dxr_wl_unity_surface,
     .unity_swapchain_size = dxr_wl_unity_swapchain_size,
     .player_surface_generation = dxr_wl_player_surface_generation,
+    .lock_player_surface = dxr_wl_lock_player_surface,
+    .unlock_player_surface = dxr_wl_unlock_player_surface,
 };
 
 static const DxrWlApi *s_api; // published once by load_library()

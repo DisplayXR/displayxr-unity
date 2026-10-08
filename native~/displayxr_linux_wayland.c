@@ -451,10 +451,24 @@ dxr_wl_weave_surface_create(struct wl_display *display, struct wl_surface *paren
 		pthread_mutex_unlock(&s_wl_mutex);
 		return 0;
 	}
+	// Requests on the player's surface only while it is locked (H3: the player may
+	// destroy it at any time otherwise). It may also have changed since the
+	// provider read it: use the current one.
+	unsigned generation = 0;
+	struct wl_surface *player = s_host->lock_player_surface(&generation);
+	if (!player) {
+		s_host->unlock_player_surface();
+		pthread_mutex_unlock(&s_wl_mutex);
+		fprintf(stderr, "[DisplayXR-WL] the player has no window surface right now: no weave\n");
+		return 0;
+	}
+	if (player != parent)
+		fprintf(stderr, "[DisplayXR-WL] the player's window surface changed since it was read: using the current one\n");
 	s_wl.surface = wl_compositor_create_surface(s_wl.compositor);
 	wl_surface_add_listener(s_wl.surface, &s_surface_listener, NULL);
-	attach_to_parent_locked(parent);
-	s_wl.parent_generation = s_host->player_surface_generation();
+	attach_to_parent_locked(player);
+	s_wl.parent_generation = generation;
+	s_host->unlock_player_surface();
 	// Pointer input goes through to the player's window underneath.
 	struct wl_region *empty = wl_compositor_create_region(s_wl.compositor);
 	wl_surface_set_input_region(s_wl.surface, empty);
@@ -503,10 +517,10 @@ dxr_wl_weave_destroy(void)
 		pthread_mutex_unlock(&s_wl_mutex);
 		return;
 	}
-	struct wl_display *d = NULL;
-	struct wl_surface *player = NULL;
-	if (s_host->unity_surface(&d, &player) && player)
+	struct wl_surface *player = s_host->lock_player_surface(NULL);
+	if (player)
 		wl_surface_set_input_region(player, NULL); // the whole window catches again
+	s_host->unlock_player_surface();
 	if (s_wl.frac)
 		wp_fractional_scale_v1_destroy(s_wl.frac);
 	if (s_wl.viewport)
@@ -619,14 +633,18 @@ dxr_wl_weave_poll(int *out_w, int *out_h)
 	// may recreate the wl_surface itself, possibly at the same address): re-attach.
 	// The sub-surface of a destroyed parent is inert, and re-attaching to a live
 	// one is harmless (it maps again on the runtime's next present).
-	unsigned generation = s_host->player_surface_generation();
-	if (generation != s_wl.parent_generation) {
-		struct wl_display *pd = NULL;
-		struct wl_surface *player = NULL;
-		if (s_host->unity_surface(&pd, &player) && player) { // else: between surfaces, retry
-			int recreated = player != s_wl.parent;
+	if (s_host->player_surface_generation() != s_wl.parent_generation) {
+		unsigned generation = 0;
+		struct wl_surface *player = s_host->lock_player_surface(&generation);
+		int attached = 0, recreated = 0;
+		if (player) { // else: between surfaces, retry
+			recreated = player != s_wl.parent;
 			attach_to_parent_locked(player);
 			s_wl.parent_generation = generation;
+			attached = 1;
+		}
+		s_host->unlock_player_surface();
+		if (attached) {
 			wl_display_flush(s_wl.display);
 			if (recreated)
 				fprintf(stderr, "[DisplayXR-WL] the player recreated its window: weave re-attached\n");
@@ -725,29 +743,30 @@ typedef struct DxrWlRect {
 static int
 dxr_wl_set_player_input_region(const void *rects, int n)
 {
-	struct wl_display *d = NULL;
-	struct wl_surface *player = NULL;
-	if (!s_host->unity_surface(&d, &player) || !player)
-		return 0; // the player is between window surfaces
 	pthread_mutex_lock(&s_wl_mutex);
 	if (!s_wl.surface || !s_wl.compositor) {
 		pthread_mutex_unlock(&s_wl_mutex);
 		return 0;
 	}
-	// Double-buffered: applies at the player's next commit (it presents every frame).
-	if (n < 0) {
-		wl_surface_set_input_region(player, NULL);
-	} else {
-		struct wl_region *region = wl_compositor_create_region(s_wl.compositor);
-		const DxrWlRect *r = (const DxrWlRect *)rects;
-		for (int i = 0; i < n; i++)
-			wl_region_add(region, r[i].x, r[i].y, r[i].w, r[i].h);
-		wl_surface_set_input_region(player, region);
-		wl_region_destroy(region);
+	struct wl_surface *player = s_host->lock_player_surface(NULL);
+	if (player) {
+		// Double-buffered: applies at the player's next commit (it presents every frame).
+		if (n < 0) {
+			wl_surface_set_input_region(player, NULL);
+		} else {
+			struct wl_region *region = wl_compositor_create_region(s_wl.compositor);
+			const DxrWlRect *r = (const DxrWlRect *)rects;
+			for (int i = 0; i < n; i++)
+				wl_region_add(region, r[i].x, r[i].y, r[i].w, r[i].h);
+			wl_surface_set_input_region(player, region);
+			wl_region_destroy(region);
+		}
 	}
-	wl_display_flush(s_wl.display);
+	s_host->unlock_player_surface();
+	if (player)
+		wl_display_flush(s_wl.display);
 	pthread_mutex_unlock(&s_wl_mutex);
-	return 1;
+	return player != NULL; // NULL: the player is between window surfaces
 }
 
 static void
@@ -1043,7 +1062,7 @@ __attribute__((visibility("default"))) const DxrWlApi *
 dxr_wl_lib_init(const DxrWlHost *host)
 {
 	if (!host || host->abi != DXR_WL_LIB_ABI || !host->unity_surface || !host->unity_swapchain_size ||
-	    !host->player_surface_generation)
+	    !host->player_surface_generation || !host->lock_player_surface || !host->unlock_player_surface)
 		return NULL;
 	s_host = host;
 	return &s_api;

@@ -122,6 +122,26 @@ dxr_wl_player_surface_generation(void)
 	return s_player_generation;
 }
 
+// The player's wl_surface may be destroyed by its SDL at any time after its last
+// VkSurfaceKHR goes, and a request on a destroyed proxy is a protocol error that
+// kills the player's connection. layer_DestroySurfaceKHR forgets the surface under
+// s_player_mutex BEFORE forwarding the destroy, so a request issued while holding
+// that lock can never race the destroy.
+extern "C" struct wl_surface *
+dxr_wl_lock_player_surface(unsigned *out_generation)
+{
+	s_player_mutex.lock();
+	if (out_generation)
+		*out_generation = s_player_generation;
+	return s_player_surface;
+}
+
+extern "C" void
+dxr_wl_unlock_player_surface(void)
+{
+	s_player_mutex.unlock();
+}
+
 /*
  *
  * The layer: the chaining every layer must do, plus three hooks.
@@ -763,6 +783,19 @@ extern "C" unsigned
 dxr_wl_player_surface_generation(void)
 {
 	return 0;
+}
+
+extern "C" struct wl_surface *
+dxr_wl_lock_player_surface(unsigned *out_generation)
+{
+	if (out_generation)
+		*out_generation = 0;
+	return NULL;
+}
+
+extern "C" void
+dxr_wl_unlock_player_surface(void)
+{
 }
 
 #endif
