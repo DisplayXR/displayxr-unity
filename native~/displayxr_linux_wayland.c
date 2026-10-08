@@ -139,6 +139,10 @@ static struct {
 	int corrections;   // moves since the window was last mapped
 	int placing;       // from a correction until its result: scale changes wait
 	int rescale_after_place;
+	// The window does not fit at the intent yet (it was mapped at a stale size,
+	// or is being resized): keep the intent and move it there once its size
+	// changes, rather than accept where the compositor keeps it.
+	int intent_blocked, blocked_w, blocked_h;
 
 	// The 3D panel as the runtime reports it in X root coordinates: the space the
 	// app-facing position API speaks (displayxr_get/set_overlay_position).
@@ -439,6 +443,37 @@ update_device_size_locked(void)
 	}
 }
 
+static struct dxr_wl_output *output_at_locked(int x, int y);
+static int layout_locked(void);
+
+//! Fit a logical window size into 95 % of the output the window is going to (the
+//! intent's) or else is on, keeping its aspect.
+static void
+clamp_to_destination_locked(int *lw, int *lh)
+{
+	struct dxr_wl_output *o = NULL;
+	if (s_wl.intent_valid)
+		o = output_at_locked(s_wl.intent_x, s_wl.intent_y);
+	if (!o && s_wl.win.present && s_wl.win.w > 0)
+		o = output_at_locked(s_wl.win.x + s_wl.win.w / 2, s_wl.win.y + s_wl.win.h / 2);
+	if (!o || o->lw <= 0 || o->lh <= 0 || *lw <= 0 || *lh <= 0)
+		return;
+	// Stage px per logical (surface) px: 1 in logical layout, the scale in physical.
+	double stage = 1.0;
+	if (layout_locked() == DXR_LAYOUT_PHYSICAL)
+		stage = o->wl_scale > 0 ? o->wl_scale : 1;
+	double max_w = 0.95 * o->lw / stage, max_h = 0.95 * o->lh / stage;
+	double f = 1.0;
+	if (*lw > max_w)
+		f = max_w / *lw;
+	if (*lh * f > max_h)
+		f = max_h / *lh;
+	if (f < 1.0) {
+		*lw = (int)floor(*lw * f);
+		*lh = (int)floor(*lh * f);
+	}
+}
+
 //! The size to keep, in device px, is the app's request; until it makes one, the
 //! window's size where its scale was first known. Moving to an output with another
 //! scale then keeps the device size, as on X11, not the logical one (which would
@@ -466,6 +501,10 @@ rerequest_player_size_locked(void)
 	double scale = s120 ? s120 / 120.0 : 1.0;
 	int lw = (int)lround(s_wl.wanted_device_w / scale);
 	int lh = (int)lround(s_wl.wanted_device_h / scale);
+	// Never bigger than the output it is going to (or is on): a window the
+	// compositor cannot fit gets squeezed or maximized, and the player then resets
+	// it to the desktop size - and saves that size for its next start.
+	clamp_to_destination_locked(&lw, &lh);
 	if (lw == s_wl.logical_w && lh == s_wl.logical_h)
 		return; // already that size: a no-op resize would still re-map the window
 	s_wl.pending_w = lw;
@@ -641,6 +680,7 @@ dxr_wl_weave_destroy(void)
 	s_wl.parent = NULL;
 	s_wl.transparent = 0;
 	s_wl.placing = s_wl.move_inflight = s_wl.rescale_after_place = 0;
+	s_wl.intent_blocked = 0;
 	s_wl.size_fixups = 0;
 	s_wl.wanted_device_w = s_wl.wanted_device_h = 0;
 	s_wl.wanted_by_app = 0;
@@ -916,15 +956,38 @@ place_locked(const char *why)
 		place_done_locked();
 		return;
 	}
-	s_wl.corrections++;
-	s_wl.move_inflight = 1;
-	s_wl.placing = 1;
-	// Size requests meanwhile use the target output's scale.
+	// Size requests use the target output's scale from here on.
 	int layout = layout_locked();
 	struct dxr_wl_output *target = output_at_locked(s_wl.intent_x, s_wl.intent_y);
 	uint32_t t120 = target && layout != DXR_LAYOUT_UNKNOWN ? output_scale120_locked(target, layout) : 0;
 	if (t120 && t120 != s_wl.scale120)
 		s_wl.expect_scale120 = t120;
+	// Too big for the target as it is (the player mapped it at a stale size):
+	// moving it there now only gets it squeezed or maximized by the compositor,
+	// which the player then fights. Get the size right first, and move it once it
+	// is (the window report after the resize, or its re-map, calls back here).
+	// If not even the size it is getting fits, move it anyway.
+	if (target && (s_wl.win.w > target->lw || s_wl.win.h > target->lh)) {
+		rerequest_player_size_locked();
+		int coming_w = s_wl.pending_w ? s_wl.pending_w : s_wl.sent_w;
+		int coming_h = s_wl.pending_w ? s_wl.pending_h : s_wl.sent_h;
+		double stage = layout == DXR_LAYOUT_PHYSICAL ? (t120 ? t120 / 120.0 : 1.0) : 1.0; // surface -> stage
+		int coming_fits = coming_w > 0 && lround(coming_w * stage) <= target->lw && lround(coming_h * stage) <= target->lh;
+		if (coming_fits) {
+			if (!s_wl.intent_blocked)
+				fprintf(stderr, "[DisplayXR-WL] %s; the window (%dx%d) does not fit at (%d,%d) until it is %dx%d: "
+				                "moving it once it is\n",
+				        why, s_wl.win.w, s_wl.win.h, s_wl.intent_x, s_wl.intent_y, coming_w, coming_h);
+			s_wl.intent_blocked = 1;
+			s_wl.blocked_w = s_wl.win.w;
+			s_wl.blocked_h = s_wl.win.h;
+			return;
+		}
+	}
+	s_wl.intent_blocked = 0;
+	s_wl.corrections++;
+	s_wl.move_inflight = 1;
+	s_wl.placing = 1;
 	fprintf(stderr, "[DisplayXR-WL] %s: window -> (%d,%d)\n", why, s_wl.intent_x, s_wl.intent_y);
 	dxr_wl_ext_move_window(s_wl.intent_x, s_wl.intent_y);
 }
@@ -952,6 +1015,7 @@ ext_window(const DxrWlExtWindow *w, int after_move, int moved)
 {
 	pthread_mutex_lock(&s_wl_mutex);
 	int was_mapped = win_mapped(&s_wl.win);
+	int size_changed = was_mapped && (w->w != s_wl.win.w || w->h != s_wl.win.h);
 	s_wl.win = *w;
 	int mapped = win_mapped(w);
 	if (!s_wl.surface) {
@@ -959,14 +1023,31 @@ ext_window(const DxrWlExtWindow *w, int after_move, int moved)
 		return;
 	}
 	if (after_move) {
-		// Our move's result. Where the compositor kept the window elsewhere (its
-		// constraints: e.g. a window as tall as the output), accept that.
+		// Our move's result. Where the compositor kept the window elsewhere: if it
+		// does not fit there yet (mapped at a stale size, or a resize is on its
+		// way), keep the intent for when it does; otherwise (its other
+		// constraints) accept where it is.
 		s_wl.move_inflight = 0;
 		if (!moved)
 			fprintf(stderr, "[DisplayXR-WL] the extension did not move the window (a move grab in progress?)\n");
-		else if (mapped && (w->x != s_wl.intent_x || w->y != s_wl.intent_y))
+		if (moved && mapped && (w->x != s_wl.intent_x || w->y != s_wl.intent_y)) {
+			struct dxr_wl_output *target = output_at_locked(s_wl.intent_x, s_wl.intent_y);
+			int fits = target && w->w <= target->lw && w->h <= target->lh;
+			if (!fits || s_wl.sent_w || s_wl.pending_w) {
+				fprintf(stderr, "[DisplayXR-WL] the window (%dx%d) does not fit at (%d,%d) yet: moving it there "
+				                "once it is resized\n",
+				        w->w, w->h, s_wl.intent_x, s_wl.intent_y);
+				s_wl.intent_blocked = 1;
+				s_wl.blocked_w = w->w;
+				s_wl.blocked_h = w->h;
+				s_wl.placing = 0; // size requests keep the target's scale (expect_scale120)
+				rerequest_player_size_locked();
+				pthread_mutex_unlock(&s_wl_mutex);
+				return;
+			}
 			fprintf(stderr, "[DisplayXR-WL] the compositor kept the window at (%d,%d), not (%d,%d): leaving it there\n",
 			        w->x, w->y, s_wl.intent_x, s_wl.intent_y);
+		}
 		if (mapped && (w->x != s_wl.intent_x || w->y != s_wl.intent_y)) {
 			s_wl.intent_centred_on[0] = 0;
 			s_wl.intent_valid = 1;
@@ -985,6 +1066,7 @@ ext_window(const DxrWlExtWindow *w, int after_move, int moved)
 	if (!was_mapped) {
 		// Just (re)mapped: the compositor has placed it by its own rules.
 		s_wl.corrections = 0;
+		s_wl.intent_blocked = 0;
 		if (s_wl.intent_valid && (w->x != s_wl.intent_x || w->y != s_wl.intent_y)) {
 			char why[96];
 			snprintf(why, sizeof(why), "the compositor placed the window at (%d,%d)", w->x, w->y);
@@ -995,6 +1077,37 @@ ext_window(const DxrWlExtWindow *w, int after_move, int moved)
 			s_wl.intent_y = w->y;
 			place_done_locked();
 		}
+		pthread_mutex_unlock(&s_wl_mutex);
+		return;
+	}
+	if (s_wl.intent_blocked) {
+		if (w->moving || s_wl.drag_state) {
+			s_wl.intent_blocked = 0; // the user is moving it: follow (below)
+		} else if (w->w != s_wl.blocked_w || w->h != s_wl.blocked_h) {
+			s_wl.intent_blocked = 0;
+			s_wl.corrections = 0;
+			if (w->x != s_wl.intent_x || w->y != s_wl.intent_y) {
+				char why[96];
+				snprintf(why, sizeof(why), "resized to %dx%d", w->w, w->h);
+				place_locked(why);
+				pthread_mutex_unlock(&s_wl_mutex);
+				return;
+			}
+		} else {
+			// Still waiting for the resize: wherever the compositor keeps it
+			// meanwhile is not where it should be.
+			pthread_mutex_unlock(&s_wl_mutex);
+			return;
+		}
+	}
+	if (!s_wl.move_inflight && (w->x != s_wl.intent_x || w->y != s_wl.intent_y) && !w->moving &&
+	    !s_wl.drag_state && s_wl.intent_valid && (size_changed || s_wl.sent_w || s_wl.pending_w)) {
+		// Moved together with a resize: the player (which resets its window when it
+		// crosses to another display mid-resize) or the compositor fitting it, not
+		// the user. Put it back.
+		char why[96];
+		snprintf(why, sizeof(why), "moved to (%d,%d) by a resize to %dx%d", w->x, w->y, w->w, w->h);
+		place_locked(why);
 		pthread_mutex_unlock(&s_wl_mutex);
 		return;
 	}
