@@ -72,6 +72,29 @@ namespace DisplayXR
             DisplayXRDepthBudget.Reset();
         }
 
+#if UNITY_STANDALONE_LINUX && !UNITY_EDITOR
+        // Native-Wayland player: displayxr_resize_overlay cannot resize Unity's window
+        // from native code (a Wayland client sizes its own toplevel, and Unity's belongs
+        // to its SDL), so the plug-in queues the size and Unity applies it here.
+        private static bool s_LinuxResizeMissing;
+        private static void ApplyPendingLinuxResize()
+        {
+            if (s_LinuxResizeMissing) return;
+            try
+            {
+                if (DisplayXRNative.displayxr_linux_take_pending_resize(out int w, out int h) != 0 && w > 0 && h > 0)
+                {
+                    Debug.Log($"[DisplayXR] Wayland: resizing the window to {w}x{h} (logical px)");
+                    Screen.SetResolution(w, h, FullScreenMode.Windowed);
+                }
+            }
+            catch (System.EntryPointNotFoundException)
+            {
+                s_LinuxResizeMissing = true;
+            }
+        }
+#endif
+
         void LateUpdate()
         {
 #if UNITY_EDITOR_OSX || UNITY_STANDALONE_OSX
@@ -91,6 +114,9 @@ namespace DisplayXR
                 Application.Quit();
                 return;
             }
+#if UNITY_STANDALONE_LINUX && !UNITY_EDITOR
+            ApplyPendingLinuxResize();
+#endif
             if (DisplayXRProviderNative.dxr_prov_session_is_running() == 0)
             {
                 // Falling edge: session lost / restarting (editor dock-undock) / stopping.

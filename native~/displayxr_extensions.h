@@ -326,6 +326,41 @@ typedef struct XrXlibWindowBindingCreateInfoDXR {
     XrBool32 transparentBackgroundEnabled; // SPEC_VERSION 2
 } XrXlibWindowBindingCreateInfoDXR;
 
+// --- XR_DXR_wayland_surface_binding (desktop Linux, Wayland) ---
+// The Wayland sibling of the xlib binding: the app hands the runtime a
+// wl_display + wl_surface pair and the runtime builds its VkSurfaceKHR on it with
+// VK_KHR_wayland_surface. A wl_surface has no intrinsic size, so the app also
+// declares the BUFFER size (device pixels) it wants (spec v2), and republishes it
+// with xrSetWaylandSurfaceGeometryDXR when it changes. Pointers are mirrored as
+// `void *` so this header needs no Wayland include.
+//
+// Used by the native-Wayland player path: the surface is a sub-surface of the
+// player's own window (displayxr_linux_wayland.c), so the weave lands in the
+// player's window instead of a second, runtime-hosted one.
+#define XR_DXR_WAYLAND_SURFACE_BINDING_EXTENSION_NAME "XR_DXR_wayland_surface_binding"
+
+#define XR_TYPE_WAYLAND_SURFACE_BINDING_CREATE_INFO_DXR_PS ((XrStructureType)1004999250)
+#define XR_TYPE_WAYLAND_SURFACE_GEOMETRY_DXR_PS ((XrStructureType)1004999251)
+
+typedef struct XrWaylandSurfaceBindingCreateInfoDXR {
+    XrStructureType type;
+    const void *next;
+    void *wlDisplay;                       // struct wl_display *
+    void *wlSurface;                       // struct wl_surface *
+    XrBool32 transparentBackgroundEnabled;
+} XrWaylandSurfaceBindingCreateInfoDXR;
+
+typedef struct XrWaylandSurfaceGeometryDXR {
+    XrStructureType type;
+    const void *next;
+    uint32_t width;             // buffer pixels, 0 = unknown
+    uint32_t height;            // buffer pixels, 0 = unknown
+    uint32_t refreshMilliHertz; // wl_output.mode, 0 = unknown
+} XrWaylandSurfaceGeometryDXR;
+
+typedef XrResult(XRAPI_PTR *PFN_xrSetWaylandSurfaceGeometryDXR)(XrSession session, uint32_t width,
+                                                                uint32_t height, uint32_t refreshMilliHertz);
+
 // --- XR_KHR_metal_enable ---
 // Hand-defined: the fetched OpenXR-SDK release-1.0.34 headers predate the
 // Metal enable extension (it landed in the 1.1.x line), so openxr_platform.h

@@ -237,6 +237,7 @@ struct PvkState {
 	VkCommandBuffer  cmd_buf = VK_NULL_HANDLE;
 	VkFence          copy_fence = VK_NULL_HANDLE;
 	bool             device_ready = false;
+	bool             keep_instance = false; // dxr_pvk_keep_instance_alive()
 
 	// --- Unity's device (captured from IUnityGraphicsVulkan) ---
 	VkApi            unity_api = {};
@@ -1519,13 +1520,21 @@ dxr_pvk_destroy(void)
 }
 
 void
+dxr_pvk_keep_instance_alive(void)
+{
+	s_pvk.keep_instance = true;
+}
+
+void
 dxr_pvk_destroy_device(void)
 {
 	if (s_pvk.device && s_pvk.api.vkDeviceWaitIdle) s_pvk.api.vkDeviceWaitIdle(s_pvk.device);
 	if (s_pvk.device && s_pvk.api.vkDestroyDevice)
 		s_pvk.api.vkDestroyDevice(s_pvk.device, NULL);
-	if (s_pvk.instance && s_pvk.api.vkDestroyInstance)
+	if (s_pvk.instance && s_pvk.api.vkDestroyInstance && !s_pvk.keep_instance)
 		s_pvk.api.vkDestroyInstance(s_pvk.instance, NULL);
+	else if (s_pvk.instance)
+		pvk_log("[DisplayXR-PROV-VK] instance kept alive (native-Wayland weave)\n");
 
 	// Unity's objects are NOT ours to destroy — drop the references only.
 	VkApi unity_api = s_pvk.unity_api;

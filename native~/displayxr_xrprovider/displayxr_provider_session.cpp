@@ -183,6 +183,11 @@ extern "C" int  dxr_pvk_copy_to_swapchain_image(int eye, uint32_t image_index);
 extern "C" void dxr_pvk_signal_unity_done(void);
 extern "C" void dxr_pvk_destroy(void);
 extern "C" void dxr_pvk_destroy_device(void);
+#if defined(__linux__) && !defined(__ANDROID__)
+// Native-Wayland player: displayxr_provider_wl_capture.cpp + displayxr_linux_wayland.c.
+#include "../displayxr_linux_wayland.h"
+extern "C" void dxr_pvk_keep_instance_alive(void);
+#endif
 extern "C" int  dxr_pvk_device_ready(void);
 // 2D overlay layers (#336). Kinds match DXR_PVK_OVERLAY_* in the VK header.
 #define PS_PVK_OVERLAY_LOCAL2D 0
@@ -332,6 +337,16 @@ typedef struct ProviderSession {
 	XrTime predicted_display_time;
 
 	int has_view_rig;
+
+	// Native-Wayland player: the runtime advertises XR_DXR_wayland_surface_binding,
+	// and this session weaves into a sub-surface of the player's own window
+	// (displayxr_linux_wayland.c). panel_connector: the 3D panel's output name
+	// (XrDisplayDesktopInfoDXR.deviceName, e.g. "HDMI-1") to find it among the
+	// Wayland outputs.
+	int has_wayland_binding;
+	int wl_weave;
+	PFN_xrSetWaylandSurfaceGeometryDXR pfn_set_wl_geometry;
+	char panel_connector[160]; // > deviceName[128]
 
 	// XR_DXR_depth_budget (#318): the runtime's advisory REAR DEPTH BUDGET - how far
 	// behind the display plane a transparent overlay may render right now, given what
@@ -1175,7 +1190,14 @@ static void ps_window_size(uint32_t *w, uint32_t *h)
 	// Linux (#249): live geometry of the bound X11 window, same role as the
 	// macOS backing size above. Returns 0 when no window is bound (runtime
 	// self-hosting), which falls through to the display-info default below.
-	displayxr_linux_window_size(&ww, &hh);
+	{
+		int dw = 0, dh = 0;
+		if (s_ps.wl_weave && dxr_wl_weave_device_size(&dw, &dh)) {
+			ww = (uint32_t)dw; hh = (uint32_t)dh; // native-Wayland player: device px
+		} else {
+			displayxr_linux_window_size(&ww, &hh);
+		}
+	}
 #endif
 	if (ww > 0 && hh > 0) s_live_window_px.store(((uint64_t)ww << 32) | hh); // a real measurement
 	if (ww == 0 || hh == 0) {
@@ -4397,6 +4419,11 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	DxrGfxKind gfx = (DxrGfxKind)backend_kind;
 	int is_d3d11 = (gfx == DXR_GFX_D3D11);
 	int is_vk = (gfx == DXR_GFX_VULKAN);
+#if defined(__linux__) && !defined(__ANDROID__)
+	// Native-Wayland capture layer: the runtime's own Vulkan instances must never
+	// load it (normally it was disarmed when Unity's device came up already).
+	dxr_wl_capture_disarm("XR session start");
+#endif
 	// D3D11 sub-mode (#195): the EDITOR (dedicated-window selector, set by C# on
 	// Application.isEditor / the DISPLAYXR_PROV_EDITOR_WINDOW diagnostic) uses an
 	// OWN-DEVICE bridge; the built PLAYER keeps the verified zero-copy path. The
@@ -4601,6 +4628,8 @@ int dxr_prov_session_start(const char *runtime_json_path,
 							s_ps.has_local_3d_zone = 1;
 						else if (strcmp(props[i].extensionName, XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME) == 0)
 							s_ps.has_atlas_capture = 1;
+						else if (strcmp(props[i].extensionName, XR_DXR_WAYLAND_SURFACE_BINDING_EXTENSION_NAME) == 0)
+							s_ps.has_wayland_binding = 1;
 						else if (strcmp(props[i].extensionName, XR_DXR_DEPTH_BUDGET_EXTENSION_NAME) == 0) {
 							s_ps.has_depth_budget = 1;
 							// The spec VERSION, not just the name: v3 adds the content
@@ -4661,7 +4690,7 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	}
 
 	// --- Create instance ---
-	const char *extensions[10];
+	const char *extensions[12];
 	uint32_t ext_count = 0;
 	extensions[ext_count++] = XR_DXR_DISPLAY_INFO_EXTENSION_NAME;
 #ifdef _WIN32
@@ -4679,6 +4708,14 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	// runtime self-hosts (enabling an extension we then don't use is harmless).
 	extensions[ext_count++] = "XR_KHR_vulkan_enable2";
 	extensions[ext_count++] = XR_DXR_XLIB_WINDOW_BINDING_EXTENSION_NAME;
+	// The native-Wayland player weaves through the Wayland binding instead. Only
+	// when the player really is on Wayland (the capture layer saw its window, which
+	// it only looks for under -force-wayland): an X11 player's instance stays exactly
+	// what it was.
+	if (s_ps.has_wayland_binding && dxr_wl_unity_surface(NULL, NULL))
+		extensions[ext_count++] = XR_DXR_WAYLAND_SURFACE_BINDING_EXTENSION_NAME;
+	else
+		s_ps.has_wayland_binding = 0;
 #else
 	extensions[ext_count++] = XR_KHR_METAL_ENABLE_EXTENSION_NAME;
 	extensions[ext_count++] = XR_DXR_COCOA_WINDOW_BINDING_EXTENSION_NAME;
@@ -4871,6 +4908,10 @@ int dxr_prov_session_start(const char *runtime_json_path,
 			s_ps.desktop_h = (uint32_t)ddi.desktopRect.extent.height;
 			s_ps.desktop_origin_valid = 1;
 			s_ps.panel_confirmed = (ddi.isPanelConfirmed == XR_TRUE) ? 1 : 0;
+#if defined(__linux__) && !defined(__ANDROID__)
+			snprintf(s_ps.panel_connector, sizeof(s_ps.panel_connector), "%.*s",
+			         (int)sizeof(ddi.deviceName), ddi.deviceName);
+#endif
 			ps_log("[DisplayXR-PROV] Display desktop rect: (%d,%d %dx%d) confirmed=%d "
 			       "primary=%d dev='%.*s' [v18]\n",
 			       ddi.desktopRect.offset.x, ddi.desktopRect.offset.y,
@@ -5090,8 +5131,58 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	// nothing and the runtime self-hosts an XCB window instead — degraded but
 	// still rendering, rather than failing the session.
 	XrXlibWindowBindingCreateInfoDXR xlib_binding = {};
+	XrWaylandSurfaceBindingCreateInfoDXR wl_binding = {};
+	XrWaylandSurfaceGeometryDXR wl_geometry = {};
 	const void *win_chain = NULL;
+	s_ps.wl_weave = 0;
+	// Native-Wayland player: the player has no X11 window, but the capture layer saw
+	// its Wayland window. Weave into a sub-surface of it, so the weave lands in the
+	// player's window and the runtime opens no window of its own.
 	{
+		struct wl_display *wd = NULL;
+		struct wl_surface *ws = NULL;
+		int lw = 0, lh = 0;
+		int have_surface = dxr_wl_unity_surface(&wd, &ws);
+		int have_size = dxr_wl_unity_swapchain_size(&lw, &lh);
+		if (have_surface)
+			ps_log("[DisplayXR-PROV] Linux/Wayland: runtime binding=%d player surface=%p size=%dx%d\n",
+			       s_ps.has_wayland_binding, (void *)ws, lw, lh);
+		if (have_surface && !s_ps.has_wayland_binding)
+			ps_log("[DisplayXR-PROV] WARN: native-Wayland player, but the runtime has no "
+			       "XR_DXR_wayland_surface_binding (needs 2.28.0+): it will open its own window\n");
+		else if (!have_surface && dxr_wl_capture_wanted())
+			ps_log("[DisplayXR-PROV] WARN: native-Wayland player (-force-wayland), but its window was not "
+			       "captured (did the Vulkan loader load VK_LAYER_DXR_unity_wayland_capture?): the runtime "
+			       "will open its own window\n");
+		if (s_ps.has_wayland_binding && have_surface && have_size) {
+			struct wl_surface *weave = NULL;
+			int dw = 0, dh = 0;
+			if (dxr_wl_weave_surface_create(wd, ws, lw, lh, &weave, &dw, &dh)) {
+				wl_geometry.type = XR_TYPE_WAYLAND_SURFACE_GEOMETRY_DXR_PS;
+				wl_geometry.next = NULL;
+				wl_geometry.width = (uint32_t)dw;
+				wl_geometry.height = (uint32_t)dh;
+				wl_geometry.refreshMilliHertz = 0; // unknown: the runtime keeps 60 Hz
+				wl_binding.type = XR_TYPE_WAYLAND_SURFACE_BINDING_CREATE_INFO_DXR_PS;
+				wl_binding.next = &wl_geometry;
+				wl_binding.wlDisplay = wd;
+				wl_binding.wlSurface = weave;
+				wl_binding.transparentBackgroundEnabled = use_transparent ? 1 : 0;
+				win_chain = &wl_binding;
+				s_ps.wl_weave = 1;
+				dxr_wl_weave_set_transparent(use_transparent ? 1 : 0); // click-through + window drag
+				if (use_transparent && !dxr_wl_capture_transparent_window())
+					ps_log("[DisplayXR-PROV] WARN: this app asks for a transparent background, but the build "
+					       "is not marked as a transparent overlay app (DisplayXR Manifest Settings > "
+					       "Transparent overlay app): on native Wayland its window stays opaque\n");
+				dxr_pvk_keep_instance_alive(); // see displayxr_provider_gfx_vulkan.h
+				ps_log("[DisplayXR-PROV] Linux/Wayland: binding the runtime's weave to a sub-surface of the "
+				       "player's window (window %dx%d logical, weave buffer %dx%d, transparent=%d)\n",
+				       lw, lh, dw, dh, (int)use_transparent);
+			}
+		}
+	}
+	if (!win_chain) {
 		void *xdpy = NULL;
 		unsigned long xwin = 0;
 		if (displayxr_linux_get_weave_window(&xdpy, &xwin) && xdpy && xwin) {
@@ -5113,6 +5204,11 @@ int dxr_prov_session_start(const char *runtime_json_path,
 		ps_log("[DisplayXR-PROV] Vulkan session binding unavailable\n");
 		dxr_prov_session_stop();
 		return 0;
+	}
+	if (s_ps.wl_weave && !s_ps.pfn_set_wl_geometry) {
+		PFN_xrVoidFunction fn = NULL;
+		s_ps.gipa(s_ps.instance, "xrSetWaylandSurfaceGeometryDXR", &fn);
+		s_ps.pfn_set_wl_geometry = (PFN_xrSetWaylandSurfaceGeometryDXR)fn;
 	}
 #else
 	// --- Session: Metal graphics binding (client queue) + cocoa window binding ---
@@ -5239,6 +5335,11 @@ void dxr_prov_session_stop(void)
 	// ...and the enable2 device + instance only now: the runtime's compositor, repaint
 	// thread included, uses them until the session is gone (DisplayXR/displayxr-runtime#1779).
 	if (s_ps.graphics_api == DXR_GFX_VULKAN) dxr_pvk_destroy_device();
+#endif
+#if defined(__linux__) && !defined(__ANDROID__)
+	// The runtime's surface on the weave sub-surface went with the session.
+	if (s_ps.wl_weave) dxr_wl_weave_destroy();
+	s_ps.wl_weave = 0;
 #endif
 
 #ifdef _WIN32
@@ -6049,6 +6150,21 @@ int dxr_prov_begin_frame(uint32_t *out_image_index, int *out_should_render)
 	if (out_should_render) *out_should_render = 0;
 	if (out_image_index) *out_image_index = 0;
 	if (!s_ps.running || !s_ps.session_ready) return 0;
+
+#if defined(__linux__) && !defined(__ANDROID__)
+	// Native-Wayland player: follow the player's window size, scale and recreation.
+	if (s_ps.wl_weave) {
+		int dw = 0, dh = 0;
+		if (dxr_wl_weave_poll(&dw, &dh) && s_ps.pfn_set_wl_geometry) {
+			XrResult gr = s_ps.pfn_set_wl_geometry(s_ps.session, (uint32_t)dw, (uint32_t)dh, 0);
+			ps_log("[DisplayXR-PROV] Linux/Wayland: weave buffer -> %dx%d (r=%d)\n", dw, dh, (int)gr);
+			// The device size of every app rect changed with it: re-ask the runtime
+			// for the zones' render sizes (the eye swapchain follows).
+			if (s_ps.zone_valid) ps_query_zone_rec_size();
+			for (uint32_t i = 0; i < s_ps.extra_zone_count; i++) ps_query_extra_zone_rec(&s_ps.extra_zones[i]);
+		}
+	}
+#endif
 
 	// D3D11 zero-copy (#195): short startup trace of the begin stages (waitFrame /
 	// beginFrame / acquire+wait) to confirm the frame loop came up. Bump the gate to
@@ -7729,6 +7845,18 @@ int dxr_prov_move_window_to_display(void)
 	if (prev) SetThreadDpiAwarenessContext(prev);
 	return rc;
 #elif defined(__linux__) && !defined(__ANDROID__)
+	// Native-Wayland player: no X11 desktop coordinates are needed (or meaningful:
+	// at a fractional scale the runtime's X11 rect is the scaled XWayland one). The
+	// panel's connector name (else its device-pixel mode) identifies its output, and
+	// the window is centred on it through the GNOME extension.
+	if (s_ps.wl_weave) {
+		int moved = dxr_wl_move_player_to_panel(s_ps.panel_connector, (int)s_ps.display_info.pixel_width,
+		                                        (int)s_ps.display_info.pixel_height);
+		ps_log("[DisplayXR-PROV] move_window_to_display (Wayland): panel '%s' %ux%u px -> %s\n",
+		       s_ps.panel_connector, s_ps.display_info.pixel_width, s_ps.display_info.pixel_height,
+		       moved ? "on it" : "not moved");
+		return moved;
+	}
 	// (#266, Linux) The runtime reports the panel rect in X root coordinates (its desktop
 	// resolver matches the panel to an XRandR output), which is the space Unity's X11
 	// window lives in under X11 and XWayland alike — no DPI virtualisation to undo here.

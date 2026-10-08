@@ -11,6 +11,9 @@
 
 #include "displayxr_unity_plugin.h"
 #include "displayxr_window_space_ui.h" // DXR_WSUI_MAX_SLOTS, get_pending_slot
+#if defined(__linux__) && !defined(__ANDROID__)
+#include "displayxr_linux_wayland.h"
+#endif
 
 #include <stdio.h>
 
@@ -141,6 +144,11 @@ static void capture_vulkan_instance(void)
 #if defined(ENABLE_VULKAN)
 		configure_vulkan_events();
 #endif
+#if defined(__linux__) && !defined(__ANDROID__)
+		// Unity's real VkInstance exists, with the native-Wayland capture layer in
+		// its chain if it was armed: take the layer out of the environment now.
+		dxr_wl_capture_disarm("Unity's graphics device is up");
+#endif
 		fprintf(stderr, "[DisplayXR] Unity Vulkan device captured: instance=%p physicalDevice=%p device=%p queue=%p qf=%u\n",
 		        (void *)s_vk_inst.instance, (void *)s_vk_inst.physicalDevice,
 		        (void *)s_vk_inst.device, (void *)s_vk_inst.graphicsQueue,
@@ -152,6 +160,16 @@ static void capture_vulkan_instance(void)
 static void UNITY_INTERFACE_API
 on_graphics_device_event(UnityGfxDeviceEventType eventType)
 {
+#if defined(__linux__) && !defined(__ANDROID__)
+	// The native-Wayland capture layer is disarmed once Unity's Vulkan device is
+	// captured (capture_vulkan_instance). A player that fell back to OpenGL never
+	// gets there, so disarm on its device instead: the layer is of no use to it.
+	if (eventType == kUnityGfxDeviceEventInitialize && s_unity_gfx) {
+		UnityGfxRenderer renderer = s_unity_gfx->GetRenderer();
+		if (renderer == kUnityGfxRendererOpenGLCore || renderer == kUnityGfxRendererOpenGLES30)
+			dxr_wl_capture_disarm("Unity's graphics device is OpenGL");
+	}
+#endif
 #if defined(DXR_HAVE_UNITY_VULKAN)
 	if (eventType == kUnityGfxDeviceEventInitialize) {
 		capture_vulkan_instance();

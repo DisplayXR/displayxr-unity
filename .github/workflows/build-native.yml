@@ -147,8 +147,11 @@ jobs:
         run: |
           export DEBIAN_FRONTEND=noninteractive
           apt-get update -qq
+          # pkg-config + libwayland-dev: the native-Wayland player path links
+          # libwayland-client and runs wayland-scanner (DisplayXR/displayxr-runtime#1831).
           apt-get install -y --no-install-recommends \
-            build-essential cmake git ca-certificates binutils file
+            build-essential cmake git ca-certificates binutils file \
+            pkg-config libwayland-dev
           # actions/checkout needs a git new enough for its safe.directory handling
           git --version
 
@@ -165,38 +168,56 @@ jobs:
       - name: Verify output
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
-          SO="Runtime/Plugins/Linux/x86_64/libdisplayxr_unity.so"
-          if [ ! -f "$SO" ]; then
-            echo "ERROR: .so not found at $SO"
-            exit 1
-          fi
-          file "$SO"
-          ls -la "$SO"
+          DIR="Runtime/Plugins/Linux/x86_64"
+          SO="$DIR/libdisplayxr_unity.so"
+          WL="$DIR/libdisplayxr_unity_wayland.so"   # native-Wayland support, dlopened by $SO
+          for f in "$SO" "$WL"; do
+            if [ ! -f "$f" ]; then
+              echo "ERROR: not found: $f"
+              exit 1
+            fi
+            file "$f"
+            ls -la "$f"
+          done
 
           # The build uses -fvisibility=hidden, so this is a REAL gate: a translation
           # unit dropped by a mis-set platform guard shows up here and nowhere else.
           # XRSDKPreInit in particular is what Unity's boot.config pre-init hook calls,
           # and it is the Linux-specific piece #249 exists to exercise.
-          for sym in UnityPluginLoad UnityPluginUnload XRSDKPreInit; do
-            if ! nm -D --defined-only "$SO" | grep -q " T $sym$"; then
-              echo "ERROR: required export missing: $sym"
-              nm -D --defined-only "$SO" | head -40
-              exit 1
-            fi
-            echo "export OK: $sym"
-          done
+          check_exports() {
+            f="$1"; shift
+            for sym in "$@"; do
+              if ! nm -D --defined-only "$f" | grep -q " T $sym$"; then
+                echo "ERROR: required export missing from $f: $sym"
+                nm -D --defined-only "$f" | head -40
+                exit 1
+              fi
+              echo "export OK: $sym ($f)"
+            done
+          }
+          check_exports "$SO" UnityPluginLoad UnityPluginUnload XRSDKPreInit
+          check_exports "$WL" dxr_wl_lib_init
 
-          # The plugin must resolve Vulkan and Xlib through dlopen
-          # (displayxr_vk_loader / displayxr_linux.c), never by linking them —
-          # otherwise it fails to load on a box with no Vulkan ICD or no X11.
-          for lib in libvulkan libX11; do
-            if readelf -d "$SO" | grep -q "$lib"; then
-              echo "ERROR: .so has a hard dependency on $lib — it must dlopen it instead"
-              readelf -d "$SO" | grep NEEDED
-              exit 1
-            fi
-            echo "no $lib link dependency: OK"
-          done
+          # EXACT dependency allow-lists. The plugin must keep loading on any box,
+          # X11-only and runtime-less ones included (it loads in every Linux editor
+          # and in players with no panel), so everything optional is dlopened:
+          # Vulkan and Xlib by the main plugin (displayxr_vk_loader /
+          # displayxr_linux.c), libdbus by the Wayland library, and the Wayland
+          # library itself only for a native-Wayland player. A new NEEDED entry
+          # fails here instead of as a DllNotFoundException on a user's box.
+          check_needed() {
+            f="$1"; shift
+            for lib in $(readelf -d "$f" | sed -n 's/.*Shared library: \[\(.*\)\]/\1/p'); do
+              case " $* " in
+                *" $lib "*) echo "NEEDED OK: $lib ($f)" ;;
+                *) echo "ERROR: $f has an unexpected link dependency: $lib (allowed: $*)"
+                   echo "       dlopen it instead, or extend this allow-list on purpose."
+                   exit 1 ;;
+              esac
+            done
+          }
+          check_needed "$SO" libstdc++.so.6 libm.so.6 libgcc_s.so.1 libc.so.6
+          check_needed "$WL" libwayland-client.so.0 libm.so.6 libc.so.6
 
           # NO UNRESOLVED SYMBOLS. This is the check that was missing when #249
           # first landed: unlike MSVC and macOS's two-level namespace, a Linux
@@ -207,19 +228,23 @@ jobs:
           # CMakeLists.txt), which makes this belt-and-braces; keep both, because
           # the link flag is easy to drop by accident and this is the symptom
           # a user would actually hit.
-          if ldd -r "$SO" 2>&1 | grep -q 'undefined symbol'; then
-            echo "ERROR: unresolved symbols in the shipped .so — it will fail to load:"
-            ldd -r "$SO" 2>&1 | grep 'undefined symbol' | sort -u
-            exit 1
-          fi
-          echo "no unresolved symbols: OK"
+          for f in "$SO" "$WL"; do
+            if ldd -r "$f" 2>&1 | grep -q 'undefined symbol'; then
+              echo "ERROR: unresolved symbols in $f — it will fail to load:"
+              ldd -r "$f" 2>&1 | grep 'undefined symbol' | sort -u
+              exit 1
+            fi
+            echo "no unresolved symbols: OK ($f)"
+          done
 
       - name: Upload artifact
         if: needs.DetectChanges.outputs.docs_only != 'true'
         uses: actions/upload-artifact@v6
         with:
           name: displayxr_unity-linux-x86_64
-          path: Runtime/Plugins/Linux/x86_64/libdisplayxr_unity.so
+          path: |
+            Runtime/Plugins/Linux/x86_64/libdisplayxr_unity.so
+            Runtime/Plugins/Linux/x86_64/libdisplayxr_unity_wayland.so
 
   # ── Release job: runs on v* tags ──────────────────────────────────────
   release:
@@ -340,12 +365,14 @@ jobs:
           git add -f Runtime/Plugins/Windows/x64/displayxr_unity.dll
           git add -f Runtime/Plugins/macOS/displayxr_unity.bundle
           git add -f Runtime/Plugins/Linux/x86_64/libdisplayxr_unity.so
+          git add -f Runtime/Plugins/Linux/x86_64/libdisplayxr_unity_wayland.so
 
           # Fail loudly rather than silently shipping an incomplete upm
           # branch: every platform binary must be staged at this point.
           for f in Runtime/Plugins/Windows/x64/displayxr_unity.dll \
                    Runtime/Plugins/macOS/displayxr_unity.bundle/Contents/MacOS/displayxr_unity \
-                   Runtime/Plugins/Linux/x86_64/libdisplayxr_unity.so; do
+                   Runtime/Plugins/Linux/x86_64/libdisplayxr_unity.so \
+                 Runtime/Plugins/Linux/x86_64/libdisplayxr_unity_wayland.so; do
             git diff --cached --name-only | grep -qxF "$f" || \
               git ls-files --error-unmatch "$f" >/dev/null 2>&1 || {
                 echo "::error::$f is not staged for the upm branch — refusing to publish an incomplete package."

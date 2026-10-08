@@ -996,7 +996,12 @@ namespace DisplayXR
             if (clickableRenderers == null || clickableRenderers.Length == 0)
                 return;
 
-            int overlayW = Screen.width, overlayH = Screen.height;
+            // Window DEVICE px, like X11 and Windows: the app's rects (zone, canvas,
+            // bubble) come in those units. Unity's Screen is logical on the
+            // native-Wayland player, so scale it like PointerPosition (1 elsewhere).
+            float uiScale = LinuxUiScale();
+            int overlayW = Mathf.RoundToInt(Screen.width * uiScale);
+            int overlayH = Mathf.RoundToInt(Screen.height * uiScale);
             int clientX = Mathf.RoundToInt(PointerPosition.x);
             int clientY = Mathf.RoundToInt(PointerPosition.y);
             int buttons = (IsLeftPressed ? 1 : 0) | (IsRightPressed ? 2 : 0);
@@ -1299,12 +1304,34 @@ namespace DisplayXR
             // pixels, top-left origin (what the Windows native poll reports). Rounded
             // to whole pixels like the macOS path, so PointerDelta is whole pixels too.
             pos = new Vector2(Mathf.RoundToInt(pos.x), Mathf.RoundToInt(Screen.height - pos.y));
+            // PointerPosition is window-client DEVICE pixels, like on X11 and Windows.
+            // On the native-Wayland player Unity's own units are logical, so scale
+            // (1 everywhere else).
+            float uiScale = LinuxUiScale();
+            if (uiScale != 1f)
+                pos = new Vector2(Mathf.RoundToInt(pos.x * uiScale), Mathf.RoundToInt(pos.y * uiScale));
             PointerDelta = m_HasPrevPointerPos ? (pos - m_PrevPointerPos) : Vector2.zero;
             PointerPosition = pos;
             m_PrevPointerPos = pos;
             m_HasPrevPointerPos = true;
             IsLeftPressed = left;
             IsRightPressed = right;
+        }
+
+        private static bool s_LinuxUiScaleMissing;
+        private static float LinuxUiScale()
+        {
+            if (s_LinuxUiScaleMissing) return 1f;
+            try
+            {
+                float s = DisplayXRNative.displayxr_linux_ui_scale();
+                return s > 0f ? s : 1f;
+            }
+            catch (EntryPointNotFoundException)
+            {
+                s_LinuxUiScaleMissing = true; // older native plugin
+                return 1f;
+            }
         }
 #endif
 

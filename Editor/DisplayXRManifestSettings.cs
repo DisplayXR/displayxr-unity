@@ -63,6 +63,15 @@ namespace DisplayXR.Editor
                  "one (sets the DISPLAYXR_NO_SPLASH define).")]
         public bool disableBootSplash = false;
 
+        [Tooltip("Tick for a transparent overlay app (one that asks for a transparent " +
+                 "background, e.g. a desktop avatar).\n\n" +
+                 "Linux, native Wayland (-force-wayland): the player's window has to be " +
+                 "presented with alpha for the desktop to show through, and that is decided " +
+                 "when Unity creates the window, before any app script runs - so it is a " +
+                 "BUILD-time setting. Leave it off for an ordinary app: its window stays " +
+                 "opaque, which is what keeps it visible when no 3D weave covers it.")]
+        public bool transparentOverlay = false;
+
         /// <summary>Effective app name: explicit setting or fallback to product name.</summary>
         public string EffectiveName =>
             string.IsNullOrWhiteSpace(appName) ? Application.productName : appName;

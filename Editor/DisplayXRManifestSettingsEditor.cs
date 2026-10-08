@@ -36,6 +36,7 @@ namespace DisplayXR.Editor
         private SerializedProperty icon3DLayout;
         private SerializedProperty registerWithDisplayXR;
         private SerializedProperty disableBootSplash;
+        private SerializedProperty transparentOverlay;
 
         private void OnEnable()
         {
@@ -48,6 +49,7 @@ namespace DisplayXR.Editor
             icon3DLayout = serializedObject.FindProperty("icon3DLayout");
             registerWithDisplayXR = serializedObject.FindProperty("registerWithDisplayXR");
             disableBootSplash = serializedObject.FindProperty("disableBootSplash");
+            transparentOverlay = serializedObject.FindProperty("transparentOverlay");
         }
 
         public override void OnInspectorGUI()
@@ -119,6 +121,15 @@ namespace DisplayXR.Editor
             EditorGUILayout.PropertyField(registerWithDisplayXR, new GUIContent("Register with DisplayXR",
                 "Also write a registered manifest to %LOCALAPPDATA%\\DisplayXR\\apps\\ so DisplayXR-compatible " +
                 "workspace controllers (including the DisplayXR Shell) discover this build without needing it under Program Files."));
+
+            EditorGUILayout.Space();
+
+            // --- Transparency ---
+            EditorGUILayout.LabelField("Transparency", EditorStyles.boldLabel);
+            EditorGUILayout.PropertyField(transparentOverlay, new GUIContent("Transparent Overlay App",
+                "A transparent overlay app (asks for a transparent background). On Linux native " +
+                "Wayland the player's window is then presented with alpha; leave off for an " +
+                "ordinary app, whose window stays opaque."));
 
             EditorGUILayout.Space();
 

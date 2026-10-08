@@ -570,6 +570,23 @@ namespace DisplayXR
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern int displayxr_linux_click_through_active();
+
+        /// <summary>
+        /// Native-Wayland player: device pixels per logical pixel of Unity's window.
+        /// Unity's Screen and pointer are logical there, while the window-pixel API
+        /// (overlay size, PointerPosition) is device pixels, as on X11 and Windows.
+        /// 1 everywhere else.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern float displayxr_linux_ui_scale();
+
+        /// <summary>
+        /// Native-Wayland player: a window size asked for through
+        /// displayxr_resize_overlay, in logical pixels, for Screen.SetResolution
+        /// (a Wayland client sizes its own window). Returns 1 when one is pending.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int displayxr_linux_take_pending_resize(out int width, out int height);
 #endif
 
     }
