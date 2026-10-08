@@ -587,6 +587,16 @@ namespace DisplayXR
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern int displayxr_linux_take_pending_resize(out int width, out int height);
+
+        /// <summary>
+        /// 1 when the last <see cref="displayxr_get_overlay_position"/> answer was the
+        /// window's current position. 0 on a native-Wayland player that could not tell
+        /// right now (no DisplayXR GNOME extension, the screen locked, the window not
+        /// shown yet): the answer was then the last known position, or (0, 0) if there
+        /// was none. (0, 0) is a legitimate position, so check this before saving one.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int displayxr_linux_overlay_position_known();
 #endif
 
     }

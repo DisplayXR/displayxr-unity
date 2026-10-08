@@ -28,6 +28,8 @@ static const DxrWlHost s_host = {
     .unity_surface = dxr_wl_unity_surface,
     .unity_swapchain_size = dxr_wl_unity_swapchain_size,
     .player_surface_generation = dxr_wl_player_surface_generation,
+    .lock_player_surface = dxr_wl_lock_player_surface,
+    .unlock_player_surface = dxr_wl_unlock_player_surface,
 };
 
 static const DxrWlApi *s_api; // published once by load_library()
@@ -228,4 +230,12 @@ dxr_wl_player_generation(void)
 {
 	const DxrWlApi *a = api();
 	return a ? a->player_generation() : 0;
+}
+
+void
+dxr_wl_set_x11_panel_rect(const char *connector, int x, int y, int w, int h)
+{
+	const DxrWlApi *a = api();
+	if (a)
+		a->set_x11_panel_rect(connector, x, y, w, h);
 }
