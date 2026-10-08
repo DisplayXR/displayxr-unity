@@ -412,6 +412,9 @@ DISPLAYXR_EXPORT int displayxr_linux_click_through_active(void);
 DISPLAYXR_EXPORT float displayxr_linux_ui_scale(void);
 /// Native-Wayland player: a pending window size (logical px) for Screen.SetResolution.
 DISPLAYXR_EXPORT int displayxr_linux_take_pending_resize(int *width, int *height);
+/// 1 when displayxr_get_overlay_position's last answer was current, 0 when it was the
+/// last known position (native-Wayland player that cannot tell right now).
+DISPLAYXR_EXPORT int displayxr_linux_overlay_position_known(void);
 
 /// (#266) Centre Unity's window on the given rect (X root coordinates), unless it is
 /// already there. Called by dxr_prov_move_window_to_display with the panel rect the

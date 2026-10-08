@@ -231,3 +231,11 @@ dxr_wl_player_generation(void)
 	const DxrWlApi *a = api();
 	return a ? a->player_generation() : 0;
 }
+
+void
+dxr_wl_set_x11_panel_rect(const char *connector, int x, int y, int w, int h)
+{
+	const DxrWlApi *a = api();
+	if (a)
+		a->set_x11_panel_rect(connector, x, y, w, h);
+}

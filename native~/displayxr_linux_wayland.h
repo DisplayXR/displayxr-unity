@@ -91,13 +91,18 @@ int dxr_wl_begin_pointer_drag(unsigned button);
 void dxr_wl_end_pointer_drag(void);
 void dxr_wl_request_player_size(int device_w, int device_h);
 int dxr_wl_take_player_size(int *out_w, int *out_h);
-//! Centre the window on the 3D panel's output (connector name, else its mode in
-//! device px). 1 when it is on the panel (already, or moved).
+//! Put the window on the 3D panel's output (connector name; its mode in device px
+//! only when exactly one output has it), centred. 1 when it is there or will be
+//! once mapped; placement is asynchronous (the GNOME extension's worker).
 int dxr_wl_move_player_to_panel(const char *connector, int panel_w, int panel_h);
 //! The window's position / a new position in X root coordinates (the space the
-//! X11 path saves and restores), converted through the XWayland scale.
+//! X11 path saves and restores). get: 1 when known now; otherwise the out values
+//! are the last known position (untouched if there never was one).
 int dxr_wl_get_player_position_x11(int *out_x, int *out_y);
 int dxr_wl_set_player_position_x11(int x, int y);
+//! The runtime's 3D panel rect in X root px (XrDisplayDesktopInfoDXR): what X root
+//! coordinates are converted through.
+void dxr_wl_set_x11_panel_rect(const char *connector, int x, int y, int w, int h);
 //! Bumps when the player recreated its window (the input region must be re-sent).
 unsigned dxr_wl_player_generation(void);
 

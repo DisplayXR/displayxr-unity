@@ -1460,6 +1460,8 @@ displayxr_get_overlay_size(int *width, int *height)
 	if (height) *height = have ? (int)s_oh : 0;
 }
 
+static int s_wl_position_known = 1; // displayxr_linux_overlay_position_known()
+
 /// Unity's window client origin in X root coordinates. (0, 0) when unknown.
 DISPLAYXR_EXPORT void
 displayxr_get_overlay_position(int *x, int *y)
@@ -1468,14 +1470,17 @@ displayxr_get_overlay_position(int *x, int *y)
 	if (y) *y = 0;
 	if (dxr_wl_weave_active()) {
 		// Native-Wayland player: from the compositor, converted into X root
-		// coordinates so a saved position means the same place under X11.
+		// coordinates so a saved position means the same place under X11. When it
+		// cannot be told right now (no GNOME extension, the screen locked, ...) this
+		// is the last position that could; displayxr_linux_overlay_position_known()
+		// says which, since (0, 0) is a legitimate position.
 		int wx = 0, wy = 0;
-		if (dxr_wl_get_player_position_x11(&wx, &wy)) {
-			if (x) *x = wx;
-			if (y) *y = wy;
-		}
+		s_wl_position_known = dxr_wl_get_player_position_x11(&wx, &wy);
+		if (x) *x = wx;
+		if (y) *y = wy;
 		return;
 	}
+	s_wl_position_known = 1;
 	if (!s_overlay || !s_win) return;
 	if (s_overlay_is_toplevel) { // the transparent overlay tracks the origin every frame
 		if (x) *x = s_ox;
@@ -1562,6 +1567,15 @@ DISPLAYXR_EXPORT int
 displayxr_consume_overlay_close_request(void)
 {
 	return 0;
+}
+
+/// 1 when displayxr_get_overlay_position's last answer was the window's current
+/// position; 0 when it could not be told (native-Wayland player with no GNOME
+/// extension, or before the window is known) and was the last known one instead.
+DISPLAYXR_EXPORT int
+displayxr_linux_overlay_position_known(void)
+{
+	return s_wl_position_known;
 }
 
 /// Native-Wayland player: device px per logical px of Unity's window (Unity's Screen

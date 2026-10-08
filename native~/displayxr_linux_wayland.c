@@ -14,6 +14,8 @@
 // (which dispatches the default queue on its main thread) never sees our events
 // and we never dispatch its. Wayland requests are thread-safe; the events for our
 // objects land on our queue, which only the provider's frame thread dispatches.
+// Requests on the player's own surface are only made while the capture layer's
+// lock is held (the player may destroy that surface at any time otherwise).
 //
 // Why a sub-surface: it moves with its parent and stacks above it, so a weave
 // drawn into it covers the player's window without a second toplevel, and the
@@ -27,9 +29,19 @@
 // us the real (fractional) scale. The app-facing window-pixel API stays in device
 // px as on X11 and Windows (displayxr_linux.c converts at its edges).
 //
-// The window controls a Wayland client cannot do for itself (moving its toplevel,
-// learning its position) go through the DisplayXR GNOME Shell extension
-// (window-geometry@displayxr.org) over D-Bus: displayxr_linux_wayland_dbus.c.
+// Placement - moving the toplevel, which a Wayland client cannot do itself - goes
+// through the DisplayXR GNOME Shell extension (displayxr_linux_wayland_dbus.c, on
+// its own thread) in mutter's STAGE coordinates. Mutter places a window by its own
+// rules at the moment it maps it (where the pointer is), which overrides any move
+// made before, and the player maps its window after its first frame. So placement
+// is an intent (where the window should be) enforced once each time the window
+// gets mapped, as the extension reports it; any other move, by the user or by the
+// compositor, is followed rather than fought.
+//
+// Stage coordinates depend on mutter's layout mode: LOGICAL (fractional scaling;
+// GNOME 47+ default) or PHYSICAL (GNOME 46 / Ubuntu 24.04 at an integer scale:
+// the stage is device px). xdg-output reports each output's layout rect, i.e. its
+// stage rect, in both; the mode only changes how stage px relate to device px.
 //
 // Every entry point is inert unless a weave sub-surface exists.
 
@@ -49,18 +61,23 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
-#include <time.h>
 #include <unistd.h>
 
 #define DXR_WL_MAX_OUTPUTS 8
+#define DXR_WL_MAX_CORRECTIONS 3 // re-placements per map: never fight the compositor
 
-// An output: its device-pixel mode (wl_output) and its logical rect and connector
-// name (xdg-output), to find the 3D panel and place the window on it.
+enum { DXR_LAYOUT_UNKNOWN, DXR_LAYOUT_LOGICAL, DXR_LAYOUT_PHYSICAL };
+
+// An output: its device-pixel mode, scale and transform (wl_output), and its
+// stage rect and connector name (xdg-output), to find the 3D panel and place the
+// window on it.
 struct dxr_wl_output {
 	uint32_t registry_name; // 0 = free slot
 	struct wl_output *output;
 	struct zxdg_output_v1 *xdg;
 	int mode_w, mode_h;
+	int wl_scale;  // wl_output.scale (integer)
+	int transform; // wl_output_transform; odd = rotated by 90 or 270
 	int lx, ly, lw, lh;
 	char name[32];
 };
@@ -87,11 +104,14 @@ static struct {
 	struct wp_viewport *viewport;
 	struct wp_fractional_scale_v1 *frac;
 	struct wl_buffer *probe_buffer;
-	struct dxr_wl_output *on_output; // the output the weave is on (wl_surface.enter)
 	int transparent;
 
-	uint32_t scale120; // preferred scale x 120, 0 = not told yet
-	uint32_t expect_scale120; // the scale of the output we just moved the window to, until told
+	uint32_t scale120;        // preferred scale x 120, 0 = not told yet
+	// The scale sizes are computed for while it is ahead of scale120: the target
+	// output's while the window is being placed there, then the scale the extension
+	// reports for the window's monitor, until the fractional-scale protocol (which
+	// only follows once the window is there) catches up.
+	uint32_t expect_scale120;
 	int logical_w, logical_h;
 	int device_w, device_h;
 	int geometry_dirty; // device size changed since the provider last read it
@@ -99,38 +119,48 @@ static struct {
 	// Window size the app asked for (displayxr_resize_overlay), DEVICE px, and the
 	// LOGICAL size still to apply (C# Screen.SetResolution).
 	int wanted_device_w, wanted_device_h;
+	int wanted_by_app; // the app asked for it (else it is the baseline, below)
 	int pending_w, pending_h;
+	int sent_w, sent_h; // the last size handed to C#, until the player's window has it
+	int size_fixups;    // re-requests of a size the player reverted, since the app's request
 
-	// Where the window is (its frame origin, logical px), as far as we know: our own
-	// moves, a query after a drag and before a resize, and the app's position reads.
-	int pos_valid, pos_x, pos_y;
-	double pos_at;
-	// Holding the window at a position for a few seconds: the compositor places a
-	// window when it maps it (wherever the pointer is), which overrides a move made
-	// before the player's first frame, and again when the player re-maps it to apply
-	// a new size. So after each of our moves, and after each re-attach, put it back
-	// if it lands elsewhere. A scale change seen meanwhile is acted on afterwards.
-	int restore_pending, restore_x, restore_y, restore_moves;
-	double restore_until, restore_next;
-	int rescale_after_restore;
-	int size_fixups; // re-requests of a size the player reverted, since the app's request
-	int dragging;
+	// The DisplayXR GNOME extension, and our window as it last reported it.
+	int ext_available;
+	unsigned ext_caps;
+	char ext_layout[16]; // "logical", "physical", "" (not reported)
+	DxrWlExtWindow win;
+	int drag_state; // 0 none, 1 asked for, 2 dragging
+
+	// Where the window should be, stage px: where we put it, or where the user (or
+	// the compositor, uninvited) moved it since. Enforced when the window gets mapped.
+	int intent_valid, intent_x, intent_y;
+	char intent_centred_on[32]; // the panel the intent centres the window on, "" if none
+	int move_inflight; // we asked the extension to move it; its answer is pending
+	int corrections;   // moves since the window was last mapped
+	int placing;       // from a correction until its result: scale changes wait
+	int rescale_after_place;
+
+	// The 3D panel as the runtime reports it in X root coordinates: the space the
+	// app-facing position API speaks (displayxr_get/set_overlay_position).
+	char x11_connector[64];
+	int x11_valid, x11_x, x11_y, x11_w, x11_h;
+	int last_x11_valid, last_x11_x, last_x11_y; // the last position we could convert
+
+	unsigned warned; // one-time log bits (DXR_WARN_*)
 } s_wl;
 
+#define DXR_WARN_LAYOUT 1u
+#define DXR_WARN_X11 2u
+#define DXR_WARN_DRAG 4u
+#define DXR_WARN_GAVE_UP 8u
+
 // Guards s_wl: the provider's frame thread polls, C#'s main thread asks for
-// resizes, positions and input regions.
+// resizes, positions and input regions, the extension worker reports. Lock order:
+// this one, then the capture layer's player lock, then the worker's job lock.
 static pthread_mutex_t s_wl_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 // The main plugin's side (displayxr_linux_wayland_lib.h), set once by dxr_wl_lib_init.
 static const DxrWlHost *s_host;
-
-static double
-now_s(void)
-{
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
-}
 
 /*
  *
@@ -140,9 +170,11 @@ now_s(void)
 
 static void
 out_geometry(void *d, struct wl_output *o, int32_t x, int32_t y, int32_t pw, int32_t ph, int32_t sub,
-             const char *make, const char *model, int32_t tr)
+             const char *make, const char *model, int32_t transform)
 {
-	(void)d; (void)o; (void)x; (void)y; (void)pw; (void)ph; (void)sub; (void)make; (void)model; (void)tr;
+	(void)o; (void)x; (void)y; (void)pw; (void)ph; (void)sub; (void)make; (void)model;
+	struct dxr_wl_output *out = d;
+	out->transform = transform;
 }
 
 static void
@@ -157,7 +189,14 @@ out_mode(void *d, struct wl_output *o, uint32_t flags, int32_t w, int32_t h, int
 }
 
 static void out_done(void *d, struct wl_output *o) { (void)d; (void)o; }
-static void out_scale(void *d, struct wl_output *o, int32_t f) { (void)d; (void)o; (void)f; }
+
+static void
+out_scale(void *d, struct wl_output *o, int32_t factor)
+{
+	(void)o;
+	struct dxr_wl_output *out = d;
+	out->wl_scale = factor;
+}
 
 static const struct wl_output_listener s_output_listener = {
     .geometry = out_geometry,
@@ -213,6 +252,83 @@ output_add_xdg(struct dxr_wl_output *out)
 	zxdg_output_v1_add_listener(out->xdg, &s_xdg_output_listener, out);
 }
 
+//! The output's mode in its layout orientation (rotated by 90/270: swapped).
+static void
+output_mode_oriented(const struct dxr_wl_output *o, int *w, int *h)
+{
+	int rotated = o->transform & 1;
+	*w = rotated ? o->mode_h : o->mode_w;
+	*h = rotated ? o->mode_w : o->mode_h;
+}
+
+//! Mutter's layout mode: what the extension reports, cross-checked with what the
+//! outputs show (an output at a scale above 1 whose stage rect is its whole mode is
+//! in physical layout; one whose rect is the mode over its scale, logical).
+static int
+layout_locked(void)
+{
+	int inferred = DXR_LAYOUT_UNKNOWN, any_scaled = 0;
+	for (int i = 0; i < DXR_WL_MAX_OUTPUTS; i++) {
+		const struct dxr_wl_output *o = &s_wl.outputs[i];
+		if (!o->registry_name || o->lw <= 0 || o->mode_w <= 0)
+			continue;
+		int mw, mh;
+		output_mode_oriented(o, &mw, &mh);
+		double ratio = (double)mw / o->lw;
+		if (o->wl_scale <= 1 && ratio < 1.01)
+			continue; // at scale 1 both layouts agree
+		any_scaled = 1;
+		int mode = ratio < 1.01 ? DXR_LAYOUT_PHYSICAL : DXR_LAYOUT_LOGICAL;
+		if (inferred == DXR_LAYOUT_UNKNOWN)
+			inferred = mode;
+		else if (inferred != mode)
+			return DXR_LAYOUT_UNKNOWN; // the outputs disagree
+	}
+	if (!any_scaled)
+		inferred = DXR_LAYOUT_LOGICAL;
+	int reported = !strcmp(s_wl.ext_layout, "logical")    ? DXR_LAYOUT_LOGICAL
+	               : !strcmp(s_wl.ext_layout, "physical") ? DXR_LAYOUT_PHYSICAL
+	                                                       : DXR_LAYOUT_UNKNOWN;
+	if (reported != DXR_LAYOUT_UNKNOWN && inferred != DXR_LAYOUT_UNKNOWN && reported != inferred)
+		return DXR_LAYOUT_UNKNOWN;
+	return reported != DXR_LAYOUT_UNKNOWN ? reported : inferred;
+}
+
+//! The output's device px per stage px, x 120; 0 when the layout is unknown.
+static uint32_t
+output_scale120_locked(const struct dxr_wl_output *o, int layout)
+{
+	int mw, mh;
+	output_mode_oriented(o, &mw, &mh);
+	if (layout == DXR_LAYOUT_LOGICAL && o->lw > 0)
+		return (uint32_t)lround(120.0 * mw / o->lw);
+	if (layout == DXR_LAYOUT_PHYSICAL)
+		return 120u * (uint32_t)(o->wl_scale > 0 ? o->wl_scale : 1);
+	return 0;
+}
+
+//! The output whose stage rect contains (x, y), or NULL.
+static struct dxr_wl_output *
+output_at_locked(int x, int y)
+{
+	for (int i = 0; i < DXR_WL_MAX_OUTPUTS; i++) {
+		struct dxr_wl_output *o = &s_wl.outputs[i];
+		if (o->registry_name && o->lw > 0 && x >= o->lx && x < o->lx + o->lw && y >= o->ly && y < o->ly + o->lh)
+			return o;
+	}
+	return NULL;
+}
+
+//! The output with this connector name, or NULL.
+static struct dxr_wl_output *
+output_named_locked(const char *name)
+{
+	for (int i = 0; i < DXR_WL_MAX_OUTPUTS && name && *name; i++)
+		if (s_wl.outputs[i].registry_name && !strcmp(s_wl.outputs[i].name, name))
+			return &s_wl.outputs[i];
+	return NULL;
+}
+
 /*
  *
  * Registry.
@@ -246,6 +362,7 @@ registry_global(void *data, struct wl_registry *reg, uint32_t name, const char *
 				continue;
 			memset(out, 0, sizeof(*out));
 			out->registry_name = name;
+			out->wl_scale = 1;
 			out->output = wl_registry_bind(reg, name, &wl_output_interface, version < 2 ? version : 2);
 			wl_output_add_listener(out->output, &s_output_listener, out);
 			output_add_xdg(out);
@@ -266,8 +383,6 @@ registry_global_remove(void *data, struct wl_registry *reg, uint32_t name)
 		if (out->xdg)
 			zxdg_output_v1_destroy(out->xdg);
 		wl_output_destroy(out->output);
-		if (s_wl.on_output == out)
-			s_wl.on_output = NULL;
 		memset(out, 0, sizeof(*out));
 	}
 }
@@ -297,15 +412,15 @@ connect_locked(struct wl_display *display)
 	for (int i = 0; i < DXR_WL_MAX_OUTPUTS; i++) {
 		const struct dxr_wl_output *o = &s_wl.outputs[i];
 		if (o->registry_name)
-			fprintf(stderr, "[DisplayXR-WL] output '%s': %dx%d px, logical %dx%d at (%d,%d)\n", o->name, o->mode_w,
-			        o->mode_h, o->lw, o->lh, o->lx, o->ly);
+			fprintf(stderr, "[DisplayXR-WL] output '%s': %dx%d px (scale %d, transform %d), stage %dx%d at (%d,%d)\n",
+			        o->name, o->mode_w, o->mode_h, o->wl_scale, o->transform, o->lw, o->lh, o->lx, o->ly);
 	}
 	return s_wl.compositor && s_wl.subcompositor;
 }
 
 /*
  *
- * The weave sub-surface.
+ * The weave sub-surface and its size.
  *
  */
 
@@ -324,16 +439,29 @@ update_device_size_locked(void)
 	}
 }
 
+//! The size to keep, in device px, is the app's request; until it makes one, the
+//! window's size where its scale was first known. Moving to an output with another
+//! scale then keeps the device size, as on X11, not the logical one (which would
+//! grow a window 4/3 moving from a 150 % laptop onto a 200 % panel).
+static void
+baseline_wanted_size_locked(void)
+{
+	if (s_wl.wanted_device_w <= 0 && s_wl.scale120 && s_wl.device_w > 0 && s_wl.device_h > 0) {
+		s_wl.wanted_device_w = s_wl.device_w;
+		s_wl.wanted_device_h = s_wl.device_h;
+	}
+}
+
 // The window changed scale (e.g. from the laptop onto the 3D panel): keep the size
-// the app asked for in DEVICE px, as on X11, by asking for the logical size that
-// gives it at the new scale.
+// wanted in DEVICE px, as on X11, by asking for the logical size that gives it at
+// the new scale.
 static void
 rerequest_player_size_locked(void)
 {
 	if (s_wl.wanted_device_w <= 0 || s_wl.wanted_device_h <= 0)
 		return;
-	// Just moved to another output: size for its scale now, not for the one we are
-	// leaving (the compositor reports the new scale only once the window is there).
+	// Being moved to another output: size for its scale now, not for the one being
+	// left (the compositor reports the new scale only once the window is there).
 	uint32_t s120 = s_wl.expect_scale120 ? s_wl.expect_scale120 : s_wl.scale120;
 	double scale = s120 ? s120 / 120.0 : 1.0;
 	int lw = (int)lround(s_wl.wanted_device_w / scale);
@@ -349,53 +477,24 @@ frac_preferred_scale(void *data, struct wp_fractional_scale_v1 *frac, uint32_t s
 {
 	(void)data;
 	(void)frac;
-	// The window reached the output we sent it to; or, with no hold in progress, the
-	// user took it elsewhere. (Mid-hold it may pass over another output first.)
-	if (scale == s_wl.expect_scale120 || !s_wl.restore_pending)
+	// The protocol caught up with the scale we expected (see expect_scale120).
+	if (scale == s_wl.expect_scale120)
 		s_wl.expect_scale120 = 0;
 	if (scale == s_wl.scale120)
 		return;
+	int first = !s_wl.scale120;
 	s_wl.scale120 = scale;
 	update_device_size_locked();
-	if (s_wl.restore_pending)
-		s_wl.rescale_after_restore = 1; // passing over another output while being put back
+	if (first)
+		baseline_wanted_size_locked();
+	if (s_wl.placing)
+		s_wl.rescale_after_place = 1;
 	else
 		rerequest_player_size_locked();
 }
 
 static const struct wp_fractional_scale_v1_listener s_frac_listener = {
     .preferred_scale = frac_preferred_scale,
-};
-
-static struct dxr_wl_output *
-output_for(struct wl_output *o)
-{
-	for (int i = 0; i < DXR_WL_MAX_OUTPUTS; i++)
-		if (s_wl.outputs[i].registry_name && s_wl.outputs[i].output == o)
-			return &s_wl.outputs[i];
-	return NULL;
-}
-
-static void
-surface_enter(void *d, struct wl_surface *s, struct wl_output *o)
-{
-	(void)d;
-	(void)s;
-	s_wl.on_output = output_for(o);
-}
-
-static void
-surface_leave(void *d, struct wl_surface *s, struct wl_output *o)
-{
-	(void)d;
-	(void)s;
-	if (s_wl.on_output && s_wl.on_output == output_for(o))
-		s_wl.on_output = NULL;
-}
-
-static const struct wl_surface_listener s_surface_listener = {
-    .enter = surface_enter,
-    .leave = surface_leave,
 };
 
 //! A 1x1 fully transparent shm buffer: maps the sub-surface before the session so
@@ -419,7 +518,8 @@ make_probe_buffer(void)
 	return buf;
 }
 
-//! Make our surface a sub-surface of `parent`, at its top-left, above it.
+//! Make our surface a sub-surface of `parent`, at its top-left, above it. The
+//! caller holds the player lock (parent is the player's surface).
 static void
 attach_to_parent_locked(struct wl_surface *parent)
 {
@@ -434,6 +534,8 @@ attach_to_parent_locked(struct wl_surface *parent)
 	s_wl.parent = parent;
 	s_wl.attach_count++;
 }
+
+static const DxrWlExtCallbacks s_ext_callbacks; // below
 
 static int
 dxr_wl_weave_surface_create(struct wl_display *display, struct wl_surface *parent, int lw, int lh,
@@ -451,9 +553,8 @@ dxr_wl_weave_surface_create(struct wl_display *display, struct wl_surface *paren
 		pthread_mutex_unlock(&s_wl_mutex);
 		return 0;
 	}
-	// Requests on the player's surface only while it is locked (H3: the player may
-	// destroy it at any time otherwise). It may also have changed since the
-	// provider read it: use the current one.
+	// The player's surface may have changed since the provider read it: use the
+	// current one, and only while it is locked.
 	unsigned generation = 0;
 	struct wl_surface *player = s_host->lock_player_surface(&generation);
 	if (!player) {
@@ -465,7 +566,6 @@ dxr_wl_weave_surface_create(struct wl_display *display, struct wl_surface *paren
 	if (player != parent)
 		fprintf(stderr, "[DisplayXR-WL] the player's window surface changed since it was read: using the current one\n");
 	s_wl.surface = wl_compositor_create_surface(s_wl.compositor);
-	wl_surface_add_listener(s_wl.surface, &s_surface_listener, NULL);
 	attach_to_parent_locked(player);
 	s_wl.parent_generation = generation;
 	s_host->unlock_player_surface();
@@ -483,29 +583,32 @@ dxr_wl_weave_surface_create(struct wl_display *display, struct wl_surface *paren
 	wp_viewport_set_destination(s_wl.viewport, lw, lh);
 
 	// Map it once (before the session: from then on only the runtime's WSI attaches
-	// and commits) so the compositor reports the scale of the output it is on.
+	// and commits) so the compositor reports the scale of the output it is on. One
+	// round trip, no waiting: if the scale is not in yet, start from the scale of the
+	// window's monitor as the extension last reported it (or 1), and correct it when
+	// it arrives (the provider republishes the geometry).
 	s_wl.probe_buffer = make_probe_buffer();
 	if (s_wl.probe_buffer) {
 		wl_surface_attach(s_wl.surface, s_wl.probe_buffer, 0, 0);
 		wl_surface_damage_buffer(s_wl.surface, 0, 0, 1, 1);
 	}
 	wl_surface_commit(s_wl.surface);
-	for (int i = 0; i < 20 && s_wl.frac && !s_wl.scale120; i++) {
-		wl_display_roundtrip_queue(display, s_wl.queue);
-		if (!s_wl.scale120) {
-			struct timespec ts = {0, 10 * 1000 * 1000};
-			nanosleep(&ts, NULL);
-		}
+	wl_display_roundtrip_queue(display, s_wl.queue);
+	if (!s_wl.scale120) {
+		if (s_wl.win.device_scale > 0.0)
+			s_wl.scale120 = (uint32_t)lround(120.0 * s_wl.win.device_scale);
+		fprintf(stderr, "[DisplayXR-WL] no fractional scale yet; starting at %.4f until it arrives\n",
+		        s_wl.scale120 ? s_wl.scale120 / 120.0 : 1.0);
 	}
-	if (!s_wl.scale120)
-		fprintf(stderr, "[DisplayXR-WL] no fractional scale reported; assuming 1.0 (the weave may not be 1:1)\n");
 	update_device_size_locked();
+	baseline_wanted_size_locked();
 	s_wl.geometry_dirty = 0; // the create-time size goes into XrWaylandSurfaceGeometryDXR
 	wl_display_flush(display);
 	*out_surface = s_wl.surface;
 	*out_w = s_wl.device_w;
 	*out_h = s_wl.device_h;
 	pthread_mutex_unlock(&s_wl_mutex);
+	dxr_wl_ext_start(&s_ext_callbacks);
 	return 1;
 }
 
@@ -536,11 +639,12 @@ dxr_wl_weave_destroy(void)
 	s_wl.surface = NULL;
 	s_wl.probe_buffer = NULL;
 	s_wl.parent = NULL;
-	s_wl.on_output = NULL;
 	s_wl.transparent = 0;
-	s_wl.restore_pending = 0;
-	s_wl.rescale_after_restore = 0;
+	s_wl.placing = s_wl.move_inflight = s_wl.rescale_after_place = 0;
 	s_wl.size_fixups = 0;
+	s_wl.wanted_device_w = s_wl.wanted_device_h = 0;
+	s_wl.wanted_by_app = 0;
+	s_wl.sent_w = s_wl.sent_h = 0;
 	s_wl.scale120 = 0;
 	s_wl.expect_scale120 = 0;
 	s_wl.logical_w = s_wl.logical_h = 0;
@@ -568,59 +672,8 @@ dxr_wl_weave_active(void)
 	return active;
 }
 
-static int placement_move(int x, int y); // below
-static int query_frame_origin(int *out_x, int *out_y);
-
-static void
-hold_position_locked(int x, int y, double seconds)
-{
-	double t = now_s();
-	s_wl.restore_pending = 1;
-	s_wl.restore_x = x;
-	s_wl.restore_y = y;
-	s_wl.restore_moves = 0;
-	s_wl.restore_until = t + seconds;
-	s_wl.restore_next = t + 0.1;
-}
-
-static void
-finish_restore_locked(void)
-{
-	s_wl.restore_pending = 0;
-	s_wl.rescale_after_restore = 0;
-	s_wl.expect_scale120 = 0; // where it ended up, the compositor has told us the scale
-	// A re-mapped player window can come back at its previous size: ask again for
-	// the one the app wants (a no-op when it has it), but only twice in a row, so a
-	// player that keeps refusing a size cannot make us re-map it forever.
-	if (s_wl.size_fixups < 2) {
-		int had = s_wl.pending_w;
-		rerequest_player_size_locked();
-		if (s_wl.pending_w && !had) {
-			s_wl.size_fixups++;
-			fprintf(stderr, "[DisplayXR-WL] the window is %dx%d logical, not the %dx%d wanted: asking again\n",
-			        s_wl.logical_w, s_wl.logical_h, s_wl.pending_w, s_wl.pending_h);
-		}
-	}
-}
-
-//! One step of putting a re-mapped window back (no lock held: D-Bus round trips).
-static void
-restore_step(int rx, int ry)
-{
-	int x = 0, y = 0;
-	if (!query_frame_origin(&x, &y) || (x == rx && y == ry))
-		return; // not mapped yet, or where it belongs
-	pthread_mutex_lock(&s_wl_mutex);
-	int go = s_wl.restore_pending && !s_wl.dragging && s_wl.restore_moves < 3;
-	if (go)
-		s_wl.restore_moves++;
-	pthread_mutex_unlock(&s_wl_mutex);
-	if (!go)
-		return;
-	fprintf(stderr, "[DisplayXR-WL] the compositor placed the window at (%d,%d): back to (%d,%d)\n", x, y, rx, ry);
-	placement_move(rx, ry);
-}
-
+//! Per frame on the provider's frame thread. No D-Bus here: placement runs on the
+//! extension worker.
 static int
 dxr_wl_weave_poll(int *out_w, int *out_h)
 {
@@ -636,22 +689,17 @@ dxr_wl_weave_poll(int *out_w, int *out_h)
 	if (s_host->player_surface_generation() != s_wl.parent_generation) {
 		unsigned generation = 0;
 		struct wl_surface *player = s_host->lock_player_surface(&generation);
-		int attached = 0, recreated = 0;
+		int recreated = 0;
 		if (player) { // else: between surfaces, retry
 			recreated = player != s_wl.parent;
 			attach_to_parent_locked(player);
 			s_wl.parent_generation = generation;
-			attached = 1;
 		}
 		s_host->unlock_player_surface();
-		if (attached) {
+		if (player) {
 			wl_display_flush(s_wl.display);
 			if (recreated)
 				fprintf(stderr, "[DisplayXR-WL] the player recreated its window: weave re-attached\n");
-			if (s_wl.restore_pending) // re-mapped mid-hold: hold on for longer
-				hold_position_locked(s_wl.restore_x, s_wl.restore_y, 3.0);
-			else if (s_wl.pos_valid && !s_wl.dragging)
-				hold_position_locked(s_wl.pos_x, s_wl.pos_y, 3.0);
 		}
 	}
 	// The player's window size (its swapchain extent, logical px).
@@ -659,23 +707,13 @@ dxr_wl_weave_poll(int *out_w, int *out_h)
 	if (s_host->unity_swapchain_size(&lw, &lh) && (lw != s_wl.logical_w || lh != s_wl.logical_h)) {
 		s_wl.logical_w = lw;
 		s_wl.logical_h = lh;
+		if (lw == s_wl.sent_w && lh == s_wl.sent_h)
+			s_wl.sent_w = s_wl.sent_h = 0; // the player applied what it was sent
 		wp_viewport_set_destination(s_wl.viewport, lw, lh);
 		update_device_size_locked();
 		wl_display_flush(s_wl.display);
 	}
 	wl_display_dispatch_queue_pending(s_wl.display, s_wl.queue);
-	int restore = 0, rx = 0, ry = 0;
-	if (s_wl.restore_pending) {
-		double t = now_s();
-		if (t > s_wl.restore_until || s_wl.dragging) {
-			finish_restore_locked();
-		} else if (t >= s_wl.restore_next) {
-			s_wl.restore_next = t + 0.25;
-			restore = 1;
-			rx = s_wl.restore_x;
-			ry = s_wl.restore_y;
-		}
-	}
 	int dirty = s_wl.geometry_dirty;
 	if (dirty) {
 		s_wl.geometry_dirty = 0;
@@ -683,8 +721,6 @@ dxr_wl_weave_poll(int *out_w, int *out_h)
 		*out_h = s_wl.device_h;
 	}
 	pthread_mutex_unlock(&s_wl_mutex);
-	if (restore)
-		restore_step(rx, ry);
 	return dirty;
 }
 
@@ -769,14 +805,34 @@ dxr_wl_set_player_input_region(const void *rects, int n)
 	return player != NULL; // NULL: the player is between window surfaces
 }
 
+// Placement (below).
+static void panel_centre_locked(const struct dxr_wl_output *panel, int layout, int *out_x, int *out_y);
+static void set_intent_locked(int x, int y, const char *why);
+
 static void
 dxr_wl_request_player_size(int device_w, int device_h)
 {
 	pthread_mutex_lock(&s_wl_mutex);
 	s_wl.wanted_device_w = device_w;
 	s_wl.wanted_device_h = device_h;
+	s_wl.wanted_by_app = 1;
 	s_wl.size_fixups = 0;
 	rerequest_player_size_locked();
+	// Centred on the 3D panel (and not moved since): keep it centred at the new size.
+	struct dxr_wl_output *panel = output_named_locked(s_wl.intent_centred_on);
+	int layout = panel ? layout_locked() : DXR_LAYOUT_UNKNOWN;
+	if (panel && layout != DXR_LAYOUT_UNKNOWN) {
+		int x, y;
+		panel_centre_locked(panel, layout, &x, &y);
+		if (x != s_wl.intent_x || y != s_wl.intent_y) {
+			char name[sizeof(s_wl.intent_centred_on)];
+			memcpy(name, s_wl.intent_centred_on, sizeof(name));
+			char why[96];
+			snprintf(why, sizeof(why), "3D panel '%s', re-centred for %dx%d px", name, device_w, device_h);
+			set_intent_locked(x, y, why);
+			memcpy(s_wl.intent_centred_on, name, sizeof(name));
+		}
+	}
 	pthread_mutex_unlock(&s_wl_mutex);
 }
 
@@ -786,122 +842,282 @@ dxr_wl_take_player_size(int *out_w, int *out_h)
 	pthread_mutex_lock(&s_wl_mutex);
 	int have = s_wl.surface && s_wl.pending_w > 0 && s_wl.pending_h > 0;
 	if (have) {
-		*out_w = s_wl.pending_w;
-		*out_h = s_wl.pending_h;
+		*out_w = s_wl.sent_w = s_wl.pending_w;
+		*out_h = s_wl.sent_h = s_wl.pending_h;
 		s_wl.pending_w = s_wl.pending_h = 0;
 	}
 	pthread_mutex_unlock(&s_wl_mutex);
-	// The player re-maps its window when it applies the size, somewhere else: note
-	// where it is now, so dxr_wl_weave_poll() can put it back.
-	int x = 0, y = 0;
-	if (have && query_frame_origin(&x, &y)) {
-		pthread_mutex_lock(&s_wl_mutex);
-		s_wl.pos_valid = 1;
-		s_wl.pos_x = x;
-		s_wl.pos_y = y;
-		s_wl.pos_at = now_s();
-		pthread_mutex_unlock(&s_wl_mutex);
-	}
 	return have;
 }
 
 /*
  *
- * Window controls through the DisplayXR GNOME Shell extension
- * (displayxr_linux_wayland_dbus.c), and what they tell us about our position.
+ * Placement, driven by what the GNOME extension reports (worker thread).
  *
  */
 
+static int
+win_mapped(const DxrWlExtWindow *w)
+{
+	return w->present && w->w > 0 && w->h > 0;
+}
+
+//! Where the window is now, the extension says what scale its monitor has, ahead of
+//! the fractional-scale protocol: compute sizes for that.
 static void
-note_position(int x, int y)
+follow_window_scale_locked(void)
+{
+	if (!win_mapped(&s_wl.win) || s_wl.win.device_scale <= 0.0)
+		return;
+	uint32_t t120 = (uint32_t)lround(120.0 * s_wl.win.device_scale);
+	s_wl.expect_scale120 = t120 != s_wl.scale120 ? t120 : 0;
+}
+
+//! A placement ended (the window is where it should be, or where the compositor
+//! insists on): act on a scale change seen meanwhile, and re-ask for the size the
+//! app wants if the player came back at another one (twice in a row at most, so a
+//! player that keeps refusing a size cannot make us re-map it forever).
+static void
+place_done_locked(void)
+{
+	s_wl.placing = 0;
+	s_wl.move_inflight = 0;
+	s_wl.rescale_after_place = 0;
+	follow_window_scale_locked();
+	// (Not while a size handed to the player has not reached its window yet: that
+	// is a resize in progress, not one reverted. And not before the protocol has
+	// caught up with the new output's scale: the scale change re-asks then, and a
+	// resize right as the window lands on another output is one the player tends to
+	// revert.)
+	if (s_wl.size_fixups < 2 && !s_wl.sent_w && !s_wl.expect_scale120) {
+		int had = s_wl.pending_w;
+		rerequest_player_size_locked();
+		if (s_wl.pending_w && !had) {
+			s_wl.size_fixups++;
+			fprintf(stderr, "[DisplayXR-WL] the window is %dx%d logical, not the %dx%d wanted: asking again\n",
+			        s_wl.logical_w, s_wl.logical_h, s_wl.pending_w, s_wl.pending_h);
+		}
+	}
+}
+
+//! Ask the extension to move the window to the intent; its answer comes back as a
+//! window report with after_move set.
+static void
+place_locked(const char *why)
+{
+	if (!s_wl.ext_available || !s_wl.intent_valid || !s_wl.surface)
+		return;
+	if (s_wl.corrections >= DXR_WL_MAX_CORRECTIONS) {
+		if (!(s_wl.warned & DXR_WARN_GAVE_UP))
+			fprintf(stderr, "[DisplayXR-WL] the compositor keeps placing the window elsewhere: leaving it there\n");
+		s_wl.warned |= DXR_WARN_GAVE_UP;
+		s_wl.intent_x = s_wl.win.x;
+		s_wl.intent_y = s_wl.win.y;
+		place_done_locked();
+		return;
+	}
+	s_wl.corrections++;
+	s_wl.move_inflight = 1;
+	s_wl.placing = 1;
+	// Size requests meanwhile use the target output's scale.
+	int layout = layout_locked();
+	struct dxr_wl_output *target = output_at_locked(s_wl.intent_x, s_wl.intent_y);
+	uint32_t t120 = target && layout != DXR_LAYOUT_UNKNOWN ? output_scale120_locked(target, layout) : 0;
+	if (t120 && t120 != s_wl.scale120)
+		s_wl.expect_scale120 = t120;
+	fprintf(stderr, "[DisplayXR-WL] %s: window -> (%d,%d)\n", why, s_wl.intent_x, s_wl.intent_y);
+	dxr_wl_ext_move_window(s_wl.intent_x, s_wl.intent_y);
+}
+
+static void
+ext_availability(int available, unsigned caps, const char *layout)
 {
 	pthread_mutex_lock(&s_wl_mutex);
-	s_wl.pos_valid = 1;
-	s_wl.pos_x = x;
-	s_wl.pos_y = y;
-	s_wl.pos_at = now_s();
+	s_wl.ext_available = available;
+	s_wl.ext_caps = caps;
+	snprintf(s_wl.ext_layout, sizeof(s_wl.ext_layout), "%s", layout ? layout : "");
+	if (!available) {
+		s_wl.placing = s_wl.move_inflight = s_wl.rescale_after_place = 0;
+		s_wl.expect_scale120 = 0;
+		memset(&s_wl.win, 0, sizeof(s_wl.win));
+	} else if (!(caps & DXR_WL_EXT_CAP_POINTER_DRAG)) {
+		fprintf(stderr, "[DisplayXR-WL] the GNOME extension has no pointer drag (needs version 9): right-drag "
+		                "will not move the window\n");
+	}
 	pthread_mutex_unlock(&s_wl_mutex);
 }
 
-static int
-placement_move(int x, int y)
+static void
+ext_window(const DxrWlExtWindow *w, int after_move, int moved)
 {
-	int moved = dxr_wl_ext_move_window(x, y);
-	if (moved)
-		note_position(x, y);
-	return moved;
+	pthread_mutex_lock(&s_wl_mutex);
+	int was_mapped = win_mapped(&s_wl.win);
+	s_wl.win = *w;
+	int mapped = win_mapped(w);
+	if (!s_wl.surface) {
+		pthread_mutex_unlock(&s_wl_mutex);
+		return;
+	}
+	if (after_move) {
+		// Our move's result. Where the compositor kept the window elsewhere (its
+		// constraints: e.g. a window as tall as the output), accept that.
+		s_wl.move_inflight = 0;
+		if (!moved)
+			fprintf(stderr, "[DisplayXR-WL] the extension did not move the window (a move grab in progress?)\n");
+		else if (mapped && (w->x != s_wl.intent_x || w->y != s_wl.intent_y))
+			fprintf(stderr, "[DisplayXR-WL] the compositor kept the window at (%d,%d), not (%d,%d): leaving it there\n",
+			        w->x, w->y, s_wl.intent_x, s_wl.intent_y);
+		if (mapped && (w->x != s_wl.intent_x || w->y != s_wl.intent_y)) {
+			s_wl.intent_centred_on[0] = 0;
+			s_wl.intent_valid = 1;
+			s_wl.intent_x = w->x;
+			s_wl.intent_y = w->y;
+		}
+		place_done_locked();
+		pthread_mutex_unlock(&s_wl_mutex);
+		return;
+	}
+	if (!mapped) {
+		// Not on screen (yet): its position is not where it will show.
+		pthread_mutex_unlock(&s_wl_mutex);
+		return;
+	}
+	if (!was_mapped) {
+		// Just (re)mapped: the compositor has placed it by its own rules.
+		s_wl.corrections = 0;
+		if (s_wl.intent_valid && (w->x != s_wl.intent_x || w->y != s_wl.intent_y)) {
+			char why[96];
+			snprintf(why, sizeof(why), "the compositor placed the window at (%d,%d)", w->x, w->y);
+			place_locked(why);
+		} else {
+			s_wl.intent_valid = 1;
+			s_wl.intent_x = w->x;
+			s_wl.intent_y = w->y;
+			place_done_locked();
+		}
+		pthread_mutex_unlock(&s_wl_mutex);
+		return;
+	}
+	if (!s_wl.move_inflight && (w->x != s_wl.intent_x || w->y != s_wl.intent_y)) {
+		// Moved by the user (our drag, Super+drag, the keyboard) or by the
+		// compositor uninvited: follow it.
+		s_wl.intent_centred_on[0] = 0;
+		s_wl.intent_valid = 1;
+		s_wl.intent_x = w->x;
+		s_wl.intent_y = w->y;
+	}
+	if (!s_wl.placing && !s_wl.move_inflight)
+		follow_window_scale_locked();
+	pthread_mutex_unlock(&s_wl_mutex);
 }
 
-static int
-query_frame_origin(int *out_x, int *out_y)
+static void
+ext_drag(int started)
 {
-	return dxr_wl_ext_frame_origin(out_x, out_y);
+	pthread_mutex_lock(&s_wl_mutex);
+	if (s_wl.drag_state == 1)
+		s_wl.drag_state = started ? 2 : 0;
+	pthread_mutex_unlock(&s_wl_mutex);
+	fprintf(stderr, "[DisplayXR-WL] window drag: %s\n", started ? "start" : "refused");
 }
+
+static const DxrWlExtCallbacks s_ext_callbacks = {
+    .availability = ext_availability,
+    .window = ext_window,
+    .drag = ext_drag,
+};
 
 static int
 dxr_wl_begin_pointer_drag(unsigned button)
 {
-	int started = dxr_wl_ext_begin_pointer_drag(button);
-	if (started) {
-		pthread_mutex_lock(&s_wl_mutex);
-		s_wl.dragging = 1;
-		pthread_mutex_unlock(&s_wl_mutex);
-	}
-	fprintf(stderr, "[DisplayXR-WL] window drag: %s\n", started ? "start" : "refused");
-	return started;
+	pthread_mutex_lock(&s_wl_mutex);
+	int ok = s_wl.surface && s_wl.ext_available && (s_wl.ext_caps & DXR_WL_EXT_CAP_POINTER_DRAG);
+	if (ok)
+		s_wl.drag_state = 1;
+	else if (!(s_wl.warned & DXR_WARN_DRAG))
+		fprintf(stderr, "[DisplayXR-WL] window drag unavailable (%s)\n",
+		        s_wl.ext_available ? "the GNOME extension has no pointer drag" : "no DisplayXR GNOME extension");
+	if (!ok)
+		s_wl.warned |= DXR_WARN_DRAG;
+	pthread_mutex_unlock(&s_wl_mutex);
+	if (ok)
+		dxr_wl_ext_begin_pointer_drag(button);
+	return ok;
 }
 
 static void
 dxr_wl_end_pointer_drag(void)
 {
-	dxr_wl_ext_end_pointer_drag();
-	int x = 0, y = 0;
-	int have = query_frame_origin(&x, &y); // where the user left it
 	pthread_mutex_lock(&s_wl_mutex);
-	s_wl.dragging = 0;
+	int was = s_wl.drag_state;
+	s_wl.drag_state = 0;
 	pthread_mutex_unlock(&s_wl_mutex);
-	if (have)
-		note_position(x, y);
-	fprintf(stderr, "[DisplayXR-WL] window drag: end at (%d,%d)\n", x, y);
-}
-
-/*
- *
- * Placement: onto the 3D panel, and positions in X root coordinates.
- *
- */
-
-//! The scale (x 120) of the output containing logical point (x, y); 0 if none.
-static uint32_t
-scale120_at_locked(int x, int y)
-{
-	for (int i = 0; i < DXR_WL_MAX_OUTPUTS; i++) {
-		const struct dxr_wl_output *o = &s_wl.outputs[i];
-		if (o->registry_name && o->lw > 0 && x >= o->lx && x < o->lx + o->lw && y >= o->ly &&
-		    y < o->ly + o->lh)
-			return (uint32_t)lround(120.0 * o->mode_w / o->lw);
+	if (was) {
+		dxr_wl_ext_end_pointer_drag();
+		fprintf(stderr, "[DisplayXR-WL] window drag: end\n");
 	}
-	return 0;
 }
 
-//! Move the window, then hold it there (see restore_pending). No lock held.
+//! The top-left that centres the window on `panel` at the size it will have there:
+//! the size the app asked for (device px) in the panel's stage px.
+static void
+panel_centre_locked(const struct dxr_wl_output *panel, int layout, int *out_x, int *out_y)
+{
+	uint32_t p120 = output_scale120_locked(panel, layout);
+	double stage_per_device = layout == DXR_LAYOUT_PHYSICAL ? 1.0 : 120.0 / (p120 ? p120 : 120);
+	int sw, sh;
+	if (s_wl.wanted_device_w > 0 && s_wl.wanted_device_h > 0) {
+		sw = (int)lround(s_wl.wanted_device_w * stage_per_device);
+		sh = (int)lround(s_wl.wanted_device_h * stage_per_device);
+	} else {
+		double scale = layout == DXR_LAYOUT_PHYSICAL ? p120 / 120.0 : 1.0; // surface px -> stage px
+		sw = (int)lround(s_wl.logical_w * scale);
+		sh = (int)lround(s_wl.logical_h * scale);
+	}
+	int x = panel->lx + (panel->lw - sw) / 2;
+	int y = panel->ly + (panel->lh - sh) / 2;
+	*out_x = x < panel->lx ? panel->lx : x;
+	*out_y = y < panel->ly ? panel->ly : y;
+}
+
+//! Where the window should go: size requests use that output's scale from now on,
+//! and it is moved there now if it is on screen, else as soon as it is mapped.
+static void
+set_intent_locked(int x, int y, const char *why)
+{
+	s_wl.intent_centred_on[0] = 0; // (the panel move sets it again right after)
+	s_wl.intent_valid = 1;
+	s_wl.intent_x = x;
+	s_wl.intent_y = y;
+	int layout = layout_locked();
+	struct dxr_wl_output *target = output_at_locked(x, y);
+	uint32_t t120 = target && layout != DXR_LAYOUT_UNKNOWN ? output_scale120_locked(target, layout) : 0;
+	if (t120 && t120 != s_wl.scale120) {
+		s_wl.expect_scale120 = t120;
+		// A size the app asked for, at the old scale: re-ask for the target's now.
+		// (A baseline is only re-asked once the window is there: the app usually
+		// asks for its own size right after placing it.)
+		if (s_wl.wanted_by_app)
+			rerequest_player_size_locked();
+	}
+	if (win_mapped(&s_wl.win))
+		place_locked(why);
+	else
+		fprintf(stderr, "[DisplayXR-WL] %s: window -> (%d,%d) once it is mapped\n", why, x, y);
+}
+
+//! Placement needs the layout mode; say so once when it cannot be told.
 static int
-place_and_hold(int x, int y)
+layout_or_warn_locked(void)
 {
-	int moved = placement_move(x, y);
-	if (!moved)
-		return 0;
-	pthread_mutex_lock(&s_wl_mutex);
-	if (s_wl.surface) {
-		hold_position_locked(x, y, 5.0);
-		uint32_t target120 = scale120_at_locked(x, y);
-		if (target120 && target120 != s_wl.scale120) {
-			s_wl.expect_scale120 = target120;
-			rerequest_player_size_locked(); // a size asked for at the old scale
-		}
+	int layout = layout_locked();
+	if (layout == DXR_LAYOUT_UNKNOWN && !(s_wl.warned & DXR_WARN_LAYOUT)) {
+		fprintf(stderr, "[DisplayXR-WL] mutter's layout mode cannot be told (extension says '%s', the outputs "
+		                "disagree): no window placement\n",
+		        s_wl.ext_layout);
+		s_wl.warned |= DXR_WARN_LAYOUT;
 	}
-	pthread_mutex_unlock(&s_wl_mutex);
-	return 1;
+	return layout;
 }
 
 static int
@@ -913,122 +1129,135 @@ dxr_wl_move_player_to_panel(const char *connector, int panel_w, int panel_h)
 		return 0;
 	}
 	wl_display_dispatch_queue_pending(s_wl.display, s_wl.queue);
-	// By connector name first (unambiguous), by mode if the name is unknown.
-	struct dxr_wl_output *panel = NULL;
-	for (int i = 0; i < DXR_WL_MAX_OUTPUTS && connector && *connector; i++)
-		if (s_wl.outputs[i].registry_name && !strcmp(s_wl.outputs[i].name, connector))
-			panel = &s_wl.outputs[i];
-	for (int i = 0; i < DXR_WL_MAX_OUTPUTS && !panel; i++)
-		if (s_wl.outputs[i].registry_name && s_wl.outputs[i].mode_w == panel_w &&
-		    s_wl.outputs[i].mode_h == panel_h && s_wl.outputs[i].lw > 0)
-			panel = &s_wl.outputs[i];
+	// By connector name (unambiguous); by mode only when exactly one output has it.
+	struct dxr_wl_output *panel = output_named_locked(connector);
+	if (!panel) {
+		int matches = 0;
+		for (int i = 0; i < DXR_WL_MAX_OUTPUTS; i++) {
+			struct dxr_wl_output *o = &s_wl.outputs[i];
+			if (o->registry_name && o->mode_w == panel_w && o->mode_h == panel_h && o->lw > 0) {
+				panel = o;
+				matches++;
+			}
+		}
+		if (matches > 1)
+			panel = NULL;
+	}
 	if (!panel) {
 		pthread_mutex_unlock(&s_wl_mutex);
-		fprintf(stderr, "[DisplayXR-WL] 3D panel: no output named '%s' or with a %dx%d mode\n",
+		fprintf(stderr, "[DisplayXR-WL] 3D panel: no single output named '%s' or with a %dx%d mode\n",
 		        connector ? connector : "", panel_w, panel_h);
 		return 0;
 	}
-	if (s_wl.on_output == panel) {
-		// Already there: leave it, as the X11 and Windows paths do.
+	int layout = layout_or_warn_locked();
+	if (layout == DXR_LAYOUT_UNKNOWN || !s_wl.ext_available) {
 		pthread_mutex_unlock(&s_wl_mutex);
-		return 1;
+		if (layout != DXR_LAYOUT_UNKNOWN)
+			fprintf(stderr, "[DisplayXR-WL] 3D panel '%s': no DisplayXR GNOME extension to move the window\n",
+			        panel->name);
+		return 0;
 	}
-	// Centre the window as it will be there: a size the app already asked for in
-	// device px becomes a different logical size at the panel's scale.
-	uint32_t panel120 = panel->lw > 0 ? (uint32_t)lround(120.0 * panel->mode_w / panel->lw) : 0;
-	double panel_scale = panel120 ? panel120 / 120.0 : 1.0;
-	int lw = s_wl.logical_w, lh = s_wl.logical_h;
-	if (s_wl.wanted_device_w > 0 && s_wl.wanted_device_h > 0) {
-		lw = (int)lround(s_wl.wanted_device_w / panel_scale);
-		lh = (int)lround(s_wl.wanted_device_h / panel_scale);
-	}
-	int x = panel->lx + (panel->lw - lw) / 2;
-	int y = panel->ly + (panel->lh - lh) / 2;
-	if (x < panel->lx)
-		x = panel->lx;
-	if (y < panel->ly)
-		y = panel->ly;
-	char name[sizeof(panel->name)];
-	memcpy(name, panel->name, sizeof(name));
-	int plw = panel->lw, plh = panel->lh, plx = panel->lx, ply = panel->ly;
-	pthread_mutex_unlock(&s_wl_mutex);
-
-	int moved = place_and_hold(x, y);
-	fprintf(stderr, "[DisplayXR-WL] 3D panel '%s' (%dx%d logical at %d,%d): window -> (%d,%d) %s\n", name, plw, plh,
-	        plx, ply, x, y, moved ? "moved" : "NOT moved");
-	return moved;
-}
-
-// X root px per logical px. Under mutter's xwayland-native-scaling (GNOME 47+,
-// Ubuntu's default) X root coordinates are logical x N, N = the largest output
-// scale rounded up. That is the space the X11 path reads and restores window
-// positions in, so a position an app saved under either backend means the same
-// place under the other. (With the feature off, X root is logical and N would be
-// 1; not handled.)
-static int
-xwayland_scale_locked(void)
-{
-	double max_scale = 1.0;
-	for (int i = 0; i < DXR_WL_MAX_OUTPUTS; i++) {
-		const struct dxr_wl_output *o = &s_wl.outputs[i];
-		if (o->registry_name && o->lw > 0 && o->mode_w > 0) {
-			double sc = (double)o->mode_w / o->lw;
-			if (sc > max_scale)
-				max_scale = sc;
+	// Already there: leave it, as the X11 and Windows paths do.
+	if (win_mapped(&s_wl.win)) {
+		int cx = s_wl.win.x + s_wl.win.w / 2, cy = s_wl.win.y + s_wl.win.h / 2;
+		if (output_at_locked(cx, cy) == panel) {
+			pthread_mutex_unlock(&s_wl_mutex);
+			return 1;
 		}
 	}
-	return (int)ceil(max_scale - 1e-3);
+	int x, y;
+	panel_centre_locked(panel, layout, &x, &y);
+	char why[96];
+	snprintf(why, sizeof(why), "3D panel '%s' (stage %dx%d at %d,%d)", panel->name, panel->lw, panel->lh, panel->lx,
+	         panel->ly);
+	set_intent_locked(x, y, why);
+	snprintf(s_wl.intent_centred_on, sizeof(s_wl.intent_centred_on), "%s", panel->name);
+	pthread_mutex_unlock(&s_wl_mutex);
+	return 1;
+}
+
+static void
+dxr_wl_set_x11_panel_rect(const char *connector, int x, int y, int w, int h)
+{
+	pthread_mutex_lock(&s_wl_mutex);
+	snprintf(s_wl.x11_connector, sizeof(s_wl.x11_connector), "%s", connector ? connector : "");
+	s_wl.x11_valid = w > 0 && h > 0;
+	s_wl.x11_x = x;
+	s_wl.x11_y = y;
+	s_wl.x11_w = w;
+	s_wl.x11_h = h;
+	pthread_mutex_unlock(&s_wl_mutex);
+}
+
+//! X root px per stage px, 0 when it cannot be told. The app-facing position API
+//! speaks X root coordinates (what the X11 path reads and restores). Under
+//! XWayland they are the stage x N: N = the largest scale rounded up with
+//! mutter's xwayland-native-scaling in logical layout, 1 without it or in physical
+//! layout. Rather than guess which, compare the runtime's panel rect (X root px,
+//! from XRandR) with the same panel's stage rect.
+static int
+x11_scale_locked(void)
+{
+	struct dxr_wl_output *panel = s_wl.x11_valid ? output_named_locked(s_wl.x11_connector) : NULL;
+	int n = 0;
+	if (panel && panel->lw > 0) {
+		n = (int)lround((double)s_wl.x11_w / panel->lw);
+		if (n < 1 || abs(s_wl.x11_w - panel->lw * n) > 1 || abs(s_wl.x11_h - panel->lh * n) > 1 ||
+		    abs(s_wl.x11_x - panel->lx * n) > 1 || abs(s_wl.x11_y - panel->ly * n) > 1)
+			n = 0;
+	}
+	if (!n && !(s_wl.warned & DXR_WARN_X11)) {
+		fprintf(stderr, "[DisplayXR-WL] window positions cannot be converted to X root coordinates (%s): the "
+		                "saved-position API reports them as unknown\n",
+		        !s_wl.x11_valid ? "the runtime reported no panel rect"
+		        : !panel        ? "no output matches the runtime's panel"
+		                        : "the runtime's panel rect does not match the output's");
+		s_wl.warned |= DXR_WARN_X11;
+	}
+	return n;
 }
 
 static int
 dxr_wl_get_player_position_x11(int *out_x, int *out_y)
 {
 	pthread_mutex_lock(&s_wl_mutex);
-	if (!s_wl.surface) {
-		pthread_mutex_unlock(&s_wl_mutex);
-		return 0;
+	int known = 0;
+	if (s_wl.surface && s_wl.ext_available && (win_mapped(&s_wl.win) || s_wl.intent_valid)) {
+		int sx = win_mapped(&s_wl.win) ? s_wl.win.x : s_wl.intent_x;
+		int sy = win_mapped(&s_wl.win) ? s_wl.win.y : s_wl.intent_y;
+		int n = x11_scale_locked();
+		if (n) {
+			s_wl.last_x11_valid = 1;
+			s_wl.last_x11_x = sx * n;
+			s_wl.last_x11_y = sy * n;
+			known = 1;
+		}
 	}
-	// Apps read this every frame: ask the compositor at most once a second, and
-	// answer from what we know otherwise (our moves, drags and resizes update it).
-	int refresh = !s_wl.pos_valid || now_s() - s_wl.pos_at > 1.0;
+	// Unknown now: answer the last position we could tell (an app that saves what
+	// it reads keeps a real one), and say it is not current.
+	if (s_wl.last_x11_valid) {
+		*out_x = s_wl.last_x11_x;
+		*out_y = s_wl.last_x11_y;
+	}
 	pthread_mutex_unlock(&s_wl_mutex);
-	int qx = 0, qy = 0;
-	int queried = refresh && query_frame_origin(&qx, &qy);
-	pthread_mutex_lock(&s_wl_mutex);
-	if (refresh) // also on failure: don't retry every frame
-		s_wl.pos_at = now_s();
-	if (queried && !s_wl.restore_pending) { // mid-restore it is about to be back
-		s_wl.pos_valid = 1;
-		s_wl.pos_x = qx;
-		s_wl.pos_y = qy;
-	}
-	int have = s_wl.pos_valid;
-	int lx = s_wl.restore_pending ? s_wl.restore_x : s_wl.pos_x;
-	int ly = s_wl.restore_pending ? s_wl.restore_y : s_wl.pos_y;
-	int n = xwayland_scale_locked();
-	pthread_mutex_unlock(&s_wl_mutex);
-	if (have) {
-		*out_x = lx * n;
-		*out_y = ly * n;
-	}
-	return have;
+	return known;
 }
 
 static int
 dxr_wl_set_player_position_x11(int x, int y)
 {
 	pthread_mutex_lock(&s_wl_mutex);
-	if (!s_wl.surface) {
+	int n = s_wl.surface ? x11_scale_locked() : 0;
+	int layout = n ? layout_or_warn_locked() : DXR_LAYOUT_UNKNOWN;
+	if (!n || layout == DXR_LAYOUT_UNKNOWN) {
 		pthread_mutex_unlock(&s_wl_mutex);
 		return 0;
 	}
-	int n = xwayland_scale_locked();
+	char why[96];
+	snprintf(why, sizeof(why), "the app's position X (%d,%d)", x, y);
+	set_intent_locked((int)lround((double)x / n), (int)lround((double)y / n), why);
 	pthread_mutex_unlock(&s_wl_mutex);
-	int lx = (int)lround((double)x / n), ly = (int)lround((double)y / n);
-	int moved = place_and_hold(lx, ly); // the app's placement replaces any hold
-	fprintf(stderr, "[DisplayXR-WL] window -> X (%d,%d) = logical (%d,%d) %s\n", x, y, lx, ly,
-	        moved ? "moved" : "NOT moved");
-	return moved;
+	return 1;
 }
 
 /*
@@ -1056,6 +1285,7 @@ static const DxrWlApi s_api = {
     .get_player_position_x11 = dxr_wl_get_player_position_x11,
     .set_player_position_x11 = dxr_wl_set_player_position_x11,
     .player_generation = dxr_wl_player_generation,
+    .set_x11_panel_rect = dxr_wl_set_x11_panel_rect,
 };
 
 __attribute__((visibility("default"))) const DxrWlApi *
