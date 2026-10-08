@@ -217,12 +217,15 @@ void dxr_pvk_destroy(void);
 /// included) uses them until then. Safe to call when nothing was created.
 void dxr_pvk_destroy_device(void);
 
-/// Leak this session's VkInstance instead of destroying it in
-/// dxr_pvk_destroy_device() (the device still goes). For the native-Wayland
-/// player only: the runtime made its weave surface with that instance on the
-/// PLAYER's wl_display, and with at least one current desktop driver destroying it
-/// tears down WSI state the driver shares per wl_display: the player's own
-/// swapchain destroy then crashes at exit. Reset by dxr_pvk_destroy_device().
+/// Keep this session's VkInstance instead of destroying it in
+/// dxr_pvk_destroy_device() (the device still goes); kept instances are held in a
+/// process static and counted in the log. For the native-Wayland player only: the
+/// runtime made its weave surface with that instance on the PLAYER's wl_display,
+/// and with at least one current desktop driver destroying it tears down WSI state
+/// the driver shares per wl_display, so the player's own swapchain destroy then
+/// crashes (PC 0, inside the driver) at exit. Measured: 8/8 runs crash when it is
+/// destroyed, whether the weave's wl_surface goes before or after it; 0 when kept.
+/// The cost is one instance per session restart. Reset by dxr_pvk_destroy_device().
 void dxr_pvk_keep_instance_alive(void);
 
 /// 1 once dxr_pvk_create_device() has succeeded.

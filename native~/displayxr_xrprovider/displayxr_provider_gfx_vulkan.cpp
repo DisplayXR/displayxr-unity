@@ -1525,16 +1525,27 @@ dxr_pvk_keep_instance_alive(void)
 	s_pvk.keep_instance = true;
 }
 
+// The instances kept alive by dxr_pvk_keep_instance_alive(): one per native-Wayland
+// session that ran in this process. Held here (not just dropped) and counted, so a
+// session restart's cost is visible; never destroyed (see the header).
+static VkInstance s_kept_instances[16];
+static unsigned s_kept_count;
+
 void
 dxr_pvk_destroy_device(void)
 {
 	if (s_pvk.device && s_pvk.api.vkDeviceWaitIdle) s_pvk.api.vkDeviceWaitIdle(s_pvk.device);
 	if (s_pvk.device && s_pvk.api.vkDestroyDevice)
 		s_pvk.api.vkDestroyDevice(s_pvk.device, NULL);
-	if (s_pvk.instance && s_pvk.api.vkDestroyInstance && !s_pvk.keep_instance)
+	if (s_pvk.instance && s_pvk.api.vkDestroyInstance && !s_pvk.keep_instance) {
 		s_pvk.api.vkDestroyInstance(s_pvk.instance, NULL);
-	else if (s_pvk.instance)
-		pvk_log("[DisplayXR-PROV-VK] instance kept alive (native-Wayland weave)\n");
+	} else if (s_pvk.instance) {
+		if (s_kept_count < sizeof(s_kept_instances) / sizeof(s_kept_instances[0]))
+			s_kept_instances[s_kept_count] = s_pvk.instance;
+		s_kept_count++;
+		pvk_log("[DisplayXR-PROV-VK] instance kept alive (native-Wayland weave): %u kept in this process\n",
+		        s_kept_count);
+	}
 
 	// Unity's objects are NOT ours to destroy — drop the references only.
 	VkApi unity_api = s_pvk.unity_api;
