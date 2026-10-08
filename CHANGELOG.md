@@ -5,6 +5,14 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.25.0] - 2026-10-08
+
+### Added
+- Linux launcher (#356, DisplayXR/displayxr-runtime#1831): a Linux build now writes `<name>.sh` next to the player; point the app's `.desktop` `Exec=` at it. At launch it starts the player as a native Wayland app (`-force-wayland`) when on a GNOME Wayland session with the DisplayXR GNOME extension (window drag capability), runtime ≥ 2.28.0 and a Vulkan loader, otherwise under X11. Transparent overlay apps also get `-popupwindow`. `DISPLAYXR_LINUX_BACKEND=wayland|x11` forces one; arguments pass through. Built on Windows, the script must be `chmod +x`'d on the Linux box.
+
+### Fixed
+- Native-Wayland player (#357): a window mapped at a stale size larger than the panel is resized first and moved once it fits, instead of ending up back on the laptop; moves caused by a resize are undone; size requests are capped at 95% of the destination output so an oversized size is never saved for the next start.
+
 ## [2.24.1] - 2026-10-08
 
 ### Fixed
