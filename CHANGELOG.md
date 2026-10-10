@@ -5,6 +5,11 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- macOS/Metal colour washed out on the format-honest Metal compositor (#358, DisplayXR/displayxr-runtime#1901, ADR-044): every swapchain that holds encoded bytes is now `_SRGB` on Metal — the primary layer and extra 3D zones of a Gamma project (Unity renders through a UNORM view of the image, so the bytes land unconverted), and the window-space UI / Local2D canvases (the overlay blit copies raw bytes through a view of the destination in the canvas RT's format). Linear projects' primary layer was already `_SRGB`; their zones stay UNORM (linear values). Correct on older Metal runtimes too (they read `_SRGB` as raw bytes); `DXR_SWAPCHAIN_ENCODING=unorm` restores the old choice for A/B.
+
 ## [2.25.0] - 2026-10-08
 
 ### Added
