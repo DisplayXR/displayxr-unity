@@ -161,6 +161,24 @@ displayxr_metal_blit_textures(void *queue_ptr, void *src_ptr, void *dst_ptr)
 	id<MTLTexture> src = (__bridge id<MTLTexture>)src_ptr;
 	id<MTLTexture> dst = (__bridge id<MTLTexture>)dst_ptr;
 
+	// sRGB siblings (#358, ADR-044): the overlay swapchain is _sRGB because the canvas holds
+	// ENCODED bytes, while Unity's canvas RT is BGRA8Unorm (Gamma) or BGRA8Unorm_sRGB (Linear,
+	// encodes on store). Either way the bytes must move UNCONVERTED, so blit into a view of the
+	// destination in the source's format (the runtime creates its swapchain images with
+	// MTLTextureUsagePixelFormatView). A blit is a byte copy, never a decode/encode.
+	id<MTLTexture> dst_view = nil;
+	if (src.pixelFormat != dst.pixelFormat) {
+		MTLPixelFormat a = src.pixelFormat, b = dst.pixelFormat;
+		int siblings =
+		    ((a == MTLPixelFormatBGRA8Unorm || a == MTLPixelFormatBGRA8Unorm_sRGB) &&
+		     (b == MTLPixelFormatBGRA8Unorm || b == MTLPixelFormatBGRA8Unorm_sRGB)) ||
+		    ((a == MTLPixelFormatRGBA8Unorm || a == MTLPixelFormatRGBA8Unorm_sRGB) &&
+		     (b == MTLPixelFormatRGBA8Unorm || b == MTLPixelFormatRGBA8Unorm_sRGB));
+		if (siblings) {
+			dst_view = [dst newTextureViewWithPixelFormat:a];
+			if (dst_view) dst = dst_view;
+		}
+	}
 	if (src.pixelFormat != dst.pixelFormat) {
 		// Same-format-only path: log once if mismatched. The format-conversion
 		// blit (render-pass shader) is intentionally not implemented here to

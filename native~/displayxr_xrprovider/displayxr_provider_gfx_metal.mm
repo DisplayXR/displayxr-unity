@@ -90,12 +90,29 @@ void *dxr_prov_metal_create_session_queue(void)
 	return (__bridge void *)s_session_queue;
 }
 
-void *dxr_prov_metal_slice_view(void *array_tex, uint32_t slice)
+// Retain a view until teardown/realloc (Unity's wrap of it is destroyed deferred —
+// ADR-001; retired generations park in the graveyard).
+static void mgl_retain_view(id<MTLTexture> view)
+{
+	if (!s_graveyard) s_graveyard = [NSMutableArray array];
+	static NSMutableArray *s_live_views = nil;
+	if (!s_live_views) s_live_views = [NSMutableArray array];
+	[s_live_views addObject:view];
+	// Cap growth across reallocs: move all but the newest generation (up to
+	// 8 images x 2 eyes, plus 8 whole-array views) to the graveyard.
+	while (s_live_views.count > 24) {
+		[s_graveyard addObject:s_live_views[0]];
+		[s_live_views removeObjectAtIndex:0];
+	}
+}
+
+void *dxr_prov_metal_slice_view(void *array_tex, uint32_t slice, int64_t pixel_format)
 {
 	id<MTLTexture> arr = (__bridge id<MTLTexture>)array_tex;
 	if (!arr || slice >= arr.arrayLength) return nullptr;
+	MTLPixelFormat fmt = pixel_format ? (MTLPixelFormat)pixel_format : arr.pixelFormat;
 	id<MTLTexture> view =
-	    [arr newTextureViewWithPixelFormat:arr.pixelFormat
+	    [arr newTextureViewWithPixelFormat:fmt
 	                           textureType:MTLTextureType2D
 	                                levels:NSMakeRange(0, 1)
 	                                slices:NSMakeRange(slice, 1)];
@@ -104,18 +121,22 @@ void *dxr_prov_metal_slice_view(void *array_tex, uint32_t slice)
 		return nullptr;
 	}
 	view.label = slice == 0 ? @"DisplayXR swapchain slice L" : @"DisplayXR swapchain slice R";
-	// Retain until teardown/realloc (Unity's wrap of it is destroyed deferred —
-	// ADR-001; retired generations park in the graveyard).
-	if (!s_graveyard) s_graveyard = [NSMutableArray array];
-	static NSMutableArray *s_live_views = nil;
-	if (!s_live_views) s_live_views = [NSMutableArray array];
-	[s_live_views addObject:view];
-	// Cap growth across reallocs: move all but the newest generation (up to
-	// 8 images x 2 eyes) to the graveyard.
-	while (s_live_views.count > 16) {
-		[s_graveyard addObject:s_live_views[0]];
-		[s_live_views removeObjectAtIndex:0];
+	mgl_retain_view(view);
+	return (__bridge void *)view;
+}
+
+void *dxr_prov_metal_format_view(void *tex, int64_t pixel_format)
+{
+	id<MTLTexture> t = (__bridge id<MTLTexture>)tex;
+	if (!t) return nullptr;
+	if (!pixel_format || (MTLPixelFormat)pixel_format == t.pixelFormat) return tex;
+	id<MTLTexture> view = [t newTextureViewWithPixelFormat:(MTLPixelFormat)pixel_format];
+	if (!view) {
+		mgl_log("[DisplayXR-PROV] Metal: format view creation failed\n");
+		return nullptr;
 	}
+	view.label = @"DisplayXR swapchain (raw-byte view)";
+	mgl_retain_view(view);
 	return (__bridge void *)view;
 }
 

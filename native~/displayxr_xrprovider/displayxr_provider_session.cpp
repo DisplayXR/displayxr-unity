@@ -294,6 +294,9 @@ typedef struct ProviderExtraZone {
 	// sc_images_metal / eye_view_metal; PopulateNextFrameDesc rotates to acquired_index.
 	XrSwapchainImageMetalKHR sc_images_metal[PS_MAX_SWAPCHAIN_IMAGES];
 	void *eye_view_metal[PS_MAX_SWAPCHAIN_IMAGES][2];
+	// What SPI wraps per image: the image itself, or (Gamma project, _SRGB swapchain) its
+	// UNORM view, so Unity's encoded bytes land unconverted (ADR-044 / #347 / #358).
+	void *unity_tex_metal[PS_MAX_SWAPCHAIN_IMAGES];
 #endif
 	int         image_acquired;
 	uint32_t    acquired_index;
@@ -610,6 +613,9 @@ typedef struct ProviderSession {
 	// NULL deref — lldb-verified, bring-up runs 7-18). Encoder-less signal/wait
 	// CBs are safe (run 19) and provide the render→weave order.
 	void *eye_view_metal[PS_MAX_SWAPCHAIN_IMAGES][2];
+	// SPI wraps these whole arraySize=2 textures: the image itself, or its UNORM view when a
+	// Gamma project renders into an _SRGB swapchain (ADR-044 / #358). Same lifetime as above.
+	void *unity_tex_metal[PS_MAX_SWAPCHAIN_IMAGES];
 #endif
 	int         swapchain_created;
 
@@ -1292,9 +1298,18 @@ static void ps_publish_stereo_matrices(void); // defined after dxr_prov_begin_fr
 //   - Gamma project:  Unity renders into the UNORM sibling (s_unity_format) and submit's raw
 //                     copy (CopyResource / CopyTextureRegion / vkCmdCopyImage — never a blit)
 //                     moves those encoded bytes into the _SRGB image unchanged.
-// Metal is not format-honest yet (ADR-044 §7) and keeps the old rule. On an older runtime, or
-// under the runtime's own escape hatch DXR_COLOR_LEGACY_UNORM_ENCODED=1, everything stays as it
-// was before #347.
+// On an older runtime, or under the runtime's own escape hatch DXR_COLOR_LEGACY_UNORM_ENCODED=1,
+// D3D/Vulkan stay as they were before #347.
+//
+// METAL (#358). The runtime's Metal compositor became format-honest in the first release after
+// v2.32.0 (runtime 23cb3db40, #1901). Metal makes the SAME split, with views instead of copies
+// (zero-copy: Unity renders straight into the swapchain images): a Gamma project renders through
+// a UNORM view of the _SRGB image (SPI: dxr_prov_metal_format_view; MultiPass and zones: slice
+// views). Unlike D3D/Vulkan this is NOT version-gated: every Metal runtime that predates the
+// change reads an _SRGB swapchain as raw bytes (it sampled one through a UNORM view), exactly
+// as it read UNORM, so "encoded bytes in _SRGB" is correct on old and new Metal runtimes alike
+// — while "encoded bytes in UNORM" is washed out on the new one. DXR_SWAPCHAIN_ENCODING=unorm
+// restores the pre-#358 Metal choice (A/B diagnostic, same knob as the runtime's Metal cube apps).
 static int s_color_space_linear = 0; // Unity project color space (C# pushes pre-session)
 static int s_swapchain_srgb     = 0; // primary swapchain created with an sRGB format
 static int s_unity_rt_srgb      = 0; // Unity encodes on store (sRGB-flagged eye textures)
@@ -1331,9 +1346,28 @@ static int ps_runtime_format_honest(void)
 	case DXR_GFX_D3D11:  need = XR_MAKE_VERSION(2, 21, 0); break;
 	case DXR_GFX_D3D12:  need = XR_MAKE_VERSION(2, 21, 1); break;
 	case DXR_GFX_VULKAN: need = XR_MAKE_VERSION(2, 21, 7); break;
-	default:             return 0; // Metal: not migrated (ADR-044 §7)
+	// Metal: the first release after v2.32.0 (#1901). Informational only — the Metal format
+	// choice does not depend on it (see ps_encoded_wants_srgb).
+	case DXR_GFX_METAL:  need = XR_MAKE_VERSION(2, 32, 1); break;
+	default:             return 0;
 	}
 	return s_runtime_version >= need;
+}
+
+// Metal A/B: DXR_SWAPCHAIN_ENCODING=unorm keeps the pre-#358 UNORM choice for encoded bytes.
+static int ps_metal_unorm_forced(void)
+{
+	const char *e = getenv("DXR_SWAPCHAIN_ENCODING");
+	return e && (e[0] == 'u' || e[0] == 'U');
+}
+
+// 1 when a swapchain that holds ENCODED bytes should be _SRGB. D3D/Vulkan: only on a
+// format-honest runtime (an older one decodes _SRGB). Metal: always — every Metal runtime reads
+// _SRGB as encoded (old ones as raw bytes, the format-honest one by decoding), see the header.
+static int ps_encoded_wants_srgb(void)
+{
+	if (s_ps.graphics_api == DXR_GFX_METAL) return !ps_metal_unorm_forced();
+	return ps_runtime_format_honest();
 }
 
 // The _SRGB / UNORM sibling of an 8-bit RGBA/BGRA swapchain format, in the current API's
@@ -1349,6 +1383,10 @@ static int64_t ps_srgb_sibling(int64_t f)
 		if (f == 28) return 29; // R8G8B8A8_UNORM -> _UNORM_SRGB
 		if (f == 87) return 91; // B8G8R8A8_UNORM -> _UNORM_SRGB
 	}
+	if (s_ps.graphics_api == DXR_GFX_METAL) {
+		if (f == 70) return 71; // MTLPixelFormatRGBA8Unorm -> _sRGB
+		if (f == 80) return 81; // MTLPixelFormatBGRA8Unorm -> _sRGB
+	}
 	return f;
 }
 static int64_t ps_unorm_sibling(int64_t f)
@@ -1362,14 +1400,19 @@ static int64_t ps_unorm_sibling(int64_t f)
 		if (f == 29) return 28;
 		if (f == 91) return 87;
 	}
+	if (s_ps.graphics_api == DXR_GFX_METAL) {
+		if (f == 71) return 70;
+		if (f == 81) return 80;
+	}
 	return f;
 }
 
 // Pick an overlay/zone swapchain format that holds ENCODED bytes: on a format-honest runtime
-// the _SRGB sibling of `unorm` if advertised, else `unorm` itself (byte-identical to before).
+// (Metal: any runtime, #358) the _SRGB sibling of `unorm` if advertised, else `unorm` itself
+// (byte-identical to before).
 static int64_t ps_encoded_bytes_format(int64_t unorm, const int64_t *formats, uint32_t count)
 {
-	if (!ps_runtime_format_honest()) return unorm;
+	if (!ps_encoded_wants_srgb()) return unorm;
 	int64_t s = ps_srgb_sibling(unorm);
 	if (s == unorm) return unorm;
 	for (uint32_t i = 0; i < count; i++)
@@ -1471,8 +1514,11 @@ static int ps_create_swapchain(void)
 	int present_path = s_sc_present_path;
 	// Format-honest runtime (#347): _SRGB in both colour spaces — a Gamma project's encoded
 	// bytes are copied in raw from a UNORM-sibling bridge (s_unity_format below).
+	// Metal (#358): _SRGB on every runtime (ps_encoded_wants_srgb); the Gamma bytes go in
+	// through a UNORM view of the image rather than a copy.
 	int format_honest = ps_runtime_format_honest();
-	int want_srgb = format_honest || (s_color_space_linear && present_path);
+	int encoded_srgb = ps_encoded_wants_srgb();
+	int want_srgb = encoded_srgb || (s_color_space_linear && present_path);
 	int64_t format = formats[0];
 	// The int64 swapchain format is API-SPECIFIC: DXGI_FORMAT under D3D, VkFormat under
 	// Vulkan, MTLPixelFormat on Metal. They are NOT interchangeable and the numbers
@@ -1532,7 +1578,7 @@ static int ps_create_swapchain(void)
 	}
 	if (s_color_space_linear && present_path && !s_swapchain_srgb)
 		ps_log("[DisplayXR-PROV] WARN: Linear project but runtime advertised NO sRGB swapchain format — present stays too dark (needs a runtime-side present encode)\n");
-	if (format_honest && !s_color_space_linear && !s_swapchain_srgb)
+	if (encoded_srgb && !s_color_space_linear && !s_swapchain_srgb)
 		ps_log("[DisplayXR-PROV] WARN: format-honest runtime advertised NO sRGB swapchain format — "
 		       "a Gamma project's encoded bytes go into UNORM and look washed out (#347)\n");
 	// What Unity renders into: the swapchain format when Unity encodes (Linear + _SRGB), else its
@@ -1663,13 +1709,26 @@ static int ps_create_swapchain(void)
 	// Unity renders straight into the slices; no provider blit (see the field
 	// comment on eye_view_metal). Realloc-safe: the glue parks replaced views
 	// in its graveyard (ADR-001 deferred destruction).
-	for (uint32_t i = 0; i < count; i++) {
-		for (uint32_t e = 0; e < 2; e++) {
-			s_ps.eye_view_metal[i][e] =
-			    dxr_prov_metal_slice_view(s_ps.sc_images_metal[i].texture, e);
-			if (!s_ps.eye_view_metal[i][e]) {
-				ps_log("[DisplayXR-PROV] Metal: slice view [%u][%u] failed\n", i, e);
+	//
+	// Views are in s_unity_format: the image's own format, or — a Gamma project in an _SRGB
+	// swapchain (#358) — its UNORM sibling, so Unity's encoded bytes are stored unconverted
+	// (ADR-044 §2 "moved without conversion"; the runtime's Metal cube apps do the same).
+	{
+		int64_t view_fmt = (s_unity_format != format) ? s_unity_format : 0;
+		for (uint32_t i = 0; i < count; i++) {
+			s_ps.unity_tex_metal[i] =
+			    dxr_prov_metal_format_view(s_ps.sc_images_metal[i].texture, view_fmt);
+			if (!s_ps.unity_tex_metal[i]) {
+				ps_log("[DisplayXR-PROV] Metal: SPI view [%u] failed\n", i);
 				return 0;
+			}
+			for (uint32_t e = 0; e < 2; e++) {
+				s_ps.eye_view_metal[i][e] =
+				    dxr_prov_metal_slice_view(s_ps.sc_images_metal[i].texture, e, view_fmt);
+				if (!s_ps.eye_view_metal[i][e]) {
+					ps_log("[DisplayXR-PROV] Metal: slice view [%u][%u] failed\n", i, e);
+					return 0;
+				}
 			}
 		}
 	}
@@ -2696,6 +2755,11 @@ static int ps_create_wsui(int slot, uint32_t w, uint32_t h)
 	s_ps.pfn_enumerate_swapchain_formats(s_ps.session, fmt_count, &fmt_count, formats);
 	int64_t format = formats[0];
 	for (uint32_t i = 0; i < fmt_count; i++) { if (formats[i] == 80) { format = 80; break; } }
+	// #358: the canvas holds ENCODED bytes (Gamma: a UNORM RT; Linear: an _SRGB RT that
+	// encodes on store), so the swapchain is the _SRGB sibling. The submit blit is a raw byte
+	// copy whatever the sRGB-ness of either side (displayxr_metal_blit_textures views the
+	// destination in the source's format).
+	format = ps_encoded_bytes_format(format, formats, fmt_count);
 
 	XrSwapchainCreateInfo ci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
 	ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
@@ -3151,6 +3215,11 @@ static int ps_create_local2d(uint32_t w, uint32_t h)
 	s_ps.pfn_enumerate_swapchain_formats(s_ps.session, fmt_count, &fmt_count, formats);
 	int64_t format = formats[0];
 	for (uint32_t i = 0; i < fmt_count; i++) { if (formats[i] == 80) { format = 80; break; } }
+	// #358: the canvas holds ENCODED bytes (Gamma: a UNORM RT; Linear: an _SRGB RT that
+	// encodes on store), so the swapchain is the _SRGB sibling. The submit blit is a raw byte
+	// copy whatever the sRGB-ness of either side (displayxr_metal_blit_textures views the
+	// destination in the source's format).
+	format = ps_encoded_bytes_format(format, formats, fmt_count);
 
 	XrSwapchainCreateInfo ci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
 	ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT |
@@ -3558,10 +3627,16 @@ static int ps_create_extra_zone(ProviderExtraZone *z)
 	s_ps.pfn_enumerate_swapchain_formats(s_ps.session, fmt_count, &fmt_count, formats);
 	int64_t format = formats[0];
 	for (uint32_t i = 0; i < fmt_count; i++) { if (formats[i] == 70) { format = 70; break; } if (formats[i] == 80) format = 80; }
+	// #358 (twin of the D3D arm below): a Gamma project's zone renders hold ENCODED bytes, so the
+	// zone swapchain is the _SRGB sibling and Unity renders through UNORM views of it. Linear
+	// projects keep UNORM: their zone targets are not sRGB-flagged, so Unity stores linear
+	// values, which is what a UNORM swapchain means (the format-honest runtime encodes them).
+	int64_t zone_sc_format = s_color_space_linear ? format : ps_encoded_bytes_format(format, formats, fmt_count);
+	int64_t zone_view_fmt = (zone_sc_format != format) ? format : 0;
 
 	XrSwapchainCreateInfo ci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
 	ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT | XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
-	ci.format = format; ci.sampleCount = 1; ci.width = w; ci.height = h;
+	ci.format = zone_sc_format; ci.sampleCount = 1; ci.width = w; ci.height = h;
 	ci.faceCount = 1; ci.arraySize = 2; ci.mipCount = 1;
 	if (XR_FAILED(s_ps.pfn_create_swapchain(s_ps.session, &ci, &z->swapchain))) { z->swapchain = XR_NULL_HANDLE; return 0; }
 	z->sc_width = w; z->sc_height = h; z->sc_format = format;
@@ -3575,14 +3650,16 @@ static int ps_create_extra_zone(ProviderExtraZone *z)
 	// Zero-copy slice views (id<MTLTexture> view per image×eye). The glue parks retired
 	// generations in its graveyard (ADR-001), so recreate just re-enumerates.
 	for (uint32_t i = 0; i < count; i++) {
+		z->unity_tex_metal[i] = dxr_prov_metal_format_view(z->sc_images_metal[i].texture, zone_view_fmt);
+		if (!z->unity_tex_metal[i]) { ps_log("[DisplayXR-PROV] extra zone id=%u: Metal SPI view [%u] failed\n", z->zone_id, i); return 0; }
 		for (uint32_t e = 0; e < 2; e++) {
-			z->eye_view_metal[i][e] = dxr_prov_metal_slice_view(z->sc_images_metal[i].texture, e);
+			z->eye_view_metal[i][e] = dxr_prov_metal_slice_view(z->sc_images_metal[i].texture, e, zone_view_fmt);
 			if (!z->eye_view_metal[i][e]) { ps_log("[DisplayXR-PROV] extra zone id=%u: Metal slice view [%u][%u] failed\n", z->zone_id, i, e); return 0; }
 		}
 	}
 	z->swapchain_created = 1;
-	ps_log("[DisplayXR-PROV] extra zone id=%u: Metal swapchain %ux%u (%u imgs, fmt=%lld, zero-copy slice views)\n",
-	       z->zone_id, w, h, count, (long long)format);
+	ps_log("[DisplayXR-PROV] extra zone id=%u: Metal swapchain %ux%u (%u imgs, fmt=%lld, unity view fmt=%lld, zero-copy slice views)\n",
+	       z->zone_id, w, h, count, (long long)zone_sc_format, (long long)format);
 	return 1;
 #elif defined(_WIN32)
 	if (z->swapchain_created) return 1;
@@ -3929,7 +4006,7 @@ extern "C" void *dxr_prov_get_extra_zone_metal_eye_view(uint32_t ei, uint32_t im
 extern "C" void *dxr_prov_get_extra_zone_metal_image(uint32_t ei, uint32_t img)
 {
 	if (ei >= PS_MAX_ZONES - 1 || img >= PS_MAX_SWAPCHAIN_IMAGES) return NULL;
-	return s_ps.extra_zones[ei].sc_images_metal[img].texture;
+	return s_ps.extra_zones[ei].unity_tex_metal[img]; // the image, or its UNORM view (#358)
 }
 extern "C" uint32_t dxr_prov_get_extra_zone_image_count(uint32_t ei)
 {
@@ -5850,8 +5927,9 @@ void *dxr_prov_get_swapchain_image_texture(uint32_t index, uint32_t *out_w,
 #elif defined(__APPLE__)
 	// Metal zero-copy (Phase 2 #204 fast-follow): the runtime swapchain image
 	// (id<MTLTexture> on Unity's device), wrapped directly by the display provider.
+	// What Unity renders into: the image, or its UNORM view for a Gamma project (#358).
 	if (s_ps.graphics_api != DXR_GFX_METAL || index >= s_ps.sc_image_count) return NULL;
-	return s_ps.sc_images_metal[index].texture;
+	return s_ps.unity_tex_metal[index];
 #else
 	// Linux/Vulkan (#249): the swapchain images live on the RUNTIME's session device,
 	// so there is nothing here Unity could wrap — the eye bridge is the only path
