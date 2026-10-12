@@ -498,9 +498,11 @@ typedef struct {
 
 #define LIN_CLIENT_MESSAGE 33
 #define LIN_SUBSTRUCTURE_MASK ((1L << 19) | (1L << 20)) // Notify | Redirect
+#define LIN_MR_POSITION ((1L << 8) | (1L << 9))   // x and y present
+#define LIN_MR_SIZE     ((1L << 10) | (1L << 11)) // width and height present
 
 static void
-lin_moveresize_client(XDpy dpy, int x, int y, unsigned int w, unsigned int h)
+lin_net_moveresize(XDpy dpy, long fields, int x, int y, unsigned int w, unsigned int h)
 {
 	XAtom atom = s_x.XInternAtom(dpy, "_NET_MOVERESIZE_WINDOW", 0);
 	if (!atom) return;
@@ -510,22 +512,35 @@ lin_moveresize_client(XDpy dpy, int x, int y, unsigned int w, unsigned int h)
 	e.window = s_win;
 	e.message_type = atom;
 	e.format = 32;
-	e.l[0] = 10 | (1L << 8) | (1L << 9) | (2L << 12);
+	e.l[0] = 10 | fields | (2L << 12);
 	e.l[1] = x;
 	e.l[2] = y;
-	if (w > 0 && h > 0) { // bits 10/11: width and height present
-		e.l[0] |= (1L << 10) | (1L << 11);
-		e.l[3] = (long)w;
-		e.l[4] = (long)h;
-	}
+	e.l[3] = (long)w;
+	e.l[4] = (long)h;
 	s_x.XSendEvent(dpy, s_x.XDefaultRootWindow(dpy), 0, LIN_SUBSTRUCTURE_MASK, &e);
 	s_x.XFlush(dpy);
+}
+
+static void
+lin_moveresize_client(XDpy dpy, int x, int y, unsigned int w, unsigned int h)
+{
+	lin_net_moveresize(dpy, LIN_MR_POSITION | (w > 0 && h > 0 ? LIN_MR_SIZE : 0), x, y, w, h);
 }
 
 static void
 lin_move_client(XDpy dpy, int x, int y)
 {
 	lin_moveresize_client(dpy, x, y, 0, 0);
+}
+
+// Size only: the position fields are left out, so the WM keeps the window where it
+// is, including where a move still in flight puts it. Sending the client's tracked
+// origin here instead (it lags a frame behind) undid a move_to_display issued just
+// before, which left a first-run window on the screen it opened on (#266).
+static void
+lin_resize_client(XDpy dpy, unsigned int w, unsigned int h)
+{
+	lin_net_moveresize(dpy, LIN_MR_SIZE, 0, 0, w, h);
 }
 
 // Keep Unity's window above normal windows while it is cloaked (#332), as the Windows
@@ -1543,16 +1558,7 @@ displayxr_resize_overlay(int width, int height)
 	if (height < LIN_MIN_WINDOW_PX) height = LIN_MIN_WINDOW_PX;
 	pthread_mutex_lock(&s_hit_mutex);
 	XDpy d = lin_main_dpy_locked();
-	if (d) {
-		// Keep the client where it is: the tracked origin for the transparent overlay,
-		// a fresh query otherwise.
-		int x = s_ox, y = s_oy;
-		if (!s_overlay_is_toplevel) {
-			XWin child = 0;
-			s_x.XTranslateCoordinates(d, s_win, s_x.XDefaultRootWindow(d), 0, 0, &x, &y, &child);
-		}
-		lin_moveresize_client(d, x, y, (unsigned int)width, (unsigned int)height);
-	}
+	if (d) lin_resize_client(d, (unsigned int)width, (unsigned int)height);
 	pthread_mutex_unlock(&s_hit_mutex);
 	char m[96];
 	snprintf(m, sizeof(m), "[DisplayXR-LNX] resize_overlay -> %dx%d\n", width, height);
