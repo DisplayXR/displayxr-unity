@@ -41,7 +41,16 @@ void *dxr_prov_metal_create_session_queue(void);
 /// the slice — no provider blit (a provider blit CB touching session textures
 /// crashes the Unity editor's Metal device worker; bring-up runs 7-18).
 /// Retained by the glue until teardown/realloc. Returns id<MTLTexture> or NULL.
-void *dxr_prov_metal_slice_view(void *array_tex, uint32_t slice);
+/// `pixel_format` (an MTLPixelFormat) reinterprets the slice — e.g. the UNORM view of an
+/// _sRGB swapchain a Gamma project renders through so its encoded bytes land unconverted
+/// (ADR-044 / #347); 0 keeps the image's own format. The runtime creates every swapchain
+/// image with MTLTextureUsagePixelFormatView, which makes the reinterpretation legal.
+void *dxr_prov_metal_slice_view(void *array_tex, uint32_t slice, int64_t pixel_format);
+
+/// A whole-texture (all slices) view of `tex` in `pixel_format`, retained by the glue like
+/// the slice views. Returns `tex` itself when the format already matches (or is 0), NULL on
+/// failure. SPI wraps this in place of the swapchain image when Unity must not encode.
+void *dxr_prov_metal_format_view(void *tex, int64_t pixel_format);
 
 /// Cross-queue frame order for zero-copy: signal the shared event on UNITY'S
 /// queue (FIFO after this frame's eye renders) and GPU-wait it on the session
