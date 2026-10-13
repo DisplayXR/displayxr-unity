@@ -9,6 +9,7 @@
 
 #include <dlfcn.h>
 #include <fcntl.h>
+#include <math.h>
 #include <poll.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -16,6 +17,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <time.h>
 #include <unistd.h>
 
 /*
@@ -242,6 +244,16 @@ parse_snapshot(const char *json, DxrWlExtWindow *w, char *layout, size_t layout_
 			const char *mon_end = mon ? json_skip(mon, obj_end) : NULL;
 			const char *ds = mon_end ? json_field(mon, mon_end, "device_scale") : NULL;
 			c.device_scale = ds ? strtod(ds, NULL) : 0.0;
+			const char *mx = mon_end ? json_field(mon, mon_end, "x") : NULL;
+			const char *my = mon_end ? json_field(mon, mon_end, "y") : NULL;
+			const char *mw = mon_end ? json_field(mon, mon_end, "w") : NULL;
+			const char *mh = mon_end ? json_field(mon, mon_end, "h") : NULL;
+			if (mx && my && mw && mh) {
+				c.mon_x = (int)lround(strtod(mx, NULL));
+				c.mon_y = (int)lround(strtod(my, NULL));
+				c.mon_w = (int)lround(strtod(mw, NULL));
+				c.mon_h = (int)lround(strtod(mh, NULL));
+			}
 			// Unity has one window; should there be more, the one mutter has mapped.
 			if (!w->present || (w->w * w->h == 0 && c.w * c.h > 0))
 				*w = c;
@@ -272,6 +284,8 @@ static struct {
 	int begin;
 	unsigned button;
 	int end;
+	int verify;
+	long long verify_at_ns; // CLOCK_MONOTONIC
 } s_job;
 
 // What the filter saw (worker thread only).
@@ -281,6 +295,14 @@ static char *s_latest_json; // the newest WindowsChanged payload, unprocessed
 static int s_available = -1; // the extension owns its bus name (1), not (0), not known yet (-1)
 static unsigned s_caps;
 static char s_layout[16];
+
+static long long
+now_ns(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (long long)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
 
 static void
 wake(void)
@@ -436,6 +458,12 @@ run_jobs(void)
 	pthread_mutex_lock(&s_job_mutex);
 	typeof(s_job) job = s_job;
 	memset(&s_job, 0, sizeof(s_job));
+	// A verification read waits for its time; it stays queued until then.
+	if (job.verify && job.verify_at_ns > now_ns()) {
+		s_job.verify = 1;
+		s_job.verify_at_ns = job.verify_at_ns;
+		job.verify = 0;
+	}
 	pthread_mutex_unlock(&s_job_mutex);
 
 	uint32_t pid = 0; // "the caller"
@@ -464,6 +492,38 @@ run_jobs(void)
 		DxrWlExtWindow none = {0};
 		s_cb->window(&none, 1, 0);
 	}
+	if (job.verify) {
+		// Always answered (a window that is not there when it cannot be read), so
+		// the caller never waits for a check that will not come.
+		DxrWlExtWindow w = {0};
+		DxrDBusMessage *reply = s_available > 0 ? call(DXR_EXT_GEOMETRY_PATH, DXR_EXT_GEOMETRY_IFACE, "GetWindows",
+		                                               DXR_DBUS_TYPE_INVALID)
+		                                        : NULL;
+		if (reply) {
+			DxrDBusError err;
+			s_dbus.error_init(&err);
+			const char *json = NULL;
+			if (s_dbus.get_args(reply, &err, DXR_DBUS_TYPE_STRING, &json, DXR_DBUS_TYPE_INVALID) && json)
+				parse_snapshot(json, &w, s_layout, sizeof(s_layout));
+			s_dbus.error_free(&err);
+			s_dbus.unref(reply);
+		}
+		s_cb->verify(&w);
+	}
+}
+
+//! Milliseconds until a queued verification read is due; -1 = none queued.
+static int
+verify_timeout_ms(void)
+{
+	pthread_mutex_lock(&s_job_mutex);
+	int ms = -1;
+	if (s_job.verify) {
+		long long left = s_job.verify_at_ns - now_ns();
+		ms = left <= 0 ? 0 : (int)((left + 999999) / 1000000);
+	}
+	pthread_mutex_unlock(&s_job_mutex);
+	return ms;
 }
 
 static int
@@ -497,12 +557,12 @@ worker(void *arg)
 		// No placement at all: answer every request as refused.
 		for (;;) {
 			struct pollfd p = {s_wake[0], POLLIN, 0};
-			if (poll(&p, 1, -1) > 0) {
+			if (poll(&p, 1, verify_timeout_ms()) > 0) {
 				char buf[64];
 				while (read(s_wake[0], buf, sizeof(buf)) > 0) {
 				}
-				run_jobs();
 			}
+			run_jobs(); // (also when a verification read fell due)
 		}
 	}
 	int fd = -1;
@@ -532,7 +592,7 @@ worker(void *arg)
 		if (s_owner_changed || s_latest_json)
 			continue;
 		struct pollfd p[2] = {{fd, POLLIN, 0}, {s_wake[0], POLLIN, 0}};
-		if (poll(p, 2, -1) > 0) {
+		if (poll(p, 2, verify_timeout_ms()) > 0) {
 			if (p[1].revents) {
 				char buf[64];
 				while (read(s_wake[0], buf, sizeof(buf)) > 0) {
@@ -599,6 +659,16 @@ dxr_wl_ext_end_pointer_drag(void)
 {
 	pthread_mutex_lock(&s_job_mutex);
 	s_job.end = 1;
+	pthread_mutex_unlock(&s_job_mutex);
+	wake();
+}
+
+void
+dxr_wl_ext_verify_after(int delay_ms)
+{
+	pthread_mutex_lock(&s_job_mutex);
+	s_job.verify = 1;
+	s_job.verify_at_ns = now_ns() + (long long)(delay_ms > 0 ? delay_ms : 0) * 1000000LL;
 	pthread_mutex_unlock(&s_job_mutex);
 	wake();
 }

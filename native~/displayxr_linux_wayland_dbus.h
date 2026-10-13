@@ -31,6 +31,7 @@ typedef struct DxrWlExtWindow {
 	int x, y, w, h;      //!< its frame, stage px; w = h = 0 until mutter maps it
 	int moving;          //!< an interactive move/resize grab is in progress
 	double device_scale; //!< device px per stage px on its monitor; 0 = not reported
+	int mon_x, mon_y, mon_w, mon_h; //!< its monitor's rect, stage px; mon_w = 0 = not reported
 } DxrWlExtWindow;
 
 //! Called on the worker thread, never while it holds a lock of its own.
@@ -44,6 +45,8 @@ typedef struct DxrWlExtCallbacks {
 	void (*window)(const DxrWlExtWindow *w, int after_move, int moved);
 	//! A BeginPointerDrag we asked for was answered.
 	void (*drag)(int started);
+	//! Our window, read afresh (GetWindows) for a dxr_wl_ext_verify_after().
+	void (*verify)(const DxrWlExtWindow *w);
 } DxrWlExtCallbacks;
 
 //! Start the worker (once; later calls are ignored).
@@ -55,6 +58,9 @@ void dxr_wl_ext_move_window(int x, int y);
 //! held. Asynchronous; the drag callback answers.
 void dxr_wl_ext_begin_pointer_drag(unsigned button);
 void dxr_wl_ext_end_pointer_drag(void);
+//! Read our window afresh in delay_ms and report it to the verify callback
+//! (placement verification, #361). Only the latest request is kept.
+void dxr_wl_ext_verify_after(int delay_ms);
 
 #ifdef __cplusplus
 }
