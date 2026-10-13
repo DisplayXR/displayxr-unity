@@ -97,7 +97,9 @@ int dxr_wl_take_player_size(int *out_w, int *out_h);
 int dxr_wl_move_player_to_panel(const char *connector, int panel_w, int panel_h);
 //! The window's position / a new position in X root coordinates (the space the
 //! X11 path saves and restores). get: 1 when known now; otherwise the out values
-//! are the last known position (untouched if there never was one).
+//! are the last known position (untouched if there never was one). set: a
+//! position set just after start (a restored one) that does not lie on the 3D
+//! panel is ignored and the window is centred on the panel instead (#361).
 int dxr_wl_get_player_position_x11(int *out_x, int *out_y);
 int dxr_wl_set_player_position_x11(int x, int y);
 //! The runtime's 3D panel rect in X root px (XrDisplayDesktopInfoDXR): what X root
