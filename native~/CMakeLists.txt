@@ -241,6 +241,12 @@ if(UNIX AND NOT APPLE AND NOT ANDROID)
             LIBRARY_OUTPUT_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}/../Runtime/Plugins/Linux/x86_64"
             LIBRARY_OUTPUT_DIRECTORY_RELEASE "${CMAKE_CURRENT_SOURCE_DIR}/../Runtime/Plugins/Linux/x86_64"
             LIBRARY_OUTPUT_DIRECTORY_DEBUG "${CMAKE_CURRENT_SOURCE_DIR}/../Runtime/Plugins/Linux/x86_64")
+        # Unit test of the placement arithmetic (#361): header-only, no Wayland or
+        # D-Bus needed. `ctest --test-dir <build>` runs it (CI does).
+        enable_testing()
+        add_executable(test_wayland_place tests/test_wayland_place.c)
+        target_include_directories(test_wayland_place PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        add_test(NAME wayland_place COMMAND test_wayland_place)
     else()
         message(WARNING "displayxr_unity: wayland-client (pkg-config) or wayland-scanner not found - "
                         "building WITHOUT libdisplayxr_unity_wayland.so (no native-Wayland player support). "
