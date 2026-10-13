@@ -165,6 +165,12 @@ jobs:
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: cmake --build native~/build --config Release -j"$(nproc)"
 
+      # Unit tests of the native Linux code that runs without a display
+      # (the native-Wayland placement arithmetic, #361).
+      - name: Unit tests
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: ctest --test-dir native~/build --output-on-failure --no-tests=error
+
       - name: Verify output
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
