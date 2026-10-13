@@ -5,6 +5,18 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- Native-Wayland player (#361): a window restored at a position saved under another monitor layout no longer stays on the laptop panel.
+  - A position the app sets with `displayxr_set_overlay_position` just after start (until 3 s after the window is first shown, and only until the user moves it) is converted back to stage coordinates with the same XWayland scale `displayxr_get_overlay_position` saves with. If it does not lie on the 3D panel, it is ignored and the window is centred on the panel (`saved position (x,y) is outside the 3D panel's rect — ignoring, centring on HDMI-1`). A saved position on the panel is still honoured.
+  - A move to the 3D panel (`DisplayXRTargetDisplay`) is now verified. About 350 ms after each placement the plug-in reads the window back through the GNOME extension (`GetWindows`, its monitor rect). If the window is not on the panel, the plug-in moves it again, up to 3 times (about 1 s), and logs `placement verified: LANDED …` or `… NOT on the panel after N tries …`. A user drag ends the verification.
+  - At the end of a right-drag the log names where the window was left and the X root position `displayxr_get_overlay_position` now reports, i.e. the value an app saves.
+  - X11, Windows and macOS are unchanged.
+
+### Added
+- Linux CI runs the native unit tests (`ctest`). The first one covers the Wayland placement arithmetic (`native~/displayxr_linux_wayland_place.h`).
+
 ## [2.25.1] - 2026-10-12
 
 ### Fixed
