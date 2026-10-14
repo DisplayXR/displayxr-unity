@@ -105,6 +105,12 @@ static struct {
 	struct wl_shm *shm;
 	struct wp_viewporter *viewporter;
 	struct wp_fractional_scale_manager_v1 *frac_manager;
+	// Our own wl_pointer on this queue, for the depth cursor: enter/leave of the player's
+	// window, i.e. its input region (outside it, the cursor of whatever lies behind shows).
+	// -1 not known yet, 0 the pointer is elsewhere, 1 over the window.
+	struct wl_seat *seat;
+	struct wl_pointer *pointer;
+	int pointer_state;
 	struct zxdg_output_manager_v1 *xdg_output_manager;
 	struct dxr_wl_output outputs[DXR_WL_MAX_OUTPUTS];
 
@@ -374,6 +380,72 @@ output_named_locked(const char *name)
  */
 
 static void
+ptr_enter(void *d, struct wl_pointer *p, uint32_t serial, struct wl_surface *surface, wl_fixed_t x, wl_fixed_t y)
+{
+	(void)d; (void)p; (void)serial; (void)surface; (void)x; (void)y;
+	s_wl.pointer_state = 1; // only our own surfaces send us enter
+}
+
+static void
+ptr_leave(void *d, struct wl_pointer *p, uint32_t serial, struct wl_surface *surface)
+{
+	(void)d; (void)p; (void)serial; (void)surface;
+	s_wl.pointer_state = 0;
+}
+
+static void
+ptr_motion(void *d, struct wl_pointer *p, uint32_t time, wl_fixed_t x, wl_fixed_t y)
+{
+	(void)d; (void)p; (void)time; (void)x; (void)y;
+}
+
+static void
+ptr_button(void *d, struct wl_pointer *p, uint32_t serial, uint32_t time, uint32_t button, uint32_t state)
+{
+	(void)d; (void)p; (void)serial; (void)time; (void)button; (void)state;
+}
+
+static void
+ptr_axis(void *d, struct wl_pointer *p, uint32_t time, uint32_t axis, wl_fixed_t value)
+{
+	(void)d; (void)p; (void)time; (void)axis; (void)value;
+}
+
+// wl_seat version 1: only these five pointer events are ever sent.
+static const struct wl_pointer_listener s_pointer_listener = {
+    .enter = ptr_enter,
+    .leave = ptr_leave,
+    .motion = ptr_motion,
+    .button = ptr_button,
+    .axis = ptr_axis,
+};
+
+static void
+seat_capabilities(void *d, struct wl_seat *seat, uint32_t caps)
+{
+	(void)d;
+	if ((caps & WL_SEAT_CAPABILITY_POINTER) && !s_wl.pointer) {
+		s_wl.pointer = wl_seat_get_pointer(seat);
+		wl_pointer_add_listener(s_wl.pointer, &s_pointer_listener, NULL);
+	} else if (!(caps & WL_SEAT_CAPABILITY_POINTER) && s_wl.pointer) {
+		wl_pointer_destroy(s_wl.pointer);
+		s_wl.pointer = NULL;
+		s_wl.pointer_state = -1;
+	}
+}
+
+static void
+seat_name(void *d, struct wl_seat *seat, const char *name)
+{
+	(void)d; (void)seat; (void)name;
+}
+
+static const struct wl_seat_listener s_seat_listener = {
+    .capabilities = seat_capabilities,
+    .name = seat_name,
+};
+
+static void
 registry_global(void *data, struct wl_registry *reg, uint32_t name, const char *iface, uint32_t version)
 {
 	(void)data;
@@ -383,6 +455,10 @@ registry_global(void *data, struct wl_registry *reg, uint32_t name, const char *
 		s_wl.subcompositor = wl_registry_bind(reg, name, &wl_subcompositor_interface, 1);
 	} else if (strcmp(iface, wl_shm_interface.name) == 0) {
 		s_wl.shm = wl_registry_bind(reg, name, &wl_shm_interface, 1);
+	} else if (strcmp(iface, wl_seat_interface.name) == 0 && !s_wl.seat) {
+		s_wl.pointer_state = -1;
+		s_wl.seat = wl_registry_bind(reg, name, &wl_seat_interface, 1);
+		wl_seat_add_listener(s_wl.seat, &s_seat_listener, NULL);
 	} else if (strcmp(iface, wp_viewporter_interface.name) == 0) {
 		s_wl.viewporter = wl_registry_bind(reg, name, &wp_viewporter_interface, 1);
 	} else if (strcmp(iface, wp_fractional_scale_manager_v1_interface.name) == 0) {
@@ -824,6 +900,16 @@ dxr_wl_weave_poll(int *out_w, int *out_h)
 	}
 	pthread_mutex_unlock(&s_wl_mutex);
 	return dirty;
+}
+
+//! The pointer is over the player's window (its input region): 1, elsewhere 0, not known -1.
+static int
+dxr_wl_pointer_inside(void)
+{
+	pthread_mutex_lock(&s_wl_mutex);
+	int v = s_wl.surface && s_wl.pointer ? s_wl.pointer_state : -1;
+	pthread_mutex_unlock(&s_wl_mutex);
+	return v;
 }
 
 static double
@@ -1672,6 +1758,7 @@ static const DxrWlApi s_api = {
     .weave_active = dxr_wl_weave_active,
     .weave_device_size = dxr_wl_weave_device_size,
     .ui_scale = dxr_wl_ui_scale,
+    .pointer_inside = dxr_wl_pointer_inside,
     .click_through_wanted = dxr_wl_click_through_wanted,
     .set_player_input_region = dxr_wl_set_player_input_region,
     .begin_pointer_drag = dxr_wl_begin_pointer_drag,

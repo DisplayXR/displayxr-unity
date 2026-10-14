@@ -95,6 +95,24 @@ static void test_screen_to_uv()
 	CHECK(screen_to_canvas_uv(1500, 540, 1920, 1080, 1, 1000, 0, 500, 1080, &uv));
 	CHECK(near(uv.x, 1.0f) && near(uv.y, 0.5f));
 
+	// A scaled native-Wayland output (200 %): Unity's 600x483 LOGICAL screen is a
+	// 1200x966 px window whose app zone is its bottom 75 % (0,242 1200x724 px). The
+	// pointer must reach client px before the zone mapping.
+	{
+		float mx = 300.0f, my = 241.5f, sw = 600.0f, sh = 483.0f;
+		screen_to_client_px(1200.0f, 966.0f, &mx, &my, &sw, &sh);
+		CHECK(near(mx, 600.0f) && near(my, 483.0f) && near(sw, 1200.0f) && near(sh, 966.0f));
+		CHECK(screen_to_canvas_uv(mx, my, sw, sh, 1, 0, 242, 1200, 724, &uv));
+		CHECK(near(uv.x, 0.5f) && near(uv.y, (483.0f - 242.0f) / 724.0f) && uv_in_canvas(uv));
+		// Unscaled, the same pointer maps to the wrong place (the bug this fixes).
+		CHECK(screen_to_canvas_uv(300.0f, 241.5f, 600.0f, 483.0f, 1, 0, 242, 1200, 724, &uv));
+		CHECK(near(uv.x, 0.25f) && !near(uv.y, (483.0f - 242.0f) / 724.0f));
+		// Unknown client size: unchanged.
+		float a = 10.0f, b = 20.0f, c = 600.0f, d = 483.0f;
+		screen_to_client_px(0.0f, 966.0f, &a, &b, &c, &d);
+		CHECK(near(a, 10.0f) && near(b, 20.0f) && near(c, 600.0f) && near(d, 483.0f));
+	}
+
 	// Degenerate inputs never produce a UV.
 	CHECK(!screen_to_canvas_uv(1, 1, 0, 1080, 0, 0, 0, 0, 0, &uv));
 	CHECK(!screen_to_canvas_uv(1, 1, 1920, 0, 0, 0, 0, 0, 0, &uv));
