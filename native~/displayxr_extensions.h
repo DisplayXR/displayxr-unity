@@ -786,6 +786,102 @@ typedef XrResult(XRAPI_PTR *PFN_xrGetDisplayZoneRecommendedViewSizeDXR)(
 typedef XrResult(XRAPI_PTR *PFN_xrGetWorkspaceTileSizeDXR)(
     XrSession session, XrExtent2Di *tileSize);
 
+// --- XR_DXR_cursor_depth (ADR-046 + Amendments 2 and 3) ---
+// HAND-WRITTEN mirror of the runtime's
+// src/external/openxr_includes/openxr/XR_DXR_cursor_depth.h, reconciled against
+// SPEC_VERSION 7. Like the rest of this file it carries only what the provider uses:
+// the hint, the source / options / draw-request structs chained on it, and the two
+// outputs on XrViewState. The v6 lifted-rect structs (XrCursorDepthLiftRectDXR /
+// XrCursorDepthLiftStateDXR, XR_DXR_lift weave rects) are deliberately NOT mirrored -
+// a Unity app has no weave rects. The layouts below must match the runtime header
+// byte for byte (extension struct ABI rule: header growth is synced to every consumer).
+//
+// What each spec version gives this provider (gated on the extensionVersion the
+// runtime ADVERTISES, never on this mirror's number):
+//   v5  the RUNTIME draws the cursor (XrCursorDepthDrawInfoDXR) and says so
+//       (XrCursorDepthDrawStateDXR::willDraw) - the provider's minimum.
+//   v7  XR_CURSOR_DEPTH_SOURCE_MEASURED_DISPARITY_DXR: the runtime block-matches the
+//       outer views itself, so the app needs no hit test at all.
+// SUBMITTED_DEPTH (v2) is mirrored for completeness but not used: it needs
+// XR_KHR_composition_layer_depth, which the runtime still builds OFF by default.
+#define XR_DXR_CURSOR_DEPTH_EXTENSION_NAME "XR_DXR_cursor_depth"
+#define XR_DXR_cursor_depth_SPEC_VERSION 7
+
+#define XR_TYPE_CURSOR_DEPTH_HINT_DXR ((XrStructureType)1004999320)
+#define XR_TYPE_CURSOR_DEPTH_PLACEMENT_DXR ((XrStructureType)1004999321)
+#define XR_TYPE_CURSOR_DEPTH_SOURCE_DXR ((XrStructureType)1004999322)
+#define XR_TYPE_CURSOR_DEPTH_OPTIONS_DXR ((XrStructureType)1004999323)
+#define XR_TYPE_CURSOR_DEPTH_DRAW_INFO_DXR ((XrStructureType)1004999324)
+#define XR_TYPE_CURSOR_DEPTH_DRAW_STATE_DXR ((XrStructureType)1004999325)
+
+// Chained on XrViewLocateInfo::next. Chaining it IS the per-frame request; a locate
+// without it costs the runtime nothing (ADR-046 section 0).
+typedef struct XrCursorDepthHintDXR {
+	XrStructureType type; // XR_TYPE_CURSOR_DEPTH_HINT_DXR
+	const void *next;
+	XrVector2f cursorUV;      // CANVAS-normalised, origin top-left, v DOWN
+	XrBool32 hasContent;      // APP_POINT only: content under the cursor footprint
+	XrVector3f nearestPoint;  // APP_POINT only: nearest content point, locate space
+	float cursorHeight;       // fraction of canvas height; <= 0 = runtime default (0.03)
+} XrCursorDepthHintDXR;
+
+typedef enum XrCursorDepthSourceKindDXR {
+	XR_CURSOR_DEPTH_SOURCE_APP_POINT_DXR = 0,
+	XR_CURSOR_DEPTH_SOURCE_SUBMITTED_DEPTH_DXR = 1,      // v2; not used (see above)
+	XR_CURSOR_DEPTH_SOURCE_MEASURED_DISPARITY_DXR = 2,   // v7
+	XR_CURSOR_DEPTH_SOURCE_KIND_MAX_ENUM_DXR = 0x7FFFFFFF
+} XrCursorDepthSourceKindDXR;
+
+// Chained on XrCursorDepthHintDXR::next (v2). Per-frame request for a runtime-side source.
+typedef struct XrCursorDepthSourceDXR {
+	XrStructureType type; // XR_TYPE_CURSOR_DEPTH_SOURCE_DXR
+	const void *next;
+	XrCursorDepthSourceKindDXR source;
+} XrCursorDepthSourceDXR;
+
+typedef enum XrCursorDepthAnchorModeDXR {
+	XR_CURSOR_DEPTH_ANCHOR_MODE_HYBRID_DXR = 0,
+	XR_CURSOR_DEPTH_ANCHOR_MODE_SCREEN_DXR = 1,
+	XR_CURSOR_DEPTH_ANCHOR_MODE_WORLD_DXR = 2,
+	XR_CURSOR_DEPTH_ANCHOR_MODE_MAX_ENUM_DXR = 0x7FFFFFFF
+} XrCursorDepthAnchorModeDXR;
+
+// Chained on XrCursorDepthHintDXR::next (v3). Absent = HYBRID + the runtime's margin.
+typedef struct XrCursorDepthOptionsDXR {
+	XrStructureType type; // XR_TYPE_CURSOR_DEPTH_OPTIONS_DXR
+	const void *next;
+	XrCursorDepthAnchorModeDXR anchorMode;
+	float margin; // eye-baseline units; <= 0 = runtime default (0.015)
+} XrCursorDepthOptionsDXR;
+
+// Chained on XrCursorDepthHintDXR::next (v5): "runtime, draw the cursor this frame".
+typedef struct XrCursorDepthDrawInfoDXR {
+	XrStructureType type; // XR_TYPE_CURSOR_DEPTH_DRAW_INFO_DXR
+	const void *next;
+	XrSwapchain image;    // XR_NULL_HANDLE = the runtime's default look (mirrors the OS cursor)
+	XrVector2f hotSpot;   // ignored for the default look
+	float sizeMeters;     // <= 0 = the OS cursor's size
+	XrBool32 visible;
+} XrCursorDepthDrawInfoDXR;
+
+// Chained on XrViewState::next (v5). Hide the OS cursor exactly while willDraw.
+typedef struct XrCursorDepthDrawStateDXR {
+	XrStructureType type; // XR_TYPE_CURSOR_DEPTH_DRAW_STATE_DXR
+	void *next;
+	XrBool32 willDraw;
+} XrCursorDepthDrawStateDXR;
+
+// Chained on XrViewState::next (v1). Diagnostics only in this provider (the runtime draws).
+typedef struct XrCursorDepthPlacementDXR {
+	XrStructureType type; // XR_TYPE_CURSOR_DEPTH_PLACEMENT_DXR
+	void *next;
+	XrBool32 isActive;
+	XrPosef pose;
+	float height;
+	float disparity;       // filtered, eye-baseline units, <= 0 since v4
+	float targetDisparity; // unfiltered target this locate
+} XrCursorDepthPlacementDXR;
+
 #ifdef __cplusplus
 }
 #endif

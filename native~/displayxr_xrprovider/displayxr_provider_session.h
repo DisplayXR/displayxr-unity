@@ -513,6 +513,45 @@ DISPLAYXR_EXPORT void dxr_prov_set_content_bounds(float min_x, float min_y, floa
 DISPLAYXR_EXPORT void dxr_prov_set_content_mask(const uint8_t *cells, uint32_t w,
                                                 uint32_t h, uint32_t stride);
 
+// ---- Depth-aware cursor (XR_DXR_cursor_depth, ADR-046) ----------------------
+// The runtime DRAWS the cursor in stereo (spec v5) at the depth of the content under
+// it; the provider chains the per-frame request on its primary xrLocateViews and hides
+// the OS cursor over its overlay exactly while the runtime reports willDraw. All of it
+// is opt-in (C#: DisplayXRCursorDepth.Enabled) and costs nothing while off.
+
+/// Snapshot for C# (mirrors DisplayXRProviderNative.CursorState).
+typedef struct DxrProvCursorState {
+	uint32_t runtime_spec; ///< advertised XR_DXR_cursor_depth version; 0 = absent or < 5
+	int      enabled;      ///< the app opted in
+	int      requested;    ///< the last locate chained a hint (pointer on the canvas, gates passed)
+	int      will_draw;    ///< ... and the runtime said it draws the cursor this frame
+	float    disparity;    ///< filtered disparity, eye baselines (<= 0; diagnostic)
+} DxrProvCursorState;
+
+/// Opt in / out. @p source: 0 = measured disparity (needs runtime spec >= 7), 1 = app
+/// point (the app supplies hits via dxr_prov_cursor_set_hits; needs spec >= 5).
+/// @p margin: eye baselines in front of the content; <= 0 = the runtime default.
+DISPLAYXR_EXPORT void dxr_prov_cursor_configure(int enabled, int source, float margin);
+
+/// The pointer, in Unity SCREEN pixels (origin bottom-left, Input.mousePosition) plus
+/// the screen size it is measured against. @p valid 0 = no pointer (nothing chained).
+DISPLAYXR_EXPORT void dxr_prov_cursor_set_pointer(int valid, float mouse_x, float mouse_y,
+                                                  float screen_w, float screen_h);
+
+/// APP_POINT: the content hits under the cursor footprint, UNITY WORLD xyz triples
+/// (count may be 0 = nothing under the cursor). The provider keeps the one nearest the
+/// viewer. The latest call wins; set every frame.
+DISPLAYXR_EXPORT void dxr_prov_cursor_set_hits(const float *xyz, uint32_t count);
+
+/// The footprint rays to cast for APP_POINT, in UNITY WORLD: (origin xyz, unit dir xyz)
+/// per ray, from the last located outer views through the current pointer. @return the
+/// ray count (<= max_rays, <= 20); 0 when there is no pointer on the canvas, no stereo
+/// views yet, or no DisplayXR rig defining Unity world for the locate space.
+DISPLAYXR_EXPORT uint32_t dxr_prov_cursor_get_footprint_rays(float *out, uint32_t max_rays);
+
+/// @return 1 and fills @p out.
+DISPLAYXR_EXPORT int dxr_prov_cursor_get_state(DxrProvCursorState *out);
+
 /// Per-zone per-eye foreground clip (#166 multi-zone). Zone 0 = primary; i>=1 =
 /// extra zone i-1. Returns 1 on success. Same data as dxr_prov_get_eye_clip but for
 /// a specific zone's views, so the clip publisher can diagnose / apply per-zone clip.
