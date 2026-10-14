@@ -226,4 +226,95 @@ inline bool nearest_hit(const Vec3 *hits, uint32_t count, Quat view_orientation,
 	return have;
 }
 
+// ---- Custom cursor sprite (XrCursorDepthDrawInfoDXR, spec v5; #369) ------------
+
+//! XrCursorDepthDrawInfoDXR (and so a custom sprite) appeared with the runtime draw, v5.
+static const uint32_t kMinSpecSprite = kMinSpecRuntimeDraw;
+
+//! Largest sprite edge the provider will make a swapchain for. A cursor is tens of
+//! pixels; anything bigger is almost certainly the wrong texture.
+static const uint32_t kSpriteMaxEdge = 1024;
+
+inline bool sprite_allowed(uint32_t advertised_spec) { return advertised_spec >= kMinSpecSprite; }
+
+inline bool sprite_size_ok(uint32_t w, uint32_t h)
+{
+	return w > 0 && h > 0 && w <= kSpriteMaxEdge && h <= kSpriteMaxEdge;
+}
+
+/*!
+ * The hotspot as XrCursorDepthDrawInfoDXR::hotSpot wants it: normalised [0,1]^2 over
+ * the sprite, origin TOP-left, v DOWN. The input is in texture pixels from the TOP-left
+ * corner - Unity's Cursor.SetCursor convention - so this is a plain divide (no flip),
+ * clamped onto the sprite. Non-finite components go to 0. A degenerate size gives (0,0).
+ */
+inline Vec2 sprite_hotspot_uv(float hx_px, float hy_px, float w, float h)
+{
+	Vec2 r = {0.0f, 0.0f};
+	if (!(w > 0.0f) || !(h > 0.0f)) return r;
+	r.x = isfinite(hx_px) ? hx_px / w : 0.0f;
+	r.y = isfinite(hy_px) ? hy_px / h : 0.0f;
+	r.x = r.x < 0.0f ? 0.0f : (r.x > 1.0f ? 1.0f : r.x);
+	r.y = r.y < 0.0f ? 0.0f : (r.y > 1.0f ? 1.0f : r.y);
+	return r;
+}
+
+/*!
+ * XrCursorDepthDrawInfoDXR::sizeMeters from what the app asked for.
+ *   > 0 (finite): that height on the panel, metres.
+ *   == 0, or non-finite: 0 = the runtime's default custom-sprite size (19 OS points).
+ *   < 0: the texture's own pixel height on the panel - what a hardware cursor of the
+ *        same texture measures - = tex_h x the panel's metres per pixel; 0 (the runtime
+ *        default) when the panel geometry is unknown.
+ */
+inline float sprite_size_meters(float requested, uint32_t tex_h, float display_h_m, uint32_t display_px_h)
+{
+	if (!isfinite(requested) || requested == 0.0f) return 0.0f;
+	if (requested > 0.0f) return requested;
+	if (tex_h == 0 || display_px_h == 0 || !(display_h_m > 0.0f) || !isfinite(display_h_m)) return 0.0f;
+	return (float)tex_h * display_h_m / (float)display_px_h;
+}
+
+//! Swapchain format numbering of the session's graphics API (the ids collide across APIs).
+enum SpriteApi { SPRITE_API_DXGI = 0, SPRITE_API_VULKAN = 1, SPRITE_API_METAL = 2 };
+
+//! The 8-bit UNORM / _SRGB format id for an RGBA- or BGRA-ordered sprite in @p api.
+inline int64_t sprite_format_id(int api, bool bgra, bool srgb)
+{
+	switch (api) {
+	case SPRITE_API_DXGI: return bgra ? (srgb ? 91 : 87) : (srgb ? 29 : 28);
+	case SPRITE_API_VULKAN: return bgra ? (srgb ? 50 : 44) : (srgb ? 43 : 37);
+	case SPRITE_API_METAL: return bgra ? (srgb ? 81 : 80) : (srgb ? 71 : 70);
+	default: return 0;
+	}
+}
+
+/*!
+ * Pick the sprite swapchain format among the runtime's @p offered formats. The copy into
+ * the sprite is a raw byte copy, so the channel order must be the source's (@p bgra);
+ * @p srgb says whether those bytes are sRGB-ENCODED colour (an sRGB Unity texture, or any
+ * texture in a Gamma-space project) - then the _SRGB format, which the runtime decodes on
+ * sample - or linear values (UNORM). Falls back to the other encoding of the same order
+ * (a byte-exact copy, slightly off colour) before giving up.
+ * @return the format id, or 0 when neither is offered (no sprite: the default look).
+ */
+inline int64_t sprite_pick_format(int api, bool bgra, bool srgb, const int64_t *offered, uint32_t count)
+{
+	const int64_t want = sprite_format_id(api, bgra, srgb);
+	const int64_t alt = sprite_format_id(api, bgra, !srgb);
+	for (uint32_t i = 0; i < count; i++)
+		if (offered[i] == want) return want;
+	for (uint32_t i = 0; i < count; i++)
+		if (offered[i] == alt) return alt;
+	return 0;
+}
+
+/*!
+ * The render-thread "filled" event carries the sprite generation modulo this, so a fill
+ * recorded for an older SetSprite is never taken for the newest one. 16 is ample: the
+ * render thread trails the main thread by one or two frames.
+ */
+static const uint32_t kSpriteGenSlots = 16;
+inline uint32_t sprite_gen_slot(uint32_t gen) { return gen % kSpriteGenSlots; }
+
 } // namespace dxr_cursor
