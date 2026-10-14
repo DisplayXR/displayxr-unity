@@ -104,7 +104,9 @@ In Unity: **Window > Package Manager > + > Add package from disk...** → select
    https://github.com/DisplayXR/displayxr-unity.git#upm
    ```
 
-Both URLs install from the `upm` branch, which includes pre-built native binaries (Windows x64 + macOS Universal) — no local build required. See the [releases page](https://github.com/DisplayXR/displayxr-unity/releases) for available versions.
+Both URLs install from the `upm` branch, which includes pre-built native binaries (Windows x64, macOS Universal, Linux x86_64) — no local build required. See the [releases page](https://github.com/DisplayXR/displayxr-unity/releases) for available versions.
+
+> **Pin `#upm/vX.Y.Z`, not `#vX.Y.Z`.** The plain `vX.Y.Z` tags are the *source* tags: the Linux `.so` files are built by CI and are not committed there, so a `#vX.Y.Z` install has only the two `.meta` files in `Runtime/Plugins/Linux/x86_64/` and a Linux build has no plugin binary. Only the `upm/…` refs carry every platform's binaries.
 
 To **update** to a newer version later: change the URL fragment (e.g., `#upm/v1.0.1`) in `Packages/manifest.json` and use **Package Manager → Refresh**, or re-add the package with the new URL.
 
