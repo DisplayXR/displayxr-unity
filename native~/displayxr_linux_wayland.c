@@ -77,6 +77,7 @@
 #define DXR_WL_VERIFY_TRIES 3      // panel moves re-checked and retried (#361)
 #define DXR_WL_VERIFY_DELAY_MS 350 // ... this long after each: ~1 s for all of them
 #define DXR_WL_RESTORE_WINDOW_NS 3000000000LL // a saved position is checked until 3 s after the first map
+#define DXR_WL_SIZE_SETTLE_NS 1000000000LL    // a size handed to the player is checked 1 s later
 
 enum { DXR_LAYOUT_UNKNOWN, DXR_LAYOUT_LOGICAL, DXR_LAYOUT_PHYSICAL };
 
@@ -135,6 +136,11 @@ static struct {
 	int pending_w, pending_h;
 	int sent_w, sent_h; // the last size handed to C#, until the player's window has it
 	int size_fixups;    // re-requests of a size the player reverted, since the app's request
+	// The last size handed to C#, checked once the player has had time to apply it:
+	// a size it drops or reverts inside one frame never shows in the poll, and
+	// sent_w would then say "resize in progress" for good.
+	int check_w, check_h;
+	long long check_ns;
 
 	// The DisplayXR GNOME extension, and our window as it last reported it.
 	int ext_available;
@@ -607,6 +613,7 @@ static int win_mapped(const DxrWlExtWindow *w);
 static long long mono_ns(void);
 static void stop_verify_locked(void);
 static void schedule_verify_locked(void);
+static void fix_player_size_locked(void);
 
 static int
 dxr_wl_weave_surface_create(struct wl_display *display, struct wl_surface *parent, int lw, int lh,
@@ -725,6 +732,7 @@ dxr_wl_weave_destroy(void)
 	s_wl.wanted_device_w = s_wl.wanted_device_h = 0;
 	s_wl.wanted_by_app = 0;
 	s_wl.sent_w = s_wl.sent_h = 0;
+	s_wl.check_w = s_wl.check_h = 0;
 	s_wl.scale120 = 0;
 	s_wl.expect_scale120 = 0;
 	s_wl.logical_w = s_wl.logical_h = 0;
@@ -792,6 +800,20 @@ dxr_wl_weave_poll(int *out_w, int *out_h)
 		wp_viewport_set_destination(s_wl.viewport, lw, lh);
 		update_device_size_locked();
 		wl_display_flush(s_wl.display);
+	}
+	// The last size handed to the player, once it has had time to apply it.
+	if (s_wl.check_w) {
+		int outcome = dxr_wl_sent_size_outcome(mono_ns(), s_wl.check_ns, s_wl.check_w, s_wl.check_h, s_wl.logical_w,
+		                                       s_wl.logical_h);
+		if (outcome < 0) {
+			fprintf(stderr, "[DisplayXR-WL] the player did not keep the %dx%d it was sent: its window is %dx%d\n",
+			        s_wl.check_w, s_wl.check_h, s_wl.logical_w, s_wl.logical_h);
+			if (s_wl.sent_w == s_wl.check_w && s_wl.sent_h == s_wl.check_h)
+				s_wl.sent_w = s_wl.sent_h = 0; // no longer a resize in progress
+			fix_player_size_locked();
+		}
+		if (outcome)
+			s_wl.check_w = s_wl.check_h = 0;
 	}
 	wl_display_dispatch_queue_pending(s_wl.display, s_wl.queue);
 	int dirty = s_wl.geometry_dirty;
@@ -925,8 +947,9 @@ dxr_wl_take_player_size(int *out_w, int *out_h)
 	pthread_mutex_lock(&s_wl_mutex);
 	int have = s_wl.surface && s_wl.pending_w > 0 && s_wl.pending_h > 0;
 	if (have) {
-		*out_w = s_wl.sent_w = s_wl.pending_w;
-		*out_h = s_wl.sent_h = s_wl.pending_h;
+		*out_w = s_wl.sent_w = s_wl.check_w = s_wl.pending_w;
+		*out_h = s_wl.sent_h = s_wl.check_h = s_wl.pending_h;
+		s_wl.check_ns = mono_ns() + DXR_WL_SIZE_SETTLE_NS;
 		s_wl.pending_w = s_wl.pending_h = 0;
 	}
 	pthread_mutex_unlock(&s_wl_mutex);
@@ -1023,10 +1046,30 @@ follow_window_scale_locked(void)
 	s_wl.expect_scale120 = t120 != s_wl.scale120 ? t120 : 0;
 }
 
+//! Re-ask for the size the app wants if the player's window is at another one
+//! (twice in a row at most, so a player that keeps refusing a size cannot make us
+//! re-map it forever). Not while a size handed to the player has not reached its
+//! window yet: that is a resize in progress, not one reverted. Not during a
+//! placement: its end calls this. And not before the protocol has caught up with a
+//! new output's scale: the scale change re-asks then, and a resize right as the
+//! window lands on another output is one the player tends to revert.
+static void
+fix_player_size_locked(void)
+{
+	if (s_wl.size_fixups >= 2 || s_wl.sent_w || s_wl.placing || s_wl.move_inflight || s_wl.expect_scale120)
+		return;
+	int had = s_wl.pending_w;
+	rerequest_player_size_locked();
+	if (s_wl.pending_w && !had) {
+		s_wl.size_fixups++;
+		fprintf(stderr, "[DisplayXR-WL] the window is %dx%d logical, not the %dx%d wanted: asking again\n",
+		        s_wl.logical_w, s_wl.logical_h, s_wl.pending_w, s_wl.pending_h);
+	}
+}
+
 //! A placement ended (the window is where it should be, or where the compositor
 //! insists on): act on a scale change seen meanwhile, and re-ask for the size the
-//! app wants if the player came back at another one (twice in a row at most, so a
-//! player that keeps refusing a size cannot make us re-map it forever).
+//! app wants if the player came back at another one.
 static void
 place_done_locked(void)
 {
@@ -1034,20 +1077,7 @@ place_done_locked(void)
 	s_wl.move_inflight = 0;
 	s_wl.rescale_after_place = 0;
 	follow_window_scale_locked();
-	// (Not while a size handed to the player has not reached its window yet: that
-	// is a resize in progress, not one reverted. And not before the protocol has
-	// caught up with the new output's scale: the scale change re-asks then, and a
-	// resize right as the window lands on another output is one the player tends to
-	// revert.)
-	if (s_wl.size_fixups < 2 && !s_wl.sent_w && !s_wl.expect_scale120) {
-		int had = s_wl.pending_w;
-		rerequest_player_size_locked();
-		if (s_wl.pending_w && !had) {
-			s_wl.size_fixups++;
-			fprintf(stderr, "[DisplayXR-WL] the window is %dx%d logical, not the %dx%d wanted: asking again\n",
-			        s_wl.logical_w, s_wl.logical_h, s_wl.pending_w, s_wl.pending_h);
-		}
-	}
+	fix_player_size_locked();
 }
 
 //! Ask the extension to move the window to the intent; its answer comes back as a
