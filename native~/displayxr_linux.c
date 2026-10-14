@@ -970,6 +970,31 @@ typedef struct {
 	int n, cap, oom;
 } LinRects;
 
+// The input region last installed on Unity's window, window DEVICE px, for the depth
+// cursor (#363): a pointer outside it is over whatever lies behind, where the OS draws
+// that cursor, so the runtime must not draw a lifted one too.
+static LinXRect *s_region_copy;
+static int s_region_n, s_region_cap;
+static int s_region_valid; // 0 = no region of ours: the whole window catches
+
+static void
+lin_region_remember_locked(const LinRects *v)
+{
+	if (v->n > s_region_cap) {
+		LinXRect *r = (LinXRect *)realloc(s_region_copy, (size_t)v->n * sizeof(LinXRect));
+		if (!r) {
+			s_region_valid = 0;
+			return;
+		}
+		s_region_copy = r;
+		s_region_cap = v->n;
+	}
+	if (v->n > 0)
+		memcpy(s_region_copy, v->r, (size_t)v->n * sizeof(LinXRect));
+	s_region_n = v->n;
+	s_region_valid = 1;
+}
+
 static void
 lin_rects_push(LinRects *v, long x0, long y0, long x1, long y1)
 {
@@ -1071,6 +1096,7 @@ lin_apply_input_region(LinRects *v, const char *what)
 	}
 	if (s_hit_shaped && h == s_hit_hash) return;
 	s_hit_hash = h;
+	lin_region_remember_locked(v); // before the Wayland path scales v->r in place
 
 	if (dxr_wl_click_through_wanted()) {
 		// The rects are window DEVICE px, like on X11; the player's surface is in
@@ -1256,6 +1282,7 @@ lin_reset_input_region_locked(void)
 		s_hit_shaped = 0;
 		s_hit_hash = 0;
 		s_hit_mask_active = 0;
+		s_region_valid = 0;
 		return;
 	}
 	if (s_hit_shaped && s_hit_dpy && s_win && s_shape_combine_mask) {
@@ -1266,6 +1293,7 @@ lin_reset_input_region_locked(void)
 	s_hit_shaped = 0;
 	s_hit_hash = 0;
 	s_hit_mask_active = 0;
+	s_region_valid = 0;
 }
 
 // Overlay creation (the provider's thread): from here the main thread may shape.
@@ -1297,6 +1325,35 @@ lin_reset_input_region(void)
 	lin_reset_input_region_locked();
 	s_drag_active = 0;
 	pthread_mutex_unlock(&s_hit_mutex);
+}
+
+//! The depth cursor (#363), X11 mode: is the pointer over the input region Unity's
+//! window has now? 1 over it, 0 elsewhere, -1 not known (no region of ours, the native-
+//! Wayland player, the pointer on another screen). Unity's own pointer position stops at
+//! the last point inside the region, so this asks the X server where the pointer is.
+//! Any thread: s_hit_dpy is only used under s_hit_mutex (THREADS, above).
+int
+displayxr_linux_pointer_in_input_region(void)
+{
+	pthread_mutex_lock(&s_hit_mutex);
+	int in = -1;
+	if (s_hit_dpy && s_win && s_hit_shaped && s_region_valid && !dxr_wl_click_through_wanted()) {
+		XWin r = 0, c = 0;
+		int rx = 0, ry = 0, wx = 0, wy = 0;
+		unsigned int mask = 0;
+		if (s_x.XQueryPointer(s_hit_dpy, s_win, &r, &c, &rx, &ry, &wx, &wy, &mask)) {
+			in = 0;
+			for (int i = 0; i < s_region_n; i++) {
+				const LinXRect *q = &s_region_copy[i];
+				if (wx >= q->x && wx < q->x + (int)q->width && wy >= q->y && wy < q->y + (int)q->height) {
+					in = 1;
+					break;
+				}
+			}
+		}
+	}
+	pthread_mutex_unlock(&s_hit_mutex);
+	return in;
 }
 
 // --- right-drag move --------------------------------------------------------

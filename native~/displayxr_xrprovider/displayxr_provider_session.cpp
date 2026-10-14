@@ -1117,6 +1117,7 @@ extern "C" int displayxr_is_shell_mode(void);
 extern "C" int displayxr_linux_get_weave_window(void **out_display, unsigned long *out_window);
 extern "C" void displayxr_linux_destroy_weave_window(void);
 extern "C" int displayxr_linux_window_size(uint32_t *out_w, uint32_t *out_h);
+extern "C" int displayxr_linux_pointer_in_input_region(void);
 #endif
 
 // Poll the live workspace-tile canvas size (#225, display_zones spec v2). The
@@ -5480,12 +5481,13 @@ static void ps_cursor_pointer_to_client_px(int app_zone, float *mx, float *my, f
 // overlay it is over whatever lies behind, and the OS draws that cursor at once, so a
 // runtime-drawn one would show as a second cursor while its depth sinks. Unity's own
 // pointer position cannot tell: it stops at the last point inside the input region.
-// Native Wayland reports pointer enter/leave; elsewhere (and before the first event)
-// the pointer counts as over the window, as before.
+// Native Wayland reports pointer enter/leave; X11 mode asks the X server where the
+// pointer is and checks it against the window's input region. Elsewhere (and when it
+// cannot tell) the pointer counts as over the window, as before.
 static int ps_cursor_pointer_over_app(void)
 {
 #if defined(__linux__) && !defined(__ANDROID__)
-	return s_ps.wl_weave ? dxr_wl_pointer_inside() != 0 : 1;
+	return (s_ps.wl_weave ? dxr_wl_pointer_inside() : displayxr_linux_pointer_in_input_region()) != 0;
 #else
 	return 1;
 #endif
