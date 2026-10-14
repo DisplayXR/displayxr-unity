@@ -147,6 +147,10 @@ enabling, since older runtimes reject unknown extensions). Without `XR_DXR_view_
 the provider logs a one-shot WARN and produces no stereo (same contract as the hook
 / standalone).
 
+`XR_DXR_cursor_depth` is enabled when the runtime advertises spec ≥ 5. Enabling it
+costs nothing: the provider chains the cursor request only while the app opts in
+(see [cursor-depth.md](cursor-depth.md)).
+
 ## M2 — native-app parity (implemented)
 
 M2 turns the M1 spike into a first-class extension app matching the native

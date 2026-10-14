@@ -165,6 +165,15 @@ jobs:
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: cmake --build native~/build --config Release -j"$(nproc)"
 
+      # Pure-math unit tests (header-only, no runtime, no Unity): the depth-aware
+      # cursor's pointer->canvas mapping, footprint rays and spec gates.
+      - name: Unit tests
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          c++ -std=c++17 -Wall -Wextra -I native~/displayxr_xrprovider \
+            native~/tests/cursor_depth_math_test.cpp -o /tmp/cursor_depth_math_test -lm
+          /tmp/cursor_depth_math_test
+
       - name: Verify output
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |

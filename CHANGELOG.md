@@ -5,6 +5,11 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Depth-aware cursor (`XR_DXR_cursor_depth`, DisplayXR/displayxr-runtime ADR-046): opt in with `DisplayXRCursorDepth.Enabled = true` or a **DisplayXR Depth Cursor** component. Over content that pops out of the display, the runtime draws the cursor in stereo just in front of it and the OS cursor is hidden; elsewhere the plain OS cursor stays. Depth from `Measured` (default: the runtime matches the rendered views, no colliders; runtime spec v7 / v2.39.0+) or `AppPoint` (footprint physics raycast, a custom hit test or `SetHitPoint`; spec v5 / v2.36.0+, needs a DisplayXR rig). Older runtimes keep the plain cursor. Off by default, no cost unless enabled. See `docs~/architecture/cursor-depth.md`.
+
 ## [2.25.1] - 2026-10-12
 
 ### Fixed
