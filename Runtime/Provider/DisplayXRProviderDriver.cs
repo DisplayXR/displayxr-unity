@@ -70,6 +70,7 @@ namespace DisplayXR
                 DisplayXRProvider.OnSessionStopped();
             }
             DisplayXRDepthBudget.Reset();
+            DisplayXRCursorDepth.Reset();
         }
 
 #if UNITY_STANDALONE_LINUX && !UNITY_EDITOR
@@ -128,6 +129,9 @@ namespace DisplayXR
                     // restarts the provider, and a remembered "Open" would leave the
                     // clip plane pushed back over a background nobody has measured.
                     DisplayXRDepthBudget.Reset();
+                    // Same for the depth-aware cursor: never leave the OS cursor hidden
+                    // for a session that is gone.
+                    DisplayXRCursorDepth.Reset();
                 }
                 return;
             }
@@ -146,6 +150,10 @@ namespace DisplayXR
             // frame's number. Cheap (one P/Invoke, no allocation) and inert on a
             // runtime without XR_DXR_depth_budget.
             DisplayXRDepthBudget.Poll();
+            // Depth-aware cursor (ADR-046): pointer + depth source in, willDraw out, OS
+            // cursor hidden exactly while the runtime draws its own. A few field reads
+            // and one state P/Invoke while the app has not opted in.
+            DisplayXRCursorDepth.Tick();
             PushActiveRigTunables();
             PushGameViewRectEditorProbe();
         }

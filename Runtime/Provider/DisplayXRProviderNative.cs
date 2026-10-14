@@ -429,6 +429,41 @@ namespace DisplayXR
         /// Extra dilation the app wants, in canvas-normalised units, ON TOP of the
         /// runtime's own default. 0 = the runtime default alone.
         /// </param>
+        // ---- Depth-aware cursor (XR_DXR_cursor_depth, ADR-046) ----------------
+        // Driven by DisplayXRCursorDepth; apps use that class, not these.
+
+        /// <summary>Mirrors <c>DxrProvCursorState</c>.</summary>
+        [StructLayout(LayoutKind.Sequential)]
+        public struct CursorState
+        {
+            public uint runtimeSpec;
+            public int enabled;
+            public int requested;
+            public int willDraw;
+            public float disparity;
+        }
+
+        /// <summary>Opt in/out. source: 0 = measured disparity, 1 = app point.
+        /// margin: eye baselines; &lt;= 0 = the runtime default.</summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void dxr_prov_cursor_configure(int enabled, int source, float margin);
+
+        /// <summary>Pointer in Unity screen pixels (origin bottom-left) + the screen size.</summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void dxr_prov_cursor_set_pointer(
+            int valid, float mouseX, float mouseY, float screenW, float screenH);
+
+        /// <summary>App-point hits under the cursor footprint: Unity-world xyz triples.</summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void dxr_prov_cursor_set_hits(float[] xyz, uint count);
+
+        /// <summary>Footprint rays (origin xyz, dir xyz) in Unity world; returns the count.</summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern uint dxr_prov_cursor_get_footprint_rays(float[] outRays, uint maxRays);
+
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int dxr_prov_cursor_get_state(out CursorState state);
+
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern void dxr_prov_set_content_bounds(
             float minX, float minY, float minZ,
