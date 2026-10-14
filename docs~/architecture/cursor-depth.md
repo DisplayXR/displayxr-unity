@@ -163,8 +163,13 @@ built so it does not switch per frame at all:
   draws its own arrow, so on native Wayland the provider asks for the OS cursor's size
   (`XCURSOR_SIZE`, else 24 pt, at the output scale); the arrow still looks different from the
   cursor theme. Over the click-through part of a transparent overlay the OS draws its own
-  cursor, so the provider stops the request when the Wayland pointer leaves the window's input
-  region; at most about one frame can still show both. X11 mode has none of these three yet.
+  cursor, so the provider stops the request when the pointer leaves the window's input region:
+  native Wayland reports pointer enter/leave; X11 mode asks the X server where the pointer is
+  (`XQueryPointer`) and checks it against the input region the plug-in installed. At most about
+  one frame (native Wayland) or a few (X11, which presents with more frames in flight) can still
+  show both. X11 mode needs neither of the first two fixes: there Unity's `Screen.*` is client px,
+  and since DisplayXR/displayxr-runtime#2112 the runtime sizes and draws the theme cursor itself
+  (at `Xft.dpi` / 96).
 
 ## Verifying on Windows (3D panel)
 
