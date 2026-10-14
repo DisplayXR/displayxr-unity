@@ -65,6 +65,23 @@ jobs:
           fi
           echo "docs_only=$(grep ^docs_only= "$GITHUB_OUTPUT" | cut -d= -f2)"
 
+  csharp-tests:
+    name: C# unit tests
+    needs: DetectChanges
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+      - uses: actions/setup-dotnet@v4
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        with:
+          dotnet-version: '8.0.x'
+      # Pure C# (no UnityEngine): the depth-aware cursor's depth unprojection
+      # (reversed-Z D3D/Metal/Vulkan vs OpenGL, off-axis Kooima frusta).
+      - name: Cursor depth math
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: dotnet run --project "Tests~/CursorDepthMath" -c Release
+
   build-windows:
     name: Windows x64
     needs: DetectChanges
