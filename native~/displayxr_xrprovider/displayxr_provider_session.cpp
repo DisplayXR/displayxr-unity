@@ -5493,6 +5493,503 @@ static int ps_cursor_pointer_over_app(void)
 #endif
 }
 
+// ----------------------------------------------------------------------------
+// Custom cursor sprite (XrCursorDepthDrawInfoDXR::image, spec v5; #369)
+// ----------------------------------------------------------------------------
+//
+// The app's sprite goes to the runtime as an ordinary colour swapchain in the session's
+// graphics API: the runtime samples its LAST RELEASED image, so it is filled ONCE per
+// change (acquire, copy, release) and then named on every frame's DrawInfo for as long
+// as the sprite is set. Zero cost without a sprite: no swapchain, no copy, no chain.
+//
+// Data flow, per SetSprite (C#, DisplayXRCursorDepth):
+//   1. main thread: Graphics.Blit the Texture2D, Y-flipped, into a small RGBA8 RT (any
+//      source format, mips, compression or readability; the flip turns Unity's bottom-up
+//      rows into the top-down rows the runtime samples). Push {RT, size, sRGB, hotspot,
+//      size, generation} here (dxr_prov_cursor_set_sprite).
+//   2. D3D11 / D3D12: Graphics.CopyTexture the RT into the Unity-side copy target this
+//      module publishes (dxr_prov_cursor_sprite_get_target) - the same cross-device
+//      bridge pattern as wsui / Local2D. Metal reads the RT directly (one device);
+//      Vulkan copies it in the render event (AccessTexture, as wsui does).
+//   3. main thread: GL.IssuePluginEvent(kCursorSpriteFilledEvent + gen % 16). On the
+//      render thread, in stream order after the copy, the event records the generation
+//      as filled (and on Vulkan records the copy itself).
+//   4. render thread, at submit (same spot and same cross-device ordering as wsui):
+//      when the filled generation is the newest and not yet uploaded, acquire a sprite
+//      swapchain image, copy, release. The swapchain + bridge are created here lazily.
+//   5. begin frame (ps_cursor_chain): DrawInfo.image = the sprite swapchain, once it has
+//      been released at least once and still matches the sprite's size/encoding.
+//
+// Lifetime: a swapchain that stops matching (ClearSprite, a size or encoding change) is
+// RETIRED - no longer chained - and destroyed PS_SPRITE_RETIRE_FRAMES submits later, after
+// every frame that named it has ended and any Unity copy queued into its bridge has run
+// (ADR-001's deferred destruction). Session stop destroys everything.
+
+#define PS_SPRITE_RETIRE_FRAMES 3
+#define PS_PVK_OVERLAY_CURSOR (PS_PVK_OVERLAY_WSUI0 + DXR_WSUI_MAX_SLOTS) // = DXR_PVK_OVERLAY_CURSOR
+
+typedef struct PsCursorSprite {
+	XrSwapchain sc;
+	uint32_t    w, h, image_count;
+	int64_t     format;
+	int         srgb;          // the sprite's encoding as requested (format may fall back)
+	int         vk;            // Vulkan: the PS_PVK_OVERLAY_CURSOR bridge belongs to this one
+	uint32_t    uploaded_gen;  // last generation copied + released (0 = none yet)
+	int         retire;        // > 0: retired, destroyed when it counts down to 0
+#ifdef _WIN32
+	XrSwapchainImageD3D12KHR images12[PS_MAX_SWAPCHAIN_IMAGES];
+	XrSwapchainImageD3D11KHR images11[PS_MAX_SWAPCHAIN_IMAGES];
+	ID3D12Resource  *bridge_own;    // D3D12: own-device side (copy source)
+	ID3D12Resource  *bridge_unity;  // D3D12: Unity-device side (C# CopyTexture target)
+	HANDLE           bridge_handle;
+	ID3D11Texture2D *tex11_unity;   // D3D11: C# CopyTexture target (plain, or the opened shared side)
+	ID3D11Texture2D *tex11_own;     // D3D11 editor bridge: own-device side
+	HANDLE           tex11_handle;
+#endif
+#if defined(__APPLE__)
+	XrSwapchainImageMetalKHR images_metal[PS_MAX_SWAPCHAIN_IMAGES];
+#endif
+} PsCursorSprite;
+
+// Main thread -> render thread (under s_cur_mutex).
+static struct {
+	int      set;
+	void    *src_tex;   // the C# RT's native pointer (Metal / Vulkan copy source)
+	uint32_t w, h;
+	int      srgb;
+	float    hot_u, hot_v;
+	float    size_req;  // as the app asked (see dxr_cursor::sprite_size_meters)
+	uint32_t gen;       // bumped by C# on every change; 0 = never set
+} s_spr_cfg;
+// Render event -> render thread: the generation slot last filled (UINT32_MAX = none).
+static std::atomic<uint32_t> s_spr_filled_slot{UINT32_MAX};
+// Render thread -> C#: the Unity-side copy target (D3D), published once created.
+static std::atomic<void *> s_spr_target{nullptr};
+// Render thread only.
+static PsCursorSprite s_spr_cur, s_spr_old;
+static uint32_t s_spr_fail_w = 0, s_spr_fail_h = 0; // create failed at this size: don't retry per frame
+static int s_spr_fail_srgb = -1;
+static int s_spr_chained = 0; // the last locate named the sprite (for C#'s status)
+
+static void ps_spr_destroy(PsCursorSprite *s)
+{
+	if (s->sc && s_ps.pfn_destroy_swapchain) s_ps.pfn_destroy_swapchain(s->sc);
+#if defined(ENABLE_VULKAN)
+	if (s->vk) dxr_pvk_overlay_destroy(PS_PVK_OVERLAY_CURSOR);
+#endif
+#ifdef _WIN32
+	if (s->bridge_unity) s->bridge_unity->Release();
+	if (s->bridge_handle) CloseHandle(s->bridge_handle);
+	if (s->bridge_own) s->bridge_own->Release();
+	if (s->tex11_unity) s->tex11_unity->Release();
+	if (s->tex11_own) s->tex11_own->Release();
+#endif
+	memset(s, 0, sizeof(*s));
+}
+
+// Stop naming the current sprite swapchain and destroy it a few submits later. If an
+// older one is still counting down, wait (keep the current one, unchained) - two changes
+// within three frames just delay the second by a frame.
+static int ps_spr_retire_current(void)
+{
+	if (!s_spr_cur.sc) return 1;
+	if (s_spr_old.sc || s_spr_old.retire) return 0;
+	s_spr_target.store(nullptr);
+#if defined(ENABLE_VULKAN)
+	// One Vulkan overlay slot: drop the bridge now (dxr_pvk_overlay_destroy waits for the
+	// device), the XR swapchain with the countdown like everything else.
+	if (s_spr_cur.vk) {
+		dxr_pvk_overlay_destroy(PS_PVK_OVERLAY_CURSOR);
+		s_spr_cur.vk = 0;
+	}
+#endif
+	s_spr_old = s_spr_cur;
+	s_spr_old.retire = PS_SPRITE_RETIRE_FRAMES;
+	memset(&s_spr_cur, 0, sizeof(s_spr_cur));
+	return 1;
+}
+
+static int ps_spr_matches(const PsCursorSprite *s, uint32_t w, uint32_t h, int srgb)
+{
+	return s->sc && s->w == w && s->h == h && s->srgb == srgb;
+}
+
+// Create the sprite swapchain (+ the API's copy bridge). Render thread, at submit.
+static int ps_spr_create(uint32_t w, uint32_t h, int srgb, void *src_tex)
+{
+	if (!s_ps.pfn_create_swapchain || !s_ps.pfn_enumerate_swapchain_formats) return 0;
+	uint32_t fmt_count = 0;
+	s_ps.pfn_enumerate_swapchain_formats(s_ps.session, 0, &fmt_count, NULL);
+	int64_t formats[32];
+	if (fmt_count > 32) fmt_count = 32;
+	if (fmt_count == 0) return 0;
+	s_ps.pfn_enumerate_swapchain_formats(s_ps.session, fmt_count, &fmt_count, formats);
+
+	int api = -1;
+	bool bgra = false;
+	int64_t bridge_format = 0; // Vulkan: the overlay bridge's (UNORM) format
+	switch (s_ps.graphics_api) {
+	case DXR_GFX_D3D11:
+	case DXR_GFX_D3D12: api = dxr_cursor::SPRITE_API_DXGI; break; // bridge is R8G8B8A8_UNORM
+	case DXR_GFX_VULKAN:
+		api = dxr_cursor::SPRITE_API_VULKAN;
+		// The bridge is UNORM in whichever order the runtime offers (the render event
+		// blits channels if Unity's RT has the other order); RGBA first.
+		bgra = dxr_cursor::sprite_pick_format(api, false, false, formats, fmt_count) == 0;
+		bridge_format = dxr_cursor::sprite_format_id(api, bgra, false);
+		break;
+	case DXR_GFX_METAL: {
+		api = dxr_cursor::SPRITE_API_METAL;
+#if defined(__APPLE__)
+		// A blit moves bytes: keep the RT's own channel order (80/81 = BGRA family).
+		const int pf = displayxr_metal_texture_pixel_format(src_tex);
+		bgra = (pf == 80 || pf == 81);
+#endif
+		break;
+	}
+	default: return 0;
+	}
+	(void)src_tex;
+	const int64_t format = dxr_cursor::sprite_pick_format(api, bgra, srgb != 0, formats, fmt_count);
+	if (!format) {
+		ps_log("[DisplayXR-PROV] cursor sprite: the runtime offers no 8-bit %s swapchain format - "
+		       "keeping the default cursor look\n", bgra ? "BGRA" : "RGBA");
+		return 0;
+	}
+	if (format != dxr_cursor::sprite_format_id(api, bgra, srgb != 0))
+		ps_log("[DisplayXR-PROV] cursor sprite: %s format not offered, using fmt=%lld (colours may be off)\n",
+		       srgb ? "_SRGB" : "UNORM", (long long)format);
+
+	PsCursorSprite *s = &s_spr_cur;
+	memset(s, 0, sizeof(*s));
+	XrSwapchainCreateInfo ci = {XR_TYPE_SWAPCHAIN_CREATE_INFO};
+	ci.usageFlags = XR_SWAPCHAIN_USAGE_COLOR_ATTACHMENT_BIT | XR_SWAPCHAIN_USAGE_TRANSFER_DST_BIT |
+	                XR_SWAPCHAIN_USAGE_SAMPLED_BIT;
+	ci.format = format;
+	ci.sampleCount = 1;
+	ci.width = w;
+	ci.height = h;
+	ci.faceCount = 1;
+	ci.arraySize = 1;
+	ci.mipCount = 1;
+	if (XR_FAILED(s_ps.pfn_create_swapchain(s_ps.session, &ci, &s->sc))) {
+		ps_log("[DisplayXR-PROV] cursor sprite: xrCreateSwapchain %ux%u fmt=%lld failed\n", w, h,
+		       (long long)format);
+		s->sc = XR_NULL_HANDLE;
+		return 0;
+	}
+	s->w = w;
+	s->h = h;
+	s->format = format;
+	s->srgb = srgb;
+	uint32_t count = 0;
+	s_ps.pfn_enumerate_swapchain_images(s->sc, 0, &count, NULL);
+	if (count > PS_MAX_SWAPCHAIN_IMAGES) count = PS_MAX_SWAPCHAIN_IMAGES;
+	int ok = 0;
+	const char *how = "?";
+#if defined(ENABLE_VULKAN)
+	if (s_ps.graphics_api == DXR_GFX_VULKAN) {
+		XrSwapchainImageVulkanKHR_PS vk_imgs[PS_MAX_SWAPCHAIN_IMAGES] = {};
+		for (uint32_t i = 0; i < count; i++) vk_imgs[i].type = XR_TYPE_SWAPCHAIN_IMAGE_VULKAN_KHR_PS;
+		if (XR_SUCCEEDED(s_ps.pfn_enumerate_swapchain_images(s->sc, count, &count,
+		                                                     (XrSwapchainImageBaseHeader *)vk_imgs))) {
+			dxr_pvk_overlay_set_swapchain_images(PS_PVK_OVERLAY_CURSOR, vk_imgs, count, format);
+			ok = dxr_pvk_overlay_create_bridge(PS_PVK_OVERLAY_CURSOR, w, h, bridge_format);
+			s->vk = ok;
+			how = "Vulkan overlay bridge";
+		}
+	}
+#endif
+#if defined(__APPLE__)
+	if (s_ps.graphics_api == DXR_GFX_METAL) {
+		for (uint32_t i = 0; i < count; i++) s->images_metal[i].type = XR_TYPE_SWAPCHAIN_IMAGE_METAL_KHR;
+		ok = XR_SUCCEEDED(s_ps.pfn_enumerate_swapchain_images(s->sc, count, &count,
+		                                                      (XrSwapchainImageBaseHeader *)s->images_metal));
+		how = "Metal, same device";
+	}
+#endif
+#ifdef _WIN32
+	if (s_ps.graphics_api == DXR_GFX_D3D11) {
+		for (uint32_t i = 0; i < count; i++) s->images11[i].type = XR_TYPE_SWAPCHAIN_IMAGE_D3D11_KHR;
+		ok = XR_SUCCEEDED(s_ps.pfn_enumerate_swapchain_images(s->sc, count, &count,
+		                                                      (XrSwapchainImageBaseHeader *)s->images11));
+		// The copy target is always R8G8B8A8_UNORM (28): copying an _SRGB source into the
+		// runtime's TYPELESS image faults in the NVIDIA D3D11 UMD (see ps_bridge_dxgi_format);
+		// the bytes are the same either way.
+		if (ok && s_ps.d3d11_bridge) {
+			ok = ps_alloc_shared_tex_d3d11(w, h, 1, &s->tex11_own, &s->tex11_unity, &s->tex11_handle, 28,
+			                               "cursor sprite bridge (D3D11)");
+			how = "D3D11 editor bridge";
+		} else if (ok) {
+			s->tex11_unity = ps_alloc_unity_tex(w, h, 1, 28);
+			ok = s->tex11_unity != NULL;
+			how = "D3D11 zero-copy";
+		}
+		if (ok) s_spr_target.store((void *)s->tex11_unity);
+	} else if (s_ps.graphics_api == DXR_GFX_D3D12) {
+		for (uint32_t i = 0; i < count; i++) s->images12[i].type = XR_TYPE_SWAPCHAIN_IMAGE_D3D12_KHR;
+		ok = XR_SUCCEEDED(s_ps.pfn_enumerate_swapchain_images(s->sc, count, &count,
+		                                                      (XrSwapchainImageBaseHeader *)s->images12));
+		if (ok && s_ps.own_device && s_ps.unity_device) {
+			D3D12_HEAP_PROPERTIES heap = {};
+			heap.Type = D3D12_HEAP_TYPE_DEFAULT;
+			D3D12_RESOURCE_DESC bd = {};
+			bd.Dimension = D3D12_RESOURCE_DIMENSION_TEXTURE2D;
+			bd.Width = w;
+			bd.Height = h;
+			bd.DepthOrArraySize = 1;
+			bd.MipLevels = 1;
+			bd.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
+			bd.SampleDesc.Count = 1;
+			bd.Layout = D3D12_TEXTURE_LAYOUT_UNKNOWN;
+			bd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+			HRESULT hr = s_ps.own_device->CreateCommittedResource(&heap, D3D12_HEAP_FLAG_SHARED, &bd,
+			        D3D12_RESOURCE_STATE_COMMON, NULL, __uuidof(ID3D12Resource), (void **)&s->bridge_own);
+			if (SUCCEEDED(hr))
+				hr = s_ps.own_device->CreateSharedHandle(s->bridge_own, NULL, GENERIC_ALL, NULL, &s->bridge_handle);
+			if (SUCCEEDED(hr) && s->bridge_handle)
+				hr = s_ps.unity_device->OpenSharedHandle(s->bridge_handle, __uuidof(ID3D12Resource),
+				                                         (void **)&s->bridge_unity);
+			ok = SUCCEEDED(hr) && s->bridge_unity != NULL;
+			if (!ok) ps_log("[DisplayXR-PROV] cursor sprite: D3D12 bridge create failed: 0x%08lx\n", hr);
+		} else {
+			ok = 0;
+		}
+		how = "D3D12 bridge";
+		if (ok) s_spr_target.store((void *)s->bridge_unity);
+	}
+#endif
+	s->image_count = count;
+	if (!ok || count == 0) {
+		ps_log("[DisplayXR-PROV] cursor sprite: %ux%u setup failed (%s) - keeping the default cursor look\n", w,
+		       h, how);
+		ps_spr_destroy(s);
+		s_spr_target.store(nullptr);
+		return 0;
+	}
+	ps_log("[DisplayXR-PROV] cursor sprite: swapchain %ux%u fmt=%lld (%u imgs, %s)\n", w, h, (long long)format,
+	       count, how);
+	return 1;
+}
+
+// Copy the filled sprite into a swapchain image and release it. Render thread, at submit,
+// after the frame's cross-device wait. @return 1 when copied.
+static int ps_spr_upload(PsCursorSprite *s, void *src_tex)
+{
+	(void)src_tex;
+#if defined(ENABLE_VULKAN)
+	// Only once the render event has filled the bridge (its first copy may have been skipped).
+	if (s_ps.graphics_api == DXR_GFX_VULKAN && !dxr_pvk_overlay_has_content(PS_PVK_OVERLAY_CURSOR)) return 0;
+#endif
+	uint32_t idx = 0;
+	XrSwapchainImageAcquireInfo ai = {XR_TYPE_SWAPCHAIN_IMAGE_ACQUIRE_INFO};
+	if (XR_FAILED(s_ps.pfn_acquire_swapchain_image(s->sc, &ai, &idx)) || idx >= s->image_count) return 0;
+	XrSwapchainImageWaitInfo wi = {XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};
+	wi.timeout = 1000000000;
+	s_ps.pfn_wait_swapchain_image(s->sc, &wi);
+	int copied = 0;
+#if defined(ENABLE_VULKAN)
+	if (s_ps.graphics_api == DXR_GFX_VULKAN) copied = dxr_pvk_overlay_copy_to_swapchain_image(PS_PVK_OVERLAY_CURSOR, idx);
+#endif
+#if defined(__APPLE__)
+	if (s_ps.graphics_api == DXR_GFX_METAL && src_tex && s->images_metal[idx].texture && s_ps.metal_queue)
+		copied = displayxr_metal_blit_textures(s_ps.metal_queue, src_tex, s->images_metal[idx].texture);
+#endif
+#ifdef _WIN32
+	if (s_ps.graphics_api == DXR_GFX_D3D11) {
+		ID3D11Texture2D *dst = (ID3D11Texture2D *)s->images11[idx].texture;
+		if (s_ps.d3d11_bridge && dst && s->tex11_own && s_ps.own_d3d11_context) {
+			s_ps.own_d3d11_context->CopyResource(dst, s->tex11_own);
+			copied = 1;
+		} else if (!s_ps.d3d11_bridge && dst && s->tex11_unity && s_ps.unity_d3d11_context) {
+			s_ps.unity_d3d11_context->CopyResource(dst, s->tex11_unity);
+			s_ps.unity_d3d11_context->Flush();
+			copied = 1;
+		}
+	} else if (s_ps.graphics_api == DXR_GFX_D3D12 && s->images12[idx].texture && s->bridge_own &&
+	           s_ps.own_cmd_list) {
+		ID3D12Resource *dst = s->images12[idx].texture;
+		s_ps.own_cmd_alloc->Reset();
+		s_ps.own_cmd_list->Reset(s_ps.own_cmd_alloc, NULL);
+		ps_sc_image_barrier(s_ps.own_cmd_list, dst, D3D12_RESOURCE_STATE_RENDER_TARGET,
+		                    D3D12_RESOURCE_STATE_COPY_DEST);
+		D3D12_TEXTURE_COPY_LOCATION dl = {};
+		dl.pResource = dst;
+		dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+		D3D12_TEXTURE_COPY_LOCATION sl = {};
+		sl.pResource = s->bridge_own;
+		sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+		s_ps.own_cmd_list->CopyTextureRegion(&dl, 0, 0, 0, &sl, NULL);
+		ps_sc_image_barrier(s_ps.own_cmd_list, dst, D3D12_RESOURCE_STATE_COPY_DEST,
+		                    D3D12_RESOURCE_STATE_RENDER_TARGET);
+		s_ps.own_cmd_list->Close();
+		ID3D12CommandList *lists[] = {s_ps.own_cmd_list};
+		s_ps.own_queue->ExecuteCommandLists(1, lists);
+		s_ps.own_fence_value++;
+		s_ps.own_queue->Signal(s_ps.own_fence, s_ps.own_fence_value);
+		if (s_ps.own_fence->GetCompletedValue() < s_ps.own_fence_value) {
+			s_ps.own_fence->SetEventOnCompletion(s_ps.own_fence_value, s_ps.own_fence_event);
+			WaitForSingleObject(s_ps.own_fence_event, INFINITE);
+		}
+		copied = 1;
+	}
+#endif
+	XrSwapchainImageReleaseInfo ri = {XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};
+	s_ps.pfn_release_swapchain_image(s->sc, &ri);
+	return copied;
+}
+
+/// Submit-time sprite work (render thread, before xrEndFrame, after the cross-device
+/// ordering the wsui copies rely on). Retires, creates and fills the sprite swapchain.
+static void ps_cursor_sprite_submit(void)
+{
+	if (s_spr_old.retire > 0 && --s_spr_old.retire == 0) ps_spr_destroy(&s_spr_old);
+	if (s_ps.cursor_depth_version == 0 && !s_spr_cur.sc) return;
+
+	int set, srgb;
+	void *src;
+	uint32_t w, h, gen;
+	{
+		std::lock_guard<std::mutex> lk(s_cur_mutex);
+		set = s_spr_cfg.set && s_cur.enabled;
+		src = s_spr_cfg.src_tex;
+		w = s_spr_cfg.w;
+		h = s_spr_cfg.h;
+		srgb = s_spr_cfg.srgb;
+		gen = s_spr_cfg.gen;
+	}
+	if (s_spr_cur.sc && (!set || !ps_spr_matches(&s_spr_cur, w, h, srgb))) {
+		if (!ps_spr_retire_current()) return; // an older one is still counting down
+	}
+	if (!set || !dxr_cursor::sprite_allowed(s_ps.cursor_depth_version) || !dxr_cursor::sprite_size_ok(w, h))
+		return;
+	if (!s_spr_cur.sc) {
+		if (s_spr_old.sc) return; // one generation of resources at a time
+		if (s_spr_fail_w == w && s_spr_fail_h == h && s_spr_fail_srgb == srgb) return;
+		if (!ps_spr_create(w, h, srgb, src)) {
+			s_spr_fail_w = w;
+			s_spr_fail_h = h;
+			s_spr_fail_srgb = srgb;
+			return;
+		}
+		s_spr_fail_w = s_spr_fail_h = 0;
+		s_spr_fail_srgb = -1;
+	}
+	if (s_spr_cur.uploaded_gen == gen) return;
+	if (s_spr_filled_slot.load() != dxr_cursor::sprite_gen_slot(gen)) return; // not filled yet
+	if (ps_spr_upload(&s_spr_cur, src)) {
+		if (s_spr_cur.uploaded_gen == 0)
+			ps_log("[DisplayXR-PROV] cursor sprite: first image released (gen %u) - the runtime draws it\n", gen);
+		s_spr_cur.uploaded_gen = gen;
+	}
+}
+
+/// The sprite to name on this frame's DrawInfo, if any. Render thread (begin frame).
+static int ps_cursor_sprite_for_chain(XrSwapchain *out_sc, float *hu, float *hv, float *size_req, uint32_t *tex_h)
+{
+	if (!s_spr_cur.sc || s_spr_cur.uploaded_gen == 0) return 0;
+	std::lock_guard<std::mutex> lk(s_cur_mutex);
+	if (!s_spr_cfg.set || !ps_spr_matches(&s_spr_cur, s_spr_cfg.w, s_spr_cfg.h, s_spr_cfg.srgb)) return 0;
+	*out_sc = s_spr_cur.sc;
+	*hu = s_spr_cfg.hot_u;
+	*hv = s_spr_cfg.hot_v;
+	*size_req = s_spr_cfg.size_req;
+	*tex_h = s_spr_cfg.h;
+	return 1;
+}
+
+static void ps_cursor_sprite_session_stop(void)
+{
+	ps_spr_destroy(&s_spr_cur);
+	ps_spr_destroy(&s_spr_old);
+	s_spr_target.store(nullptr);
+	s_spr_filled_slot.store(UINT32_MAX);
+	s_spr_fail_w = s_spr_fail_h = 0;
+	s_spr_fail_srgb = -1;
+	s_spr_chained = 0;
+}
+
+void dxr_prov_cursor_set_sprite(void *src_tex, uint32_t w, uint32_t h, int srgb, float hot_u, float hot_v,
+                                float size_meters, uint32_t gen)
+{
+	int log_it;
+	{
+		std::lock_guard<std::mutex> lk(s_cur_mutex);
+		log_it = (src_tex != NULL) != (s_spr_cfg.set != 0) || w != s_spr_cfg.w || h != s_spr_cfg.h;
+		s_spr_cfg.set = src_tex != NULL && dxr_cursor::sprite_size_ok(w, h);
+		s_spr_cfg.src_tex = src_tex;
+		s_spr_cfg.w = w;
+		s_spr_cfg.h = h;
+		s_spr_cfg.srgb = srgb ? 1 : 0;
+		s_spr_cfg.hot_u = hot_u;
+		s_spr_cfg.hot_v = hot_v;
+		s_spr_cfg.size_req = size_meters;
+		s_spr_cfg.gen = gen;
+	}
+	static int s_logs = 0;
+	if (log_it && s_logs < 16 && ++s_logs) {
+		if (src_tex)
+			ps_log("[DisplayXR-PROV] cursor sprite: SET %ux%u %s hotspot (%.3f, %.3f) size %.4f m%s (gen %u)\n", w,
+			       h, srgb ? "sRGB" : "linear", hot_u, hot_v, size_meters,
+			       dxr_cursor::sprite_size_ok(w, h) ? "" : " - REJECTED, edge must be 1..1024 px", gen);
+		else
+			ps_log("[DisplayXR-PROV] cursor sprite: CLEARED - default cursor look\n");
+	}
+}
+
+void *dxr_prov_cursor_sprite_get_target(uint32_t *out_w, uint32_t *out_h)
+{
+	if (out_w) *out_w = 0;
+	if (out_h) *out_h = 0;
+	if (!s_ps.running) return NULL;
+#if defined(ENABLE_VULKAN) || defined(__APPLE__)
+	if (s_ps.graphics_api == DXR_GFX_VULKAN || s_ps.graphics_api == DXR_GFX_METAL) {
+		// No Unity-side target: the render event / the submit read the RT itself. A
+		// session token instead, so C# re-fills after a session restart.
+		const uint32_t g = s_session_generation.load();
+		return (void *)(uintptr_t)(g ? g : 1);
+	}
+#endif
+	void *t = s_spr_target.load();
+	// The size the target was made for: C# copies only an RT of exactly that size. Read
+	// racily from the render thread's struct; a stale pair only skips one frame's copy.
+	if (t && out_w) *out_w = s_spr_cur.w;
+	if (t && out_h) *out_h = s_spr_cur.h;
+	return t;
+}
+
+int dxr_prov_cursor_sprite_needs_fill(void)
+{
+#if defined(ENABLE_VULKAN)
+	if (s_ps.graphics_api == DXR_GFX_VULKAN && s_spr_cur.vk) return dxr_pvk_overlay_needs_copy(PS_PVK_OVERLAY_CURSOR);
+#endif
+	return 0;
+}
+
+int dxr_prov_cursor_sprite_status(void)
+{
+	std::lock_guard<std::mutex> lk(s_cur_mutex);
+	if (!s_spr_cfg.set) return 0;
+	return s_spr_chained ? 2 : 1;
+}
+
+/// Render-event side (displayxr_unity_plugin.cpp), Vulkan: the sprite RT to copy.
+int dxr_prov_cursor_sprite_source(void **out_tex, int *out_w, int *out_h)
+{
+	std::lock_guard<std::mutex> lk(s_cur_mutex);
+	if (out_tex) *out_tex = s_spr_cfg.src_tex;
+	if (out_w) *out_w = (int)s_spr_cfg.w;
+	if (out_h) *out_h = (int)s_spr_cfg.h;
+	return s_spr_cfg.set && s_spr_cfg.src_tex != NULL;
+}
+
+/// Render-event side: the C# fill for generation slot @p slot is in Unity's stream (on
+/// Vulkan: its copy was recorded). Submit uploads it once it is the newest generation.
+void dxr_prov_cursor_sprite_mark_filled(uint32_t slot)
+{
+	s_spr_filled_slot.store(slot % dxr_cursor::kSpriteGenSlots);
+}
+
 /// Before xrLocateViews: prepend the cursor structs, exactly the layout
 /// dxr::CursorDepth::chain uses -
 ///   li     -> hint -> draw [-> options] [-> source] -> (previous li.next)
@@ -5606,6 +6103,21 @@ static int ps_cursor_chain(PsCursorFrame *f, XrViewLocateInfo *li, XrViewState *
 		}
 	}
 #endif
+	// The app's own sprite (#369), once its swapchain has a released image. Its size is
+	// the app's, never the Linux OS-cursor estimate above (that only sizes the default look).
+	{
+		XrSwapchain spr = XR_NULL_HANDLE;
+		float hu = 0.0f, hv = 0.0f, size_req = 0.0f;
+		uint32_t tex_h = 0;
+		s_spr_chained = ps_cursor_sprite_for_chain(&spr, &hu, &hv, &size_req, &tex_h);
+		if (s_spr_chained) {
+			f->draw.image = spr;
+			f->draw.hotSpot = XrVector2f{hu, hv};
+			f->draw.sizeMeters = dxr_cursor::sprite_size_meters(
+			    size_req, tex_h, s_ps.display_info.is_valid ? s_ps.display_info.height_m : 0.0f,
+			    s_ps.display_info.is_valid ? s_ps.display_info.pixel_height : 0);
+		}
+	}
 	f->draw.visible = XR_TRUE;
 	f->draw.next = tail;
 	tail = &f->draw;
@@ -5798,6 +6310,7 @@ int dxr_prov_cursor_get_state(DxrProvCursorState *out)
 void dxr_prov_session_stop(void)
 {
 	s_live_window_px.store(0); // the next session measures its own window
+	ps_cursor_sprite_session_stop(); // sprite swapchain + bridge (#369); the C# config survives
 	for (int i = 0; i < PS_MAX_WSUI; i++) {
 		ProviderWsui *ws = &s_ps.wsui[i];
 		if (ws->swapchain && s_ps.pfn_destroy_swapchain) s_ps.pfn_destroy_swapchain(ws->swapchain);
@@ -7960,6 +8473,10 @@ int dxr_prov_submit_frame(uint32_t image_index)
 	// rect/bridge is registered.
 	XrCompositionLayerLocal2DDXR l2d_layer = {};
 	int has_l2d = ps_submit_local2d(&l2d_layer);
+
+	// Custom cursor sprite (#369): not a layer - the runtime samples it from the swapchain
+	// named on the hint. Filled only when it changed; nothing at all without a sprite.
+	ps_cursor_sprite_submit();
 
 	// Window-space UI (HUD). Composites over everything (fractional coords + disparity).
 	XrCompositionLayerWindowSpaceDXR wsui_layer[PS_MAX_WSUI] = {};
