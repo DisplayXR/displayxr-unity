@@ -5,7 +5,7 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.25.2] - 2026-10-13
 
 ### Fixed
 - Native-Wayland player (#361): a window restored at a position saved under another monitor layout no longer stays on the laptop panel.
