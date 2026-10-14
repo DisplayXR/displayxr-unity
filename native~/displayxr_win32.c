@@ -1885,7 +1885,22 @@ dedicated_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 			SetCursor(LoadCursorW(NULL, shape));
 			return TRUE;
 		}
+		// Depth-aware cursor: same as overlay_wnd_proc - the runtime draws it in
+		// stereo, so no flat OS cursor over the client area while it is lifted.
+		if (LOWORD(lParam) == HTCLIENT && s_overlay_cursor_hidden) {
+			SetCursor(NULL);
+			return TRUE;
+		}
 		break;
+
+	// Depth-aware cursor hide/show transition (displayxr_set_overlay_cursor_hidden
+	// posts it to s_overlay_hwnd, which is this window in editor external-window Play).
+	case DXR_WM_CURSOR_REFRESH: {
+		POINT pt;
+		if (GetCursorPos(&pt) && WindowFromPoint(pt) == hwnd)
+			SendMessageW(hwnd, WM_SETCURSOR, (WPARAM)hwnd, MAKELPARAM(HTCLIENT, WM_MOUSEMOVE));
+		return 0;
+	}
 
 	case WM_MOUSEMOVE:
 		if (s_ded_dragging) {

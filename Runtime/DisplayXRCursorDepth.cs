@@ -247,6 +247,26 @@ namespace DisplayXR
         {
             pos = default;
             if (Cursor.lockState == CursorLockMode.Locked) return false; // FPS-style: no pointer
+#if UNITY_EDITOR_WIN
+            // Editor Play with DISPLAYXR_PROV_EXTERNAL_WINDOW=1: the woven output is the
+            // dedicated window, not the Game view, so Mouse.current stops tracking the pointer
+            // as soon as it leaves the Game view and the lifted cursor freezes there. Read the
+            // pointer from the dedicated window instead (top-left client px), scaled into
+            // Screen space so the pointer and the Screen size we push stay consistent.
+            if (DisplayXRProviderDriver.IsActive && !DisplayXRProviderDriver.GameViewTextureModeEnabled())
+            {
+                try
+                {
+                    DisplayXRNative.displayxr_get_overlay_size(out int w, out int h);
+                    DisplayXRNative.displayxr_get_overlay_pointer(out int cx, out int cy, out _);
+                    if (w <= 0 || h <= 0 || cx < 0 || cy < 0 || cx >= w || cy >= h) return false;
+                    pos = new Vector2((cx + 0.5f) * Screen.width / w,
+                                      (h - cy - 0.5f) * Screen.height / h);
+                    return true;
+                }
+                catch (EntryPointNotFoundException) { /* old binary: fall through */ }
+            }
+#endif
 #if HAS_INPUT_SYSTEM && ENABLE_INPUT_SYSTEM
             var m = Mouse.current;
             if (m != null)
