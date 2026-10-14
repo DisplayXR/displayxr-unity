@@ -17,6 +17,11 @@
       "name": "com.unity.inputsystem",
       "expression": "1.0.0",
       "define": "HAS_INPUT_SYSTEM"
+    },
+    {
+      "name": "com.unity.modules.physics",
+      "expression": "1.0.0",
+      "define": "DISPLAYXR_HAS_PHYSICS"
     }
   ],
   "noEngineReferences": false
