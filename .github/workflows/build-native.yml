@@ -299,7 +299,20 @@ jobs:
         uses: actions/download-artifact@v7
         with:
           name: displayxr_unity-macos
-          path: Runtime/Plugins/macOS/
+          # The artifact was uploaded FROM the bundle directory, so its root is
+          # Contents/. Extract it INTO the bundle: extracting into macOS/ left the
+          # CI-built binary at Runtime/Plugins/macOS/Contents/MacOS/ (shipped in
+          # the .tgz as a stray file) while the .bundle that shipped was the
+          # committed one, not the CI build.
+          path: Runtime/Plugins/macOS/displayxr_unity.bundle/
+
+      - name: Check the macOS bundle landed in place
+        run: |
+          test -f Runtime/Plugins/macOS/displayxr_unity.bundle/Contents/MacOS/displayxr_unity || {
+            echo "::error::CI-built macOS binary missing from the bundle"; exit 1; }
+          if [ -e Runtime/Plugins/macOS/Contents ]; then
+            echo "::error::stray Runtime/Plugins/macOS/Contents - the macOS artifact was extracted outside the bundle"; exit 1
+          fi
 
       # Linux (#249). The .so is NOT committed to the repo — unlike the Windows DLL
       # and macOS bundle, no maintainer box builds it locally — so the artifact is
@@ -474,7 +487,20 @@ jobs:
         uses: actions/download-artifact@v7
         with:
           name: displayxr_unity-macos
-          path: Runtime/Plugins/macOS/
+          # The artifact was uploaded FROM the bundle directory, so its root is
+          # Contents/. Extract it INTO the bundle: extracting into macOS/ left the
+          # CI-built binary at Runtime/Plugins/macOS/Contents/MacOS/ (shipped in
+          # the .tgz as a stray file) while the .bundle that shipped was the
+          # committed one, not the CI build.
+          path: Runtime/Plugins/macOS/displayxr_unity.bundle/
+
+      - name: Check the macOS bundle landed in place
+        run: |
+          test -f Runtime/Plugins/macOS/displayxr_unity.bundle/Contents/MacOS/displayxr_unity || {
+            echo "::error::CI-built macOS binary missing from the bundle"; exit 1; }
+          if [ -e Runtime/Plugins/macOS/Contents ]; then
+            echo "::error::stray Runtime/Plugins/macOS/Contents - the macOS artifact was extracted outside the bundle"; exit 1
+          fi
 
       - name: Download Linux artifact
         uses: actions/download-artifact@v7
