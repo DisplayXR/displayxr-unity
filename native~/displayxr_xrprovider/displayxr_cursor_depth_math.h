@@ -68,6 +68,22 @@ inline bool chain_allowed(uint32_t advertised_spec, int source)
 // ---- Pointer -> canvas UV -----------------------------------------------------
 
 /*!
+ * Unity screen units -> the window's client pixels, in place. App zone rects are in client
+ * pixels; Unity's pointer and Screen.* are the same unit on Windows and macOS, but LOGICAL
+ * pixels (client / scale) on a scaled native-Wayland output, so a zone-scoped mapping
+ * scales them first. Leaves everything as is when either size is unknown (<= 0).
+ */
+inline void screen_to_client_px(float client_w, float client_h, float *mouse_x, float *mouse_y_up,
+                                float *screen_w, float *screen_h)
+{
+	if (!(client_w > 0.0f) || !(client_h > 0.0f) || !(*screen_w > 0.0f) || !(*screen_h > 0.0f)) return;
+	*mouse_x *= client_w / *screen_w;
+	*mouse_y_up *= client_h / *screen_h;
+	*screen_w = client_w;
+	*screen_h = client_h;
+}
+
+/*!
  * Unity screen pixels (origin bottom-left) -> canvas UV (origin top-left, v down).
  *
  * @param zone_valid  1 when the locate is zone-scoped on an APP-authored zone; the zone
