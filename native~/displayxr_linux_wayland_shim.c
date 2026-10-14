@@ -161,6 +161,13 @@ dxr_wl_ui_scale(void)
 }
 
 int
+dxr_wl_pointer_inside(void)
+{
+	const DxrWlApi *a = api();
+	return a ? a->pointer_inside() : -1;
+}
+
+int
 dxr_wl_click_through_wanted(void)
 {
 	const DxrWlApi *a = api();

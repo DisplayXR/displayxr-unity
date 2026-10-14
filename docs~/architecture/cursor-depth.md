@@ -157,6 +157,14 @@ built so it does not switch per frame at all:
   Unity world for the locate space. Without one, Auto uses Measured.
 - **Under the shell (IPC).** The service lifts the shell's workspace cursor onto the content
   instead of drawing a second one, and reports `willDraw` back.
+- **Linux.** On a scaled native-Wayland output Unity's pointer and `Screen.*` are logical px;
+  the provider scales the pointer to client px before an app-zone mapping
+  (`dxr_cursor::screen_to_client_px`). The Linux runtime cannot mirror the OS cursor yet and
+  draws its own arrow, so on native Wayland the provider asks for the OS cursor's size
+  (`XCURSOR_SIZE`, else 24 pt, at the output scale); the arrow still looks different from the
+  cursor theme. Over the click-through part of a transparent overlay the OS draws its own
+  cursor, so the provider stops the request when the Wayland pointer leaves the window's input
+  region; at most about one frame can still show both. X11 mode has none of these three yet.
 
 ## Verifying on Windows (3D panel)
 
