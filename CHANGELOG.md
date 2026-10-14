@@ -5,10 +5,14 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.26.0] - 2026-10-14
 
 ### Added
 - Depth-aware cursor (`XR_DXR_cursor_depth`, DisplayXR/displayxr-runtime ADR-046): opt in with `DisplayXRCursorDepth.Enabled = true` or a **DisplayXR Depth Cursor** component. Over content that pops out of the display, the runtime draws the cursor in stereo just in front of it and the OS cursor is hidden; elsewhere the plain OS cursor stays. `Source = Auto` (default) reads Unity's own scene depth under the cursor (a small async readback of the camera depth texture; URP's camera Depth Texture is switched on while the cursor is enabled; HDRP always; BiRP in deferred, or forward when the camera already renders depth) and falls back to the runtime's measured disparity elsewhere (runtime v2.39.0+). Also `Depth`, `Measured`, `Physics` (footprint raycast against colliders) and a per-frame `SetHitPoint`. Needs runtime v2.36.0+; older runtimes keep the plain cursor. Off by default, no cost unless enabled. See `docs~/architecture/cursor-depth.md`.
+
+### Fixed
+- Depth-aware cursor on Linux native Wayland (#365, thanks Byungju Lee): with an app 3D zone on a scaled output the pointer is mapped in client px (it used to land at half its position and never lift); the runtime-drawn cursor is sized like the OS cursor (`XCURSOR_SIZE` at the output scale; runtime v2.44.0 draws the theme cursor at the right size); no second cursor at the silhouette edge (the Wayland library reports pointer enter/leave, `DXR_WL_LIB_ABI` 3 -> 4).
+- Depth-aware cursor in Linux X11 mode (#366, thanks Byungju Lee): no second cursor at the silhouette edge — the provider checks the X pointer against the installed input region and drops the request outside it.
 
 ## [2.25.3] - 2026-10-14
 
