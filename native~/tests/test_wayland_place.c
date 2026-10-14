@@ -73,6 +73,16 @@ main(void)
 	CHECK(!dxr_wl_monitor_is(none, odyssey));
 	CHECK(!dxr_wl_monitor_is(odyssey, none));
 
+	// A size handed to the player, checked once it has had time to apply it. The
+	// failing run: DS1 left of the laptop at 150 %, the app's 1200x966 px sent as
+	// 800x644 logical, and the player back at 600x483 within the same frame.
+	const long long until = 2000000000LL;
+	CHECK(dxr_wl_sent_size_outcome(until - 1, until, 800, 644, 600, 483) == 0);  // still settling
+	CHECK(dxr_wl_sent_size_outcome(until, until, 800, 644, 800, 644) == 1);      // kept
+	CHECK(dxr_wl_sent_size_outcome(until, until, 800, 644, 600, 483) == -1);     // reverted: ask again
+	CHECK(dxr_wl_sent_size_outcome(until + 5, until, 800, 644, 800, 483) == -1); // half of it
+	CHECK(dxr_wl_sent_size_outcome(until, until, 0, 0, 600, 483) == 1);          // nothing sent
+
 	if (s_failed) {
 		fprintf(stderr, "test_wayland_place: %d check(s) failed\n", s_failed);
 		return 1;

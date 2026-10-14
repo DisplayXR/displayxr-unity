@@ -1,8 +1,8 @@
 // Copyright 2026, DisplayXR contributors
 // SPDX-License-Identifier: Apache-2.0
 //
-// Native-Wayland player: pure placement arithmetic (no Wayland, no D-Bus), so it
-// can be unit-tested on its own (native~/tests/test_wayland_place.c).
+// Native-Wayland player: pure placement and sizing arithmetic (no Wayland, no
+// D-Bus), so it can be unit-tested on its own (native~/tests/test_wayland_place.c).
 //
 // All rects are in mutter's STAGE coordinates (what xdg-output reports for each
 // output and what the GNOME extension reports for a window's frame and monitor).
@@ -65,6 +65,21 @@ dxr_wl_monitor_is(DxrWlRect4 monitor, DxrWlRect4 panel)
 		return 0;
 	return abs(monitor.x - panel.x) <= 1 && abs(monitor.y - panel.y) <= 1 && abs(monitor.w - panel.w) <= 1 &&
 	       abs(monitor.h - panel.h) <= 1;
+}
+
+//! A size handed to the player (sent_w x sent_h logical px), checked once it has
+//! had until `until_ns` to apply it: 0 = still waiting, 1 = its window has it (or
+//! nothing was sent), -1 = it does not. The player dropped the request or reverted
+//! it, which it can do inside one frame (resize, then back) when the compositor
+//! moves the window mid-resize, so the per-frame poll never sees the size change.
+static inline int
+dxr_wl_sent_size_outcome(long long now_ns, long long until_ns, int sent_w, int sent_h, int cur_w, int cur_h)
+{
+	if (sent_w <= 0 || sent_h <= 0)
+		return 1;
+	if (now_ns < until_ns)
+		return 0;
+	return cur_w == sent_w && cur_h == sent_h ? 1 : -1;
 }
 
 #ifdef __cplusplus

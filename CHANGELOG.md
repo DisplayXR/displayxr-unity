@@ -5,6 +5,14 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- Native-Wayland player (#361 follow-up): a window size the player drops or reverts is now asked for again.
+  - When the compositor moves the window while the player is resizing it, Unity can apply the requested size and reset it within the same frame. Seen when a restore lands on the 3D panel after a monitor-layout change, with the DS1 left of the laptop at 150 %. The per-frame poll then never saw the size change, the plug-in kept treating the request as in progress and never asked again, and the window stayed at its old logical size (900x725 px on the DS1 instead of the saved 1200x966).
+  - The plug-in now checks each size it hands to the player 1 s later. If the window does not have it, it logs `the player did not keep the WxH it was sent: …` and asks again, at most twice per app request as before.
+  - The Wayland unit test covers the check (`dxr_wl_sent_size_outcome` in `native~/displayxr_linux_wayland_place.h`). X11, Windows and macOS are unchanged.
+
 ## [2.25.2] - 2026-10-13
 
 ### Fixed
