@@ -80,6 +80,8 @@ int dxr_wl_weave_active(void);
 int dxr_wl_weave_device_size(int *out_w, int *out_h);
 //! Device px per logical px of the player's window; 1.0 when not active.
 double dxr_wl_ui_scale(void);
+//! The pointer is over the player's window (its input region): 1, elsewhere 0, not known -1.
+int dxr_wl_pointer_inside(void);
 
 // --- Window controls (called from displayxr_linux.c) -----------------------
 

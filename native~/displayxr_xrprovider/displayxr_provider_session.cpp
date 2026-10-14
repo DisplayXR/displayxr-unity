@@ -5462,6 +5462,35 @@ static void ps_cursor_session_reset(void)
 	s_cur.view_count = 0;
 }
 
+// Linux: Unity's pointer and Screen.* are LOGICAL px on a scaled native-Wayland output
+// (client px / scale), while an app zone rect is in the window's client px. Bring the
+// pointer into client px before a zone-scoped mapping. Windows and macOS: unchanged.
+static void ps_cursor_pointer_to_client_px(int app_zone, float *mx, float *my, float *sw, float *sh)
+{
+#if defined(__linux__) && !defined(__ANDROID__)
+	if (!app_zone) return;
+	const uint64_t v = s_live_window_px.load();
+	dxr_cursor::screen_to_client_px((float)(uint32_t)(v >> 32), (float)(uint32_t)(v & 0xffffffffu), mx, my, sw, sh);
+#else
+	(void)app_zone; (void)mx; (void)my; (void)sw; (void)sh;
+#endif
+}
+
+// Is the pointer over the app's window? Over the click-through part of a transparent
+// overlay it is over whatever lies behind, and the OS draws that cursor at once, so a
+// runtime-drawn one would show as a second cursor while its depth sinks. Unity's own
+// pointer position cannot tell: it stops at the last point inside the input region.
+// Native Wayland reports pointer enter/leave; elsewhere (and before the first event)
+// the pointer counts as over the window, as before.
+static int ps_cursor_pointer_over_app(void)
+{
+#if defined(__linux__) && !defined(__ANDROID__)
+	return s_ps.wl_weave ? dxr_wl_pointer_inside() != 0 : 1;
+#else
+	return 1;
+#endif
+}
+
 /// Before xrLocateViews: prepend the cursor structs, exactly the layout
 /// dxr::CursorDepth::chain uses -
 ///   li     -> hint -> draw [-> options] [-> source] -> (previous li.next)
@@ -5501,7 +5530,9 @@ static int ps_cursor_chain(PsCursorFrame *f, XrViewLocateInfo *li, XrViewState *
 	// Pointer -> canvas UV. A locate on an APP-authored zone frames that zone, so the
 	// UV is zone-relative; any other locate (full window, the editor's pane-glue zone,
 	// the texture-mode forced zone) frames what Unity renders to the screen.
+	if (pointer_valid && !ps_cursor_pointer_over_app()) pointer_valid = 0;
 	const int app_zone = (s_app_zone_valid && ps_zone_active()) ? 1 : 0;
+	ps_cursor_pointer_to_client_px(app_zone, &mx, &my, &sw, &sh);
 	dxr_cursor::Vec2 uv;
 	if (!pointer_valid ||
 	    !dxr_cursor::screen_to_canvas_uv(mx, my, sw, sh, app_zone, (float)s_app_zone_x,
@@ -5554,6 +5585,25 @@ static int ps_cursor_chain(PsCursorFrame *f, XrViewLocateInfo *li, XrViewState *
 	f->draw = {XR_TYPE_CURSOR_DEPTH_DRAW_INFO_DXR};
 	f->draw.image = XR_NULL_HANDLE; // the runtime's default look: the user's own OS cursor
 	f->draw.sizeMeters = 0.0f;      // ... at the OS cursor's size
+#if defined(__linux__) && !defined(__ANDROID__)
+	// The Linux runtime cannot mirror the OS cursor yet: it draws its own arrow at backing
+	// scale 1.0, half the OS cursor on a 200 % output. Native Wayland: ask for the OS
+	// cursor's size instead, its nominal size (XCURSOR_SIZE, else GNOME's default 24 pt)
+	// at the window's output scale, on the panel's pixel pitch.
+	if (s_ps.wl_weave && s_ps.display_info.is_valid && s_ps.display_info.pixel_height > 0 &&
+	    s_ps.display_info.height_m > 0.0f) {
+		const double scale = dxr_wl_ui_scale();
+		if (scale > 1.0) {
+			static int s_cursor_pt = 0;
+			if (s_cursor_pt == 0) {
+				const char *e = getenv("XCURSOR_SIZE");
+				s_cursor_pt = (e && atoi(e) > 0) ? atoi(e) : 24;
+			}
+			f->draw.sizeMeters = (float)(s_cursor_pt * scale * s_ps.display_info.height_m /
+			                             s_ps.display_info.pixel_height);
+		}
+	}
+#endif
 	f->draw.visible = XR_TRUE;
 	f->draw.next = tail;
 	tail = &f->draw;
@@ -5671,6 +5721,7 @@ uint32_t dxr_prov_cursor_get_footprint_rays(float *out, uint32_t max_rays)
 	}
 	if (out == NULL || max_rays == 0 || view_count < 2 || !unity_ok || !pointer_valid) return 0;
 	app_zone = (s_app_zone_valid && ps_zone_active()) ? 1 : 0;
+	ps_cursor_pointer_to_client_px(app_zone, &mx, &my, &sw, &sh);
 	dxr_cursor::Vec2 uv;
 	if (!dxr_cursor::screen_to_canvas_uv(mx, my, sw, sh, app_zone, (float)s_app_zone_x,
 	                                     (float)s_app_zone_y, (float)s_app_zone_w,
@@ -5701,6 +5752,7 @@ int dxr_prov_cursor_get_canvas_uv(float *out_u, float *out_v)
 	}
 	if (!valid) return 0;
 	const int app_zone = (s_app_zone_valid && ps_zone_active()) ? 1 : 0;
+	ps_cursor_pointer_to_client_px(app_zone, &mx, &my, &sw, &sh);
 	dxr_cursor::Vec2 uv;
 	if (!dxr_cursor::screen_to_canvas_uv(mx, my, sw, sh, app_zone, (float)s_app_zone_x, (float)s_app_zone_y,
 	                                     (float)s_app_zone_w, (float)s_app_zone_h, &uv) ||
