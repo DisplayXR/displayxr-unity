@@ -125,12 +125,17 @@ build will tell you. One container run catches them all:
   cursor in stereo just in front of the content under it; the provider chains the per-frame
   hint + draw request on its primary `xrLocateViews` and hides the OS cursor exactly while
   `willDraw` - natively over the overlay window (its `WM_SETCURSOR` sets a cursor itself, so
-  `Cursor.visible` cannot reach it) and via `Cursor.visible` over Unity's own window. Source
-  `Measured` (default; runtime spec v7, no colliders) or `AppPoint` (spec v5; footprint physics
-  raycast / `SetHitPoint`; needs a rig, since locate space == Unity world only via the rig
-  pose). Gate on the ADVERTISED spec, never the mirror's; below v5 nothing is chained. Pure math
-  in `native~/displayxr_xrprovider/displayxr_cursor_depth_math.h`, unit-tested in CI (Linux
-  job). Full write-up + Windows panel recipe: `docs~/architecture/cursor-depth.md`.
+  `Cursor.visible` cannot reach it) and via `Cursor.visible` over Unity's own window.
+  `Source = Auto` (default) reads **Unity's scene depth**: a 32x32 patch of the camera depth
+  texture (BiRP command buffer / URP render-graph pass that turns the camera Depth Texture on /
+  HDRP global custom pass), `AsyncGPUReadback` (never waits), unprojected in pure C#
+  (`DisplayXRCursorDepthMath`, reversed-Z vs GL, tested in CI) and sent as APP_POINT (spec v5);
+  it falls back to the runtime's MEASURED disparity (spec v7) where the pipeline exposes no depth
+  (BiRP forward without a camera depth texture - never force a pre-pass). `Depth`, `Measured`,
+  `Physics` (footprint raycast) are explicit choices; `SetHitPoint` overrides per frame.
+  Depth/Physics need a rig (locate space == Unity world only via the rig pose). Gate on the
+  ADVERTISED spec. Full write-up, the Auto/no-jump argument, and the Windows panel recipe:
+  `docs~/architecture/cursor-depth.md`.
 - **Runtime-owned Kooima math (`XR_DXR_view_rig`, #396 W7)**: the plugin no longer computes Kooima. It chains an `XrDisplayRigDXR`/`XrCameraRigDXR` descriptor (the handful of tunables) onto `xrLocateViews` and consumes render-ready `XrView{pose, fov}` in the provider's per-frame pump (Play Mode and built player alike). **This requires a runtime that advertises `XR_DXR_view_rig` (SPEC_VERSION 2)**; against an older runtime the plugin emits a one-shot WARN and passes raw views through (no stereo). The former vendored/`displayxr::math` display3d/camera3d math is gone (do not re-add — see the `no-vendored-math` drift guard).
 
 ### Render Pipeline Support (BiRP / URP / HDRP)
@@ -265,7 +270,7 @@ Scenes can contain multiple cameras with different rig types (display-centric, c
 | `DisplayXRRigManager` | Automatic | Static camera registry — no scene object, rigs self-register |
 | `DisplayXRInputController` | Optional | Sample WASD/mouse/scroll controller. Tab cycles cameras via `DisplayXRRigManager.CycleNext()`. Developers typically replace this with their own input. |
 | `DisplayXRContentBounds` | Optional (recommended for transparent overlays) | Reports the content's world AABB so the rear depth budget is judged from the desktop *behind the content*, not behind the whole window (`XR_DXR_depth_budget` v2). Drop it on the content root; nothing else to wire. |
-| `DisplayXRDepthCursor` | Optional | Opt-in switch for the depth-aware cursor (`XR_DXR_cursor_depth`); same settings as the static `DisplayXRCursorDepth`. |
+| `DisplayXRDepthCursor` | Optional | Opt-in switch for the depth-aware cursor (`XR_DXR_cursor_depth`); Source Auto/Depth/Measured/Physics; same settings as the static `DisplayXRCursorDepth`. |
 | `DisplayXRDepthBudget` | Automatic | Static read-only view of the rear depth budget (`State`, `FarOffsetVH`, `CueEnergy`, `RearOffsetWorld`) — no scene object; the provider driver publishes it each frame. |
 
 ### OpenXR path: the display provider
