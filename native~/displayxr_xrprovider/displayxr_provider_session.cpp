@@ -12,6 +12,7 @@
 
 #include <openxr/openxr.h>
 #include "../displayxr_extensions.h"
+#include "displayxr_cursor_depth_math.h" // pure cursor math (unit-tested)
 #include "../displayxr_shared_state.h" // displayxr_state_set_stereo_matrices (overlay hit-test)
 #include "../displayxr_window_space_ui.h" // DXR_WSUI_MAX_SLOTS, get_pending_slot
 #include <atomic>     // s_session_generation (#336)
@@ -32,6 +33,9 @@
 #endif
 
 #include <mutex>
+#ifdef _WIN32
+extern "C" void displayxr_set_overlay_cursor_hidden(int hidden); // displayxr_win32.c
+#endif
 
 #include <stdio.h>
 #include <stdarg.h>
@@ -389,6 +393,11 @@ typedef struct ProviderSession {
 	// depth_budget_version gates the whole path - an older runtime never sees the
 	// struct, and falls back to the bounds rect it already understands.
 	int      depth_budget_version;
+	// XR_DXR_cursor_depth (ADR-046): the extensionVersion the runtime ADVERTISED (0 =
+	// not advertised, extension not enabled). Every cursor decision gates on this
+	// number, never on the mirror's SPEC_VERSION: v5 = the runtime draws (the
+	// provider's minimum), v7 = measured disparity.
+	uint32_t cursor_depth_version;
 	uint8_t *content_mask;      // owned, mask_w * mask_h bytes, row-major, top-left
 	uint32_t content_mask_w, content_mask_h;
 	uint32_t content_mask_cap;  // allocated bytes
@@ -4713,6 +4722,8 @@ int dxr_prov_session_start(const char *runtime_json_path,
 							// mask, and chaining it at a v2 runtime would be dead weight.
 							s_ps.depth_budget_version = (int)props[i].extensionVersion;
 						}
+						else if (strcmp(props[i].extensionName, XR_DXR_CURSOR_DEPTH_EXTENSION_NAME) == 0)
+							s_ps.cursor_depth_version = props[i].extensionVersion;
 					}
 				}
 				free(props);
@@ -4730,6 +4741,11 @@ int dxr_prov_session_start(const char *runtime_json_path,
 		                             : "no (foreground clip stays at the display plane)",
 		       s_ps.depth_budget_version,
 		       s_ps.depth_budget_version >= 3 ? "supported" : "not supported, bounds rect only");
+		ps_log("[DisplayXR-PROV] XR_DXR_cursor_depth: %s (spec v%u; runtime-drawn cursor %s, measured disparity %s)\n",
+		       s_ps.cursor_depth_version ? "AVAILABLE" : "no (plain OS cursor)",
+		       s_ps.cursor_depth_version,
+		       s_ps.cursor_depth_version >= 5 ? "yes" : "no",
+		       s_ps.cursor_depth_version >= 7 ? "yes" : "no");
 		// -1 = "no state logged yet". 0 is a real state (UNRESTRICTED_OPAQUE), so the
 		// memset-to-zero s_ps cannot double as "unknown".
 		s_ps.budget_state_logged = -1;
@@ -4767,7 +4783,7 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	}
 
 	// --- Create instance ---
-	const char *extensions[12];
+	const char *extensions[14];
 	uint32_t ext_count = 0;
 	extensions[ext_count++] = XR_DXR_DISPLAY_INFO_EXTENSION_NAME;
 #ifdef _WIN32
@@ -4815,6 +4831,15 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	// has_depth_budget at 0, so nothing about today's behaviour changes.
 	if (s_ps.has_depth_budget)
 		extensions[ext_count++] = XR_DXR_DEPTH_BUDGET_EXTENSION_NAME;
+	// Depth-aware cursor (ADR-046). Enabling it costs nothing (section 0): the runtime
+	// does cursor work only on a locate that chains a hint, and the provider chains one
+	// only while the app opted in (DisplayXRCursorDepth.Enabled). Below v5 the runtime
+	// cannot draw the cursor and this provider never draws one itself, so there is
+	// nothing to enable for.
+	if (s_ps.cursor_depth_version >= 5)
+		extensions[ext_count++] = XR_DXR_CURSOR_DEPTH_EXTENSION_NAME;
+	else
+		s_ps.cursor_depth_version = 0;
 
 	PFN_xrVoidFunction fn_create = NULL;
 	s_ps.gipa(XR_NULL_HANDLE, "xrCreateInstance", &fn_create);
@@ -5362,6 +5387,318 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	return 1;
 }
 
+// ============================================================================
+// Depth-aware cursor (XR_DXR_cursor_depth, ADR-046 + Amendments 2 and 3)
+// ============================================================================
+//
+// The RUNTIME draws the cursor (spec v5); this provider only (1) chains the per-frame
+// request on the main locate - hint + draw request + optional margin + optional
+// measured-disparity source - (2) reads willDraw back, and (3) hides the OS cursor
+// over its overlay exactly while it is true. The app's side lives in C#
+// (DisplayXRCursorDepth): opt-in, the depth source, the pointer, and - for APP_POINT -
+// the hit points it found along the footprint rays this module hands it.
+//
+// Section 0 (zero cost unless asked): with the feature off, ps_cursor_chain returns
+// before touching either chain, and nothing else here runs per frame.
+//
+// Threads: the config + pointer + hits are written on Unity's main thread
+// (dxr_prov_cursor_*), the chain / readback run on the graphics thread inside
+// dxr_prov_begin_frame. Everything shared goes through s_cur_mutex; the critical
+// sections copy a few dozen bytes. File statics, not s_ps fields: the app opts in
+// once and the session RESTARTS on dock<->undock (s_ps is memset there).
+
+static std::mutex s_cur_mutex;
+static struct {
+	int   enabled;
+	int   source;      // dxr_cursor::Source
+	float margin;      // eye baselines; <= 0 = the runtime default
+	int   pointer_valid;
+	float mouse_x, mouse_y, screen_w, screen_h; // Unity screen px, origin bottom-left
+	uint32_t hit_count;                          // APP_POINT hits, UNITY world
+	dxr_cursor::Vec3 hits[dxr_cursor::kFootprintMaxRays];
+	// Published by the graphics thread after each locate: the outer views (locate
+	// space) for next frame's footprint rays, and whether locate space == Unity world
+	// with Z negated (a DisplayXR rig pushed its pose).
+	dxr_cursor::View views[2];
+	int   view_count;
+	int   views_unity_ok;
+	// Outputs.
+	int   chained;     // the last locate carried a hint
+	int   will_draw;   // ... and the runtime said it will draw
+	float disparity;   // filtered placement disparity (diagnostic)
+} s_cur;
+static int s_cur_hidden_os = 0;        // graphics thread: last hide state pushed to the overlay
+static int s_cur_logged_transitions = 0;
+static int s_cur_logged_no_rig = 0;
+
+// Everything the runtime reads during ONE xrLocateViews: lives on the caller's stack
+// for the duration of that call.
+struct PsCursorFrame {
+	XrCursorDepthHintDXR      hint;
+	XrCursorDepthDrawInfoDXR  draw;
+	XrCursorDepthOptionsDXR   options;
+	XrCursorDepthSourceDXR    source;
+	XrCursorDepthDrawStateDXR draw_state;
+	XrCursorDepthPlacementDXR placement;
+	int chained;
+};
+
+static void ps_cursor_set_os_hidden(int hidden)
+{
+	if (hidden == s_cur_hidden_os) return;
+	s_cur_hidden_os = hidden;
+#ifdef _WIN32
+	displayxr_set_overlay_cursor_hidden(hidden);
+#endif
+}
+
+// Session stop: the next session starts from "not drawn", with the OS cursor back.
+static void ps_cursor_session_reset(void)
+{
+	ps_cursor_set_os_hidden(0);
+	std::lock_guard<std::mutex> lk(s_cur_mutex);
+	s_cur.chained = 0;
+	s_cur.will_draw = 0;
+	s_cur.view_count = 0;
+}
+
+/// Before xrLocateViews: prepend the cursor structs, exactly the layout
+/// dxr::CursorDepth::chain uses -
+///   li     -> hint -> draw [-> options] [-> source] -> (previous li.next)
+///   vstate -> drawState -> placement -> (previous vstate.next)
+/// @return 1 when a hint was chained.
+static int ps_cursor_chain(PsCursorFrame *f, XrViewLocateInfo *li, XrViewState *vs)
+{
+	f->chained = 0;
+	if (s_ps.cursor_depth_version == 0) return 0;
+
+	int enabled, source, pointer_valid, views_unity_ok;
+	float margin, mx, my, sw, sh;
+	uint32_t hit_count;
+	dxr_cursor::Vec3 hits[dxr_cursor::kFootprintMaxRays];
+	dxr_cursor::Quat view_q = {0, 0, 0, 1};
+	{
+		std::lock_guard<std::mutex> lk(s_cur_mutex);
+		enabled = s_cur.enabled;
+		if (!enabled) {
+			s_cur.chained = 0;
+			s_cur.will_draw = 0;
+		}
+		source = s_cur.source;
+		margin = s_cur.margin;
+		pointer_valid = s_cur.pointer_valid;
+		mx = s_cur.mouse_x; my = s_cur.mouse_y; sw = s_cur.screen_w; sh = s_cur.screen_h;
+		hit_count = s_cur.hit_count;
+		for (uint32_t i = 0; i < hit_count; i++) hits[i] = s_cur.hits[i];
+		views_unity_ok = s_ps.display_pose_set;
+		if (s_cur.view_count >= 1) view_q = s_cur.views[0].orientation;
+	}
+	if (!enabled || !dxr_cursor::chain_allowed(s_ps.cursor_depth_version, source)) {
+		ps_cursor_set_os_hidden(0);
+		return 0;
+	}
+
+	// Pointer -> canvas UV. A locate on an APP-authored zone frames that zone, so the
+	// UV is zone-relative; any other locate (full window, the editor's pane-glue zone,
+	// the texture-mode forced zone) frames what Unity renders to the screen.
+	const int app_zone = (s_app_zone_valid && ps_zone_active()) ? 1 : 0;
+	dxr_cursor::Vec2 uv;
+	if (!pointer_valid ||
+	    !dxr_cursor::screen_to_canvas_uv(mx, my, sw, sh, app_zone, (float)s_app_zone_x,
+	                                     (float)s_app_zone_y, (float)s_app_zone_w,
+	                                     (float)s_app_zone_h, &uv) ||
+	    !dxr_cursor::uv_in_canvas(uv)) {
+		// Off the canvas: no request this frame (and so no runtime cost).
+		std::lock_guard<std::mutex> lk(s_cur_mutex);
+		s_cur.chained = 0;
+		s_cur.will_draw = 0;
+		return 0;
+	}
+
+	f->hint = {XR_TYPE_CURSOR_DEPTH_HINT_DXR};
+	f->hint.cursorUV = XrVector2f{uv.x, uv.y};
+	f->hint.cursorHeight = 0.0f; // the runtime default (0.03 of the canvas height)
+	f->hint.hasContent = XR_FALSE;
+	const void *tail = li->next;
+	if (source == dxr_cursor::SOURCE_MEASURED) {
+		f->source = {XR_TYPE_CURSOR_DEPTH_SOURCE_DXR};
+		f->source.source = XR_CURSOR_DEPTH_SOURCE_MEASURED_DISPARITY_DXR;
+		f->source.next = tail;
+		tail = &f->source;
+	} else {
+		// APP_POINT: the C# side cast the footprint rays and handed us UNITY-world hits.
+		// Locate space is Unity world (Z negated) only when a rig pushed its pose; without
+		// one there is no defined mapping, so the cursor stays on the plane (OS cursor).
+		if (hit_count > 0 && views_unity_ok) {
+			dxr_cursor::Vec3 oxr[dxr_cursor::kFootprintMaxRays];
+			for (uint32_t i = 0; i < hit_count; i++) oxr[i] = dxr_cursor::flip_z(hits[i]);
+			dxr_cursor::Vec3 nearest;
+			if (dxr_cursor::nearest_hit(oxr, hit_count, view_q, &nearest)) {
+				f->hint.hasContent = XR_TRUE;
+				f->hint.nearestPoint = XrVector3f{nearest.x, nearest.y, nearest.z};
+			}
+		} else if (hit_count > 0 && !s_cur_logged_no_rig) {
+			s_cur_logged_no_rig = 1;
+			ps_log("[DisplayXR-PROV] cursor_depth: AppPoint hits ignored - no DisplayXR rig "
+			       "(DisplayXRDisplay/DisplayXRCamera) is pushing a pose, so Unity world has no "
+			       "defined mapping to the locate space. Use Source=Measured, or add a rig.\n");
+		}
+	}
+	if (margin > 0.0f && s_ps.cursor_depth_version >= 3) {
+		f->options = {XR_TYPE_CURSOR_DEPTH_OPTIONS_DXR};
+		f->options.anchorMode = XR_CURSOR_DEPTH_ANCHOR_MODE_HYBRID_DXR;
+		f->options.margin = margin;
+		f->options.next = tail;
+		tail = &f->options;
+	}
+	f->draw = {XR_TYPE_CURSOR_DEPTH_DRAW_INFO_DXR};
+	f->draw.image = XR_NULL_HANDLE; // the runtime's default look: the user's own OS cursor
+	f->draw.sizeMeters = 0.0f;      // ... at the OS cursor's size
+	f->draw.visible = XR_TRUE;
+	f->draw.next = tail;
+	tail = &f->draw;
+	f->hint.next = tail;
+	li->next = &f->hint;
+
+	f->placement = {XR_TYPE_CURSOR_DEPTH_PLACEMENT_DXR};
+	f->placement.next = vs->next;
+	f->draw_state = {XR_TYPE_CURSOR_DEPTH_DRAW_STATE_DXR};
+	f->draw_state.next = &f->placement;
+	vs->next = &f->draw_state;
+	f->chained = 1;
+	return 1;
+}
+
+/// After xrLocateViews: publish willDraw + the outer views, and hide/show the OS
+/// cursor over the overlay on transitions. Also runs (to record the views) when no hint
+/// was chained, so the first frame after the pointer enters has footprint rays.
+static void ps_cursor_after_locate(const PsCursorFrame *f, const XrView *views, uint32_t n)
+{
+	if (s_ps.cursor_depth_version == 0) return;
+	const int will = (f->chained && f->draw_state.willDraw == XR_TRUE) ? 1 : 0;
+	int was;
+	{
+		std::lock_guard<std::mutex> lk(s_cur_mutex);
+		if (!s_cur.enabled && !s_cur.chained && !s_cur.will_draw && !f->chained) {
+			s_cur.view_count = 0;
+			return; // feature off: nothing to publish
+		}
+		was = s_cur.will_draw;
+		s_cur.chained = f->chained;
+		s_cur.will_draw = will;
+		s_cur.disparity = f->chained ? f->placement.disparity : 0.0f;
+		s_cur.views_unity_ok = s_ps.display_pose_set;
+		s_cur.view_count = 0;
+		if (views != NULL && n >= 2) {
+			const XrView *outer[2] = {&views[0], &views[n - 1]};
+			for (int k = 0; k < 2; k++) {
+				dxr_cursor::View &v = s_cur.views[k];
+				v.position = {outer[k]->pose.position.x, outer[k]->pose.position.y, outer[k]->pose.position.z};
+				v.orientation = {outer[k]->pose.orientation.x, outer[k]->pose.orientation.y,
+				                 outer[k]->pose.orientation.z, outer[k]->pose.orientation.w};
+				v.angle_left = outer[k]->fov.angleLeft;
+				v.angle_right = outer[k]->fov.angleRight;
+				v.angle_up = outer[k]->fov.angleUp;
+				v.angle_down = outer[k]->fov.angleDown;
+			}
+			s_cur.view_count = 2;
+		}
+	}
+	ps_cursor_set_os_hidden(will);
+	if (will != was && s_cur_logged_transitions < 16) {
+		s_cur_logged_transitions++;
+		ps_log("[DisplayXR-PROV] cursor_depth: willDraw %d -> %d (disparity %.4f)%s\n", was, will,
+		       f->chained ? f->placement.disparity : 0.0f,
+		       s_cur_logged_transitions == 16 ? " - further transitions not logged" : "");
+	}
+}
+
+void dxr_prov_cursor_configure(int enabled, int source, float margin)
+{
+	int log_it = 0;
+	{
+		std::lock_guard<std::mutex> lk(s_cur_mutex);
+		log_it = (enabled != s_cur.enabled || source != s_cur.source);
+		s_cur.enabled = enabled ? 1 : 0;
+		s_cur.source = source;
+		s_cur.margin = margin;
+		if (!enabled) {
+			s_cur.hit_count = 0;
+			s_cur.pointer_valid = 0;
+		}
+	}
+	if (log_it)
+		ps_log("[DisplayXR-PROV] cursor_depth: %s, source=%s, margin=%.4f (runtime spec v%u)\n",
+		       enabled ? "ENABLED" : "disabled", source == dxr_cursor::SOURCE_MEASURED ? "measured" : "app-point",
+		       margin, s_ps.cursor_depth_version);
+}
+
+void dxr_prov_cursor_set_pointer(int valid, float mouse_x, float mouse_y, float screen_w, float screen_h)
+{
+	std::lock_guard<std::mutex> lk(s_cur_mutex);
+	s_cur.pointer_valid = valid ? 1 : 0;
+	s_cur.mouse_x = mouse_x;
+	s_cur.mouse_y = mouse_y;
+	s_cur.screen_w = screen_w;
+	s_cur.screen_h = screen_h;
+}
+
+void dxr_prov_cursor_set_hits(const float *xyz, uint32_t count)
+{
+	std::lock_guard<std::mutex> lk(s_cur_mutex);
+	if (xyz == NULL) count = 0;
+	if (count > dxr_cursor::kFootprintMaxRays) count = dxr_cursor::kFootprintMaxRays;
+	for (uint32_t i = 0; i < count; i++) s_cur.hits[i] = {xyz[3 * i], xyz[3 * i + 1], xyz[3 * i + 2]};
+	s_cur.hit_count = count;
+}
+
+uint32_t dxr_prov_cursor_get_footprint_rays(float *out, uint32_t max_rays)
+{
+	dxr_cursor::View views[2];
+	int view_count, unity_ok, pointer_valid, app_zone;
+	float mx, my, sw, sh;
+	{
+		std::lock_guard<std::mutex> lk(s_cur_mutex);
+		view_count = s_cur.view_count;
+		unity_ok = s_cur.views_unity_ok;
+		pointer_valid = s_cur.pointer_valid;
+		mx = s_cur.mouse_x; my = s_cur.mouse_y; sw = s_cur.screen_w; sh = s_cur.screen_h;
+		views[0] = s_cur.views[0];
+		views[1] = s_cur.views[1];
+	}
+	if (out == NULL || max_rays == 0 || view_count < 2 || !unity_ok || !pointer_valid) return 0;
+	app_zone = (s_app_zone_valid && ps_zone_active()) ? 1 : 0;
+	dxr_cursor::Vec2 uv;
+	if (!dxr_cursor::screen_to_canvas_uv(mx, my, sw, sh, app_zone, (float)s_app_zone_x,
+	                                     (float)s_app_zone_y, (float)s_app_zone_w,
+	                                     (float)s_app_zone_h, &uv) ||
+	    !dxr_cursor::uv_in_canvas(uv))
+		return 0;
+	dxr_cursor::Ray rays[dxr_cursor::kFootprintMaxRays];
+	uint32_t n = dxr_cursor::footprint_rays(views, 2, uv, dxr_cursor::kDefaultCursorHeight, rays);
+	if (n > max_rays) n = max_rays;
+	for (uint32_t i = 0; i < n; i++) {
+		// Locate space -> Unity world: the same Z negation, on the point and the direction.
+		const dxr_cursor::Vec3 o = dxr_cursor::flip_z(rays[i].origin);
+		const dxr_cursor::Vec3 d = dxr_cursor::flip_z(rays[i].dir);
+		out[6 * i + 0] = o.x; out[6 * i + 1] = o.y; out[6 * i + 2] = o.z;
+		out[6 * i + 3] = d.x; out[6 * i + 4] = d.y; out[6 * i + 5] = d.z;
+	}
+	return n;
+}
+
+int dxr_prov_cursor_get_state(DxrProvCursorState *out)
+{
+	if (out == NULL) return 0;
+	std::lock_guard<std::mutex> lk(s_cur_mutex);
+	out->runtime_spec = s_ps.cursor_depth_version;
+	out->enabled = s_cur.enabled;
+	out->requested = s_cur.chained;
+	out->will_draw = s_cur.will_draw;
+	out->disparity = s_cur.disparity;
+	return 1;
+}
+
 void dxr_prov_session_stop(void)
 {
 	s_live_window_px.store(0); // the next session measures its own window
@@ -5471,6 +5808,7 @@ void dxr_prov_session_stop(void)
 	// reference it (matches the standalone's deliberate leak).
 	void *lib = s_ps.runtime_lib;
 	ps_free_content_mask();
+	ps_cursor_session_reset();
 	memset(&s_ps, 0, sizeof(s_ps));
 	s_ps.runtime_lib = lib;
 }
@@ -6352,8 +6690,17 @@ int dxr_prov_begin_frame(uint32_t *out_image_index, int *out_should_render)
 			vstate.next = &budget;
 		}
 
-		if (XR_SUCCEEDED(s_ps.pfn_locate_views(s_ps.session, &li, &vstate,
-		                                       PS_MAX_VIEWS, &vcount, views)) && vcount >= 1) {
+		// Depth-aware cursor (ADR-046): prepend the per-frame request (no-op unless the
+		// app opted in AND the runtime advertises spec >= 5). On the PRIMARY locate only:
+		// it is the zone-scoped locate of the primary zone when zones are on, and the
+		// spec asks for the hint on at most one locate per frame.
+		PsCursorFrame cursor_frame;
+		ps_cursor_chain(&cursor_frame, &li, &vstate);
+
+		const int located = XR_SUCCEEDED(s_ps.pfn_locate_views(s_ps.session, &li, &vstate,
+		                                                       PS_MAX_VIEWS, &vcount, views)) && vcount >= 1;
+		ps_cursor_after_locate(&cursor_frame, located ? views : NULL, located ? vcount : 0);
+		if (located) {
 			uint32_t n = vcount < DXR_PROV_MAX_VIEWS ? vcount : DXR_PROV_MAX_VIEWS;
 			for (uint32_t i = 0; i < n; i++) {
 				s_ps.views[i].position[0] = views[i].pose.position.x;
