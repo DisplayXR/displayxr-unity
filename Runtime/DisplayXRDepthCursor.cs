@@ -16,12 +16,13 @@ namespace DisplayXR
     [DisallowMultipleComponent]
     public class DisplayXRDepthCursor : MonoBehaviour
     {
-        [Tooltip("Measured: the runtime measures the depth under the cursor from the two " +
-                 "rendered views - any content, no colliders, no code (runtime spec v7). " +
-                 "AppPoint: raycast 3D physics colliders along the cursor footprint, or feed " +
-                 "DisplayXRCursorDepth.SetHitPoint every frame (runtime spec v5; needs a " +
-                 "DisplayXRDisplay / DisplayXRCamera rig).")]
-        public DisplayXRCursorDepth.DepthSource source = DisplayXRCursorDepth.DepthSource.Measured;
+        [Tooltip("Auto (default): Unity's scene depth under the cursor when the render pipeline " +
+                 "exposes it, else the runtime's measured disparity. Depth: scene depth only " +
+                 "(URP: the camera Depth Texture is switched on while this is enabled; BiRP " +
+                 "forward needs the camera to already render depth). Measured: the runtime " +
+                 "matches the two rendered views (runtime spec v7). Physics: raycast 3D " +
+                 "colliders along the cursor footprint.")]
+        public DisplayXRCursorDepth.DepthSource source = DisplayXRCursorDepth.DepthSource.Auto;
 
         [Tooltip("How far in front of the content the cursor floats, in eye baselines. " +
                  "0 = the runtime default (0.015), shared by every DisplayXR app.")]
@@ -31,11 +32,7 @@ namespace DisplayXR
         [Tooltip("Hide Cursor.visible while the runtime draws its own cursor.")]
         public bool manageOsCursor = true;
 
-        [Header("AppPoint")]
-        [Tooltip("Raycast 3D physics colliders along the cursor footprint when nothing calls " +
-                 "SetHitPoint / sets CustomHitTest.")]
-        public bool usePhysicsRaycast = true;
-
+        [Header("Physics source")]
         [Tooltip("Layers the footprint raycast considers.")]
         public LayerMask raycastLayers = ~(1 << 2);
 
@@ -62,7 +59,6 @@ namespace DisplayXR
             DisplayXRCursorDepth.Source = source;
             DisplayXRCursorDepth.Margin = margin;
             DisplayXRCursorDepth.ManageOsCursor = manageOsCursor;
-            DisplayXRCursorDepth.UsePhysicsRaycast = usePhysicsRaycast;
             DisplayXRCursorDepth.RaycastLayerMask = raycastLayers;
             DisplayXRCursorDepth.RaycastMaxDistance = raycastMaxDistance;
         }

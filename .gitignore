@@ -41,3 +41,7 @@ displayxr-app.log.meta
 # IS committed so Unity imports the pair once CI supplies the binary. A local
 # native~/build-linux.sh drops one here; keep it out of commits.
 Runtime/Plugins/Linux/x86_64/*.so
+
+# C# unit-test build output (Tests~/ is invisible to Unity)
+Tests~/**/bin/
+Tests~/**/obj/

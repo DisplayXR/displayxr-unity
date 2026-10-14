@@ -5627,7 +5627,10 @@ void dxr_prov_cursor_configure(int enabled, int source, float margin)
 			s_cur.pointer_valid = 0;
 		}
 	}
-	if (log_it)
+	// Auto switches between app-point and measured when the depth readback comes and
+	// goes; log the first few configuration changes only.
+	static int s_cfg_logs = 0;
+	if (log_it && s_cfg_logs < 16 && ++s_cfg_logs)
 		ps_log("[DisplayXR-PROV] cursor_depth: %s, source=%s, margin=%.4f (runtime spec v%u)\n",
 		       enabled ? "ENABLED" : "disabled", source == dxr_cursor::SOURCE_MEASURED ? "measured" : "app-point",
 		       margin, s_ps.cursor_depth_version);
@@ -5685,6 +5688,45 @@ uint32_t dxr_prov_cursor_get_footprint_rays(float *out, uint32_t max_rays)
 		out[6 * i + 3] = d.x; out[6 * i + 4] = d.y; out[6 * i + 5] = d.z;
 	}
 	return n;
+}
+
+int dxr_prov_cursor_get_canvas_uv(float *out_u, float *out_v)
+{
+	int valid;
+	float mx, my, sw, sh;
+	{
+		std::lock_guard<std::mutex> lk(s_cur_mutex);
+		valid = s_cur.pointer_valid;
+		mx = s_cur.mouse_x; my = s_cur.mouse_y; sw = s_cur.screen_w; sh = s_cur.screen_h;
+	}
+	if (!valid) return 0;
+	const int app_zone = (s_app_zone_valid && ps_zone_active()) ? 1 : 0;
+	dxr_cursor::Vec2 uv;
+	if (!dxr_cursor::screen_to_canvas_uv(mx, my, sw, sh, app_zone, (float)s_app_zone_x, (float)s_app_zone_y,
+	                                     (float)s_app_zone_w, (float)s_app_zone_h, &uv) ||
+	    !dxr_cursor::uv_in_canvas(uv))
+		return 0;
+	if (out_u) *out_u = uv.x;
+	if (out_v) *out_v = uv.y;
+	return 1;
+}
+
+int dxr_prov_cursor_get_eye(DxrProvCursorEye *out)
+{
+	if (out == NULL) return 0;
+	memset(out, 0, sizeof(*out));
+	if (!s_ps.running || !s_ps.display_pose_set || s_ps.view_count < 1 || !s_ps.views[0].valid) return 0;
+	const DxrProvView &v = s_ps.views[0];
+	for (int i = 0; i < 3; i++) out->position[i] = v.position[i];
+	for (int i = 0; i < 4; i++) out->orientation[i] = v.orientation[i];
+	dxr_prov_build_projection(v.fov, out->projection); // exactly what PopulateNextFrameDesc hands Unity
+	uint32_t scW = 0, scH = 0, scArr = 0, scImgs = 0, rW = 0, rH = 0;
+	dxr_prov_get_swapchain_info(&scW, &scH, &scArr, &scImgs);
+	dxr_prov_get_render_rect(&rW, &rH);
+	out->viewport[0] = (scW > 0 && rW > 0 && rW < scW) ? (float)rW / (float)scW : 1.0f;
+	out->viewport[1] = (scH > 0 && rH > 0 && rH < scH) ? (float)rH / (float)scH : 1.0f;
+	out->valid = 1;
+	return 1;
 }
 
 int dxr_prov_cursor_get_state(DxrProvCursorState *out)

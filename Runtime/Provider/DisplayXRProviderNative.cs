@@ -464,6 +464,24 @@ namespace DisplayXR
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern int dxr_prov_cursor_get_state(out CursorState state);
 
+        /// <summary>Mirrors <c>DxrProvCursorEye</c>: eye 0 as Unity rendered it.</summary>
+        [StructLayout(LayoutKind.Sequential)]
+        public unsafe struct CursorEye
+        {
+            public fixed float position[3];    // OpenXR locate space
+            public fixed float orientation[4]; // x, y, z, w
+            public fixed float projection[16]; // GL-style, column-major
+            public fixed float viewport[2];    // rendered fraction of the eye texture
+            public int valid;
+        }
+
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int dxr_prov_cursor_get_eye(out CursorEye eye);
+
+        /// <summary>Pointer canvas UV (top-left origin, v down); 1 when on the canvas.</summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int dxr_prov_cursor_get_canvas_uv(out float u, out float v);
+
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern void dxr_prov_set_content_bounds(
             float minX, float minY, float minZ,

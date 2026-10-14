@@ -552,6 +552,23 @@ DISPLAYXR_EXPORT uint32_t dxr_prov_cursor_get_footprint_rays(float *out, uint32_
 /// @return 1 and fills @p out.
 DISPLAYXR_EXPORT int dxr_prov_cursor_get_state(DxrProvCursorState *out);
 
+/// Eye 0 (left) as Unity rendered it, for unprojecting a depth-buffer sample (the
+/// Depth / Auto cursor source). Mirrors DisplayXRProviderNative.CursorEye.
+typedef struct DxrProvCursorEye {
+	float position[3];    ///< eye position, OpenXR locate space (== Unity world, Z negated, with a rig)
+	float orientation[4]; ///< eye orientation (x,y,z,w), OpenXR locate space
+	float projection[16]; ///< the GL-style projection handed to Unity (column-major)
+	float viewport[2];    ///< rendered fraction of the eye texture (render rect / swapchain)
+	int   valid;          ///< 0: no stereo views yet, or no rig defines Unity world
+} DxrProvCursorEye;
+
+/// The pointer's canvas UV (origin top-left, v down) as the next hint will carry it.
+/// @return 1 when the pointer is on the canvas, 0 otherwise.
+DISPLAYXR_EXPORT int dxr_prov_cursor_get_canvas_uv(float *out_u, float *out_v);
+
+/// @return 1 and fills @p out when the eye is usable (out->valid), 0 otherwise.
+DISPLAYXR_EXPORT int dxr_prov_cursor_get_eye(DxrProvCursorEye *out);
+
 /// Per-zone per-eye foreground clip (#166 multi-zone). Zone 0 = primary; i>=1 =
 /// extra zone i-1. Returns 1 on success. Same data as dxr_prov_get_eye_clip but for
 /// a specific zone's views, so the clip publisher can diagnose / apply per-zone clip.

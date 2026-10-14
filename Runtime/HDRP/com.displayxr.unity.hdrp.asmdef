@@ -1,0 +1,26 @@
+{
+    "name": "com.displayxr.unity.hdrp",
+    "rootNamespace": "DisplayXR.HDRP",
+    "references": [
+        "com.displayxr.unity",
+        "Unity.RenderPipelines.HighDefinition.Runtime",
+        "Unity.RenderPipelines.Core.Runtime"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [
+        "DISPLAYXR_HDRP"
+    ],
+    "versionDefines": [
+        {
+            "name": "com.unity.render-pipelines.high-definition",
+            "expression": "17.0.0",
+            "define": "DISPLAYXR_HDRP"
+        }
+    ],
+    "noEngineReferences": false
+}
