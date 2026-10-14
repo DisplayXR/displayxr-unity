@@ -328,3 +328,14 @@ endif()
 # --- Summary ---
 message(STATUS "displayxr_unity: OpenXR headers from ${OPENXR_INCLUDE_DIR}")
 message(STATUS "displayxr_unity: Output to ${PLUGIN_OUTPUT_DIR}")
+
+# --- Unit tests (pure math only; no runtime, no Unity) ---
+# cmake -DDISPLAYXR_BUILD_TESTS=ON .. && cmake --build . && ctest --output-on-failure
+option(DISPLAYXR_BUILD_TESTS "Build the native unit tests" OFF)
+if(DISPLAYXR_BUILD_TESTS)
+    enable_testing()
+    add_executable(cursor_depth_math_test tests/cursor_depth_math_test.cpp)
+    target_include_directories(cursor_depth_math_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/displayxr_xrprovider)
+    target_compile_features(cursor_depth_math_test PRIVATE cxx_std_17)
+    add_test(NAME cursor_depth_math COMMAND cursor_depth_math_test)
+endif()

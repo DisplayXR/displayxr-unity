@@ -82,6 +82,11 @@ int displayxr_host_drag_active(void);
 /// is also honored) environment variable.
 int displayxr_is_shell_mode(void);
 
+/// Depth-aware cursor (XR_DXR_cursor_depth): hide (1) / show (0) the OS cursor over
+/// the provider overlay's client area while the runtime draws the stereo cursor.
+/// Called on transitions only; safe from any thread.
+void displayxr_set_overlay_cursor_hidden(int hidden);
+
 /// Install IAT hooks and window subclass for shell mode input.
 /// Hooks GetForegroundWindow, GetFocus, RegisterRawInputDevices.
 /// Subclasses Unity's HWND to suppress deactivation and track button state.

@@ -254,6 +254,17 @@ static int   s_provider_opaque_overlay = 0;
 // editor to show resize affordances on window edges/corners and region lines.
 static volatile LONG s_overlay_cursor = 0;
 
+// Depth-aware cursor (XR_DXR_cursor_depth, ADR-046): 1 while the RUNTIME draws the
+// cursor (willDraw), so the OS cursor over the overlay's client area must be hidden -
+// otherwise the panel shows two cursors, the flat one on top of the lifted one. Set
+// from the provider's render thread right after the locate that reported it; applied
+// in WM_SETCURSOR on the overlay's own thread (DXR_WM_CURSOR_REFRESH makes it take
+// effect without waiting for the next mouse move). The overlay class has no hCursor
+// and WM_SETCURSOR below always sets one explicitly, which is why Unity's own
+// Cursor.visible cannot hide the cursor over this window: the overlay must do it.
+static volatile LONG s_overlay_cursor_hidden = 0;
+#define DXR_WM_CURSOR_REFRESH (WM_APP + 0x39)
+
 // True once C# has pushed at least one per-pixel silhouette mask via
 // displayxr_set_overlay_hit_mask. Acts as a one-way upgrade flag — the
 // rect-based displayxr_set_overlay_hit_rect path STOPS calling
@@ -693,6 +704,12 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 		return MA_NOACTIVATE;
 
 	case WM_SETCURSOR:
+		// Depth-aware cursor: the runtime is drawing it in stereo - no flat OS
+		// cursor over the client area (the frame and other windows keep theirs).
+		if (LOWORD(lParam) == HTCLIENT && s_overlay_cursor_hidden) {
+			SetCursor(NULL);
+			return TRUE;
+		}
 		// (#131) App-driven cursor for the region editor's resize
 		// affordances. WM_NCHITTEST returns HTCLIENT for the toplevel
 		// overlay, so the low word is HTCLIENT whenever the cursor is in
@@ -983,6 +1000,16 @@ overlay_wnd_proc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 	case DXR_WM_DESTROY_OVERLAY:
 		displayxr_destroy_app_overlay();
 		return 0;
+
+	// Depth-aware cursor hide/show transition, posted from the render thread: re-run
+	// WM_SETCURSOR now (if the pointer is over our client area) so the change does not
+	// wait for the next mouse move. Hidden -> NULL above; shown -> the normal path.
+	case DXR_WM_CURSOR_REFRESH: {
+		POINT pt;
+		if (GetCursorPos(&pt) && WindowFromPoint(pt) == hwnd)
+			SendMessageW(hwnd, WM_SETCURSOR, (WPARAM)hwnd, MAKELPARAM(HTCLIENT, WM_MOUSEMOVE));
+		return 0;
+	}
 
 	default:
 		break;
@@ -3966,6 +3993,19 @@ displayxr_set_overlay_cursor(int shape)
 	if (shape < 0 || shape > 5)
 		shape = 0;
 	InterlockedExchange(&s_overlay_cursor, (LONG)shape);
+}
+
+void
+displayxr_set_overlay_cursor_hidden(int hidden)
+{
+	// Called on willDraw TRANSITIONS only (never per frame), from any thread: an
+	// interlocked write plus one PostMessage, so the overlay's own thread applies it.
+	LONG v = hidden ? 1 : 0;
+	if (InterlockedExchange(&s_overlay_cursor_hidden, v) == v)
+		return;
+	HWND h = s_overlay_hwnd;
+	if (h != NULL && IsWindow(h))
+		PostMessageW(h, DXR_WM_CURSOR_REFRESH, 0, 0);
 }
 
 // Provided by the provider session (#225): the live workspace-tile canvas px.
