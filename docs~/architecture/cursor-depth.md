@@ -56,6 +56,77 @@ sub-region. To answer the first question for free, the plug-in logs
 `XRRenderPass.shouldFillOutDepth=...` once per session (about one second after the cursor is
 enabled), with the pipeline and graphics API.
 
+## Custom cursor sprite
+
+Games with their own cursor art can give the lifted cursor that art (#369):
+
+```csharp
+DisplayXRCursorDepth.SetSprite(myCursorTex, new Vector2(4, 2));   // hotspot px from the top-left
+DisplayXRCursorDepth.SetSprite(myCursorTex, hotspot, 0.004f);     // 4 mm tall on the panel
+DisplayXRCursorDepth.ClearSprite();                               // back to the default look
+DisplayXRCursorDepth.SetCursor(myCursorTex, hotspot, CursorMode.Auto); // Cursor.SetCursor + sprite
+```
+
+Or fill **Sprite**, **Sprite Hotspot** and **Sprite Height Meters** on the **DisplayXR Depth
+Cursor** component.
+
+- **What it changes.** Only the look of the *lifted* cursor. Placement, lift, softening (blur
+  and fade with lift, B.7) and the hand-over to the OS cursor on the glass are the runtime's,
+  exactly as with the default look. On the glass the OS cursor is the cursor, so set the
+  hardware cursor too; `SetCursor` does both in one call.
+- **Hotspot.** Texture pixels from the **top-left** corner, the same convention as
+  `Cursor.SetCursor`. It is sent as `hotSpot` normalised over the sprite with the same origin
+  (`DisplayXRCursorDepthMath.SpriteHotspotUV`, unit-tested in C# and natively).
+- **Size.** `heightMeters` is the sprite's height on the panel at the display plane; the
+  runtime keeps its apparent size constant as it lifts, and the width follows the texture's
+  aspect, so a non-square sprite keeps its shape. `0` is the runtime's default (the OS cursor's
+  size, 19 points). `SpriteHeightTexturePixels` (negative) draws it at the texture's own pixel
+  height × the panel's pixel pitch, which is about what a hardware cursor made from the same
+  texture measures; `SetCursor` uses it.
+- **Texture.** Any format, mip chain, compression or read/write setting, up to 1024 px a side.
+  Alpha is straight (not premultiplied), as Unity textures are and as the runtime expects. An
+  sRGB texture (or any texture in a Gamma-space project) goes to an `_SRGB` swapchain, which
+  the runtime decodes; a linear texture goes to a UNORM one.
+- **Updates.** The texture is copied once per `SetSprite` call. Call it again after changing
+  the pixels; calling it every frame with different textures animates the cursor at one small
+  copy per frame.
+- **Needs** runtime spec v5 (v2.36.0+), the same as the rest of the feature. `SpriteActive`
+  reports whether the last frame handed the sprite to the runtime.
+
+**Hardware cursors without `SetSprite`.** On Windows and macOS the runtime's default look
+copies the *live* OS cursor, so a hardware cursor set with `Cursor.SetCursor(tex, hotspot,
+CursorMode.Auto)` should already come out lifted with the game's art. This is not yet
+verified on a panel. `CursorMode.ForceSoftware` is drawn by Unity and the OS never sees it, so
+it needs `SetSprite` (or `SetCursor`). On Linux the runtime draws the cursor theme's arrow,
+never a custom hardware cursor, so a custom cursor needs `SetSprite` there. Unity has no getter
+for the texture last passed to `Cursor.SetCursor`, which is why mirroring it is a wrapper
+(`SetCursor`) rather than a flag.
+
+**How it is wired.** The runtime samples the *last released image* of an app swapchain, so
+the provider fills the sprite once per change and names it on every frame's
+`XrCursorDepthDrawInfoDXR` while it is set:
+
+1. C# (`TickSprite`, main thread): `Graphics.Blit` the texture, Y-flipped, into a small RGBA8
+   RenderTexture. That normalises any texture, and the flip turns Unity's bottom-up rows into
+   the top-down rows the runtime samples. Then push the configuration with a generation
+   number.
+2. D3D11/D3D12: `Graphics.CopyTexture` the RT into the provider's Unity-side copy target, the
+   same cross-device bridge as the window-space UI. Metal reads the RT directly (one device).
+   Vulkan copies it in the render event (`AccessTexture`, as the 2D overlays do).
+3. `GL.IssuePluginEvent(kCursorSpriteFilledEvent0 + gen % 16)`. On the render thread, in
+   stream order after the copy, this marks the generation as filled.
+4. Provider submit (render thread, at the window-space UI's place and with its cross-device
+   ordering): create the swapchain and bridge lazily. When the newest generation is filled,
+   acquire an image, copy, and release.
+5. Provider begin-frame (`ps_cursor_chain`): `DrawInfo.image` = the sprite swapchain once it
+   has been released at least once and still matches the sprite's size and encoding.
+   Otherwise `XR_NULL_HANDLE`, the default look.
+
+A swapchain that stops matching (cleared, resized, re-encoded, or the cursor disabled) stops
+being named at once and is destroyed three submits later, after every frame that named it has
+ended (deferred destruction, ADR-001). Session stop destroys it. Nothing is created or chained
+while no sprite is set.
+
 ## What the runtime owns, and what the plug-in owns
 
 | | Owner |
@@ -151,8 +222,8 @@ built so it does not switch per frame at all:
 - **Display zones.** The hint rides the primary locate only. A pointer over an extra 3D zone
   gets the plain OS cursor. `Measured` in any zones frame reports no content, which is a
   runtime limit, so the cursor stays on the glass. Depth works in the primary zone.
-- **Custom sprite.** Not exposed. The runtime's default look, the user's own OS cursor, is
-  what ADR-046 A.6 asks for.
+- **Custom sprite.** Opt-in, see [Custom cursor sprite](#custom-cursor-sprite). Without one,
+  the runtime's default look (the user's own OS cursor) is what ADR-046 A.6 asks for.
 - **Rig-less cameras.** `Depth` and `Physics` need a DisplayXR rig: only the rig pose defines
   Unity world for the locate space. Without one, Auto uses Measured.
 - **Under the shell (IPC).** The service lifts the shell's workspace cursor onto the content
