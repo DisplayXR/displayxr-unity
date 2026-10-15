@@ -32,6 +32,20 @@ namespace DisplayXR
         [Tooltip("Hide Cursor.visible while the runtime draws its own cursor.")]
         public bool manageOsCursor = true;
 
+        [Header("Custom sprite (optional)")]
+        [Tooltip("Your own cursor art for the LIFTED cursor (runtime spec v5). Empty = the default " +
+                 "look (a copy of the OS cursor on Windows/macOS). Any format; straight alpha; up " +
+                 "to 1024 px a side. On the glass the OS cursor shows - set it too, e.g. with " +
+                 "DisplayXRCursorDepth.SetCursor.")]
+        public Texture2D sprite;
+
+        [Tooltip("The click point in sprite pixels from the TOP-left corner (Cursor.SetCursor's convention).")]
+        public Vector2 spriteHotspot = Vector2.zero;
+
+        [Tooltip("Sprite height on the panel, metres. 0 = the runtime default (the OS cursor's " +
+                 "size); negative = the texture's own pixel height on the panel.")]
+        public float spriteHeightMeters = 0f;
+
         [Header("Physics source")]
         [Tooltip("Layers the footprint raycast considers.")]
         public LayerMask raycastLayers = ~(1 << 2);
@@ -48,7 +62,13 @@ namespace DisplayXR
         void OnDisable()
         {
             DisplayXRCursorDepth.Enabled = false;
+            if (m_AppliedSprite != null) DisplayXRCursorDepth.ClearSprite();
+            m_AppliedSprite = null;
         }
+
+        Texture2D m_AppliedSprite;
+        Vector2 m_AppliedHotspot;
+        float m_AppliedHeight;
 
         // Live-apply inspector edits (cheap: field copies; the native side is told only
         // when something actually changed).
@@ -61,6 +81,16 @@ namespace DisplayXR
             DisplayXRCursorDepth.ManageOsCursor = manageOsCursor;
             DisplayXRCursorDepth.RaycastLayerMask = raycastLayers;
             DisplayXRCursorDepth.RaycastMaxDistance = raycastMaxDistance;
+
+            // The sprite: pushed only when one of its fields changed (SetSprite re-uploads).
+            if (sprite != m_AppliedSprite || spriteHotspot != m_AppliedHotspot || spriteHeightMeters != m_AppliedHeight)
+            {
+                if (sprite != null) DisplayXRCursorDepth.SetSprite(sprite, spriteHotspot, spriteHeightMeters);
+                else if (m_AppliedSprite != null) DisplayXRCursorDepth.ClearSprite();
+                m_AppliedSprite = sprite;
+                m_AppliedHotspot = spriteHotspot;
+                m_AppliedHeight = spriteHeightMeters;
+            }
         }
     }
 }

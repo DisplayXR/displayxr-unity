@@ -478,6 +478,34 @@ namespace DisplayXR
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern int dxr_prov_cursor_get_eye(out CursorEye eye);
 
+        // ---- Custom cursor sprite (XrCursorDepthDrawInfoDXR::image, #369) ----------------
+
+        /// <summary>The sprite: the RT's native pointer (Zero = clear), size, sRGB-encoded
+        /// bytes, hotspot (normalised, top-left, v down), requested height (0 = runtime
+        /// default, &lt; 0 = texture px on the panel) and a generation bumped per change.</summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void dxr_prov_cursor_set_sprite(System.IntPtr srcTex, uint width, uint height,
+            int srgb, float hotU, float hotV, float sizeMeters, uint generation);
+
+        /// <summary>D3D11/D3D12: the Unity-device copy target + the size it was made for
+        /// (Zero until created). Metal/Vulkan: a non-zero session token, sizes 0.</summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern System.IntPtr dxr_prov_cursor_sprite_get_target(out uint width, out uint height);
+
+        /// <summary>Vulkan: 1 while the sprite bridge wants a fill.</summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int dxr_prov_cursor_sprite_needs_fill();
+
+        /// <summary>0 = no sprite, 1 = set but not handed to the runtime yet, 2 = named on the
+        /// last locate.</summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int dxr_prov_cursor_sprite_status();
+
+        /// <summary>Render event "sprite fill for generation slot N is in the stream" (all
+        /// backends; N = gen % 16). Keep in sync with DXR_EVENT_CURSOR_SPRITE_FILLED0.</summary>
+        public const int kCursorSpriteFilledEvent0 = 0x44585220;
+        public const int kCursorSpriteGenSlots = 16;
+
         /// <summary>Pointer canvas UV (top-left origin, v down); 1 when on the canvas.</summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern int dxr_prov_cursor_get_canvas_uv(out float u, out float v);
