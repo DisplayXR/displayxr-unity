@@ -1281,6 +1281,7 @@ pvk_overlay_label(int kind)
 	if (kind < 0 || kind >= DXR_PVK_OVERLAY_COUNT) return "?";
 	if (!names[kind][0]) {
 		if (kind == DXR_PVK_OVERLAY_LOCAL2D) snprintf(names[kind], sizeof(names[kind]), "local2d");
+		else if (kind == DXR_PVK_OVERLAY_CURSOR) snprintf(names[kind], sizeof(names[kind]), "cursor");
 		else snprintf(names[kind], sizeof(names[kind]), "wsui%d", kind - DXR_PVK_OVERLAY_WSUI0);
 	}
 	return names[kind];

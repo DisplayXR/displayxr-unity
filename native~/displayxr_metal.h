@@ -50,6 +50,10 @@ int displayxr_metal_get_app_window_rect(int32_t *out_x, int32_t *out_y,
 /// static queue — different session, possibly different MTLDevice).
 int displayxr_metal_blit_textures(void *queue, void *src_tex, void *dst_tex);
 
+// The MTLPixelFormat of an id<MTLTexture> (0 for NULL). Used to keep a raw blit's
+// channel order (the cursor sprite, #369).
+int displayxr_metal_texture_pixel_format(void *tex);
+
 #ifdef __cplusplus
 }
 #endif

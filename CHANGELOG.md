@@ -5,6 +5,11 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- Depth-aware cursor: custom cursor sprite (#369). `DisplayXRCursorDepth.SetSprite(texture, hotspotPx, heightMeters = 0)` / `ClearSprite()`, and `sprite` / `spriteHotspot` / `spriteHeightMeters` fields on the **DisplayXR Depth Cursor** component, draw the lifted cursor with the game's own art instead of the default look (runtime `XR_DXR_cursor_depth` v5+, `XrCursorDepthDrawInfoDXR`). `DisplayXRCursorDepth.SetCursor(texture, hotspot, mode)` wraps `Cursor.SetCursor` and sets the same texture as the sprite, at its own pixel height. The provider makes a small swapchain in the session's graphics API (D3D11, D3D12, Metal, Vulkan) and copies the texture in only when it changes; nothing is created without a sprite.
+
 ## [2.26.0] - 2026-10-14
 
 ### Added

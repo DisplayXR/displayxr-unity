@@ -185,8 +185,31 @@ static class Program
         Check(Near(wz, 0.05f, 1e-3f), $"world point is 5 cm in front of the canvas (z={wz})");
     }
 
+    // Custom sprite hotspot (#369): Unity's Cursor.SetCursor hotspot (px from the top-left)
+    // -> the runtime's normalised top-left, v-down hotSpot. Same vectors as the native test.
+    static void TestSpriteHotspot()
+    {
+        DisplayXRCursorDepthMath.SpriteHotspotUV(0f, 0f, 32f, 32f, out float u, out float v);
+        Check(Near(u, 0f) && Near(v, 0f), "arrow tip at the top-left corner -> (0, 0)");
+        DisplayXRCursorDepthMath.SpriteHotspotUV(16f, 16f, 32f, 32f, out u, out v);
+        Check(Near(u, 0.5f) && Near(v, 0.5f), "crosshair centre -> (0.5, 0.5)");
+        DisplayXRCursorDepthMath.SpriteHotspotUV(8f, 30f, 32f, 40f, out u, out v);
+        Check(Near(u, 0.25f) && Near(v, 0.75f), "non-square: each axis by its own size, no y flip");
+        DisplayXRCursorDepthMath.SpriteHotspotUV(-5f, 100f, 32f, 32f, out u, out v);
+        Check(Near(u, 0f) && Near(v, 1f), "clamped onto the sprite");
+        DisplayXRCursorDepthMath.SpriteHotspotUV(float.NaN, 16f, 32f, 32f, out u, out v);
+        Check(Near(u, 0f) && Near(v, 0.5f), "NaN component -> 0");
+        DisplayXRCursorDepthMath.SpriteHotspotUV(16f, 16f, 0f, 32f, out u, out v);
+        Check(Near(u, 0f) && Near(v, 0f), "degenerate size -> (0, 0)");
+        Check(DisplayXRCursorDepthMath.SpriteSizeOk(32, 32), "32x32 accepted");
+        Check(DisplayXRCursorDepthMath.SpriteSizeOk(1, 1024), "1x1024 accepted");
+        Check(!DisplayXRCursorDepthMath.SpriteSizeOk(0, 32), "0 width rejected");
+        Check(!DisplayXRCursorDepthMath.SpriteSizeOk(2048, 32), "2048 width rejected");
+    }
+
     static int Main()
     {
+        TestSpriteHotspot();
         TestKnownVectors();
         TestRoundTripOffAxis();
         TestGpuRemap();

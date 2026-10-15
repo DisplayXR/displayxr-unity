@@ -41,6 +41,16 @@ extern "C" void displayxr_unregister_xr_display_provider(void);
 #include "displayxr_xrprovider/displayxr_provider_gfx_metal.h"
 #endif
 
+// Custom cursor sprite (#369): "the sprite fill for generation slot N is in the stream".
+// Every backend (the D3D / Metal fill is a CopyTexture / Blit C# issued just before; on
+// Vulkan this event records the copy). Slot N = DXR_EVENT_CURSOR_SPRITE_FILLED0 + N,
+// N < dxr_cursor::kSpriteGenSlots (16). Keep in sync with
+// DisplayXRProviderNative.kCursorSpriteFilledEvent0.
+#define DXR_EVENT_CURSOR_SPRITE_FILLED0 0x44585220
+#define DXR_CURSOR_SPRITE_SLOTS 16
+extern "C" int  dxr_prov_cursor_sprite_source(void **out_tex, int *out_w, int *out_h);
+extern "C" void dxr_prov_cursor_sprite_mark_filled(uint32_t slot);
+
 static IUnityInterfaces *s_unity_ifaces = nullptr;
 static IUnityGraphics   *s_unity_gfx    = nullptr;
 #if defined(DXR_HAVE_UNITY_VULKAN)
@@ -84,12 +94,14 @@ static void configure_vulkan_events(void)
 	s_unity_vk->ConfigureEvent(DXR_EVENT_VK_OVERLAY_COPY_LOCAL2D, &cfg);
 	for (int i = 0; i < DXR_WSUI_MAX_SLOTS; i++)
 		s_unity_vk->ConfigureEvent(DXR_EVENT_VK_OVERLAY_COPY_WSUI0 + i, &cfg);
+	for (int i = 0; i < DXR_CURSOR_SPRITE_SLOTS; i++)
+		s_unity_vk->ConfigureEvent(DXR_EVENT_CURSOR_SPRITE_FILLED0 + i, &cfg);
 }
 
-static void vk_overlay_copy(int kind, void *tex, int w, int h)
+static int vk_overlay_copy(int kind, void *tex, int w, int h)
 {
 	// Only once the provider has created the bridge (render thread, at submit).
-	if (!dxr_pvk_overlay_ready(kind)) return;
+	if (!dxr_pvk_overlay_ready(kind)) return 0;
 	UnityVulkanImage img = {};
 	if (!s_unity_vk->AccessTexture(tex, UnityVulkanWholeImage, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
 	                               VK_PIPELINE_STAGE_TRANSFER_BIT, VK_ACCESS_TRANSFER_READ_BIT,
@@ -99,18 +111,18 @@ static void vk_overlay_copy(int kind, void *tex, int w, int h)
 			warned = true;
 			fprintf(stderr, "[DisplayXR] Vulkan overlay copy: AccessTexture failed (tex=%p)\n", tex);
 		}
-		return;
+		return 0;
 	}
 	// After AccessTexture: resource access may record commands and invalidates any
 	// recording state fetched earlier.
 	UnityVulkanRecordingState st = {};
 	if (!s_unity_vk->CommandRecordingState(&st, kUnityVulkanGraphicsQueueAccess_DontCare) ||
 	    st.commandBuffer == VK_NULL_HANDLE)
-		return;
+		return 0;
 	uint32_t sw = img.extent.width ? img.extent.width : (uint32_t)w;
 	uint32_t sh = img.extent.height ? img.extent.height : (uint32_t)h;
-	dxr_pvk_overlay_record_unity_copy(kind, (void *)st.commandBuffer, (void *)img.image,
-	                                  (int64_t)img.format, sw, sh, tex);
+	return dxr_pvk_overlay_record_unity_copy(kind, (void *)st.commandBuffer, (void *)img.image,
+	                                         (int64_t)img.format, sw, sh, tex);
 }
 #endif
 
@@ -128,6 +140,14 @@ static void UNITY_INTERFACE_API on_render_event(int event_id)
 		float x, y, lw, lh, disp;
 		if (displayxr_window_space_ui_get_pending_slot(slot, &tex, &w, &h, &x, &y, &lw, &lh, &disp))
 			vk_overlay_copy(1 + slot /* DXR_PVK_OVERLAY_WSUI0 + slot */, tex, w, h);
+	} else if (event_id >= DXR_EVENT_CURSOR_SPRITE_FILLED0 &&
+	           event_id < DXR_EVENT_CURSOR_SPRITE_FILLED0 + DXR_CURSOR_SPRITE_SLOTS) {
+		// Cursor sprite (#369): record the RT -> bridge copy, and only then call the
+		// generation filled (a skipped copy leaves the bridge's want-copy set; C# retries).
+		void *tex = NULL; int w = 0, h = 0;
+		if (dxr_prov_cursor_sprite_source(&tex, &w, &h) &&
+		    vk_overlay_copy(1 + DXR_WSUI_MAX_SLOTS /* DXR_PVK_OVERLAY_CURSOR */, tex, w, h))
+			dxr_prov_cursor_sprite_mark_filled((uint32_t)(event_id - DXR_EVENT_CURSOR_SPRITE_FILLED0));
 	}
 #else
 	(void)event_id;
@@ -236,16 +256,28 @@ UnityPluginUnload(void)
 
 // ---- C ABI exposed to the rest of the plugin --------------------------------
 
-// Render-event entry point for GL.IssuePluginEvent (#336). Valid on every backend;
-// the callback only does work on Vulkan.
+// Every backend: route the cursor-sprite "filled" event (#369) - on Vulkan it carries a
+// copy (on_render_event), elsewhere the copy is already in the stream and the event only
+// marks the generation. The overlay copy events stay Vulkan-only.
+static void UNITY_INTERFACE_API on_render_event_any(int event_id)
+{
+	const bool vk = s_unity_gfx && s_unity_gfx->GetRenderer() == kUnityGfxRendererVulkan;
+	if (!vk && event_id >= DXR_EVENT_CURSOR_SPRITE_FILLED0 &&
+	    event_id < DXR_EVENT_CURSOR_SPRITE_FILLED0 + DXR_CURSOR_SPRITE_SLOTS) {
+		dxr_prov_cursor_sprite_mark_filled((uint32_t)(event_id - DXR_EVENT_CURSOR_SPRITE_FILLED0));
+		return;
+	}
+#if defined(DXR_HAVE_UNITY_VULKAN)
+	if (vk) on_render_event(event_id);
+#endif
+}
+
+// Render-event entry point for GL.IssuePluginEvent (#336). Valid on every backend: the
+// overlay copies only do work on Vulkan, the cursor-sprite event (#369) everywhere.
 extern "C" UNITY_INTERFACE_EXPORT UnityRenderingEvent UNITY_INTERFACE_API
 dxr_prov_get_render_event_func(void)
 {
-#if defined(DXR_HAVE_UNITY_VULKAN)
-	return on_render_event;
-#else
-	return nullptr;
-#endif
+	return on_render_event_any;
 }
 
 extern "C" int

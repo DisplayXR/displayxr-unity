@@ -153,6 +153,14 @@ displayxr_metal_view_backing_size(void *view_ptr, uint32_t *out_w, uint32_t *out
 // ============================================================================
 
 int
+displayxr_metal_texture_pixel_format(void *tex)
+{
+	if (!tex) return 0;
+	id<MTLTexture> t = (__bridge id<MTLTexture>)tex;
+	return (int)t.pixelFormat;
+}
+
+int
 displayxr_metal_blit_textures(void *queue_ptr, void *src_ptr, void *dst_ptr)
 {
 	if (!queue_ptr || !src_ptr || !dst_ptr) return 0;

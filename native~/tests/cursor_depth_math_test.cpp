@@ -212,6 +212,65 @@ static void test_nearest_hit()
 	CHECK(near3(flip_z(out), unity_hits[1]));
 }
 
+static void test_sprite()
+{
+	// Gate: the DrawInfo sprite came with the runtime draw (v5).
+	CHECK(!sprite_allowed(4));
+	CHECK(sprite_allowed(5));
+	CHECK(sprite_allowed(7));
+
+	CHECK(sprite_size_ok(32, 32));
+	CHECK(sprite_size_ok(1, 1024));
+	CHECK(!sprite_size_ok(0, 32));
+	CHECK(!sprite_size_ok(32, 0));
+	CHECK(!sprite_size_ok(2048, 32));
+
+	// Hotspot: texture px from the TOP-left (Unity's Cursor.SetCursor convention) ->
+	// the header's normalised top-left, v-down space: a plain divide, no flip.
+	Vec2 h = sprite_hotspot_uv(0, 0, 32, 32);
+	CHECK(near(h.x, 0.0f) && near(h.y, 0.0f)); // arrow tip at the top-left corner
+	h = sprite_hotspot_uv(16, 16, 32, 32);
+	CHECK(near(h.x, 0.5f) && near(h.y, 0.5f)); // crosshair centre
+	h = sprite_hotspot_uv(8, 30, 32, 40);      // non-square: each axis by its own size
+	CHECK(near(h.x, 0.25f) && near(h.y, 0.75f));
+	h = sprite_hotspot_uv(-5, 100, 32, 32);    // clamped onto the sprite
+	CHECK(near(h.x, 0.0f) && near(h.y, 1.0f));
+	h = sprite_hotspot_uv(NAN, 16, 32, 32);
+	CHECK(near(h.x, 0.0f) && near(h.y, 0.5f));
+	h = sprite_hotspot_uv(16, 16, 0, 32);
+	CHECK(near(h.x, 0.0f) && near(h.y, 0.0f));
+
+	// Size: > 0 as given; 0 / NaN = the runtime default (0); < 0 = texture px on the panel.
+	CHECK(near(sprite_size_meters(0.004f, 32, 0.2f, 2000), 0.004f));
+	CHECK(sprite_size_meters(0.0f, 32, 0.2f, 2000) == 0.0f);
+	CHECK(sprite_size_meters(NAN, 32, 0.2f, 2000) == 0.0f);
+	CHECK(near(sprite_size_meters(-1.0f, 32, 0.2f, 2000), 32 * 0.2f / 2000, 1e-7f));
+	CHECK(sprite_size_meters(-1.0f, 32, 0.0f, 2000) == 0.0f); // unknown panel -> default
+	CHECK(sprite_size_meters(-1.0f, 32, 0.2f, 0) == 0.0f);
+
+	// Formats per API, and the pick among what the runtime offers.
+	CHECK(sprite_format_id(SPRITE_API_DXGI, false, false) == 28);
+	CHECK(sprite_format_id(SPRITE_API_DXGI, false, true) == 29);
+	CHECK(sprite_format_id(SPRITE_API_DXGI, true, true) == 91);
+	CHECK(sprite_format_id(SPRITE_API_VULKAN, false, true) == 43);
+	CHECK(sprite_format_id(SPRITE_API_VULKAN, true, false) == 44);
+	CHECK(sprite_format_id(SPRITE_API_METAL, true, true) == 81);
+	CHECK(sprite_format_id(SPRITE_API_METAL, false, false) == 70);
+	const int64_t dxgi[] = {87, 28, 29, 91};
+	CHECK(sprite_pick_format(SPRITE_API_DXGI, false, true, dxgi, 4) == 29);
+	CHECK(sprite_pick_format(SPRITE_API_DXGI, false, false, dxgi, 4) == 28);
+	const int64_t dxgi_unorm_only[] = {87, 28};
+	CHECK(sprite_pick_format(SPRITE_API_DXGI, false, true, dxgi_unorm_only, 2) == 28); // same order, other encoding
+	const int64_t bgra_only[] = {87, 91};
+	CHECK(sprite_pick_format(SPRITE_API_DXGI, false, true, bgra_only, 2) == 0);        // never swap channels
+	CHECK(sprite_pick_format(SPRITE_API_DXGI, false, true, dxgi, 0) == 0);
+
+	// Generation slots wrap, so the event id range stays small.
+	CHECK(sprite_gen_slot(1) == 1);
+	CHECK(sprite_gen_slot(kSpriteGenSlots) == 0);
+	CHECK(sprite_gen_slot(kSpriteGenSlots + 3) == 3);
+}
+
 int main()
 {
 	test_gate();
@@ -221,6 +280,7 @@ int main()
 	test_view_ray();
 	test_footprint_rays();
 	test_nearest_hit();
+	test_sprite();
 	printf("cursor_depth_math: %d passed, %d failed\n", s_pass, s_fail);
 	return s_fail == 0 ? 0 : 1;
 }

@@ -569,6 +569,32 @@ DISPLAYXR_EXPORT int dxr_prov_cursor_get_canvas_uv(float *out_u, float *out_v);
 /// @return 1 and fills @p out when the eye is usable (out->valid), 0 otherwise.
 DISPLAYXR_EXPORT int dxr_prov_cursor_get_eye(DxrProvCursorEye *out);
 
+// ---- Custom cursor sprite (XrCursorDepthDrawInfoDXR::image, #369) ----------------
+// Driven by DisplayXRCursorDepth.SetSprite / ClearSprite. See the block comment above
+// ps_cursor_sprite_submit in displayxr_provider_session.cpp for the data flow.
+
+/// The sprite: @p src_tex = the C# RT's native pointer (NULL = clear), its size, whether
+/// its bytes are sRGB-encoded, the hotspot (normalised, top-left, v down), the requested
+/// height (dxr_cursor::sprite_size_meters) and a generation C# bumps on every change.
+DISPLAYXR_EXPORT void dxr_prov_cursor_set_sprite(void *src_tex, uint32_t w, uint32_t h, int srgb, float hot_u,
+                                                 float hot_v, float size_meters, uint32_t gen);
+
+/// D3D11 / D3D12: the Unity-device texture C# Graphics.CopyTexture's the RT into, and
+/// the size it was made for; NULL until the render thread created it. Metal / Vulkan: a
+/// non-NULL session token (no Unity-side target), sizes 0.
+DISPLAYXR_EXPORT void *dxr_prov_cursor_sprite_get_target(uint32_t *out_w, uint32_t *out_h);
+
+/// Vulkan: 1 while the sprite bridge wants a fill (fresh bridge, or a skipped copy).
+DISPLAYXR_EXPORT int dxr_prov_cursor_sprite_needs_fill(void);
+
+/// 0 = no sprite set, 1 = set but not (yet) handed to the runtime, 2 = named on the
+/// last locate's DrawInfo.
+DISPLAYXR_EXPORT int dxr_prov_cursor_sprite_status(void);
+
+/// Render-event internals (displayxr_unity_plugin.cpp), not for C#.
+int  dxr_prov_cursor_sprite_source(void **out_tex, int *out_w, int *out_h);
+void dxr_prov_cursor_sprite_mark_filled(uint32_t slot);
+
 /// Per-zone per-eye foreground clip (#166 multi-zone). Zone 0 = primary; i>=1 =
 /// extra zone i-1. Returns 1 on success. Same data as dxr_prov_get_eye_clip but for
 /// a specific zone's views, so the clip publisher can diagnose / apply per-zone clip.

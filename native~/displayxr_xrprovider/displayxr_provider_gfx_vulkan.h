@@ -157,7 +157,8 @@ void dxr_pvk_signal_unity_done(void);
 enum {
 	DXR_PVK_OVERLAY_LOCAL2D = 0,
 	DXR_PVK_OVERLAY_WSUI0 = 1,   // wsui slot N is DXR_PVK_OVERLAY_WSUI0 + N
-	DXR_PVK_OVERLAY_COUNT = 1 + DXR_WSUI_MAX_SLOTS, // Local2D + one per wsui slot
+	DXR_PVK_OVERLAY_CURSOR = 1 + DXR_WSUI_MAX_SLOTS, // the custom cursor sprite (#369)
+	DXR_PVK_OVERLAY_COUNT = 2 + DXR_WSUI_MAX_SLOTS, // Local2D + one per wsui slot + cursor
 };
 
 /// Record the overlay layer's swapchain VkImages (session device) and format.
