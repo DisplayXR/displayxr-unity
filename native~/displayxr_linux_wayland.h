@@ -53,6 +53,9 @@ int dxr_wl_unity_swapchain_size(int *out_w, int *out_h);
 //! Bumps every time the player makes a new VkSurfaceKHR for its window (it does on
 //! a resolution change, and may recreate the wl_surface itself).
 unsigned dxr_wl_player_surface_generation(void);
+//! 1 when the player's last window swapchain is presented with alpha (the capture
+//! layer made it PRE_MULTIPLIED for a transparent overlay app), 0 when opaque.
+int dxr_wl_player_presents_alpha(void);
 //! Lock the player's window record and return its wl_surface (NULL while it has
 //! none) and generation. Requests on that surface are safe until
 //! dxr_wl_unlock_player_surface(): the capture layer forgets the surface under the

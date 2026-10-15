@@ -868,7 +868,7 @@ dxr_wl_weave_poll(int *out_w, int *out_h)
 				fprintf(stderr, "[DisplayXR-WL] the player recreated its window: weave re-attached\n");
 		}
 	}
-	// A transparent weave: the player's window must not be declared opaque (#367).
+	// A player window presented with alpha must not be declared opaque (#367).
 	// Unity's SDL marks its whole window opaque (wl_surface.set_opaque_region) when
 	// it creates it and again on every configure (resize, focus change). The
 	// compositor then paints nothing behind the window, so wherever the weave is
@@ -876,7 +876,10 @@ dxr_wl_weave_poll(int *out_w, int *out_h)
 	// frames pile up on black. A Leia weave hides this (it is opaque, the desktop
 	// baked in); sim-display's is not. A configure can re-mark it at any time, so
 	// the region is cleared every frame; it applies at the player's next commit.
-	if (s_wl.transparent) {
+	// Gated on what the capture layer actually made of the player's swapchain, not
+	// the session flag: SDL's claim is wrong exactly when that swapchain carries
+	// alpha, and right for an opaque one, whatever the weave is.
+	if (s_host->player_presents_alpha()) {
 		struct wl_surface *player = s_host->lock_player_surface(NULL);
 		if (player)
 			wl_surface_set_opaque_region(player, NULL);
@@ -885,7 +888,7 @@ dxr_wl_weave_poll(int *out_w, int *out_h)
 			wl_display_flush(s_wl.display);
 			if (!s_wl.opaque_cleared) {
 				s_wl.opaque_cleared = 1;
-				fprintf(stderr, "[DisplayXR-WL] the player's window is kept non-opaque (transparent weave)\n");
+				fprintf(stderr, "[DisplayXR-WL] the player's window is kept non-opaque (it presents alpha)\n");
 			}
 		}
 	}
@@ -1799,7 +1802,8 @@ __attribute__((visibility("default"))) const DxrWlApi *
 dxr_wl_lib_init(const DxrWlHost *host)
 {
 	if (!host || host->abi != DXR_WL_LIB_ABI || !host->unity_surface || !host->unity_swapchain_size ||
-	    !host->player_surface_generation || !host->lock_player_surface || !host->unlock_player_surface)
+	    !host->player_surface_generation || !host->lock_player_surface || !host->unlock_player_surface ||
+	    !host->player_presents_alpha)
 		return NULL;
 	s_host = host;
 	return &s_api;

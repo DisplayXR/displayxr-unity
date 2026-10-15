@@ -82,6 +82,7 @@ static struct wl_display *s_player_display = nullptr;
 static struct wl_surface *s_player_surface = nullptr; // NULL while the player has no window surface
 static uint32_t s_player_w = 0, s_player_h = 0;        // its swapchain extent, logical px
 static unsigned s_player_generation = 0;               // bumps per new window VkSurfaceKHR
+static int s_player_alpha = 0;                         // its last swapchain is presented with alpha
 static VkSurfaceKHR s_player_vk[8];                    // its live window VkSurfaceKHRs
 
 static int
@@ -120,6 +121,13 @@ dxr_wl_player_surface_generation(void)
 {
 	std::lock_guard<std::mutex> lock(s_player_mutex);
 	return s_player_generation;
+}
+
+extern "C" int
+dxr_wl_player_presents_alpha(void)
+{
+	std::lock_guard<std::mutex> lock(s_player_mutex);
+	return s_player_alpha;
 }
 
 // The player's wl_surface may be destroyed by its SDL at any time after its last
@@ -413,6 +421,8 @@ layer_CreateSwapchainKHR(VkDevice device, const VkSwapchainCreateInfoKHR *ci, co
 			changed = s_player_w != ci->imageExtent.width || s_player_h != ci->imageExtent.height;
 			s_player_w = ci->imageExtent.width;
 			s_player_h = ci->imageExtent.height;
+			s_player_alpha = (alpha_ci.compositeAlpha & (VK_COMPOSITE_ALPHA_PRE_MULTIPLIED_BIT_KHR |
+			                                              VK_COMPOSITE_ALPHA_POST_MULTIPLIED_BIT_KHR)) != 0;
 		}
 		if (changed)
 			fprintf(stderr, "[DisplayXR-WL] the player's window: %ux%u logical, %s\n", ci->imageExtent.width,
@@ -781,6 +791,12 @@ dxr_wl_unity_swapchain_size(int *out_w, int *out_h)
 
 extern "C" unsigned
 dxr_wl_player_surface_generation(void)
+{
+	return 0;
+}
+
+extern "C" int
+dxr_wl_player_presents_alpha(void)
 {
 	return 0;
 }

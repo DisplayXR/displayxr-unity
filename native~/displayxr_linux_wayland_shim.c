@@ -30,6 +30,7 @@ static const DxrWlHost s_host = {
     .player_surface_generation = dxr_wl_player_surface_generation,
     .lock_player_surface = dxr_wl_lock_player_surface,
     .unlock_player_surface = dxr_wl_unlock_player_surface,
+    .player_presents_alpha = dxr_wl_player_presents_alpha,
 };
 
 static const DxrWlApi *s_api; // published once by load_library()
