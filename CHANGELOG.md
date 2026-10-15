@@ -5,6 +5,11 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+- Native-Wayland player (#367 follow-up): the player's opaque region is cleared when the capture layer has actually made the player's swapchain present alpha (a transparent overlay app on a surface that supports `PRE_MULTIPLIED`), instead of when the session is transparent. SDL's opaque claim is wrong exactly when that swapchain carries alpha, whatever the weave is. The log line is now `the player's window is kept non-opaque (it presents alpha)`. The Wayland library and the main plug-in must match again (`DXR_WL_LIB_ABI` 4 -> 5); they always ship together.
+
 ## [2.26.1] - 2026-10-14
 
 ### Fixed
