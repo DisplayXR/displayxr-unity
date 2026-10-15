@@ -215,5 +215,37 @@ namespace DisplayXR
             m[14] = -2f * far * near / (far - near);
             return m;
         }
+
+        // ---- Custom cursor sprite (#369) ------------------------------------------------
+
+        /// <summary>
+        /// A sprite hotspot in texture PIXELS from the TOP-left corner (Unity's
+        /// <c>Cursor.SetCursor</c> convention) -> what <c>XrCursorDepthDrawInfoDXR::hotSpot</c>
+        /// wants: normalised [0,1]^2 over the sprite, origin top-left, v down. Both conventions
+        /// are top-left/y-down, so this is a divide with no flip; the result is clamped onto the
+        /// sprite. Non-finite components map to 0; a degenerate size gives (0, 0).
+        /// Mirrors <c>dxr_cursor::sprite_hotspot_uv</c> (native).
+        /// </summary>
+        public static void SpriteHotspotUV(float hotspotX, float hotspotY, float width, float height,
+                                           out float u, out float vDown)
+        {
+            u = 0f;
+            vDown = 0f;
+            if (!(width > 0f) || !(height > 0f)) return;
+            u = IsFinite(hotspotX) ? hotspotX / width : 0f;
+            vDown = IsFinite(hotspotY) ? hotspotY / height : 0f;
+            u = u < 0f ? 0f : (u > 1f ? 1f : u);
+            vDown = vDown < 0f ? 0f : (vDown > 1f ? 1f : vDown);
+        }
+
+        /// <summary>The largest sprite edge the provider makes a swapchain for (native
+        /// <c>dxr_cursor::kSpriteMaxEdge</c>).</summary>
+        public const int SpriteMaxEdge = 1024;
+
+        /// <summary>True when a sprite of this size is accepted (1..<see cref="SpriteMaxEdge"/> each way).</summary>
+        public static bool SpriteSizeOk(int width, int height) =>
+            width > 0 && height > 0 && width <= SpriteMaxEdge && height <= SpriteMaxEdge;
+
+        static bool IsFinite(float f) => !float.IsNaN(f) && !float.IsInfinity(f);
     }
 }
