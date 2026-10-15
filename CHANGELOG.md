@@ -5,6 +5,13 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- Native-Wayland player, transparent overlay app (#367): earlier frames no longer pile up around the avatar, and the desktop shows behind the window instead of black, on a display whose weave is not opaque (sim-display).
+  - Unity's SDL declares its whole window opaque (`wl_surface.set_opaque_region`) when it creates it and again on every configure. The compositor then paints nothing behind the window, so wherever the weave is transparent the screen kept what it showed before. The Leia weave is opaque (the desktop baked in), so it never showed there.
+  - While a transparent weave is up, the plug-in clears the player's opaque region every frame (`the player's window is kept non-opaque (transparent weave)`, logged once). Opaque apps, X11, Windows and macOS are unchanged.
+
 ## [2.26.0] - 2026-10-14
 
 ### Added
