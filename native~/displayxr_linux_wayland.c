@@ -124,6 +124,7 @@ static struct {
 	struct wp_fractional_scale_v1 *frac;
 	struct wl_buffer *probe_buffer;
 	int transparent;
+	int opaque_cleared; // logged that the player's opaque region is being cleared
 
 	uint32_t scale120;        // preferred scale x 120, 0 = not told yet
 	// The scale sizes are computed for while it is ahead of scale120: the target
@@ -799,6 +800,7 @@ dxr_wl_weave_destroy(void)
 	s_wl.probe_buffer = NULL;
 	s_wl.parent = NULL;
 	s_wl.transparent = 0;
+	s_wl.opaque_cleared = 0;
 	s_wl.placing = s_wl.move_inflight = s_wl.rescale_after_place = 0;
 	s_wl.intent_blocked = 0;
 	s_wl.restore_open = 0;
@@ -864,6 +866,27 @@ dxr_wl_weave_poll(int *out_w, int *out_h)
 			wl_display_flush(s_wl.display);
 			if (recreated)
 				fprintf(stderr, "[DisplayXR-WL] the player recreated its window: weave re-attached\n");
+		}
+	}
+	// A transparent weave: the player's window must not be declared opaque (#367).
+	// Unity's SDL marks its whole window opaque (wl_surface.set_opaque_region) when
+	// it creates it and again on every configure (resize, focus change). The
+	// compositor then paints nothing behind the window, so wherever the weave is
+	// transparent the screen keeps what it last showed there: the avatar's earlier
+	// frames pile up on black. A Leia weave hides this (it is opaque, the desktop
+	// baked in); sim-display's is not. A configure can re-mark it at any time, so
+	// the region is cleared every frame; it applies at the player's next commit.
+	if (s_wl.transparent) {
+		struct wl_surface *player = s_host->lock_player_surface(NULL);
+		if (player)
+			wl_surface_set_opaque_region(player, NULL);
+		s_host->unlock_player_surface();
+		if (player) {
+			wl_display_flush(s_wl.display);
+			if (!s_wl.opaque_cleared) {
+				s_wl.opaque_cleared = 1;
+				fprintf(stderr, "[DisplayXR-WL] the player's window is kept non-opaque (transparent weave)\n");
+			}
 		}
 	}
 	// The player's window size (its swapchain extent, logical px).
