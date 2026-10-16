@@ -597,6 +597,54 @@ namespace DisplayXR
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern int displayxr_linux_overlay_position_known();
+
+        /// <summary>
+        /// Native-Wayland player: what can be asked of the app's own window right
+        /// now, through the DisplayXR GNOME extension (version 15): bit 1 keep
+        /// above, bit 2 activate, bit 4 minimize. 0 in X11 mode (the app's own
+        /// EWMH calls work there), before the session starts, or without the
+        /// extension.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int displayxr_linux_window_state_caps();
+
+        /// <summary>
+        /// Native-Wayland player: keep the app's window above other windows (1) or
+        /// stop (0). Remembered (also when called before the session starts) and
+        /// sent until the extension confirms it: after a refusal (screen locked,
+        /// a drag) and whenever the window is shown anew (recreated, the extension
+        /// came back). Returns 1 when the extension can do it now, 0 when it cannot
+        /// right now (still remembered). Setting the same value again is a no-op.
+        /// Asynchronous; the result is logged.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int displayxr_linux_set_keep_above(int above);
+
+        /// <summary>
+        /// Native-Wayland player: bring the app's window to the front with keyboard
+        /// focus, restoring it if minimized and switching to its workspace. Returns
+        /// 1 when the request was sent.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int displayxr_linux_activate_window();
+
+        /// <summary>
+        /// Native-Wayland player: minimize the app's window (1) or restore it
+        /// without focus (0; <see cref="displayxr_linux_activate_window"/> restores
+        /// it with focus). Returns 1 when the request was sent.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int displayxr_linux_set_minimized(int minimized);
+
+        /// <summary>
+        /// Native-Wayland player: the app's window state as the DisplayXR GNOME
+        /// extension reports it, whoever changed it (the app, or the user from the
+        /// dock or the window menu): bit 1 kept above, bit 4 minimized. -1 when not
+        /// known (X11 mode, before the session, no extension or one older than
+        /// version 15).
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int displayxr_linux_window_state();
 #endif
 
     }

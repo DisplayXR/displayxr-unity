@@ -416,6 +416,25 @@ DISPLAYXR_EXPORT int displayxr_linux_take_pending_resize(int *width, int *height
 /// last known position (native-Wayland player that cannot tell right now).
 DISPLAYXR_EXPORT int displayxr_linux_overlay_position_known(void);
 
+/// Native-Wayland player: the window's own state, through the DisplayXR GNOME
+/// extension (version 15) — what an app does with EWMH on X11. All asynchronous.
+/// In X11 mode, before the first session or without the extension: caps 0, state -1,
+/// the actions do nothing.
+/// window_state_caps: bits 1 keep above, 2 activate, 4 minimize, available now.
+/// set_keep_above: window state, remembered (also before the session) and sent until
+/// the extension confirms it — after a refusal (locked, a drag) and whenever the
+/// window is shown anew. Returns 1 when the extension can do it now, 0 when it
+/// cannot right now (still remembered). Setting the same value again is a no-op.
+/// activate_window: to the front with focus, restoring it if minimized. set_minimized
+/// (0 restores without focus). Actions: 1 when sent now, never re-sent.
+DISPLAYXR_EXPORT int displayxr_linux_window_state_caps(void);
+DISPLAYXR_EXPORT int displayxr_linux_set_keep_above(int above);
+DISPLAYXR_EXPORT int displayxr_linux_activate_window(void);
+DISPLAYXR_EXPORT int displayxr_linux_set_minimized(int minimized);
+/// window_state: the state as the extension reports it (bit 1 above, 4 minimized),
+/// whoever changed it; -1 when not known.
+DISPLAYXR_EXPORT int displayxr_linux_window_state(void);
+
 /// (#266) Centre Unity's window on the given rect (X root coordinates), unless it is
 /// already there. Called by dxr_prov_move_window_to_display with the panel rect the
 /// runtime reported. Returns 1 when the window is on (or was moved to) the rect.

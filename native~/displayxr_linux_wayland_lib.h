@@ -22,9 +22,15 @@ extern "C" {
 struct wl_display;
 struct wl_surface;
 
-#define DXR_WL_LIB_ABI 5
+#define DXR_WL_LIB_ABI 6
 #define DXR_WL_LIB_NAME "libdisplayxr_unity_wayland.so"
 #define DXR_WL_LIB_INIT "dxr_wl_lib_init"
+
+//! dxr_wl_own_window_caps() bits: what the GNOME extension can do for the
+//! player's own window right now (extension version 15).
+#define DXR_WL_OWN_KEEP_ABOVE 1 //!< dxr_wl_set_keep_above
+#define DXR_WL_OWN_ACTIVATE 2   //!< dxr_wl_activate_window
+#define DXR_WL_OWN_MINIMIZE 4   //!< dxr_wl_set_minimized
 
 //! What the library needs from the main plugin: the player's window, as the
 //! capture layer (displayxr_provider_wl_capture.cpp) recorded it.
@@ -63,6 +69,11 @@ typedef struct DxrWlApi {
 	unsigned (*player_generation)(void);
 	void (*set_x11_panel_rect)(const char *connector, int x, int y, int w, int h);
 	int (*pointer_inside)(void);
+	int (*own_window_caps)(void);
+	int (*set_keep_above)(int above);
+	int (*activate_window)(void);
+	int (*set_minimized)(int minimized);
+	int (*window_state)(void);
 } DxrWlApi;
 
 //! The library's one export. NULL on an ABI mismatch.

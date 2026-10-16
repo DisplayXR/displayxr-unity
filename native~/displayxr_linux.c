@@ -1663,6 +1663,64 @@ displayxr_linux_take_pending_resize(int *width, int *height)
 }
 
 // ---------------------------------------------------------------------------
+// The window's own state under native Wayland
+// ---------------------------------------------------------------------------
+//
+// Keep it above other windows, bring it to the front, minimize and restore it:
+// what an app does to its own window with EWMH on X11, and a Wayland client has
+// no protocol for. The DisplayXR GNOME extension (version 15) does it for this
+// process's window only (Wayland library, dxr_wl_set_keep_above & co.). In X11
+// mode these answer 0 and do nothing: the app's own EWMH calls work there, and
+// in transparent mode this plugin keeps Unity's window above itself (#332).
+
+/// Native-Wayland player: what can be asked of the window right now, bits
+/// 1 keep above, 2 activate, 4 minimize. 0 in X11 mode, before the session, or
+/// without the DisplayXR GNOME extension (version 15+).
+DISPLAYXR_EXPORT int
+displayxr_linux_window_state_caps(void)
+{
+	return dxr_wl_own_window_caps();
+}
+
+/// Native-Wayland player: keep the window above other windows (1) or stop (0).
+/// Remembered (also before the session) and sent until the extension confirms it:
+/// after a refusal (screen locked, a drag) and whenever the window is shown anew
+/// (recreated, the extension came back). 1 when the extension can do it now, 0 when
+/// it cannot right now (still remembered). The same value again is a no-op.
+/// Asynchronous; the result is logged.
+DISPLAYXR_EXPORT int
+displayxr_linux_set_keep_above(int above)
+{
+	return dxr_wl_set_keep_above(above);
+}
+
+/// Native-Wayland player: bring the window to the front with keyboard focus,
+/// restoring it if minimized and switching to its workspace. 1 when sent.
+DISPLAYXR_EXPORT int
+displayxr_linux_activate_window(void)
+{
+	return dxr_wl_activate_window();
+}
+
+/// Native-Wayland player: minimize the window (1) or restore it without focus
+/// (0; displayxr_linux_activate_window restores with focus). 1 when sent.
+DISPLAYXR_EXPORT int
+displayxr_linux_set_minimized(int minimized)
+{
+	return dxr_wl_set_minimized(minimized);
+}
+
+/// Native-Wayland player: the window's state as the extension reports it, whoever
+/// changed it (the app, the user from the dock or the window menu): bit 1 kept
+/// above, bit 4 minimized. -1 when not known (X11 mode, before the session, no
+/// extension or one older than version 15).
+DISPLAYXR_EXPORT int
+displayxr_linux_window_state(void)
+{
+	return dxr_wl_window_state();
+}
+
+// ---------------------------------------------------------------------------
 // Foreground query (#332)
 // ---------------------------------------------------------------------------
 //

@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- Native-Wayland player: the app can keep its own window above other windows, bring it to the front with focus, and minimize and restore it, through the DisplayXR GNOME extension (version 15+). These are what an app does to its own window with EWMH on X11, and a Wayland client has no protocol for them.
+  - New Linux-player exports, with C# P/Invokes in `DisplayXRNative` (Linux player builds only, like the other `displayxr_linux_*` imports): `displayxr_linux_window_state_caps()` (bit 1 keep above, 2 activate, 4 minimize, available now), `displayxr_linux_set_keep_above(int)`, `displayxr_linux_activate_window()` (restores a minimized window and switches workspace too), `displayxr_linux_set_minimized(int)` (0 restores without focus), and `displayxr_linux_window_state()` (bit 1 kept above, 4 minimized, as the extension reports it — also what the user changed from the dock or the window menu).
+  - All asynchronous; the result is logged (`[DisplayXR-WL] window keep above on: done|refused`). Activate and minimize are actions: sent now or not at all. Keep-above is window state: remembered (also before the first session, and still applied after a session ends) and sent until the extension confirms it — again after a refusal (screen locked, the user dragging; 1 s, 2 s, … 30 s apart), and whenever the window is shown anew (recreated, a new session, the extension came back). Setting the same value again is a no-op, so an app may set it every frame.
+  - In X11 mode the exports do nothing (`window_state_caps` 0, `window_state` -1): the app's own EWMH calls work there. Windows and macOS are unchanged. `DisplayXRTransparentOverlay.alwaysOnTop` is still Windows-only; it does not turn keep-above on under Wayland.
+  - The Wayland library and the main plug-in must match again (`DXR_WL_LIB_ABI` 5 -> 6); they always ship together.
+
 ### Changed
 - Native-Wayland player (#367 follow-up): the player's opaque region is cleared when the capture layer has actually made the player's swapchain present alpha (a transparent overlay app on a surface that supports `PRE_MULTIPLIED`), instead of when the session is transparent. SDL's opaque claim is wrong exactly when that swapchain carries alpha, whatever the weave is. The log line is now `the player's window is kept non-opaque (it presents alpha)`. The Wayland library and the main plug-in must match again (`DXR_WL_LIB_ABI` 4 -> 5); they always ship together.
 

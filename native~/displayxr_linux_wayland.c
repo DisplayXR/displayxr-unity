@@ -151,10 +151,22 @@ static struct {
 
 	// The DisplayXR GNOME extension, and our window as it last reported it.
 	int ext_available;
+	int ext_known; // the worker has reported the extension's presence at least once
 	unsigned ext_caps;
 	char ext_layout[16]; // "logical", "physical", "" (not reported)
 	DxrWlExtWindow win;
 	int drag_state; // 0 none, 1 asked for, 2 dragging
+	// Keep-above as the app asked for it (dxr_wl_set_keep_above). It is window STATE,
+	// not an action: kept until the extension confirms it (keep_above_send_locked).
+	int keep_above_asked;        // the app asked at all (never touch it otherwise)
+	int keep_above_wanted;       // what it asked for
+	int keep_above_ok;           // the extension confirmed keep_above_wanted
+	unsigned keep_above_seq;     // the request last sent; answers to older ones are ignored
+	int keep_above_inflight;     // keep_above_seq is not answered yet
+	int keep_above_redo;         // the window was shown anew meanwhile: that answer does not count
+	int keep_above_logged;       // "done" was logged for keep_above_wanted: re-confirmations are quiet
+	int keep_above_refusals;     // in a row: the retry delay; only the first is logged
+	long long keep_above_due_ns; // not before (mono_ns); 0 = at the next chance
 
 	// Where the window should be, stage px: where we put it, or where the user (or
 	// the compositor, uninvited) moved it since. Enforced when the window gets mapped.
@@ -198,6 +210,9 @@ static struct {
 #define DXR_WARN_X11 2u
 #define DXR_WARN_DRAG 4u
 #define DXR_WARN_GAVE_UP 8u
+#define DXR_WARN_OWN_KEEP_ABOVE 16u
+#define DXR_WARN_OWN_ACTIVATE 32u
+#define DXR_WARN_OWN_MINIMIZE 64u
 
 // Guards s_wl: the provider's frame thread polls, C#'s main thread asks for
 // resizes, positions and input regions, the extension worker reports. Lock order:
@@ -687,6 +702,8 @@ attach_to_parent_locked(struct wl_surface *parent)
 
 static const DxrWlExtCallbacks s_ext_callbacks; // below
 static int win_mapped(const DxrWlExtWindow *w);
+static void keep_above_send_locked(void);
+static void keep_above_reset_locked(void);
 static long long mono_ns(void);
 static void stop_verify_locked(void);
 static void schedule_verify_locked(void);
@@ -724,6 +741,7 @@ dxr_wl_weave_surface_create(struct wl_display *display, struct wl_surface *paren
 	attach_to_parent_locked(player);
 	s_wl.parent_generation = generation;
 	s_host->unlock_player_surface();
+	keep_above_reset_locked(); // the player may have a new window since the last session
 	// Pointer input goes through to the player's window underneath.
 	struct wl_region *empty = wl_compositor_create_region(s_wl.compositor);
 	wl_surface_set_input_region(s_wl.surface, empty);
@@ -867,7 +885,13 @@ dxr_wl_weave_poll(int *out_w, int *out_h)
 			if (recreated)
 				fprintf(stderr, "[DisplayXR-WL] the player recreated its window: weave re-attached\n");
 		}
+		// A new surface (even at the old address) may be a new mutter window:
+		// keep-above is to be applied again. The reports may merge its unmap and map
+		// into one, so this does not wait for them.
+		if (player)
+			keep_above_reset_locked();
 	}
+	keep_above_send_locked();
 	// A player window presented with alpha must not be declared opaque (#367).
 	// Unity's SDL marks its whole window opaque (wl_surface.set_opaque_region) when
 	// it creates it and again on every configure (resize, focus change). The
@@ -1250,6 +1274,7 @@ ext_availability(int available, unsigned caps, const char *layout)
 {
 	pthread_mutex_lock(&s_wl_mutex);
 	s_wl.ext_available = available;
+	s_wl.ext_known = 1;
 	s_wl.ext_caps = caps;
 	snprintf(s_wl.ext_layout, sizeof(s_wl.ext_layout), "%s", layout ? layout : "");
 	if (!available) {
@@ -1263,14 +1288,58 @@ ext_availability(int available, unsigned caps, const char *layout)
 	pthread_mutex_unlock(&s_wl_mutex);
 }
 
+//! The window may be a new mutter window (recreated, a new session, shown anew by
+//! the extension): keep-above is to be applied again, and an answer still on its
+//! way (it was for the old window) must not count as done.
+static void
+keep_above_reset_locked(void)
+{
+	if (!s_wl.keep_above_asked || !s_wl.keep_above_wanted)
+		return;
+	s_wl.keep_above_ok = 0;
+	s_wl.keep_above_due_ns = 0;
+	if (s_wl.keep_above_inflight)
+		s_wl.keep_above_redo = 1;
+}
+
+//! Send the keep-above the app asked for while the extension has not confirmed
+//! it (also between XR sessions: it is the app's window either way). Called from
+//! the per-frame poll and on every report of the window, so a
+//! request is sent once the window is shown and again after a refusal (the
+//! screen locked, the user dragging it). Never during a move or our own drag,
+//! never with a request still on its way, and after a refusal not before 1, 2,
+//! 4, 8, 16, then every 30 s: a refusal that keeps holding costs one quiet round
+//! trip per 30 s. A (re)mapped or recreated window, a drag that ended and a new
+//! request from the app clear the delay.
+static void
+keep_above_send_locked(void)
+{
+	if (!s_wl.keep_above_asked || s_wl.keep_above_ok || s_wl.keep_above_inflight ||
+	    !win_mapped(&s_wl.win) || s_wl.win.moving || s_wl.drag_state || !s_wl.ext_available ||
+	    !(s_wl.ext_caps & DXR_WL_EXT_CAP_KEEP_ABOVE) || mono_ns() < s_wl.keep_above_due_ns)
+		return;
+	s_wl.keep_above_inflight = 1;
+	dxr_wl_ext_own_window(DXR_WL_EXT_OWN_KEEP_ABOVE, s_wl.keep_above_wanted, ++s_wl.keep_above_seq);
+}
+
 static void
 ext_window(const DxrWlExtWindow *w, int after_move, int moved)
 {
 	pthread_mutex_lock(&s_wl_mutex);
 	int was_mapped = win_mapped(&s_wl.win);
+	int was_moving = s_wl.win.moving;
 	int size_changed = was_mapped && (w->w != s_wl.win.w || w->h != s_wl.win.h);
 	s_wl.win = *w;
 	int mapped = win_mapped(w);
+	// Keep-above lives on a mutter window, and lasts as long as our bus connection
+	// to the extension: a window shown anew (mapped again, or reported again by an
+	// extension that went away and came back) has lost it. A drag that ended is
+	// when a request refused during it can go through.
+	if (mapped && !was_mapped)
+		keep_above_reset_locked();
+	if (was_moving && !w->moving)
+		s_wl.keep_above_due_ns = 0;
+	keep_above_send_locked();
 	if (!s_wl.surface) {
 		pthread_mutex_unlock(&s_wl_mutex);
 		return;
@@ -1477,12 +1546,166 @@ ext_drag(int started)
 	fprintf(stderr, "[DisplayXR-WL] window drag: %s\n", started ? "start" : "refused");
 }
 
+static void
+ext_own_window(int op, int value, unsigned seq, int ok)
+{
+	static const char *const what[] = {"keep above", "activate", "minimize"};
+	const char *name = op >= 0 && op <= DXR_WL_EXT_OWN_MINIMIZE ? what[op] : "?";
+	if (op == DXR_WL_EXT_OWN_KEEP_ABOVE) {
+		pthread_mutex_lock(&s_wl_mutex);
+		int latest = seq == s_wl.keep_above_seq; // else superseded: ignored
+		int log = 1;
+		if (latest && s_wl.keep_above_redo) {
+			// For a window that has since been shown anew: send again for the new one.
+			s_wl.keep_above_inflight = 0;
+			s_wl.keep_above_redo = 0;
+			s_wl.keep_above_ok = 0;
+		} else if (latest) {
+			s_wl.keep_above_inflight = 0;
+			// The app may have asked for the other value meanwhile: then it is not done.
+			s_wl.keep_above_ok = ok && value == s_wl.keep_above_wanted;
+			if (ok) {
+				s_wl.keep_above_refusals = 0;
+				// Re-sent for a window shown anew (a resize recreates the player's
+				// surface): the same state again, not worth a line each time.
+				log = !(s_wl.keep_above_logged && s_wl.keep_above_ok);
+				if (s_wl.keep_above_ok)
+					s_wl.keep_above_logged = 1;
+			} else {
+				log = s_wl.keep_above_refusals == 0;
+				int n = s_wl.keep_above_refusals++;
+				long long delay_s = n < 5 ? 1LL << n : 30;
+				s_wl.keep_above_due_ns = mono_ns() + delay_s * 1000000000LL;
+			}
+		}
+		pthread_mutex_unlock(&s_wl_mutex);
+		if (log)
+			fprintf(stderr, "[DisplayXR-WL] window %s %s: %s%s\n", name, value ? "on" : "off",
+			        ok ? "done" : "refused", !ok && latest ? " (sent again later, quietly)" : "");
+	} else if (op == DXR_WL_EXT_OWN_ACTIVATE) {
+		fprintf(stderr, "[DisplayXR-WL] window %s: %s\n", name, ok ? "done" : "refused");
+	} else {
+		fprintf(stderr, "[DisplayXR-WL] window %s %s: %s\n", name, value ? "on" : "off", ok ? "done" : "refused");
+	}
+}
+
 static const DxrWlExtCallbacks s_ext_callbacks = {
     .availability = ext_availability,
     .window = ext_window,
     .drag = ext_drag,
     .verify = ext_verify,
+    .own_window = ext_own_window,
 };
+
+/*
+ * The window's own state (extension version 15): what the window menu offers
+ * the user and an app expects to ask for itself — keep it above, bring it to the
+ * front, minimize and restore it. A Wayland client has no protocol for any of it
+ * (no keep-above; xdg-activation of a background app only flashes it; nothing
+ * undoes set_minimized), so the extension does it, for this process's window
+ * only. Each answer is logged by ext_own_window.
+ */
+
+//! Whether the extension offers @p cap now; logs once per kind (@p warn) when it
+//! does not — once the worker has said whether the extension is there (right after
+//! a session starts it may not have yet). @p remembered: the request is kept and
+//! sent once it can be.
+static int
+own_window_ready_locked(unsigned cap, const char *what, unsigned warn, int remembered)
+{
+	if (s_wl.ext_available && (s_wl.ext_caps & cap))
+		return 1;
+	if (s_wl.ext_known && !(s_wl.warned & warn)) {
+		fprintf(stderr, "[DisplayXR-WL] window %s %s (%s)\n", what,
+		        remembered ? "remembered, not possible right now" : "unavailable",
+		        !s_wl.ext_available ? "no DisplayXR GNOME extension"
+		                            : "the GNOME extension is older than version 15");
+		s_wl.warned |= warn;
+	}
+	return 0;
+}
+
+static int
+dxr_wl_own_window_caps(void)
+{
+	pthread_mutex_lock(&s_wl_mutex);
+	int caps = 0;
+	if (s_wl.ext_available) {
+		if (s_wl.ext_caps & DXR_WL_EXT_CAP_KEEP_ABOVE)
+			caps |= DXR_WL_OWN_KEEP_ABOVE;
+		if (s_wl.ext_caps & DXR_WL_EXT_CAP_ACTIVATE)
+			caps |= DXR_WL_OWN_ACTIVATE;
+		if (s_wl.ext_caps & DXR_WL_EXT_CAP_MINIMIZE)
+			caps |= DXR_WL_OWN_MINIMIZE;
+	}
+	pthread_mutex_unlock(&s_wl_mutex);
+	return caps;
+}
+
+static int
+dxr_wl_set_keep_above(int above)
+{
+	pthread_mutex_lock(&s_wl_mutex);
+	int want = above ? 1 : 0;
+	int ready = own_window_ready_locked(DXR_WL_EXT_CAP_KEEP_ABOVE, "keep above", DXR_WARN_OWN_KEEP_ABOVE, 1);
+	// The same request again (an app may set it every frame) changes nothing — not
+	// even a refusal's back-off — unless the window reports otherwise: then the user
+	// cleared it (window menu) and the app asks for it anew.
+	int reported_differs = s_wl.win.present && s_wl.win.above >= 0 && s_wl.win.above != want;
+	if (s_wl.keep_above_asked && s_wl.keep_above_wanted == want && !(s_wl.keep_above_ok && reported_differs)) {
+		pthread_mutex_unlock(&s_wl_mutex);
+		return ready;
+	}
+	// Remembered in any case: keep_above_send_locked sends it now, once the window is
+	// shown, or once the extension can (a request still on its way is answered
+	// first, and the answer to it then does not count as this one's).
+	s_wl.keep_above_asked = 1;
+	s_wl.keep_above_wanted = want;
+	s_wl.keep_above_ok = 0;
+	s_wl.keep_above_logged = 0;
+	s_wl.keep_above_refusals = 0;
+	s_wl.keep_above_due_ns = 0;
+	keep_above_send_locked();
+	pthread_mutex_unlock(&s_wl_mutex);
+	return ready;
+}
+
+//! Activate / minimize: actions, not state — sent now or not at all, never again.
+static int
+own_window_action(unsigned cap, const char *what, unsigned warn, int op, int value)
+{
+	pthread_mutex_lock(&s_wl_mutex);
+	int ok = own_window_ready_locked(cap, what, warn, 0);
+	if (ok)
+		dxr_wl_ext_own_window(op, value, 0);
+	pthread_mutex_unlock(&s_wl_mutex);
+	return ok;
+}
+
+static int
+dxr_wl_activate_window(void)
+{
+	return own_window_action(DXR_WL_EXT_CAP_ACTIVATE, "activate", DXR_WARN_OWN_ACTIVATE, DXR_WL_EXT_OWN_ACTIVATE, 1);
+}
+
+static int
+dxr_wl_window_state(void)
+{
+	pthread_mutex_lock(&s_wl_mutex);
+	const DxrWlExtWindow *w = &s_wl.win;
+	int state = -1;
+	if (s_wl.ext_available && w->present && w->minimized >= 0 && w->above >= 0)
+		state = (w->above ? DXR_WL_OWN_KEEP_ABOVE : 0) | (w->minimized ? DXR_WL_OWN_MINIMIZE : 0);
+	pthread_mutex_unlock(&s_wl_mutex);
+	return state;
+}
+
+static int
+dxr_wl_set_minimized(int minimized)
+{
+	return own_window_action(DXR_WL_EXT_CAP_MINIMIZE, "minimize", DXR_WARN_OWN_MINIMIZE, DXR_WL_EXT_OWN_MINIMIZE,
+	                         minimized ? 1 : 0);
+}
 
 static int
 dxr_wl_begin_pointer_drag(unsigned button)
@@ -1510,6 +1733,7 @@ dxr_wl_end_pointer_drag(void)
 	pthread_mutex_lock(&s_wl_mutex);
 	int was = s_wl.drag_state;
 	s_wl.drag_state = 0;
+	s_wl.keep_above_due_ns = 0; // a keep-above refused during the drag can go through now
 	if (was)
 		s_wl.drag_end_pending = 1; // the snapshot after EndPointerDrag logs where it was left
 	pthread_mutex_unlock(&s_wl_mutex);
@@ -1796,6 +2020,11 @@ static const DxrWlApi s_api = {
     .set_player_position_x11 = dxr_wl_set_player_position_x11,
     .player_generation = dxr_wl_player_generation,
     .set_x11_panel_rect = dxr_wl_set_x11_panel_rect,
+    .own_window_caps = dxr_wl_own_window_caps,
+    .set_keep_above = dxr_wl_set_keep_above,
+    .activate_window = dxr_wl_activate_window,
+    .set_minimized = dxr_wl_set_minimized,
+    .window_state = dxr_wl_window_state,
 };
 
 __attribute__((visibility("default"))) const DxrWlApi *
