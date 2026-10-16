@@ -48,6 +48,12 @@ namespace DisplayXR.Editor
             string category = settings != null ? settings.category.ToString() : "app";
             string displayMode = settings != null ? settings.displayMode : "auto";
             string description = settings != null ? settings.description : "";
+            string appId = settings != null ? settings.appId : "";
+            if (!string.IsNullOrEmpty(appId) && !IsValidAppId(appId))
+            {
+                Debug.LogWarning($"DisplayXR: app id '{appId}' is not ^[a-z0-9][a-z0-9-]{{0,31}}$ — left out of the manifest.");
+                appId = "";
+            }
             string layout = settings != null
                 ? DisplayXRManifestSettings.LayoutToString(settings.icon3DLayout)
                 : "sbs-lr";
@@ -71,7 +77,7 @@ namespace DisplayXR.Editor
             }
 
             string sidecarJson = BuildManifestJson(
-                appName, category, displayMode, description,
+                appName, appId, category, displayMode, description,
                 exePath: null, sidecarIconRel, sidecarIcon3DRel, layout);
             File.WriteAllText(sidecarPath, sidecarJson, Encoding.UTF8);
             Debug.Log($"DisplayXR: Generated app manifest at {sidecarPath}");
@@ -79,7 +85,7 @@ namespace DisplayXR.Editor
             if (settings != null && settings.registerWithDisplayXR)
             {
                 WriteRegisteredManifest(exePath, settings,
-                    appName, category, displayMode, description, layout);
+                    appName, appId, category, displayMode, description, layout);
             }
         }
 
@@ -119,13 +125,17 @@ namespace DisplayXR.Editor
         /// responsible for placing the actual files where the manifest expects them.
         /// </summary>
         private static string BuildManifestJson(
-            string appName, string category, string displayMode, string description,
+            string appName, string appId, string category, string displayMode, string description,
             string exePath, string iconRelName, string icon3DRelName, string icon3DLayout)
         {
             var sb = new StringBuilder();
             sb.AppendLine("{");
             sb.AppendLine("  \"schema_version\": 1,");
             sb.AppendLine($"  \"name\": {JsonEscape(appName)},");
+            // Manifest spec 3.4: the stable id an app's MCP tools are namespaced under
+            // (XR_DXR_mcp_tools section 5 — must equal what the app passes to SetAppId).
+            if (!string.IsNullOrEmpty(appId))
+                sb.AppendLine($"  \"id\": {JsonEscape(appId)},");
             sb.Append($"  \"type\": \"3d\"");
 
             // (#322) Always declare that this engine gates rendering on a shown
@@ -191,7 +201,7 @@ namespace DisplayXR.Editor
         /// </summary>
         private static void WriteRegisteredManifest(
             string exePath, DisplayXRManifestSettings settings,
-            string appName, string category, string displayMode, string description,
+            string appName, string appId, string category, string displayMode, string description,
             string icon3DLayout)
         {
             string localAppData = Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData);
@@ -237,7 +247,7 @@ namespace DisplayXR.Editor
             }
 
             string json = BuildManifestJson(
-                appName, category, displayMode, description,
+                appName, appId, category, displayMode, description,
                 exePath: exePath, iconRel, icon3DRel, icon3DLayout);
             File.WriteAllText(manifestPath, json, Encoding.UTF8);
             Debug.Log($"DisplayXR: Registered with DisplayXR — manifest at {manifestPath}");
@@ -248,6 +258,19 @@ namespace DisplayXR.Editor
         /// DisplayXR Shell's sanitize_basename so manifest filenames are
         /// interchangeable across the ecosystem.
         /// </summary>
+        /// <summary>Manifest spec 3.4 / XR_DXR_mcp_tools: ^[a-z0-9][a-z0-9-]{0,31}$.</summary>
+        internal static bool IsValidAppId(string id)
+        {
+            if (string.IsNullOrEmpty(id) || id.Length > 32) return false;
+            for (int i = 0; i < id.Length; i++)
+            {
+                char c = id[i];
+                bool alnum = (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9');
+                if (i == 0 ? !alnum : !(alnum || c == '-')) return false;
+            }
+            return true;
+        }
+
         private static string SanitizeBasename(string src)
         {
             if (string.IsNullOrEmpty(src)) return "";

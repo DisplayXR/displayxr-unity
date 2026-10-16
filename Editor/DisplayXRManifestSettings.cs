@@ -22,6 +22,11 @@ namespace DisplayXR.Editor
         [Tooltip("Display name shown on the launcher tile. Leave empty to use Application.productName.")]
         public string appName = "";
 
+        [Tooltip("Stable app id, written as the manifest \"id\" (^[a-z0-9][a-z0-9-]{0,31}$). " +
+                 "Required if the app registers MCP tools: pass the same string to " +
+                 "DisplayXRMcp.SetAppId, and agents see the tools as <id>__<tool>. Leave empty otherwise.")]
+        public string appId = "";
+
         [Tooltip("Free-form category tag for the launcher.")]
         public AppCategory category = AppCategory.app;
 
