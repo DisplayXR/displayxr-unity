@@ -145,6 +145,15 @@ build will tell you. One container run catches them all:
   re-applied on every session create. **Strings cross the boundary as UTF-8 `byte[]`, never
   marshalled .NET strings** (Windows `DllImport` defaults to ANSI). Do not expose privileged
   capabilities through it — any same-user process can call an app's tools.
+- **Desktop control (`XR_DXR_desktop_control`, runtime ADR-056)**: `DisplayXRDesktop` lets the
+  app's agent list windows, pick, read UI text, and activate / move / type / click into other
+  apps. The OS consent belongs to the app (`Request` → the OS's own prompt for this app).
+  `displayxr_provider_desktop.cpp` is a thin synchronous pass-through for observation + submit
+  (blittable `Dxr*` structs pinned by static_asserts and mirrored byte-for-byte in C#), and
+  queues action completions / consent changes from the poll loop; `DisplayXRDesktop.Pump()`
+  (driver `LateUpdate`) resolves the `Task`s on the main thread, and a session-generation bump
+  fails pending ones. Binding error codes sit below -2000000000 so they never alias an
+  `XrResult`. **Never route these operations through `DisplayXRMcp`** (ADR-056 D4).
 - **Runtime-owned Kooima math (`XR_DXR_view_rig`, #396 W7)**: the plugin no longer computes Kooima. It chains an `XrDisplayRigDXR`/`XrCameraRigDXR` descriptor (the handful of tunables) onto `xrLocateViews` and consumes render-ready `XrView{pose, fov}` in the provider's per-frame pump (Play Mode and built player alike). **This requires a runtime that advertises `XR_DXR_view_rig` (SPEC_VERSION 2)**; against an older runtime the plugin emits a one-shot WARN and passes raw views through (no stereo). The former vendored/`displayxr::math` display3d/camera3d math is gone (do not re-add — see the `no-vendored-math` drift guard).
 
 ### Render Pipeline Support (BiRP / URP / HDRP)
