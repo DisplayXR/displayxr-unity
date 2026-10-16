@@ -24,6 +24,17 @@ extern "C" {
 
 //! Placement capability bits (GetPlacementCapabilities, extension version 6+).
 #define DXR_WL_EXT_CAP_POINTER_DRAG 4u // BeginPointerDrag / EndPointerDrag (version 9)
+#define DXR_WL_EXT_CAP_KEEP_ABOVE 32u  // SetKeepAbove (version 15)
+#define DXR_WL_EXT_CAP_ACTIVATE 64u    // ActivateWindow (version 15)
+#define DXR_WL_EXT_CAP_MINIMIZE 128u   // SetMinimized (version 15)
+
+//! Requests on our own window that a Wayland client cannot make itself
+//! (extension version 15), for dxr_wl_ext_own_window().
+enum dxr_wl_ext_own_op {
+	DXR_WL_EXT_OWN_KEEP_ABOVE = 0, //!< value: keep it above other windows (1) or not (0)
+	DXR_WL_EXT_OWN_ACTIVATE = 1,   //!< bring it to the front with focus (restores it too); value unused
+	DXR_WL_EXT_OWN_MINIMIZE = 2,   //!< value: minimize (1) or restore without focus (0)
+};
 
 //! Our window as the extension last reported it.
 typedef struct DxrWlExtWindow {
@@ -32,6 +43,8 @@ typedef struct DxrWlExtWindow {
 	int moving;          //!< an interactive move/resize grab is in progress
 	double device_scale; //!< device px per stage px on its monitor; 0 = not reported
 	int mon_x, mon_y, mon_w, mon_h; //!< its monitor's rect, stage px; mon_w = 0 = not reported
+	int minimized;       //!< minimized (version 15+); -1 = not reported
+	int above;           //!< kept above other windows (version 15+); -1 = not reported
 } DxrWlExtWindow;
 
 //! Called on the worker thread, never while it holds a lock of its own.
@@ -47,6 +60,10 @@ typedef struct DxrWlExtCallbacks {
 	void (*drag)(int started);
 	//! Our window, read afresh (GetWindows) for a dxr_wl_ext_verify_after().
 	void (*verify)(const DxrWlExtWindow *w);
+	//! A dxr_wl_ext_own_window() request was answered: ok = the extension did
+	//! it (0 also when it cannot: not there, too old, refused). seq: the one the
+	//! request was made with.
+	void (*own_window)(int op, int value, unsigned seq, int ok);
 } DxrWlExtCallbacks;
 
 //! Start the worker (once; later calls are ignored).
@@ -61,6 +78,12 @@ void dxr_wl_ext_end_pointer_drag(void);
 //! Read our window afresh in delay_ms and report it to the verify callback
 //! (placement verification, #361). Only the latest request is kept.
 void dxr_wl_ext_verify_after(int delay_ms);
+//! An own-window request (enum dxr_wl_ext_own_op). Asynchronous; requests are
+//! made in the order asked and each is answered through the own_window callback,
+//! with @p seq (the caller's number for it). A queued keep-above takes the latest
+//! value and seq (one at most, never dropped, so the latest is always answered);
+//! past a handful queued, the oldest activate / minimize is dropped unanswered.
+void dxr_wl_ext_own_window(int op, int value, unsigned seq);
 
 #ifdef __cplusplus
 }

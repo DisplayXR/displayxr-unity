@@ -108,13 +108,26 @@ api(void)
 	return __atomic_load_n(&s_api, __ATOMIC_ACQUIRE);
 }
 
+// Keep-above asked before the library was loaded (before the first native-Wayland
+// session): -1 none, else the value, handed to the library once a weave exists. One
+// lock covers it, a direct call and the hand-over, so the app's LAST call wins.
+static pthread_mutex_t s_keep_above_mutex = PTHREAD_MUTEX_INITIALIZER;
+static int s_pending_keep_above = -1;
+
 int
 dxr_wl_weave_surface_create(struct wl_display *display, struct wl_surface *parent, int lw, int lh,
                             struct wl_surface **out_surface, int *out_w, int *out_h)
 {
 	pthread_once(&s_load_once, load_library);
 	const DxrWlApi *a = api();
-	return a ? a->weave_surface_create(display, parent, lw, lh, out_surface, out_w, out_h) : 0;
+	int created = a ? a->weave_surface_create(display, parent, lw, lh, out_surface, out_w, out_h) : 0;
+	pthread_mutex_lock(&s_keep_above_mutex);
+	if (a && s_pending_keep_above >= 0) {
+		a->set_keep_above(s_pending_keep_above);
+		s_pending_keep_above = -1;
+	}
+	pthread_mutex_unlock(&s_keep_above_mutex);
+	return created;
 }
 
 void
@@ -246,4 +259,48 @@ dxr_wl_set_x11_panel_rect(const char *connector, int x, int y, int w, int h)
 	const DxrWlApi *a = api();
 	if (a)
 		a->set_x11_panel_rect(connector, x, y, w, h);
+}
+
+int
+dxr_wl_own_window_caps(void)
+{
+	const DxrWlApi *a = api();
+	return a ? a->own_window_caps() : 0;
+}
+
+int
+dxr_wl_set_keep_above(int above)
+{
+	pthread_mutex_lock(&s_keep_above_mutex);
+	const DxrWlApi *a = api();
+	int ready = 0;
+	if (a) {
+		s_pending_keep_above = -1; // superseded
+		ready = a->set_keep_above(above);
+	} else {
+		s_pending_keep_above = above ? 1 : 0;
+	}
+	pthread_mutex_unlock(&s_keep_above_mutex);
+	return ready;
+}
+
+int
+dxr_wl_activate_window(void)
+{
+	const DxrWlApi *a = api();
+	return a ? a->activate_window() : 0;
+}
+
+int
+dxr_wl_set_minimized(int minimized)
+{
+	const DxrWlApi *a = api();
+	return a ? a->set_minimized(minimized) : 0;
+}
+
+int
+dxr_wl_window_state(void)
+{
+	const DxrWlApi *a = api();
+	return a ? a->window_state() : -1;
 }

@@ -18,6 +18,8 @@
 
 #pragma once
 
+#include "displayxr_linux_wayland_lib.h" // DXR_WL_OWN_*
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -112,6 +114,30 @@ int dxr_wl_set_player_position_x11(int x, int y);
 void dxr_wl_set_x11_panel_rect(const char *connector, int x, int y, int w, int h);
 //! Bumps when the player recreated its window (the input region must be re-sent).
 unsigned dxr_wl_player_generation(void);
+
+//! What the DisplayXR GNOME extension (version 15) can do for the player's own
+//! window right now, which a Wayland client cannot do for itself: DXR_WL_OWN_*
+//! bits (displayxr_linux_wayland_lib.h). 0 without a native-Wayland session or
+//! without the extension (X11 mode: the app's own EWMH calls work there).
+int dxr_wl_own_window_caps(void);
+//! Keep the window above other windows, or stop. It is state, so it is remembered
+//! (also before the first session) and sent until the extension confirms it: once
+//! the window is shown, again after a refusal (screen locked, the user dragging),
+//! and whenever the window is shown anew (the extension came back, the player
+//! recreated its window). 1 when the extension can do it now, 0 when it cannot
+//! right now (remembered either way); the result is logged.
+int dxr_wl_set_keep_above(int above);
+//! Bring the window to the front with keyboard focus, restoring it if minimized
+//! and switching to its workspace. 1 when the request was sent.
+int dxr_wl_activate_window(void);
+//! Minimize the window, or restore it (without focus: activate gives focus too).
+//! 1 when the request was sent.
+int dxr_wl_set_minimized(int minimized);
+//! The window's state as the extension last reported it: DXR_WL_OWN_KEEP_ABOVE
+//! when kept above, DXR_WL_OWN_MINIMIZE when minimized — whoever did it (the app,
+//! the user from the dock or the window menu). -1 when not known (no
+//! native-Wayland session, no extension, or one older than version 15).
+int dxr_wl_window_state(void);
 
 #ifdef __cplusplus
 }

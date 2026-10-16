@@ -235,6 +235,10 @@ parse_snapshot(const char *json, DxrWlExtWindow *w, char *layout, size_t layout_
 		if (pid && strtol(pid, NULL, 10) == self) {
 			DxrWlExtWindow c = {0};
 			c.present = 1;
+			const char *minimized = json_field(p, obj_end, "minimized");
+			const char *above = json_field(p, obj_end, "above");
+			c.minimized = minimized ? !strncmp(minimized, "true", 4) : -1;
+			c.above = above ? !strncmp(above, "true", 4) : -1;
 			const char *frame = json_field(p, obj_end, "frame");
 			if (!frame || sscanf(frame, "[ %d , %d , %d , %d", &c.x, &c.y, &c.w, &c.h) != 4)
 				c.w = c.h = 0;
@@ -286,7 +290,15 @@ static struct {
 	int end;
 	int verify;
 	long long verify_at_ns; // CLOCK_MONOTONIC
+	// Own-window requests, in the order asked: "activate, then minimize" must not
+	// end up activated. The oldest is dropped past DXR_OWN_QUEUE.
+	struct {
+		int op, value;
+		unsigned seq;
+	} own[8];
+	int own_n;
 } s_job;
+#define DXR_OWN_QUEUE ((int)(sizeof(s_job.own) / sizeof(s_job.own[0])))
 
 // What the filter saw (worker thread only).
 static int s_owner_changed;
@@ -483,6 +495,22 @@ run_jobs(void)
 			s_dbus.unref(r);
 		snapshot(0, 0); // where the user left it
 	}
+	for (int i = 0; i < job.own_n; i++) {
+		static const char *const method[] = {"SetKeepAbove", "ActivateWindow", "SetMinimized"};
+		static const unsigned cap[] = {DXR_WL_EXT_CAP_KEEP_ABOVE, DXR_WL_EXT_CAP_ACTIVATE,
+		                               DXR_WL_EXT_CAP_MINIMIZE};
+		int op = job.own[i].op, value = job.own[i].value;
+		int ok = 0;
+		if (op >= 0 && op <= DXR_WL_EXT_OWN_MINIMIZE && s_available > 0 && (s_caps & cap[op])) {
+			uint32_t b = value ? 1 : 0;
+			// ActivateWindow takes no flag: the argument list ends after the pid.
+			int flag_type = op == DXR_WL_EXT_OWN_ACTIVATE ? DXR_DBUS_TYPE_INVALID : DXR_DBUS_TYPE_BOOLEAN;
+			ok = reply_bool(call(DXR_EXT_PLACEMENT_PATH, DXR_EXT_PLACEMENT_IFACE, method[op], DXR_DBUS_TYPE_UINT32,
+			                     &pid, flag_type, &b, DXR_DBUS_TYPE_INVALID));
+		}
+		if (s_cb->own_window)
+			s_cb->own_window(op, value, job.own[i].seq, ok);
+	}
 	if (job.move && s_available > 0) {
 		int32_t x = job.move_x, y = job.move_y;
 		int moved = reply_bool(call(DXR_EXT_PLACEMENT_PATH, DXR_EXT_PLACEMENT_IFACE, "MoveWindow", DXR_DBUS_TYPE_UINT32,
@@ -669,6 +697,37 @@ dxr_wl_ext_verify_after(int delay_ms)
 	pthread_mutex_lock(&s_job_mutex);
 	s_job.verify = 1;
 	s_job.verify_at_ns = now_ns() + (long long)(delay_ms > 0 ? delay_ms : 0) * 1000000LL;
+	pthread_mutex_unlock(&s_job_mutex);
+	wake();
+}
+
+void
+dxr_wl_ext_own_window(int op, int value, unsigned seq)
+{
+	pthread_mutex_lock(&s_job_mutex);
+	// Keep-above is state: one queued request, the latest value. It is never
+	// dropped (its caller waits for its answer before sending another).
+	for (int i = 0; op == DXR_WL_EXT_OWN_KEEP_ABOVE && i < s_job.own_n; i++) {
+		if (s_job.own[i].op == op) {
+			s_job.own[i].value = value;
+			s_job.own[i].seq = seq;
+			pthread_mutex_unlock(&s_job_mutex);
+			wake();
+			return;
+		}
+	}
+	if (s_job.own_n == DXR_OWN_QUEUE) {
+		// Full: drop the oldest action (activate / minimize).
+		int drop = 0;
+		while (drop < s_job.own_n - 1 && s_job.own[drop].op == DXR_WL_EXT_OWN_KEEP_ABOVE)
+			drop++;
+		memmove(&s_job.own[drop], &s_job.own[drop + 1], sizeof(s_job.own[0]) * (size_t)(DXR_OWN_QUEUE - 1 - drop));
+		s_job.own_n--;
+	}
+	s_job.own[s_job.own_n].op = op;
+	s_job.own[s_job.own_n].value = value;
+	s_job.own[s_job.own_n].seq = seq;
+	s_job.own_n++;
 	pthread_mutex_unlock(&s_job_mutex);
 	wake();
 }
