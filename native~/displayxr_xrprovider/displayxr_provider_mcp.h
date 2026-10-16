@@ -52,10 +52,12 @@ int dxr_mcp_handle_event(const XrEventDataBuffer *ev);
 
 // ---- C# surface (DisplayXRProviderNative / DisplayXRMcp) ----
 //
-// Return codes are XrResult values (0 = XR_SUCCESS), plus:
-//   1  = stored; applied when the session (re)starts (no session yet)
-//  -1  = extension not available on this runtime / not enabled
-//  -2  = bad argument (null, too long, invalid name)
+// Return codes are XrResult values (0 = XR_SUCCESS), plus the binding's own codes
+// below — chosen far outside the XrResult range so a real runtime error (e.g.
+// XR_ERROR_VALIDATION_FAILURE = -1) can never be mistaken for one of them:
+#define DXR_MCP_STORED            2000000001  //!< stored; applied when the session (re)starts
+#define DXR_MCP_ERR_UNAVAILABLE (-2000000001) //!< extension not available / not enabled
+#define DXR_MCP_ERR_BAD_ARGUMENT (-2000000002) //!< null, too long, invalid name, buffer too small
 
 //! 1 when a session is up, the extension is enabled AND the runtime's MCP server is
 //! running (the capability gate passed); 0 otherwise. A pure query, no side effects.
@@ -77,7 +79,7 @@ DISPLAYXR_EXPORT int dxr_prov_mcp_peek_call(uint64_t *call_id, uint32_t *name_si
 
 //! Pop the oldest queued call into the caller's buffers (sizes from peek).
 //! Returns 1 on success, 0 if the queue is empty or @p call_id is not at its head,
-//! -2 if a buffer is too small.
+//! DXR_MCP_ERR_BAD_ARGUMENT if a buffer is too small.
 DISPLAYXR_EXPORT int dxr_prov_mcp_pop_call(uint64_t call_id, uint8_t *name_buf, uint32_t name_cap, uint8_t *args_buf,
                                            uint32_t args_cap);
 

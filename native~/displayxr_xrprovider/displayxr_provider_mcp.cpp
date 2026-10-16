@@ -260,15 +260,15 @@ int
 dxr_prov_mcp_set_app_id(const uint8_t *app_id_utf8)
 {
 	const char *id = cstr(app_id_utf8);
-	if (!app_id_valid(id)) return -2;
+	if (!app_id_valid(id)) return DXR_MCP_ERR_BAD_ARGUMENT;
 	XrSession s;
 	{
 		std::lock_guard<std::mutex> lk(g_mx);
 		g_app_id = id;
 		s = g_session;
-		if (!g_enabled) return s ? -1 : 1;
+		if (!g_enabled) return s ? DXR_MCP_ERR_UNAVAILABLE : DXR_MCP_STORED;
 	}
-	if (s == XR_NULL_HANDLE) return 1;
+	if (s == XR_NULL_HANDLE) return DXR_MCP_STORED;
 	return (int)apply_app_id(s, id);
 }
 
@@ -277,7 +277,7 @@ dxr_prov_mcp_register_tool(const uint8_t *name_utf8, const uint8_t *description_
 {
 	const char *name = cstr(name_utf8);
 	const char *desc = cstr(description_utf8);
-	if (!name_valid(name) || !desc || !*desc) return -2;
+	if (!name_valid(name) || !desc || !*desc) return DXR_MCP_ERR_BAD_ARGUMENT;
 
 	StoredTool t{name, desc, schema_utf8 ? cstr(schema_utf8) : ""};
 	XrSession s;
@@ -292,9 +292,9 @@ dxr_prov_mcp_register_tool(const uint8_t *name_utf8, const uint8_t *description_
 		}
 		if (!replaced) g_tools.push_back(t);
 		s = g_session;
-		if (!g_enabled) return s ? -1 : 1;
+		if (!g_enabled) return s ? DXR_MCP_ERR_UNAVAILABLE : DXR_MCP_STORED;
 	}
-	if (s == XR_NULL_HANDLE) return 1;
+	if (s == XR_NULL_HANDLE) return DXR_MCP_STORED;
 	return (int)apply_tool(s, t);
 }
 
@@ -302,7 +302,7 @@ int
 dxr_prov_mcp_unregister_tool(const uint8_t *name_utf8)
 {
 	const char *name = cstr(name_utf8);
-	if (!name || !*name) return -2;
+	if (!name || !*name) return DXR_MCP_ERR_BAD_ARGUMENT;
 	XrSession s;
 	{
 		std::lock_guard<std::mutex> lk(g_mx);
@@ -313,9 +313,9 @@ dxr_prov_mcp_unregister_tool(const uint8_t *name_utf8)
 			}
 		}
 		s = g_session;
-		if (!g_enabled) return s ? -1 : 1;
+		if (!g_enabled) return s ? DXR_MCP_ERR_UNAVAILABLE : DXR_MCP_STORED;
 	}
-	if (s == XR_NULL_HANDLE) return 1;
+	if (s == XR_NULL_HANDLE) return DXR_MCP_STORED;
 	XrResult r = pfn_unregister(s, name);
 	note_result(r, "unregister tool", name);
 	return (int)r;
@@ -339,7 +339,7 @@ dxr_prov_mcp_pop_call(uint64_t call_id, uint8_t *name_buf, uint32_t name_cap, ui
 	std::lock_guard<std::mutex> lk(g_mx);
 	if (g_queue.empty() || g_queue.front().id != call_id) return 0;
 	const QueuedCall &c = g_queue.front();
-	if (!name_buf || !args_buf || name_cap < c.name.size() + 1 || args_cap < c.args.size() + 1) return -2;
+	if (!name_buf || !args_buf || name_cap < c.name.size() + 1 || args_cap < c.args.size() + 1) return DXR_MCP_ERR_BAD_ARGUMENT;
 	memcpy(name_buf, c.name.c_str(), c.name.size() + 1);
 	memcpy(args_buf, c.args.c_str(), c.args.size() + 1);
 	g_queue.pop_front();
@@ -353,9 +353,9 @@ dxr_prov_mcp_submit_result(uint64_t call_id, int success, const uint8_t *result_
 	{
 		std::lock_guard<std::mutex> lk(g_mx);
 		s = g_session;
-		if (!g_enabled) return -1;
+		if (!g_enabled) return DXR_MCP_ERR_UNAVAILABLE;
 	}
-	if (s == XR_NULL_HANDLE) return -1; // the session is gone; the runtime already failed the call
+	if (s == XR_NULL_HANDLE) return DXR_MCP_ERR_UNAVAILABLE; // the session is gone; the runtime already failed the call
 	const char *json = (result_json_utf8 && *result_json_utf8) ? cstr(result_json_utf8) : "{}";
 	return (int)pfn_submit(s, call_id, success ? XR_TRUE : XR_FALSE, json);
 }

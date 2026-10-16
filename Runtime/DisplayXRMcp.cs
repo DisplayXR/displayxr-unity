@@ -67,6 +67,10 @@ namespace DisplayXR
         /// <summary>An asynchronous tool handler: JSON arguments in, JSON object out.</summary>
         public delegate Task<string> AsyncHandler(string argsJson);
 
+        // The native binding's own codes (displayxr_provider_mcp.h), far outside the XrResult range.
+        private const int ErrUnavailable = -2000000001;
+        private const int ErrBadArgument = -2000000002;
+
         private static readonly Dictionary<string, AsyncHandler> s_Handlers = new Dictionary<string, AsyncHandler>();
         private static bool s_Missing; // native binary predates the binding
 
@@ -93,7 +97,7 @@ namespace DisplayXR
         public static bool SetAppId(string appId)
         {
             int r = Call(() => Native.dxr_prov_mcp_set_app_id(Utf8(appId)));
-            if (r == -2) Debug.LogError($"[DisplayXR] MCP: invalid app id '{appId}' (want ^[a-z0-9][a-z0-9-]{{0,31}}$)");
+            if (r == ErrBadArgument) Debug.LogError($"[DisplayXR] MCP: invalid app id '{appId}' (want ^[a-z0-9][a-z0-9-]{{0,31}}$)");
             return r >= 0;
         }
 
@@ -120,7 +124,7 @@ namespace DisplayXR
             if (handler == null) throw new ArgumentNullException(nameof(handler));
             int r = Call(() => Native.dxr_prov_mcp_register_tool(Utf8(name), Utf8(description),
                                                                 inputSchemaJson == null ? null : Utf8(inputSchemaJson)));
-            if (r == -2)
+            if (r == ErrBadArgument)
             {
                 Debug.LogError($"[DisplayXR] MCP: invalid tool '{name}' (name must match ^[a-z0-9][a-z0-9_-]{{0,62}}$ " +
                                "with no '__', and the description must not be empty)");
@@ -223,11 +227,11 @@ namespace DisplayXR
 
         private static int Call(Func<int> f)
         {
-            if (s_Missing) return -1;
+            if (s_Missing) return ErrUnavailable;
             try { return f(); }
             catch (EntryPointNotFoundException) { s_Missing = true; }
             catch (DllNotFoundException) { s_Missing = true; }
-            return -1;
+            return ErrUnavailable;
         }
 
         // NUL-terminated UTF-8. Strings are passed as bytes, never as marshalled .NET

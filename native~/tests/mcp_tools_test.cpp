@@ -138,15 +138,15 @@ main()
 	// --- Before any session: stored, reported as "applied later" ---------------
 	dxr_mcp_on_instance(inst, f_gipa, 1, quiet);
 	CHECK(dxr_prov_mcp_state() == 0);
-	CHECK(dxr_prov_mcp_set_app_id(u8("lenovo-avatar")) == 1);
-	CHECK(dxr_prov_mcp_register_tool(u8("wave"), u8("Wave at the user."), nullptr) == 1);
+	CHECK(dxr_prov_mcp_set_app_id(u8("lenovo-avatar")) == DXR_MCP_STORED);
+	CHECK(dxr_prov_mcp_register_tool(u8("wave"), u8("Wave at the user."), nullptr) == DXR_MCP_STORED);
 	CHECK(F.tools.empty());
 
 	// --- Bad input never reaches the runtime ------------------------------------
-	CHECK(dxr_prov_mcp_set_app_id(u8("Lenovo Avatar")) == -2);
-	CHECK(dxr_prov_mcp_register_tool(u8("Wave"), u8("x"), nullptr) == -2);
-	CHECK(dxr_prov_mcp_register_tool(u8("a__b"), u8("x"), nullptr) == -2);
-	CHECK(dxr_prov_mcp_register_tool(u8("ok"), u8(""), nullptr) == -2);
+	CHECK(dxr_prov_mcp_set_app_id(u8("Lenovo Avatar")) == DXR_MCP_ERR_BAD_ARGUMENT);
+	CHECK(dxr_prov_mcp_register_tool(u8("Wave"), u8("x"), nullptr) == DXR_MCP_ERR_BAD_ARGUMENT);
+	CHECK(dxr_prov_mcp_register_tool(u8("a__b"), u8("x"), nullptr) == DXR_MCP_ERR_BAD_ARGUMENT);
+	CHECK(dxr_prov_mcp_register_tool(u8("ok"), u8(""), nullptr) == DXR_MCP_ERR_BAD_ARGUMENT);
 
 	// --- Session 1: the stored id + tool are applied ----------------------------
 	dxr_mcp_on_session_created(s1);
@@ -179,7 +179,7 @@ main()
 	uint8_t small[2];
 	uint8_t big[64];
 	CHECK(dxr_prov_mcp_pop_call(999, big, 64, big, 64) == 0);
-	CHECK(dxr_prov_mcp_pop_call(103, small, 2, big, 64) == -2);
+	CHECK(dxr_prov_mcp_pop_call(103, small, 2, big, 64) == DXR_MCP_ERR_BAD_ARGUMENT);
 	CHECK(pop(name, args, id) && id == 103);
 
 	// The queue is bounded: the 17th call is failed to the agent at once.
@@ -197,7 +197,7 @@ main()
 	dxr_mcp_on_session_destroying();
 	CHECK(dxr_prov_mcp_state() == 0);
 	CHECK(dxr_prov_mcp_peek_call(&id, nullptr, nullptr) == 0);
-	CHECK(dxr_prov_mcp_submit_result(300, 1, nullptr) == -1);
+	CHECK(dxr_prov_mcp_submit_result(300, 1, nullptr) == DXR_MCP_ERR_UNAVAILABLE);
 	F.tools.clear();
 	F.app_id.clear();
 	dxr_mcp_on_instance(inst, f_gipa, 1, quiet);
@@ -221,7 +221,7 @@ main()
 	dxr_mcp_on_instance(inst, f_gipa, 0, quiet);
 	dxr_mcp_on_session_created(s1);
 	CHECK(dxr_prov_mcp_state() == 0);
-	CHECK(dxr_prov_mcp_register_tool(u8("late"), u8("x"), nullptr) == -1);
+	CHECK(dxr_prov_mcp_register_tool(u8("late"), u8("x"), nullptr) == DXR_MCP_ERR_UNAVAILABLE);
 	CHECK(F.registers == regs);
 
 	if (g_fail) {
