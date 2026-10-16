@@ -6,8 +6,9 @@
 // carry UTF-8 intact, results reach the runtime, the capability gate is honoured,
 // and bad input is refused before it reaches the runtime. No Unity, no real runtime.
 //
-//   c++ -std=c++17 -I native~/displayxr_xrprovider -I <openxr include> \
+//   c++ -std=c++17 -I native~/displayxr_xrprovider -I <openxr include>
 //       native~/tests/mcp_tools_test.cpp native~/displayxr_xrprovider/displayxr_provider_mcp.cpp
+//   (one command; see the "MCP tools binding tests" step in build-native.yml)
 
 #include "displayxr_provider_mcp.h"
 #include "../displayxr_extensions.h"
