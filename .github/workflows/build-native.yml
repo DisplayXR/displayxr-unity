@@ -197,6 +197,17 @@ jobs:
             native~/tests/cursor_depth_math_test.cpp -o /tmp/cursor_depth_math_test -lm
           /tmp/cursor_depth_math_test
 
+      # The XR_DXR_mcp_tools binding against a fake runtime: registration survives a
+      # session restart, calls queue FIFO with UTF-8 intact, the capability gate holds.
+      - name: MCP tools binding tests
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          c++ -std=c++17 -Wall -I native~/displayxr_xrprovider \
+            -I native~/build/_deps/openxr_sdk-src/include \
+            native~/tests/mcp_tools_test.cpp native~/displayxr_xrprovider/displayxr_provider_mcp.cpp \
+            -o /tmp/mcp_tools_test
+          /tmp/mcp_tools_test
+
       - name: Verify output
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |

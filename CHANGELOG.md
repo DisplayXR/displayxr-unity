@@ -5,6 +5,16 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **App-registered MCP tools for AI agents (`XR_DXR_mcp_tools`).** New `DisplayXRMcp` API: an app registers its own verbs (`RegisterTool(name, description, inputSchemaJson, handler)`, sync or async) and any MCP client — Claude, a voice assistant, a test script — can call them through the runtime's per-app MCP server, without the app linking an MCP library or opening a port. `SetAppId` names the app (= its `.displayxr.json` manifest `id`); tools appear as `<app-id>__<tool>` through `displayxr-mcp --target workspace`.
+  - Handlers run on Unity's main thread (drained every `LateUpdate` by the provider driver); throw to fail a call. The runtime fails a call after 5 s, so long work should start and return.
+  - The app id and tools are stored natively and re-applied on every session (re)start; they may be registered before the session exists.
+  - All strings cross the native boundary as UTF-8 bytes, so non-ASCII descriptions, arguments and results (e.g. Chinese) survive on Windows, where default `DllImport` marshalling uses the ANSI code page.
+  - Inert — `DisplayXRMcp.IsAvailable` false, registration stored but not applied — on a runtime without the extension or a machine with the MCP capability off (Windows: the DisplayXR MCP Tools installer; Linux: `~/.config/displayxr/capabilities/mcp/Enabled` = `1`; any OS: `DISPLAYXR_MCP=1`).
+  - Native: `displayxr_provider_mcp.{h,cpp}` (`dxr_prov_mcp_*` exports) + `native~/tests/mcp_tools_test.cpp`, run in CI against a fake runtime.
+
 ## [2.26.2] - 2026-10-16
 
 ### Added

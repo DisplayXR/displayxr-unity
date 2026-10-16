@@ -882,6 +882,53 @@ typedef struct XrCursorDepthPlacementDXR {
 	float targetDisparity; // unfiltered target this locate
 } XrCursorDepthPlacementDXR;
 
+
+// ---------------------------------------------------------------------------
+// XR_DXR_mcp_tools (runtime >= v1.13): the app registers its own MCP tools so an
+// AI agent can operate it. Mirrors the runtime's XR_DXR_mcp_tools.h (spec v1);
+// see native~/displayxr_xrprovider/displayxr_provider_mcp.h for the binding.
+// ---------------------------------------------------------------------------
+#define XR_DXR_MCP_TOOLS_EXTENSION_NAME "XR_DXR_mcp_tools"
+#define XR_DXR_MCP_TOOLS_SPEC_VERSION 1
+
+#define XR_TYPE_MCP_APP_INFO_DXR             ((XrStructureType)1004999130)
+#define XR_TYPE_MCP_TOOL_INFO_DXR            ((XrStructureType)1004999131)
+#define XR_TYPE_EVENT_DATA_MCP_TOOL_CALL_DXR ((XrStructureType)1004999132)
+
+#define XR_MAX_MCP_APP_ID_SIZE_DXR 33
+#define XR_MAX_MCP_TOOL_NAME_SIZE_DXR 64
+
+typedef struct XrMCPAppInfoDXR {
+	XrStructureType type; // XR_TYPE_MCP_APP_INFO_DXR
+	const void *next;
+	char appId[XR_MAX_MCP_APP_ID_SIZE_DXR];
+} XrMCPAppInfoDXR;
+
+typedef struct XrMCPToolInfoDXR {
+	XrStructureType type; // XR_TYPE_MCP_TOOL_INFO_DXR
+	const void *next;
+	const char *name;
+	const char *description;
+	const char *inputSchemaJson;
+} XrMCPToolInfoDXR;
+
+typedef struct XrEventDataMCPToolCallDXR {
+	XrStructureType type; // XR_TYPE_EVENT_DATA_MCP_TOOL_CALL_DXR
+	const void *next;
+	XrSession session;
+	uint64_t callId;
+	char toolName[XR_MAX_MCP_TOOL_NAME_SIZE_DXR];
+	uint32_t argsSize;
+} XrEventDataMCPToolCallDXR;
+
+typedef XrResult (XRAPI_PTR *PFN_xrSetMCPAppInfoDXR)(XrSession session, const XrMCPAppInfoDXR *info);
+typedef XrResult (XRAPI_PTR *PFN_xrRegisterMCPToolDXR)(XrSession session, const XrMCPToolInfoDXR *tool);
+typedef XrResult (XRAPI_PTR *PFN_xrUnregisterMCPToolDXR)(XrSession session, const char *name);
+typedef XrResult (XRAPI_PTR *PFN_xrGetMCPToolCallArgsDXR)(XrSession session, uint64_t callId, uint32_t capacity,
+                                                          uint32_t *countOutput, char *buffer);
+typedef XrResult (XRAPI_PTR *PFN_xrSubmitMCPToolResultDXR)(XrSession session, uint64_t callId, XrBool32 success,
+                                                           const char *resultJson);
+
 #ifdef __cplusplus
 }
 #endif
