@@ -108,6 +108,8 @@ set(SOURCES
     displayxr_xrprovider/displayxr_display_provider.cpp
     # XR_DXR_mcp_tools binding: app-registered MCP tools for AI agents.
     displayxr_xrprovider/displayxr_provider_mcp.cpp
+    # XR_DXR_desktop_control binding: the app's agent operates the desktop (ADR-056).
+    displayxr_xrprovider/displayxr_provider_desktop.cpp
     # XR SDK pre-init provider (#247): XRSDKPreInit export, compiled everywhere so
     # the boot.config xrsdk-pre-init-library entry never dangles; VK-only in effect.
     displayxr_xrprovider/displayxr_provider_preinit.cpp
@@ -135,6 +137,7 @@ endif()
 # (transparent overlay mode, issue #57).
 list(APPEND HEADERS displayxr_xrprovider/displayxr_provider_session.h)
 list(APPEND HEADERS displayxr_xrprovider/displayxr_provider_mcp.h)
+list(APPEND HEADERS displayxr_xrprovider/displayxr_provider_desktop.h)
 
 if(WIN32)
     list(APPEND SOURCES displayxr_win32.c displayxr_gpu_preference.cpp)
@@ -352,4 +355,9 @@ if(DISPLAYXR_BUILD_TESTS)
     target_include_directories(mcp_tools_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/displayxr_xrprovider ${OPENXR_INCLUDE_DIR})
     target_compile_features(mcp_tools_test PRIVATE cxx_std_17)
     add_test(NAME mcp_tools COMMAND mcp_tools_test)
+    # XR_DXR_desktop_control binding against a fake runtime (events, UTF-8, marshalling).
+    add_executable(desktop_test tests/desktop_test.cpp displayxr_xrprovider/displayxr_provider_desktop.cpp)
+    target_include_directories(desktop_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/displayxr_xrprovider ${OPENXR_INCLUDE_DIR})
+    target_compile_features(desktop_test PRIVATE cxx_std_17)
+    add_test(NAME desktop_control COMMAND desktop_test)
 endif()
