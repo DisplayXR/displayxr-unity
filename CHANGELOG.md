@@ -5,7 +5,7 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.26.2] - 2026-10-16
 
 ### Added
 - Native-Wayland player: the app can keep its own window above other windows, bring it to the front with focus, and minimize and restore it, through the DisplayXR GNOME extension (version 15+). These are what an app does to its own window with EWMH on X11, and a Wayland client has no protocol for them.
