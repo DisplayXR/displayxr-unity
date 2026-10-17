@@ -28,6 +28,7 @@ namespace DisplayXR.Editor
         }
 
         private SerializedProperty appName;
+        private SerializedProperty appId;
         private SerializedProperty category;
         private SerializedProperty displayMode;
         private SerializedProperty description;
@@ -41,6 +42,7 @@ namespace DisplayXR.Editor
         private void OnEnable()
         {
             appName = serializedObject.FindProperty("appName");
+            appId = serializedObject.FindProperty("appId");
             category = serializedObject.FindProperty("category");
             displayMode = serializedObject.FindProperty("displayMode");
             description = serializedObject.FindProperty("description");
@@ -76,6 +78,13 @@ namespace DisplayXR.Editor
                 EditorGUILayout.LabelField("Default", Application.productName, EditorStyles.miniLabel);
                 EditorGUI.indentLevel--;
             }
+
+            EditorGUILayout.PropertyField(appId, new GUIContent("App Id",
+                "Stable id written as the manifest \"id\". Required only if the app registers MCP tools " +
+                "(DisplayXRMcp): pass the same string to DisplayXRMcp.SetAppId."));
+            if (!string.IsNullOrEmpty(appId.stringValue) && !DisplayXRBuildProcessor.IsValidAppId(appId.stringValue))
+                EditorGUILayout.HelpBox("App Id must match ^[a-z0-9][a-z0-9-]{0,31}$ (lowercase, digits, '-'). " +
+                                        "It will be left out of the manifest.", MessageType.Warning);
 
             EditorGUILayout.LabelField("Type", "3d (always for Unity apps)", EditorStyles.miniLabel);
 

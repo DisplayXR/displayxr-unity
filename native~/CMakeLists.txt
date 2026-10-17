@@ -106,6 +106,8 @@ set(SOURCES
     # Cross-platform TUs: D3D backends behind _WIN32, Metal behind __APPLE__.
     displayxr_xrprovider/displayxr_provider_session.cpp
     displayxr_xrprovider/displayxr_display_provider.cpp
+    # XR_DXR_mcp_tools binding: app-registered MCP tools for AI agents.
+    displayxr_xrprovider/displayxr_provider_mcp.cpp
     # XR SDK pre-init provider (#247): XRSDKPreInit export, compiled everywhere so
     # the boot.config xrsdk-pre-init-library entry never dangles; VK-only in effect.
     displayxr_xrprovider/displayxr_provider_preinit.cpp
@@ -132,6 +134,7 @@ endif()
 # user32 is required for SetLayeredWindowAttributes / WS_EX_LAYERED
 # (transparent overlay mode, issue #57).
 list(APPEND HEADERS displayxr_xrprovider/displayxr_provider_session.h)
+list(APPEND HEADERS displayxr_xrprovider/displayxr_provider_mcp.h)
 
 if(WIN32)
     list(APPEND SOURCES displayxr_win32.c displayxr_gpu_preference.cpp)
@@ -344,4 +347,9 @@ if(DISPLAYXR_BUILD_TESTS)
     target_include_directories(cursor_depth_math_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/displayxr_xrprovider)
     target_compile_features(cursor_depth_math_test PRIVATE cxx_std_17)
     add_test(NAME cursor_depth_math COMMAND cursor_depth_math_test)
+    # XR_DXR_mcp_tools binding against a fake runtime (queue, restart, UTF-8, gate).
+    add_executable(mcp_tools_test tests/mcp_tools_test.cpp displayxr_xrprovider/displayxr_provider_mcp.cpp)
+    target_include_directories(mcp_tools_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/displayxr_xrprovider ${OPENXR_INCLUDE_DIR})
+    target_compile_features(mcp_tools_test PRIVATE cxx_std_17)
+    add_test(NAME mcp_tools COMMAND mcp_tools_test)
 endif()

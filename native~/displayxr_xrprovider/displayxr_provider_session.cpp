@@ -13,6 +13,7 @@
 #include <openxr/openxr.h>
 #include "../displayxr_extensions.h"
 #include "displayxr_cursor_depth_math.h" // pure cursor math (unit-tested)
+#include "displayxr_provider_mcp.h" // XR_DXR_mcp_tools: app-registered MCP tools
 #include "../displayxr_shared_state.h" // displayxr_state_set_stereo_matrices (overlay hit-test)
 #include "../displayxr_window_space_ui.h" // DXR_WSUI_MAX_SLOTS, get_pending_slot
 #include <atomic>     // s_session_generation (#336)
@@ -415,6 +416,11 @@ typedef struct ProviderSession {
 	// DisplayXRScreenshot). Detected in the probe, enabled on the instance, PFN
 	// soft-resolved. Re-derived each session create — no reset preservation needed.
 	int has_atlas_capture;
+
+	// XR_DXR_mcp_tools: the app's own MCP tools (displayxr_provider_mcp.cpp). Detected in
+	// the probe and enabled whenever advertised; the runtime gates it per call on the
+	// machine's MCP capability, so enabling it costs nothing where MCP is off.
+	int has_mcp_tools;
 
 	// XR_DXR_display_zones + XR_DXR_local_3d_zone (#166 Phase B). Detected in
 	// session_start (probe) and enabled on the instance. Caps queried lazily on the
@@ -4715,6 +4721,8 @@ int dxr_prov_session_start(const char *runtime_json_path,
 							s_ps.has_local_3d_zone = 1;
 						else if (strcmp(props[i].extensionName, XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME) == 0)
 							s_ps.has_atlas_capture = 1;
+						else if (strcmp(props[i].extensionName, XR_DXR_MCP_TOOLS_EXTENSION_NAME) == 0)
+							s_ps.has_mcp_tools = 1;
 						else if (strcmp(props[i].extensionName, XR_DXR_WAYLAND_SURFACE_BINDING_EXTENSION_NAME) == 0)
 							s_ps.has_wayland_binding = 1;
 						else if (strcmp(props[i].extensionName, XR_DXR_DEPTH_BUDGET_EXTENSION_NAME) == 0) {
@@ -4825,6 +4833,9 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	// unconditionally-if-advertised — independent of transparency/zones.
 	if (s_ps.has_atlas_capture)
 		extensions[ext_count++] = XR_DXR_ATLAS_CAPTURE_EXTENSION_NAME;
+	// App-registered MCP tools: enable whenever advertised (see has_mcp_tools).
+	if (s_ps.has_mcp_tools)
+		extensions[ext_count++] = XR_DXR_MCP_TOOLS_EXTENSION_NAME;
 	// Rear depth budget (#318): enabling it is the app's opt-in AND the runtime's
 	// gate - the runtime fetches + analyses the background only for sessions that
 	// asked. Enable whenever advertised; the budget is inert unless a rig actually
@@ -4859,6 +4870,7 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	}
 
 	if (!ps_resolve_functions()) { dxr_prov_session_stop(); return 0; }
+	dxr_mcp_on_instance(s_ps.instance, s_ps.gipa, s_ps.has_mcp_tools, ps_log);
 
 	// --- System ---
 	XrSystemGetInfo sgi = {XR_TYPE_SYSTEM_GET_INFO};
@@ -5342,6 +5354,8 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	if (XR_FAILED(s_ps.pfn_create_session(s_ps.instance, &sci, &s_ps.session))) {
 		ps_log("[DisplayXR-PROV] xrCreateSession failed\n"); dxr_prov_session_stop(); return 0;
 	}
+	// Re-apply the app's MCP id + tools to every new session (they live on the session).
+	dxr_mcp_on_session_created(s_ps.session);
 #ifdef _WIN32
 	ps_log("[DisplayXR-PROV] Session created (%s, overlay HWND=%p)\n",
 	       is_vk ? "runtime-created Vulkan device (enable2 + external-memory bridge)"
@@ -5841,6 +5855,7 @@ void dxr_prov_session_stop(void)
 	// destroyed. No-op on the D3D paths.
 	if (s_ps.graphics_api == DXR_GFX_VULKAN) dxr_pvk_destroy();
 #endif
+	dxr_mcp_on_session_destroying();
 	if (s_ps.session && s_ps.session_ready && s_ps.pfn_end_session) s_ps.pfn_end_session(s_ps.session);
 	if (s_ps.session && s_ps.pfn_destroy_session) s_ps.pfn_destroy_session(s_ps.session);
 	if (s_ps.instance && s_ps.pfn_destroy_instance) s_ps.pfn_destroy_instance(s_ps.instance);
@@ -6382,6 +6397,8 @@ void dxr_prov_poll_events(void)
 	if (!s_ps.running || !s_ps.pfn_poll_event) return;
 	XrEventDataBuffer ev = {XR_TYPE_EVENT_DATA_BUFFER};
 	while (s_ps.pfn_poll_event(s_ps.instance, &ev) == XR_SUCCESS) {
+		// An agent called one of the app's MCP tools: queued for the C# main thread.
+		if (dxr_mcp_handle_event(&ev)) { ev = {XR_TYPE_EVENT_DATA_BUFFER}; continue; }
 		if (ev.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
 			XrEventDataSessionStateChanged *ssc = (XrEventDataSessionStateChanged *)&ev;
 			s_ps.session_state = ssc->state;

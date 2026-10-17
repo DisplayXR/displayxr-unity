@@ -136,6 +136,15 @@ build will tell you. One container run catches them all:
   Depth/Physics need a rig (locate space == Unity world only via the rig pose). Gate on the
   ADVERTISED spec. Full write-up, the Auto/no-jump argument, and the Windows panel recipe:
   `docs~/architecture/cursor-depth.md`.
+- **App-registered MCP tools (`XR_DXR_mcp_tools`)**: `DisplayXRMcp.RegisterTool` exposes an
+  app's own verbs to AI agents through the runtime's per-app MCP server. The provider pumps
+  `xrPollEvent` on the graphics thread (Windows/Linux), so a tool-call event is never handled
+  where app code runs: `displayxr_provider_mcp.cpp` fetches the arguments at poll time and
+  queues the call, and `DisplayXRMcp.Pump()` (from the driver's `LateUpdate`) runs the C#
+  handler on the main thread and submits the result. The id + tools are stored natively and
+  re-applied on every session create. **Strings cross the boundary as UTF-8 `byte[]`, never
+  marshalled .NET strings** (Windows `DllImport` defaults to ANSI). Do not expose privileged
+  capabilities through it — any same-user process can call an app's tools.
 - **Runtime-owned Kooima math (`XR_DXR_view_rig`, #396 W7)**: the plugin no longer computes Kooima. It chains an `XrDisplayRigDXR`/`XrCameraRigDXR` descriptor (the handful of tunables) onto `xrLocateViews` and consumes render-ready `XrView{pose, fov}` in the provider's per-frame pump (Play Mode and built player alike). **This requires a runtime that advertises `XR_DXR_view_rig` (SPEC_VERSION 2)**; against an older runtime the plugin emits a one-shot WARN and passes raw views through (no stereo). The former vendored/`displayxr::math` display3d/camera3d math is gone (do not re-add — see the `no-vendored-math` drift guard).
 
 ### Render Pipeline Support (BiRP / URP / HDRP)

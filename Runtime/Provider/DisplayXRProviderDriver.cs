@@ -118,6 +118,9 @@ namespace DisplayXR
 #if UNITY_STANDALONE_LINUX && !UNITY_EDITOR
             ApplyPendingLinuxResize();
 #endif
+            // Agent calls to the app's own MCP tools (XR_DXR_mcp_tools), queued by the
+            // event pump; their handlers run here, on the main thread.
+            DisplayXRMcp.Pump();
             if (DisplayXRProviderNative.dxr_prov_session_is_running() == 0)
             {
                 // Falling edge: session lost / restarting (editor dock-undock) / stopping.
