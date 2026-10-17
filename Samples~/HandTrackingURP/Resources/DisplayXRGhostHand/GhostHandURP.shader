@@ -8,6 +8,10 @@
 // ForwardBase. All three passes are untagged (SRPDefaultUnlit) so URP draws them
 // in shader order for the material; SRP-batcher compatible (UnityPerMaterial),
 // XR single-pass-instanced safe (stereo macros on every pass).
+//
+// Ships in the separate "Hand Tracking (URP Ghost Hand)" sample, not the main Hand
+// Tracking sample: its URP #includes fail to resolve in a Built-in / HDRP project, and a
+// sample import compiles every shader in it (field report on PR #379).
 Shader "DisplayXR/Samples/GhostHandURP"
 {
 	Properties
@@ -29,6 +33,13 @@ Shader "DisplayXR/Samples/GhostHandURP"
 
 	SubShader
 	{
+		// Belt and braces: this shader lives in its own sample ("Hand Tracking (URP Ghost
+		// Hand)") so Built-in / HDRP projects that import only the main Hand Tracking sample
+		// never see it. If it IS imported into a project without URP, this block makes Unity
+		// skip the SubShader before compiling it — the URP includes below are never opened,
+		// so the Console shows one "no SubShader meets the package requirements" warning
+		// instead of a Core.hlsl include error. Must be the SubShader's first declaration.
+		PackageRequirements { "com.unity.render-pipelines.universal" }
 		Tags { "RenderPipeline" = "UniversalPipeline" "Queue" = "Transparent" "RenderType" = "Transparent" "IgnoreProjector" = "True" }
 		ZWrite On
 		Blend SrcAlpha OneMinusSrcAlpha

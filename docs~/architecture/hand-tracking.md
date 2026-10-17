@@ -33,7 +33,8 @@ modelled on it.
 | `DisplayXRHandSubsystem` / `…Provider` | `Runtime/Hands/` | The `XRHandSubsystem` + `XRHandSubsystemProvider`; registers the descriptor at `SubsystemRegistration`. |
 | `DisplayXRHandTracking` | `Runtime/Hands/` | Creates/starts/stops the subsystem from the loader hooks, runs XR Hands' `SubsystemUpdater`, resolves the pose scale, exposes `Enabled` / `IsRunning` / `IsSupported`. |
 | `DisplayXRHandNative` | `Runtime/Hands/` | The four P/Invokes. |
-| Sample *Hand Tracking (XR Hands)* | `Samples~/HandTracking/` | `DisplayXRGhostHand`: Ultraleap's GenericHand model with the transparent Ghost Hand look (Apache-2.0, attributed), driven through a by-name bone table + the transcribed `HandBinder` rotation offsets; Built-in CG shader + a hand-written URP HLSL port; `DisplayXRHandJointGizmos` (spheres + bones) as the fallback. Status line, README. |
+| Sample *Hand Tracking (XR Hands)* | `Samples~/HandTracking/` | `DisplayXRGhostHand`: Ultraleap's GenericHand model with the transparent Ghost Hand look (Apache-2.0, attributed), driven through a by-name bone table + the transcribed `HandBinder` rotation offsets; Built-in CG shader; `DisplayXRHandJointGizmos` (spheres + bones) as the fallback. Status line, README. |
+| Sample *Hand Tracking (URP Ghost Hand)* | `Samples~/HandTrackingURP/` | The Ghost Hand's hand-written URP HLSL port + its material, as a separate add-on sample: a sample import compiles every shader in it, and the URP `#include`s fail in Built-in / HDRP projects. `PackageRequirements { "com.unity.render-pipelines.universal" }` on its SubShader turns a mistaken non-URP import into one warning. `DisplayXRGhostHand` loads its material by `Resources` name when present. |
 
 ## How it works
 
@@ -159,13 +160,18 @@ tunables, and parenting under the scaled camera applies it to the hands.
    right way on **both** hands (the right hand is the mirrored model), and a fingertip on
    the glass lands on the display plane. Then switch `Visual` to *Joint Spheres* and
    confirm the spheres sit on the ghost hand's joints. Repeat in the URP sample project
-   (the HLSL port) — the look must match Built-in: clear palm, bright rim, hairline
+   with both samples imported (the HLSL port) — the look must match Built-in: clear palm, bright rim, hairline
    outline, no pink.
 5. Dock/undock the Game view (session restart): tracking resumes without a Play restart.
 6. Unplug the tracker mid-session: both hands go untracked (`isTracked` false), no errors;
    replug: tracking resumes (the runtime's role arbitration follows presence, ADR-034
    Amendment 3).
-7. A project **without** `com.unity.xr.hands`: compiles clean, no `Runtime/Hands`
+7. Sample import is shader-error-free on every pipeline: in a Built-in and an HDRP project,
+   importing *Hand Tracking (XR Hands)* leaves no red Console entry (the URP shader is not in
+   it); in a URP project, importing it plus *Hand Tracking (URP Ghost Hand)* is clean and the
+   ghost hand renders with the URP material (without the add-on: one warning naming it, then
+   the spheres).
+8. A project **without** `com.unity.xr.hands`: compiles clean, no `Runtime/Hands`
    assembly, behaviour byte-for-byte as before.
 
 ## Limitations
@@ -184,4 +190,5 @@ tunables, and parenting under the scaled camera applies it to the hands.
   mirror construction and Ultraleap's rotation offsets re-applied to OpenXR joints) is
   reasoned from the conventions — the runtime passes `LEAP_BONE.rotation` through
   unchanged and both sides mirror quaternions as `(−x, −y, z, w)` — and must be eyeballed.
-- The Ghost Hand ships Built-in and URP shaders only; HDRP falls back to the spheres.
+- The Ghost Hand ships Built-in and URP shaders only (URP as the separate *Hand Tracking
+  (URP Ghost Hand)* sample); HDRP, and URP without that sample, fall back to the spheres.

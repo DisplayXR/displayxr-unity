@@ -7,8 +7,8 @@
 | `Resources/DisplayXRGhostHand/GenericHand.fbx` | `Hands/Runtime/Models/GenericHand/GenericHand.fbx` — copied verbatim (import settings kept, material slot remapped to the sample's material) |
 | `Resources/DisplayXRGhostHand/GenericHandTransparencyMap.png` | `Hands/Runtime/Models/GenericHand/GenericHandTransparencyMap.png` — copied verbatim |
 | `Resources/DisplayXRGhostHand/GhostHand.shader` | derived from `GenericHandShader.shader` (renamed `DisplayXR/Samples/GhostHand`, defaults changed, `Fallback Off`) |
-| `Resources/DisplayXRGhostHand/GhostHandURP.shader` | a Universal Render Pipeline port (hand-written HLSL) of `GenericHandShader.shader` |
-| `Resources/DisplayXRGhostHand/Ghost Hand.mat`, `Ghost Hand URP.mat` | values transcribed from `Ghost Hand.mat` / `Outline.mat` (fresnel 22.4× white @ 0.098, power 0.629; lighting off; white hairline outline) |
+| `Resources/DisplayXRGhostHand/Ghost Hand.mat` | values transcribed from `Ghost Hand.mat` / `Outline.mat` (fresnel 22.4× white @ 0.098, power 0.629; lighting off; white hairline outline) |
+| *(the URP shader + material ship in the separate "Hand Tracking (URP Ghost Hand)" sample, `Samples~/HandTrackingURP/`, with its own notice)* | |
 | `DisplayXRGhostHand.cs` (bone table + rotation offsets) | the per-hand `HandBinder` settings transcribed from `Hands/Runtime/Prefabs/GhostHands.prefab` (`GlobalFingerRotationOffset` / `WristRotationOffset`, right hand = the left model mirrored in X) — code is DisplayXR's own |
 
 Source: **Ultraleap Unity Plugin ("Ultraleap Tracking") 5.4.0**, package root `Assets/ThirdParty/Ultraleap/Tracking/`,
