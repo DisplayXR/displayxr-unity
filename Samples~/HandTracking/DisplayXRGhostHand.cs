@@ -27,7 +27,8 @@ namespace DisplayXR.Samples
     /// <summary>
     /// Shows the tracked hands as transparent, fresnel-rimmed ghost hands (default) or as
     /// the joint-sphere debug visual (<see cref="DisplayXRHandJointGizmos"/>, the
-    /// fallback — also used automatically on HDRP, where the sample ships no shader).
+    /// fallback — also used automatically on HDRP, where the sample ships no shader, and on
+    /// URP when the companion "Hand Tracking (URP Ghost Hand)" sample is not imported).
     /// Drop it on any GameObject. The hand models are parented under the active rig
     /// camera (the display plane the joint poses are relative to) and scaled with
     /// <see cref="DisplayXRHandTracking.CurrentPoseScale"/>.
@@ -128,7 +129,18 @@ namespace DisplayXR.Samples
             }
 
             var prefab = Resources.Load<GameObject>(k_ResourcePath + "GenericHand");
-            var material = materialOverride != null ? materialOverride : LoadMaterialForPipeline();
+            bool urp = IsUrp();
+            var material = materialOverride != null ? materialOverride : LoadMaterialForPipeline(urp);
+            if (prefab != null && material == null && urp)
+            {
+                // The URP shader + material ship in their own sample so that Built-in / HDRP
+                // projects importing this one get no URP #include errors. The Built-in
+                // material would render pink under URP, so fall back to the spheres.
+                Debug.LogWarning("[DisplayXR] Ghost Hand: URP project but the URP material was not found — import the " +
+                                 "\"Hand Tracking (URP Ghost Hand)\" sample too (Package Manager > DisplayXR > Samples). Using the joint-sphere visual");
+                UseFallback();
+                return;
+            }
             if (prefab == null || material == null)
             {
                 Debug.LogWarning("[DisplayXR] Ghost Hand: model or material not found under Resources/" + k_ResourcePath +
@@ -151,10 +163,17 @@ namespace DisplayXR.Samples
             enabled = false;
         }
 
-        static Material LoadMaterialForPipeline()
+        static bool IsUrp()
         {
             var rp = GraphicsSettings.currentRenderPipeline;
-            bool urp = rp != null && rp.GetType().FullName.Contains("Universal");
+            return rp != null && rp.GetType().FullName.Contains("Universal");
+        }
+
+        // "Ghost Hand URP" comes from the optional "Hand Tracking (URP Ghost Hand)" sample;
+        // Resources.Load finds it in any Resources folder, so importing that sample next to
+        // this one is all it takes. Null when it is not imported.
+        static Material LoadMaterialForPipeline(bool urp)
+        {
             return Resources.Load<Material>(k_ResourcePath + (urp ? "Ghost Hand URP" : "Ghost Hand"));
         }
 

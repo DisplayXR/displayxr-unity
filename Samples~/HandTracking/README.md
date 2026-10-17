@@ -38,7 +38,7 @@ Two components ship:
 
 | Component | What it shows | Pipelines |
 |---|---|---|
-| `DisplayXRGhostHand` (default) | Ultraleap's **GenericHand** skinned model with the Ghost Hand look: transparent white, HDR fresnel rim (`_FresnelColor` 22.4× white @ α 0.098, `_FresnelPower` 0.629), white hairline outline, unlit, ZWrite on with a depth-prime pass so the hand self-occludes. | Built-in (`GhostHand.shader`, CG) and **URP** (`GhostHandURP.shader`, hand-written HLSL port — not Shader Graph). Picked by `GraphicsSettings.currentRenderPipeline`; HDRP falls back to spheres. |
+| `DisplayXRGhostHand` (default) | Ultraleap's **GenericHand** skinned model with the Ghost Hand look: transparent white, HDR fresnel rim (`_FresnelColor` 22.4× white @ α 0.098, `_FresnelPower` 0.629), white hairline outline, unlit, ZWrite on with a depth-prime pass so the hand self-occludes. | Built-in (`GhostHand.shader`, CG) in this sample; **URP** (`GhostHandURP.shader`, hand-written HLSL port — not Shader Graph) in the companion sample *Hand Tracking (URP Ghost Hand)*. Picked by `GraphicsSettings.currentRenderPipeline`; HDRP, and URP without the companion sample, fall back to spheres. |
 | `DisplayXRHandJointGizmos` | 26 joint spheres + finger bones. Dependency-free debug visual. | any |
 
 **How the model is driven.** XR Hands' `XRHandSkeletonDriver` writes joint rotations
@@ -57,8 +57,19 @@ same way Ultraleap's SDK does. Like Ultraleap's default, only rotations are driv
 model keeps its proportions; `setBonePositions` stretches it to the tracked joints) and
 the four finger metacarpals stay at rest (`driveMetacarpals` opts in).
 
-Materials: `Resources/DisplayXRGhostHand/Ghost Hand.mat` (Built-in) / `Ghost Hand URP.mat`;
-tweak the fresnel / outline / lighting toggles there, or assign `materialOverride`.
+Materials: `Resources/DisplayXRGhostHand/Ghost Hand.mat` (Built-in, this sample) /
+`Ghost Hand URP.mat` (the URP sample); tweak the fresnel / outline / lighting toggles there,
+or assign `materialOverride`.
+
+**URP projects: import both samples.** The URP shader and its material live in a separate
+sample, *Hand Tracking (URP Ghost Hand)*, because importing a sample compiles every shader
+in it, and the URP shader's `#include "Packages/com.unity.render-pipelines.universal/…"`
+cannot resolve in a Built-in or HDRP project — it was a red Console error on import for
+every non-URP user. Import it next to this sample (same `Resources/DisplayXRGhostHand/`
+name, so `Resources.Load` finds it wherever it lands; its material also uses this sample's
+`GenericHandTransparencyMap.png` by GUID). Without it, a URP project logs a warning and uses
+the spheres. Don't import it into a non-URP project; if you do, its `PackageRequirements`
+block skips the SubShader, so you get one warning, not an include error.
 
 ## Where the hands land — the rig camera is the origin
 
@@ -110,7 +121,8 @@ work unchanged against this subsystem (`XRHandTrackingEvents` finds the running
   time as the views). Velocities are not reported.
 - Hand tracking is Windows-first (the runtime's Ultraleap provider is Windows today); the
   subsystem compiles everywhere and simply reports *unsupported* elsewhere.
-- The Ghost Hand ships Built-in and URP shaders; HDRP projects get the sphere visual.
+- The Ghost Hand ships a Built-in shader here and a URP shader in the companion
+  *Hand Tracking (URP Ghost Hand)* sample; HDRP projects get the sphere visual.
 - Not yet verified on hardware: the bone binding (mirror, offsets, thumb mapping) is
   transcribed from Ultraleap's prefab and reasoned from the conventions, so the first
   panel run should eyeball a natural rest pose, correct thumb side, and finger curl
