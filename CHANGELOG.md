@@ -5,7 +5,7 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.27.0] - 2026-10-16
 
 ### Added
 - **App-registered MCP tools for AI agents (`XR_DXR_mcp_tools`).** New `DisplayXRMcp` API: an app registers its own verbs (`RegisterTool(name, description, inputSchemaJson, handler)`, sync or async) and any MCP client — Claude, a voice assistant, a test script — can call them through the runtime's per-app MCP server, without the app linking an MCP library or opening a port. `SetAppId` names the app (= its `.displayxr.json` manifest `id`); tools appear as `<app-id>__<tool>` through `displayxr-mcp --target workspace`.
