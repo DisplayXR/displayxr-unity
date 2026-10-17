@@ -23,7 +23,9 @@ namespace DisplayXR
     /// subsystem; this loader creates/starts/stops it and owns the lifecycle of the
     /// per-frame <see cref="DisplayXRProviderDriver"/>. Display-only (no input
     /// subsystem) — by design (#166): apps render stereo 3D while using normal
-    /// Unity input.
+    /// Unity input. Companion subsystems that need the same lifecycle but live in a
+    /// package-gated assembly (the XR Hands subsystem, <c>Runtime/Hands/</c>) attach
+    /// through <see cref="DisplayXRCompanionSubsystems"/>, raised at each stage below.
     /// </summary>
     public sealed class DisplayXRDisplayLoader : XRLoaderHelper
 #if UNITY_EDITOR
@@ -180,6 +182,9 @@ namespace DisplayXR
                     "UnitySubsystemsManifest.json shipped?");
                 return false;
             }
+            // Companions (XR Hands) are created only once the display subsystem exists —
+            // never on the declined paths above, where there is no provider to ride.
+            DisplayXRCompanionSubsystems.RaiseInitialized();
             return true;
         }
 
@@ -228,12 +233,14 @@ namespace DisplayXR
             }
             DisplayXRProviderDriver.EnsureInstance();
             SubsystemRunning = true;
+            DisplayXRCompanionSubsystems.RaiseStarted();
             return true;
         }
 
         public override bool Stop()
         {
             SubsystemRunning = false;
+            DisplayXRCompanionSubsystems.RaiseStopped();
             DisplayXRProviderDriver.DestroyInstance();
             StopSubsystem<XRDisplaySubsystem>();
             return true;
@@ -241,6 +248,7 @@ namespace DisplayXR
 
         public override bool Deinitialize()
         {
+            DisplayXRCompanionSubsystems.RaiseDeinitialized();
             DestroySubsystem<XRDisplaySubsystem>();
             return base.Deinitialize();
         }
