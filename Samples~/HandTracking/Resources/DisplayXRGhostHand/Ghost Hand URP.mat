@@ -1,0 +1,42 @@
+%YAML 1.1
+%TAG !u! tag:unity3d.com,2011:
+--- !u!21 &2100000
+Material:
+  serializedVersion: 8
+  m_ObjectHideFlags: 0
+  m_CorrespondingSourceObject: {fileID: 0}
+  m_PrefabInstance: {fileID: 0}
+  m_PrefabAsset: {fileID: 0}
+  m_Name: Ghost Hand URP
+  m_Shader: {fileID: 4800000, guid: f212eb0c5bfa4a7db19a45b305fcabe3, type: 3}
+  m_Parent: {fileID: 0}
+  m_ModifiedSerializedProperties: 0
+  m_ValidKeywords: []
+  m_InvalidKeywords: []
+  m_LightmapFlags: 4
+  m_EnableInstancingVariants: 0
+  m_DoubleSidedGI: 0
+  m_CustomRenderQueue: 5000
+  stringTagMap: {}
+  disabledShaderPasses: []
+  m_LockedProperties: 
+  m_SavedProperties:
+    serializedVersion: 3
+    m_TexEnvs:
+    - _MainTex:
+        m_Texture: {fileID: 2800000, guid: e32f6d5a79e44555ac3b7a8c183d3975, type: 3}
+        m_Scale: {x: 1, y: 1}
+        m_Offset: {x: 0, y: 0}
+    m_Ints: []
+    m_Floats:
+    - _FresnelPower: 0.629
+    - _LightIntensity: 0.5
+    - _Outline: 0.002
+    - _useFresnel: 1
+    - _useLighting: 0
+    - _useOutline: 1
+    m_Colors:
+    - _FresnelColor: {r: 22.408676, g: 22.408676, b: 22.408676, a: 0.09803922}
+    - _MainColor: {r: 2.670157, g: 2.670157, b: 2.670157, a: 0.078431375}
+    - _OutlineColor: {r: 1, g: 1, b: 1, a: 0.35}
+  m_BuildTextureStacks: []
