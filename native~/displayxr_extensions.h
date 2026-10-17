@@ -929,6 +929,150 @@ typedef XrResult (XRAPI_PTR *PFN_xrGetMCPToolCallArgsDXR)(XrSession session, uin
 typedef XrResult (XRAPI_PTR *PFN_xrSubmitMCPToolResultDXR)(XrSession session, uint64_t callId, XrBool32 success,
                                                            const char *resultJson);
 
+// ---------------------------------------------------------------------------
+// XR_DXR_desktop_control (ADR-056): the app's agent observes and operates the
+// desktop (windows, pointer, UI text, typing, clicks); the OS consent belongs to
+// the app. Mirrors the runtime's XR_DXR_desktop_control.h (spec v1, provisional
+// numbers); see native~/displayxr_xrprovider/displayxr_provider_desktop.h.
+// ---------------------------------------------------------------------------
+#define XR_DXR_DESKTOP_CONTROL_EXTENSION_NAME "XR_DXR_desktop_control"
+#define XR_DXR_DESKTOP_CONTROL_SPEC_VERSION 1
+
+#define XR_TYPE_DESKTOP_WINDOW_DXR                           ((XrStructureType)1004999400)
+#define XR_TYPE_DESKTOP_PICK_DXR                             ((XrStructureType)1004999401)
+#define XR_TYPE_DESKTOP_ACTION_DXR                           ((XrStructureType)1004999402)
+#define XR_TYPE_EVENT_DATA_DESKTOP_ACTION_COMPLETED_DXR      ((XrStructureType)1004999403)
+#define XR_TYPE_EVENT_DATA_DESKTOP_CONTROL_STATE_CHANGED_DXR ((XrStructureType)1004999404)
+#define XR_TYPE_DESKTOP_CONTROL_REQUEST_INFO_DXR             ((XrStructureType)1004999405)
+
+#define XR_ERROR_DESKTOP_CONTROL_REFUSED_DXR     ((XrResult)-1004999400)
+#define XR_ERROR_DESKTOP_CONTROL_NOT_GRANTED_DXR ((XrResult)-1004999401)
+#define XR_ERROR_DESKTOP_WINDOW_LOST_DXR         ((XrResult)-1004999402)
+
+#define XR_MAX_DESKTOP_APP_ID_SIZE_DXR 128
+#define XR_MAX_DESKTOP_TITLE_SIZE_DXR 256
+#define XR_MAX_DESKTOP_MESSAGE_SIZE_DXR 256
+
+typedef enum XrDesktopControlStateDXR {
+	XR_DESKTOP_CONTROL_STATE_UNSUPPORTED_DXR = 0,
+	XR_DESKTOP_CONTROL_STATE_NOT_REQUESTED_DXR = 1,
+	XR_DESKTOP_CONTROL_STATE_PENDING_DXR = 2,
+	XR_DESKTOP_CONTROL_STATE_GRANTED_DXR = 3,
+	XR_DESKTOP_CONTROL_STATE_DENIED_DXR = 4,
+	XR_DESKTOP_CONTROL_STATE_DISABLED_BY_USER_DXR = 5,
+	XR_DESKTOP_CONTROL_STATE_SUSPENDED_DXR = 6,
+	XR_DESKTOP_CONTROL_STATE_MAX_ENUM_DXR = 0x7FFFFFFF
+} XrDesktopControlStateDXR;
+
+typedef XrFlags64 XrDesktopControlCapabilityFlagsDXR;
+typedef XrFlags64 XrDesktopWindowStateFlagsDXR;
+// Capability / window-state bit values are mirrored on the C# side
+// (DisplayXRDesktop.Capabilities / DesktopWindowState); the provider passes the
+// masks through unchanged, so they are not repeated here.
+
+typedef struct XrDesktopWindowDXR {
+	XrStructureType type; // XR_TYPE_DESKTOP_WINDOW_DXR
+	void *next;
+	uint64_t windowId;
+	uint64_t parentWindowId;
+	uint32_t pid;
+	char appId[XR_MAX_DESKTOP_APP_ID_SIZE_DXR];
+	char title[XR_MAX_DESKTOP_TITLE_SIZE_DXR];
+	XrRect2Di frame; // desktop coordinates
+	XrDesktopWindowStateFlagsDXR state;
+	uint32_t zOrder;
+} XrDesktopWindowDXR;
+
+typedef enum XrDesktopPickKindDXR {
+	XR_DESKTOP_PICK_KIND_WINDOW_DXR = 0,
+	XR_DESKTOP_PICK_KIND_DESKTOP_DXR = 1,
+	XR_DESKTOP_PICK_KIND_SHELL_DXR = 2,
+	XR_DESKTOP_PICK_KIND_OUTSIDE_DXR = 3,
+	XR_DESKTOP_PICK_KIND_MAX_ENUM_DXR = 0x7FFFFFFF
+} XrDesktopPickKindDXR;
+
+typedef struct XrDesktopPickDXR {
+	XrStructureType type; // XR_TYPE_DESKTOP_PICK_DXR
+	void *next;
+	XrOffset2Di point;
+	XrDesktopPickKindDXR kind;
+	XrDesktopWindowDXR window; // valid when kind == WINDOW
+} XrDesktopPickDXR;
+
+typedef enum XrDesktopActionTypeDXR {
+	XR_DESKTOP_ACTION_TYPE_ACTIVATE_DXR = 0,
+	XR_DESKTOP_ACTION_TYPE_MOVE_RESIZE_DXR = 1,
+	XR_DESKTOP_ACTION_TYPE_MINIMIZE_DXR = 2,
+	XR_DESKTOP_ACTION_TYPE_RESTORE_DXR = 3,
+	XR_DESKTOP_ACTION_TYPE_MAXIMIZE_DXR = 4,
+	XR_DESKTOP_ACTION_TYPE_CLOSE_DXR = 5,
+	XR_DESKTOP_ACTION_TYPE_TYPE_TEXT_DXR = 10,
+	XR_DESKTOP_ACTION_TYPE_KEY_CHORD_DXR = 11,
+	XR_DESKTOP_ACTION_TYPE_POINTER_MOVE_DXR = 12,
+	XR_DESKTOP_ACTION_TYPE_CLICK_DXR = 13,
+	XR_DESKTOP_ACTION_TYPE_DRAG_DXR = 14,
+	XR_DESKTOP_ACTION_TYPE_SCROLL_DXR = 15,
+	XR_DESKTOP_ACTION_TYPE_MAX_ENUM_DXR = 0x7FFFFFFF
+} XrDesktopActionTypeDXR;
+
+typedef enum XrDesktopPointerButtonDXR {
+	XR_DESKTOP_POINTER_BUTTON_LEFT_DXR = 0,
+	XR_DESKTOP_POINTER_BUTTON_RIGHT_DXR = 1,
+	XR_DESKTOP_POINTER_BUTTON_MIDDLE_DXR = 2,
+	XR_DESKTOP_POINTER_BUTTON_MAX_ENUM_DXR = 0x7FFFFFFF
+} XrDesktopPointerButtonDXR;
+
+typedef struct XrDesktopActionDXR {
+	XrStructureType type; // XR_TYPE_DESKTOP_ACTION_DXR
+	const void *next;
+	XrDesktopActionTypeDXR actionType;
+	uint64_t targetWindowId;
+	XrRect2Di rect;
+	XrOffset2Di point;
+	XrOffset2Di point2;
+	XrDesktopPointerButtonDXR button;
+	uint32_t clickCount;
+	int32_t scrollX;
+	int32_t scrollY;
+	const char *text;
+	const char *keys;
+} XrDesktopActionDXR;
+
+typedef struct XrDesktopControlRequestInfoDXR {
+	XrStructureType type; // XR_TYPE_DESKTOP_CONTROL_REQUEST_INFO_DXR
+	const void *next;
+	const char *reason;
+} XrDesktopControlRequestInfoDXR;
+
+typedef struct XrEventDataDesktopActionCompletedDXR {
+	XrStructureType type; // XR_TYPE_EVENT_DATA_DESKTOP_ACTION_COMPLETED_DXR
+	const void *next;
+	XrSession session;
+	uint64_t actionId;
+	XrResult result;
+	char message[XR_MAX_DESKTOP_MESSAGE_SIZE_DXR];
+} XrEventDataDesktopActionCompletedDXR;
+
+typedef struct XrEventDataDesktopControlStateChangedDXR {
+	XrStructureType type; // XR_TYPE_EVENT_DATA_DESKTOP_CONTROL_STATE_CHANGED_DXR
+	const void *next;
+	XrSession session;
+	XrDesktopControlStateDXR state;
+} XrEventDataDesktopControlStateChangedDXR;
+
+typedef XrResult (XRAPI_PTR *PFN_xrGetDesktopControlStateDXR)(XrSession session, XrDesktopControlStateDXR *state,
+                                                              XrDesktopControlCapabilityFlagsDXR *capabilities);
+typedef XrResult (XRAPI_PTR *PFN_xrRequestDesktopControlDXR)(XrSession session,
+                                                             const XrDesktopControlRequestInfoDXR *info);
+typedef XrResult (XRAPI_PTR *PFN_xrEnumerateDesktopWindowsDXR)(XrSession session, uint32_t windowCapacityInput,
+                                                               uint32_t *windowCountOutput, XrDesktopWindowDXR *windows);
+typedef XrResult (XRAPI_PTR *PFN_xrGetDesktopPointerDXR)(XrSession session, XrDesktopPickDXR *pick);
+typedef XrResult (XRAPI_PTR *PFN_xrPickDesktopDXR)(XrSession session, XrOffset2Di point, XrDesktopPickDXR *pick);
+typedef XrResult (XRAPI_PTR *PFN_xrGetDesktopTextAtDXR)(XrSession session, XrOffset2Di point, uint32_t capacityInput,
+                                                        uint32_t *countOutput, char *buffer);
+typedef XrResult (XRAPI_PTR *PFN_xrSubmitDesktopActionDXR)(XrSession session, const XrDesktopActionDXR *action,
+                                                           uint64_t *actionId);
+
 #ifdef __cplusplus
 }
 #endif

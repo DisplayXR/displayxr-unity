@@ -71,6 +71,8 @@ namespace DisplayXR
             }
             DisplayXRDepthBudget.Reset();
             DisplayXRCursorDepth.Reset();
+            // No pump will run again: complete every pending desktop action as failed.
+            DisplayXRDesktop.OnProviderStopped();
         }
 
 #if UNITY_STANDALONE_LINUX && !UNITY_EDITOR
@@ -121,6 +123,9 @@ namespace DisplayXR
             // Agent calls to the app's own MCP tools (XR_DXR_mcp_tools), queued by the
             // event pump; their handlers run here, on the main thread.
             DisplayXRMcp.Pump();
+            // Desktop-control action results + consent changes (XR_DXR_desktop_control),
+            // queued by the event pump; tasks complete / StateChanged fires here.
+            DisplayXRDesktop.Pump();
             if (DisplayXRProviderNative.dxr_prov_session_is_running() == 0)
             {
                 // Falling edge: session lost / restarting (editor dock-undock) / stopping.

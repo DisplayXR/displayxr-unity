@@ -14,6 +14,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - All strings cross the native boundary as UTF-8 bytes, so non-ASCII descriptions, arguments and results (e.g. Chinese) survive on Windows, where default `DllImport` marshalling uses the ANSI code page.
   - Inert — `DisplayXRMcp.IsAvailable` false, registration stored but not applied — on a runtime without the extension or a machine with the MCP capability off (Windows: the DisplayXR MCP Tools installer; Linux: `~/.config/displayxr/capabilities/mcp/Enabled` = `1`; any OS: `DISPLAYXR_MCP=1`).
   - Native: `displayxr_provider_mcp.{h,cpp}` (`dxr_prov_mcp_*` exports) + `native~/tests/mcp_tools_test.cpp`, run in CI against a fake runtime.
+- **Desktop control for the app's AI agent (`XR_DXR_desktop_control`, runtime ADR-056).** New `DisplayXRDesktop` API: list windows (`ListWindows`), find what is under the pointer or a point (`TryGetPointer`, `TryPick`), read UI text (`GetTextAt`), and operate windows and input — `Activate`, `MoveResize`, `Minimize`, `Restore`, `Maximize`, `Close`, `TypeText`, `PressKeys`, `MovePointer`, `Click`, `Drag`, `Scroll` — each returning a `Task<DesktopActionResult>` (Success / Refused / NotGranted / WindowLost / Unsupported / Failed + message + raw `XrResult`).
+  - The consent belongs to the app: `Request(reason)` triggers the OS's own prompt for this app (macOS Accessibility, the GNOME RemoteDesktop portal, a DisplayXR dialog on Windows); `State` / `StateChanged` follow it. The runtime's safety layer waits for the user to be idle and verifies the target window before every keystroke or click — `Activate` a window before typing into it.
+  - Coordinates are desktop coordinates (Windows physical virtual-desktop px, macOS global points, GNOME logical px), not Unity screen coordinates.
+  - Completions are delivered on the main thread from the provider driver's `LateUpdate`; a session end completes every pending action as Failed ("session ended"). Inert (`State` = Unsupported) on a runtime without the extension or an older native plug-in.
+  - Never expose these operations through `DisplayXRMcp` tools: any local process can call an app's MCP tools.
+  - Native: `displayxr_provider_desktop.{h,cpp}` (`dxr_prov_desktop_*` exports, blittable structs, UTF-8 strings) + `native~/tests/desktop_test.cpp`, run in CI against a fake runtime.
 
 ## [2.26.2] - 2026-10-16
 

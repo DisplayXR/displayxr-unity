@@ -14,6 +14,7 @@
 #include "../displayxr_extensions.h"
 #include "displayxr_cursor_depth_math.h" // pure cursor math (unit-tested)
 #include "displayxr_provider_mcp.h" // XR_DXR_mcp_tools: app-registered MCP tools
+#include "displayxr_provider_desktop.h" // XR_DXR_desktop_control: the app's agent operates the desktop
 #include "../displayxr_shared_state.h" // displayxr_state_set_stereo_matrices (overlay hit-test)
 #include "../displayxr_window_space_ui.h" // DXR_WSUI_MAX_SLOTS, get_pending_slot
 #include <atomic>     // s_session_generation (#336)
@@ -421,6 +422,12 @@ typedef struct ProviderSession {
 	// the probe and enabled whenever advertised; the runtime gates it per call on the
 	// machine's MCP capability, so enabling it costs nothing where MCP is off.
 	int has_mcp_tools;
+
+	// XR_DXR_desktop_control (ADR-056): the app's agent operates the desktop
+	// (displayxr_provider_desktop.cpp). Enabled whenever advertised: enabling grants
+	// nothing - every operation needs the user's consent for this app, requested
+	// explicitly by the app (DisplayXRDesktop.Request).
+	int has_desktop_control;
 
 	// XR_DXR_display_zones + XR_DXR_local_3d_zone (#166 Phase B). Detected in
 	// session_start (probe) and enabled on the instance. Caps queried lazily on the
@@ -4723,6 +4730,8 @@ int dxr_prov_session_start(const char *runtime_json_path,
 							s_ps.has_atlas_capture = 1;
 						else if (strcmp(props[i].extensionName, XR_DXR_MCP_TOOLS_EXTENSION_NAME) == 0)
 							s_ps.has_mcp_tools = 1;
+						else if (strcmp(props[i].extensionName, XR_DXR_DESKTOP_CONTROL_EXTENSION_NAME) == 0)
+							s_ps.has_desktop_control = 1;
 						else if (strcmp(props[i].extensionName, XR_DXR_WAYLAND_SURFACE_BINDING_EXTENSION_NAME) == 0)
 							s_ps.has_wayland_binding = 1;
 						else if (strcmp(props[i].extensionName, XR_DXR_DEPTH_BUDGET_EXTENSION_NAME) == 0) {
@@ -4792,7 +4801,7 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	}
 
 	// --- Create instance ---
-	const char *extensions[14];
+	const char *extensions[16]; // worst case today: 12 (Linux + Wayland + every optional ext)
 	uint32_t ext_count = 0;
 	extensions[ext_count++] = XR_DXR_DISPLAY_INFO_EXTENSION_NAME;
 #ifdef _WIN32
@@ -4836,6 +4845,9 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	// App-registered MCP tools: enable whenever advertised (see has_mcp_tools).
 	if (s_ps.has_mcp_tools)
 		extensions[ext_count++] = XR_DXR_MCP_TOOLS_EXTENSION_NAME;
+	// Desktop control: enable whenever advertised (see has_desktop_control).
+	if (s_ps.has_desktop_control)
+		extensions[ext_count++] = XR_DXR_DESKTOP_CONTROL_EXTENSION_NAME;
 	// Rear depth budget (#318): enabling it is the app's opt-in AND the runtime's
 	// gate - the runtime fetches + analyses the background only for sessions that
 	// asked. Enable whenever advertised; the budget is inert unless a rig actually
@@ -4871,6 +4883,7 @@ int dxr_prov_session_start(const char *runtime_json_path,
 
 	if (!ps_resolve_functions()) { dxr_prov_session_stop(); return 0; }
 	dxr_mcp_on_instance(s_ps.instance, s_ps.gipa, s_ps.has_mcp_tools, ps_log);
+	dxr_desktop_on_instance(s_ps.instance, s_ps.gipa, s_ps.has_desktop_control, ps_log);
 
 	// --- System ---
 	XrSystemGetInfo sgi = {XR_TYPE_SYSTEM_GET_INFO};
@@ -5356,6 +5369,7 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	}
 	// Re-apply the app's MCP id + tools to every new session (they live on the session).
 	dxr_mcp_on_session_created(s_ps.session);
+	dxr_desktop_on_session_created(s_ps.session);
 #ifdef _WIN32
 	ps_log("[DisplayXR-PROV] Session created (%s, overlay HWND=%p)\n",
 	       is_vk ? "runtime-created Vulkan device (enable2 + external-memory bridge)"
@@ -5856,6 +5870,7 @@ void dxr_prov_session_stop(void)
 	if (s_ps.graphics_api == DXR_GFX_VULKAN) dxr_pvk_destroy();
 #endif
 	dxr_mcp_on_session_destroying();
+	dxr_desktop_on_session_destroying();
 	if (s_ps.session && s_ps.session_ready && s_ps.pfn_end_session) s_ps.pfn_end_session(s_ps.session);
 	if (s_ps.session && s_ps.pfn_destroy_session) s_ps.pfn_destroy_session(s_ps.session);
 	if (s_ps.instance && s_ps.pfn_destroy_instance) s_ps.pfn_destroy_instance(s_ps.instance);
@@ -6399,6 +6414,8 @@ void dxr_prov_poll_events(void)
 	while (s_ps.pfn_poll_event(s_ps.instance, &ev) == XR_SUCCESS) {
 		// An agent called one of the app's MCP tools: queued for the C# main thread.
 		if (dxr_mcp_handle_event(&ev)) { ev = {XR_TYPE_EVENT_DATA_BUFFER}; continue; }
+		// Desktop-control action results + consent changes: queued for the C# main thread.
+		if (dxr_desktop_handle_event(&ev)) { ev = {XR_TYPE_EVENT_DATA_BUFFER}; continue; }
 		if (ev.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
 			XrEventDataSessionStateChanged *ssc = (XrEventDataSessionStateChanged *)&ev;
 			s_ps.session_state = ssc->state;
