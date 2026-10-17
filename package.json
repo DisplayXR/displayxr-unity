@@ -74,7 +74,7 @@
     },
     {
       "displayName": "Hand Tracking (XR Hands)",
-      "description": "Draws each tracked hand's 26 joints as spheres plus finger bones, placed relative to the active rig camera, with an on-screen status line (runtime hand support, per-hand tracking, pose scale). Needs com.unity.xr.hands >= 1.3.0 in the project — the plugin's XR Hands subsystem (XR_EXT_hand_tracking via the DisplayXR runtime, e.g. an Ultraleap device) and this sample compile out without it. README covers the rig-camera origin rule and XRHandSkeletonDriver / XRHandMeshController wiring.",
+      "description": "Renders each tracked hand as a transparent Ghost Hand (Ultraleap's GenericHand model with its HDR fresnel rim; Apache-2.0, attributed) driven from XR Hands joints, with a joint-sphere debug visual as the fallback toggle, placed relative to the active rig camera, plus an on-screen status line (runtime hand support, per-hand tracking, pose scale). Built-in and URP shaders ship; HDRP gets the spheres. Needs com.unity.xr.hands >= 1.3.0 in the project — the plugin's XR Hands subsystem (XR_EXT_hand_tracking via the DisplayXR runtime, e.g. an Ultraleap device) and this sample compile out without it. README covers the rig-camera origin rule and XRHandSkeletonDriver / XRHandMeshController wiring.",
       "path": "Samples~/HandTracking"
     }
   ]

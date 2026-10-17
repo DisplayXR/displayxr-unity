@@ -33,7 +33,7 @@ modelled on it.
 | `DisplayXRHandSubsystem` / `…Provider` | `Runtime/Hands/` | The `XRHandSubsystem` + `XRHandSubsystemProvider`; registers the descriptor at `SubsystemRegistration`. |
 | `DisplayXRHandTracking` | `Runtime/Hands/` | Creates/starts/stops the subsystem from the loader hooks, runs XR Hands' `SubsystemUpdater`, resolves the pose scale, exposes `Enabled` / `IsRunning` / `IsSupported`. |
 | `DisplayXRHandNative` | `Runtime/Hands/` | The four P/Invokes. |
-| Sample *Hand Tracking (XR Hands)* | `Samples~/HandTracking/` | Joint spheres + bones through the rig camera, status line, README with the skinned-mesh wiring. |
+| Sample *Hand Tracking (XR Hands)* | `Samples~/HandTracking/` | `DisplayXRGhostHand`: Ultraleap's GenericHand model with the transparent Ghost Hand look (Apache-2.0, attributed), driven through a by-name bone table + the transcribed `HandBinder` rotation offsets; Built-in CG shader + a hand-written URP HLSL port; `DisplayXRHandJointGizmos` (spheres + bones) as the fallback. Status line, README. |
 
 ## How it works
 
@@ -144,16 +144,23 @@ tunables, and parenting under the scaled camera applies it to the hands.
 1. `displayxr-cli selftest` passes and lists the Ultraleap input provider with hand
    tracking; a native OpenXR hand app (or `sim_input` with `DXR_SIM_INPUT`) shows joints.
 2. Install `com.unity.xr.hands` in the test project, import the *Hand Tracking (XR
-   Hands)* sample, add `DisplayXRHandJointGizmos` to the Basic Scene, press Play.
+   Hands)* sample, add `DisplayXRGhostHand` to the Basic Scene, press Play.
 3. Native log (`%TEMP%\displayxr_prov_native.log` / Player.log), in order:
    `XR_EXT_hand_tracking: advertised …` → `XR_EXT_hand_tracking: AVAILABLE (enabled, entry
    points resolved)` → `hand tracking: AVAILABLE (extension enabled, system
    supportsHandTracking=1, app requested=1)` → `left tracker created` / `right tracker
    created` → `left hand first seen (wrist LOCAL x,y,z m; flags=0xf)`.
 4. Console: `[DisplayXR] Hands: XR Hands subsystem created …`; the sample's status line
-   reads `left TRACKED / right TRACKED` with your hands above the sensor; spheres sit in
-   front of the panel where the hands are, mirrored correctly (left is left), fingers
-   curl the right way, and a fingertip on the glass lands on the display plane.
+   reads `left TRACKED / right TRACKED` with your hands above the sensor; the ghost hands
+   sit in front of the panel where the hands are, mirrored correctly (left is left, thumb
+   on the right side of the left hand seen from the back), a flat open hand reads as a
+   natural rest pose (no twisted wrist, no folded metacarpals — that is the transcribed
+   `HandBinder` offset being right for this runtime's joint frame), fingers curl the
+   right way on **both** hands (the right hand is the mirrored model), and a fingertip on
+   the glass lands on the display plane. Then switch `Visual` to *Joint Spheres* and
+   confirm the spheres sit on the ghost hand's joints. Repeat in the URP sample project
+   (the HLSL port) — the look must match Built-in: clear palm, bright rim, hairline
+   outline, no pink.
 5. Dock/undock the Game view (session restart): tracking resumes without a Play restart.
 6. Unplug the tracker mid-session: both hands go untracked (`isTracked` false), no errors;
    replug: tracking resumes (the runtime's role arbitration follows presence, ADR-034
@@ -173,4 +180,8 @@ tunables, and parenting under the scaled camera applies it to the hands.
 - Windows-first in practice (the Ultraleap provider is Windows today). The binding compiles
   on every platform and reports *unsupported* where the runtime serves no hands.
 - Not hardware-verified at the time of writing: the native and in-editor runs above are the
-  acceptance test on the Windows box.
+  acceptance test on the Windows box. The Ghost Hand's bone binding in particular (the
+  mirror construction and Ultraleap's rotation offsets re-applied to OpenXR joints) is
+  reasoned from the conventions — the runtime passes `LEAP_BONE.rotation` through
+  unchanged and both sides mirror quaternions as `(−x, −y, z, w)` — and must be eyeballed.
+- The Ghost Hand ships Built-in and URP shaders only; HDRP falls back to the spheres.

@@ -3,8 +3,10 @@
 Shows the DisplayXR plugin's **XR Hands subsystem**: the DisplayXR runtime's 26-joint
 `XR_EXT_hand_tracking` (served by an input-provider plug-in with hand roles — an
 Ultraleap / Leap Motion device today) surfaced through Unity's standard
-`com.unity.xr.hands` API. The sample draws each tracked hand as joint spheres plus
-finger bones, placed in front of the panel where your real hands are.
+`com.unity.xr.hands` API. The sample renders each tracked hand as a transparent
+**Ghost Hand** — Ultraleap's GenericHand model with its HDR fresnel rim and hairline
+outline (Apache-2.0, see `THIRD-PARTY-NOTICES.md`) — placed in front of the panel where
+your real hands are, with a joint-sphere debug visual as the fallback.
 
 ## Requirements
 
@@ -22,12 +24,41 @@ finger bones, placed in front of the panel where your real hands are.
 
 1. Package Manager → DisplayXR → Samples → **Hand Tracking (XR Hands)** → Import.
 2. Open any DisplayXR scene (e.g. the *Basic Scene* sample) and add
-   `DisplayXRHandJointGizmos` to an empty GameObject.
+   `DisplayXRGhostHand` to an empty GameObject (`Visual` = *Ghost Hand*; switch to
+   *Joint Spheres* for the debug visual, which is also what HDRP projects get).
 3. Press Play with the tracker connected. Hold your hands above the sensor: the status
    line reports `left TRACKED / right TRACKED` and the joints appear in front of the
    display. The native log (`%TEMP%\displayxr_prov_native.log` / Player.log) shows
    `XR_EXT_hand_tracking: AVAILABLE`, `hand tracking: AVAILABLE (... supportsHandTracking=1 ...)`,
    `left tracker created`, then `left hand first seen (wrist LOCAL x,y,z m)`.
+
+## The Ghost Hand
+
+Two components ship:
+
+| Component | What it shows | Pipelines |
+|---|---|---|
+| `DisplayXRGhostHand` (default) | Ultraleap's **GenericHand** skinned model with the Ghost Hand look: transparent white, HDR fresnel rim (`_FresnelColor` 22.4× white @ α 0.098, `_FresnelPower` 0.629), white hairline outline, unlit, ZWrite on with a depth-prime pass so the hand self-occludes. | Built-in (`GhostHand.shader`, CG) and **URP** (`GhostHandURP.shader`, hand-written HLSL port — not Shader Graph). Picked by `GraphicsSettings.currentRenderPipeline`; HDRP falls back to spheres. |
+| `DisplayXRHandJointGizmos` | 26 joint spheres + finger bones. Dependency-free debug visual. | any |
+
+**How the model is driven.** XR Hands' `XRHandSkeletonDriver` writes joint rotations
+straight into bone transforms, so it needs a rig whose bones already use the XR Hands
+joint frame (+Z along the bone, +Y out of the back of the hand). GenericHand is a Maya
+skeleton with bones along −X, which Ultraleap drives through their `HandBinder` with a
+constant world-space rotation offset per hand — a component we do not ship. So
+`DisplayXRGhostHand` reproduces that binding itself: a 19-row table binds
+`XRHandJointID`s to bone **names** once (`L_Wrist`, `L_thumb_meta/a/b`,
+`L_<finger>_meta/a/b/c`; tips and the palm are skinned leaves), the rotation offsets are
+transcribed from the plugin's `GhostHands.prefab`, and the right hand is the same
+left-hand model mirrored in X under the rig — exactly Ultraleap's construction. The
+offsets apply unchanged because the DisplayXR runtime passes Leap's bone rotations
+through to `XR_EXT_hand_tracking` and the plugin mirrors them into Unity's frame the
+same way Ultraleap's SDK does. Like Ultraleap's default, only rotations are driven (the
+model keeps its proportions; `setBonePositions` stretches it to the tracked joints) and
+the four finger metacarpals stay at rest (`driveMetacarpals` opts in).
+
+Materials: `Resources/DisplayXRGhostHand/Ghost Hand.mat` (Built-in) / `Ghost Hand URP.mat`;
+tweak the fresnel / outline / lighting toggles there, or assign `materialOverride`.
 
 ## Where the hands land — the rig camera is the origin
 
@@ -38,7 +69,9 @@ provider sends the runtime). So joint poses from `XRHandSubsystem` are **relativ
 transform**, already scaled to the rig's world units (virtual display height vs. the
 physical panel; see `DisplayXRHandTracking.ResolvePoseScale`).
 
-This sample therefore transforms every pose through `DisplayXRRigManager.ActiveCamera`:
+Both visuals therefore go through `DisplayXRRigManager.ActiveCamera` — the Ghost Hand
+roots are parented under it (so the rig's scale reaches the bone lengths and the right
+hand's mirror plane turns with the rig), the spheres transform through it:
 
 ```csharp
 Transform rig = DisplayXRRigManager.ActiveCamera.transform;
@@ -77,3 +110,8 @@ work unchanged against this subsystem (`XRHandTrackingEvents` finds the running
   time as the views). Velocities are not reported.
 - Hand tracking is Windows-first (the runtime's Ultraleap provider is Windows today); the
   subsystem compiles everywhere and simply reports *unsupported* elsewhere.
+- The Ghost Hand ships Built-in and URP shaders; HDRP projects get the sphere visual.
+- Not yet verified on hardware: the bone binding (mirror, offsets, thumb mapping) is
+  transcribed from Ultraleap's prefab and reasoned from the conventions, so the first
+  panel run should eyeball a natural rest pose, correct thumb side, and finger curl
+  direction on both hands (see the doc page's validation list).
