@@ -145,16 +145,20 @@ namespace DisplayXR.Samples
             }
         }
 
+        /// <summary>One-line status shared by both sample visuals.</summary>
+        public static string StatusText(XRHandSubsystem subsystem)
+        {
+            if (subsystem == null) return "XR Hands subsystem: not running (is com.unity.xr.hands installed and DisplayXR Display enabled?)";
+            if (!DisplayXRHandTracking.IsSupported) return "XR Hands subsystem running — runtime reports NO hand source (XR_EXT_hand_tracking unsupported or no input provider with hands)";
+            return "Hands: left " + (subsystem.leftHand.isTracked ? "TRACKED" : "-") +
+                   "  right " + (subsystem.rightHand.isTracked ? "TRACKED" : "-") +
+                   "  (pose scale " + DisplayXRHandTracking.CurrentPoseScale.ToString("0.###") + ")";
+        }
+
         void OnGUI()
         {
             if (!showStatus) return;
-            string status;
-            if (m_Subsystem == null) status = "XR Hands subsystem: not running (is com.unity.xr.hands installed and DisplayXR Display enabled?)";
-            else if (!DisplayXRHandTracking.IsSupported) status = "XR Hands subsystem running — runtime reports NO hand source (XR_EXT_hand_tracking unsupported or no input provider with hands)";
-            else status = "Hands: left " + (m_Subsystem.leftHand.isTracked ? "TRACKED" : "-") +
-                          "  right " + (m_Subsystem.rightHand.isTracked ? "TRACKED" : "-") +
-                          "  (pose scale " + DisplayXRHandTracking.CurrentPoseScale.ToString("0.###") + ")";
-            GUI.Label(new Rect(10, 10, Screen.width - 20, 24), status);
+            GUI.Label(new Rect(10, 10, Screen.width - 20, 24), StatusText(m_Subsystem));
         }
     }
 }
