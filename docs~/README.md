@@ -13,6 +13,7 @@
 - [2D Scenes and Menus](architecture/two-dimensional-scenes.md) — why a rig-less camera still renders stereo, the three levers that actually switch to 2D, the asymmetric 3D↔2D transition, and `DisplayXRSceneMode`
 - [Window-Space 2D UI](architecture/window-space-ui.md) — `DisplayXRWindowSpaceUI` rendering model and the input-routing contract (the composition layer carries pixels, not input)
 - [Depth-Aware Cursor](architecture/cursor-depth.md) — `XR_DXR_cursor_depth` (runtime ADR-046): the runtime draws a stereo cursor in front of popped-out content; opt-in API, depth sources, wiring, and the Windows panel verification recipe
+- [Hand Tracking](architecture/hand-tracking.md) — the XR Hands subsystem: `XR_EXT_hand_tracking` from the runtime's input provider (Ultraleap) through `com.unity.xr.hands`; package gating, the rig-camera origin + scale rule, threading, limits, validation
 - [Click-Through Silhouette Mask](architecture/click-through-mask.md) — transparent-overlay per-pixel click-through: the mask→`SetWindowRgn` pipeline, the mask/weave rect-alignment invariant, and the debugging pitfalls (the #166 clip)
 
 ### Architecture Decision Records — Why things are the way they are
