@@ -1,0 +1,26 @@
+{
+    "name": "DisplayXR.Samples.HandTracking",
+    "rootNamespace": "DisplayXR.Samples",
+    "references": [
+        "com.displayxr.unity",
+        "com.displayxr.unity.hands",
+        "Unity.XR.Hands"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [
+        "DISPLAYXR_XR_HANDS"
+    ],
+    "versionDefines": [
+        {
+            "name": "com.unity.xr.hands",
+            "expression": "1.3.0",
+            "define": "DISPLAYXR_XR_HANDS"
+        }
+    ],
+    "noEngineReferences": false
+}

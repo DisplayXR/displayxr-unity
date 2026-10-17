@@ -1,0 +1,26 @@
+{
+    "name": "com.displayxr.unity.hands",
+    "rootNamespace": "DisplayXR.Hands",
+    "references": [
+        "com.displayxr.unity",
+        "Unity.XR.Hands",
+        "Unity.XR.Management"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [
+        "DISPLAYXR_XR_HANDS"
+    ],
+    "versionDefines": [
+        {
+            "name": "com.unity.xr.hands",
+            "expression": "1.3.0",
+            "define": "DISPLAYXR_XR_HANDS"
+        }
+    ],
+    "noEngineReferences": false
+}

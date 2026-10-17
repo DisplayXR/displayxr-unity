@@ -82,6 +82,7 @@ build will tell you. One container run catches them all:
 ### Key Features
 
 - **Two stereo rig modes**: Camera-centric (`DisplayXRCamera` — inherits camera FOV, inv. convergence distance tunable) and display-centric (`DisplayXRDisplay` — physical display geometry, virtual display height, scale-as-zoom)
+- **Hand tracking (XR Hands subsystem, `Runtime/Hands/`)**: the runtime's `XR_EXT_hand_tracking` (26 joints from an input-provider plug-in — Ultraleap) surfaced as a `com.unity.xr.hands` `XRHandSubsystem`. Package-gated assembly (`DISPLAYXR_XR_HANDS` version define on `com.unity.xr.hands >= 1.3.0`, same pattern as `Runtime/URP/`) that rides the display loader via `DisplayXRCompanionSubsystems`; native binding in `native~/displayxr_xrprovider/displayxr_provider_hands.cpp` (own TU, same shape as the MCP/desktop bindings). Joint poses are rig-camera-relative and scaled to rig units — see `docs~/architecture/hand-tracking.md`.
 - **Multi-camera support**: Multiple rigs coexist in one scene; `DisplayXRRigManager` coordinates which rig is active (see below)
 - **Play Mode == built app**: the `IUnityXRDisplay` provider runs identically in-editor and in a built player. Pressing Play *is* the preview — there is no separate preview window.
 - **2D UI overlay**: Canvas → `XrCompositionLayerWindowSpaceDXR` with stereo disparity

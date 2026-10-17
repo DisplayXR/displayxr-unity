@@ -15,6 +15,7 @@
 #include "displayxr_cursor_depth_math.h" // pure cursor math (unit-tested)
 #include "displayxr_provider_mcp.h" // XR_DXR_mcp_tools: app-registered MCP tools
 #include "displayxr_provider_desktop.h" // XR_DXR_desktop_control: the app's agent operates the desktop
+#include "displayxr_provider_hands.h" // XR_EXT_hand_tracking: 26-joint hands for the XR Hands subsystem
 #include "../displayxr_shared_state.h" // displayxr_state_set_stereo_matrices (overlay hit-test)
 #include "../displayxr_window_space_ui.h" // DXR_WSUI_MAX_SLOTS, get_pending_slot
 #include <atomic>     // s_session_generation (#336)
@@ -366,6 +367,16 @@ typedef struct ProviderSession {
 	// units - exactly what ps_compute_eye_clip adds to the eye's display-plane
 	// distance. budget_state/_vh/_cue are diagnostics republished to C#.
 	int has_depth_budget;
+
+	// XR_EXT_hand_tracking (XR Hands subsystem, Runtime/Hands/). has_hand_tracking:
+	// the runtime advertised the extension (probe) and it was enabled on the
+	// instance. system_hand_tracking: XrSystemHandTrackingPropertiesEXT
+	// .supportsHandTracking — whether an input provider with hand roles is actually
+	// present (the runtime advertises the extension whenever it is built with it).
+	// The trackers themselves live in displayxr_provider_hands.cpp.
+	int has_hand_tracking;
+	int system_hand_tracking;
+
 	int budget_live;
 	int budget_state;
 	int budget_state_logged;   // last state a log line was emitted for; -1 = none yet
@@ -4742,6 +4753,8 @@ int dxr_prov_session_start(const char *runtime_json_path,
 						}
 						else if (strcmp(props[i].extensionName, XR_DXR_CURSOR_DEPTH_EXTENSION_NAME) == 0)
 							s_ps.cursor_depth_version = props[i].extensionVersion;
+						else if (strcmp(props[i].extensionName, XR_EXT_HAND_TRACKING_EXTENSION_NAME) == 0)
+							s_ps.has_hand_tracking = 1;
 					}
 				}
 				free(props);
@@ -4764,6 +4777,9 @@ int dxr_prov_session_start(const char *runtime_json_path,
 		       s_ps.cursor_depth_version,
 		       s_ps.cursor_depth_version >= 5 ? "yes" : "no",
 		       s_ps.cursor_depth_version >= 7 ? "yes" : "no");
+		ps_log("[DisplayXR-PROV] XR_EXT_hand_tracking: %s\n",
+		       s_ps.has_hand_tracking ? "advertised (system support checked at xrGetSystemProperties)"
+		                              : "no (XR Hands subsystem stays inactive)");
 		// -1 = "no state logged yet". 0 is a real state (UNRESTRICTED_OPAQUE), so the
 		// memset-to-zero s_ps cannot double as "unknown".
 		s_ps.budget_state_logged = -1;
@@ -4801,7 +4817,7 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	}
 
 	// --- Create instance ---
-	const char *extensions[16]; // worst case today: 12 (Linux + Wayland + every optional ext)
+	const char *extensions[16]; // worst case today: 13 (Linux + Wayland + every optional ext)
 	uint32_t ext_count = 0;
 	extensions[ext_count++] = XR_DXR_DISPLAY_INFO_EXTENSION_NAME;
 #ifdef _WIN32
@@ -4855,6 +4871,12 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	// has_depth_budget at 0, so nothing about today's behaviour changes.
 	if (s_ps.has_depth_budget)
 		extensions[ext_count++] = XR_DXR_DEPTH_BUDGET_EXTENSION_NAME;
+	// Hand tracking (XR Hands subsystem). Enable whenever advertised: creating the
+	// trackers is the app's opt-in (DisplayXR_HandTracking_Start), and an enabled-
+	// but-unused extension costs the runtime nothing. Whether hands are actually
+	// served is a SYSTEM property (supportsHandTracking), read below.
+	if (s_ps.has_hand_tracking)
+		extensions[ext_count++] = XR_EXT_HAND_TRACKING_EXTENSION_NAME;
 	// Depth-aware cursor (ADR-046). Enabling it costs nothing (section 0): the runtime
 	// does cursor work only on a locate that chains a hint, and the provider chains one
 	// only while the app opted in (DisplayXRCursorDepth.Enabled). Below v5 the runtime
@@ -4884,6 +4906,7 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	if (!ps_resolve_functions()) { dxr_prov_session_stop(); return 0; }
 	dxr_mcp_on_instance(s_ps.instance, s_ps.gipa, s_ps.has_mcp_tools, ps_log);
 	dxr_desktop_on_instance(s_ps.instance, s_ps.gipa, s_ps.has_desktop_control, ps_log);
+	dxr_hands_on_instance(s_ps.instance, s_ps.gipa, s_ps.has_hand_tracking, ps_log);
 
 	// --- System ---
 	XrSystemGetInfo sgi = {XR_TYPE_SYSTEM_GET_INFO};
@@ -4989,7 +5012,18 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	di.next  = &ddp;
 	XrSystemProperties sp = {XR_TYPE_SYSTEM_PROPERTIES};
 	sp.next = &di;
+	// XR_EXT_hand_tracking: does the SYSTEM track hands right now? The runtime
+	// advertises the extension whenever it is built with it; supportsHandTracking is
+	// what says an input provider with hand roles is present. Chained at the head
+	// (sp -> htp -> di -> ddp -> ddi), and only when the extension was enabled —
+	// the struct belongs to it.
+	XrSystemHandTrackingPropertiesEXT htp = {XR_TYPE_SYSTEM_HAND_TRACKING_PROPERTIES_EXT};
+	if (s_ps.has_hand_tracking) {
+		htp.next = sp.next;
+		sp.next = &htp;
+	}
 	if (XR_SUCCEEDED(s_ps.pfn_get_system_properties(s_ps.instance, s_ps.system_id, &sp))) {
+		s_ps.system_hand_tracking = (s_ps.has_hand_tracking && htp.supportsHandTracking == XR_TRUE) ? 1 : 0;
 		s_ps.display_info.width_m = di.displaySizeMeters.width;
 		s_ps.display_info.height_m = di.displaySizeMeters.height;
 		s_ps.display_info.pixel_width = di.displayPixelWidth;
@@ -5395,6 +5429,9 @@ int dxr_prov_session_start(const char *runtime_json_path,
 		ps_log("[DisplayXR-PROV] xrCreateReferenceSpace failed\n");
 		s_ps.local_space = XR_NULL_HANDLE;
 	}
+	// Hand trackers hang off the session AND locate in this space (the views' space),
+	// so they are bound only now, after both exist.
+	dxr_hands_on_session_created(s_ps.session, s_ps.local_space, s_ps.system_hand_tracking);
 
 	ps_enumerate_modes();
 
@@ -5871,6 +5908,7 @@ void dxr_prov_session_stop(void)
 #endif
 	dxr_mcp_on_session_destroying();
 	dxr_desktop_on_session_destroying();
+	dxr_hands_on_session_destroying(); // destroys the trackers under its lock, before the session goes
 	if (s_ps.session && s_ps.session_ready && s_ps.pfn_end_session) s_ps.pfn_end_session(s_ps.session);
 	if (s_ps.session && s_ps.pfn_destroy_session) s_ps.pfn_destroy_session(s_ps.session);
 	if (s_ps.instance && s_ps.pfn_destroy_instance) s_ps.pfn_destroy_instance(s_ps.instance);
@@ -6729,6 +6767,7 @@ int dxr_prov_begin_frame(uint32_t *out_image_index, int *out_should_render)
 	if (bdiag) ps_log("[DisplayXR-PROV] D3D11 begin[%u]: beginFrame ok\n", d11_bframes);
 	s_ps.predicted_display_time = fs.predictedDisplayTime;
 	s_ps.frame_begun = 1;
+	dxr_hands_on_frame_begun(fs.predictedDisplayTime); // hands locate at the views' time
 
 	// --- Per-frame render rect. In a 3D-zone frame the swapchain IS zone-sized, so
 	//     render == swapchain (full slice, no sub-rect). Otherwise render =
