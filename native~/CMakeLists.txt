@@ -110,6 +110,8 @@ set(SOURCES
     displayxr_xrprovider/displayxr_provider_mcp.cpp
     # XR_DXR_desktop_control binding: the app's agent operates the desktop (ADR-056).
     displayxr_xrprovider/displayxr_provider_desktop.cpp
+    # XR_EXT_hand_tracking binding: 26-joint hands for the XR Hands subsystem (Runtime/Hands/).
+    displayxr_xrprovider/displayxr_provider_hands.cpp
     # XR SDK pre-init provider (#247): XRSDKPreInit export, compiled everywhere so
     # the boot.config xrsdk-pre-init-library entry never dangles; VK-only in effect.
     displayxr_xrprovider/displayxr_provider_preinit.cpp
