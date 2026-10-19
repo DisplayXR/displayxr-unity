@@ -427,8 +427,9 @@ DISPLAYXR_EXPORT int displayxr_linux_overlay_position_known(void);
 /// cannot right now (still remembered). Setting the same value again is a no-op.
 /// activate_window: to the front with focus, restoring it if minimized; with GNOME
 /// extension 17+ only when the user's latest key press or click went to the app and
-/// the user has not left it since (else GNOME only flags the window as wanting
-/// attention; it stays minimized). set_minimized (0 restores without focus).
+/// the user has not left it since (else focus stays where it is, a minimized window
+/// stays minimized, and GNOME flags it if covered or minimized). set_minimized (0
+/// restores without focus).
 /// Actions: 1 when sent now, never re-sent.
 DISPLAYXR_EXPORT int displayxr_linux_window_state_caps(void);
 DISPLAYXR_EXPORT int displayxr_linux_set_keep_above(int above);

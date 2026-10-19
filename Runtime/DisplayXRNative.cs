@@ -627,8 +627,9 @@ namespace DisplayXR
         /// the user's latest key press or click went to the app and the user has not
         /// left it since (Alt+Tab, Super+H, the dock, a click elsewhere; the app
         /// minimizing itself with <see cref="displayxr_linux_set_minimized"/> does not
-        /// count), or when no window has focus. Otherwise it only flags the window as
-        /// wanting attention, a minimized window stays minimized, and the log says
+        /// count), or when no window has focus. Otherwise focus stays where it is, a
+        /// minimized window stays minimized, GNOME flags the window as wanting
+        /// attention if it is covered or minimized, and the log says
         /// "window activate: refused". To show the window without focus, use
         /// <see cref="displayxr_linux_set_minimized"/>(0). Returns 1 when the request
         /// was sent.
