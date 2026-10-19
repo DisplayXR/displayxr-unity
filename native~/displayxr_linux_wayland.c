@@ -1583,7 +1583,11 @@ ext_own_window(int op, int value, unsigned seq, int ok)
 			fprintf(stderr, "[DisplayXR-WL] window %s %s: %s%s\n", name, value ? "on" : "off",
 			        ok ? "done" : "refused", !ok && latest ? " (sent again later, quietly)" : "");
 	} else if (op == DXR_WL_EXT_OWN_ACTIVATE) {
-		fprintf(stderr, "[DisplayXR-WL] window %s: %s\n", name, ok ? "done" : "refused");
+		// Extension 17+ gives focus only when the user's latest input went to the app
+		// (else GNOME flags the window as wanting attention); 15/16 refuse only while
+		// locked or during a drag. Never re-sent: a later request is the app's call.
+		fprintf(stderr, "[DisplayXR-WL] window %s: %s\n", name,
+		        ok ? "done" : "refused (the user is in another app, the screen is locked, or a drag runs)");
 	} else {
 		fprintf(stderr, "[DisplayXR-WL] window %s %s: %s\n", name, value ? "on" : "off", ok ? "done" : "refused");
 	}
