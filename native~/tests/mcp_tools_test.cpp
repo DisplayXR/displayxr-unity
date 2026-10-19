@@ -3,7 +3,8 @@
 //
 // Unit test of the XR_DXR_mcp_tools binding (displayxr_provider_mcp.cpp) against a
 // fake runtime: registration survives a session restart, calls queue in order and
-// carry UTF-8 intact, results reach the runtime, the capability gate is honoured,
+// carry UTF-8 intact, results reach the runtime, a failed handler reaches the agent as
+// an isError result carrying its message, the capability gate is honoured,
 // and bad input is refused before it reaches the runtime. No Unity, no real runtime.
 //
 //   c++ -std=c++17 -I native~/displayxr_xrprovider -I <openxr include>
@@ -171,8 +172,34 @@ main()
 	CHECK(!pop(name, args, id));
 	CHECK(dxr_prov_mcp_submit_result(102, 1, u8("{\"said\":\"你好\"}")) == XR_SUCCESS);
 	CHECK(F.results.back().first == 102 && F.results.back().second == "{\"said\":\"你好\"}" && F.result_ok.back());
+	// A failed handler is a tool RESULT flagged isError, never an XR_FALSE submit: the
+	// runtime drops an XR_FALSE payload and the agent would get only a generic JSON-RPC
+	// "tool handler failed" instead of the handler's message.
 	CHECK(dxr_prov_mcp_submit_result(101, 0, nullptr) == XR_SUCCESS);
-	CHECK(F.results.back().second == "{}" && !F.result_ok.back());
+	CHECK(F.results.back().second == "{\"isError\":true,\"error\":\"tool failed\"}" && F.result_ok.back());
+
+	// --- Handler errors carry the message (UTF-8 intact) as an isError result ---
+	// This is exactly what DisplayXRMcp.Dispatch submits when a C# handler throws.
+	push_call(110, "wave", "{\"behavior\":\"nope\"}");
+	CHECK(pop(name, args, id) && id == 110);
+	CHECK(dxr_prov_mcp_submit_result(110, 0, u8("{\"error\":\"unknown behavior 'nope'\"}")) == XR_SUCCESS);
+	CHECK(F.results.back().first == 110 && F.result_ok.back());
+	CHECK(F.results.back().second == "{\"isError\":true,\"error\":\"unknown behavior 'nope'\"}");
+	CHECK(dxr_prov_mcp_submit_result(111, 0, u8("{\"error\":\"未知动作 'nope' 😀\"}")) == XR_SUCCESS);
+	CHECK(F.results.back().second == "{\"isError\":true,\"error\":\"未知动作 'nope' 😀\"}" && F.result_ok.back());
+	// Extra members and leading whitespace survive; {} and "" get a generic message;
+	// a non-object payload is wrapped rather than spliced.
+	CHECK(dxr_prov_mcp_submit_result(112, 0, u8("  {\"error\":\"x\",\"code\":7}")) == XR_SUCCESS);
+	CHECK(F.results.back().second == "{\"isError\":true,\"error\":\"x\",\"code\":7}");
+	CHECK(dxr_prov_mcp_submit_result(113, 0, u8("{ }")) == XR_SUCCESS);
+	CHECK(F.results.back().second == "{\"isError\":true,\"error\":\"tool failed\"}");
+	CHECK(dxr_prov_mcp_submit_result(114, 0, u8("")) == XR_SUCCESS);
+	CHECK(F.results.back().second == "{\"isError\":true,\"error\":\"tool failed\"}");
+	CHECK(dxr_prov_mcp_submit_result(115, 0, u8("\"bad\"")) == XR_SUCCESS);
+	CHECK(F.results.back().second == "{\"isError\":true,\"error\":\"bad\"}" && F.result_ok.back());
+	// A successful result is passed through untouched (no isError added).
+	CHECK(dxr_prov_mcp_submit_result(116, 1, u8("{\"ok\":true}")) == XR_SUCCESS);
+	CHECK(F.results.back().second == "{\"ok\":true}" && F.result_ok.back());
 
 	// pop with the wrong id or a short buffer leaves the queue intact
 	push_call(103, "wave", "{\"n\":1}");
@@ -185,7 +212,8 @@ main()
 	// The queue is bounded: the 17th call is failed to the agent at once.
 	size_t before = F.results.size();
 	for (uint64_t i = 0; i < 17; i++) push_call(200 + i, "wave", "{}");
-	CHECK(F.results.size() == before + 1 && F.results.back().first == 216 && !F.result_ok.back());
+	CHECK(F.results.size() == before + 1 && F.results.back().first == 216);
+	CHECK(F.results.back().second == "{\"isError\":true,\"error\":\"app is busy\"}" && F.result_ok.back());
 	for (int i = 0; i < 16; i++) CHECK(pop(name, args, id));
 
 	// --- Unregister removes from the runtime and from the stored list -----------
