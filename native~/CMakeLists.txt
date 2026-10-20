@@ -222,11 +222,11 @@ if(UNIX AND NOT APPLE AND NOT ANDROID)
         add_library(displayxr_unity_wayland SHARED
             displayxr_linux_wayland.c
             displayxr_linux_wayland_dbus.c)
-        # viewporter + fractional-scale + xdg-output glue, generated from the vendored
+        # viewporter + fractional-scale + xdg-output + xdg-foreign glue, generated from the vendored
         # XML (wayland-protocols is not installed everywhere; see wayland-protocols/README.md).
         set(DXR_WL_GEN ${CMAKE_CURRENT_BINARY_DIR}/wayland-generated)
         file(MAKE_DIRECTORY ${DXR_WL_GEN})
-        foreach(proto viewporter fractional-scale-v1 xdg-output-unstable-v1)
+        foreach(proto viewporter fractional-scale-v1 xdg-output-unstable-v1 xdg-foreign-unstable-v2)
             set(xml ${CMAKE_CURRENT_SOURCE_DIR}/wayland-protocols/${proto}.xml)
             add_custom_command(OUTPUT ${DXR_WL_GEN}/${proto}-client-protocol.h ${DXR_WL_GEN}/${proto}-protocol.c
                 COMMAND ${DXR_WAYLAND_SCANNER} client-header ${xml} ${DXR_WL_GEN}/${proto}-client-protocol.h

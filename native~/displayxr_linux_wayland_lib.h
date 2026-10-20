@@ -22,7 +22,7 @@ extern "C" {
 struct wl_display;
 struct wl_surface;
 
-#define DXR_WL_LIB_ABI 6
+#define DXR_WL_LIB_ABI 7
 #define DXR_WL_LIB_NAME "libdisplayxr_unity_wayland.so"
 #define DXR_WL_LIB_INIT "dxr_wl_lib_init"
 
@@ -74,6 +74,7 @@ typedef struct DxrWlApi {
 	int (*activate_window)(void);
 	int (*set_minimized)(int minimized);
 	int (*window_state)(void);
+	int (*export_handle)(char *buf, int len);
 } DxrWlApi;
 
 //! The library's one export. NULL on an ABI mismatch.

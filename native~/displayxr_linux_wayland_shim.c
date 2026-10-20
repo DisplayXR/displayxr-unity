@@ -304,3 +304,14 @@ dxr_wl_window_state(void)
 	const DxrWlApi *a = api();
 	return a ? a->window_state() : -1;
 }
+
+int
+dxr_wl_export_handle(char *buf, int len)
+{
+	const DxrWlApi *a = api();
+	if (a)
+		return a->export_handle(buf, len);
+	if (buf && len > 0)
+		buf[0] = 0;
+	return 0;
+}

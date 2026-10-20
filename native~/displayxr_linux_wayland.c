@@ -13,7 +13,8 @@
 // on the player's connection but on a PRIVATE event queue, so the player's SDL
 // (which dispatches the default queue on its main thread) never sees our events
 // and we never dispatch its. Wayland requests are thread-safe; the events for our
-// objects land on our queue, which only the provider's frame thread dispatches.
+// objects land on our queue, dispatched only under s_wl_mutex: by the provider's
+// frame thread, and by the calls that need an answer (create, the window export).
 // Requests on the player's own surface are only made while the capture layer's
 // lock is held (the player may destroy that surface at any time otherwise).
 //
@@ -57,6 +58,7 @@
 #include "viewporter-client-protocol.h"
 #include "fractional-scale-v1-client-protocol.h"
 #include "xdg-output-unstable-v1-client-protocol.h"
+#include "xdg-foreign-unstable-v2-client-protocol.h"
 
 #include "displayxr_linux_wayland_dbus.h"
 #include "displayxr_linux_wayland_lib.h"
@@ -113,6 +115,15 @@ static struct {
 	int pointer_state;
 	struct zxdg_output_manager_v1 *xdg_output_manager;
 	struct dxr_wl_output outputs[DXR_WL_MAX_OUTPUTS];
+	// The player's window exported for other processes (dxr_wl_export_handle).
+	struct zxdg_exporter_v2 *exporter;
+	struct zxdg_exported_v2 *exported;
+	unsigned exported_map_seq; // map_seq it was exported at
+	char exported_handle[128];
+	// Outputs our weave sub-surface is on (wl_surface enter/leave): > 0 only while it
+	// is mapped, which a sub-surface is only while the player's window is shown.
+	int weave_outputs;
+	unsigned map_seq; // bumps when the weave goes from no output to an output
 
 	// The weave (NULL surface = no native-Wayland session).
 	struct wl_surface *surface;
@@ -479,6 +490,8 @@ registry_global(void *data, struct wl_registry *reg, uint32_t name, const char *
 		s_wl.viewporter = wl_registry_bind(reg, name, &wp_viewporter_interface, 1);
 	} else if (strcmp(iface, wp_fractional_scale_manager_v1_interface.name) == 0) {
 		s_wl.frac_manager = wl_registry_bind(reg, name, &wp_fractional_scale_manager_v1_interface, 1);
+	} else if (strcmp(iface, zxdg_exporter_v2_interface.name) == 0) {
+		s_wl.exporter = wl_registry_bind(reg, name, &zxdg_exporter_v2_interface, 1);
 	} else if (strcmp(iface, zxdg_output_manager_v1_interface.name) == 0) {
 		s_wl.xdg_output_manager =
 		    wl_registry_bind(reg, name, &zxdg_output_manager_v1_interface, version < 3 ? version : 3);
@@ -686,6 +699,32 @@ make_probe_buffer(void)
 //! Make our surface a sub-surface of `parent`, at its top-left, above it. The
 //! caller holds the player lock (parent is the player's surface).
 static void
+weave_enter(void *data, struct wl_surface *surface, struct wl_output *output)
+{
+	(void)data;
+	(void)surface;
+	(void)output;
+	if (s_wl.weave_outputs++ == 0)
+		s_wl.map_seq++;
+}
+
+static void
+weave_leave(void *data, struct wl_surface *surface, struct wl_output *output)
+{
+	(void)data;
+	(void)surface;
+	(void)output;
+	if (s_wl.weave_outputs > 0)
+		s_wl.weave_outputs--;
+}
+
+//! enter / leave only: the compositor is bound at version 4 or lower.
+static const struct wl_surface_listener s_weave_surface_listener = {
+    .enter = weave_enter,
+    .leave = weave_leave,
+};
+
+static void
 attach_to_parent_locked(struct wl_surface *parent)
 {
 	if (s_wl.subsurface)
@@ -738,6 +777,8 @@ dxr_wl_weave_surface_create(struct wl_display *display, struct wl_surface *paren
 	if (player != parent)
 		fprintf(stderr, "[DisplayXR-WL] the player's window surface changed since it was read: using the current one\n");
 	s_wl.surface = wl_compositor_create_surface(s_wl.compositor);
+	s_wl.weave_outputs = 0;
+	wl_surface_add_listener(s_wl.surface, &s_weave_surface_listener, NULL);
 	attach_to_parent_locked(player);
 	s_wl.parent_generation = generation;
 	s_host->unlock_player_surface();
@@ -815,6 +856,7 @@ dxr_wl_weave_destroy(void)
 	s_wl.viewport = NULL;
 	s_wl.subsurface = NULL;
 	s_wl.surface = NULL;
+	s_wl.weave_outputs = 0;
 	s_wl.probe_buffer = NULL;
 	s_wl.parent = NULL;
 	s_wl.transparent = 0;
@@ -1692,6 +1734,65 @@ dxr_wl_activate_window(void)
 	return own_window_action(DXR_WL_EXT_CAP_ACTIVATE, "activate", DXR_WARN_OWN_ACTIVATE, DXR_WL_EXT_OWN_ACTIVATE, 1);
 }
 
+static void
+exported_on_handle(void *data, struct zxdg_exported_v2 *exported, const char *handle)
+{
+	(void)data;
+	if (exported == s_wl.exported)
+		snprintf(s_wl.exported_handle, sizeof(s_wl.exported_handle), "%s", handle ? handle : "");
+}
+
+static const struct zxdg_exported_v2_listener s_exported_listener = {
+    .handle = exported_on_handle,
+};
+
+static int
+dxr_wl_export_handle(char *buf, int len)
+{
+	if (!buf || len <= 0)
+		return 0;
+	buf[0] = 0;
+	pthread_mutex_lock(&s_wl_mutex);
+	if (!s_wl.display || !s_wl.exporter || !s_wl.surface) {
+		pthread_mutex_unlock(&s_wl_mutex);
+		return 0;
+	}
+	// Exporting is only legal on a shown toplevel: a surface with no window (the
+	// player's window hidden, or recreated and not shown yet) is a protocol error,
+	// which would end the PLAYER's connection. Our weave sub-surface is on an
+	// output only while it is mapped, and it is mapped only while its parent, the
+	// player's window, is. So read its enter/leave events first, and export only
+	// while it is on an output and attached to the player's current window. (A hide
+	// in the moment between this check and the request is not covered.)
+	wl_display_roundtrip_queue(s_wl.display, s_wl.queue);
+	if (s_wl.weave_outputs > 0 && (!s_wl.exported || s_wl.exported_map_seq != s_wl.map_seq)) {
+		// Shown anew: the compositor dropped the last export when the window was hidden.
+		if (s_wl.exported)
+			zxdg_exported_v2_destroy(s_wl.exported);
+		s_wl.exported = NULL;
+		s_wl.exported_handle[0] = 0;
+		unsigned generation = 0;
+		struct wl_surface *player = s_host->lock_player_surface(&generation);
+		if (player && player == s_wl.parent && generation == s_wl.parent_generation) {
+			s_wl.exported = zxdg_exporter_v2_export_toplevel(s_wl.exporter, player);
+			zxdg_exported_v2_add_listener(s_wl.exported, &s_exported_listener, NULL);
+			s_wl.exported_map_seq = s_wl.map_seq;
+		}
+		s_host->unlock_player_surface();
+		if (s_wl.exported) {
+			wl_display_roundtrip_queue(s_wl.display, s_wl.queue);
+			fprintf(stderr, "[DisplayXR-WL] the player's window is exported for portal dialogs%s\n",
+			        s_wl.exported_handle[0] ? "" : " (no handle yet)");
+		}
+	}
+	int known = s_wl.weave_outputs > 0 && s_wl.exported && s_wl.exported_handle[0] &&
+	            snprintf(buf, (size_t)len, "wayland:%s", s_wl.exported_handle) < len;
+	if (!known)
+		buf[0] = 0;
+	pthread_mutex_unlock(&s_wl_mutex);
+	return known;
+}
+
 static int
 dxr_wl_window_state(void)
 {
@@ -2029,6 +2130,7 @@ static const DxrWlApi s_api = {
     .activate_window = dxr_wl_activate_window,
     .set_minimized = dxr_wl_set_minimized,
     .window_state = dxr_wl_window_state,
+    .export_handle = dxr_wl_export_handle,
 };
 
 __attribute__((visibility("default"))) const DxrWlApi *

@@ -654,6 +654,30 @@ namespace DisplayXR
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern int displayxr_linux_window_state();
+
+        /// <summary>
+        /// The app's window as an xdg-desktop-portal <c>parent_window</c>:
+        /// <c>"wayland:&lt;handle&gt;"</c> for a native-Wayland player (the window
+        /// exported with xdg-foreign), <c>"x11:&lt;hex&gt;"</c> for an X11 player. Pass
+        /// it to a portal request (RemoteDesktop / ScreenCast Start, Screenshot, ...)
+        /// so GNOME opens the dialog on top of the app's window instead of wherever a
+        /// window with no parent lands. Writes a NUL-terminated string to
+        /// <paramref name="buf"/> and returns 1; 0 when the window is not known yet.
+        /// See <see cref="LinuxWindowHandle"/>.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int displayxr_linux_window_handle([Out] byte[] buf, int len);
+
+        /// <summary><see cref="displayxr_linux_window_handle"/> as a string; "" when
+        /// the window is not known yet.</summary>
+        public static string LinuxWindowHandle()
+        {
+            var buf = new byte[256];
+            if (displayxr_linux_window_handle(buf, buf.Length) == 0)
+                return "";
+            int n = System.Array.IndexOf(buf, (byte)0);
+            return System.Text.Encoding.ASCII.GetString(buf, 0, n < 0 ? buf.Length : n);
+        }
 #endif
 
     }
