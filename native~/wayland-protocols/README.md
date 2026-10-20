@@ -3,6 +3,7 @@
 - `viewporter.xml` (stable/viewporter)
 - `fractional-scale-v1.xml` (staging/fractional-scale)
 - `xdg-output-unstable-v1.xml` (unstable/xdg-output)
+- `xdg-foreign-unstable-v2.xml` (unstable/xdg-foreign; from wayland-protocols 1.47)
 
 Copied verbatim from [wayland-protocols](https://gitlab.freedesktop.org/wayland/wayland-protocols)
 by way of displayxr-common (`common/linux/wayland-protocols/`). MIT licensed; keep the
@@ -16,6 +17,8 @@ Vendoring also pins the protocol revision.
 sub-surface of the player's window: `wp_viewporter` maps the runtime's device-pixel buffer
 onto the logical window size, `wp_fractional_scale_v1` gives the real scale, and
 `zxdg_output_v1` gives each output's logical rect, to put the window on the 3D panel.
+`zxdg_exporter_v2` exports the player's window as a handle that another process (an
+xdg-desktop-portal dialog) can attach to.
 
 **Regenerating:** don't edit the XML or the generated files. CMake runs `wayland-scanner`
 on these files at build time (see `CMakeLists.txt`) into `build-*/wayland-generated/`.

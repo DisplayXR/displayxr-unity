@@ -654,6 +654,44 @@ namespace DisplayXR
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern int displayxr_linux_window_state();
+
+        /// <summary>
+        /// The app's window as an xdg-desktop-portal <c>parent_window</c>:
+        /// <c>"wayland:&lt;handle&gt;"</c> for a native-Wayland player (the window
+        /// exported with xdg-foreign), <c>"x11:&lt;hex&gt;"</c> for an X11 player. Pass
+        /// it to a portal request (RemoteDesktop / ScreenCast Start, Screenshot, ...)
+        /// so GNOME opens the dialog on top of the app's window instead of wherever a
+        /// window with no parent lands. Writes a NUL-terminated string to
+        /// <paramref name="buf"/> and returns 1; 0 when the window is not known:
+        /// <list type="bullet">
+        /// <item>X11: until an XR session has bound the app's window (the plugin
+        /// finds the window then, not before).</item>
+        /// <item>Native Wayland: without an XR session, when the compositor has no
+        /// <c>zxdg_exporter_v2</c>, while the window is hidden or minimized, and
+        /// from the moment the compositor dropped the export (the window was
+        /// hidden) until a frame or two after the window is shown again.</item>
+        /// </list>
+        /// It only reads a value the plugin keeps (no request to the compositor, no
+        /// waiting), so it is cheap from any thread. Ask for it right before each
+        /// portal request rather than keeping it: a window shown anew gets a new
+        /// handle. Pass it on verbatim: the compositor picks the Wayland handle
+        /// (mutter: 32 random printable ASCII characters, spaces and quotes
+        /// included). See <see cref="LinuxWindowHandle"/>.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int displayxr_linux_window_handle([Out] byte[] buf, int len);
+
+        /// <summary><see cref="displayxr_linux_window_handle"/> as a string; "" when
+        /// the window is not known (pass "" as <c>parent_window</c> then: the
+        /// dialog opens unparented, as it would without this call).</summary>
+        public static string LinuxWindowHandle()
+        {
+            var buf = new byte[256];
+            if (displayxr_linux_window_handle(buf, buf.Length) == 0)
+                return "";
+            int n = System.Array.IndexOf(buf, (byte)0);
+            return System.Text.Encoding.ASCII.GetString(buf, 0, n < 0 ? buf.Length : n);
+        }
 #endif
 
     }
