@@ -5,6 +5,21 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.28.0] - 2026-10-20
+
+### Added
+- **Name the app's window for portal dialogs (Linux, #384).** New export `displayxr_linux_window_handle` with a C# binding `DisplayXRNative.LinuxWindowHandle()` (Linux player builds only). It returns the app's window in the form an xdg-desktop-portal request takes as `parent_window` (RemoteDesktop Start, ScreenCast, Screenshot), so GNOME opens its dialog attached on top of the app instead of wherever a new window lands. The value is `wayland:<handle>` on a native-Wayland player and `x11:<hex>` on an X11 player. Pass it on verbatim.
+  - On native Wayland the support library exports the player's window with xdg-foreign (`zxdg_exporter_v2`, vendored from wayland-protocols 1.47). It does this itself, right after it sees the window shown again (the weave enters an output, or the GNOME extension reports the window mapped). It never exports a hidden window, because doing so is a protocol error that would end the player's connection. The call only reads that cached handle: no request and no round trip, so it is safe from any thread.
+  - The handle is `""` when there is none: on Wayland from the moment the compositor drops the export (the window was hidden) until the window is shown again, and on X11 before a session has bound the window.
+  - The Wayland library and the main plug-in must match again (`DXR_WL_LIB_ABI` 6 -> 7). They always ship together.
+
+### Fixed
+- **An app can move its own window again and again on native Wayland (#382).** `displayxr_set_overlay_position` counted against the cap that stops a fight with a compositor that keeps placing the window elsewhere. That cap only reset on a (re)map or resize, so after the start-up placement an app could move its window just twice. Later requests were dropped with "the compositor keeps placing the window elsewhere". The correction budget now resets whenever the app asks for a new place. Repeated requests for the same place still share one budget, so the cap still ends a real fight.
+- **A failed `DisplayXRMcp` tool call reaches the agent with its message (#381).** When a handler threw (e.g. `unknown behavior 'nope'`), the agent got a bare `-32000 "tool handler failed"` JSON-RPC error. A failed call is now submitted as `{"isError":true,"error":"<message>"}`, so the message gets through the runtime. This covers handler exceptions, "no handler" after a domain reload, a full call queue and oversized arguments. MCP's `result.isError` is also set when the runtime's `displayxr-mcp` is v0.5.6+ (displayxr-runtime#2239/#2243). Older runtimes carry the flag only inside the payload.
+
+### Documentation
+- `activate_window` on Linux (#374): DisplayXR GNOME extension v17 gives an app focus only when the user's latest key press or click went to that app and the user has not left it since. Otherwise GNOME only flags the window as wanting attention, and a minimized window stays minimized. The C# and C docs no longer promise focus every time, and the `window activate: refused` log line says why a request was refused. The plug-in's behaviour is unchanged.
+
 ## [2.27.0] - 2026-10-16
 
 ### Added
