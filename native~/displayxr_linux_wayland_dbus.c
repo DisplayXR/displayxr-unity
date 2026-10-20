@@ -239,6 +239,8 @@ parse_snapshot(const char *json, DxrWlExtWindow *w, char *layout, size_t layout_
 			const char *above = json_field(p, obj_end, "above");
 			c.minimized = minimized ? !strncmp(minimized, "true", 4) : -1;
 			c.above = above ? !strncmp(above, "true", 4) : -1;
+			const char *id = json_field(p, obj_end, "id");
+			c.id = id ? strtoull(id, NULL, 10) : 0;
 			const char *frame = json_field(p, obj_end, "frame");
 			if (!frame || sscanf(frame, "[ %d , %d , %d , %d", &c.x, &c.y, &c.w, &c.h) != 4)
 				c.w = c.h = 0;

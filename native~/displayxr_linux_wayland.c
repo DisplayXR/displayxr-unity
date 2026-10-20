@@ -14,9 +14,9 @@
 // (which dispatches the default queue on its main thread) never sees our events
 // and we never dispatch its. Wayland requests are thread-safe; the events for our
 // objects land on our queue, dispatched only under s_wl_mutex: by the provider's
-// frame thread, and by the calls that need an answer (create, the window export).
-// Requests on the player's own surface are only made while the capture layer's
-// lock is held (the player may destroy that surface at any time otherwise).
+// frame thread, and once when the weave is created. Requests on the player's own
+// surface are only made while the capture layer's lock is held (the player may
+// destroy that surface at any time otherwise).
 //
 // Why a sub-surface: it moves with its parent and stacks above it, so a weave
 // drawn into it covers the player's window without a second toplevel, and the
@@ -115,15 +115,25 @@ static struct {
 	int pointer_state;
 	struct zxdg_output_manager_v1 *xdg_output_manager;
 	struct dxr_wl_output outputs[DXR_WL_MAX_OUTPUTS];
-	// The player's window exported for other processes (dxr_wl_export_handle).
+	// The outputs our weave sub-surface is on, one bit per outputs[] slot
+	// (wl_surface enter/leave). Only for OUR wl_output proxies: the compositor
+	// sends enter/leave once per wl_output the client bound, SDL's included.
+	// Non-zero only while the weave is mapped, i.e. while the player's window is
+	// shown (a sub-surface is mapped only while its parent is).
+	unsigned weave_on;
+	unsigned weave_shown_seq; // bumps when weave_on goes from none to an output
+
+	// The player's window exported for other processes (export_update_locked),
+	// read by dxr_wl_export_handle.
 	struct zxdg_exporter_v2 *exporter;
+	struct zxdg_importer_v2 *importer;
 	struct zxdg_exported_v2 *exported;
-	unsigned exported_map_seq; // map_seq it was exported at
-	char exported_handle[128];
-	// Outputs our weave sub-surface is on (wl_surface enter/leave): > 0 only while it
-	// is mapped, which a sub-surface is only while the player's window is shown.
-	int weave_outputs;
-	unsigned map_seq; // bumps when the weave goes from no output to an output
+	struct zxdg_imported_v2 *export_watch; // our own import of the handle: told when it dies
+	int export_dead;                       // export_watch said the compositor dropped it
+	unsigned exported_weave_seq;           // weave_shown_seq the export is current for
+	unsigned exported_ext_seq;             // ext_shown_seq the export is current for
+	char exported_handle[128];             // "" = no handle (yet)
+	unsigned ext_shown_seq; // bumps when the extension reports our window shown anew
 
 	// The weave (NULL surface = no native-Wayland session).
 	struct wl_surface *surface;
@@ -492,6 +502,8 @@ registry_global(void *data, struct wl_registry *reg, uint32_t name, const char *
 		s_wl.frac_manager = wl_registry_bind(reg, name, &wp_fractional_scale_manager_v1_interface, 1);
 	} else if (strcmp(iface, zxdg_exporter_v2_interface.name) == 0) {
 		s_wl.exporter = wl_registry_bind(reg, name, &zxdg_exporter_v2_interface, 1);
+	} else if (strcmp(iface, zxdg_importer_v2_interface.name) == 0) {
+		s_wl.importer = wl_registry_bind(reg, name, &zxdg_importer_v2_interface, 1);
 	} else if (strcmp(iface, zxdg_output_manager_v1_interface.name) == 0) {
 		s_wl.xdg_output_manager =
 		    wl_registry_bind(reg, name, &zxdg_output_manager_v1_interface, version < 3 ? version : 3);
@@ -523,6 +535,7 @@ registry_global_remove(void *data, struct wl_registry *reg, uint32_t name)
 		struct dxr_wl_output *out = &s_wl.outputs[i];
 		if (out->registry_name != name)
 			continue;
+		s_wl.weave_on &= ~(1u << i); // its leave can no longer reach us
 		if (out->xdg)
 			zxdg_output_v1_destroy(out->xdg);
 		wl_output_destroy(out->output);
@@ -696,16 +709,32 @@ make_probe_buffer(void)
 	return buf;
 }
 
-//! Make our surface a sub-surface of `parent`, at its top-left, above it. The
-//! caller holds the player lock (parent is the player's surface).
+_Static_assert(DXR_WL_MAX_OUTPUTS <= 32, "weave_on has one bit per output slot");
+
+//! The outputs[] slot of one of OUR wl_output proxies, or -1: another of the
+//! client's (SDL's), or NULL (one destroyed meanwhile).
+static int
+output_slot(const struct wl_output *output)
+{
+	if (!output)
+		return -1;
+	for (int i = 0; i < DXR_WL_MAX_OUTPUTS; i++)
+		if (s_wl.outputs[i].registry_name && s_wl.outputs[i].output == output)
+			return i;
+	return -1;
+}
+
 static void
 weave_enter(void *data, struct wl_surface *surface, struct wl_output *output)
 {
 	(void)data;
 	(void)surface;
-	(void)output;
-	if (s_wl.weave_outputs++ == 0)
-		s_wl.map_seq++;
+	int i = output_slot(output);
+	if (i < 0)
+		return;
+	if (!s_wl.weave_on)
+		s_wl.weave_shown_seq++; // on screen again: the window was shown anew
+	s_wl.weave_on |= 1u << i;
 }
 
 static void
@@ -713,9 +742,9 @@ weave_leave(void *data, struct wl_surface *surface, struct wl_output *output)
 {
 	(void)data;
 	(void)surface;
-	(void)output;
-	if (s_wl.weave_outputs > 0)
-		s_wl.weave_outputs--;
+	int i = output_slot(output);
+	if (i >= 0)
+		s_wl.weave_on &= ~(1u << i);
 }
 
 //! enter / leave only: the compositor is bound at version 4 or lower.
@@ -724,6 +753,8 @@ static const struct wl_surface_listener s_weave_surface_listener = {
     .leave = weave_leave,
 };
 
+//! Make our surface a sub-surface of `parent`, at its top-left, above it. The
+//! caller holds the player lock (parent is the player's surface).
 static void
 attach_to_parent_locked(struct wl_surface *parent)
 {
@@ -747,6 +778,8 @@ static long long mono_ns(void);
 static void stop_verify_locked(void);
 static void schedule_verify_locked(void);
 static void fix_player_size_locked(void);
+static void export_update_locked(void);
+static void export_drop_locked(void);
 
 static int
 dxr_wl_weave_surface_create(struct wl_display *display, struct wl_surface *parent, int lw, int lh,
@@ -777,7 +810,7 @@ dxr_wl_weave_surface_create(struct wl_display *display, struct wl_surface *paren
 	if (player != parent)
 		fprintf(stderr, "[DisplayXR-WL] the player's window surface changed since it was read: using the current one\n");
 	s_wl.surface = wl_compositor_create_surface(s_wl.compositor);
-	s_wl.weave_outputs = 0;
+	s_wl.weave_on = 0;
 	wl_surface_add_listener(s_wl.surface, &s_weave_surface_listener, NULL);
 	attach_to_parent_locked(player);
 	s_wl.parent_generation = generation;
@@ -822,6 +855,7 @@ dxr_wl_weave_surface_create(struct wl_display *display, struct wl_surface *paren
 	s_wl.drag_end_pending = 0;
 	stop_verify_locked();
 	s_wl.geometry_dirty = 0; // the create-time size goes into XrWaylandSurfaceGeometryDXR
+	export_update_locked();  // the round trip above has told whether the window is shown
 	wl_display_flush(display);
 	*out_surface = s_wl.surface;
 	*out_w = s_wl.device_w;
@@ -852,11 +886,13 @@ dxr_wl_weave_destroy(void)
 	wl_surface_destroy(s_wl.surface);
 	if (s_wl.probe_buffer)
 		wl_buffer_destroy(s_wl.probe_buffer);
+	// No weave, no export: revoke the handle (the next session exports anew).
+	export_drop_locked();
 	s_wl.frac = NULL;
 	s_wl.viewport = NULL;
 	s_wl.subsurface = NULL;
 	s_wl.surface = NULL;
-	s_wl.weave_outputs = 0;
+	s_wl.weave_on = 0;
 	s_wl.probe_buffer = NULL;
 	s_wl.parent = NULL;
 	s_wl.transparent = 0;
@@ -984,6 +1020,7 @@ dxr_wl_weave_poll(int *out_w, int *out_h)
 			s_wl.check_w = s_wl.check_h = 0;
 	}
 	wl_display_dispatch_queue_pending(s_wl.display, s_wl.queue);
+	export_update_locked(); // right after the events that tell the window was shown anew
 	int dirty = s_wl.geometry_dirty;
 	if (dirty) {
 		s_wl.geometry_dirty = 0;
@@ -1364,6 +1401,17 @@ keep_above_send_locked(void)
 	dxr_wl_ext_own_window(DXR_WL_EXT_OWN_KEEP_ABOVE, s_wl.keep_above_wanted, ++s_wl.keep_above_seq);
 }
 
+//! A report of our window. Shown anew (mapped again, or a new mutter window: a
+//! NULL-buffer unmap gives the toplevel a new one, which the next show maps) is
+//! evidence for the export (export_update_locked).
+static void
+take_window_locked(const DxrWlExtWindow *w)
+{
+	if (win_mapped(w) && (!win_mapped(&s_wl.win) || (w->id && w->id != s_wl.win.id)))
+		s_wl.ext_shown_seq++;
+	s_wl.win = *w;
+}
+
 static void
 ext_window(const DxrWlExtWindow *w, int after_move, int moved)
 {
@@ -1371,8 +1419,9 @@ ext_window(const DxrWlExtWindow *w, int after_move, int moved)
 	int was_mapped = win_mapped(&s_wl.win);
 	int was_moving = s_wl.win.moving;
 	int size_changed = was_mapped && (w->w != s_wl.win.w || w->h != s_wl.win.h);
-	s_wl.win = *w;
+	take_window_locked(w);
 	int mapped = win_mapped(w);
+	export_update_locked();
 	// Keep-above lives on a mutter window, and lasts as long as our bus connection
 	// to the extension: a window shown anew (mapped again, or reported again by an
 	// extension that went away and came back) has lost it. A drag that ended is
@@ -1570,7 +1619,7 @@ ext_verify(const DxrWlExtWindow *w)
 	char why[160];
 	snprintf(why, sizeof(why), "verify: the window is at (%d,%d), not on the 3D panel '%s'; moving it again (try %d/%d)",
 	         w->x, w->y, name, s_wl.verify_tries, DXR_WL_VERIFY_TRIES);
-	s_wl.win = *w;
+	take_window_locked(w);
 	s_wl.corrections = 0; // a fresh budget per retry; the retries themselves are bounded
 	set_intent_locked(x, y, why);
 	if (centre)
@@ -1734,18 +1783,152 @@ dxr_wl_activate_window(void)
 	return own_window_action(DXR_WL_EXT_CAP_ACTIVATE, "activate", DXR_WARN_OWN_ACTIVATE, DXR_WL_EXT_OWN_ACTIVATE, 1);
 }
 
+/*
+ * The player's window for other processes (xdg-foreign): a portal dialog given
+ * its handle as parent_window opens on top of the app's window.
+ *
+ * Exporting a surface that has no window is a protocol error, which ends the
+ * PLAYER's connection, and nothing tells us in time that the window went away.
+ * mutter drops the window the moment the client destroys its xdg_toplevel or
+ * attaches a NULL buffer, but sends our sub-surface no leave for it (GNOME 50,
+ * either way: none while the window stays hidden; a leave and an enter come
+ * together when it is shown again). The extension lists windows by their
+ * actors, which outlive the window for its close effect. So "on an output" is
+ * no proof that the window is there.
+ *
+ * So the export is made only right after the window was SEEN SHOWN ANEW: our
+ * weave entering an output again (dispatched on the frame thread) or the
+ * extension reporting it mapped again or as a new mutter window (its worker),
+ * and only while both still say it is shown. dxr_wl_export_handle (the app's
+ * call) never sends anything: it reads what was made here. The compositor drops
+ * the export when the window is unmapped and sends the exporter nothing; our own
+ * import of the handle hears it (zxdg_imported_v2.destroyed), and the handle is
+ * "" from then until the window is shown anew. The case left: a window shown
+ * and hidden again (its toplevel destroyed) within the frame or the D-Bus round
+ * trip it takes us to see the show.
+ *
+ * Unity's player can get there: in Unity 6000.4, SDL_HideWindow destroys the
+ * xdg_toplevel (it unrefs the libdecor frame; without libdecor it destroys the
+ * toplevel itself) and keeps the wl_surface until SDL_DestroyWindow. Of Unity's
+ * own window operations, only quitting did that in a protocol trace (after the
+ * XR session, and so this export, had ended); resolution and fullscreen
+ * changes, maximize and minimize keep the toplevel.
+ */
+
+static void
+export_watch_destroyed(void *data, struct zxdg_imported_v2 *imported)
+{
+	(void)data;
+	if (imported != s_wl.export_watch || s_wl.export_dead)
+		return;
+	s_wl.export_dead = 1;
+	s_wl.exported_handle[0] = 0;
+	fprintf(stderr, "[DisplayXR-WL] the compositor dropped the window's export (hidden or closed): no handle "
+	                "until it is shown again\n");
+}
+
+static const struct zxdg_imported_v2_listener s_export_watch_listener = {
+    .destroyed = export_watch_destroyed,
+};
+
 static void
 exported_on_handle(void *data, struct zxdg_exported_v2 *exported, const char *handle)
 {
 	(void)data;
-	if (exported == s_wl.exported)
-		snprintf(s_wl.exported_handle, sizeof(s_wl.exported_handle), "%s", handle ? handle : "");
+	if (exported != s_wl.exported || s_wl.export_dead)
+		return;
+	int n = snprintf(s_wl.exported_handle, sizeof(s_wl.exported_handle), "%s", handle ? handle : "");
+	if (n <= 0 || (size_t)n >= sizeof(s_wl.exported_handle)) {
+		s_wl.exported_handle[0] = 0; // empty, or cut short: not a handle we can pass on
+		fprintf(stderr, "[DisplayXR-WL] the compositor's window handle is %s: not used\n", n <= 0 ? "empty" : "too long");
+		return;
+	}
+	fprintf(stderr, "[DisplayXR-WL] the player's window is exported for portal dialogs\n");
+	// export_update_locked starts watching it.
 }
 
 static const struct zxdg_exported_v2_listener s_exported_listener = {
     .handle = exported_on_handle,
 };
 
+static void
+export_drop_locked(void)
+{
+	if (s_wl.export_watch)
+		zxdg_imported_v2_destroy(s_wl.export_watch);
+	if (s_wl.exported)
+		zxdg_exported_v2_destroy(s_wl.exported);
+	s_wl.export_watch = NULL;
+	s_wl.exported = NULL;
+	s_wl.export_dead = 0;
+	s_wl.exported_handle[0] = 0;
+}
+
+//! The export still stands. Without an importer to tell, it is taken to have
+//! died with any show seen since it was made (the compositor drops it on unmap).
+static int
+export_alive_locked(void)
+{
+	if (!s_wl.exported || s_wl.export_dead)
+		return 0;
+	return s_wl.importer ||
+	       (s_wl.exported_weave_seq == s_wl.weave_shown_seq && s_wl.exported_ext_seq == s_wl.ext_shown_seq);
+}
+
+//! The window is on screen, as far as we can tell: the weave is on an output and,
+//! where the extension reports the window, it says mapped and not minimized.
+static int
+export_window_shown_locked(void)
+{
+	if (!s_wl.weave_on)
+		return 0;
+	return !s_wl.ext_available || (win_mapped(&s_wl.win) && s_wl.win.minimized != 1);
+}
+
+//! After every dispatch of our queue and every report of the window: export the
+//! window if it was seen shown anew since the export it has died (or since there
+//! was none), and is still shown. See the comment above.
+static void
+export_update_locked(void)
+{
+	if (!s_wl.exporter || !s_wl.surface)
+		return;
+	// Watch the export: importing a handle is harmless (an unknown one is answered
+	// with `destroyed` at once), and every importer is told when the export dies.
+	if (s_wl.exported && !s_wl.export_dead && s_wl.exported_handle[0] && s_wl.importer && !s_wl.export_watch) {
+		s_wl.export_watch = zxdg_importer_v2_import_toplevel(s_wl.importer, s_wl.exported_handle);
+		zxdg_imported_v2_add_listener(s_wl.export_watch, &s_export_watch_listener, NULL);
+		wl_display_flush(s_wl.display);
+	}
+	if (export_alive_locked()) {
+		// Shows seen while it stands (a minimized window restored, a report of the
+		// window it was made for) are not new: only one after it died is.
+		s_wl.exported_weave_seq = s_wl.weave_shown_seq;
+		s_wl.exported_ext_seq = s_wl.ext_shown_seq;
+		return;
+	}
+	int shown_anew = s_wl.exported_weave_seq != s_wl.weave_shown_seq || s_wl.exported_ext_seq != s_wl.ext_shown_seq;
+	if (!shown_anew || !export_window_shown_locked())
+		return;
+	export_drop_locked();
+	unsigned generation = 0;
+	struct wl_surface *player = s_host->lock_player_surface(&generation);
+	// Only the window the weave is attached to: its enter/leave are what we saw.
+	if (player && player == s_wl.parent && generation == s_wl.parent_generation) {
+		s_wl.exported = zxdg_exporter_v2_export_toplevel(s_wl.exporter, player);
+		zxdg_exported_v2_add_listener(s_wl.exported, &s_exported_listener, NULL);
+		s_wl.exported_weave_seq = s_wl.weave_shown_seq;
+		s_wl.exported_ext_seq = s_wl.ext_shown_seq;
+	}
+	s_host->unlock_player_surface();
+	if (s_wl.exported)
+		wl_display_flush(s_wl.display); // the handle comes with a later dispatch
+}
+
+//! Reads what export_update_locked made: no request, no dispatch, no round trip,
+//! so it is cheap from any thread. Right after the window is hidden it may still
+//! give the old handle, until the frame thread reads the compositor's notice (a
+//! frame or so; a dialog given that handle opens unparented, as with "").
 static int
 dxr_wl_export_handle(char *buf, int len)
 {
@@ -1753,40 +1936,14 @@ dxr_wl_export_handle(char *buf, int len)
 		return 0;
 	buf[0] = 0;
 	pthread_mutex_lock(&s_wl_mutex);
-	if (!s_wl.display || !s_wl.exporter || !s_wl.surface) {
-		pthread_mutex_unlock(&s_wl_mutex);
-		return 0;
+	// Only a watched export counts: an unwatched one may already be gone unseen.
+	int watched = s_wl.export_watch || !s_wl.importer;
+	int known = s_wl.surface && export_alive_locked() && watched && s_wl.exported_handle[0] &&
+	            export_window_shown_locked();
+	if (known) {
+		int n = snprintf(buf, (size_t)len, "wayland:%s", s_wl.exported_handle);
+		known = n > 0 && n < len;
 	}
-	// Exporting is only legal on a shown toplevel: a surface with no window (the
-	// player's window hidden, or recreated and not shown yet) is a protocol error,
-	// which would end the PLAYER's connection. Our weave sub-surface is on an
-	// output only while it is mapped, and it is mapped only while its parent, the
-	// player's window, is. So read its enter/leave events first, and export only
-	// while it is on an output and attached to the player's current window. (A hide
-	// in the moment between this check and the request is not covered.)
-	wl_display_roundtrip_queue(s_wl.display, s_wl.queue);
-	if (s_wl.weave_outputs > 0 && (!s_wl.exported || s_wl.exported_map_seq != s_wl.map_seq)) {
-		// Shown anew: the compositor dropped the last export when the window was hidden.
-		if (s_wl.exported)
-			zxdg_exported_v2_destroy(s_wl.exported);
-		s_wl.exported = NULL;
-		s_wl.exported_handle[0] = 0;
-		unsigned generation = 0;
-		struct wl_surface *player = s_host->lock_player_surface(&generation);
-		if (player && player == s_wl.parent && generation == s_wl.parent_generation) {
-			s_wl.exported = zxdg_exporter_v2_export_toplevel(s_wl.exporter, player);
-			zxdg_exported_v2_add_listener(s_wl.exported, &s_exported_listener, NULL);
-			s_wl.exported_map_seq = s_wl.map_seq;
-		}
-		s_host->unlock_player_surface();
-		if (s_wl.exported) {
-			wl_display_roundtrip_queue(s_wl.display, s_wl.queue);
-			fprintf(stderr, "[DisplayXR-WL] the player's window is exported for portal dialogs%s\n",
-			        s_wl.exported_handle[0] ? "" : " (no handle yet)");
-		}
-	}
-	int known = s_wl.weave_outputs > 0 && s_wl.exported && s_wl.exported_handle[0] &&
-	            snprintf(buf, (size_t)len, "wayland:%s", s_wl.exported_handle) < len;
 	if (!known)
 		buf[0] = 0;
 	pthread_mutex_unlock(&s_wl_mutex);

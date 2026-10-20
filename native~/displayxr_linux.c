@@ -1724,7 +1724,10 @@ displayxr_linux_window_state(void)
 /// a native-Wayland player (the window exported with xdg-foreign), "x11:<hex>" for
 /// an X11 player. A portal dialog given it opens on top of the app's window instead
 /// of wherever the compositor puts a window with no parent. Writes it to @p buf
-/// and returns 1; 0 (buf "") when the window is not known yet.
+/// and returns 1; 0 (buf "") when the window is not known: on X11 until an XR
+/// session has bound the window (s_win), on native Wayland without a session, with
+/// no zxdg_exporter_v2, or while the window is hidden (dxr_wl_export_handle).
+/// Neither path sends anything to a server: it reads what is already known.
 DISPLAYXR_EXPORT int
 displayxr_linux_window_handle(char *buf, int len)
 {

@@ -439,7 +439,8 @@ DISPLAYXR_EXPORT int displayxr_linux_set_minimized(int minimized);
 /// whoever changed it; -1 when not known.
 DISPLAYXR_EXPORT int displayxr_linux_window_state(void);
 /// The app's window as an xdg-desktop-portal parent_window ("wayland:<handle>" or
-/// "x11:<hex>"), so a portal dialog opens on top of it. 1 and @p buf filled, or 0.
+/// "x11:<hex>"), so a portal dialog opens on top of it. 1 and @p buf filled, or 0
+/// while it is not known (see displayxr_linux.c). Reads a cached value: cheap.
 DISPLAYXR_EXPORT int displayxr_linux_window_handle(char *buf, int len);
 
 /// (#266) Centre Unity's window on the given rect (X root coordinates), unless it is

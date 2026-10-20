@@ -141,10 +141,13 @@ int dxr_wl_window_state(void);
 
 //! The player's window as an xdg-foreign handle, "wayland:<handle>", for another
 //! process to attach a window to it: an xdg-desktop-portal dialog takes it as its
-//! parent_window, so GNOME opens the dialog on top of the app's window. Exported
-//! on first use and again when the player recreated its window. Writes it to @p buf
-//! and returns 1; 0 (buf "") without a native-Wayland session or when the
-//! compositor has no zxdg_exporter_v2.
+//! parent_window, so GNOME opens the dialog on top of the app's window. The
+//! library exports the window itself, each time it sees it shown anew; this only
+//! reads the result (no request, no round trip: cheap from any thread). Writes it
+//! to @p buf and returns 1; 0 (buf "") without a native-Wayland session, when the
+//! compositor has no zxdg_exporter_v2, while the window is hidden or minimized,
+//! and from the moment the compositor dropped the export until the window is
+//! shown again (a frame or two after it is).
 int dxr_wl_export_handle(char *buf, int len);
 
 #ifdef __cplusplus

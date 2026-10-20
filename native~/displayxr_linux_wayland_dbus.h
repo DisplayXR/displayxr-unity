@@ -45,6 +45,7 @@ typedef struct DxrWlExtWindow {
 	int mon_x, mon_y, mon_w, mon_h; //!< its monitor's rect, stage px; mon_w = 0 = not reported
 	int minimized;       //!< minimized (version 15+); -1 = not reported
 	int above;           //!< kept above other windows (version 15+); -1 = not reported
+	unsigned long long id; //!< mutter's window id (version 16+): a new one = a new window; 0 = not reported
 } DxrWlExtWindow;
 
 //! Called on the worker thread, never while it holds a lock of its own.
