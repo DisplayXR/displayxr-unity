@@ -1986,6 +1986,13 @@ dxr_wl_set_player_position_x11(int x, int y)
 		}
 	}
 	int sx = dxr_wl_x11_to_stage(x, n), sy = dxr_wl_x11_to_stage(y, n);
+	// A new place the app asks for gets a fresh correction budget: the cap stops a
+	// fight with a compositor that keeps placing the window elsewhere, not an app that
+	// moves its own window again and again (one stepping aside and back used it up).
+	if (!s_wl.intent_valid || sx != s_wl.intent_x || sy != s_wl.intent_y) {
+		s_wl.corrections = 0;
+		s_wl.warned &= ~DXR_WARN_GAVE_UP;
+	}
 	char why[96];
 	snprintf(why, sizeof(why), "the app's position X (%d,%d)", x, y);
 	set_intent_locked(sx, sy, why);
