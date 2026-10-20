@@ -475,6 +475,25 @@ DISPLAYXR_EXPORT int displayxr_linux_window_at(int x, int y, struct DisplayXRLin
 DISPLAYXR_EXPORT int displayxr_linux_pointer(int *x, int *y);
 DISPLAYXR_EXPORT float displayxr_linux_xroot_scale(void);
 
+/// Native-Wayland player: files dragged onto the app's window (a file manager's
+/// drag and drop). file_drop_enable(1) makes the plugin the window's drop target;
+/// it COSTS SDL's clipboard: SDL gets no new clipboard offers, so
+/// GUIUtility.systemCopyBuffer cannot be relied on for what other apps copy, for
+/// the rest of the run (0 does not give it back). Returns 1 on now,
+/// 0 remembered until the 3D session binds the window (or turned off), -1
+/// unsupported (X11 / XWayland player: XDND goes to Unity's own X connection; or
+/// no wl_data_device_manager version 3). Events arrive only while a 3D session runs.
+/// file_drop_next: the oldest event into @p event — ten int32, laid out as
+/// DxrWlDropEvent (displayxr_linux_wayland_lib.h): kind (1 enter, 2 move, 3 leave,
+/// 4 drop), flags (1 x/y X root known, 2 stage known), x, y (X root px), stage_x,
+/// stage_y, window_x, window_y (device px in the window), path_count, paths_bytes —
+/// and, for enter / drop, the paths into @p paths: UTF-8, each NUL-terminated, one
+/// more NUL at the end. Returns the kind, 0 when there is none, -1 when
+/// @p paths_len < paths_bytes (the event stays queued). Any thread.
+struct DxrWlDropEvent;
+DISPLAYXR_EXPORT int displayxr_linux_file_drop_enable(int enable);
+DISPLAYXR_EXPORT int displayxr_linux_file_drop_next(struct DxrWlDropEvent *event, char *paths, int paths_len);
+
 /// (#266) Centre Unity's window on the given rect (X root coordinates), unless it is
 /// already there. Called by dxr_prov_move_window_to_display with the panel rect the
 /// runtime reported. Returns 1 when the window is on (or was moved to) the rect.

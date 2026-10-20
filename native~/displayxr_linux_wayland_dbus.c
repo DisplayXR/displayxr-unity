@@ -79,11 +79,18 @@ parse_snapshot(const char *json, DxrWlExtWindow *w, char *layout, size_t layout_
 			const char *above = dxr_json_field(p, obj_end, "above");
 			c.minimized = minimized ? !strncmp(minimized, "true", 4) : -1;
 			c.above = above ? !strncmp(above, "true", 4) : -1;
+			const char *focus = dxr_json_field(p, obj_end, "focus");
+			c.focus = focus ? !strncmp(focus, "true", 4) : -1;
 			const char *id = dxr_json_field(p, obj_end, "id");
 			c.id = id ? strtoull(id, NULL, 10) : 0;
 			const char *frame = dxr_json_field(p, obj_end, "frame");
 			if (!frame || sscanf(frame, "[ %d , %d , %d , %d", &c.x, &c.y, &c.w, &c.h) != 4)
 				c.w = c.h = 0;
+			// The main surface (no client-side title bar): where surface-local
+			// coordinates start (file drops).
+			const char *buffer = dxr_json_field(p, obj_end, "buffer");
+			if (!buffer || sscanf(buffer, "[ %d , %d , %d , %d", &c.bx, &c.by, &c.bw, &c.bh) != 4)
+				c.bw = c.bh = 0;
 			const char *moving = dxr_json_field(p, obj_end, "moving");
 			c.moving = moving && !strncmp(moving, "true", 4);
 			const char *mon = dxr_json_field(p, obj_end, "monitor");

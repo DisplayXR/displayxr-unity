@@ -31,6 +31,30 @@ dxr_wl_x11_to_stage(int v, int n)
 	return v >= 0 ? (v + n / 2) / n : -((-v + n / 2) / n);
 }
 
+//! Round to nearest, halves away from zero (no libm).
+static inline int
+dxr_wl_round(double v)
+{
+	return v >= 0 ? (int)(v + 0.5) : -(int)(-v + 0.5);
+}
+
+//! A point on the player's main surface (surface-local px, one axis) to stage px
+//! and X root px: stage = origin + local x k, where origin is the surface's
+//! top-left on the stage (the extension's "buffer" rect) and k the stage px per
+//! surface px (1 in logical layout; the output's integer scale in physical
+//! layout); X root = stage x n (n = the XWayland scale). With n <= 0 (unknown)
+//! only *out_stage is set and 0 is returned.
+static inline int
+dxr_wl_surface_point(int origin, double local, int k, int n, int *out_stage, int *out_root)
+{
+	double stage = origin + local * (k > 0 ? k : 1);
+	*out_stage = dxr_wl_round(stage);
+	if (n <= 0)
+		return 0;
+	*out_root = dxr_wl_round(stage * n);
+	return 1;
+}
+
 //! A window of size w x h with its top-left at (x, y) lies on `panel`: its centre
 //! is inside the panel's rect (the rule mutter uses to say which monitor a window
 //! is on). With no size (w or h <= 0) the top-left itself must be inside.

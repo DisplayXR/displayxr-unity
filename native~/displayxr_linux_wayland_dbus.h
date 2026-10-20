@@ -40,12 +40,14 @@ enum dxr_wl_ext_own_op {
 typedef struct DxrWlExtWindow {
 	int present;         //!< our window is in the extension's list
 	int x, y, w, h;      //!< its frame, stage px; w = h = 0 until mutter maps it
+	int bx, by, bw, bh;  //!< its main surface ("buffer"), stage px; bw = 0 = not reported
 	int moving;          //!< an interactive move/resize grab is in progress
 	double device_scale; //!< device px per stage px on its monitor; 0 = not reported
 	int mon_x, mon_y, mon_w, mon_h; //!< its monitor's rect, stage px; mon_w = 0 = not reported
 	int minimized;       //!< minimized (version 15+); -1 = not reported
 	int above;           //!< kept above other windows (version 15+); -1 = not reported
 	unsigned long long id; //!< mutter's window id (version 16+): a new one = a new window; 0 = not reported
+	int focus;           //!< it has the focus (mutter's focus window); -1 = not reported
 } DxrWlExtWindow;
 
 //! Called on the worker thread, never while it holds a lock of its own.

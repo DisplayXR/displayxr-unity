@@ -63,7 +63,10 @@
 #include "displayxr_linux_wayland_dbus.h"
 #include "displayxr_linux_wayland_lib.h"
 #include "displayxr_linux_wayland_place.h"
+#include "displayxr_linux_uri_list.h"
 
+#include <errno.h>
+#include <fcntl.h>
 #include <math.h>
 #include <pthread.h>
 #include <stdint.h>
@@ -81,7 +84,25 @@
 #define DXR_WL_RESTORE_WINDOW_NS 3000000000LL // a saved position is checked until 3 s after the first map
 #define DXR_WL_SIZE_SETTLE_NS 1000000000LL    // a size handed to the player is checked 1 s later
 
+#define DXR_WL_DROP_QUEUE 32               // file-drop events kept for the app (oldest dropped past it)
+#define DXR_WL_DROP_READ_MAX (1u << 20)    // a longer text/uri-list is not a file list we take
+#define DXR_WL_DROP_READ_NS 3000000000LL   // the drag's source has this long to send it
+#define DXR_WL_URI_LIST "text/uri-list"
+
 enum { DXR_LAYOUT_UNKNOWN, DXR_LAYOUT_LOGICAL, DXR_LAYOUT_PHYSICAL };
+
+//! A wl_data_offer of our data device (file drops) and what it offers.
+struct dxr_wl_offer {
+	struct wl_data_offer *offer;
+	int uri_list;    // it offers text/uri-list
+	uint32_t action; // the drag action the compositor chose (wl_data_offer.action); 0 none
+};
+
+//! A file-drop event waiting for the app (dxr_wl_file_drop_next).
+struct dxr_wl_drop_ev {
+	DxrWlDropEvent e;
+	char *paths; // e.paths_bytes bytes (malloc'd); NULL for MOVE / LEAVE
+};
 
 // An output: its device-pixel mode, scale and transform (wl_output), and its
 // stage rect and connector name (xdg-output), to find the 3D panel and place the
@@ -111,6 +132,7 @@ static struct {
 	// window, i.e. its input region (outside it, the cursor of whatever lies behind shows).
 	// -1 not known yet, 0 the pointer is elsewhere, 1 over the window.
 	struct wl_seat *seat;
+	uint32_t seat_caps;
 	struct wl_pointer *pointer;
 	int pointer_state;
 	struct zxdg_output_manager_v1 *xdg_output_manager;
@@ -224,6 +246,36 @@ static struct {
 	int x11_valid, x11_x, x11_y, x11_w, x11_h;
 	int last_x11_valid, last_x11_x, last_x11_y; // the last position we could convert
 
+	// File drops (see "File drops" below): our own data device for the seat, made
+	// only once the app asks (dxr_wl_file_drop_enable), and the drag over us.
+	struct wl_data_device_manager *ddm;
+	uint32_t ddm_version;
+	struct wl_data_device *ddev;
+	struct wl_keyboard *keyboard; // tells when the player loses keyboard focus
+	int kb_focus;                 // the player has keyboard focus (as last dispatched)
+	int drop_wanted;              // the app asked for drops
+	int drop_remake;              // make the device again once unfocused (it lost focus)
+	unsigned drop_makes;          // devices made this run (logs)
+	struct dxr_wl_offer *sel_offer; // the clipboard offer sent to our device (unused, kept as the protocol asks)
+	struct {
+		struct dxr_wl_offer *o; // the drag's offer; NULL = no drag over the window
+		uint32_t serial;        // its enter's
+		int files;              // taken: text/uri-list over the player's own surface
+		double lx, ly;          // the pointer, surface-local logical px
+		int reading, fd;        // the list on its way through a pipe
+		char *buf;
+		size_t len, cap;
+		long long deadline_ns;
+		int read_done;
+		char *paths; // dxr_uri_list_to_paths' layout, once read
+		size_t paths_bytes;
+		int path_count;
+		int told;    // the app had its ENTER
+		int dropped; // dropped; finished once the list is in
+	} drag;
+	struct dxr_wl_drop_ev drop_q[DXR_WL_DROP_QUEUE];
+	int drop_head, drop_count;
+
 	unsigned warned; // one-time log bits (DXR_WARN_*)
 } s_wl;
 
@@ -234,6 +286,10 @@ static struct {
 #define DXR_WARN_OWN_KEEP_ABOVE 16u
 #define DXR_WARN_OWN_ACTIVATE 32u
 #define DXR_WARN_OWN_MINIMIZE 64u
+#define DXR_WARN_DROP_NOT_FILES 128u
+#define DXR_WARN_DROP_QUEUE 256u
+#define DXR_WARN_DROP_UNSUPPORTED 512u
+#define DXR_WARN_DROP_NO_KEYBOARD 1024u
 
 // Guards s_wl: the provider's frame thread polls, C#'s main thread asks for
 // resizes, positions and input regions, the extension worker reports. Lock order:
@@ -457,10 +513,14 @@ static const struct wl_pointer_listener s_pointer_listener = {
     .axis = ptr_axis,
 };
 
+static void drop_keyboard_locked(void);
+
 static void
 seat_capabilities(void *d, struct wl_seat *seat, uint32_t caps)
 {
 	(void)d;
+	s_wl.seat_caps = caps;
+	drop_keyboard_locked(); // file drops follow the keyboard focus, if they are on
 	if ((caps & WL_SEAT_CAPABILITY_POINTER) && !s_wl.pointer) {
 		s_wl.pointer = wl_seat_get_pointer(seat);
 		wl_pointer_add_listener(s_wl.pointer, &s_pointer_listener, NULL);
@@ -500,6 +560,11 @@ registry_global(void *data, struct wl_registry *reg, uint32_t name, const char *
 		s_wl.viewporter = wl_registry_bind(reg, name, &wp_viewporter_interface, 1);
 	} else if (strcmp(iface, wp_fractional_scale_manager_v1_interface.name) == 0) {
 		s_wl.frac_manager = wl_registry_bind(reg, name, &wp_fractional_scale_manager_v1_interface, 1);
+	} else if (strcmp(iface, wl_data_device_manager_interface.name) == 0 && !s_wl.ddm) {
+		// Bound, but no data device made until the app asks for file drops: the
+		// device is what changes things for SDL (see "File drops").
+		s_wl.ddm_version = version < 3 ? version : 3;
+		s_wl.ddm = wl_registry_bind(reg, name, &wl_data_device_manager_interface, s_wl.ddm_version);
 	} else if (strcmp(iface, zxdg_exporter_v2_interface.name) == 0) {
 		s_wl.exporter = wl_registry_bind(reg, name, &zxdg_exporter_v2_interface, 1);
 	} else if (strcmp(iface, zxdg_importer_v2_interface.name) == 0) {
@@ -780,6 +845,10 @@ static void schedule_verify_locked(void);
 static void fix_player_size_locked(void);
 static void export_update_locked(void);
 static void export_drop_locked(void);
+static int drop_supported_locked(void);
+static void drop_device_make_locked(const char *why, int first);
+static void drop_device_destroy_locked(void);
+static void drop_poll_locked(void);
 
 static int
 dxr_wl_weave_surface_create(struct wl_display *display, struct wl_surface *parent, int lw, int lh,
@@ -856,6 +925,8 @@ dxr_wl_weave_surface_create(struct wl_display *display, struct wl_surface *paren
 	stop_verify_locked();
 	s_wl.geometry_dirty = 0; // the create-time size goes into XrWaylandSurfaceGeometryDXR
 	export_update_locked();  // the round trip above has told whether the window is shown
+	if (s_wl.drop_wanted && drop_supported_locked())
+		drop_device_make_locked("the 3D session has bound the window", 1);
 	wl_display_flush(display);
 	*out_surface = s_wl.surface;
 	*out_w = s_wl.device_w;
@@ -888,6 +959,9 @@ dxr_wl_weave_destroy(void)
 		wl_buffer_destroy(s_wl.probe_buffer);
 	// No weave, no export: revoke the handle (the next session exports anew).
 	export_drop_locked();
+	// Nothing dispatches our queue between sessions: no drops either (the next
+	// session makes the device again if the app still wants them).
+	drop_device_destroy_locked();
 	s_wl.frac = NULL;
 	s_wl.viewport = NULL;
 	s_wl.subsurface = NULL;
@@ -1021,6 +1095,7 @@ dxr_wl_weave_poll(int *out_w, int *out_h)
 	}
 	wl_display_dispatch_queue_pending(s_wl.display, s_wl.queue);
 	export_update_locked(); // right after the events that tell the window was shown anew
+	drop_poll_locked();     // a dragged file list arriving, a data device to make again
 	int dirty = s_wl.geometry_dirty;
 	if (dirty) {
 		s_wl.geometry_dirty = 0;
@@ -1412,10 +1487,13 @@ take_window_locked(const DxrWlExtWindow *w)
 	s_wl.win = *w;
 }
 
+static void drop_focus_report_locked(const DxrWlExtWindow *w);
+
 static void
 ext_window(const DxrWlExtWindow *w, int after_move, int moved)
 {
 	pthread_mutex_lock(&s_wl_mutex);
+	drop_focus_report_locked(w); // before s_wl.win takes the new report
 	int was_mapped = win_mapped(&s_wl.win);
 	int was_moving = s_wl.win.moving;
 	int size_changed = was_mapped && (w->w != s_wl.win.w || w->h != s_wl.win.h);
@@ -2265,6 +2343,689 @@ dxr_wl_set_player_position_x11(int x, int y)
 
 /*
  *
+ * File drops: files dragged onto the player's window from a file manager, for
+ * the app (dxr_wl_file_drop_enable / dxr_wl_file_drop_next).
+ *
+ * Unity's SDL handles Wayland drag and drop itself, but it is linked statically
+ * and exports nothing, so its drop events cannot be reached. So this library
+ * makes its own wl_data_device for the seat, on our queue, and is the drop
+ * target. Opt-in, because of what it costs.
+ *
+ * The cost. Mutter (50) keeps ONE data device per client: making one unlinks
+ * the client's previous one (get_data_device), and an unlinked device is sent
+ * neither drags nor clipboard offers again — also after ours is released. So
+ * from the moment drops are on, SDL gets no new clipboard offers, for the rest
+ * of the run: GUIUtility.systemCopyBuffer can no longer be relied on for what
+ * other apps copy. Measured on GNOME 50.1: it read "" for every other app's copy
+ * when SDL had never had an offer, and the current text when it still held one
+ * from before (mutter answers an old offer with the current clipboard). Unity's
+ * own copies still read back. Its writes still reach the compositor (a set_selection on an
+ * unlinked device is still the seat's; mutter takes it only from the focused
+ * client, drops or not). An app that turns drops on reads the clipboard
+ * elsewhere (the RemoteDesktop portal's Clipboard, which also works without
+ * keyboard focus). SDL starts no drags in Unity's player, so nothing else is lost.
+ *
+ * Mutter only unlinks a device that is on its list of UNFOCUSED clients' devices:
+ * made while the player has keyboard focus, ours and SDL's both stay linked, and
+ * after the next focus change a drag goes to whichever comes first in mutter's
+ * list — SDL's, at the first one. So the device is made again each time the
+ * player loses focus: ours released first, then a new one made, which unlinks
+ * the only other one the player has, SDL's. Our own wl_keyboard (on our queue,
+ * made with the first device) says when; on a seat without a keyboard, the GNOME
+ * extension's report of the window does (it reports every focus change). While
+ * the player has focus, drags go to ours anyway (mutter looks among the
+ * unfocused clients' devices first). A drag that starts in the frame between the
+ * focus loss and the remake goes to SDL.
+ *
+ * A drag over the window: on enter, an offer of text/uri-list over the player's
+ * own surface (not a client-side title bar, whose offset we do not know) is
+ * accepted for COPY only (a MOVE would have the file manager delete the file)
+ * and the list is asked for at once through a non-blocking pipe, read by the
+ * frame thread's poll (DXR_WL_DROP_READ_NS at most). The app hears ENTER once
+ * the paths are known (a list with no local file is refused, and the app hears
+ * nothing), then MOVEs (coalesced), then LEAVE or DROP. A drop is finished
+ * (wl_data_offer.finish) only with the COPY action the compositor chose: mutter
+ * answers a premature or action-less finish with a protocol error, which would
+ * end the PLAYER's connection.
+ *
+ * Coordinates: surface-local logical px from the protocol; the window px the app
+ * gets are device px (x the fractional scale), as the rest of the window API; the
+ * desktop point is the window's main surface on the stage (the extension's
+ * "buffer" rect) plus the surface point, then x the XWayland scale for X root
+ * px (x11_scale_locked, as the position API). Without the extension, or without
+ * the runtime's panel rect, the event says which of them it lacks.
+ *
+ * Everything runs under s_wl_mutex: the handlers on whichever thread dispatches
+ * our queue (the frame thread; the main thread in dxr_wl_move_player_to_panel),
+ * the app's calls on any thread.
+ *
+ */
+
+static void drag_clear_locked(int tell_leave);
+static void drop_complete_locked(void);
+
+static void
+offer_offer(void *data, struct wl_data_offer *offer, const char *mime_type)
+{
+	(void)offer;
+	struct dxr_wl_offer *o = data;
+	if (mime_type && !strcmp(mime_type, DXR_WL_URI_LIST))
+		o->uri_list = 1;
+}
+
+static void
+offer_source_actions(void *data, struct wl_data_offer *offer, uint32_t source_actions)
+{
+	(void)data;
+	(void)offer;
+	(void)source_actions;
+}
+
+static void
+offer_action(void *data, struct wl_data_offer *offer, uint32_t dnd_action)
+{
+	(void)offer;
+	struct dxr_wl_offer *o = data;
+	o->action = dnd_action;
+}
+
+static const struct wl_data_offer_listener s_offer_listener = {
+    .offer = offer_offer,
+    .source_actions = offer_source_actions,
+    .action = offer_action,
+};
+
+static void
+offer_destroy(struct dxr_wl_offer *o)
+{
+	if (!o)
+		return;
+	wl_data_offer_destroy(o->offer);
+	free(o);
+}
+
+//! The pointer's position in the event: window px always, stage and X root px when known.
+static void
+drop_coords_locked(DxrWlDropEvent *e)
+{
+	double scale = s_wl.scale120 ? s_wl.scale120 / 120.0 : 1.0;
+	e->window_x = dxr_wl_round(s_wl.drag.lx * scale);
+	e->window_y = dxr_wl_round(s_wl.drag.ly * scale);
+	e->flags = 0;
+	const DxrWlExtWindow *w = &s_wl.win;
+	if (!s_wl.ext_available || !win_mapped(w))
+		return;
+	// The main surface's top-left; an extension that does not report it gives the
+	// frame, which is off by a client-side title bar (Unity's borderless window has none).
+	int ox = w->bw > 0 ? w->bx : w->x, oy = w->bw > 0 ? w->by : w->y;
+	// Stage px per surface px: 1 in logical layout; the output's integer scale in
+	// physical layout (the surface is drawn at buffer scale 1, scaled up there).
+	int k = 1;
+	if (layout_locked() == DXR_LAYOUT_PHYSICAL && w->bw > 0 && s_wl.logical_w > 0) {
+		k = dxr_wl_round((double)w->bw / s_wl.logical_w);
+		if (k < 1)
+			k = 1;
+	}
+	int n = x11_scale_locked();
+	int rx = 0, ry = 0;
+	int root = dxr_wl_surface_point(ox, s_wl.drag.lx, k, n, &e->stage_x, &rx);
+	dxr_wl_surface_point(oy, s_wl.drag.ly, k, n, &e->stage_y, &ry);
+	e->flags |= DXR_WL_DROP_HAS_STAGE;
+	if (root) {
+		e->x = rx;
+		e->y = ry;
+		e->flags |= DXR_WL_DROP_HAS_ROOT;
+	}
+}
+
+static void
+drop_push_locked(int kind, const char *paths, size_t bytes, int count)
+{
+	// A MOVE replaces one still queued: the app wants where the pointer is now.
+	if (kind == DXR_WL_DROP_MOVE && s_wl.drop_count) {
+		struct dxr_wl_drop_ev *last = &s_wl.drop_q[(s_wl.drop_head + s_wl.drop_count - 1) % DXR_WL_DROP_QUEUE];
+		if (last->e.kind == DXR_WL_DROP_MOVE) {
+			drop_coords_locked(&last->e);
+			return;
+		}
+	}
+	if (s_wl.drop_count == DXR_WL_DROP_QUEUE) {
+		// Nobody drains the queue: keep the latest.
+		struct dxr_wl_drop_ev *old = &s_wl.drop_q[s_wl.drop_head];
+		free(old->paths);
+		old->paths = NULL;
+		s_wl.drop_head = (s_wl.drop_head + 1) % DXR_WL_DROP_QUEUE;
+		s_wl.drop_count--;
+		if (!(s_wl.warned & DXR_WARN_DROP_QUEUE))
+			fprintf(stderr, "[DisplayXR-WL] file drop: the app does not take its drop events "
+			                "(displayxr_linux_file_drop_next): the oldest are dropped\n");
+		s_wl.warned |= DXR_WARN_DROP_QUEUE;
+	}
+	struct dxr_wl_drop_ev *ev = &s_wl.drop_q[(s_wl.drop_head + s_wl.drop_count) % DXR_WL_DROP_QUEUE];
+	memset(ev, 0, sizeof(*ev));
+	ev->e.kind = kind;
+	drop_coords_locked(&ev->e);
+	if (paths && bytes > 0) {
+		ev->paths = malloc(bytes);
+		if (!ev->paths)
+			return; // out of memory: the event is lost
+		memcpy(ev->paths, paths, bytes);
+		ev->e.paths_bytes = (int32_t)bytes;
+		ev->e.path_count = count;
+	}
+	s_wl.drop_count++;
+}
+
+//! Where the drop point is, for the log.
+static void
+drop_log_locked(const char *what, int count)
+{
+	DxrWlDropEvent e = {0};
+	drop_coords_locked(&e);
+	char where[96] = "";
+	if (e.flags & DXR_WL_DROP_HAS_ROOT)
+		snprintf(where, sizeof(where), ", X root (%d,%d)", e.x, e.y);
+	else if (e.flags & DXR_WL_DROP_HAS_STAGE)
+		snprintf(where, sizeof(where), ", stage (%d,%d), no X root", e.stage_x, e.stage_y);
+	fprintf(stderr, "[DisplayXR-WL] file drop: %s %d file%s at window (%d,%d) px%s\n", what, count,
+	        count == 1 ? "" : "s", e.window_x, e.window_y, where);
+}
+
+//! The drag is over (or never was ours): forget it. @p tell_leave: the app heard
+//! ENTER, so it hears LEAVE.
+static void
+drag_clear_locked(int tell_leave)
+{
+	if (tell_leave && s_wl.drag.told) {
+		drop_push_locked(DXR_WL_DROP_LEAVE, NULL, 0, 0);
+		fprintf(stderr, "[DisplayXR-WL] file drop: the files left the window (or the drag was cancelled)\n");
+	}
+	if (s_wl.drag.reading)
+		close(s_wl.drag.fd);
+	free(s_wl.drag.buf);
+	free(s_wl.drag.paths);
+	offer_destroy(s_wl.drag.o);
+	memset(&s_wl.drag, 0, sizeof(s_wl.drag));
+}
+
+static const char *
+self_host(void)
+{
+	static char host[256];
+	static int done;
+	if (!done) {
+		if (gethostname(host, sizeof(host) - 1) != 0)
+			host[0] = 0;
+		host[sizeof(host) - 1] = 0;
+		done = 1;
+	}
+	return host[0] ? host : NULL;
+}
+
+//! Read what has arrived of the dragged file list (non-blocking); once it is all
+//! in (or the source gave up), tell the app or refuse the drag.
+static void
+drop_read_locked(void)
+{
+	if (!s_wl.drag.reading)
+		return;
+	int done = 0;
+	const char *failed = NULL;
+	for (;;) {
+		if (s_wl.drag.cap - s_wl.drag.len < 4096) {
+			if (s_wl.drag.cap >= DXR_WL_DROP_READ_MAX) {
+				failed = "longer than 1 MiB";
+				break;
+			}
+			size_t cap = s_wl.drag.cap ? s_wl.drag.cap * 2 : 16384;
+			char *b = realloc(s_wl.drag.buf, cap);
+			if (!b) {
+				failed = "out of memory";
+				break;
+			}
+			s_wl.drag.buf = b;
+			s_wl.drag.cap = cap;
+		}
+		ssize_t n = read(s_wl.drag.fd, s_wl.drag.buf + s_wl.drag.len, s_wl.drag.cap - s_wl.drag.len);
+		if (n > 0) {
+			s_wl.drag.len += (size_t)n;
+			continue;
+		}
+		if (n == 0) {
+			done = 1;
+			break;
+		}
+		if (errno == EINTR)
+			continue;
+		if (errno != EAGAIN && errno != EWOULDBLOCK)
+			failed = strerror(errno);
+		break;
+	}
+	if (!done && !failed) {
+		if (mono_ns() < s_wl.drag.deadline_ns)
+			return; // more to come
+		failed = "the drag's source did not send it in time";
+	}
+	close(s_wl.drag.fd);
+	s_wl.drag.reading = 0;
+	s_wl.drag.read_done = 1;
+	size_t list_len = s_wl.drag.len;
+	if (done) {
+		s_wl.drag.paths = malloc(s_wl.drag.len + 1);
+		if (s_wl.drag.paths)
+			s_wl.drag.path_count = dxr_uri_list_to_paths(s_wl.drag.buf, s_wl.drag.len, self_host(),
+			                                             s_wl.drag.paths, &s_wl.drag.paths_bytes);
+	} else {
+		fprintf(stderr, "[DisplayXR-WL] file drop: the dragged file list could not be read (%s)\n", failed);
+	}
+	free(s_wl.drag.buf);
+	s_wl.drag.buf = NULL;
+	s_wl.drag.len = s_wl.drag.cap = 0;
+	if (s_wl.drag.path_count > 0 && !s_wl.drag.dropped) {
+		drop_push_locked(DXR_WL_DROP_ENTER, s_wl.drag.paths, s_wl.drag.paths_bytes, s_wl.drag.path_count);
+		s_wl.drag.told = 1;
+		drop_log_locked("drag entered with", s_wl.drag.path_count);
+	} else if (s_wl.drag.path_count == 0) {
+		// No local file (links, a remote location): not ours to take.
+		if (!s_wl.drag.dropped) {
+			wl_data_offer_accept(s_wl.drag.o->offer, s_wl.drag.serial, NULL);
+			wl_display_flush(s_wl.display);
+		}
+		if (done && !(s_wl.warned & DXR_WARN_DROP_NOT_FILES))
+			fprintf(stderr, "[DisplayXR-WL] file drop: the dragged list names no local file (%zu bytes): refused\n",
+			        list_len);
+		if (done)
+			s_wl.warned |= DXR_WARN_DROP_NOT_FILES;
+	}
+	if (s_wl.drag.dropped)
+		drop_complete_locked();
+}
+
+//! Dropped, and the list is in: hand it to the app, finish the drop, forget it.
+static void
+drop_complete_locked(void)
+{
+	int n = s_wl.drag.path_count;
+	if (n > 0) {
+		if (!s_wl.drag.told) // dropped before the list was in: the app hears both
+			drop_push_locked(DXR_WL_DROP_ENTER, s_wl.drag.paths, s_wl.drag.paths_bytes, n);
+		drop_push_locked(DXR_WL_DROP_DROP, s_wl.drag.paths, s_wl.drag.paths_bytes, n);
+		drop_log_locked("dropped", n);
+	}
+	// finish only for a drop we took with the COPY action the compositor chose
+	// (mutter: a finish without an accepted type and a copy / move action is a
+	// protocol error). Otherwise destroying the offer cancels the drop for the source.
+	if (n > 0 && s_wl.drag.o->action == WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY)
+		wl_data_offer_finish(s_wl.drag.o->offer);
+	s_wl.drag.told = 0; // DROP ends it for the app: no LEAVE
+	drag_clear_locked(0);
+	wl_display_flush(s_wl.display);
+}
+
+static void
+dd_data_offer(void *data, struct wl_data_device *dev, struct wl_data_offer *offer)
+{
+	(void)data;
+	(void)dev;
+	struct dxr_wl_offer *o = calloc(1, sizeof(*o));
+	if (!o) {
+		wl_data_offer_destroy(offer); // enter / selection then get no offer
+		return;
+	}
+	o->offer = offer;
+	wl_data_offer_add_listener(offer, &s_offer_listener, o);
+}
+
+static void
+dd_enter(void *data, struct wl_data_device *dev, uint32_t serial, struct wl_surface *surface, wl_fixed_t x,
+         wl_fixed_t y, struct wl_data_offer *offer)
+{
+	(void)data;
+	(void)dev;
+	drag_clear_locked(1); // a drag that never ended for us (cannot happen in order)
+	struct dxr_wl_offer *o = offer ? wl_data_offer_get_user_data(offer) : NULL;
+	if (!o)
+		return; // a drag with no data
+	s_wl.drag.o = o;
+	s_wl.drag.serial = serial;
+	s_wl.drag.lx = wl_fixed_to_double(x);
+	s_wl.drag.ly = wl_fixed_to_double(y);
+	// Over the player's own surface only: a client-side title bar is another
+	// surface, at an offset we do not know (the weave takes no input at all).
+	if (!o->uri_list || !surface || surface != s_wl.parent) {
+		wl_data_offer_accept(offer, serial, NULL);
+		wl_display_flush(s_wl.display);
+		return;
+	}
+	s_wl.drag.files = 1;
+	wl_data_offer_accept(offer, serial, DXR_WL_URI_LIST);
+	wl_data_offer_set_actions(offer, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY, WL_DATA_DEVICE_MANAGER_DND_ACTION_COPY);
+	int fds[2];
+	if (pipe2(fds, O_CLOEXEC | O_NONBLOCK) == 0) {
+		wl_data_offer_receive(offer, DXR_WL_URI_LIST, fds[1]);
+		close(fds[1]);
+		s_wl.drag.fd = fds[0];
+		s_wl.drag.reading = 1;
+		s_wl.drag.deadline_ns = mono_ns() + DXR_WL_DROP_READ_NS;
+	} else {
+		fprintf(stderr, "[DisplayXR-WL] file drop: no pipe for the file list (%s): drag refused\n", strerror(errno));
+		s_wl.drag.files = 0;
+		wl_data_offer_accept(offer, serial, NULL);
+	}
+	wl_display_flush(s_wl.display);
+}
+
+static void
+dd_leave(void *data, struct wl_data_device *dev)
+{
+	(void)data;
+	(void)dev;
+	if (s_wl.drag.dropped)
+		return; // after a drop (mutter sends leave then too): the drop ends it
+	drag_clear_locked(1);
+}
+
+static void
+dd_motion(void *data, struct wl_data_device *dev, uint32_t time, wl_fixed_t x, wl_fixed_t y)
+{
+	(void)data;
+	(void)dev;
+	(void)time;
+	if (!s_wl.drag.o || s_wl.drag.dropped)
+		return;
+	s_wl.drag.lx = wl_fixed_to_double(x);
+	s_wl.drag.ly = wl_fixed_to_double(y);
+	if (s_wl.drag.told)
+		drop_push_locked(DXR_WL_DROP_MOVE, NULL, 0, 0);
+}
+
+static void
+dd_drop(void *data, struct wl_data_device *dev)
+{
+	(void)data;
+	(void)dev;
+	if (!s_wl.drag.o || s_wl.drag.dropped)
+		return;
+	if (!s_wl.drag.files) { // not taken (the compositor does not send a drop then)
+		drag_clear_locked(0);
+		return;
+	}
+	s_wl.drag.dropped = 1;
+	if (s_wl.drag.read_done)
+		drop_complete_locked();
+	// else drop_read_locked completes it once the list is in
+}
+
+static void
+dd_selection(void *data, struct wl_data_device *dev, struct wl_data_offer *offer)
+{
+	(void)data;
+	(void)dev;
+	// The clipboard, now offered to our device (no longer to SDL's) while the
+	// player has focus. Not read: only the latest is kept, as the protocol asks.
+	struct dxr_wl_offer *o = offer ? wl_data_offer_get_user_data(offer) : NULL;
+	if (s_wl.sel_offer && s_wl.sel_offer != o)
+		offer_destroy(s_wl.sel_offer);
+	s_wl.sel_offer = o;
+}
+
+static const struct wl_data_device_listener s_data_device_listener = {
+    .data_offer = dd_data_offer,
+    .enter = dd_enter,
+    .leave = dd_leave,
+    .motion = dd_motion,
+    .drop = dd_drop,
+    .selection = dd_selection,
+};
+
+static void
+kb_keymap(void *data, struct wl_keyboard *kb, uint32_t format, int32_t fd, uint32_t size)
+{
+	(void)data;
+	(void)kb;
+	(void)format;
+	(void)size;
+	close(fd);
+}
+
+static void
+kb_enter(void *data, struct wl_keyboard *kb, uint32_t serial, struct wl_surface *surface, struct wl_array *keys)
+{
+	(void)data;
+	(void)kb;
+	(void)serial;
+	(void)surface;
+	(void)keys;
+	s_wl.kb_focus = 1;
+}
+
+static void
+kb_leave(void *data, struct wl_keyboard *kb, uint32_t serial, struct wl_surface *surface)
+{
+	(void)data;
+	(void)kb;
+	(void)serial;
+	(void)surface;
+	s_wl.kb_focus = 0;
+	if (s_wl.ddev)
+		s_wl.drop_remake = 1; // see "File drops": now SDL's device can be unlinked
+}
+
+static void
+kb_key(void *data, struct wl_keyboard *kb, uint32_t serial, uint32_t time, uint32_t key, uint32_t state)
+{
+	(void)data;
+	(void)kb;
+	(void)serial;
+	(void)time;
+	(void)key;
+	(void)state;
+}
+
+static void
+kb_modifiers(void *data, struct wl_keyboard *kb, uint32_t serial, uint32_t depressed, uint32_t latched,
+             uint32_t locked, uint32_t group)
+{
+	(void)data;
+	(void)kb;
+	(void)serial;
+	(void)depressed;
+	(void)latched;
+	(void)locked;
+	(void)group;
+}
+
+static void
+kb_repeat_info(void *data, struct wl_keyboard *kb, int32_t rate, int32_t delay)
+{
+	(void)data;
+	(void)kb;
+	(void)rate;
+	(void)delay;
+}
+
+// wl_seat version 1: repeat_info is never sent; listed for completeness.
+static const struct wl_keyboard_listener s_keyboard_listener = {
+    .keymap = kb_keymap,
+    .enter = kb_enter,
+    .leave = kb_leave,
+    .key = kb_key,
+    .modifiers = kb_modifiers,
+    .repeat_info = kb_repeat_info,
+};
+
+//! Our wl_keyboard, once drops have been on (kept: a version-1 seat's keyboard
+//! has no release; its few events are dispatched and ignored afterwards).
+static void
+drop_keyboard_locked(void)
+{
+	if (!(s_wl.seat_caps & WL_SEAT_CAPABILITY_KEYBOARD)) {
+		if (s_wl.keyboard) {
+			wl_keyboard_destroy(s_wl.keyboard);
+			s_wl.keyboard = NULL;
+			s_wl.kb_focus = 0;
+		}
+		return;
+	}
+	if (s_wl.keyboard || !s_wl.ddev || !s_wl.seat)
+		return;
+	s_wl.keyboard = wl_seat_get_keyboard(s_wl.seat);
+	wl_keyboard_add_listener(s_wl.keyboard, &s_keyboard_listener, NULL);
+}
+
+static int
+drop_supported_locked(void)
+{
+	return s_wl.ddm && s_wl.ddm_version >= 3 && s_wl.seat;
+}
+
+//! Whether the player has the focus: 1, 0, or -1 when it cannot be told. From
+//! our wl_keyboard (exact) or, on a seat without a keyboard, from the GNOME
+//! extension's report of the window (it reports every focus change).
+static int
+player_focused_locked(void)
+{
+	if (s_wl.keyboard)
+		return s_wl.kb_focus;
+	if (s_wl.ext_available && s_wl.win.present && s_wl.win.focus >= 0)
+		return s_wl.win.focus;
+	return -1;
+}
+
+//! A report of our window from the extension: losing the focus is when SDL's
+//! data device can be unlinked (used where the seat has no keyboard to tell).
+static void
+drop_focus_report_locked(const DxrWlExtWindow *w)
+{
+	if (!s_wl.ddev || s_wl.keyboard || !w->present || w->focus != 0)
+		return;
+	if (!s_wl.win.present || s_wl.win.focus != 0)
+		s_wl.drop_remake = 1;
+}
+
+//! Make our data device (again): ours released first, then a new one, which
+//! unlinks the player's other one (SDL's) if mutter lists it among the unfocused.
+//! @p first: drops were just turned on; if the player may have the focus right
+//! now, SDL's device survived, and the device is made again once it has not.
+static void
+drop_device_make_locked(const char *why, int first)
+{
+	if (!drop_supported_locked())
+		return;
+	if (s_wl.ddev) {
+		drag_clear_locked(1);
+		offer_destroy(s_wl.sel_offer);
+		s_wl.sel_offer = NULL;
+		wl_data_device_release(s_wl.ddev);
+	}
+	s_wl.ddev = wl_data_device_manager_get_data_device(s_wl.ddm, s_wl.seat);
+	wl_data_device_add_listener(s_wl.ddev, &s_data_device_listener, NULL);
+	drop_keyboard_locked();
+	s_wl.drop_remake = first && player_focused_locked() != 0;
+	s_wl.drop_makes++;
+	wl_display_flush(s_wl.display);
+	if (s_wl.drop_makes == 1) {
+		fprintf(stderr, "[DisplayXR-WL] file drops on (%s): this app's data device replaces SDL's, so from now on "
+		                "SDL gets no new clipboard offers: GUIUtility.systemCopyBuffer cannot be relied on for what "
+		                "other apps copy, for the rest of this run\n",
+		        why);
+		if (!s_wl.keyboard && !(s_wl.warned & DXR_WARN_DROP_NO_KEYBOARD))
+			fprintf(stderr, "[DisplayXR-WL] file drops: the seat has no keyboard; the focus is followed through the "
+			                "GNOME extension%s\n",
+			        s_wl.ext_available ? "" : " (not running: a drag may go to SDL after the player had the focus)");
+		if (!s_wl.keyboard)
+			s_wl.warned |= DXR_WARN_DROP_NO_KEYBOARD;
+	} else if (s_wl.drop_makes == 2) {
+		fprintf(stderr, "[DisplayXR-WL] file drops: data device made again (%s); quietly from now on\n", why);
+	}
+}
+
+static void
+drop_device_destroy_locked(void)
+{
+	drag_clear_locked(1);
+	offer_destroy(s_wl.sel_offer);
+	s_wl.sel_offer = NULL;
+	if (s_wl.ddev) {
+		wl_data_device_release(s_wl.ddev);
+		s_wl.ddev = NULL;
+		wl_display_flush(s_wl.display);
+	}
+	s_wl.drop_remake = 0;
+}
+
+//! Per frame, after our queue was dispatched: the file list arriving; the device
+//! made again once the player has lost focus (and no drag is over it).
+static void
+drop_poll_locked(void)
+{
+	drop_read_locked();
+	if (s_wl.drop_remake && s_wl.ddev && !s_wl.drag.o && player_focused_locked() == 0)
+		drop_device_make_locked("the player lost the focus", 0);
+}
+
+static int
+dxr_wl_file_drop_enable(int enable)
+{
+	pthread_mutex_lock(&s_wl_mutex);
+	int want = enable ? 1 : 0, r = 0;
+	int changed = want != s_wl.drop_wanted;
+	s_wl.drop_wanted = want;
+	if (!want) {
+		if (s_wl.ddev) {
+			drop_device_destroy_locked();
+			fprintf(stderr, "[DisplayXR-WL] file drops off (SDL's clipboard does not get other apps' copies back "
+			                "until the app restarts)\n");
+		}
+	} else if (s_wl.registry && !drop_supported_locked()) {
+		r = -1;
+		if (!(s_wl.warned & DXR_WARN_DROP_UNSUPPORTED))
+			fprintf(stderr, "[DisplayXR-WL] file drops unavailable: the compositor has no wl_data_device_manager "
+			                "version 3 (it has %u) or no seat\n",
+			        s_wl.ddm ? s_wl.ddm_version : 0u);
+		s_wl.warned |= DXR_WARN_DROP_UNSUPPORTED;
+	} else if (!s_wl.surface) {
+		if (changed)
+			fprintf(stderr, "[DisplayXR-WL] file drops: on once the 3D session binds the window\n");
+	} else {
+		if (!s_wl.ddev)
+			drop_device_make_locked("the app turned them on", 1);
+		r = s_wl.ddev ? 1 : -1;
+	}
+	pthread_mutex_unlock(&s_wl_mutex);
+	return r;
+}
+
+static int
+dxr_wl_file_drop_next(DxrWlDropEvent *event, char *paths, int paths_len)
+{
+	if (!event)
+		return 0;
+	pthread_mutex_lock(&s_wl_mutex);
+	if (!s_wl.drop_count) {
+		pthread_mutex_unlock(&s_wl_mutex);
+		return 0;
+	}
+	struct dxr_wl_drop_ev *ev = &s_wl.drop_q[s_wl.drop_head];
+	*event = ev->e;
+	if (ev->e.paths_bytes > 0 && (!paths || paths_len < ev->e.paths_bytes)) {
+		pthread_mutex_unlock(&s_wl_mutex);
+		return -1; // kept: the caller asks again with event->paths_bytes of room
+	}
+	if (ev->e.paths_bytes > 0)
+		memcpy(paths, ev->paths, (size_t)ev->e.paths_bytes);
+	else if (paths && paths_len > 0)
+		paths[0] = 0;
+	free(ev->paths);
+	ev->paths = NULL;
+	s_wl.drop_head = (s_wl.drop_head + 1) % DXR_WL_DROP_QUEUE;
+	s_wl.drop_count--;
+	pthread_mutex_unlock(&s_wl_mutex);
+	return event->kind;
+}
+
+/*
+ *
  * The library's one export (displayxr_linux_wayland_lib.h).
  *
  */
@@ -2296,6 +3057,8 @@ static const DxrWlApi s_api = {
     .set_minimized = dxr_wl_set_minimized,
     .window_state = dxr_wl_window_state,
     .export_handle = dxr_wl_export_handle,
+    .file_drop_enable = dxr_wl_file_drop_enable,
+    .file_drop_next = dxr_wl_file_drop_next,
 };
 
 __attribute__((visibility("default"))) const DxrWlApi *

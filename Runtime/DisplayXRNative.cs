@@ -694,6 +694,114 @@ namespace DisplayXR
             int n = System.Array.IndexOf(buf, (byte)0);
             return System.Text.Encoding.ASCII.GetString(buf, 0, n < 0 ? buf.Length : n);
         }
+
+        /// <summary>Kinds of <see cref="LinuxFileDropEvent"/>.</summary>
+        public const int LinuxFileDropEnter = 1, LinuxFileDropMove = 2, LinuxFileDropLeave = 3, LinuxFileDropDrop = 4;
+        /// <summary><see cref="LinuxFileDropEvent.flags"/>: x, y (X root px) are known.</summary>
+        public const int LinuxFileDropHasRoot = 1;
+        /// <summary><see cref="LinuxFileDropEvent.flags"/>: stageX, stageY (GNOME's
+        /// desktop px, mutter's stage) are known.</summary>
+        public const int LinuxFileDropHasStage = 2;
+
+        /// <summary>
+        /// One file-drop event of a native-Wayland player
+        /// (<see cref="displayxr_linux_file_drop_next"/>); the native DxrWlDropEvent.
+        /// </summary>
+        [StructLayout(LayoutKind.Sequential)]
+        public struct LinuxFileDropEvent
+        {
+            /// <summary>1 enter (files dragged onto the window; paths), 2 move (the
+            /// latest position), 3 leave (they left, or the drag was cancelled), 4
+            /// drop (paths). Enter comes first, then moves, then leave or drop.</summary>
+            public int kind;
+            /// <summary><see cref="LinuxFileDropHasRoot"/> | <see cref="LinuxFileDropHasStage"/>.</summary>
+            public int flags;
+            /// <summary>The pointer in X root px, the screen space of the X11 code and
+            /// of <see cref="displayxr_get_overlay_position"/> (HasRoot).</summary>
+            public int x, y;
+            /// <summary>The pointer in GNOME's desktop px (HasStage; needs the DisplayXR
+            /// GNOME extension).</summary>
+            public int stageX, stageY;
+            /// <summary>The pointer in the window, device px from its top-left (the
+            /// units of <see cref="displayxr_get_overlay_size"/>). Always set.</summary>
+            public int windowX, windowY;
+            /// <summary>Enter / drop: how many paths.</summary>
+            public int pathCount;
+            /// <summary>Enter / drop: the size of the paths buffer they need.</summary>
+            public int pathsBytes;
+        }
+
+        /// <summary>
+        /// Native-Wayland player: receive files dragged onto the app's window from a
+        /// file manager (1), or stop (0). Poll the events with
+        /// <see cref="LinuxFileDropNext"/> (or <see cref="displayxr_linux_file_drop_next"/>)
+        /// every frame; they arrive while a DisplayXR session runs.
+        /// <para><b>What turning it on costs:</b> the plugin's own Wayland data device
+        /// replaces SDL's (the compositor keeps one per app), so from then on Unity gets
+        /// no new clipboard offers, for the rest of the run, and
+        /// <c>GUIUtility.systemCopyBuffer</c> cannot be relied on for what other apps
+        /// copy: on GNOME 50 it read "" when Unity had never had an offer, and the
+        /// current text when it still held one from before. Unity's own copies still
+        /// read back; writing still works while the app has keyboard focus, as before
+        /// (GNOME takes clipboard writes only from the focused app). Turning drops off
+        /// does not give it back. An
+        /// app that turns drops on reads the clipboard another way (on GNOME: the
+        /// RemoteDesktop portal's Clipboard, which also works while the app is not
+        /// focused).</para>
+        /// Returns 1 when drops are on now; 0 when remembered until the session binds
+        /// the window (or when turned off); -1 when unsupported: an X11 / XWayland
+        /// player (XDND messages go to Unity's own X connection, which the plugin
+        /// cannot read), or a compositor without wl_data_device_manager version 3.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int displayxr_linux_file_drop_enable(int enable);
+
+        /// <summary>
+        /// Native-Wayland player: takes the oldest file-drop event into
+        /// <paramref name="ev"/>, and for enter / drop its paths into
+        /// <paramref name="paths"/> (UTF-8, each NUL-terminated, one more NUL at the
+        /// end). Returns the kind; 0 when there is none; -1 when
+        /// <paramref name="pathsLen"/> is smaller than <c>ev.pathsBytes</c> (the event
+        /// stays queued: call again with that much room). Any thread.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int displayxr_linux_file_drop_next(out LinuxFileDropEvent ev, [Out] byte[] paths, int pathsLen);
+
+        private static readonly object s_FileDropLock = new object();
+        private static byte[] s_FileDropBuf = new byte[4096];
+
+        /// <summary><see cref="displayxr_linux_file_drop_next"/> with the paths as
+        /// strings (empty for move / leave). False when there is no event.</summary>
+        public static bool LinuxFileDropNext(out LinuxFileDropEvent ev, out string[] paths)
+        {
+            paths = System.Array.Empty<string>();
+            lock (s_FileDropLock)
+            {
+                int kind = displayxr_linux_file_drop_next(out ev, s_FileDropBuf, s_FileDropBuf.Length);
+                if (kind < 0)
+                {
+                    s_FileDropBuf = new byte[ev.pathsBytes];
+                    kind = displayxr_linux_file_drop_next(out ev, s_FileDropBuf, s_FileDropBuf.Length);
+                }
+                if (kind <= 0)
+                    return false;
+                if (ev.pathsBytes > 0)
+                {
+                    var list = new System.Collections.Generic.List<string>(ev.pathCount);
+                    int start = 0;
+                    for (int i = 0; i < ev.pathsBytes; i++)
+                    {
+                        if (s_FileDropBuf[i] != 0)
+                            continue;
+                        if (i > start)
+                            list.Add(System.Text.Encoding.UTF8.GetString(s_FileDropBuf, start, i - start));
+                        start = i + 1;
+                    }
+                    paths = list.ToArray();
+                }
+                return true;
+            }
+        }
 #endif
 
         /// <summary>
