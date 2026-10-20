@@ -43,7 +43,10 @@ namespace DisplayXR
     /// <c>{"started":true}</c> and expose a status tool, rather than block.</para>
     ///
     /// <para><b>Errors.</b> Throw from a handler to fail the call: the agent receives a tool
-    /// error carrying the exception message.</para>
+    /// result carrying the exception message, <c>{"isError":true,"error":"&lt;message&gt;"}</c>
+    /// (UTF-8 intact), so it can tell a bad argument from a broken connection and retry. It is
+    /// not a JSON-RPC protocol error. A runtime built with displayxr-mcp v0.5.6 or later also
+    /// sets MCP's <c>result.isError</c>; on older runtimes the flag is only inside the payload.</para>
     ///
     /// <para><b>When nothing happens.</b> Registration is a no-op (and returns false from
     /// <see cref="IsAvailable"/>) when the runtime is older than the extension or the machine
@@ -218,6 +221,9 @@ namespace DisplayXR
             Submit(id, true, string.IsNullOrEmpty(result) ? "{}" : result);
         }
 
+        // ok == false: json is {"error":"<message>"}. The native binding turns it into a tool
+        // result flagged "isError":true (displayxr_provider_mcp.cpp, mark_error) rather than
+        // an XR_FALSE submit, whose payload the runtime discards.
         private static void Submit(ulong id, bool ok, string json)
         {
             Call(() => Native.dxr_prov_mcp_submit_result(id, ok ? 1 : 0, Utf8(json)));

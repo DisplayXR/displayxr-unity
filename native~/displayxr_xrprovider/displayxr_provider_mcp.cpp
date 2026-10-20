@@ -134,6 +134,43 @@ cstr(const uint8_t *p)
 	return reinterpret_cast<const char *>(p);
 }
 
+// A failed call is answered as a SUCCESSFUL submit whose JSON carries "isError":true.
+//
+// Why not xrSubmitMCPToolResultDXR(..., XR_FALSE, ...): the runtime (oxr_mcp_app_tools.c,
+// runtime <= v2.47) discards resultJson on XR_FALSE and hands the MCP framework a NULL
+// result, which the framework answers as a bare JSON-RPC error {-32000, "tool handler
+// failed"}. The handler's message never reaches the agent, and the agent cannot tell a
+// tool-level failure ("unknown behavior 'nope'" — retry with other arguments) from a
+// transport failure. Submitting XR_TRUE keeps the message; "isError":true marks it the
+// way MCP marks a tool error (CallToolResult.isError), so an agent reading the payload
+// sees the failure, and a framework that lifts the flag onto the result (the runtime-side
+// fix) needs no change here.
+//
+// @p json is what the app passed (a JSON object such as {"error":"..."}; NULL/empty
+// allowed). Returns that object with "isError":true as its first member; a non-object
+// payload is wrapped as {"isError":true,"error":<payload>}.
+std::string
+mark_error(const char *json)
+{
+	static const char kFlag[] = "{\"isError\":true";
+	const char *p = json ? json : "";
+	while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r') p++;
+	if (!*p) return std::string(kFlag) + ",\"error\":\"tool failed\"}";
+	if (*p != '{') return std::string(kFlag) + ",\"error\":" + p + "}";
+	const char *body = p + 1;
+	const char *q = body;
+	while (*q == ' ' || *q == '\t' || *q == '\n' || *q == '\r') q++;
+	if (*q == '}') return std::string(kFlag) + ",\"error\":\"tool failed\"" + q; // {} -> generic message
+	return std::string(kFlag) + "," + body;
+}
+
+XrResult
+submit_error(XrSession s, uint64_t id, const char *json)
+{
+	std::string out = mark_error(json);
+	return pfn_submit(s, id, XR_TRUE, out.c_str());
+}
+
 } // namespace
 
 // ---------------------------------------------------------------- provider hooks
@@ -220,7 +257,7 @@ dxr_mcp_handle_event(const XrEventDataBuffer *ev)
 	std::string args;
 	uint32_t size = call->argsSize;
 	if (size > kMaxArgsBytes) {
-		pfn_submit(s, call->callId, XR_FALSE, "{\"error\":\"arguments too large\"}");
+		submit_error(s, call->callId, "{\"error\":\"arguments too large\"}");
 		return 1;
 	}
 	if (size > 0) {
@@ -243,7 +280,7 @@ dxr_mcp_handle_event(const XrEventDataBuffer *ev)
 		full = g_queue.size() >= kMaxQueued;
 		if (!full) g_queue.push_back(QueuedCall{call->callId, name, std::move(args)});
 	}
-	if (full) pfn_submit(s, call->callId, XR_FALSE, "{\"error\":\"app is busy\"}");
+	if (full) submit_error(s, call->callId, "{\"error\":\"app is busy\"}");
 	return 1;
 }
 
@@ -356,6 +393,7 @@ dxr_prov_mcp_submit_result(uint64_t call_id, int success, const uint8_t *result_
 		if (!g_enabled) return DXR_MCP_ERR_UNAVAILABLE;
 	}
 	if (s == XR_NULL_HANDLE) return DXR_MCP_ERR_UNAVAILABLE; // the session is gone; the runtime already failed the call
+	if (!success) return (int)submit_error(s, call_id, cstr(result_json_utf8));
 	const char *json = (result_json_utf8 && *result_json_utf8) ? cstr(result_json_utf8) : "{}";
-	return (int)pfn_submit(s, call_id, success ? XR_TRUE : XR_FALSE, json);
+	return (int)pfn_submit(s, call_id, XR_TRUE, json);
 }

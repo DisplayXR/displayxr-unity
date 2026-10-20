@@ -84,6 +84,10 @@ DISPLAYXR_EXPORT int dxr_prov_mcp_pop_call(uint64_t call_id, uint8_t *name_buf, 
                                            uint32_t args_cap);
 
 //! Answer a call. @p result_json_utf8 should be a JSON object (NULL = `{}`).
+//! @p success = 0 (a failed handler, e.g. `{"error":"<message>"}`) is delivered as an MCP
+//! tool result carrying `"isError":true` plus the app's payload, NOT as XR_FALSE: the
+//! runtime drops the payload of an XR_FALSE submit and the agent would only see a
+//! generic JSON-RPC "tool handler failed". See mark_error() in the .cpp.
 DISPLAYXR_EXPORT int dxr_prov_mcp_submit_result(uint64_t call_id, int success, const uint8_t *result_json_utf8);
 
 #ifdef __cplusplus
