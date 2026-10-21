@@ -3,6 +3,7 @@
 
 using System;
 using System.Collections.Generic;
+using System.ComponentModel;
 using System.Runtime.InteropServices;
 using System.Text;
 using System.Threading.Tasks;
@@ -403,7 +404,7 @@ namespace DisplayXR
     /// <see cref="KeyUp"/>, <see cref="ButtonDown"/> / <see cref="ButtonUp"/> — whatever the agent holds is
     /// released automatically after 10 s, 2 s after its last action, on the kill switch, a lock, the
     /// user's own input or a focus change, and the actions queued behind such a release are refused),
-    /// <b>modifiers</b> around a click / drag / scroll (the <see cref="DesktopKeyModifiers"/> overloads),
+    /// <b>modifiers</b> around a click / drag / scroll (their trailing <c>modifiers</c> parameter),
     /// the <b>shell target</b> <see cref="ShellTarget"/> (input where no app window is: the top bar, the
     /// dock, the desktop, the GNOME overview, keys with nothing focused — only when the app asks for it
     /// per action) and <b>clipboard text</b> (<see cref="SetClipboardText"/> /
@@ -470,7 +471,7 @@ namespace DisplayXR
         /// The window id of input meant for the desktop SHELL rather than an app window (spec v3): the top
         /// bar / taskbar, the dock, the desktop background, the GNOME overview, and keys with no app window
         /// focused (Super, shell shortcuts). Pass it as <c>windowId</c> to the input actions
-        /// (<see cref="Click(ulong, Vector2Int, DesktopPointerButton, int)"/>, <see cref="PressKeys"/>,
+        /// (<see cref="Click(ulong, Vector2Int, DesktopPointerButton, int, DesktopKeyModifiers)"/>, <see cref="PressKeys"/>,
         /// <see cref="TypeText"/>, <see cref="KeyDown"/>, ...); window actions refuse it. It is verified the
         /// other way round: a pointer action is refused when an app window is under the point, keys and
         /// text when an app window has keyboard focus. On GNOME a paste into a freshly opened overview is
@@ -793,71 +794,63 @@ namespace DisplayXR
 
         /// <summary>Click <paramref name="count"/> times at <paramref name="at"/>; refused unless
         /// the window (or its dialog) is what is under the point at delivery time.</summary>
+        /// <param name="modifiers">Spec v3: keys held around the click (ctrl+click, shift+click), e.g.
+        /// <c>modifiers: DesktopKeyModifiers.Ctrl</c>. <see cref="DesktopKeyModifiers.None"/> (the default) is the
+        /// plain click on any runtime; with modifiers set the click needs spec v3 and completes Unsupported —
+        /// never sent as a plain click — on an older runtime.</param>
         public static Task<DesktopActionResult> Click(ulong windowId, Vector2Int at,
                                                       DesktopPointerButton button = DesktopPointerButton.Left,
-                                                      int count = 1) =>
+                                                      int count = 1,
+                                                      DesktopKeyModifiers modifiers = DesktopKeyModifiers.None) =>
             Submit(new NativeAction
             {
                 actionType = 13, targetWindowId = windowId, x = at.x, y = at.y,
                 button = (int)button, clickCount = (uint)Math.Max(1, count),
-            });
+            }, modifiers: modifiers);
 
         /// <summary>Hold <paramref name="button"/> from <paramref name="from"/> to <paramref name="to"/>;
         /// the start point is verified against the window.</summary>
+        /// <param name="modifiers">Spec v3: keys held around the drag (alt+drag); see
+        /// <see cref="Click(ulong, Vector2Int, DesktopPointerButton, int, DesktopKeyModifiers)"/>.</param>
         public static Task<DesktopActionResult> Drag(ulong windowId, Vector2Int from, Vector2Int to,
-                                                     DesktopPointerButton button = DesktopPointerButton.Left) =>
+                                                     DesktopPointerButton button = DesktopPointerButton.Left,
+                                                     DesktopKeyModifiers modifiers = DesktopKeyModifiers.None) =>
             Submit(new NativeAction
             {
                 actionType = 14, targetWindowId = windowId, x = from.x, y = from.y, x2 = to.x, y2 = to.y,
                 button = (int)button,
-            });
+            }, modifiers: modifiers);
 
         /// <summary>Scroll by notches at <paramref name="at"/>: <paramref name="dx"/> +right,
         /// <paramref name="dy"/> +down.</summary>
-        public static Task<DesktopActionResult> Scroll(ulong windowId, Vector2Int at, int dx, int dy) =>
-            Submit(new NativeAction
-            {
-                actionType = 15, targetWindowId = windowId, x = at.x, y = at.y, scrollX = dx, scrollY = dy,
-            });
-
-        // ---------------------------------------------------------------- spec v3: modifiers, held input
-
-        /// <summary>
-        /// <see cref="Click(ulong, Vector2Int, DesktopPointerButton, int)"/> with <paramref name="modifiers"/>
-        /// held around it (ctrl+click, shift+click; spec v3). <see cref="DesktopKeyModifiers.None"/> is the
-        /// plain click and works on any runtime; with modifiers set it needs spec v3 and is Unsupported —
-        /// never sent as a plain click — on an older runtime.
-        /// </summary>
-        public static Task<DesktopActionResult> Click(ulong windowId, Vector2Int at, DesktopKeyModifiers modifiers,
-                                                      DesktopPointerButton button = DesktopPointerButton.Left,
-                                                      int count = 1) =>
-            Submit(new NativeAction
-            {
-                actionType = 13, targetWindowId = windowId, x = at.x, y = at.y,
-                button = (int)button, clickCount = (uint)Math.Max(1, count),
-            }, modifiers: modifiers);
-
-        /// <summary><see cref="Drag(ulong, Vector2Int, Vector2Int, DesktopPointerButton)"/> with
-        /// <paramref name="modifiers"/> held around it (alt+drag; spec v3, see
-        /// <see cref="Click(ulong, Vector2Int, DesktopKeyModifiers, DesktopPointerButton, int)"/>).</summary>
-        public static Task<DesktopActionResult> Drag(ulong windowId, Vector2Int from, Vector2Int to,
-                                                     DesktopKeyModifiers modifiers,
-                                                     DesktopPointerButton button = DesktopPointerButton.Left) =>
-            Submit(new NativeAction
-            {
-                actionType = 14, targetWindowId = windowId, x = from.x, y = from.y, x2 = to.x, y2 = to.y,
-                button = (int)button,
-            }, modifiers: modifiers);
-
-        /// <summary><see cref="Scroll(ulong, Vector2Int, int, int)"/> with <paramref name="modifiers"/> held
-        /// around it (ctrl+scroll to zoom; spec v3, see
-        /// <see cref="Click(ulong, Vector2Int, DesktopKeyModifiers, DesktopPointerButton, int)"/>).</summary>
+        /// <param name="modifiers">Spec v3: keys held around the scroll (ctrl+scroll to zoom); see
+        /// <see cref="Click(ulong, Vector2Int, DesktopPointerButton, int, DesktopKeyModifiers)"/>.</param>
         public static Task<DesktopActionResult> Scroll(ulong windowId, Vector2Int at, int dx, int dy,
-                                                       DesktopKeyModifiers modifiers) =>
+                                                       DesktopKeyModifiers modifiers = DesktopKeyModifiers.None) =>
             Submit(new NativeAction
             {
                 actionType = 15, targetWindowId = windowId, x = at.x, y = at.y, scrollX = dx, scrollY = dy,
             }, modifiers: modifiers);
+
+        // The v2.29.0 signatures without defaults, kept so a method group converted to the old exact delegate
+        // type (Func<ulong, Vector2Int, DesktopPointerButton, int, Task<DesktopActionResult>> f = Click) still
+        // compiles. A call that supplies every argument binds here (no default substituted, so it is the
+        // better overload, never ambiguous); every shorter call binds to the methods above.
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        public static Task<DesktopActionResult> Click(ulong windowId, Vector2Int at, DesktopPointerButton button,
+                                                      int count) =>
+            Click(windowId, at, button, count, DesktopKeyModifiers.None);
+
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        public static Task<DesktopActionResult> Drag(ulong windowId, Vector2Int from, Vector2Int to,
+                                                     DesktopPointerButton button) =>
+            Drag(windowId, from, to, button, DesktopKeyModifiers.None);
+
+        [EditorBrowsable(EditorBrowsableState.Never)]
+        public static Task<DesktopActionResult> Scroll(ulong windowId, Vector2Int at, int dx, int dy) =>
+            Scroll(windowId, at, dx, dy, DesktopKeyModifiers.None);
+
+        // ---------------------------------------------------------------- spec v3: held input
 
         /// <summary>
         /// Press and HOLD one key (spec v3): <paramref name="key"/> names exactly one key or one modifier —
