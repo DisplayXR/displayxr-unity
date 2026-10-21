@@ -51,7 +51,7 @@
 // polls, and the worker waits out its whole timeout before either moves on. On
 // Windows/Linux a worker polls for itself and has no such dependency.
 //
-// Spec v3 (PROPOSED, runtime spec §11) adds held keys / buttons (KEY_DOWN / KEY_UP /
+// Spec v3 (runtime spec §11, ADR-056 Amendment 3) adds held keys / buttons (KEY_DOWN / KEY_UP /
 // BUTTON_DOWN / BUTTON_UP), modifiers held around a CLICK / DRAG / SCROLL (a chained
 // XrDesktopActionModifiersDXR), the shell target (XR_DESKTOP_TARGET_SHELL_DXR) and
 // clipboard text (SET / GET_CLIPBOARD_TEXT + xrGetDesktopClipboardTextDXR). All of it

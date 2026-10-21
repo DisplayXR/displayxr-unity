@@ -935,7 +935,7 @@ typedef XrResult (XRAPI_PTR *PFN_xrSubmitMCPToolResultDXR)(XrSession session, ui
 // the app. Mirrors the runtime's XR_DXR_desktop_control.h (spec v3, provisional
 // numbers); see native~/displayxr_xrprovider/displayxr_provider_desktop.h.
 // Spec v2 adds screen capture as a second consent scope (runtime spec §10); spec v3
-// (PROPOSED, runtime spec §11) adds held keys / buttons, modifiers around a pointer
+// (runtime spec §11, ADR-056 Amendment 3) adds held keys / buttons, modifiers around a pointer
 // action, the shell target and clipboard text. The provider gates every v2 / v3 call
 // on the version the runtime ADVERTISED, never on this mirror's SPEC_VERSION.
 // ---------------------------------------------------------------------------

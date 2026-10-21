@@ -399,7 +399,7 @@ namespace DisplayXR
     /// runtime whose extension predates spec v2 <see cref="CaptureState"/> is Unsupported and every
     /// capture completes with <see cref="DesktopActionStatus.Unsupported"/>; the rest is unchanged.</para>
     ///
-    /// <para><b>Spec v3</b> (proposed; needs a runtime that advertises <c>XR_DXR_desktop_control</c>
+    /// <para><b>Spec v3</b> (needs a runtime that advertises <c>XR_DXR_desktop_control</c>
     /// version 3, see <see cref="SpecVersion"/>) adds <b>held input</b> (<see cref="KeyDown"/> /
     /// <see cref="KeyUp"/>, <see cref="ButtonDown"/> / <see cref="ButtonUp"/> — whatever the agent holds is
     /// released automatically after 10 s, 2 s after its last action, on the kill switch, a lock, the
