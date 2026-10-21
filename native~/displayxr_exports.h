@@ -446,7 +446,9 @@ DISPLAYXR_EXPORT int displayxr_linux_window_handle(char *buf, int len);
 /// Read-only desktop info for an app's agent (GNOME; native-Wayland and X11 players
 /// alike): what the DisplayXR GNOME extension's read-only members and mutter's
 /// DisplayConfig give any client without consent. NO window titles or UI text, by
-/// design (those come from DisplayXRDesktop after the user's consent). Records and
+/// design (those come from DisplayXRDesktop after the user's consent). The C# binding
+/// serves windows / window_at / pointer only while the app's desktop control is
+/// GRANTED (ADR-056); monitors and xroot_scale are ungated. Records and
 /// coordinates: displayxr_linux_desktop_info.h — everything is in mutter's stage
 /// coordinates (logical desktop px in its logical layout mode). Any thread; results
 /// are cached for 100 ms (windows, pointer) / 250 ms (monitors, X root scale); a call

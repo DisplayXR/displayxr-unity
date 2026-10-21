@@ -726,11 +726,16 @@ namespace DisplayXR
         // Linux desktop info (read-only): the monitors, the windows, the window at
         // a point, the pointer and the X root scale, for an app's agent on GNOME. Linux player only;
         // elsewhere (Windows, macOS, the editor) every call returns false / empty /
-        // 0. No consent is needed and none is asked: it is only what the DisplayXR
-        // GNOME extension's read-only members (runtime spec
-        // wayland-window-geometry.md §12.4) and mutter's DisplayConfig give any
-        // client. No window titles and no UI text, by design: those come from
-        // DisplayXRDesktop (ListWindows, GetTextAt) after the user's consent.
+        // 0. It is only what the DisplayXR GNOME extension's read-only members
+        // (runtime spec wayland-window-geometry.md §12.4) and mutter's DisplayConfig
+        // give any client. No window titles and no UI text, by design: those come
+        // from DisplayXRDesktop (ListWindows, GetTextAt) after the user's consent.
+        // Consent policy (runtime ADR-056): the monitors and the X root scale are
+        // always available. What tells the agent about OTHER apps (the window list,
+        // the window at a point, the focused window, the pointer) needs this app's
+        // desktop control GRANTED (DisplayXRDesktop.State == Granted): before that,
+        // LinuxWindows / LinuxWindowAt / LinuxPointer return false (empty), with one
+        // log line, "needs desktop control granted". None of them ever asks.
         // ---------------------------------------------------------------------
 
         /// <summary>
@@ -873,6 +878,9 @@ namespace DisplayXR
         /// the desktop. No titles (see <see cref="LinuxWindowInfo"/>). Returns false,
         /// with an empty array, when not available: not a Linux player, no DisplayXR
         /// GNOME extension (not installed, disabled, not GNOME), or no session bus.
+        /// <b>Needs desktop control granted</b> (<see cref="DisplayXRDesktop.State"/> ==
+        /// <see cref="DesktopControlState.Granted"/>): before that, false and an empty
+        /// array (see the policy note above <see cref="LinuxMonitor"/>).
         /// Any thread. The answer is cached for 100 ms; a call that refreshes it waits
         /// for a D-Bus round trip or two (about a millisecond each; the monitor list is
         /// refreshed too when it is due). A D-Bus call gives up after 250 ms, and after
@@ -882,7 +890,7 @@ namespace DisplayXR
         {
             windows = Array.Empty<LinuxWindowInfo>();
 #if UNITY_STANDALONE_LINUX && !UNITY_EDITOR
-            if (s_LinuxDesktopMissing) return false;
+            if (s_LinuxDesktopMissing || !LinuxDesktopControlGranted("LinuxWindows")) return false;
             try
             {
                 var raw = t_LinuxWindowBuf ?? (t_LinuxWindowBuf = new NativeLinuxWindow[64]);
@@ -930,7 +938,8 @@ namespace DisplayXR
         /// Returns false, and a default <paramref name="window"/>, when no app window is
         /// there: the desktop background (or a desktop-icons window), shell UI (the top
         /// bar, the overview), a point on no monitor, the screen locked; and when not
-        /// available (not a Linux player, no extension).
+        /// available (not a Linux player, no extension), and while this app's desktop
+        /// control is not <see cref="DesktopControlState.Granted"/>.
         /// Any thread. The same point is answered from a 100 ms cache; another point
         /// costs a D-Bus round trip (about a millisecond; a D-Bus call gives up after
         /// 250 ms).
@@ -939,7 +948,7 @@ namespace DisplayXR
         {
             window = default;
 #if UNITY_STANDALONE_LINUX && !UNITY_EDITOR
-            if (s_LinuxDesktopMissing) return false;
+            if (s_LinuxDesktopMissing || !LinuxDesktopControlGranted("LinuxWindowAt")) return false;
             try
             {
                 NativeLinuxWindow w;
@@ -968,7 +977,8 @@ namespace DisplayXR
         /// Wayland app is otherwise only told while the pointer is over its own
         /// window). From the DisplayXR GNOME extension, version 16 or newer. Returns
         /// false (and (0, 0)) when not available: not a Linux player, no extension or an
-        /// older one, or the screen is locked.
+        /// older one, or the screen is locked; and while this app's desktop control is
+        /// not <see cref="DesktopControlState.Granted"/>.
         /// Any thread. The answer is cached for 100 ms: after moving the pointer, ask
         /// again at least 100 ms later to see the new position.
         /// </summary>
@@ -976,7 +986,7 @@ namespace DisplayXR
         {
             position = default;
 #if UNITY_STANDALONE_LINUX && !UNITY_EDITOR
-            if (s_LinuxDesktopMissing) return false;
+            if (s_LinuxDesktopMissing || !LinuxDesktopControlGranted("LinuxPointer")) return false;
             try
             {
                 if (displayxr_linux_pointer(out int x, out int y) == 0) return false;
@@ -1057,6 +1067,27 @@ namespace DisplayXR
 
         // A native plug-in older than these exports: every call answers "not available".
         private static volatile bool s_LinuxDesktopMissing;
+
+        // The consent gate (runtime ADR-056): what tells the agent about other apps needs
+        // this app's desktop control granted. One log line per refusal streak, not per
+        // call (agents poll these every frame); a grant re-arms it.
+        private static volatile bool s_LinuxGateLogged;
+
+        private static bool LinuxDesktopControlGranted(string what)
+        {
+            if (DisplayXRDesktop.State == DesktopControlState.Granted)
+            {
+                s_LinuxGateLogged = false;
+                return true;
+            }
+            if (!s_LinuxGateLogged)
+            {
+                s_LinuxGateLogged = true;
+                Debug.Log($"[DisplayXR] {what}: needs desktop control granted (DisplayXRDesktop.Request); " +
+                          "returning nothing until then");
+            }
+            return false;
+        }
 
         // Per-thread native buffers, reused: per-frame polling allocates only the result.
         [ThreadStatic] private static NativeLinuxMonitor[] t_LinuxMonitorBuf;

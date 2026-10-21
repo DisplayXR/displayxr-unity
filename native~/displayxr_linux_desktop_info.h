@@ -20,6 +20,9 @@
 // is what the GNOME extension's read-only members give any client without consent
 // (runtime spec wayland-window-geometry.md §12.4): frames, focus, pid, app id,
 // monitor geometry and scale, the pointer position.
+// The C# binding (DisplayXRNative) still gates the window list, the window at a
+// point and the pointer on the app's desktop control being GRANTED (runtime
+// ADR-056); only the monitors and the X root scale are served before consent.
 
 #pragma once
 
