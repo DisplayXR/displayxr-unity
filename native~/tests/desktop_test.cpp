@@ -854,6 +854,34 @@ main()
 	}
 	g_pump_refuses = false;
 
+	// --- The macOS trap (documented on dxr_prov_desktop_capture_wait): a worker whose pump
+	// may not poll, while the main thread, the only poller there, is blocked joining it.
+	// The completion is in the runtime's queue the whole time, yet the worker waits out its
+	// full timeout; it is not taken off the queue until the main thread polls again, and
+	// then dropped, because the worker has given up on it.
+	g_pump_refuses = true;
+	CHECK(dxr_prov_desktop_capture_waitable(&ci, &wid) == XR_SUCCESS);
+	rt_push(capture_completed(s1, wid, XR_SUCCESS, 8, 8));
+	{
+		std::atomic<int> wr{99};
+		std::atomic<long> wt{0};
+		uint64_t want = wid;
+		std::thread worker([&] {
+			DxrDesktopEvent e2;
+			clk::time_point a = clk::now();
+			wr = dxr_prov_desktop_capture_wait(want, 150, &e2);
+			wt = ms_since(a);
+			if (wr == 0) dxr_prov_desktop_capture_abandon(want); // what C# does on a timeout
+		});
+		worker.join(); // the main thread polls nothing meanwhile
+		CHECK(wr == 0);
+		CHECK(wt >= 145 && wt < 1000);
+	}
+	g_pump_refuses = false;
+	CHECK(fake_pump() == 1); // the main thread's next poll: routed to the abandoned waiter
+	CHECK(dxr_prov_desktop_next_event(&ev) == 0);
+	CHECK(dxr_prov_desktop_capture_wait(wid, 0, &ev) == DXR_DESKTOP_E_BAD_ARGUMENT);
+
 	// --- An async capture still completes through C#'s queue, next to a waiter.
 	uint64_t aid = 0;
 	CHECK(dxr_prov_desktop_capture(&ci, &aid) == XR_SUCCESS && aid != 0);

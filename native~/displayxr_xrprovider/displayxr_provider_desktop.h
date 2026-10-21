@@ -46,6 +46,10 @@
 // other event is handed back to the regular poller, in order. The pump is
 // serialised with the regular poll and with session teardown, never blocks, and
 // on macOS runs on the main thread only (the runtime's poll drives AppKit there).
+// So on macOS a worker thread's wait ends only through the main thread's own
+// per-frame poll: if the main thread is blocked on that worker (a join), nothing
+// polls, and the worker waits out its whole timeout before either moves on. On
+// Windows/Linux a worker polls for itself and has no such dependency.
 //
 // The Dxr* structs below are the C# ABI: blittable, fixed layout, no pointers.
 // Their sizes and offsets are pinned by static_asserts in the .cpp and mirrored by
@@ -236,7 +240,9 @@ DISPLAYXR_EXPORT int dxr_prov_desktop_capture_waitable(const DxrDesktopCaptureIn
 //! still in flight (wait again, or abandon it); DXR_DESKTOP_E_NO_SESSION when the
 //! session ended (it will never complete; forgotten); DXR_DESKTOP_E_BAD_ARGUMENT for
 //! an id that is not a waitable capture (any more). Any thread; returns within
-//! @p timeout_ms plus one non-blocking poll.
+//! @p timeout_ms plus one non-blocking poll. On a macOS worker thread the poll is
+//! the main thread's (see the header comment): a main thread blocked on this
+//! thread means 0 after the full @p timeout_ms, every time.
 DISPLAYXR_EXPORT int dxr_prov_desktop_capture_wait(uint64_t capture_id, uint32_t timeout_ms, DxrDesktopEvent *ev);
 
 //! Give up on a waitable capture: its completion, if it still comes, is dropped

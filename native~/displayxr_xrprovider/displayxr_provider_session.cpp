@@ -4554,7 +4554,8 @@ static void ps_pump_enable(int on)
 static int ps_pump_for_waiter(void)
 {
 #ifdef __APPLE__
-	// A worker thread waits for the main thread's own poll (LateUpdate) instead.
+	// A worker thread waits for the main thread's own poll (LateUpdate) instead, so a
+	// main thread blocked joining it leaves it to wait out its whole timeout.
 	if (!pthread_main_np()) return 0;
 #endif
 	std::unique_lock<std::mutex> lk(s_poll_mx, std::try_to_lock);
