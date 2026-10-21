@@ -5,7 +5,11 @@
 // against a fake runtime: entry-point resolution, pass-through of every
 // observation call, every submit field marshalled, UTF-8 (Chinese + emoji) intact
 // both ways, events queued FIFO / bounded / coalesced / filtered by session, and
-// clean failure codes with no extension or no session. No Unity, no real runtime.
+// clean failure codes with no extension or no session. Spec v2 screen capture: the
+// scope / parent-window chain (parent passed verbatim, spaces included), every
+// capture field marshalled, the two-call image fetch, capture events, and a v1
+// runtime (or missing capture entry points) leaving v1 untouched and capture
+// reporting E_NO_CAPTURE. No Unity, no real runtime.
 //
 //   c++ -std=c++17 -I native~/displayxr_xrprovider -I <openxr include>
 //       native~/tests/desktop_test.cpp native~/displayxr_xrprovider/displayxr_provider_desktop.cpp
@@ -39,6 +43,16 @@ static const char *kTextZh = "你好，世界 👋🏽 café";
 struct Fake
 {
 	bool omit_submit = false; // gipa does not resolve xrSubmitDesktopActionDXR
+	bool omit_capture_image = false; // gipa does not resolve xrGetDesktopCaptureImageDXR
+	// Request chain as seen by the runtime (spec v2).
+	bool request_had_scope = false, request_had_parent = false;
+	uint64_t request_scopes = 0;
+	std::string request_parent;
+	// Capture.
+	XrDesktopControlStateDXR capture_state = XR_DESKTOP_CONTROL_STATE_NOT_REQUESTED_DXR;
+	XrDesktopCaptureInfoDXR last_capture;
+	std::vector<uint8_t> image;
+	uint64_t image_id = 0;
 	XrResult force = XR_SUCCESS; // returned by every observation call when failing
 	XrSession last_session = XR_NULL_HANDLE;
 	XrDesktopControlStateDXR state = XR_DESKTOP_CONTROL_STATE_GRANTED_DXR;
@@ -74,6 +88,21 @@ f_request(XrSession s, const XrDesktopControlRequestInfoDXR *info)
 	F.request_had_info = info != nullptr;
 	F.reason = (info && info->reason) ? info->reason : "";
 	if (info && info->type != XR_TYPE_DESKTOP_CONTROL_REQUEST_INFO_DXR) return XR_ERROR_VALIDATION_FAILURE;
+	F.request_had_scope = F.request_had_parent = false;
+	F.request_scopes = 0;
+	F.request_parent.clear();
+	for (const XrBaseInStructure *n = info ? (const XrBaseInStructure *)info->next : nullptr; n; n = n->next) {
+		if (n->type == XR_TYPE_DESKTOP_CONTROL_REQUEST_SCOPE_DXR) {
+			F.request_had_scope = true;
+			F.request_scopes = ((const XrDesktopControlRequestScopeDXR *)n)->scopes;
+		} else if (n->type == XR_TYPE_DESKTOP_CONTROL_PARENT_WINDOW_DXR) {
+			const char *pw = ((const XrDesktopControlParentWindowDXR *)n)->parentWindow;
+			F.request_had_parent = true;
+			F.request_parent = pw ? pw : "";
+		} else {
+			return XR_ERROR_VALIDATION_FAILURE; // nothing else is ever chained
+		}
+	}
 	F.state = XR_DESKTOP_CONTROL_STATE_PENDING_DXR;
 	return XR_SUCCESS;
 }
@@ -149,6 +178,40 @@ f_submit(XrSession s, const XrDesktopActionDXR *a, uint64_t *id)
 	return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL
+f_capture_state(XrSession s, XrDesktopControlStateDXR *st)
+{
+	F.calls++;
+	F.last_session = s;
+	if (F.force != XR_SUCCESS) return F.force;
+	*st = F.capture_state;
+	return XR_SUCCESS;
+}
+static XrResult XRAPI_CALL
+f_capture(XrSession s, const XrDesktopCaptureInfoDXR *info, uint64_t *id)
+{
+	F.calls++;
+	F.last_session = s;
+	if (F.force != XR_SUCCESS) return F.force;
+	if (info->type != XR_TYPE_DESKTOP_CAPTURE_INFO_DXR || info->next != nullptr) return XR_ERROR_VALIDATION_FAILURE;
+	if (info->maxWidth == 0 || info->maxWidth > 8192) return XR_ERROR_VALIDATION_FAILURE;
+	F.last_capture = *info;
+	*id = F.next_id++;
+	return XR_SUCCESS;
+}
+static XrResult XRAPI_CALL
+f_capture_image(XrSession s, uint64_t id, uint32_t cap, uint32_t *count, uint8_t *rgba)
+{
+	F.calls++;
+	F.last_session = s;
+	if (id == 0 || id != F.image_id) return XR_ERROR_VALIDATION_FAILURE;
+	*count = (uint32_t)F.image.size();
+	if (cap == 0) return XR_SUCCESS;
+	if (cap < F.image.size()) return XR_ERROR_SIZE_INSUFFICIENT;
+	memcpy(rgba, F.image.data(), F.image.size());
+	F.image_id = 0; // copied out: the runtime frees it
+	return XR_SUCCESS;
+}
+static XrResult XRAPI_CALL
 f_gipa(XrInstance, const char *name, PFN_xrVoidFunction *fn)
 {
 	*fn = nullptr;
@@ -159,6 +222,10 @@ f_gipa(XrInstance, const char *name, PFN_xrVoidFunction *fn)
 	if (!strcmp(name, "xrPickDesktopDXR")) *fn = (PFN_xrVoidFunction)f_pick;
 	if (!strcmp(name, "xrGetDesktopTextAtDXR")) *fn = (PFN_xrVoidFunction)f_text_at;
 	if (!strcmp(name, "xrSubmitDesktopActionDXR") && !F.omit_submit) *fn = (PFN_xrVoidFunction)f_submit;
+	if (!strcmp(name, "xrGetDesktopCaptureStateDXR")) *fn = (PFN_xrVoidFunction)f_capture_state;
+	if (!strcmp(name, "xrCaptureDesktopDXR")) *fn = (PFN_xrVoidFunction)f_capture;
+	if (!strcmp(name, "xrGetDesktopCaptureImageDXR") && !F.omit_capture_image)
+		*fn = (PFN_xrVoidFunction)f_capture_image;
 	return *fn ? XR_SUCCESS : XR_ERROR_FUNCTION_UNSUPPORTED;
 }
 
@@ -214,6 +281,17 @@ push_state(XrSession s, XrDesktopControlStateDXR st)
 	XrEventDataBuffer ev = {XR_TYPE_EVENT_DATA_BUFFER};
 	XrEventDataDesktopControlStateChangedDXR *c = (XrEventDataDesktopControlStateChangedDXR *)&ev;
 	c->type = XR_TYPE_EVENT_DATA_DESKTOP_CONTROL_STATE_CHANGED_DXR;
+	c->session = s;
+	c->state = st;
+	CHECK(dxr_desktop_handle_event(&ev) == 1);
+}
+
+static void
+push_capture_state(XrSession s, XrDesktopControlStateDXR st)
+{
+	XrEventDataBuffer ev = {XR_TYPE_EVENT_DATA_BUFFER};
+	XrEventDataDesktopCaptureStateChangedDXR *c = (XrEventDataDesktopCaptureStateChangedDXR *)&ev;
+	c->type = XR_TYPE_EVENT_DATA_DESKTOP_CAPTURE_STATE_CHANGED_DXR;
 	c->session = s;
 	c->state = st;
 	CHECK(dxr_desktop_handle_event(&ev) == 1);
@@ -487,6 +565,151 @@ main()
 	push_completed(s2, 7001, XR_SUCCESS, nullptr);
 	CHECK(dxr_prov_desktop_next_event(&ev) == 1 && ev.action_id == 7001);
 	dxr_desktop_on_session_destroying();
+
+	// ================================================================ spec v2: capture
+
+	DxrDesktopCaptureInfo ci;
+	memset(&ci, 0, sizeof(ci));
+	ci.target = XR_DESKTOP_CAPTURE_TARGET_REGION_DXR;
+	ci.max_width = ci.max_height = 512;
+	ci.width = ci.height = 10;
+
+	// --- A spec v1 runtime (even one that would resolve the capture PFNs): v1 untouched,
+	// capture E_NO_CAPTURE, never a chained struct.
+	dxr_desktop_on_instance(inst, f_gipa, 1, quiet);
+	dxr_desktop_on_session_created(s1);
+	CHECK(dxr_prov_desktop_available() == 1 && dxr_prov_desktop_capture_available() == 0);
+	before = F.calls;
+	st = 42;
+	CHECK(dxr_prov_desktop_get_capture_state(&st) == DXR_DESKTOP_E_NO_CAPTURE && st == 0);
+	CHECK(dxr_prov_desktop_capture(&ci, &id) == DXR_DESKTOP_E_NO_CAPTURE && id == 0);
+	CHECK(dxr_prov_desktop_capture_image(1, 0, &count, nullptr) == DXR_DESKTOP_E_NO_CAPTURE);
+	CHECK(dxr_prov_desktop_request_scopes(nullptr, DXR_DESKTOP_SCOPE_CAPTURE, u8("x11:4a00007")) ==
+	      DXR_DESKTOP_E_NO_CAPTURE);
+	CHECK(F.calls == before);
+	CHECK(dxr_prov_desktop_request_scopes(u8("why"), DXR_DESKTOP_SCOPE_CONTROL | DXR_DESKTOP_SCOPE_CAPTURE |
+	                                                     DXR_DESKTOP_SCOPE_ASK_AGAIN,
+	                                      u8("x11:4a00007")) == XR_SUCCESS);
+	CHECK(F.request_had_info && F.reason == "why" && !F.request_had_scope && !F.request_had_parent);
+	CHECK(dxr_prov_desktop_request_scopes(nullptr, DXR_DESKTOP_SCOPE_CONTROL, u8("x11:1")) == XR_SUCCESS);
+	CHECK(!F.request_had_info);
+	CHECK(dxr_prov_desktop_request(u8("v1")) == XR_SUCCESS && F.reason == "v1" && !F.request_had_scope);
+	dxr_desktop_on_session_destroying();
+
+	// --- v2 advertised but one capture entry point missing: v1 on, capture off ----
+	F.omit_capture_image = true;
+	dxr_desktop_on_instance(inst, f_gipa, 2, quiet);
+	dxr_desktop_on_session_created(s1);
+	CHECK(dxr_prov_desktop_available() == 1 && dxr_prov_desktop_capture_available() == 0);
+	CHECK(dxr_prov_desktop_capture(&ci, &id) == DXR_DESKTOP_E_NO_CAPTURE);
+	CHECK(dxr_prov_desktop_get_state(&st, &caps) == XR_SUCCESS);
+	dxr_desktop_on_session_destroying();
+	F.omit_capture_image = false;
+
+	// --- v2: no session / bad arguments ------------------------------------------
+	dxr_desktop_on_instance(inst, f_gipa, 2, quiet);
+	CHECK(dxr_prov_desktop_capture_available() == 0);
+	CHECK(dxr_prov_desktop_capture(&ci, &id) == DXR_DESKTOP_E_NO_SESSION);
+	CHECK(dxr_prov_desktop_get_capture_state(nullptr) == DXR_DESKTOP_E_BAD_ARGUMENT);
+	CHECK(dxr_prov_desktop_capture(nullptr, &id) == DXR_DESKTOP_E_BAD_ARGUMENT);
+	CHECK(dxr_prov_desktop_capture_image(1, 4, &count, nullptr) == DXR_DESKTOP_E_BAD_ARGUMENT);
+
+	// --- v2 session -------------------------------------------------------------
+	dxr_desktop_on_session_created(s2);
+	CHECK(dxr_prov_desktop_capture_available() == 1);
+	CHECK(dxr_prov_desktop_get_capture_state(&st) == XR_SUCCESS && st == XR_DESKTOP_CONTROL_STATE_NOT_REQUESTED_DXR);
+	CHECK(F.last_session == s2);
+
+	// Request: scopes + ASK_AGAIN + a Wayland handle with spaces (leading, inner,
+	// trailing) and a quote, passed byte for byte.
+	const char *wl = "wayland: aB3 \"x~ Q9 ";
+	CHECK(dxr_prov_desktop_request_scopes(u8("看屏幕"), DXR_DESKTOP_SCOPE_CONTROL | DXR_DESKTOP_SCOPE_CAPTURE |
+	                                                        DXR_DESKTOP_SCOPE_ASK_AGAIN,
+	                                      u8(wl)) == XR_SUCCESS);
+	CHECK(F.request_had_info && F.reason == "看屏幕" && F.request_had_scope);
+	CHECK(F.request_scopes == (0x1 | 0x2 | 0x100) && F.request_had_parent && F.request_parent == wl);
+	// No reason, no parent, scopes 0 = CONTROL (the v1 default), never an empty parent struct.
+	CHECK(dxr_prov_desktop_request_scopes(nullptr, 0, u8("")) == XR_SUCCESS);
+	CHECK(F.request_had_info && F.reason.empty() && F.request_had_scope && F.request_scopes == 0x1);
+	CHECK(!F.request_had_parent);
+	CHECK(dxr_prov_desktop_request_scopes(nullptr, DXR_DESKTOP_SCOPE_CAPTURE, nullptr) == XR_SUCCESS);
+	CHECK(F.request_scopes == 0x2 && !F.request_had_parent);
+	// Unknown bits never reach the runtime.
+	CHECK(dxr_prov_desktop_request_scopes(nullptr, 0x2 | 0x80, u8("x11:4a00007")) == XR_SUCCESS);
+	CHECK(F.request_scopes == 0x2 && F.request_parent == "x11:4a00007");
+	// The v1 export is unchanged against a v2 runtime too: no chain.
+	CHECK(dxr_prov_desktop_request(u8("r")) == XR_SUCCESS && !F.request_had_scope && !F.request_had_parent);
+
+	// Capture: every field marshalled.
+	DxrDesktopCaptureInfo w = ci;
+	w.target = XR_DESKTOP_CAPTURE_TARGET_WINDOW_DXR;
+	w.window_id = 0xABCDEF0123ull;
+	w.x = -1920;
+	w.y = -8;
+	w.width = 1280;
+	w.height = 720;
+	w.max_width = 640;
+	w.max_height = 8192;
+	uint64_t cid = 0;
+	CHECK(dxr_prov_desktop_capture(&w, &cid) == XR_SUCCESS && cid != 0);
+	CHECK(F.last_capture.target == XR_DESKTOP_CAPTURE_TARGET_WINDOW_DXR && F.last_capture.windowId == 0xABCDEF0123ull);
+	CHECK(F.last_capture.region.offset.x == -1920 && F.last_capture.region.offset.y == -8);
+	CHECK(F.last_capture.region.extent.width == 1280 && F.last_capture.region.extent.height == 720);
+	CHECK(F.last_capture.maxWidth == 640 && F.last_capture.maxHeight == 8192);
+	DxrDesktopCaptureInfo badc = ci;
+	badc.max_width = 0;
+	CHECK(dxr_prov_desktop_capture(&badc, &id) == XR_ERROR_VALIDATION_FAILURE && id == 0);
+	F.force = XR_ERROR_DESKTOP_CONTROL_NOT_GRANTED_DXR;
+	CHECK(dxr_prov_desktop_capture(&ci, &id) == XR_ERROR_DESKTOP_CONTROL_NOT_GRANTED_DXR && id == 0);
+	F.force = XR_ERROR_LIMIT_REACHED;
+	CHECK(dxr_prov_desktop_capture(&ci, &id) == XR_ERROR_LIMIT_REACHED);
+	F.force = XR_SUCCESS;
+
+	// Completion event: every field; capture state coalesces apart from CONTROL's.
+	{
+		XrEventDataBuffer raw = {XR_TYPE_EVENT_DATA_BUFFER};
+		XrEventDataDesktopCaptureCompletedDXR *cc = (XrEventDataDesktopCaptureCompletedDXR *)&raw;
+		cc->type = XR_TYPE_EVENT_DATA_DESKTOP_CAPTURE_COMPLETED_DXR;
+		cc->session = s2;
+		cc->captureId = cid;
+		cc->result = XR_SUCCESS;
+		cc->width = 3;
+		cc->height = 2;
+		cc->sourceRect = {{-1920, -8}, {1280, 720}};
+		cc->frameTime = 123456789012345ll;
+		strncpy(cc->message, "ok ✓", sizeof(cc->message) - 1);
+		push_capture_state(s2, XR_DESKTOP_CONTROL_STATE_PENDING_DXR);
+		push_state(s2, XR_DESKTOP_CONTROL_STATE_GRANTED_DXR);
+		CHECK(dxr_desktop_handle_event(&raw) == 1);
+		push_capture_state(s2, XR_DESKTOP_CONTROL_STATE_GRANTED_DXR); // replaces PENDING only
+		push_capture_state(s1, XR_DESKTOP_CONTROL_STATE_DENIED_DXR);  // stale session: dropped
+	}
+	CHECK(dxr_prov_desktop_next_event(&ev) == 1 && ev.kind == DXR_DESKTOP_EVENT_STATE_CHANGED);
+	CHECK(ev.state == XR_DESKTOP_CONTROL_STATE_GRANTED_DXR);
+	CHECK(dxr_prov_desktop_next_event(&ev) == 1 && ev.kind == DXR_DESKTOP_EVENT_CAPTURE_COMPLETED);
+	CHECK(ev.action_id == cid && ev.result == XR_SUCCESS && ev.width == 3 && ev.height == 2);
+	CHECK(ev.src_x == -1920 && ev.src_y == -8 && ev.src_width == 1280 && ev.src_height == 720);
+	CHECK(ev.frame_time == 123456789012345ll && str(ev.message) == "ok ✓");
+	CHECK(dxr_prov_desktop_next_event(&ev) == 1 && ev.kind == DXR_DESKTOP_EVENT_CAPTURE_STATE_CHANGED);
+	CHECK(ev.state == XR_DESKTOP_CONTROL_STATE_GRANTED_DXR);
+	CHECK(dxr_prov_desktop_next_event(&ev) == 0);
+
+	// Image: two-call in bytes, short buffer keeps it, a copy frees it, other ids fail.
+	F.image.clear();
+	for (int i = 0; i < 3 * 2 * 4; i++) F.image.push_back((uint8_t)(i * 7));
+	F.image_id = cid;
+	CHECK(dxr_prov_desktop_capture_image(cid, 0, &count, nullptr) == XR_SUCCESS && count == 24);
+	std::vector<uint8_t> img(24);
+	CHECK(dxr_prov_desktop_capture_image(cid, 8, &count, img.data()) == XR_ERROR_SIZE_INSUFFICIENT);
+	CHECK(dxr_prov_desktop_capture_image(cid + 1, 24, &count, img.data()) == XR_ERROR_VALIDATION_FAILURE);
+	CHECK(dxr_prov_desktop_capture_image(cid, 24, &count, img.data()) == XR_SUCCESS && count == 24);
+	CHECK(img == F.image);
+	CHECK(dxr_prov_desktop_capture_image(cid, 24, &count, img.data()) == XR_ERROR_VALIDATION_FAILURE);
+
+	// Session end: capture refused, capture state UNSUPPORTED.
+	dxr_desktop_on_session_destroying();
+	CHECK(dxr_prov_desktop_capture_available() == 0);
+	CHECK(dxr_prov_desktop_get_capture_state(&st) == DXR_DESKTOP_E_NO_SESSION && st == 0);
 
 	if (g_fail) {
 		fprintf(stderr, "%d of %d check(s) failed\n", g_fail, g_checks);

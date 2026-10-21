@@ -5,6 +5,20 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Screen capture for the app's agent (`XR_DXR_desktop_control` spec v2, runtime ADR-056 Amendment 1).** Capture is a second consent scope next to CONTROL; needs a runtime that advertises spec v2 (displayxr-runtime#2259 GNOME, #2260 macOS).
+  - `DisplayXRDesktop.RequestAccess(DesktopControlScopes scopes, string reason = null, bool askAgain = false)` asks for CONTROL and/or CAPTURE in one prompt. `askAgain` re-shows the prompt for scopes already granted (GNOME: change which screens are shared; macOS: opens System Settings). Ask for both scopes in the first request: on GNOME a later CAPTURE-only request shows a second dialog that asks about input again.
+  - `DisplayXRDesktop.CaptureState` + `CaptureStateChanged`, `IsCaptureAvailable`, and `DesktopControlCapabilities.Capture`.
+  - `CaptureAsync(RectInt desktopRect, maxWidth, maxHeight)`, `CaptureDesktopAsync(...)`, `CaptureWindowAsync(windowId, ...)` return a `Task<DesktopCaptureResult>`: status + message on failure; on success the RGBA8 pixels as delivered (sRGB, top row first), `SourceRect`, `FrameTime`, `ImageToDesktop(px, py)`, and `ToTexture2D()` (RGBA32, rows flipped for Unity). `Capture(RectInt)` returns the `Texture2D` directly (null + a warning on failure). A capture never prompts.
+  - On a Linux player the consent dialog is parented to the app's window: the request passes `DisplayXRNative.LinuxWindowHandle()` (`wayland:<handle>` / `x11:<hex>`, read right before each request, verbatim) as the parent window. `Request(reason)` gets it too. If the runtime refuses the handle, the request is made again without a parent (the dialog opens unparented) rather than failing.
+  - Against a runtime that only advertises spec v1, nothing changes: CONTROL is requested exactly as before (no chained structures), `CaptureState` is `Unsupported`, and captures complete with `Unsupported`.
+  - Native: `dxr_prov_desktop_request_scopes`, `_capture_available`, `_get_capture_state`, `_capture`, `_capture_image`; `DxrDesktopEvent` grew to 312 bytes (capture fields appended). `displayxr_extensions.h` mirrors the runtime header at spec v2. Unit tests cover the scope / parent-window chain, capture marshalling, the image fetch, capture events, and the v1-runtime fallback.
+
+### Fixed
+- **A desktop action submitted while the XR session was being torn down could stay pending.** The session ends on the graphics thread, and the binding read the session generation after the submit call, so a teardown in between filed the action under the new generation: its task failed only when yet another session started. The generation is now read before the call (captures do the same), so the task completes with "session ended" on the next frame.
+
 ## [2.28.0] - 2026-10-20
 
 ### Added

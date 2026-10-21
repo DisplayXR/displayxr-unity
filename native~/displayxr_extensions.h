@@ -932,11 +932,14 @@ typedef XrResult (XRAPI_PTR *PFN_xrSubmitMCPToolResultDXR)(XrSession session, ui
 // ---------------------------------------------------------------------------
 // XR_DXR_desktop_control (ADR-056): the app's agent observes and operates the
 // desktop (windows, pointer, UI text, typing, clicks); the OS consent belongs to
-// the app. Mirrors the runtime's XR_DXR_desktop_control.h (spec v1, provisional
+// the app. Mirrors the runtime's XR_DXR_desktop_control.h (spec v2, provisional
 // numbers); see native~/displayxr_xrprovider/displayxr_provider_desktop.h.
+// Spec v2 adds screen capture as a second consent scope (runtime spec §10); the
+// provider gates every v2 call on the version the runtime ADVERTISED, never on
+// this mirror's SPEC_VERSION.
 // ---------------------------------------------------------------------------
 #define XR_DXR_DESKTOP_CONTROL_EXTENSION_NAME "XR_DXR_desktop_control"
-#define XR_DXR_DESKTOP_CONTROL_SPEC_VERSION 1
+#define XR_DXR_DESKTOP_CONTROL_SPEC_VERSION 2
 
 #define XR_TYPE_DESKTOP_WINDOW_DXR                           ((XrStructureType)1004999400)
 #define XR_TYPE_DESKTOP_PICK_DXR                             ((XrStructureType)1004999401)
@@ -944,6 +947,12 @@ typedef XrResult (XRAPI_PTR *PFN_xrSubmitMCPToolResultDXR)(XrSession session, ui
 #define XR_TYPE_EVENT_DATA_DESKTOP_ACTION_COMPLETED_DXR      ((XrStructureType)1004999403)
 #define XR_TYPE_EVENT_DATA_DESKTOP_CONTROL_STATE_CHANGED_DXR ((XrStructureType)1004999404)
 #define XR_TYPE_DESKTOP_CONTROL_REQUEST_INFO_DXR             ((XrStructureType)1004999405)
+// Spec version 2 (screen capture).
+#define XR_TYPE_DESKTOP_CAPTURE_INFO_DXR                     ((XrStructureType)1004999406)
+#define XR_TYPE_EVENT_DATA_DESKTOP_CAPTURE_COMPLETED_DXR     ((XrStructureType)1004999407)
+#define XR_TYPE_DESKTOP_CONTROL_REQUEST_SCOPE_DXR            ((XrStructureType)1004999408)
+#define XR_TYPE_EVENT_DATA_DESKTOP_CAPTURE_STATE_CHANGED_DXR ((XrStructureType)1004999409)
+#define XR_TYPE_DESKTOP_CONTROL_PARENT_WINDOW_DXR            ((XrStructureType)1004999420)
 
 #define XR_ERROR_DESKTOP_CONTROL_REFUSED_DXR     ((XrResult)-1004999400)
 #define XR_ERROR_DESKTOP_CONTROL_NOT_GRANTED_DXR ((XrResult)-1004999401)
@@ -952,6 +961,8 @@ typedef XrResult (XRAPI_PTR *PFN_xrSubmitMCPToolResultDXR)(XrSession session, ui
 #define XR_MAX_DESKTOP_APP_ID_SIZE_DXR 128
 #define XR_MAX_DESKTOP_TITLE_SIZE_DXR 256
 #define XR_MAX_DESKTOP_MESSAGE_SIZE_DXR 256
+//! Spec version 2: XrDesktopControlParentWindowDXR::parentWindow, terminator included.
+#define XR_MAX_DESKTOP_PARENT_WINDOW_SIZE_DXR 256
 
 typedef enum XrDesktopControlStateDXR {
 	XR_DESKTOP_CONTROL_STATE_UNSUPPORTED_DXR = 0,
@@ -966,6 +977,11 @@ typedef enum XrDesktopControlStateDXR {
 
 typedef XrFlags64 XrDesktopControlCapabilityFlagsDXR;
 typedef XrFlags64 XrDesktopWindowStateFlagsDXR;
+//! Spec version 2: the consent scopes (and the ASK_AGAIN request modifier).
+typedef XrFlags64 XrDesktopControlScopeFlagsDXR;
+static const XrDesktopControlScopeFlagsDXR XR_DESKTOP_CONTROL_SCOPE_CONTROL_BIT_DXR = 0x00000001;
+static const XrDesktopControlScopeFlagsDXR XR_DESKTOP_CONTROL_SCOPE_CAPTURE_BIT_DXR = 0x00000002;
+static const XrDesktopControlScopeFlagsDXR XR_DESKTOP_CONTROL_SCOPE_ASK_AGAIN_BIT_DXR = 0x00000100;
 // Capability / window-state bit values are mirrored on the C# side
 // (DisplayXRDesktop.Capabilities / DesktopWindowState); the provider passes the
 // masks through unchanged, so they are not repeated here.
@@ -1044,6 +1060,59 @@ typedef struct XrDesktopControlRequestInfoDXR {
 	const char *reason;
 } XrDesktopControlRequestInfoDXR;
 
+// Spec version 2: chained on XrDesktopControlRequestInfoDXR::next. Absent = CONTROL only.
+typedef struct XrDesktopControlRequestScopeDXR {
+	XrStructureType type; // XR_TYPE_DESKTOP_CONTROL_REQUEST_SCOPE_DXR
+	const void *next;
+	XrDesktopControlScopeFlagsDXR scopes;
+} XrDesktopControlRequestScopeDXR;
+
+// Spec version 2: chained on XrDesktopControlRequestInfoDXR::next. The xdg-desktop-portal
+// parent_window string, verbatim ("wayland:<handle>" — spaces included — or "x11:<hex>").
+typedef struct XrDesktopControlParentWindowDXR {
+	XrStructureType type; // XR_TYPE_DESKTOP_CONTROL_PARENT_WINDOW_DXR
+	const void *next;
+	const char *parentWindow;
+} XrDesktopControlParentWindowDXR;
+
+typedef enum XrDesktopCaptureTargetDXR {
+	XR_DESKTOP_CAPTURE_TARGET_DESKTOP_DXR = 0,
+	XR_DESKTOP_CAPTURE_TARGET_REGION_DXR = 1,
+	XR_DESKTOP_CAPTURE_TARGET_WINDOW_DXR = 2,
+	XR_DESKTOP_CAPTURE_TARGET_MAX_ENUM_DXR = 0x7FFFFFFF
+} XrDesktopCaptureTargetDXR;
+
+// Spec version 2: one still, RGBA8 sRGB, straight alpha, TOP row first, stride width*4.
+typedef struct XrDesktopCaptureInfoDXR {
+	XrStructureType type; // XR_TYPE_DESKTOP_CAPTURE_INFO_DXR
+	const void *next;
+	XrDesktopCaptureTargetDXR target;
+	uint64_t windowId;  // WINDOW
+	XrRect2Di region;   // REGION, desktop coordinates
+	uint32_t maxWidth;  // 1..8192, scaled down to fit, never up
+	uint32_t maxHeight; // 1..8192
+} XrDesktopCaptureInfoDXR;
+
+typedef struct XrEventDataDesktopCaptureCompletedDXR {
+	XrStructureType type; // XR_TYPE_EVENT_DATA_DESKTOP_CAPTURE_COMPLETED_DXR
+	const void *next;
+	XrSession session;
+	uint64_t captureId;
+	XrResult result;
+	uint32_t width; // 0 on failure
+	uint32_t height;
+	XrRect2Di sourceRect; // desktop coordinates the image covers
+	XrTime frameTime;
+	char message[XR_MAX_DESKTOP_MESSAGE_SIZE_DXR];
+} XrEventDataDesktopCaptureCompletedDXR;
+
+typedef struct XrEventDataDesktopCaptureStateChangedDXR {
+	XrStructureType type; // XR_TYPE_EVENT_DATA_DESKTOP_CAPTURE_STATE_CHANGED_DXR
+	const void *next;
+	XrSession session;
+	XrDesktopControlStateDXR state; // the CAPTURE scope's state
+} XrEventDataDesktopCaptureStateChangedDXR;
+
 typedef struct XrEventDataDesktopActionCompletedDXR {
 	XrStructureType type; // XR_TYPE_EVENT_DATA_DESKTOP_ACTION_COMPLETED_DXR
 	const void *next;
@@ -1072,6 +1141,13 @@ typedef XrResult (XRAPI_PTR *PFN_xrGetDesktopTextAtDXR)(XrSession session, XrOff
                                                         uint32_t *countOutput, char *buffer);
 typedef XrResult (XRAPI_PTR *PFN_xrSubmitDesktopActionDXR)(XrSession session, const XrDesktopActionDXR *action,
                                                            uint64_t *actionId);
+// Spec version 2.
+typedef XrResult (XRAPI_PTR *PFN_xrGetDesktopCaptureStateDXR)(XrSession session, XrDesktopControlStateDXR *state);
+typedef XrResult (XRAPI_PTR *PFN_xrCaptureDesktopDXR)(XrSession session, const XrDesktopCaptureInfoDXR *info,
+                                                      uint64_t *captureId);
+typedef XrResult (XRAPI_PTR *PFN_xrGetDesktopCaptureImageDXR)(XrSession session, uint64_t captureId,
+                                                              uint32_t capacityInput, uint32_t *countOutput,
+                                                              uint8_t *rgba);
 
 #ifdef __cplusplus
 }

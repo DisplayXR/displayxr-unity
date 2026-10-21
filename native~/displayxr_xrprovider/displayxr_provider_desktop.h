@@ -25,6 +25,14 @@
 // Every string crossing the C# boundary is UTF-8 bytes (Windows DllImport defaults
 // to the ANSI code page, which would mangle titles, typed text and messages).
 //
+// Screen capture (spec v2, runtime spec §10) is a second consent SCOPE next to
+// CONTROL (= everything in spec v1). It exists only when the runtime ADVERTISES
+// spec version >= 2 and resolves the three capture entry points; against an older
+// runtime every capture export returns DXR_DESKTOP_E_NO_CAPTURE and the v1 surface
+// behaves exactly as before. A capture is asynchronous like an action: the
+// completion is queued from the poll loop, and C# fetches the image (which the
+// runtime keeps for 10 s) from the main thread when it drains that event.
+//
 // The Dxr* structs below are the C# ABI: blittable, fixed layout, no pointers.
 // Their sizes and offsets are pinned by static_asserts in the .cpp and mirrored by
 // the unsafe structs in Runtime/DisplayXRDesktop.cs.
@@ -51,10 +59,18 @@ extern "C" {
 #define DXR_DESKTOP_E_UNAVAILABLE (-2000000001)  //!< extension not advertised / not enabled / entry points missing
 #define DXR_DESKTOP_E_NO_SESSION (-2000000002)   //!< no XR session right now
 #define DXR_DESKTOP_E_BAD_ARGUMENT (-2000000003) //!< null pointer where one is required
+#define DXR_DESKTOP_E_NO_CAPTURE (-2000000004)   //!< the runtime's extension predates spec v2 (no screen capture)
 
 //! Event kinds returned by dxr_prov_desktop_next_event.
 #define DXR_DESKTOP_EVENT_ACTION_COMPLETED 1
 #define DXR_DESKTOP_EVENT_STATE_CHANGED 2
+#define DXR_DESKTOP_EVENT_CAPTURE_COMPLETED 3     //!< spec v2
+#define DXR_DESKTOP_EVENT_CAPTURE_STATE_CHANGED 4 //!< spec v2: the CAPTURE scope's state
+
+//! Scope bits of dxr_prov_desktop_request_scopes (= XrDesktopControlScopeFlagsDXR).
+#define DXR_DESKTOP_SCOPE_CONTROL 0x1ull
+#define DXR_DESKTOP_SCOPE_CAPTURE 0x2ull
+#define DXR_DESKTOP_SCOPE_ASK_AGAIN 0x100ull
 
 // ---- Blittable C# ABI structs -------------------------------------------------
 
@@ -97,24 +113,43 @@ typedef struct DxrDesktopAction
 	int32_t reserved;                   // 60
 } DxrDesktopAction;
 
-//! One queued runtime event. 280 bytes.
+//! One queued runtime event. 312 bytes (the capture fields were appended in spec v2;
+//! the first 280 bytes are unchanged).
 typedef struct DxrDesktopEvent
 {
-	uint64_t action_id; //  0  ACTION_COMPLETED
+	uint64_t action_id; //  0  ACTION_COMPLETED: the action id; CAPTURE_COMPLETED: the capture id
 	int32_t kind;       //  8  DXR_DESKTOP_EVENT_*
-	int32_t result;     // 12  ACTION_COMPLETED: the action's XrResult
-	int32_t state;      // 16  STATE_CHANGED: XrDesktopControlStateDXR
+	int32_t result;     // 12  *_COMPLETED: the XrResult
+	int32_t state;      // 16  *STATE_CHANGED: XrDesktopControlStateDXR
 	int32_t reserved;   // 20
-	uint8_t message[256]; // 24  ACTION_COMPLETED: UTF-8 detail, NUL-terminated
+	uint8_t message[256]; // 24  *_COMPLETED: UTF-8 detail, NUL-terminated
+	uint32_t width, height;     // 280  CAPTURE_COMPLETED: image size (0 on failure)
+	int32_t src_x, src_y;       // 288  CAPTURE_COMPLETED: what the image covers, desktop coordinates
+	int32_t src_width, src_height; // 296
+	int64_t frame_time;         // 304  CAPTURE_COMPLETED: XrTime the pixels were current
 } DxrDesktopEvent;
+
+//! XrDesktopCaptureInfoDXR minus type/next. 40 bytes.
+typedef struct DxrDesktopCaptureInfo
+{
+	uint64_t window_id;           //  0  WINDOW
+	int32_t target;               //  8  XrDesktopCaptureTargetDXR
+	int32_t x, y;                 // 12  REGION, desktop coordinates
+	int32_t width, height;        // 20
+	uint32_t max_width, max_height; // 28  1..8192: scaled down to fit, never up
+	int32_t reserved;             // 36
+} DxrDesktopCaptureInfo;
 
 // ---- Provider-internal hooks (called from displayxr_provider_session.cpp) ----
 
 typedef void (*DxrDesktopLogFn)(const char *fmt, ...);
 
-//! After xrCreateInstance: soft-resolve the seven entry points. @p enabled says
-//! whether XR_DXR_desktop_control was enabled on the instance.
-void dxr_desktop_on_instance(XrInstance instance, PFN_xrGetInstanceProcAddr gipa, int enabled, DxrDesktopLogFn log);
+//! After xrCreateInstance: soft-resolve the entry points. @p spec_version is the
+//! extensionVersion the runtime advertised, 0 when XR_DXR_desktop_control was not
+//! enabled on the instance. The seven v1 entry points gate the binding; the three
+//! capture ones are resolved only for spec_version >= 2 and gate capture alone.
+void dxr_desktop_on_instance(XrInstance instance, PFN_xrGetInstanceProcAddr gipa, uint32_t spec_version,
+                             DxrDesktopLogFn log);
 //! After xrCreateSession.
 void dxr_desktop_on_session_created(XrSession session);
 //! Before xrDestroySession: forget the session and drop queued events (the runtime
@@ -139,6 +174,29 @@ DISPLAYXR_EXPORT int dxr_prov_desktop_get_state(int32_t *state, uint64_t *capabi
 
 //! Ask for consent. @p reason_utf8 may be NULL or empty (no reason shown).
 DISPLAYXR_EXPORT int dxr_prov_desktop_request(const uint8_t *reason_utf8);
+
+//! Spec v2 request: ask for @p scopes (DXR_DESKTOP_SCOPE_*; 0 = CONTROL) in one prompt,
+//! with an optional @p parent_window_utf8 ("wayland:<handle>" / "x11:<hex>", passed
+//! verbatim; NULL or "" = none). Against a v1 runtime: CONTROL is requested exactly as
+//! dxr_prov_desktop_request does (no chain — ASK_AGAIN and the parent are dropped), and
+//! a request for CAPTURE without CONTROL returns DXR_DESKTOP_E_NO_CAPTURE untried.
+DISPLAYXR_EXPORT int dxr_prov_desktop_request_scopes(const uint8_t *reason_utf8, uint64_t scopes,
+                                                     const uint8_t *parent_window_utf8);
+
+//! 1 when a session is up and the runtime has spec-v2 screen capture.
+DISPLAYXR_EXPORT int dxr_prov_desktop_capture_available(void);
+
+//! The CAPTURE scope's state. On any failure *state is UNSUPPORTED (0).
+DISPLAYXR_EXPORT int dxr_prov_desktop_get_capture_state(int32_t *state);
+
+//! Start one capture. On success *capture_id is never 0 and exactly one
+//! CAPTURE_COMPLETED event follows while the session exists.
+DISPLAYXR_EXPORT int dxr_prov_desktop_capture(const DxrDesktopCaptureInfo *info, uint64_t *capture_id);
+
+//! Two-call idiom, in BYTES, over xrGetDesktopCaptureImageDXR (count = width*height*4,
+//! top row first). The runtime keeps the image until a call copies it out.
+DISPLAYXR_EXPORT int dxr_prov_desktop_capture_image(uint64_t capture_id, uint32_t capacity, uint32_t *count,
+                                                    uint8_t *rgba);
 
 //! Two-call idiom, straight through to xrEnumerateDesktopWindowsDXR: capacity 0
 //! (windows may be NULL) returns the count; a short capacity returns

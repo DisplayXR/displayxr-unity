@@ -426,8 +426,9 @@ typedef struct ProviderSession {
 	// XR_DXR_desktop_control (ADR-056): the app's agent operates the desktop
 	// (displayxr_provider_desktop.cpp). Enabled whenever advertised: enabling grants
 	// nothing - every operation needs the user's consent for this app, requested
-	// explicitly by the app (DisplayXRDesktop.Request).
-	int has_desktop_control;
+	// explicitly by the app (DisplayXRDesktop.Request). Holds the ADVERTISED spec
+	// version (0 = not advertised): v2 adds screen capture, gated on it.
+	uint32_t has_desktop_control;
 
 	// XR_DXR_display_zones + XR_DXR_local_3d_zone (#166 Phase B). Detected in
 	// session_start (probe) and enabled on the instance. Caps queried lazily on the
@@ -4731,7 +4732,7 @@ int dxr_prov_session_start(const char *runtime_json_path,
 						else if (strcmp(props[i].extensionName, XR_DXR_MCP_TOOLS_EXTENSION_NAME) == 0)
 							s_ps.has_mcp_tools = 1;
 						else if (strcmp(props[i].extensionName, XR_DXR_DESKTOP_CONTROL_EXTENSION_NAME) == 0)
-							s_ps.has_desktop_control = 1;
+							s_ps.has_desktop_control = props[i].extensionVersion ? props[i].extensionVersion : 1;
 						else if (strcmp(props[i].extensionName, XR_DXR_WAYLAND_SURFACE_BINDING_EXTENSION_NAME) == 0)
 							s_ps.has_wayland_binding = 1;
 						else if (strcmp(props[i].extensionName, XR_DXR_DEPTH_BUDGET_EXTENSION_NAME) == 0) {

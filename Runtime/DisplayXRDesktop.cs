@@ -40,6 +40,24 @@ namespace DisplayXR
         ReadText = 0x8,
         WindowActions = 0x10,
         Input = 0x20,
+        /// <summary>The backend can capture screen pixels (spec v2). Without it
+        /// <see cref="DisplayXRDesktop.CaptureState"/> is <see cref="DesktopControlState.Unsupported"/>.</summary>
+        Capture = 0x40,
+    }
+
+    /// <summary>
+    /// The consent scopes of <see cref="DisplayXRDesktop.RequestAccess"/> (spec v2). Each has its own
+    /// state: <see cref="DisplayXRDesktop.State"/> is CONTROL's, <see cref="DisplayXRDesktop.CaptureState"/>
+    /// is CAPTURE's.
+    /// </summary>
+    [Flags]
+    public enum DesktopControlScopes : ulong
+    {
+        None = 0,
+        /// <summary>Everything of spec v1: observation, window actions, input.</summary>
+        Control = 0x1,
+        /// <summary>Screen pixels (<see cref="DisplayXRDesktop.CaptureAsync(RectInt, int, int)"/>).</summary>
+        Capture = 0x2,
     }
 
     /// <summary>State bits of a desktop window.</summary>
@@ -112,6 +130,79 @@ namespace DisplayXR
 
         public override string ToString() =>
             Message.Length > 0 ? $"{Status} ({XrResult}): {Message}" : $"{Status} ({XrResult})";
+    }
+
+    /// <summary>
+    /// The outcome of one screen capture. On success <see cref="Pixels"/> holds
+    /// <see cref="Width"/> x <see cref="Height"/> RGBA8 pixels exactly as the runtime delivered them:
+    /// sRGB-encoded, straight alpha, <b>top row first</b>, stride Width * 4. Withheld pixels (off every
+    /// monitor, on a monitor the user did not share, inside an excluded window or one of this app's
+    /// own windows) are (0,0,0,0); every other pixel has alpha 255. <see cref="ToTexture2D"/> flips the
+    /// rows for Unity.
+    /// </summary>
+    public readonly struct DesktopCaptureResult
+    {
+        public DesktopActionStatus Status { get; }
+        /// <summary>Human-readable detail from the runtime (may be empty).</summary>
+        public string Message { get; }
+        /// <summary>The raw <c>XrResult</c> (or a binding code below -2000000000).</summary>
+        public int XrResult { get; }
+        public int Width { get; }
+        public int Height { get; }
+        /// <summary>What the image covers, desktop coordinates (top-left origin, y down).</summary>
+        public RectInt SourceRect { get; }
+        /// <summary>The <c>XrTime</c> (ns) at which these pixels were current.</summary>
+        public long FrameTime { get; }
+        /// <summary>RGBA8, top row first; null unless <see cref="Succeeded"/>.</summary>
+        public byte[] Pixels { get; }
+        public bool Succeeded => Status == DesktopActionStatus.Success && Pixels != null;
+
+        public DesktopCaptureResult(DesktopActionStatus status, string message, int xrResult, int width, int height,
+                                    RectInt sourceRect, long frameTime, byte[] pixels)
+        {
+            Status = status;
+            Message = message ?? "";
+            XrResult = xrResult;
+            Width = width;
+            Height = height;
+            SourceRect = sourceRect;
+            FrameTime = frameTime;
+            Pixels = pixels;
+        }
+
+        /// <summary>
+        /// The desktop point at the centre of image pixel (<paramref name="px"/>, <paramref name="py"/>),
+        /// with <paramref name="py"/> counted from the TOP row as in <see cref="Pixels"/>. Feed it straight
+        /// to <see cref="DisplayXRDesktop.TryPick"/> or a pointer action.
+        /// </summary>
+        public Vector2Int ImageToDesktop(int px, int py) =>
+            Width <= 0 || Height <= 0
+                ? SourceRect.position
+                : new Vector2Int(
+                      SourceRect.x + Mathf.FloorToInt((px + 0.5f) * SourceRect.width / Width),
+                      SourceRect.y + Mathf.FloorToInt((py + 0.5f) * SourceRect.height / Height));
+
+        /// <summary>
+        /// A new <c>RGBA32</c> sRGB texture of the image, rows flipped so it displays upright in Unity
+        /// (Unity textures are bottom row first). Null unless <see cref="Succeeded"/>. Call it on the
+        /// main thread; the caller owns (and destroys) the texture.
+        /// </summary>
+        public Texture2D ToTexture2D()
+        {
+            if (!Succeeded || Width <= 0 || Height <= 0) return null;
+            int stride = Width * 4;
+            var flipped = new byte[Pixels.Length];
+            for (int row = 0; row < Height; row++)
+                Buffer.BlockCopy(Pixels, row * stride, flipped, (Height - 1 - row) * stride, stride);
+            var tex = new Texture2D(Width, Height, TextureFormat.RGBA32, false, false);
+            tex.LoadRawTextureData(flipped);
+            tex.Apply(false, false);
+            return tex;
+        }
+
+        public override string ToString() =>
+            Succeeded ? $"{Width}x{Height} of {SourceRect}"
+            : Message.Length > 0 ? $"{Status} ({XrResult}): {Message}" : $"{Status} ({XrResult})";
     }
 
     /// <summary>One top-level desktop window.</summary>
@@ -242,6 +333,17 @@ namespace DisplayXR
     /// given to <i>this</i> app — to every one of them. Desktop control is for the agent that
     /// lives inside the app.</para>
     ///
+    /// <para><b>Screen capture</b> (spec v2) is a second consent scope next to CONTROL: ask for both in
+    /// ONE request (<c>RequestAccess(DesktopControlScopes.Control | DesktopControlScopes.Capture, reason)</c>
+    /// — on GNOME a later request for CAPTURE alone shows a second dialog that asks about input again),
+    /// watch <see cref="CaptureStateChanged"/>, then <see cref="CaptureAsync(RectInt, int, int)"/>. A
+    /// capture never prompts; one is in flight at a time and starts are at least 250 ms apart. Frames are
+    /// for the agent inside this app: never write them anywhere other processes can reach. On Linux the
+    /// consent dialog is parented to the app's window automatically
+    /// (<see cref="DisplayXRNative"/><c>.LinuxWindowHandle()</c>, read right before each request). On a
+    /// runtime whose extension predates spec v2 <see cref="CaptureState"/> is Unsupported and every
+    /// capture completes with <see cref="DesktopActionStatus.Unsupported"/>; the rest is unchanged.</para>
+    ///
     /// <para><b>Graceful absence.</b> On a runtime without the extension, an older native
     /// plug-in, or with no XR session, <see cref="State"/> is
     /// <see cref="DesktopControlState.Unsupported"/>, observation returns nothing and actions
@@ -254,6 +356,7 @@ namespace DisplayXR
         private const int E_Unavailable = -2000000001;
         private const int E_NoSession = -2000000002;
         private const int E_BadArgument = -2000000003;
+        private const int E_NoCapture = -2000000004;
 
         private const int XR_ERROR_VALIDATION_FAILURE = -1;
         private const int XR_ERROR_FUNCTION_UNSUPPORTED = -7;
@@ -266,6 +369,13 @@ namespace DisplayXR
 
         private const int EventActionCompleted = 1;
         private const int EventStateChanged = 2;
+        private const int EventCaptureCompleted = 3;
+        private const int EventCaptureStateChanged = 4;
+
+        private const ulong ScopeAskAgain = 0x100;
+
+        /// <summary>The largest <c>maxWidth</c> / <c>maxHeight</c> a capture accepts (no downscale below it).</summary>
+        public const int MaxCaptureSize = 8192;
 
         private struct Pending
         {
@@ -276,15 +386,26 @@ namespace DisplayXR
         private static readonly object s_Lock = new object();
         private static readonly Dictionary<ulong, Pending> s_Pending = new Dictionary<ulong, Pending>();
         private static bool s_Missing; // native binary predates the binding (or layout mismatch)
+        private static bool s_CaptureMissing; // native binary predates the spec-v2 exports
         private static uint s_Generation;
         private static DesktopControlState s_LastState = DesktopControlState.Unsupported;
+        private static DesktopControlState s_LastCaptureState = DesktopControlState.Unsupported;
+
+        private struct PendingCapture
+        {
+            public TaskCompletionSource<DesktopCaptureResult> Tcs;
+            public uint Generation;
+        }
+
+        private static readonly Dictionary<ulong, PendingCapture> s_PendingCaptures =
+            new Dictionary<ulong, PendingCapture>();
 
         static unsafe DisplayXRDesktop()
         {
             // A layout drift would corrupt every call; refuse the binding instead. Runs before
             // any member of this class is touched, so no call ever sees a wrong layout.
             if (sizeof(NativeWindow) != 432 || sizeof(NativePick) != 448 || sizeof(NativeAction) != 64 ||
-                sizeof(NativeEvent) != 280)
+                sizeof(NativeEvent) != 312 || sizeof(NativeCaptureInfo) != 40)
             {
                 Debug.LogError("[DisplayXR] desktop control: native struct layout mismatch; disabled");
                 s_Missing = true;
@@ -296,6 +417,13 @@ namespace DisplayXR
         /// <see cref="Request"/>, the kill switch, a lock screen, a session ending.
         /// </summary>
         public static event Action<DesktopControlState> StateChanged;
+
+        /// <summary>
+        /// Raised on the main thread when the CAPTURE scope's state changes (spec v2) — the answer to a
+        /// <see cref="RequestAccess"/> that listed <see cref="DesktopControlScopes.Capture"/>, a
+        /// revocation, the kill switch, a lock screen, a session ending.
+        /// </summary>
+        public static event Action<DesktopControlState> CaptureStateChanged;
 
         /// <summary>The raw result of the last observation / request call (0 = success).</summary>
         public static int LastResult { get; private set; }
@@ -324,6 +452,21 @@ namespace DisplayXR
             }
         }
 
+        /// <summary>True while a session is up on a runtime with spec-v2 screen capture. Says nothing
+        /// about consent — see <see cref="CaptureState"/>.</summary>
+        public static bool IsCaptureAvailable => CallCapture(() => Native.dxr_prov_desktop_capture_available()) == 1;
+
+        /// <summary>The CAPTURE scope's consent state (a synchronous runtime query);
+        /// <see cref="DesktopControlState.Unsupported"/> on a runtime without spec-v2 capture.</summary>
+        public static DesktopControlState CaptureState
+        {
+            get
+            {
+                QueryCaptureState(out DesktopControlState s);
+                return s;
+            }
+        }
+
         /// <summary>
         /// Ask the user for desktop control. Returns at once; the state goes
         /// <see cref="DesktopControlState.Pending"/> and the answer arrives through
@@ -333,12 +476,63 @@ namespace DisplayXR
         /// <param name="reason">Shown in DisplayXR's prompt where DisplayXR draws one (Windows) and
         /// written to the audit log, e.g. "so Lumo can open apps and type for you". May be null.</param>
         /// <returns>False when the request could not be made (no session, no extension).</returns>
-        public static bool Request(string reason)
+        public static bool Request(string reason) => RequestAccess(DesktopControlScopes.Control, reason);
+
+        /// <summary>
+        /// Ask the user for one or more consent scopes in ONE prompt (spec v2). Returns at once; each
+        /// listed scope goes <see cref="DesktopControlState.Pending"/> and its answer arrives through
+        /// <see cref="StateChanged"/> (CONTROL) / <see cref="CaptureStateChanged"/> (CAPTURE). A scope
+        /// already Granted is not asked again unless <paramref name="askAgain"/>, which shows the prompt
+        /// again so the user can change what is shared (GNOME: which screens) or decline — on macOS it
+        /// opens System Settings instead. Use <paramref name="askAgain"/> only on an explicit user
+        /// gesture ("change what the assistant can see"). On Linux the dialog is parented to the app's
+        /// window. Against a runtime without spec v2, Control is requested exactly as
+        /// <see cref="Request"/> always did, and Capture alone fails (<see cref="LastResult"/>).
+        /// </summary>
+        /// <param name="scopes">What to ask for; <see cref="DesktopControlScopes.None"/> means Control.</param>
+        /// <param name="reason">Shown where DisplayXR draws the prompt (Windows) and written to the audit
+        /// log. May be null.</param>
+        /// <param name="askAgain">Re-ask even for scopes already granted.</param>
+        /// <returns>False when the request could not be made (no session, no extension, no capture).</returns>
+        public static bool RequestAccess(DesktopControlScopes scopes, string reason = null, bool askAgain = false)
         {
             byte[] r = string.IsNullOrEmpty(reason) ? null : Utf8(reason);
-            int res = Call(() => Native.dxr_prov_desktop_request(r));
+            ulong bits = (ulong)scopes | (askAgain ? ScopeAskAgain : 0);
+            byte[] parent = ParentWindow();
+            int res = CallCapture(() => Native.dxr_prov_desktop_request_scopes(r, bits, parent));
+            if (res == XR_ERROR_VALIDATION_FAILURE && parent != null)
+            {
+                // The parent is only a placement hint (spec v2): a handle the runtime refuses must not cost
+                // the user the prompt. Ask again without it (the dialog then opens unparented).
+                Debug.LogWarning("[DisplayXR] desktop control: the runtime refused the window handle as the " +
+                                 "consent dialog's parent; asking without a parent");
+                res = CallCapture(() => Native.dxr_prov_desktop_request_scopes(r, bits, null));
+            }
+            if (s_CaptureMissing)
+            {
+                // A native binary without the v2 export: the v1 request, CONTROL only.
+                bool control = scopes == DesktopControlScopes.None || (scopes & DesktopControlScopes.Control) != 0;
+                res = control ? Call(() => Native.dxr_prov_desktop_request(r)) : E_NoCapture;
+            }
             LastResult = res;
             return res >= 0;
+        }
+
+        // The app's window as the consent dialog's parent: "wayland:<handle>" / "x11:<hex>" on a Linux
+        // player, read right before each request (a window shown anew gets a new handle), passed
+        // verbatim (a Wayland handle may contain spaces). Null elsewhere / when not known.
+        private static byte[] ParentWindow()
+        {
+#if UNITY_STANDALONE_LINUX && !UNITY_EDITOR
+            try
+            {
+                string h = DisplayXRNative.LinuxWindowHandle();
+                if (!string.IsNullOrEmpty(h)) return Encoding.ASCII.GetBytes(h + "\0");
+            }
+            catch (EntryPointNotFoundException) { }
+            catch (DllNotFoundException) { }
+#endif
+            return null;
         }
 
         // ---------------------------------------------------------------- observation
@@ -503,6 +697,118 @@ namespace DisplayXR
                 actionType = 15, targetWindowId = windowId, x = at.x, y = at.y, scrollX = dx, scrollY = dy,
             });
 
+        // ---------------------------------------------------------------- screen capture (spec v2)
+
+        /// <summary>
+        /// Capture <paramref name="desktopRect"/> (desktop coordinates, top-left origin, y down; clipped
+        /// to the monitors) as one still. Needs <see cref="CaptureState"/> Granted (CONTROL is not
+        /// required) and never prompts. The image is scaled down to fit
+        /// <paramref name="maxWidth"/> x <paramref name="maxHeight"/> (1..<see cref="MaxCaptureSize"/>)
+        /// keeping the aspect ratio, never up. The task completes on the main thread and never throws.
+        /// </summary>
+        public static Task<DesktopCaptureResult> CaptureAsync(RectInt desktopRect, int maxWidth = MaxCaptureSize,
+                                                              int maxHeight = MaxCaptureSize) =>
+            StartCapture(new NativeCaptureInfo
+            {
+                target = 1, x = desktopRect.x, y = desktopRect.y, width = desktopRect.width,
+                height = desktopRect.height, maxWidth = (uint)Math.Max(0, maxWidth),
+                maxHeight = (uint)Math.Max(0, maxHeight),
+            });
+
+        /// <summary>Capture the bounding box of every monitor (gaps come back transparent). See
+        /// <see cref="CaptureAsync(RectInt, int, int)"/>.</summary>
+        public static Task<DesktopCaptureResult> CaptureDesktopAsync(int maxWidth = MaxCaptureSize,
+                                                                     int maxHeight = MaxCaptureSize) =>
+            StartCapture(new NativeCaptureInfo
+            {
+                target = 0, maxWidth = (uint)Math.Max(0, maxWidth), maxHeight = (uint)Math.Max(0, maxHeight),
+            });
+
+        /// <summary>Capture <paramref name="windowId"/>'s frame as it is on screen (windows overlapping it
+        /// are in the image; a minimized window is Refused). See
+        /// <see cref="CaptureAsync(RectInt, int, int)"/>.</summary>
+        public static Task<DesktopCaptureResult> CaptureWindowAsync(ulong windowId, int maxWidth = MaxCaptureSize,
+                                                                    int maxHeight = MaxCaptureSize) =>
+            StartCapture(new NativeCaptureInfo
+            {
+                target = 2, windowId = windowId, maxWidth = (uint)Math.Max(0, maxWidth),
+                maxHeight = (uint)Math.Max(0, maxHeight),
+            });
+
+        /// <summary>
+        /// <see cref="CaptureAsync(RectInt, int, int)"/> straight to a texture (see
+        /// <see cref="DesktopCaptureResult.ToTexture2D"/>): null on failure, with the reason logged as a
+        /// warning. Use <see cref="CaptureAsync(RectInt, int, int)"/> when you need the status.
+        /// </summary>
+        public static async Task<Texture2D> Capture(RectInt desktopRect, int maxWidth = MaxCaptureSize,
+                                                    int maxHeight = MaxCaptureSize)
+        {
+            DesktopCaptureResult r = await CaptureAsync(desktopRect, maxWidth, maxHeight);
+            if (!r.Succeeded) Debug.LogWarning($"[DisplayXR] desktop capture: {r}");
+            return r.ToTexture2D();
+        }
+
+        private static Task<DesktopCaptureResult> StartCapture(NativeCaptureInfo info)
+        {
+            if (s_Missing || s_CaptureMissing) return CaptureDone(s_Missing ? E_Unavailable : E_NoCapture, null);
+            try
+            {
+                // The generation BEFORE the call: the session is torn down on the graphics thread (GfxStop),
+                // and a teardown between the call and a later read would file this capture under the NEW
+                // generation, which Pump does not fail (until yet another session starts) while its
+                // completion was already dropped with the old session.
+                uint gen = Native.dxr_prov_desktop_session_generation();
+                int r = Native.dxr_prov_desktop_capture(ref info, out ulong id);
+                if (r < 0 || id == 0) return CaptureDone(r < 0 ? r : XR_ERROR_VALIDATION_FAILURE, null);
+                var tcs = new TaskCompletionSource<DesktopCaptureResult>();
+                lock (s_Lock) s_PendingCaptures[id] = new PendingCapture { Tcs = tcs, Generation = gen };
+                return tcs.Task;
+            }
+            catch (EntryPointNotFoundException) { s_CaptureMissing = true; }
+            catch (DllNotFoundException) { s_Missing = true; }
+            return CaptureDone(E_NoCapture, null);
+        }
+
+        // A completed capture: fetch the image now (the runtime keeps it 10 s; we are on the main
+        // thread, draining the event the frame it arrived).
+        private static unsafe DesktopCaptureResult FinishCapture(in NativeEvent ev, string message)
+        {
+            var src = new RectInt(ev.srcX, ev.srcY, ev.srcWidth, ev.srcHeight);
+            if (ev.result < 0) return MakeCapture(ev.result, message, src, ev.frameTime);
+            long bytes = (long)ev.width * ev.height * 4;
+            if (ev.width == 0 || ev.height == 0 || bytes > int.MaxValue)
+                return MakeCapture(XR_ERROR_VALIDATION_FAILURE, "the runtime returned no image", src, ev.frameTime);
+            var px = new byte[bytes];
+            int r;
+            uint count;
+            try { r = Native.dxr_prov_desktop_capture_image(ev.actionId, (uint)px.Length, out count, px); }
+            catch (EntryPointNotFoundException) { s_CaptureMissing = true; r = E_NoCapture; count = 0; }
+            if (r < 0) return MakeCapture(r, "could not fetch the captured image", src, ev.frameTime);
+            if (count != (uint)px.Length)
+                return MakeCapture(XR_ERROR_VALIDATION_FAILURE, "captured image size mismatch", src, ev.frameTime);
+            return new DesktopCaptureResult(DesktopActionStatus.Success, message, r, (int)ev.width, (int)ev.height, src,
+                                            ev.frameTime, px);
+        }
+
+        private static Task<DesktopCaptureResult> CaptureDone(int r, string message) =>
+            Task.FromResult(MakeCapture(r, message, default, 0));
+
+        private static DesktopCaptureResult MakeCapture(int r, string message, RectInt src, long frameTime)
+        {
+            string fallback = null;
+            switch (r)
+            {
+                case XR_ERROR_DESKTOP_CONTROL_NOT_GRANTED_DXR: fallback = "screen capture is not granted for this app"; break;
+                case XR_ERROR_LIMIT_REACHED: fallback = "a capture is already in flight"; break;
+                case XR_ERROR_VALIDATION_FAILURE: fallback = "invalid capture (empty region, window id 0, size 0 or > 8192?)"; break;
+                case E_NoCapture: fallback = "the runtime has no screen capture (XR_DXR_desktop_control spec v2)"; break;
+            }
+            DesktopActionResult a = Make(r, string.IsNullOrEmpty(message) ? fallback : message);
+            DesktopActionStatus status = r == E_NoCapture ? DesktopActionStatus.Unsupported : a.Status;
+            if (status == DesktopActionStatus.Success) status = DesktopActionStatus.Failed; // no image = not a success
+            return new DesktopCaptureResult(status, a.Message, r, 0, 0, src, frameTime, null);
+        }
+
         // ---------------------------------------------------------------- dispatch
 
         private static Task<DesktopActionResult> Submit(NativeAction a, string text = null, string keys = null)
@@ -512,10 +818,10 @@ namespace DisplayXR
             byte[] k = keys == null ? null : Utf8(keys);
             try
             {
+                uint gen = Native.dxr_prov_desktop_session_generation(); // before the call: see StartCapture
                 int r = Native.dxr_prov_desktop_submit(ref a, t, k, out ulong id);
                 if (r < 0 || id == 0) return Done(r < 0 ? r : XR_ERROR_VALIDATION_FAILURE, null);
                 var tcs = new TaskCompletionSource<DesktopActionResult>();
-                uint gen = Native.dxr_prov_desktop_session_generation();
                 lock (s_Lock) s_Pending[id] = new Pending { Tcs = tcs, Generation = gen };
                 return tcs.Task;
             }
@@ -541,6 +847,8 @@ namespace DisplayXR
                     // A new / ended session: re-read, announce if it moved.
                     QueryState(out DesktopControlState now, out _);
                     SetState(now);
+                    QueryCaptureState(out DesktopControlState cnow);
+                    SetCaptureState(cnow);
                 }
 
                 // Bounded per frame: the native queue holds at most 128.
@@ -563,6 +871,23 @@ namespace DisplayXR
                         }
                         if (found) p.Tcs.TrySetResult(Make(ev.result, Utf8Z(ev.message, 256)));
                     }
+                    else if (ev.kind == EventCaptureStateChanged)
+                    {
+                        SetCaptureState((DesktopControlState)ev.state);
+                    }
+                    else if (ev.kind == EventCaptureCompleted)
+                    {
+                        PendingCapture p;
+                        bool found;
+                        lock (s_Lock)
+                        {
+                            found = s_PendingCaptures.TryGetValue(ev.actionId, out p);
+                            if (found) s_PendingCaptures.Remove(ev.actionId);
+                        }
+                        // Fetch even when nobody waits: the copy frees the runtime's frame at once.
+                        DesktopCaptureResult cr = FinishCapture(ev, Utf8Z(ev.message, 256));
+                        if (found) p.Tcs.TrySetResult(cr);
+                    }
                 }
             }
             catch (EntryPointNotFoundException) { s_Missing = true; }
@@ -574,6 +899,7 @@ namespace DisplayXR
         {
             FailPending(_ => true);
             SetState(DesktopControlState.Unsupported);
+            SetCaptureState(DesktopControlState.Unsupported);
         }
 
         private static void FailPending(Func<Pending, bool> which)
@@ -590,6 +916,25 @@ namespace DisplayXR
                 }
                 if (ids != null) foreach (ulong id in ids) s_Pending.Remove(id);
             }
+            List<PendingCapture> failedCaptures = null;
+            lock (s_Lock)
+            {
+                List<ulong> ids = null;
+                foreach (var kv in s_PendingCaptures)
+                {
+                    var asPending = new Pending { Generation = kv.Value.Generation };
+                    if (!which(asPending)) continue;
+                    (ids ??= new List<ulong>()).Add(kv.Key);
+                    (failedCaptures ??= new List<PendingCapture>()).Add(kv.Value);
+                }
+                if (ids != null) foreach (ulong id in ids) s_PendingCaptures.Remove(id);
+            }
+            if (failedCaptures != null)
+            {
+                var cr = new DesktopCaptureResult(DesktopActionStatus.Failed, "session ended", E_NoSession, 0, 0,
+                                                  default, 0, null);
+                foreach (PendingCapture p in failedCaptures) p.Tcs.TrySetResult(cr);
+            }
             if (failed == null) return;
             var r = new DesktopActionResult(DesktopActionStatus.Failed, "session ended", E_NoSession);
             foreach (Pending p in failed) p.Tcs.TrySetResult(r);
@@ -601,6 +946,21 @@ namespace DisplayXR
             s_LastState = s;
             try { StateChanged?.Invoke(s); }
             catch (Exception e) { Debug.LogException(e); }
+        }
+
+        private static void SetCaptureState(DesktopControlState s)
+        {
+            if (s == s_LastCaptureState) return;
+            s_LastCaptureState = s;
+            try { CaptureStateChanged?.Invoke(s); }
+            catch (Exception e) { Debug.LogException(e); }
+        }
+
+        private static void QueryCaptureState(out DesktopControlState state)
+        {
+            int st = 0;
+            int r = CallCapture(() => Native.dxr_prov_desktop_get_capture_state(out st));
+            state = r >= 0 ? (DesktopControlState)st : DesktopControlState.Unsupported;
         }
 
         private static void QueryState(out DesktopControlState state, out DesktopControlCapabilities caps)
@@ -657,6 +1017,17 @@ namespace DisplayXR
             return E_Unavailable;
         }
 
+        // The spec-v2 exports: a native binary without them disables capture only, never the v1 surface.
+        private static int CallCapture(Func<int> f)
+        {
+            if (s_Missing) return E_Unavailable;
+            if (s_CaptureMissing) return E_NoCapture;
+            try { return f(); }
+            catch (EntryPointNotFoundException) { s_CaptureMissing = true; }
+            catch (DllNotFoundException) { s_Missing = true; return E_Unavailable; }
+            return E_NoCapture;
+        }
+
         // NUL-terminated UTF-8; never a marshalled .NET string (Windows DllImport defaults
         // to the ANSI code page, which would mangle non-ASCII text).
         private static byte[] Utf8(string s)
@@ -689,7 +1060,7 @@ namespace DisplayXR
                             p.kind == (int)DesktopPickKind.Window ? ToWindow(p.window) : default);
 
         // Byte-for-byte mirrors of the Dxr* structs in displayxr_provider_desktop.h (pinned
-        // there by static_asserts): 432 / 448 / 64 / 280 bytes.
+        // there by static_asserts): 432 / 448 / 64 / 312 / 40 bytes.
         [StructLayout(LayoutKind.Sequential)]
         private unsafe struct NativeWindow
         {
@@ -726,6 +1097,20 @@ namespace DisplayXR
             public ulong actionId;
             public int kind, result, state, reserved;
             public fixed byte message[256];
+            // Spec v2, CAPTURE_COMPLETED (actionId is then the capture id).
+            public uint width, height;
+            public int srcX, srcY, srcWidth, srcHeight;
+            public long frameTime;
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private struct NativeCaptureInfo
+        {
+            public ulong windowId;
+            public int target; // XrDesktopCaptureTargetDXR: 0 desktop, 1 region, 2 window
+            public int x, y, width, height;
+            public uint maxWidth, maxHeight;
+            public int reserved;
         }
 
         private static unsafe class Native
@@ -762,6 +1147,24 @@ namespace DisplayXR
 
             [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
             public static extern int dxr_prov_desktop_next_event(out NativeEvent ev);
+
+            // Spec v2 (screen capture).
+            [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+            public static extern int dxr_prov_desktop_request_scopes(byte[] reasonUtf8, ulong scopes,
+                                                                     byte[] parentWindowUtf8);
+
+            [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+            public static extern int dxr_prov_desktop_capture_available();
+
+            [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+            public static extern int dxr_prov_desktop_get_capture_state(out int state);
+
+            [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+            public static extern int dxr_prov_desktop_capture(ref NativeCaptureInfo info, out ulong captureId);
+
+            [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+            public static extern int dxr_prov_desktop_capture_image(ulong captureId, uint capacity, out uint count,
+                                                                    byte[] rgba);
         }
     }
 }
