@@ -344,7 +344,8 @@ namespace DisplayXR
     /// capture never prompts; one is in flight at a time and starts are at least 250 ms apart. Code that
     /// cannot await (a synchronous agent API, a worker thread, the main thread inside <c>Update</c>) uses
     /// <see cref="CaptureBlocking"/> / <see cref="CaptureDesktopBlocking"/> / <see cref="CaptureWindowBlocking"/>
-    /// instead: they block the calling thread, ANY thread, the main thread included, without deadlocking.
+    /// instead: they block the calling thread, ANY thread, the main thread included, without deadlocking
+    /// (on macOS, never block the main thread on a worker that is in one: see <see cref="CaptureBlocking"/>).
     /// Frames are for the agent inside this app: never write them anywhere other processes can reach. On Linux the
     /// consent dialog is parented to the app's window automatically
     /// (<see cref="DisplayXRNative"/><c>.LinuxWindowHandle()</c>, read right before each request). On a
@@ -387,10 +388,17 @@ namespace DisplayXR
         public const int MaxCaptureSize = 8192;
 
         /// <summary>The default <c>timeoutMs</c> of the blocking captures (<see cref="CaptureBlocking"/>).</summary>
-        public const int DefaultCaptureTimeoutMs = 5000;
+        public const int DefaultCaptureTimeoutMs = DisplayXRDesktopCaptureTimeout.DefaultMs;
 
-        /// <summary>The longest a blocking capture waits; a negative or larger <c>timeoutMs</c> means this.</summary>
-        public const int MaxCaptureTimeoutMs = 60000;
+        /// <summary>The longest a blocking capture waits off Unity's main thread; a negative or larger
+        /// <c>timeoutMs</c> means this.</summary>
+        public const int MaxCaptureTimeoutMs = DisplayXRDesktopCaptureTimeout.MaxMs;
+
+        /// <summary>The longest a blocking capture waits ON Unity's main thread, where the whole wait is a
+        /// frozen frame: a negative or larger <c>timeoutMs</c> there means this, silently. A healthy capture
+        /// ends well inside it (the runtime bounds a capture itself); a worker thread keeps
+        /// <see cref="MaxCaptureTimeoutMs"/>.</summary>
+        public const int MaxMainThreadCaptureTimeoutMs = DisplayXRDesktopCaptureTimeout.MaxMainThreadMs;
 
         // A blocking capture returns to managed code at least this often (a domain reload / thread abort
         // can land in between); the native wait polls the runtime's queue every few ms within a slice.
@@ -419,6 +427,11 @@ namespace DisplayXR
 
         private static readonly Dictionary<ulong, PendingCapture> s_PendingCaptures =
             new Dictionary<ulong, PendingCapture>();
+
+        // Which thread is Unity's main thread (the blocking captures' lower cap). Runs on it before any
+        // scene loads, in a player and on every entry into Play Mode.
+        [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
+        private static void RecordMainThread() => DisplayXRDesktopCaptureTimeout.RecordMainThread();
 
         static unsafe DisplayXRDesktop()
         {
@@ -786,12 +799,24 @@ namespace DisplayXR
         /// -10, status Failed). If the session ends while waiting: Failed, "session ended". On
         /// <see cref="DesktopActionStatus.TimedOut"/> the capture may still be in flight; its image is
         /// dropped.</para>
+        /// <para><b>The main thread waits at most <see cref="MaxMainThreadCaptureTimeoutMs"/></b> (10 s), so
+        /// a frame cannot freeze for a minute: a larger or negative <paramref name="timeoutMs"/> is lowered
+        /// to it silently (the TimedOut message says so). Other threads keep <see cref="MaxCaptureTimeoutMs"/>.</para>
+        /// <para><b>macOS: do not block the main thread on a worker that is in a blocking capture</b>
+        /// (<c>Thread.Join</c>, <c>Task.Wait</c>, <c>.Result</c>). Only the main thread may poll the runtime
+        /// there (its poll drives AppKit), so a worker's capture completes through the main thread's
+        /// per-frame poll alone. A main thread blocked on that worker never polls: the worker waits out
+        /// its whole <paramref name="timeoutMs"/> and returns TimedOut, and only then does the main thread
+        /// go on. Call the blocking capture on the main thread itself, or let the main thread keep running
+        /// frames while the worker waits. Windows and Linux do not have this trap: a worker polls the
+        /// runtime itself.</para>
         /// </summary>
         /// <param name="desktopRect">Desktop coordinates, top-left origin, y down; clipped to the monitors.</param>
         /// <param name="maxWidth">1..<see cref="MaxCaptureSize"/>: the image is scaled down to fit, never up.</param>
         /// <param name="maxHeight">1..<see cref="MaxCaptureSize"/>.</param>
-        /// <param name="timeoutMs">How long to wait at most (default <see cref="DefaultCaptureTimeoutMs"/>,
-        /// at most <see cref="MaxCaptureTimeoutMs"/>).</param>
+        /// <param name="timeoutMs">How long to wait at most (default <see cref="DefaultCaptureTimeoutMs"/>). A
+        /// negative or larger value means the cap: <see cref="MaxMainThreadCaptureTimeoutMs"/> on Unity's main
+        /// thread, <see cref="MaxCaptureTimeoutMs"/> on any other.</param>
         public static DesktopCaptureResult CaptureBlocking(RectInt desktopRect, int maxWidth, int maxHeight,
                                                            int timeoutMs = DefaultCaptureTimeoutMs) =>
             CaptureAndWait(new NativeCaptureInfo
@@ -829,7 +854,10 @@ namespace DisplayXR
                 return MakeCapture(s_Missing ? E_Unavailable : E_NoCapture, null, default, 0);
             if (s_WaitMissing)
                 return MakeCapture(E_Unavailable, "this native plug-in build has no blocking capture", default, 0);
-            long budget = timeoutMs < 0 || timeoutMs > MaxCaptureTimeoutMs ? MaxCaptureTimeoutMs : timeoutMs;
+            // A frozen frame for the whole wait on the main thread: capped lower there (see the constants).
+            bool mainThread = DisplayXRDesktopCaptureTimeout.OnMainThread;
+            long budget = DisplayXRDesktopCaptureTimeout.Budget(timeoutMs, mainThread);
+            string capped = mainThread && budget != timeoutMs ? ", the main thread's cap" : "";
             long start = System.Diagnostics.Stopwatch.GetTimestamp();
             uint gen;
             ulong id;
@@ -874,9 +902,9 @@ namespace DisplayXR
                         return ended ? SessionEnded() : MakeCapture(w, "lost track of the capture", default, 0);
                     }
                     if (left == 0)
-                        return MakeCapture(E_Timeout, $"no result within {budget} ms (the capture may still be " +
-                                                      "in flight: a new one fails with LIMIT_REACHED until it ends)",
-                                           default, 0);
+                        return MakeCapture(E_Timeout, $"no result within {budget} ms{capped} (the capture may " +
+                                                      "still be in flight: a new one fails with LIMIT_REACHED until " +
+                                                      "it ends)", default, 0);
                 }
             }
             finally

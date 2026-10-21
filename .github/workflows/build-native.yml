@@ -81,6 +81,10 @@ jobs:
       - name: Cursor depth math
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: dotnet run --project "Tests~/CursorDepthMath" -c Release
+      # Pure C#: how long a blocking desktop capture waits (the main thread's lower cap).
+      - name: Desktop capture timeout
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: dotnet run --project "Tests~/DesktopCaptureTimeout" -c Release
 
   build-windows:
     name: Windows x64
