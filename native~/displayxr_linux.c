@@ -192,7 +192,8 @@ static PFN_XShapeCombineMask s_shape_combine_mask;
 
 static struct XlibApi s_x;
 static XDpy s_dpy;       // our own connection; must outlive the session
-static XWin s_win;       // the player's top-level window, 0 if not found
+static XWin s_win;       // the player's top-level window, 0 if not found (written once, atomically:
+                         // displayxr_linux_window_handle reads it from any thread)
 static int  s_attempts;  // bounded retry — see the note in the getter
 static int  s_gave_up;   // latched only after we stop trying
 static XWin s_overlay;   // OUR window — the one the runtime weaves into
@@ -340,9 +341,11 @@ displayxr_linux_get_app_window(void **out_display, unsigned long *out_window)
 				XWin root = s_x.XDefaultRootWindow(s_dpy);
 				XAtom pid_atom = s_x.XInternAtom(s_dpy, "_NET_WM_PID", 1 /*only_if_exists*/);
 				unsigned long best_area = 0;
-				if (pid_atom) lin_scan(root, pid_atom, getpid(), 0, &s_win, &best_area);
+				XWin found = 0; // scanned into a local: the best match is only known at the end
+				if (pid_atom) lin_scan(root, pid_atom, getpid(), 0, &found, &best_area);
 
-				if (s_win) {
+				if (found) {
+					__atomic_store_n(&s_win, found, __ATOMIC_RELEASE);
 					char m[192];
 					snprintf(m, sizeof(m),
 					         "[DisplayXR-LNX] bound app X11 window 0x%lx (%lu px area, pid %d, "
@@ -1727,7 +1730,9 @@ displayxr_linux_window_state(void)
 /// and returns 1; 0 (buf "") when the window is not known: on X11 until an XR
 /// session has bound the window (s_win), on native Wayland without a session, with
 /// no zxdg_exporter_v2, or while the window is hidden (dxr_wl_export_handle).
-/// Neither path sends anything to a server: it reads what is already known.
+/// Neither path sends anything to a server: it reads what is already known. On
+/// native Wayland it may wait briefly while a session is starting (the library's
+/// lock is held across the session's first round trip).
 DISPLAYXR_EXPORT int
 displayxr_linux_window_handle(char *buf, int len)
 {
@@ -1736,7 +1741,8 @@ displayxr_linux_window_handle(char *buf, int len)
 	buf[0] = 0;
 	if (dxr_wl_export_handle(buf, len))
 		return 1;
-	if (s_win && snprintf(buf, (size_t)len, "x11:%lx", (unsigned long)s_win) < len)
+	XWin win = __atomic_load_n(&s_win, __ATOMIC_ACQUIRE); // set once by the session thread
+	if (win && snprintf(buf, (size_t)len, "x11:%lx", (unsigned long)win) < len)
 		return 1;
 	buf[0] = 0;
 	return 0;

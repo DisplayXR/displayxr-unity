@@ -74,7 +74,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define DXR_WL_MAX_OUTPUTS 8
+#define DXR_WL_MAX_OUTPUTS 8 // more are not tracked: a window only on them gets no window handle ("")
 #define DXR_WL_MAX_CORRECTIONS 3 // re-placements per map: never fight the compositor
 #define DXR_WL_VERIFY_TRIES 3      // panel moves re-checked and retried (#361)
 #define DXR_WL_VERIFY_DELAY_MS 350 // ... this long after each: ~1 s for all of them
@@ -1925,8 +1925,9 @@ export_update_locked(void)
 		wl_display_flush(s_wl.display); // the handle comes with a later dispatch
 }
 
-//! Reads what export_update_locked made: no request, no dispatch, no round trip,
-//! so it is cheap from any thread. Right after the window is hidden it may still
+//! Reads what export_update_locked made: no request, no dispatch, no round trip of
+//! its own. It takes s_wl_mutex, so it may wait while dxr_wl_weave_surface_create
+//! holds it across the session's first round trip. Right after the window is hidden it may still
 //! give the old handle, until the frame thread reads the compositor's notice (a
 //! frame or so; a dialog given that handle opens unparented, as with "").
 static int

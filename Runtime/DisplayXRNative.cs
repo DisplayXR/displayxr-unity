@@ -671,8 +671,9 @@ namespace DisplayXR
         /// from the moment the compositor dropped the export (the window was
         /// hidden) until a frame or two after the window is shown again.</item>
         /// </list>
-        /// It only reads a value the plugin keeps (no request to the compositor, no
-        /// waiting), so it is cheap from any thread. Ask for it right before each
+        /// It only reads a value the plugin keeps (no request to the compositor). It may
+        /// wait briefly while an XR session is starting; otherwise it returns at once,
+        /// from any thread. Ask for it right before each
         /// portal request rather than keeping it: a window shown anew gets a new
         /// handle. Pass it on verbatim: the compositor picks the Wayland handle
         /// (mutter: 32 random printable ASCII characters, spaces and quotes
