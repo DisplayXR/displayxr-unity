@@ -18,9 +18,10 @@
 // the runtime guarantees they never block on an action in flight. Action results and
 // consent changes arrive as events through xrPollEvent, which the provider pumps on
 // the GRAPHICS thread (Windows/Linux) or the main thread (macOS); this module copies
-// them into a bounded queue that C# drains every LateUpdate. A separate call lock
-// serialises the C# pass-throughs against session destroy, so no runtime call is
-// ever made with a session that is being destroyed.
+// them into a bounded queue that C# drains every LateUpdate (a waitable capture's
+// completion goes to its waiter instead, below). A separate call lock serialises the
+// C# pass-throughs against session destroy, so no runtime call is ever made with a
+// session that is being destroyed; the capture calls may come from any thread.
 //
 // Every string crossing the C# boundary is UTF-8 bytes (Windows DllImport defaults
 // to the ANSI code page, which would mangle titles, typed text and messages).
@@ -32,6 +33,19 @@
 // behaves exactly as before. A capture is asynchronous like an action: the
 // completion is queued from the poll loop, and C# fetches the image (which the
 // runtime keeps for 10 s) from the main thread when it drains that event.
+//
+// A WAITABLE capture (dxr_prov_desktop_capture_waitable + _capture_wait) is the
+// same capture with its completion routed to the thread that waits for it instead
+// of the event queue, so any thread can block on it, Unity's main thread too. That
+// thread cannot just wait for the regular poll: on Windows/Linux the graphics
+// thread polls from Unity's per-frame XR callback, which the render thread runs
+// only for a frame the main thread has submitted, so a blocked main thread stops
+// the poll (and on macOS the main thread IS the poller). The waiting thread
+// therefore polls the runtime's event queue itself (the session module's pump,
+// dxr_desktop_set_waiter_pump): desktop events are routed here as usual, every
+// other event is handed back to the regular poller, in order. The pump is
+// serialised with the regular poll and with session teardown, never blocks, and
+// on macOS runs on the main thread only (the runtime's poll drives AppKit there).
 //
 // The Dxr* structs below are the C# ABI: blittable, fixed layout, no pointers.
 // Their sizes and offsets are pinned by static_asserts in the .cpp and mirrored by
@@ -60,6 +74,7 @@ extern "C" {
 #define DXR_DESKTOP_E_NO_SESSION (-2000000002)   //!< no XR session right now
 #define DXR_DESKTOP_E_BAD_ARGUMENT (-2000000003) //!< null pointer where one is required
 #define DXR_DESKTOP_E_NO_CAPTURE (-2000000004)   //!< the runtime's extension predates spec v2 (no screen capture)
+#define DXR_DESKTOP_E_TIMEOUT (-2000000005)      //!< C# only: a blocking capture's wait ran out (never returned here)
 
 //! Event kinds returned by dxr_prov_desktop_next_event.
 #define DXR_DESKTOP_EVENT_ACTION_COMPLETED 1
@@ -156,8 +171,17 @@ void dxr_desktop_on_session_created(XrSession session);
 //! drops its queued actions without events on destroy, spec §4).
 void dxr_desktop_on_session_destroying(void);
 //! From the xrPollEvent loop: returns 1 if @p ev was a desktop-control event
-//! (queued or dropped), else 0.
+//! (queued, handed to its waiter, or dropped), else 0. Any thread.
 int dxr_desktop_handle_event(const XrEventDataBuffer *ev);
+
+//! Polls the runtime's event queue on the CALLING thread for a capture waiter and
+//! returns the number of events it took (0 when it may not poll from this thread or
+//! another thread is polling right now). Never blocks; routes desktop events
+//! through dxr_desktop_handle_event.
+typedef int (*DxrDesktopPumpFn)(void);
+
+//! The session module's pump (NULL = none: waiters rely on the regular poll alone).
+void dxr_desktop_set_waiter_pump(DxrDesktopPumpFn pump);
 
 // ---- C# surface (DisplayXRDesktop) ----------------------------------------------
 
@@ -194,9 +218,30 @@ DISPLAYXR_EXPORT int dxr_prov_desktop_get_capture_state(int32_t *state);
 DISPLAYXR_EXPORT int dxr_prov_desktop_capture(const DxrDesktopCaptureInfo *info, uint64_t *capture_id);
 
 //! Two-call idiom, in BYTES, over xrGetDesktopCaptureImageDXR (count = width*height*4,
-//! top row first). The runtime keeps the image until a call copies it out.
+//! top row first). The runtime keeps the image until a call copies it out. Any thread.
 DISPLAYXR_EXPORT int dxr_prov_desktop_capture_image(uint64_t capture_id, uint32_t capacity, uint32_t *count,
                                                     uint8_t *rgba);
+
+//! As dxr_prov_desktop_capture, but the completion is kept for
+//! dxr_prov_desktop_capture_wait instead of being queued for
+//! dxr_prov_desktop_next_event. The runtime's limits apply unchanged: a second
+//! capture while one is in flight returns XR_ERROR_LIMIT_REACHED at once; starts
+//! closer than 250 ms are accepted and delayed. Any thread.
+DISPLAYXR_EXPORT int dxr_prov_desktop_capture_waitable(const DxrDesktopCaptureInfo *info, uint64_t *capture_id);
+
+//! Wait up to @p timeout_ms for a waitable capture's completion, polling the
+//! runtime's event queue from this thread meanwhile (see the header comment).
+//! Returns 1 and fills @p ev (what dxr_prov_desktop_next_event would have returned,
+//! kind CAPTURE_COMPLETED), after which the capture is forgotten; 0 while it is
+//! still in flight (wait again, or abandon it); DXR_DESKTOP_E_NO_SESSION when the
+//! session ended (it will never complete; forgotten); DXR_DESKTOP_E_BAD_ARGUMENT for
+//! an id that is not a waitable capture (any more). Any thread; returns within
+//! @p timeout_ms plus one non-blocking poll.
+DISPLAYXR_EXPORT int dxr_prov_desktop_capture_wait(uint64_t capture_id, uint32_t timeout_ms, DxrDesktopEvent *ev);
+
+//! Give up on a waitable capture: its completion, if it still comes, is dropped
+//! (the runtime frees the image after 10 s or with the next capture). Any thread.
+DISPLAYXR_EXPORT void dxr_prov_desktop_capture_abandon(uint64_t capture_id);
 
 //! Two-call idiom, straight through to xrEnumerateDesktopWindowsDXR: capacity 0
 //! (windows may be NULL) returns the count; a short capacity returns

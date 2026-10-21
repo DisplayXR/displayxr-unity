@@ -35,8 +35,12 @@
 #endif
 
 #include <mutex>
+#include <deque> // s_poll_deferred
 #ifdef _WIN32
 extern "C" void displayxr_set_overlay_cursor_hidden(int hidden); // displayxr_win32.c
+#endif
+#ifdef __APPLE__
+#include <pthread.h> // pthread_main_np (ps_pump_for_waiter)
 #endif
 
 #include <stdio.h>
@@ -4511,6 +4515,61 @@ static void ps_probe_cleanup(void)
 static void ps_probe_cleanup(void) {}  // macOS: the weave-to-texture probe is Windows-only
 #endif // _WIN32
 
+// ============================================================================
+// The event poll, shared with desktop-capture waiters
+// ============================================================================
+//
+// Every xrPollEvent caller holds s_poll_mx: the regular poller (dxr_prov_poll_events:
+// the graphics thread on Windows/Linux, the main thread on macOS) and a thread
+// blocked on a desktop capture (dxr_prov_desktop_capture_wait -> ps_pump_for_waiter).
+// That thread may be Unity's main thread, and while it blocks the regular poll does
+// not run: the graphics thread polls from GfxPopulateNextFrameDesc, which the render
+// thread runs only for a frame the main thread has submitted. So the waiter polls the
+// runtime's queue itself. Desktop-control events go to the desktop module as always;
+// every other event is kept here, in order, and the regular poller dispatches it
+// before it polls anew, so session-state, mode and MCP events are still handled on
+// the thread that always handled them, and no later than they would have been.
+//
+// The runtime's xrPollEvent may be called from any thread (it serialises its queue
+// and session list itself) except on macOS, where it pumps AppKit: main thread only.
+static std::mutex s_poll_mx;
+static PFN_xrPollEvent s_pump_poll = nullptr;         // s_poll_mx; non-NULL while a session runs
+static XrInstance s_pump_instance = XR_NULL_HANDLE;   // s_poll_mx
+static std::deque<XrEventDataBuffer> s_poll_deferred; // s_poll_mx
+// What a waiter may hold back (4 KB each). When full it stops polling: the rest stay
+// in the runtime's queue for the regular poller.
+#define PS_MAX_DEFERRED_EVENTS 64
+
+// On at session start, off before anything is torn down (the pump never polls an
+// instance that is being destroyed: it holds s_poll_mx for its whole poll).
+static void ps_pump_enable(int on)
+{
+	std::lock_guard<std::mutex> lk(s_poll_mx);
+	s_pump_poll = on ? s_ps.pfn_poll_event : nullptr;
+	s_pump_instance = on ? s_ps.instance : XR_NULL_HANDLE;
+	s_poll_deferred.clear();
+}
+
+// DxrDesktopPumpFn: never blocks.
+static int ps_pump_for_waiter(void)
+{
+#ifdef __APPLE__
+	// A worker thread waits for the main thread's own poll (LateUpdate) instead.
+	if (!pthread_main_np()) return 0;
+#endif
+	std::unique_lock<std::mutex> lk(s_poll_mx, std::try_to_lock);
+	if (!lk.owns_lock() || !s_pump_poll) return 0; // someone else is polling: they route it
+	int n = 0;
+	while (s_poll_deferred.size() < PS_MAX_DEFERRED_EVENTS) {
+		XrEventDataBuffer ev = {XR_TYPE_EVENT_DATA_BUFFER};
+		if (s_pump_poll(s_pump_instance, &ev) != XR_SUCCESS) break;
+		n++;
+		if (dxr_desktop_handle_event(&ev)) continue;
+		s_poll_deferred.push_back(ev);
+	}
+	return n;
+}
+
 int dxr_prov_session_start(const char *runtime_json_path,
                            int backend_kind,
                            void *unity_device,
@@ -5413,6 +5472,9 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	ps_create_swapchain();
 
 	s_ps.running = 1;
+	// Desktop-capture waiters may poll from now on (see ps_pump_for_waiter).
+	ps_pump_enable(1);
+	dxr_desktop_set_waiter_pump(ps_pump_for_waiter);
 	ps_log("[DisplayXR-PROV] Session start OK\n");
 	return 1;
 }
@@ -5826,6 +5888,8 @@ int dxr_prov_cursor_get_state(DxrProvCursorState *out)
 
 void dxr_prov_session_stop(void)
 {
+	// First: no capture waiter polls the instance this tears down (waits out one in progress).
+	ps_pump_enable(0);
 	s_live_window_px.store(0); // the next session measures its own window
 	for (int i = 0; i < PS_MAX_WSUI; i++) {
 		ProviderWsui *ws = &s_ps.wsui[i];
@@ -6408,11 +6472,25 @@ void *dxr_prov_get_swapchain_image_texture(uint32_t index, uint32_t *out_w,
 // Frame loop
 // ============================================================================
 
+// The regular poller's next event: first what a desktop-capture waiter took off the
+// runtime's queue (ps_pump_for_waiter), in order, then the runtime's queue. s_poll_mx held.
+static bool ps_next_event(XrEventDataBuffer *ev)
+{
+	if (!s_poll_deferred.empty()) {
+		*ev = s_poll_deferred.front();
+		s_poll_deferred.pop_front();
+		return true;
+	}
+	return s_ps.pfn_poll_event(s_ps.instance, ev) == XR_SUCCESS;
+}
+
+// Never stops the session from inside the loop: it holds s_poll_mx, which session stop takes.
 void dxr_prov_poll_events(void)
 {
 	if (!s_ps.running || !s_ps.pfn_poll_event) return;
+	std::lock_guard<std::mutex> lk(s_poll_mx);
 	XrEventDataBuffer ev = {XR_TYPE_EVENT_DATA_BUFFER};
-	while (s_ps.pfn_poll_event(s_ps.instance, &ev) == XR_SUCCESS) {
+	while (ps_next_event(&ev)) {
 		// An agent called one of the app's MCP tools: queued for the C# main thread.
 		if (dxr_mcp_handle_event(&ev)) { ev = {XR_TYPE_EVENT_DATA_BUFFER}; continue; }
 		// Desktop-control action results + consent changes: queued for the C# main thread.

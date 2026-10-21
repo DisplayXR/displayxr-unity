@@ -355,9 +355,12 @@ if(DISPLAYXR_BUILD_TESTS)
     target_include_directories(mcp_tools_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/displayxr_xrprovider ${OPENXR_INCLUDE_DIR})
     target_compile_features(mcp_tools_test PRIVATE cxx_std_17)
     add_test(NAME mcp_tools COMMAND mcp_tools_test)
-    # XR_DXR_desktop_control binding against a fake runtime (events, UTF-8, marshalling).
+    # XR_DXR_desktop_control binding against a fake runtime (events, UTF-8, marshalling,
+    # waitable captures across threads).
+    find_package(Threads REQUIRED)
     add_executable(desktop_test tests/desktop_test.cpp displayxr_xrprovider/displayxr_provider_desktop.cpp)
     target_include_directories(desktop_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/displayxr_xrprovider ${OPENXR_INCLUDE_DIR})
     target_compile_features(desktop_test PRIVATE cxx_std_17)
+    target_link_libraries(desktop_test PRIVATE Threads::Threads)
     add_test(NAME desktop_control COMMAND desktop_test)
 endif()
