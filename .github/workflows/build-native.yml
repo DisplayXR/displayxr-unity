@@ -262,7 +262,7 @@ jobs:
           # X11-only and runtime-less ones included (it loads in every Linux editor
           # and in players with no panel), so everything optional is dlopened:
           # Vulkan and Xlib by the main plugin (displayxr_vk_loader /
-          # displayxr_linux.c), libdbus by the Wayland library, and the Wayland
+          # displayxr_linux.c), libdbus by both (displayxr_linux_dbus.c), and the Wayland
           # library itself only for a native-Wayland player. A new NEEDED entry
           # fails here instead of as a DllNotFoundException on a user's box.
           check_needed() {

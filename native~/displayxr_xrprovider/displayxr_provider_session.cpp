@@ -1136,6 +1136,8 @@ extern "C" int displayxr_linux_get_weave_window(void **out_display, unsigned lon
 extern "C" void displayxr_linux_destroy_weave_window(void);
 extern "C" int displayxr_linux_window_size(uint32_t *out_w, uint32_t *out_h);
 extern "C" int displayxr_linux_pointer_in_input_region(void);
+// The desktop info's X root scale (displayxr_linux_desktop_info.c): the panel rect in X root px.
+extern "C" void dxr_linux_desktop_info_set_panel(const char *connector, int x, int y, int w, int h);
 #endif
 
 // Poll the live workspace-tile canvas size (#225, display_zones spec v2). The
@@ -5121,6 +5123,15 @@ int dxr_prov_session_start(const char *runtime_json_path,
 			ps_log("[DisplayXR-PROV] Display desktop origin: NOT REPORTED - runtime predates "
 			       "v16; placing the window on the 3D display is unavailable (#266)\n");
 		}
+#if defined(__linux__) && !defined(__ANDROID__)
+		// The panel's X root rect against its stage rect gives the desktop info's X
+		// root scale, as it does the native-Wayland position API's (v18 only).
+		if (v18)
+			dxr_linux_desktop_info_set_panel(s_ps.panel_connector, (int)s_ps.desktop_origin_x,
+			                                 (int)s_ps.desktop_origin_y, (int)s_ps.desktop_w, (int)s_ps.desktop_h);
+		else
+			dxr_linux_desktop_info_set_panel("", 0, 0, 0, 0);
+#endif
 
 		ps_log("[DisplayXR-PROV] Display: %ux%u %.3fx%.3fm\n",
 		       di.displayPixelWidth, di.displayPixelHeight,
@@ -8407,6 +8418,17 @@ int dxr_prov_get_display_desktop_origin(int *out_x, int *out_y)
 	if (!s_ps.desktop_origin_valid) return 0;
 	if (out_x) *out_x = (int)s_ps.desktop_origin_x;
 	if (out_y) *out_y = (int)s_ps.desktop_origin_y;
+	return 1;
+}
+
+int dxr_prov_get_runtime_version(char *buf, int len)
+{
+	if (!buf || len <= 0) return 0;
+	buf[0] = 0;
+	uint64_t v = s_runtime_version; // one aligned 64-bit read (written at instance creation)
+	if (!v) return 0;
+	snprintf(buf, (size_t)len, "%u.%u.%u", (unsigned)XR_VERSION_MAJOR(v), (unsigned)XR_VERSION_MINOR(v),
+	         (unsigned)XR_VERSION_PATCH(v));
 	return 1;
 }
 

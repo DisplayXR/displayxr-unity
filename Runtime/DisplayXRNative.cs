@@ -3,6 +3,7 @@
 
 using System;
 using System.Runtime.InteropServices;
+using UnityEngine;
 
 namespace DisplayXR
 {
@@ -692,6 +693,411 @@ namespace DisplayXR
                 return "";
             int n = System.Array.IndexOf(buf, (byte)0);
             return System.Text.Encoding.ASCII.GetString(buf, 0, n < 0 ? buf.Length : n);
+        }
+#endif
+
+        /// <summary>
+        /// The DisplayXR runtime's version as the plug-in read it when it created its
+        /// OpenXR instance, "major.minor.patch" (e.g. "2.50.0"); "" before the first XR
+        /// session (and with an older native plug-in). After a session ends it is still
+        /// the version of the runtime that ran it. On Linux it is the release tag in the
+        /// runtime's name, since Linux runtimes report 1.6.0 as their OpenXR
+        /// runtimeVersion (displayxr-runtime#1790). Any platform, any thread.
+        /// </summary>
+        public static string RuntimeVersion()
+        {
+            try
+            {
+                var buf = new byte[32];
+                if (dxr_prov_get_runtime_version(buf, buf.Length) == 0)
+                    return "";
+                int n = Array.IndexOf(buf, (byte)0);
+                return System.Text.Encoding.ASCII.GetString(buf, 0, n < 0 ? buf.Length : n);
+            }
+            catch (EntryPointNotFoundException) { }
+            catch (DllNotFoundException) { }
+            return "";
+        }
+
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        private static extern int dxr_prov_get_runtime_version([Out] byte[] buf, int len);
+
+        // ---------------------------------------------------------------------
+        // Linux desktop info (read-only): the monitors, the windows, the window at
+        // a point, the pointer and the X root scale, for an app's agent on GNOME. Linux player only;
+        // elsewhere (Windows, macOS, the editor) every call returns false / empty /
+        // 0. It is only what the DisplayXR GNOME extension's read-only members
+        // (runtime spec wayland-window-geometry.md §12.4) and mutter's DisplayConfig
+        // give any client. No window titles and no UI text, by design: those come
+        // from DisplayXRDesktop (ListWindows, GetTextAt) after the user's consent.
+        // Consent policy (runtime ADR-056): the monitors and the X root scale are
+        // always available. What tells the agent about OTHER apps (the window list,
+        // the window at a point, the focused window, the pointer) needs this app's
+        // desktop control GRANTED (DisplayXRDesktop.State == Granted): before that,
+        // LinuxWindows / LinuxWindowAt / LinuxPointer return false (empty), with one
+        // log line, "needs desktop control granted". None of them ever asks.
+        // ---------------------------------------------------------------------
+
+        /// <summary>
+        /// One monitor of the desktop as GNOME lays it out (a mutter "logical
+        /// monitor"). See <see cref="LinuxMonitors"/>.
+        /// </summary>
+        public struct LinuxMonitor
+        {
+            /// <summary>
+            /// The monitor's rect in GNOME desktop coordinates: mutter's stage
+            /// coordinates, top-left origin, y down. These are logical px in mutter's
+            /// logical layout mode (fractional scaling; the default on GNOME 50) and
+            /// device px in its physical layout mode. The same space as
+            /// <see cref="LinuxWindowInfo.Frame"/>, <see cref="LinuxPointer"/> and
+            /// DisplayXRDesktop on GNOME; multiply by <see cref="LinuxXRootScale"/>
+            /// for X root coordinates.
+            /// </summary>
+            public RectInt Rect;
+
+            /// <summary>
+            /// Mutter's scale for this monitor (1, 1.25, 1.333..., 2, ...). In the
+            /// logical layout mode one desktop px on this monitor is Scale device px
+            /// (a screenshot's px); in the physical layout mode desktop px are device
+            /// px already.
+            /// </summary>
+            public float Scale;
+
+            /// <summary>The primary monitor (the one with GNOME's top bar).</summary>
+            public bool Primary;
+
+            /// <summary>Its connector name as mutter has it ("eDP-1", "HDMI-1", ...).
+            /// A monitor mirrored on several connectors reports the first.</summary>
+            public string Connector;
+        }
+
+        /// <summary>
+        /// One window on the desktop, as the DisplayXR GNOME extension reports it. No
+        /// title, by design (see the note above <see cref="LinuxMonitor"/>). See
+        /// <see cref="LinuxWindows"/>.
+        /// </summary>
+        public struct LinuxWindowInfo
+        {
+            /// <summary>
+            /// Mutter's window id: unique and stable for the window's lifetime (a
+            /// window shown anew gets a new one). An unsigned 64-bit number, often
+            /// above int.MaxValue. 0 with a DisplayXR GNOME extension older than
+            /// version 16.
+            /// </summary>
+            public ulong Id;
+
+            /// <summary>
+            /// The window's frame (what the user sees as the window, a client-side
+            /// title bar included; no shadow) in GNOME desktop coordinates, the space of
+            /// <see cref="LinuxMonitor.Rect"/>. Reported for a minimized window too
+            /// (where it would be).
+            /// </summary>
+            public RectInt Frame;
+
+            /// <summary>The owning process; 0 when not known.</summary>
+            public int Pid;
+
+            /// <summary>The X11 WM_CLASS or the Wayland app id ("org.gnome.Nautilus",
+            /// "firefox", ...); "" when the window has none. Cut at 127 bytes of UTF-8.</summary>
+            public string AppId;
+
+            /// <summary>It has the keyboard focus (at most one window does).</summary>
+            public bool Focused;
+
+            /// <summary>Minimized (by its app, the user or the dock). Always false with a
+            /// DisplayXR GNOME extension older than version 15.</summary>
+            public bool Minimized;
+
+            /// <summary>
+            /// Index of its monitor (the one mutter places it on: the one holding most
+            /// of it) in the array <see cref="LinuxMonitors"/> returns; -1 when it is on
+            /// no monitor or the monitor list is not available. Indexes the list as it
+            /// is now: call LinuxMonitors and LinuxWindows together.
+            /// </summary>
+            public int Monitor;
+        }
+
+        /// <summary>
+        /// Linux player: the desktop's monitors, from mutter's
+        /// <c>org.gnome.Mutter.DisplayConfig</c> (GNOME only; X11 and native-Wayland
+        /// players alike). In mutter's order; <see cref="LinuxMonitor.Primary"/> marks
+        /// the primary. Returns false, with an empty array, when not available: not a
+        /// Linux player, not a GNOME session, or no session bus.
+        /// Any thread. The answer is cached for 250 ms; a call that refreshes it waits
+        /// for a D-Bus round trip to gnome-shell (about a millisecond). A D-Bus call
+        /// gives up after 250 ms, and after a timeout nothing is asked for a second
+        /// (this list keeps its last answer meanwhile).
+        /// </summary>
+        public static unsafe bool LinuxMonitors(out LinuxMonitor[] monitors)
+        {
+            monitors = Array.Empty<LinuxMonitor>();
+#if UNITY_STANDALONE_LINUX && !UNITY_EDITOR
+            if (s_LinuxDesktopMissing) return false;
+            try
+            {
+                var raw = t_LinuxMonitorBuf ?? (t_LinuxMonitorBuf = new NativeLinuxMonitor[8]);
+                for (int attempt = 0; attempt < 3; attempt++)
+                {
+                    int n;
+                    fixed (NativeLinuxMonitor* p = raw)
+                        n = displayxr_linux_monitors(p, raw.Length);
+                    if (n < 0) return false;
+                    if (n > raw.Length) { raw = t_LinuxMonitorBuf = new NativeLinuxMonitor[n + 4]; continue; }
+                    var result = new LinuxMonitor[n];
+                    for (int i = 0; i < n; i++)
+                    {
+                        NativeLinuxMonitor m = raw[i];
+                        result[i] = new LinuxMonitor
+                        {
+                            Rect = new RectInt(m.x, m.y, m.width, m.height),
+                            Scale = m.scale,
+                            Primary = m.primary != 0,
+                            Connector = LinuxUtf8Z(m.connector, 32),
+                        };
+                    }
+                    monitors = result;
+                    return true;
+                }
+            }
+            catch (EntryPointNotFoundException) { s_LinuxDesktopMissing = true; }
+            catch (DllNotFoundException) { s_LinuxDesktopMissing = true; }
+#endif
+            return false;
+        }
+
+        /// <summary>
+        /// Linux player: the windows on the desktop, in stacking order, TOP FIRST: index
+        /// 0 is the window above all the others, and of two overlapping windows the one
+        /// with the lower index covers the other. From the DisplayXR GNOME extension,
+        /// which lists mutter's window actors, kept in stacking order (X11 and
+        /// native-Wayland players alike; the app's own window included). To find the
+        /// window at a point, use <see cref="LinuxWindowAt"/>: it also knows input
+        /// regions (a click-through window) and shell UI. With extension version 16 or newer: normal
+        /// windows, dialogs and utility windows (a "Save changes?" dialog is listed);
+        /// older ones list normal windows only. Never menus, popups, tooltips, docks or
+        /// the desktop. No titles (see <see cref="LinuxWindowInfo"/>). Returns false,
+        /// with an empty array, when not available: not a Linux player, no DisplayXR
+        /// GNOME extension (not installed, disabled, not GNOME), or no session bus.
+        /// <b>Needs desktop control granted</b> (<see cref="DisplayXRDesktop.State"/> ==
+        /// <see cref="DesktopControlState.Granted"/>): before that, false and an empty
+        /// array (see the policy note above <see cref="LinuxMonitor"/>).
+        /// Any thread. The answer is cached for 100 ms; a call that refreshes it waits
+        /// for a D-Bus round trip or two (about a millisecond each; the monitor list is
+        /// refreshed too when it is due). A D-Bus call gives up after 250 ms, and after
+        /// a timeout nothing is asked for a second (false meanwhile).
+        /// </summary>
+        public static unsafe bool LinuxWindows(out LinuxWindowInfo[] windows)
+        {
+            windows = Array.Empty<LinuxWindowInfo>();
+#if UNITY_STANDALONE_LINUX && !UNITY_EDITOR
+            if (s_LinuxDesktopMissing || !LinuxDesktopControlGranted("LinuxWindows")) return false;
+            try
+            {
+                var raw = t_LinuxWindowBuf ?? (t_LinuxWindowBuf = new NativeLinuxWindow[64]);
+                for (int attempt = 0; attempt < 3; attempt++)
+                {
+                    int n;
+                    fixed (NativeLinuxWindow* p = raw)
+                        n = displayxr_linux_windows(p, raw.Length);
+                    if (n < 0) return false;
+                    if (n > raw.Length) { raw = t_LinuxWindowBuf = new NativeLinuxWindow[n + 16]; continue; }
+                    var result = new LinuxWindowInfo[n];
+                    for (int i = 0; i < n; i++)
+                    {
+                        NativeLinuxWindow w = raw[i];
+                        result[i] = new LinuxWindowInfo
+                        {
+                            Id = w.id,
+                            Frame = new RectInt(w.x, w.y, w.width, w.height),
+                            Pid = w.pid,
+                            AppId = LinuxUtf8Z(w.appId, 128),
+                            Focused = w.focused != 0,
+                            Minimized = w.minimized != 0,
+                            Monitor = w.monitor,
+                        };
+                    }
+                    windows = result;
+                    return true;
+                }
+            }
+            catch (EntryPointNotFoundException) { s_LinuxDesktopMissing = true; }
+            catch (DllNotFoundException) { s_LinuxDesktopMissing = true; }
+#endif
+            return false;
+        }
+
+        /// <summary>
+        /// Linux player: the app window a click at <paramref name="position"/> (GNOME
+        /// desktop coordinates, the space of <see cref="LinuxMonitor.Rect"/>) would
+        /// meet. With DisplayXR GNOME extension version 16 or newer this is mutter's own
+        /// pick (GetWindowAt): stacking, input regions (a click-through window is passed
+        /// over to the one behind it) and shell UI on top all count, as for a click. It
+        /// can be a menu or popup that <see cref="LinuxWindows"/> does not list. With an
+        /// older extension it is the topmost not-minimized window whose frame holds the
+        /// point (from LinuxWindows). No title, as everywhere here.
+        /// Returns false, and a default <paramref name="window"/>, when no app window is
+        /// there: the desktop background (or a desktop-icons window), shell UI (the top
+        /// bar, the overview), a point on no monitor, the screen locked; and when not
+        /// available (not a Linux player, no extension), and while this app's desktop
+        /// control is not <see cref="DesktopControlState.Granted"/>.
+        /// Any thread. The same point is answered from a 100 ms cache; another point
+        /// costs a D-Bus round trip (about a millisecond; a D-Bus call gives up after
+        /// 250 ms).
+        /// </summary>
+        public static unsafe bool LinuxWindowAt(Vector2Int position, out LinuxWindowInfo window)
+        {
+            window = default;
+#if UNITY_STANDALONE_LINUX && !UNITY_EDITOR
+            if (s_LinuxDesktopMissing || !LinuxDesktopControlGranted("LinuxWindowAt")) return false;
+            try
+            {
+                NativeLinuxWindow w;
+                if (displayxr_linux_window_at(position.x, position.y, &w) != 1) return false;
+                window = new LinuxWindowInfo
+                {
+                    Id = w.id,
+                    Frame = new RectInt(w.x, w.y, w.width, w.height),
+                    Pid = w.pid,
+                    AppId = LinuxUtf8Z(w.appId, 128),
+                    Focused = w.focused != 0,
+                    Minimized = w.minimized != 0,
+                    Monitor = w.monitor,
+                };
+                return true;
+            }
+            catch (EntryPointNotFoundException) { s_LinuxDesktopMissing = true; }
+            catch (DllNotFoundException) { s_LinuxDesktopMissing = true; }
+#endif
+            return false;
+        }
+
+        /// <summary>
+        /// Linux player: where the pointer is, in GNOME desktop coordinates (the space
+        /// of <see cref="LinuxMonitor.Rect"/>), wherever it is on the desktop (a
+        /// Wayland app is otherwise only told while the pointer is over its own
+        /// window). From the DisplayXR GNOME extension, version 16 or newer. Returns
+        /// false (and (0, 0)) when not available: not a Linux player, no extension or an
+        /// older one, or the screen is locked; and while this app's desktop control is
+        /// not <see cref="DesktopControlState.Granted"/>.
+        /// Any thread. The answer is cached for 100 ms: after moving the pointer, ask
+        /// again at least 100 ms later to see the new position.
+        /// </summary>
+        public static bool LinuxPointer(out Vector2Int position)
+        {
+            position = default;
+#if UNITY_STANDALONE_LINUX && !UNITY_EDITOR
+            if (s_LinuxDesktopMissing || !LinuxDesktopControlGranted("LinuxPointer")) return false;
+            try
+            {
+                if (displayxr_linux_pointer(out int x, out int y) == 0) return false;
+                position = new Vector2Int(x, y);
+                return true;
+            }
+            catch (EntryPointNotFoundException) { s_LinuxDesktopMissing = true; }
+            catch (DllNotFoundException) { s_LinuxDesktopMissing = true; }
+#endif
+            return false;
+        }
+
+        /// <summary>
+        /// Linux player: X root px per GNOME desktop px. X root coordinates are what an
+        /// X11 client sees, and what the plug-in's window-position API
+        /// (<c>displayxr_get_overlay_position</c> / <c>displayxr_set_overlay_position</c>)
+        /// speaks on Linux, on X11 and native-Wayland players alike:
+        /// X root = desktop x this. 1 without XWayland scaling (and in an X11
+        /// session); an integer N with mutter's xwayland-native-scaling at a scaled
+        /// monitor. It is the factor the plug-in itself converts window positions
+        /// with: the 3D panel's rect as the runtime reports it (X root px) against the
+        /// same monitor's desktop rect; on an X11 player without an XR session, the X
+        /// root window's size against the monitors' bounding box.
+        /// 0 when not known: not a Linux player, no monitor list, or a native-Wayland
+        /// player without the panel's rect (before its XR session reported it, or with
+        /// no X server at all); the position API cannot convert then either.
+        /// Any thread. Cached for 250 ms.
+        /// </summary>
+        public static float LinuxXRootScale()
+        {
+#if UNITY_STANDALONE_LINUX && !UNITY_EDITOR
+            if (s_LinuxDesktopMissing) return 0f;
+            try
+            {
+                return displayxr_linux_xroot_scale();
+            }
+            catch (EntryPointNotFoundException) { s_LinuxDesktopMissing = true; }
+            catch (DllNotFoundException) { s_LinuxDesktopMissing = true; }
+#endif
+            return 0f;
+        }
+
+#if UNITY_STANDALONE_LINUX && !UNITY_EDITOR
+        // Byte-for-byte mirrors of DisplayXRLinuxMonitor / DisplayXRLinuxWindow in
+        // native~/displayxr_linux_desktop_info.h (its unit test pins 56 / 168 bytes).
+        [StructLayout(LayoutKind.Sequential)]
+        private unsafe struct NativeLinuxMonitor
+        {
+            public int x, y, width, height;
+            public float scale;
+            public int primary;
+            public fixed byte connector[32];
+        }
+
+        [StructLayout(LayoutKind.Sequential)]
+        private unsafe struct NativeLinuxWindow
+        {
+            public ulong id;
+            public int x, y, width, height;
+            public int pid, monitor, focused, minimized;
+            public fixed byte appId[128];
+        }
+
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        private static extern unsafe int displayxr_linux_monitors(NativeLinuxMonitor* buf, int len);
+
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        private static extern unsafe int displayxr_linux_windows(NativeLinuxWindow* buf, int len);
+
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        private static extern unsafe int displayxr_linux_window_at(int x, int y, NativeLinuxWindow* window);
+
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        private static extern int displayxr_linux_pointer(out int x, out int y);
+
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        private static extern float displayxr_linux_xroot_scale();
+
+        // A native plug-in older than these exports: every call answers "not available".
+        private static volatile bool s_LinuxDesktopMissing;
+
+        // The consent gate (runtime ADR-056): what tells the agent about other apps needs
+        // this app's desktop control granted. One log line per refusal streak, not per
+        // call (agents poll these every frame); a grant re-arms it.
+        private static volatile bool s_LinuxGateLogged;
+
+        private static bool LinuxDesktopControlGranted(string what)
+        {
+            if (DisplayXRDesktop.State == DesktopControlState.Granted)
+            {
+                s_LinuxGateLogged = false;
+                return true;
+            }
+            if (!s_LinuxGateLogged)
+            {
+                s_LinuxGateLogged = true;
+                Debug.Log($"[DisplayXR] {what}: needs desktop control granted (DisplayXRDesktop.Request); " +
+                          "returning nothing until then");
+            }
+            return false;
+        }
+
+        // Per-thread native buffers, reused: per-frame polling allocates only the result.
+        [ThreadStatic] private static NativeLinuxMonitor[] t_LinuxMonitorBuf;
+        [ThreadStatic] private static NativeLinuxWindow[] t_LinuxWindowBuf;
+
+        private static unsafe string LinuxUtf8Z(byte* p, int cap)
+        {
+            int n = 0;
+            while (n < cap && p[n] != 0) n++;
+            return n == 0 ? "" : System.Text.Encoding.UTF8.GetString(p, n);
         }
 #endif
 
