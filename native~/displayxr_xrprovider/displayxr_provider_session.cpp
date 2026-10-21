@@ -8421,6 +8421,17 @@ int dxr_prov_get_display_desktop_origin(int *out_x, int *out_y)
 	return 1;
 }
 
+int dxr_prov_get_runtime_version(char *buf, int len)
+{
+	if (!buf || len <= 0) return 0;
+	buf[0] = 0;
+	uint64_t v = s_runtime_version; // one aligned 64-bit read (written at instance creation)
+	if (!v) return 0;
+	snprintf(buf, (size_t)len, "%u.%u.%u", (unsigned)XR_VERSION_MAJOR(v), (unsigned)XR_VERSION_MINOR(v),
+	         (unsigned)XR_VERSION_PATCH(v));
+	return 1;
+}
+
 int dxr_prov_move_window_to_display(void)
 {
 #if defined(_WIN32)

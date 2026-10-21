@@ -168,10 +168,58 @@ dxr_di_version_ok(const char *json, const char *end)
 	return dxr_di_int(json, end, "version", -1) == 1;
 }
 
-//! The window list from a GetAllWindows / GetWindows reply, TOP FIRST (the extension
-//! lists them in mutter's stacking order, bottom first). Writes up to `max` records
-//! and returns how many windows there are (more than `max` = cut), or -1 when the
-//! reply cannot be read. `mons` (n_mons) maps each window's monitor rect to an index.
+//! One window entry of the extension's JSON, the object [obj, obj_end), into a
+//! record. `mons` (n_mons) maps its monitor rect to an index.
+static inline void
+dxr_di_parse_window_entry(const char *q, const char *obj_end, DisplayXRLinuxWindow *w,
+                          const DisplayXRLinuxMonitor *mons, int n_mons)
+{
+	memset(w, 0, sizeof(*w));
+	w->id = dxr_di_json_u64(dxr_json_field(q, obj_end, "id"), obj_end);
+	w->pid = dxr_di_int(q, obj_end, "pid", 0);
+	dxr_json_string_utf8(dxr_json_field(q, obj_end, "app_id"), obj_end, (char *)w->app_id, sizeof(w->app_id));
+	w->focused = dxr_json_bool(dxr_json_field(q, obj_end, "focus"), obj_end, 0);
+	w->minimized = dxr_json_bool(dxr_json_field(q, obj_end, "minimized"), obj_end, 0);
+	const char *f = dxr_json_field(q, obj_end, "frame");
+	if (f && *f == '[') {
+		// Exactly four numbers, or no frame at all.
+		int v[4] = {0, 0, 0, 0};
+		const char *e = f + 1;
+		int k = 0;
+		for (; k < 4; k++) {
+			e = dxr_json_ws(e, obj_end);
+			double d = dxr_json_number(e, obj_end, NAN);
+			if (isnan(d))
+				break;
+			v[k] = (int)lround(d);
+			e = dxr_json_skip(e, obj_end);
+			if (!e)
+				break;
+			e = dxr_json_ws(e, obj_end);
+			if (e >= obj_end || *e != (k < 3 ? ',' : ']'))
+				break;
+			e++;
+		}
+		if (k == 4) {
+			w->x = v[0];
+			w->y = v[1];
+			w->width = v[2];
+			w->height = v[3];
+		}
+	}
+	w->monitor = -1;
+	const char *m = dxr_json_field(q, obj_end, "monitor");
+	const char *m_end = m && *m == '{' ? dxr_json_skip(m, obj_end) : NULL;
+	if (m_end)
+		w->monitor = dxr_di_monitor_index(mons, n_mons, dxr_di_int(m, m_end, "x", 0), dxr_di_int(m, m_end, "y", 0),
+		                                  dxr_di_int(m, m_end, "w", 0), dxr_di_int(m, m_end, "h", 0));
+}
+
+//! The window list from a GetAllWindows / GetWindows reply, TOP FIRST: the extension
+//! lists mutter's window actors (global.get_window_actors()), which mutter keeps in
+//! stacking order, bottom first. Writes up to `max` records and returns how many
+//! windows there are (more than `max` = cut), or -1 when the reply cannot be read.
+//! `mons` (n_mons) maps each window's monitor rect to an index.
 static inline int
 dxr_di_parse_windows(const char *json, DisplayXRLinuxWindow *out, int max, const DisplayXRLinuxMonitor *mons,
                      int n_mons)
@@ -210,56 +258,55 @@ dxr_di_parse_windows(const char *json, DisplayXRLinuxWindow *out, int max, const
 		q = dxr_json_ws(q, end);
 		const char *obj_end = dxr_json_skip(q, end);
 		int slot = total - 1 - i; // top first
-		if (slot < max) {
-			DisplayXRLinuxWindow *w = &out[slot];
-			memset(w, 0, sizeof(*w));
-			w->id = dxr_di_json_u64(dxr_json_field(q, obj_end, "id"), obj_end);
-			w->pid = dxr_di_int(q, obj_end, "pid", 0);
-			dxr_json_string_utf8(dxr_json_field(q, obj_end, "app_id"), obj_end, (char *)w->app_id,
-			                     sizeof(w->app_id));
-			w->focused = dxr_json_bool(dxr_json_field(q, obj_end, "focus"), obj_end, 0);
-			w->minimized = dxr_json_bool(dxr_json_field(q, obj_end, "minimized"), obj_end, 0);
-			const char *f = dxr_json_field(q, obj_end, "frame");
-			if (f && *f == '[') {
-				// Exactly four numbers, or no frame at all.
-				int v[4] = {0, 0, 0, 0};
-				const char *e = f + 1;
-				int k = 0;
-				for (; k < 4; k++) {
-					e = dxr_json_ws(e, obj_end);
-					double d = dxr_json_number(e, obj_end, NAN);
-					if (isnan(d))
-						break;
-					v[k] = (int)lround(d);
-					e = dxr_json_skip(e, obj_end);
-					if (!e)
-						break;
-					e = dxr_json_ws(e, obj_end);
-					if (e >= obj_end || *e != (k < 3 ? ',' : ']'))
-						break;
-					e++;
-				}
-				if (k == 4) {
-					w->x = v[0];
-					w->y = v[1];
-					w->width = v[2];
-					w->height = v[3];
-				}
-			}
-			w->monitor = -1;
-			const char *m = dxr_json_field(q, obj_end, "monitor");
-			const char *m_end = m && *m == '{' ? dxr_json_skip(m, obj_end) : NULL;
-			if (m_end)
-				w->monitor = dxr_di_monitor_index(mons, n_mons, dxr_di_int(m, m_end, "x", 0),
-				                                  dxr_di_int(m, m_end, "y", 0), dxr_di_int(m, m_end, "w", 0),
-				                                  dxr_di_int(m, m_end, "h", 0));
-		}
+		if (slot < max)
+			dxr_di_parse_window_entry(q, obj_end, &out[slot], mons, n_mons);
 		i++;
 		q = dxr_json_ws(obj_end, end);
 		if (q < end && *q == ',')
 			q++;
 	}
 	return total;
+}
+
+//! The app window a click at a point would meet, from a GetWindowAt reply
+//! (extension version 16): 1 and *out when it is an app window ("over": "window");
+//! 0 when it is not (the desktop background or a desktop window, shell UI, no
+//! monitor there, the screen locked); -1 when the reply cannot be read.
+static inline int
+dxr_di_parse_window_at(const char *json, DisplayXRLinuxWindow *out, const DisplayXRLinuxMonitor *mons, int n_mons)
+{
+	if (!json)
+		return -1;
+	const char *end = json + strlen(json);
+	if (!dxr_di_version_ok(json, end))
+		return -1;
+	if (dxr_json_bool(dxr_json_field(json, end, "locked"), end, 0))
+		return 0;
+	char over[16];
+	dxr_json_string(dxr_json_field(json, end, "over"), end, over, sizeof(over));
+	if (strcmp(over, "window") != 0)
+		return over[0] ? 0 : -1;
+	const char *w = dxr_json_field(json, end, "window");
+	const char *w_end = w && *w == '{' ? dxr_json_skip(w, end) : NULL;
+	if (!w_end)
+		return 0;
+	dxr_di_parse_window_entry(w, w_end, out, mons, n_mons);
+	return 1;
+}
+
+//! Without GetWindowAt (an extension older than version 16): the first window of a
+//! top-first list whose frame holds (x, y), minimized ones skipped; -1 = none. It
+//! cannot see input regions (a click-through window counts) or shell UI.
+static inline int
+dxr_di_window_at_frames(const DisplayXRLinuxWindow *wins, int n, int x, int y)
+{
+	for (int i = 0; i < n; i++) {
+		const DisplayXRLinuxWindow *w = &wins[i];
+		if (!w->minimized && w->width > 0 && w->height > 0 && x >= w->x && x < w->x + w->width && y >= w->y &&
+		    y < w->y + w->height)
+			return i;
+	}
+	return -1;
 }
 
 //! The pointer from a GetPointer reply, stage px. 0 when there is none to give: the

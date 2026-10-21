@@ -230,6 +230,61 @@ test_windows(void)
 }
 
 static void
+test_window_at(void)
+{
+	DisplayXRLinuxMonitor m[2] = {mon(0, 0, 1280, 800, 1.0f, 1, "Meta-0"), mon(1280, 0, 960, 540, 2.0f, 0, "Meta-1")};
+	DisplayXRLinuxWindow w;
+	// A window (its entry, with a hostile title and a popup's parent_id).
+	const char *hit = "{\"version\":1,\"x\":1500,\"y\":200,\"layout_mode\":\"logical\",\"over\":\"window\","
+	                  "\"window\":{\"id\":4294967302,\"parent_id\":4294967301,\"pid\":102,\"app_id\":\"firefox\","
+	                  "\"title\":\"over\\\":\\\"desktop\",\"focus\":false,\"frame\":[1400,100,300,200],"
+	                  "\"monitor\":{\"x\":1280,\"y\":0,\"w\":960,\"h\":540,\"scale\":2},\"minimized\":false},"
+	                  "\"window_type\":10}";
+	memset(&w, 0xAB, sizeof(w));
+	CHECK(dxr_di_parse_window_at(hit, &w, m, 2) == 1);
+	CHECK(w.id == 4294967302ULL && w.pid == 102 && !strcmp(str(w.app_id), "firefox") && w.monitor == 1);
+	CHECK(w.x == 1400 && w.y == 100 && w.width == 300 && w.height == 200 && w.focused == 0);
+	// Not an app window: the desktop (also a desktop window such as DING), shell UI,
+	// outside every monitor, the lock screen.
+	CHECK(dxr_di_parse_window_at("{\"version\":1,\"x\":5,\"y\":5,\"over\":\"desktop\",\"window\":null}", &w, m,
+	                             2) == 0);
+	CHECK(dxr_di_parse_window_at("{\"version\":1,\"x\":5,\"y\":5,\"over\":\"desktop\",\"window\":{\"id\":9,"
+	                             "\"pid\":3,\"app_id\":\"com.rastersoft.ding\",\"frame\":[0,0,1280,800]}}",
+	                             &w, m, 2) == 0);
+	CHECK(dxr_di_parse_window_at("{\"version\":1,\"x\":5,\"y\":5,\"over\":\"shell\",\"window\":null}", &w, m,
+	                             2) == 0);
+	CHECK(dxr_di_parse_window_at("{\"version\":1,\"x\":-5,\"y\":5,\"over\":\"outside\"}", &w, m, 2) == 0);
+	CHECK(dxr_di_parse_window_at("{\"version\":1,\"locked\":true}", &w, m, 2) == 0);
+	// Cannot be read.
+	CHECK(dxr_di_parse_window_at("{\"version\":2,\"over\":\"window\",\"window\":{}}", &w, m, 2) == -1);
+	CHECK(dxr_di_parse_window_at("{\"version\":1,\"x\":5}", &w, m, 2) == -1);
+	CHECK(dxr_di_parse_window_at(NULL, &w, m, 2) == -1);
+	CHECK(dxr_di_parse_window_at("{\"version\":1,\"over\":\"window\",\"window\":null}", &w, m, 2) == 0);
+
+	// The fallback without GetWindowAt: the first (topmost) frame holding the point.
+	DisplayXRLinuxWindow list[8];
+	// k_windows, top first: [0] id 7 at (-50,-40) 30x20; [1] the dialog at (1400,100)
+	// 400x300; [2] Nautilus at (10,20) 800x600, minimized.
+	CHECK(dxr_di_parse_windows(k_windows, list, 8, m, 2) == 3);
+	CHECK(dxr_di_window_at_frames(list, 3, 1500, 200) == 1);
+	CHECK(dxr_di_window_at_frames(list, 3, 100, 100) == -1);  // only Nautilus holds it, and it is minimized
+	CHECK(dxr_di_window_at_frames(list, 3, -40, -30) == 0);
+	CHECK(dxr_di_window_at_frames(list, 3, -20, -30) == -1);  // the right edge is exclusive
+	CHECK(dxr_di_window_at_frames(list, 3, 1799, 399) == 1);  // the bottom-right pixel is inside
+	CHECK(dxr_di_window_at_frames(list, 3, 1800, 200) == -1);
+	CHECK(dxr_di_window_at_frames(list, 0, 1500, 200) == -1);
+	list[2].minimized = 0;
+	CHECK(dxr_di_window_at_frames(list, 3, 100, 100) == 2);
+	// Overlap: the topmost (lowest index) wins.
+	list[0].x = 1450;
+	list[0].y = 150;
+	list[0].width = 100;
+	list[0].height = 100;
+	CHECK(dxr_di_window_at_frames(list, 3, 1500, 200) == 0);
+	CHECK(dxr_di_window_at_frames(list, 3, 1600, 200) == 1);
+}
+
+static void
 test_pointer(void)
 {
 	int x = -1, y = -1;
@@ -253,6 +308,7 @@ main(void)
 	test_xroot_scale();
 	test_json_strings();
 	test_windows();
+	test_window_at();
 	test_pointer();
 	if (s_failed) {
 		fprintf(stderr, "test_linux_desktop_info: %d check(s) failed\n", s_failed);

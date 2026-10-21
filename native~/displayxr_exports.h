@@ -455,7 +455,12 @@ DISPLAYXR_EXPORT int displayxr_linux_window_handle(char *buf, int len);
 /// monitors / windows: copy up to @p len records into @p buf and return how many
 /// there are (more than @p len = the list was cut: ask again with a bigger buffer),
 /// or -1 when not available (no mutter DisplayConfig / no DisplayXR GNOME extension).
-/// Windows are top first; each one's `monitor` indexes the monitors list.
+/// Windows are top first (mutter's stacking order); each one's `monitor` indexes the
+/// monitors list.
+/// window_at: the app window a click at (x, y) would meet (GetWindowAt, extension 16+;
+/// older ones: the topmost frame holding the point): 1 and @p out, 0 when there is
+/// none there (desktop, shell UI, no monitor, locked), -1 when not available. The
+/// same point is answered from a 100 ms cache.
 /// pointer: 1 and the pointer in stage px; 0 when not available (no extension, one
 /// older than version 16, the screen locked).
 /// xroot_scale: X root px per stage px (the factor between the plug-in's
@@ -464,6 +469,7 @@ struct DisplayXRLinuxMonitor;
 struct DisplayXRLinuxWindow;
 DISPLAYXR_EXPORT int displayxr_linux_monitors(struct DisplayXRLinuxMonitor *buf, int len);
 DISPLAYXR_EXPORT int displayxr_linux_windows(struct DisplayXRLinuxWindow *buf, int len);
+DISPLAYXR_EXPORT int displayxr_linux_window_at(int x, int y, struct DisplayXRLinuxWindow *out);
 DISPLAYXR_EXPORT int displayxr_linux_pointer(int *x, int *y);
 DISPLAYXR_EXPORT float displayxr_linux_xroot_scale(void);
 

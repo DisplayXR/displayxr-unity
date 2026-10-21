@@ -663,6 +663,13 @@ DISPLAYXR_EXPORT uint32_t dxr_prov_get_active_mode_index(void);
 /// C# here runs in Unity's process DPI awareness and would read virtualized geometry.
 DISPLAYXR_EXPORT int  dxr_prov_get_display_desktop_origin(int *out_x, int *out_y);
 
+/// The loaded runtime's version, "major.minor.patch" (e.g. "2.50.0"), as the provider
+/// reads it at instance creation (XrInstanceProperties.runtimeVersion; on Linux the
+/// 'vX.Y.Z' tag in runtimeName, see ps_resolve_functions). Writes a NUL-terminated
+/// string to @p buf and returns 1; 0 and "" before the first XR session. After a
+/// session it keeps the last runtime's version. Any thread.
+DISPLAYXR_EXPORT int  dxr_prov_get_runtime_version(char *buf, int len);
+
 /// (#266) Move the app's own window onto the 3D panel, centred, and return 1 on
 /// success. No-op returning 1 when the window is already on that panel -- the common
 /// case for users who worked around #266 by making the panel their primary display.

@@ -2,7 +2,8 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 // Read-only desktop info for a Linux app on GNOME: displayxr_linux_monitors,
-// displayxr_linux_windows, displayxr_linux_pointer, displayxr_linux_xroot_scale.
+// displayxr_linux_windows, displayxr_linux_window_at, displayxr_linux_pointer,
+// displayxr_linux_xroot_scale.
 // What is reported, in which coordinates, and why there are no titles:
 // displayxr_linux_desktop_info.h.
 //
@@ -12,7 +13,8 @@
 //    and the layout mode). The DisplayXR GNOME extension has no monitor list.
 //  - Windows and the pointer: the DisplayXR GNOME extension's read-only members
 //    (org.displayxr.WindowGeometry1: GetAllWindows, version 16, else GetWindows;
-//    GetPointer, version 16).
+//    GetPointer and GetWindowAt, version 16; without GetWindowAt, the topmost
+//    window frame holding the point).
 //  - The X root scale: the 3D panel's rect as the runtime reported it in X root px
 //    (set by the XR session) against the same output's stage rect — the comparison
 //    the native-Wayland player's window-position API converts with
@@ -97,6 +99,13 @@ static struct {
 	int ok, x, y;
 } s_ptr;
 
+// The last GetWindowAt answer, for a caller asking about the same point every frame.
+static struct {
+	long long until;
+	int x, y, r; // r: displayxr_linux_window_at's answer
+	DisplayXRLinuxWindow w;
+} s_at;
+
 static struct {
 	long long until;
 	float k;
@@ -121,6 +130,7 @@ static int s_ext_state = -1;  // 1 answered, 0 not on the bus / failing
 static int s_dc_state = -1;   // DisplayConfig, same
 static int s_ext_no_all;      // GetAllWindows unknown: the extension predates version 16
 static int s_ext_no_pointer;  // GetPointer unknown, logged
+static int s_ext_no_at;       // GetWindowAt unknown: the window frames answer instead
 static int s_bus_logged;
 
 static long long
@@ -205,10 +215,11 @@ error_kind(const DxrDBusError *err)
 	return CALL_FAILED;
 }
 
-//! A method call with no arguments; the reply (unref it) or NULL with *out_err set.
+//! A method call, with no arguments or with two int32 ones (xy non-NULL); the reply
+//! (unref it) or NULL with *out_err set.
 static DxrDBusMessage *
 call_locked(long long now, const char *dest, const char *path, const char *iface, const char *method,
-            enum call_error *out_err)
+            const int32_t *xy, enum call_error *out_err)
 {
 	*out_err = CALL_FAILED;
 	DxrDBusConnection *c = conn_locked(now);
@@ -221,6 +232,11 @@ call_locked(long long now, const char *dest, const char *path, const char *iface
 	DxrDBusMessage *msg = s_db->new_method_call(dest, path, iface, method);
 	if (!msg)
 		return NULL;
+	if (xy && !s_db->append_args(msg, DXR_DBUS_TYPE_INT32, &xy[0], DXR_DBUS_TYPE_INT32, &xy[1],
+	                             DXR_DBUS_TYPE_INVALID)) {
+		s_db->unref(msg);
+		return NULL;
+	}
 	DxrDBusError err;
 	s_db->error_init(&err);
 	DxrDBusMessage *reply = s_db->send_with_reply_and_block(c, msg, DXR_DI_TIMEOUT_MS, &err);
@@ -238,9 +254,9 @@ call_locked(long long now, const char *dest, const char *path, const char *iface
 
 //! A call on the extension returning its JSON string: a malloc'd copy, or NULL.
 static char *
-ext_json_locked(long long now, const char *method, enum call_error *out_err)
+ext_json_locked(long long now, const char *method, const int32_t *xy, enum call_error *out_err)
 {
-	DxrDBusMessage *reply = call_locked(now, DXR_EXT_NAME, DXR_EXT_PATH, DXR_EXT_IFACE, method, out_err);
+	DxrDBusMessage *reply = call_locked(now, DXR_EXT_NAME, DXR_EXT_PATH, DXR_EXT_IFACE, method, xy, out_err);
 	if (!reply)
 		return NULL;
 	char *copy = NULL;
@@ -272,6 +288,7 @@ ext_note_locked(enum call_error e)
 		if (was == 0) { // back after it was away: it may have been updated meanwhile
 			s_ext_no_all = 0;
 			s_ext_no_pointer = 0;
+			s_ext_no_at = 0;
 		}
 	} else if (e == CALL_TIMEOUT) {
 		di_log("the DisplayXR GNOME extension did not answer within %d ms: no windows or pointer for now\n",
@@ -497,7 +514,7 @@ monitors_locked(long long now)
 	if (now < s_mon.until)
 		return s_mon.ok;
 	enum call_error e;
-	DxrDBusMessage *reply = call_locked(now, DXR_DC_NAME, DXR_DC_PATH, DXR_DC_NAME, "GetCurrentState", &e);
+	DxrDBusMessage *reply = call_locked(now, DXR_DC_NAME, DXR_DC_PATH, DXR_DC_NAME, "GetCurrentState", NULL, &e);
 	if (!reply && e == CALL_TIMEOUT && s_mon.ok) {
 		// gnome-shell is not answering right now: monitors rarely change, so keep
 		// the last list rather than report none, and ask again in a second.
@@ -537,12 +554,12 @@ windows_locked(long long now)
 	enum call_error e = CALL_FAILED;
 	char *json = NULL;
 	if (!s_ext_no_all) {
-		json = ext_json_locked(now, "GetAllWindows", &e);
+		json = ext_json_locked(now, "GetAllWindows", NULL, &e);
 		if (!json && e == CALL_NO_METHOD)
 			s_ext_no_all = 1; // version < 16: normal windows only
 	}
 	if (!json && s_ext_no_all)
-		json = ext_json_locked(now, "GetWindows", &e);
+		json = ext_json_locked(now, "GetWindows", NULL, &e);
 	ext_note_locked(e);
 	int n = -1;
 	if (json) {
@@ -577,7 +594,7 @@ pointer_locked(long long now)
 	if (now < s_ptr.until)
 		return s_ptr.ok;
 	enum call_error e = CALL_FAILED;
-	char *json = ext_json_locked(now, "GetPointer", &e);
+	char *json = ext_json_locked(now, "GetPointer", NULL, &e);
 	ext_note_locked(e);
 	if (!json && e == CALL_NO_METHOD && !s_ext_no_pointer) {
 		s_ext_no_pointer = 1;
@@ -589,6 +606,45 @@ pointer_locked(long long now)
 	s_ptr.until = now + (answered ? DXR_DI_TTL_FAST : DXR_DI_RETRY);
 	free(json);
 	return s_ptr.ok;
+}
+
+//! The app window a click at (x, y) would meet: 1 and *out, 0 none, -1 not available.
+static int
+window_at_locked(long long now, int x, int y, DisplayXRLinuxWindow *out)
+{
+	if (now < s_at.until && s_at.x == x && s_at.y == y) {
+		*out = s_at.w;
+		return s_at.r;
+	}
+	int r = -1;
+	memset(out, 0, sizeof(*out));
+	enum call_error e = CALL_FAILED;
+	if (!s_ext_no_at) {
+		const int32_t xy[2] = {x, y};
+		char *json = ext_json_locked(now, "GetWindowAt", xy, &e);
+		ext_note_locked(e);
+		if (json) {
+			monitors_locked(now); // the window's monitor index
+			r = dxr_di_parse_window_at(json, out, s_mon.m, s_mon.ok ? s_mon.n : 0);
+			free(json);
+		} else if (e == CALL_NO_METHOD) {
+			s_ext_no_at = 1;
+			di_log("the DisplayXR GNOME extension predates version 16: the window at a point comes from the "
+			       "window frames (no input regions, no shell UI)\n");
+		}
+	}
+	if (s_ext_no_at && windows_locked(now)) {
+		int i = dxr_di_window_at_frames(s_win.w, s_win.n, x, y);
+		r = i >= 0;
+		if (i >= 0)
+			*out = s_win.w[i];
+	}
+	s_at.x = x;
+	s_at.y = y;
+	s_at.r = r;
+	s_at.w = *out;
+	s_at.until = now + (r >= 0 ? DXR_DI_TTL_FAST : DXR_DI_RETRY);
+	return r;
 }
 
 static float
@@ -682,6 +738,18 @@ displayxr_linux_windows(DisplayXRLinuxWindow *buf, int len)
 		memcpy(buf, s_win.w, sizeof(*buf) * (size_t)(n < len ? n : len));
 	pthread_mutex_unlock(&s_mutex);
 	return n;
+}
+
+DISPLAYXR_EXPORT int
+displayxr_linux_window_at(int x, int y, DisplayXRLinuxWindow *out)
+{
+	DisplayXRLinuxWindow w;
+	pthread_mutex_lock(&s_mutex);
+	int r = window_at_locked(now_ns(), x, y, &w);
+	pthread_mutex_unlock(&s_mutex);
+	if (out)
+		*out = w;
+	return r;
 }
 
 DISPLAYXR_EXPORT int
