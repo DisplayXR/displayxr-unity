@@ -51,6 +51,16 @@
 // polls, and the worker waits out its whole timeout before either moves on. On
 // Windows/Linux a worker polls for itself and has no such dependency.
 //
+// Spec v3 (runtime spec §11, ADR-056 Amendment 3) adds held keys / buttons (KEY_DOWN / KEY_UP /
+// BUTTON_DOWN / BUTTON_UP), modifiers held around a CLICK / DRAG / SCROLL (a chained
+// XrDesktopActionModifiersDXR), the shell target (XR_DESKTOP_TARGET_SHELL_DXR) and
+// clipboard text (SET / GET_CLIPBOARD_TEXT + xrGetDesktopClipboardTextDXR). All of it
+// exists only when the runtime ADVERTISES spec version >= 3. Against an older runtime
+// dxr_prov_desktop_submit returns DXR_DESKTOP_E_NO_V3 untried for every v3 action type,
+// for the shell target and for non-zero modifiers — never sending the modifiers struct
+// to a v2 runtime matters most: it would IGNORE the struct and run a plain click.
+// Clipboard text never reaches a log here.
+//
 // The Dxr* structs below are the C# ABI: blittable, fixed layout, no pointers.
 // Their sizes and offsets are pinned by static_asserts in the .cpp and mirrored by
 // the unsafe structs in Runtime/DisplayXRDesktop.cs.
@@ -79,6 +89,10 @@ extern "C" {
 #define DXR_DESKTOP_E_BAD_ARGUMENT (-2000000003) //!< null pointer where one is required
 #define DXR_DESKTOP_E_NO_CAPTURE (-2000000004)   //!< the runtime's extension predates spec v2 (no screen capture)
 #define DXR_DESKTOP_E_TIMEOUT (-2000000005)      //!< C# only: a blocking capture's wait ran out (never returned here)
+#define DXR_DESKTOP_E_NO_V3 (-2000000006)        //!< the runtime's extension predates spec v3 (held input, shell, clipboard)
+
+//! Spec v3: the reserved target id of input for the desktop shell (= XR_DESKTOP_TARGET_SHELL_DXR).
+#define DXR_DESKTOP_TARGET_SHELL 0xFFFFFFFFFFFFFFFFull
 
 //! Event kinds returned by dxr_prov_desktop_next_event.
 #define DXR_DESKTOP_EVENT_ACTION_COMPLETED 1
@@ -117,7 +131,8 @@ typedef struct DxrDesktopPick
 } DxrDesktopPick;
 
 //! The scalar fields of XrDesktopActionDXR; text/keys travel as separate UTF-8
-//! pointers on the submit call. 64 bytes.
+//! pointers on the submit call. 64 bytes. `modifiers` (spec v3) took the former
+//! `reserved` slot, so an older caller that zeroed it sends no modifiers.
 typedef struct DxrDesktopAction
 {
 	uint64_t target_window_id;          //  0
@@ -129,7 +144,7 @@ typedef struct DxrDesktopAction
 	int32_t button;                     // 44  XrDesktopPointerButtonDXR
 	uint32_t click_count;               // 48
 	int32_t scroll_x, scroll_y;         // 52  notches, +right / +down
-	int32_t reserved;                   // 60
+	uint32_t modifiers;                 // 60  spec v3: XrDesktopKeyModifierFlagsDXR around CLICK/DRAG/SCROLL; 0 = none
 } DxrDesktopAction;
 
 //! One queued runtime event. 312 bytes (the capture fields were appended in spec v2;
@@ -166,7 +181,8 @@ typedef void (*DxrDesktopLogFn)(const char *fmt, ...);
 //! After xrCreateInstance: soft-resolve the entry points. @p spec_version is the
 //! extensionVersion the runtime advertised, 0 when XR_DXR_desktop_control was not
 //! enabled on the instance. The seven v1 entry points gate the binding; the three
-//! capture ones are resolved only for spec_version >= 2 and gate capture alone.
+//! capture ones are resolved only for spec_version >= 2 and gate capture alone; the
+//! v3 surface needs spec_version >= 3 (and the clipboard fetch its entry point).
 void dxr_desktop_on_instance(XrInstance instance, PFN_xrGetInstanceProcAddr gipa, uint32_t spec_version,
                              DxrDesktopLogFn log);
 //! After xrCreateSession.
@@ -261,10 +277,24 @@ DISPLAYXR_EXPORT int dxr_prov_desktop_pick(int32_t x, int32_t y, DxrDesktopPick 
 DISPLAYXR_EXPORT int dxr_prov_desktop_text_at(int32_t x, int32_t y, uint32_t capacity, uint32_t *count,
                                               uint8_t *buffer_utf8);
 
-//! Queue an action. @p text_utf8 (TYPE_TEXT) and @p keys_utf8 (KEY_CHORD) may be
-//! NULL when the action does not use them. On success *action_id is never 0.
+//! Queue an action. @p text_utf8 (TYPE_TEXT, SET_CLIPBOARD_TEXT) and @p keys_utf8
+//! (KEY_CHORD, KEY_DOWN, KEY_UP) may be NULL when the action does not use them. On
+//! success *action_id is never 0. Spec v3 action types, the shell target and non-zero
+//! modifiers return DXR_DESKTOP_E_NO_V3 untried unless the runtime advertised spec v3;
+//! non-zero modifiers are then chained as an XrDesktopActionModifiersDXR.
 DISPLAYXR_EXPORT int dxr_prov_desktop_submit(const DxrDesktopAction *action, const uint8_t *text_utf8,
                                              const uint8_t *keys_utf8, uint64_t *action_id);
+
+//! The extensionVersion the runtime advertised for XR_DXR_desktop_control while the
+//! binding is enabled (0 when not, or with no session). Apps gate spec-v3 features on >= 3.
+DISPLAYXR_EXPORT uint32_t dxr_prov_desktop_spec_version(void);
+
+//! Spec v3: two-call idiom, in BYTES (the NUL included), over
+//! xrGetDesktopClipboardTextDXR for a GET_CLIPBOARD_TEXT that completed with success.
+//! The runtime keeps the text until a call copies it out (a size query keeps it).
+//! DXR_DESKTOP_E_NO_V3 against an older runtime. The buffer is always NUL-terminated.
+DISPLAYXR_EXPORT int dxr_prov_desktop_clipboard_text(uint64_t action_id, uint32_t capacity, uint32_t *count,
+                                                     uint8_t *buffer_utf8);
 
 //! Pop the oldest queued event. Returns 1 and fills @p ev, or 0 when empty.
 DISPLAYXR_EXPORT int dxr_prov_desktop_next_event(DxrDesktopEvent *ev);

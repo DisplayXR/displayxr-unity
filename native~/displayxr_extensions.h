@@ -932,14 +932,15 @@ typedef XrResult (XRAPI_PTR *PFN_xrSubmitMCPToolResultDXR)(XrSession session, ui
 // ---------------------------------------------------------------------------
 // XR_DXR_desktop_control (ADR-056): the app's agent observes and operates the
 // desktop (windows, pointer, UI text, typing, clicks); the OS consent belongs to
-// the app. Mirrors the runtime's XR_DXR_desktop_control.h (spec v2, provisional
+// the app. Mirrors the runtime's XR_DXR_desktop_control.h (spec v3, provisional
 // numbers); see native~/displayxr_xrprovider/displayxr_provider_desktop.h.
-// Spec v2 adds screen capture as a second consent scope (runtime spec §10); the
-// provider gates every v2 call on the version the runtime ADVERTISED, never on
-// this mirror's SPEC_VERSION.
+// Spec v2 adds screen capture as a second consent scope (runtime spec §10); spec v3
+// (runtime spec §11, ADR-056 Amendment 3) adds held keys / buttons, modifiers around a pointer
+// action, the shell target and clipboard text. The provider gates every v2 / v3 call
+// on the version the runtime ADVERTISED, never on this mirror's SPEC_VERSION.
 // ---------------------------------------------------------------------------
 #define XR_DXR_DESKTOP_CONTROL_EXTENSION_NAME "XR_DXR_desktop_control"
-#define XR_DXR_DESKTOP_CONTROL_SPEC_VERSION 2
+#define XR_DXR_DESKTOP_CONTROL_SPEC_VERSION 3
 
 #define XR_TYPE_DESKTOP_WINDOW_DXR                           ((XrStructureType)1004999400)
 #define XR_TYPE_DESKTOP_PICK_DXR                             ((XrStructureType)1004999401)
@@ -953,6 +954,8 @@ typedef XrResult (XRAPI_PTR *PFN_xrSubmitMCPToolResultDXR)(XrSession session, ui
 #define XR_TYPE_DESKTOP_CONTROL_REQUEST_SCOPE_DXR            ((XrStructureType)1004999408)
 #define XR_TYPE_EVENT_DATA_DESKTOP_CAPTURE_STATE_CHANGED_DXR ((XrStructureType)1004999409)
 #define XR_TYPE_DESKTOP_CONTROL_PARENT_WINDOW_DXR            ((XrStructureType)1004999420)
+// Spec version 3.
+#define XR_TYPE_DESKTOP_ACTION_MODIFIERS_DXR                 ((XrStructureType)1004999421)
 
 #define XR_ERROR_DESKTOP_CONTROL_REFUSED_DXR     ((XrResult)-1004999400)
 #define XR_ERROR_DESKTOP_CONTROL_NOT_GRANTED_DXR ((XrResult)-1004999401)
@@ -963,6 +966,12 @@ typedef XrResult (XRAPI_PTR *PFN_xrSubmitMCPToolResultDXR)(XrSession session, ui
 #define XR_MAX_DESKTOP_MESSAGE_SIZE_DXR 256
 //! Spec version 2: XrDesktopControlParentWindowDXR::parentWindow, terminator included.
 #define XR_MAX_DESKTOP_PARENT_WINDOW_SIZE_DXR 256
+//! Spec version 3: XrDesktopActionDXR::targetWindowId of input for the desktop SHELL (top
+//! bar / taskbar, dock, desktop, overview, keys with no app window focused). A v2 runtime
+//! has no such window: the action completes XR_ERROR_DESKTOP_WINDOW_LOST_DXR there.
+#define XR_DESKTOP_TARGET_SHELL_DXR ((uint64_t)0xFFFFFFFFFFFFFFFFull)
+//! Spec version 3: the largest clipboard text, bytes of UTF-8, terminator excluded (1 MiB).
+#define XR_MAX_DESKTOP_CLIPBOARD_TEXT_SIZE_DXR 1048576
 
 typedef enum XrDesktopControlStateDXR {
 	XR_DESKTOP_CONTROL_STATE_UNSUPPORTED_DXR = 0,
@@ -1028,6 +1037,15 @@ typedef enum XrDesktopActionTypeDXR {
 	XR_DESKTOP_ACTION_TYPE_CLICK_DXR = 13,
 	XR_DESKTOP_ACTION_TYPE_DRAG_DXR = 14,
 	XR_DESKTOP_ACTION_TYPE_SCROLL_DXR = 15,
+	// Spec version 3: held input (released automatically after 10 s, at the end of the
+	// action burst, on the kill switch, a lock, the user's own input ...).
+	XR_DESKTOP_ACTION_TYPE_KEY_DOWN_DXR = 16,
+	XR_DESKTOP_ACTION_TYPE_KEY_UP_DXR = 17,
+	XR_DESKTOP_ACTION_TYPE_BUTTON_DOWN_DXR = 18,
+	XR_DESKTOP_ACTION_TYPE_BUTTON_UP_DXR = 19,
+	// Spec version 3: clipboard text (targetWindowId 0).
+	XR_DESKTOP_ACTION_TYPE_SET_CLIPBOARD_TEXT_DXR = 20,
+	XR_DESKTOP_ACTION_TYPE_GET_CLIPBOARD_TEXT_DXR = 21,
 	XR_DESKTOP_ACTION_TYPE_MAX_ENUM_DXR = 0x7FFFFFFF
 } XrDesktopActionTypeDXR;
 
@@ -1053,6 +1071,22 @@ typedef struct XrDesktopActionDXR {
 	const char *text;
 	const char *keys;
 } XrDesktopActionDXR;
+
+//! Spec version 3: the modifier keys held around a CLICK, DRAG or SCROLL.
+typedef XrFlags64 XrDesktopKeyModifierFlagsDXR;
+static const XrDesktopKeyModifierFlagsDXR XR_DESKTOP_KEY_MODIFIER_CTRL_BIT_DXR = 0x00000001;
+static const XrDesktopKeyModifierFlagsDXR XR_DESKTOP_KEY_MODIFIER_SHIFT_BIT_DXR = 0x00000002;
+static const XrDesktopKeyModifierFlagsDXR XR_DESKTOP_KEY_MODIFIER_ALT_BIT_DXR = 0x00000004;   // Option
+static const XrDesktopKeyModifierFlagsDXR XR_DESKTOP_KEY_MODIFIER_SUPER_BIT_DXR = 0x00000008; // Win / Command
+
+// Spec version 3: chained on XrDesktopActionDXR::next of a CLICK, DRAG or SCROLL. A v2
+// runtime IGNORES it (OpenXR's rule for unknown structures) and would run the plain
+// click, so it is only ever chained for a runtime that advertised spec v3.
+typedef struct XrDesktopActionModifiersDXR {
+	XrStructureType type; // XR_TYPE_DESKTOP_ACTION_MODIFIERS_DXR
+	const void *next;
+	XrDesktopKeyModifierFlagsDXR modifiers;
+} XrDesktopActionModifiersDXR;
 
 typedef struct XrDesktopControlRequestInfoDXR {
 	XrStructureType type; // XR_TYPE_DESKTOP_CONTROL_REQUEST_INFO_DXR
@@ -1148,6 +1182,12 @@ typedef XrResult (XRAPI_PTR *PFN_xrCaptureDesktopDXR)(XrSession session, const X
 typedef XrResult (XRAPI_PTR *PFN_xrGetDesktopCaptureImageDXR)(XrSession session, uint64_t captureId,
                                                               uint32_t capacityInput, uint32_t *countOutput,
                                                               uint8_t *rgba);
+// Spec version 3: the text of the most recent successful GET_CLIPBOARD_TEXT (two-call idiom,
+// bytes, the terminator included). Kept until a call copies it out, the next GET completes,
+// the session ends or 10 s pass; a size query or a short buffer keeps it.
+typedef XrResult (XRAPI_PTR *PFN_xrGetDesktopClipboardTextDXR)(XrSession session, uint64_t actionId,
+                                                               uint32_t capacityInput, uint32_t *countOutput,
+                                                               char *buffer);
 
 #ifdef __cplusplus
 }
