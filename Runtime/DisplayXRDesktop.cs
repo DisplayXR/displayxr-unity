@@ -43,6 +43,26 @@ namespace DisplayXR
         /// <summary>The backend can capture screen pixels (spec v2). Without it
         /// <see cref="DisplayXRDesktop.CaptureState"/> is <see cref="DesktopControlState.Unsupported"/>.</summary>
         Capture = 0x40,
+        /// <summary>The backend can read and write the clipboard's text (spec v3,
+        /// <see cref="DisplayXRDesktop.SetClipboardText"/> / <see cref="DisplayXRDesktop.GetClipboardText"/>).</summary>
+        Clipboard = 0x80,
+    }
+
+    /// <summary>
+    /// Modifier keys held around a click, drag or scroll (spec v3): pressed after the pointer reached the
+    /// point and the target was verified, released after it whatever happened. A modifier the agent
+    /// already holds (<see cref="DisplayXRDesktop.KeyDown"/>) is neither pressed again nor released.
+    /// </summary>
+    [Flags]
+    public enum DesktopKeyModifiers : ulong
+    {
+        None = 0,
+        Ctrl = 0x1,
+        Shift = 0x2,
+        /// <summary>Option on macOS.</summary>
+        Alt = 0x4,
+        /// <summary>The Windows key / Command / Super.</summary>
+        Super = 0x8,
     }
 
     /// <summary>
@@ -209,6 +229,32 @@ namespace DisplayXR
     }
 
     /// <summary>One top-level desktop window.</summary>
+    /// <summary>The outcome of <see cref="DisplayXRDesktop.GetClipboardText"/> (spec v3).</summary>
+    public readonly struct DesktopClipboardResult
+    {
+        public DesktopActionStatus Status { get; }
+        /// <summary>The runtime's fixed detail ("ok", "ok (the clipboard holds no text)", the reason it
+        /// failed). Never the clipboard text.</summary>
+        public string Message { get; }
+        /// <summary>The raw XrResult (0 = XR_SUCCESS).</summary>
+        public int XrResult { get; }
+        /// <summary>The clipboard's text; "" when it held no text; null on failure.</summary>
+        public string Text { get; }
+        public bool Succeeded => Status == DesktopActionStatus.Success && Text != null;
+
+        public DesktopClipboardResult(DesktopActionStatus status, string message, int xrResult, string text)
+        {
+            Status = status;
+            Message = message ?? "";
+            XrResult = xrResult;
+            Text = text;
+        }
+
+        // The text stays out: it is the user's clipboard and must not land in a log by accident.
+        public override string ToString() =>
+            Succeeded ? $"{Status}: {Message} ({Encoding.UTF8.GetByteCount(Text)} bytes)" : $"{Status}: {Message}";
+    }
+
     public readonly struct DesktopWindow
     {
         /// <summary>Stable for the window's lifetime, never 0 (HWND / CGWindowID / mutter id).</summary>
@@ -352,6 +398,21 @@ namespace DisplayXR
     /// runtime whose extension predates spec v2 <see cref="CaptureState"/> is Unsupported and every
     /// capture completes with <see cref="DesktopActionStatus.Unsupported"/>; the rest is unchanged.</para>
     ///
+    /// <para><b>Spec v3</b> (proposed; needs a runtime that advertises <c>XR_DXR_desktop_control</c>
+    /// version 3, see <see cref="SpecVersion"/>) adds <b>held input</b> (<see cref="KeyDown"/> /
+    /// <see cref="KeyUp"/>, <see cref="ButtonDown"/> / <see cref="ButtonUp"/> — whatever the agent holds is
+    /// released automatically after 10 s, 2 s after its last action, on the kill switch, a lock, the
+    /// user's own input or a focus change, and the actions queued behind such a release are refused),
+    /// <b>modifiers</b> around a click / drag / scroll (the <see cref="DesktopKeyModifiers"/> overloads),
+    /// the <b>shell target</b> <see cref="ShellTarget"/> (input where no app window is: the top bar, the
+    /// dock, the desktop, the GNOME overview, keys with nothing focused — only when the app asks for it
+    /// per action) and <b>clipboard text</b> (<see cref="SetClipboardText"/> /
+    /// <see cref="GetClipboardText"/>, at most <see cref="MaxClipboardTextBytes"/> of UTF-8, under the
+    /// CONTROL consent). Against an older runtime each of these completes at once with
+    /// <see cref="DesktopActionStatus.Unsupported"/> and nothing is sent — in particular a modified click is
+    /// never sent as a plain one. Submit a held sequence in one go and check each completion: input queued
+    /// after an automatic release is dropped (Refused), so a queued Tab never runs without its Alt.</para>
+    ///
     /// <para><b>Graceful absence.</b> On a runtime without the extension, an older native
     /// plug-in, or with no XR session, <see cref="State"/> is
     /// <see cref="DesktopControlState.Unsupported"/>, observation returns nothing and actions
@@ -367,6 +428,7 @@ namespace DisplayXR
         private const int E_BadArgument = -2000000003;
         private const int E_NoCapture = -2000000004;
         private const int E_Timeout = -2000000005;
+        private const int E_NoV3 = -2000000006;
 
         private const int XR_ERROR_VALIDATION_FAILURE = -1;
         private const int XR_ERROR_FUNCTION_UNSUPPORTED = -7;
@@ -404,9 +466,30 @@ namespace DisplayXR
         // can land in between); the native wait polls the runtime's queue every few ms within a slice.
         private const int WaitSliceMs = 50;
 
+        /// <summary>
+        /// The window id of input meant for the desktop SHELL rather than an app window (spec v3): the top
+        /// bar / taskbar, the dock, the desktop background, the GNOME overview, and keys with no app window
+        /// focused (Super, shell shortcuts). Pass it as <c>windowId</c> to the input actions
+        /// (<see cref="Click(ulong, Vector2Int, DesktopPointerButton, int)"/>, <see cref="PressKeys"/>,
+        /// <see cref="TypeText"/>, <see cref="KeyDown"/>, ...); window actions refuse it. It is verified the
+        /// other way round: a pointer action is refused when an app window is under the point, keys and
+        /// text when an app window has keyboard focus. On GNOME a paste into a freshly opened overview is
+        /// read by nobody (it completes Failed): send the first character as a key
+        /// (<c>PressKeys(ShellTarget, "f")</c>, which starts the search), then the rest as text.
+        /// </summary>
+        public const ulong ShellTarget = 0xFFFFFFFFFFFFFFFFul;
+
+        /// <summary>The largest clipboard text, in bytes of UTF-8 (1 MiB, spec v3). A longer
+        /// <see cref="SetClipboardText"/> is refused before it is sent; a longer clipboard makes
+        /// <see cref="GetClipboardText"/> fail (never cut).</summary>
+        public const int MaxClipboardTextBytes = 1048576;
+
+        private const ulong KnownModifiers = 0xF;
+
         private struct Pending
         {
             public TaskCompletionSource<DesktopActionResult> Tcs;
+            public TaskCompletionSource<DesktopClipboardResult> ClipTcs; // a GET_CLIPBOARD_TEXT (spec v3); Tcs is then null
             public uint Generation;
         }
 
@@ -415,6 +498,7 @@ namespace DisplayXR
         private static bool s_Missing; // native binary predates the binding (or layout mismatch)
         private static bool s_CaptureMissing; // native binary predates the spec-v2 exports
         private static bool s_WaitMissing; // native binary predates the waitable-capture exports
+        private static bool s_V3Missing; // native binary predates the spec-v3 exports (and their gate)
         private static uint s_Generation;
         private static DesktopControlState s_LastState = DesktopControlState.Unsupported;
         private static DesktopControlState s_LastCaptureState = DesktopControlState.Unsupported;
@@ -484,6 +568,12 @@ namespace DisplayXR
                 return c;
             }
         }
+
+        /// <summary>
+        /// The <c>XR_DXR_desktop_control</c> version the runtime advertised (0 with no session or no
+        /// extension). Held input, modifiers, <see cref="ShellTarget"/> and the clipboard need 3 or more.
+        /// </summary>
+        public static int SpecVersion => (int)Math.Min(int.MaxValue, RawSpecVersion());
 
         /// <summary>True while a session is up on a runtime with spec-v2 screen capture. Says nothing
         /// about consent — see <see cref="CaptureState"/>.</summary>
@@ -729,6 +819,189 @@ namespace DisplayXR
             {
                 actionType = 15, targetWindowId = windowId, x = at.x, y = at.y, scrollX = dx, scrollY = dy,
             });
+
+        // ---------------------------------------------------------------- spec v3: modifiers, held input
+
+        /// <summary>
+        /// <see cref="Click(ulong, Vector2Int, DesktopPointerButton, int)"/> with <paramref name="modifiers"/>
+        /// held around it (ctrl+click, shift+click; spec v3). <see cref="DesktopKeyModifiers.None"/> is the
+        /// plain click and works on any runtime; with modifiers set it needs spec v3 and is Unsupported —
+        /// never sent as a plain click — on an older runtime.
+        /// </summary>
+        public static Task<DesktopActionResult> Click(ulong windowId, Vector2Int at, DesktopKeyModifiers modifiers,
+                                                      DesktopPointerButton button = DesktopPointerButton.Left,
+                                                      int count = 1) =>
+            Submit(new NativeAction
+            {
+                actionType = 13, targetWindowId = windowId, x = at.x, y = at.y,
+                button = (int)button, clickCount = (uint)Math.Max(1, count),
+            }, modifiers: modifiers);
+
+        /// <summary><see cref="Drag(ulong, Vector2Int, Vector2Int, DesktopPointerButton)"/> with
+        /// <paramref name="modifiers"/> held around it (alt+drag; spec v3, see
+        /// <see cref="Click(ulong, Vector2Int, DesktopKeyModifiers, DesktopPointerButton, int)"/>).</summary>
+        public static Task<DesktopActionResult> Drag(ulong windowId, Vector2Int from, Vector2Int to,
+                                                     DesktopKeyModifiers modifiers,
+                                                     DesktopPointerButton button = DesktopPointerButton.Left) =>
+            Submit(new NativeAction
+            {
+                actionType = 14, targetWindowId = windowId, x = from.x, y = from.y, x2 = to.x, y2 = to.y,
+                button = (int)button,
+            }, modifiers: modifiers);
+
+        /// <summary><see cref="Scroll(ulong, Vector2Int, int, int)"/> with <paramref name="modifiers"/> held
+        /// around it (ctrl+scroll to zoom; spec v3, see
+        /// <see cref="Click(ulong, Vector2Int, DesktopKeyModifiers, DesktopPointerButton, int)"/>).</summary>
+        public static Task<DesktopActionResult> Scroll(ulong windowId, Vector2Int at, int dx, int dy,
+                                                       DesktopKeyModifiers modifiers) =>
+            Submit(new NativeAction
+            {
+                actionType = 15, targetWindowId = windowId, x = at.x, y = at.y, scrollX = dx, scrollY = dy,
+            }, modifiers: modifiers);
+
+        /// <summary>
+        /// Press and HOLD one key (spec v3): <paramref name="key"/> names exactly one key or one modifier —
+        /// <c>"shift"</c>, <c>"alt"</c>, <c>"ctrl"</c>, <c>"super"</c>, <c>"tab"</c>, <c>"f5"</c>, <c>"a"</c>
+        /// (a character key presses the key that produces it, without adding Shift). Verified like
+        /// <see cref="PressKeys"/> (the target needs keyboard focus). The OS repeats a held key as it would
+        /// a physical one (GNOME: from 500 ms, every 30 ms). Release it with <see cref="KeyUp"/>; the runtime
+        /// releases it anyway after 10 s, 2 s after the agent's last action, on the kill switch, a lock, the
+        /// user's own input or a focus change. While anything is held, <see cref="TypeText"/> and window
+        /// actions are Refused. Unsupported before spec v3.
+        /// </summary>
+        public static Task<DesktopActionResult> KeyDown(ulong windowId, string key) =>
+            Submit(new NativeAction { actionType = 16, targetWindowId = windowId }, keys: key, v3: true);
+
+        /// <summary>Release a key <see cref="KeyDown"/> holds (spec v3). Never waits for the user and is never
+        /// refused for focus; Refused when the key is not held (the message says why when the runtime released
+        /// it already).</summary>
+        public static Task<DesktopActionResult> KeyUp(ulong windowId, string key) =>
+            Submit(new NativeAction { actionType = 17, targetWindowId = windowId }, keys: key, v3: true);
+
+        /// <summary>Press and HOLD <paramref name="button"/> at <paramref name="at"/>, verified like a
+        /// click (spec v3). A <see cref="MovePointer"/> while it is held drags it (a drag with stops); release it
+        /// with <see cref="ButtonUp"/>. Released automatically like a held key (<see cref="KeyDown"/>).</summary>
+        public static Task<DesktopActionResult> ButtonDown(ulong windowId, Vector2Int at,
+                                                           DesktopPointerButton button = DesktopPointerButton.Left) =>
+            Submit(new NativeAction
+            {
+                actionType = 18, targetWindowId = windowId, x = at.x, y = at.y, button = (int)button,
+            }, v3: true);
+
+        /// <summary>Release a held <paramref name="button"/> at <paramref name="at"/> (spec v3): the pointer drags
+        /// there first when the point verifies like a click's; otherwise the button is released where the pointer
+        /// is and the action is Refused. A release always happens. Never waits for the user.</summary>
+        public static Task<DesktopActionResult> ButtonUp(ulong windowId, Vector2Int at,
+                                                         DesktopPointerButton button = DesktopPointerButton.Left) =>
+            Submit(new NativeAction
+            {
+                actionType = 19, targetWindowId = windowId, x = at.x, y = at.y, button = (int)button,
+            }, v3: true);
+
+        // ---------------------------------------------------------------- spec v3: clipboard text
+
+        /// <summary>
+        /// Make <paramref name="text"/> the clipboard's text for every app, as a copy would (spec v3). Runs in
+        /// submission order with the other actions (never in the middle of a <see cref="TypeText"/> paste) and
+        /// waits for the user to be idle, like input. Needs CONTROL Granted and
+        /// <see cref="DesktopControlCapabilities.Clipboard"/>. Empty text, a NUL character or more than
+        /// <see cref="MaxClipboardTextBytes"/> bytes of UTF-8 fail at once and nothing is sent. The text never
+        /// reaches a log or the audit (only its size).
+        /// </summary>
+        public static Task<DesktopActionResult> SetClipboardText(string text)
+        {
+            int v3 = CheckV3();
+            if (v3 != 0) return Done(v3, null);
+            if (string.IsNullOrEmpty(text)) return Done(XR_ERROR_VALIDATION_FAILURE, "the clipboard text is empty");
+            // A C string ends at the first NUL: the runtime would set a cut text without saying so.
+            if (text.IndexOf('\0') >= 0)
+                return Done(XR_ERROR_VALIDATION_FAILURE, "the clipboard text contains a NUL character");
+            if (Encoding.UTF8.GetByteCount(text) > MaxClipboardTextBytes)
+                return Done(XR_ERROR_LIMIT_REACHED, $"the clipboard text is larger than {MaxClipboardTextBytes} bytes");
+            return Submit(new NativeAction { actionType = 20 }, text: text, v3: true);
+        }
+
+        /// <summary>
+        /// Read the clipboard's text, whoever copied it (spec v3). Runs in submission order with the other
+        /// actions (a read after <see cref="SetClipboardText"/> sees that text) and does not wait for the user.
+        /// The task completes on the main thread with the text — "" when the clipboard holds no text — or a
+        /// failed status: more than <see cref="MaxClipboardTextBytes"/> bytes fails (never cut). Needs CONTROL
+        /// Granted and <see cref="DesktopControlCapabilities.Clipboard"/>. Never throws.
+        /// </summary>
+        public static Task<DesktopClipboardResult> GetClipboardText()
+        {
+            int v3 = CheckV3();
+            if (v3 != 0) return ClipboardDone(v3, null);
+            if (s_Missing) return ClipboardDone(E_Unavailable, null);
+            try
+            {
+                var a = new NativeAction { actionType = 21 };
+                uint gen = Native.dxr_prov_desktop_session_generation(); // before the call: see StartCapture
+                int r = Native.dxr_prov_desktop_submit(ref a, null, null, out ulong id);
+                if (r < 0 || id == 0) return ClipboardDone(r < 0 ? r : XR_ERROR_VALIDATION_FAILURE, null);
+                var tcs = new TaskCompletionSource<DesktopClipboardResult>();
+                lock (s_Lock) s_Pending[id] = new Pending { ClipTcs = tcs, Generation = gen };
+                return tcs.Task;
+            }
+            catch (EntryPointNotFoundException) { s_Missing = true; }
+            catch (DllNotFoundException) { s_Missing = true; }
+            return ClipboardDone(E_Unavailable, null);
+        }
+
+        // A completed GET: fetch the text now (the runtime keeps it 10 s, until it is copied out; we are on
+        // the main thread, draining the event the frame it arrived). The buffer is wiped after decoding.
+        private static DesktopClipboardResult FinishClipboard(in NativeEvent ev, string message)
+        {
+            if (ev.result < 0) return MakeClipboard(ev.result, message, null);
+            int r;
+            uint count;
+            try
+            {
+                r = Native.dxr_prov_desktop_clipboard_text(ev.actionId, 0, out count, null);
+                if (r < 0) return MakeClipboard(r, "could not fetch the clipboard text", null);
+                if (count == 0 || count > (uint)MaxClipboardTextBytes + 1)
+                    return MakeClipboard(XR_ERROR_VALIDATION_FAILURE, "clipboard text size mismatch", null);
+                var buf = new byte[count];
+                r = Native.dxr_prov_desktop_clipboard_text(ev.actionId, (uint)buf.Length, out count, buf);
+                string text = r >= 0 ? FromUtf8(buf) : null;
+                Array.Clear(buf, 0, buf.Length);
+                if (r < 0) return MakeClipboard(r, "could not fetch the clipboard text", null);
+                return new DesktopClipboardResult(DesktopActionStatus.Success, message, ev.result, text);
+            }
+            catch (EntryPointNotFoundException) { s_V3Missing = true; }
+            return MakeClipboard(E_NoV3, null, null);
+        }
+
+        private static Task<DesktopClipboardResult> ClipboardDone(int r, string message) =>
+            Task.FromResult(MakeClipboard(r, message, null));
+
+        private static DesktopClipboardResult MakeClipboard(int r, string message, string text)
+        {
+            DesktopActionResult a = Make(r, message);
+            DesktopActionStatus status = a.Status;
+            if (status == DesktopActionStatus.Success && text == null) status = DesktopActionStatus.Failed;
+            return new DesktopClipboardResult(status, a.Message, r, text);
+        }
+
+        // 0 when the native binary has the spec-v3 exports (and so the gate that refuses v3 actions to an older
+        // runtime untried), else the code to complete with. A runtime that advertises an older version is
+        // answered here too, so the app gets Unsupported without a round trip.
+        private static int CheckV3()
+        {
+            if (s_Missing) return E_Unavailable;
+            uint v = RawSpecVersion();
+            if (s_V3Missing) return E_NoV3;
+            return v != 0 && v < 3 ? E_NoV3 : 0;
+        }
+
+        private static uint RawSpecVersion()
+        {
+            if (s_Missing || s_V3Missing) return 0;
+            try { return Native.dxr_prov_desktop_spec_version(); }
+            catch (EntryPointNotFoundException) { s_V3Missing = true; }
+            catch (DllNotFoundException) { s_Missing = true; }
+            return 0;
+        }
 
         // ---------------------------------------------------------------- screen capture (spec v2)
 
@@ -984,9 +1257,21 @@ namespace DisplayXR
 
         // ---------------------------------------------------------------- dispatch
 
-        private static Task<DesktopActionResult> Submit(NativeAction a, string text = null, string keys = null)
+        private static Task<DesktopActionResult> Submit(NativeAction a, string text = null, string keys = null,
+                                                        DesktopKeyModifiers modifiers = DesktopKeyModifiers.None,
+                                                        bool v3 = false)
         {
             if (s_Missing) return Done(E_Unavailable, null);
+            if (((ulong)modifiers & ~KnownModifiers) != 0)
+                return Done(XR_ERROR_VALIDATION_FAILURE, "unknown modifier bits");
+            // Everything of spec v3 — the shell target and modifiers included — only through a native binary
+            // that gates it on the runtime's advertised version (a v2 runtime would click without the modifiers).
+            if (v3 || modifiers != DesktopKeyModifiers.None || a.targetWindowId == ShellTarget)
+            {
+                int g = CheckV3();
+                if (g != 0) return Done(g, null);
+            }
+            a.modifiers = (uint)modifiers;
             byte[] t = text == null ? null : Utf8(text);
             byte[] k = keys == null ? null : Utf8(keys);
             try
@@ -1042,7 +1327,8 @@ namespace DisplayXR
                             found = s_Pending.TryGetValue(ev.actionId, out p);
                             if (found) s_Pending.Remove(ev.actionId);
                         }
-                        if (found) p.Tcs.TrySetResult(Make(ev.result, Utf8Z(ev.message, 256)));
+                        if (found && p.ClipTcs != null) p.ClipTcs.TrySetResult(FinishClipboard(ev, Utf8Z(ev.message, 256)));
+                        else if (found) p.Tcs.TrySetResult(Make(ev.result, Utf8Z(ev.message, 256)));
                     }
                     else if (ev.kind == EventCaptureStateChanged)
                     {
@@ -1110,7 +1396,12 @@ namespace DisplayXR
             }
             if (failed == null) return;
             var r = new DesktopActionResult(DesktopActionStatus.Failed, "session ended", E_NoSession);
-            foreach (Pending p in failed) p.Tcs.TrySetResult(r);
+            var clipFailed = new DesktopClipboardResult(DesktopActionStatus.Failed, "session ended", E_NoSession, null);
+            foreach (Pending p in failed)
+            {
+                if (p.ClipTcs != null) p.ClipTcs.TrySetResult(clipFailed);
+                else p.Tcs.TrySetResult(r);
+            }
         }
 
         private static void SetState(DesktopControlState s)
@@ -1170,6 +1461,10 @@ namespace DisplayXR
                     status = DesktopActionStatus.Failed; fallback = "no XR session"; break;
                 case E_Timeout:
                     status = DesktopActionStatus.TimedOut; fallback = "timed out"; break;
+                case E_NoV3:
+                    status = DesktopActionStatus.Unsupported;
+                    fallback = "the runtime's XR_DXR_desktop_control predates spec v3 (held input, modifiers, " +
+                               "the shell target, clipboard)"; break;
                 case XR_ERROR_VALIDATION_FAILURE:
                     status = DesktopActionStatus.Failed; fallback = "invalid action (missing window id, text or keys?)"; break;
                 case XR_ERROR_LIMIT_REACHED:
@@ -1263,7 +1558,7 @@ namespace DisplayXR
             public int button;
             public uint clickCount;
             public int scrollX, scrollY;
-            public int reserved;
+            public uint modifiers; // spec v3: DesktopKeyModifiers around CLICK / DRAG / SCROLL (was `reserved`)
         }
 
         [StructLayout(LayoutKind.Sequential)]
@@ -1350,6 +1645,14 @@ namespace DisplayXR
 
             [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
             public static extern void dxr_prov_desktop_capture_abandon(ulong captureId);
+
+            // Spec v3.
+            [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+            public static extern uint dxr_prov_desktop_spec_version();
+
+            [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+            public static extern int dxr_prov_desktop_clipboard_text(ulong actionId, uint capacity, out uint count,
+                                                                     byte[] bufferUtf8);
         }
     }
 }
