@@ -22,8 +22,13 @@ static_assert(sizeof(DxrDesktopPick) == 448 && offsetof(DxrDesktopPick, window) 
               "DxrDesktopPick layout is C# ABI");
 static_assert(sizeof(DxrDesktopAction) == 64 && offsetof(DxrDesktopAction, click_count) == 48,
               "DxrDesktopAction layout is C# ABI");
-static_assert(sizeof(DxrDesktopEvent) == 280 && offsetof(DxrDesktopEvent, message) == 24,
+static_assert(sizeof(DxrDesktopEvent) == 312 && offsetof(DxrDesktopEvent, message) == 24 &&
+                  offsetof(DxrDesktopEvent, width) == 280 && offsetof(DxrDesktopEvent, src_x) == 288 &&
+                  offsetof(DxrDesktopEvent, frame_time) == 304,
               "DxrDesktopEvent layout is C# ABI");
+static_assert(sizeof(DxrDesktopCaptureInfo) == 40 && offsetof(DxrDesktopCaptureInfo, target) == 8 &&
+                  offsetof(DxrDesktopCaptureInfo, max_width) == 28,
+              "DxrDesktopCaptureInfo layout is C# ABI");
 static_assert(sizeof(((DxrDesktopWindow *)0)->app_id) == XR_MAX_DESKTOP_APP_ID_SIZE_DXR &&
                   sizeof(((DxrDesktopWindow *)0)->title) == XR_MAX_DESKTOP_TITLE_SIZE_DXR &&
                   sizeof(((DxrDesktopEvent *)0)->message) == XR_MAX_DESKTOP_MESSAGE_SIZE_DXR,
@@ -43,6 +48,8 @@ std::mutex g_mx;
 
 DxrDesktopLogFn g_log = nullptr;
 int g_enabled = 0; // extension enabled on the instance and all seven PFNs resolved
+uint32_t g_spec_version = 0; // what the runtime ADVERTISED (0 = not enabled)
+int g_capture = 0; // spec >= 2 and the three capture PFNs resolved (implies g_enabled)
 XrSession g_session = XR_NULL_HANDLE;
 uint32_t g_generation = 0;
 std::deque<DxrDesktopEvent> g_queue;
@@ -60,6 +67,10 @@ PFN_xrGetDesktopPointerDXR pfn_get_pointer = nullptr;
 PFN_xrPickDesktopDXR pfn_pick = nullptr;
 PFN_xrGetDesktopTextAtDXR pfn_text_at = nullptr;
 PFN_xrSubmitDesktopActionDXR pfn_submit = nullptr;
+// Spec v2 (screen capture).
+PFN_xrGetDesktopCaptureStateDXR pfn_capture_state = nullptr;
+PFN_xrCaptureDesktopDXR pfn_capture = nullptr;
+PFN_xrGetDesktopCaptureImageDXR pfn_capture_image = nullptr;
 
 #define DESK_LOG(...)                                                                                                  \
 	do {                                                                                                               \
@@ -130,6 +141,16 @@ session_for_call(XrSession *s)
 	return 0;
 }
 
+// As session_for_call, for the spec-v2 capture calls. Caller holds g_call_mx.
+int
+capture_session_for_call(XrSession *s)
+{
+	int r = session_for_call(s);
+	if (r != 0) return r;
+	std::lock_guard<std::mutex> lk(g_mx);
+	return g_capture ? 0 : DXR_DESKTOP_E_NO_CAPTURE;
+}
+
 const char *
 cstr(const uint8_t *p)
 {
@@ -156,12 +177,17 @@ state_name(XrDesktopControlStateDXR s)
 // ---------------------------------------------------------------- provider hooks
 
 void
-dxr_desktop_on_instance(XrInstance instance, PFN_xrGetInstanceProcAddr gipa, int enabled, DxrDesktopLogFn log)
+dxr_desktop_on_instance(XrInstance instance, PFN_xrGetInstanceProcAddr gipa, uint32_t spec_version, DxrDesktopLogFn log)
 {
 	std::lock_guard<std::mutex> clk(g_call_mx);
 	std::lock_guard<std::mutex> lk(g_mx);
 	g_log = log;
 	g_enabled = 0;
+	g_capture = 0;
+	g_spec_version = 0;
+	pfn_capture_state = nullptr;
+	pfn_capture = nullptr;
+	pfn_capture_image = nullptr;
 	pfn_get_state = nullptr;
 	pfn_request = nullptr;
 	pfn_enumerate = nullptr;
@@ -169,7 +195,7 @@ dxr_desktop_on_instance(XrInstance instance, PFN_xrGetInstanceProcAddr gipa, int
 	pfn_pick = nullptr;
 	pfn_text_at = nullptr;
 	pfn_submit = nullptr;
-	if (!enabled || !instance || !gipa) return;
+	if (spec_version == 0 || !instance || !gipa) return;
 
 	auto resolve = [&](const char *name) {
 		PFN_xrVoidFunction fn = nullptr;
@@ -186,7 +212,17 @@ dxr_desktop_on_instance(XrInstance instance, PFN_xrGetInstanceProcAddr gipa, int
 
 	g_enabled = pfn_get_state && pfn_request && pfn_enumerate && pfn_get_pointer && pfn_pick && pfn_text_at &&
 	            pfn_submit;
-	DESK_LOG("[DisplayXR-PROV] desktop control: %s\n", g_enabled ? "extension enabled" : "entry points missing");
+	g_spec_version = g_enabled ? spec_version : 0;
+	// Screen capture only from a runtime that advertises spec v2: a v1 runtime would not
+	// understand the chained scope / parent structs, so they are never sent to it.
+	if (g_enabled && spec_version >= 2) {
+		pfn_capture_state = (PFN_xrGetDesktopCaptureStateDXR)resolve("xrGetDesktopCaptureStateDXR");
+		pfn_capture = (PFN_xrCaptureDesktopDXR)resolve("xrCaptureDesktopDXR");
+		pfn_capture_image = (PFN_xrGetDesktopCaptureImageDXR)resolve("xrGetDesktopCaptureImageDXR");
+		g_capture = pfn_capture_state && pfn_capture && pfn_capture_image;
+	}
+	DESK_LOG("[DisplayXR-PROV] desktop control: %s (spec v%u, screen capture %s)\n",
+	         g_enabled ? "extension enabled" : "entry points missing", spec_version, g_capture ? "on" : "off");
 }
 
 void
@@ -230,16 +266,36 @@ dxr_desktop_handle_event(const XrEventDataBuffer *ev)
 		e.kind = DXR_DESKTOP_EVENT_STATE_CHANGED;
 		e.state = (int32_t)c->state;
 		DESK_LOG("[DisplayXR-PROV] desktop control: state -> %s\n", state_name(c->state));
+	} else if (ev->type == XR_TYPE_EVENT_DATA_DESKTOP_CAPTURE_COMPLETED_DXR) {
+		const XrEventDataDesktopCaptureCompletedDXR *c = (const XrEventDataDesktopCaptureCompletedDXR *)ev;
+		from = c->session;
+		e.kind = DXR_DESKTOP_EVENT_CAPTURE_COMPLETED;
+		e.action_id = c->captureId;
+		e.result = (int32_t)c->result;
+		e.width = c->width;
+		e.height = c->height;
+		e.src_x = c->sourceRect.offset.x;
+		e.src_y = c->sourceRect.offset.y;
+		e.src_width = c->sourceRect.extent.width;
+		e.src_height = c->sourceRect.extent.height;
+		e.frame_time = c->frameTime;
+		copy_str(e.message, c->message);
+	} else if (ev->type == XR_TYPE_EVENT_DATA_DESKTOP_CAPTURE_STATE_CHANGED_DXR) {
+		const XrEventDataDesktopCaptureStateChangedDXR *c = (const XrEventDataDesktopCaptureStateChangedDXR *)ev;
+		from = c->session;
+		e.kind = DXR_DESKTOP_EVENT_CAPTURE_STATE_CHANGED;
+		e.state = (int32_t)c->state;
+		DESK_LOG("[DisplayXR-PROV] desktop control: capture state -> %s\n", state_name(c->state));
 	} else {
 		return 0;
 	}
 
 	std::lock_guard<std::mutex> lk(g_mx);
 	if (g_session == XR_NULL_HANDLE || from != g_session) return 1; // stale session
-	if (e.kind == DXR_DESKTOP_EVENT_STATE_CHANGED) {
-		// Only the latest consent state matters: keep at most one queued, at the tail.
+	if (e.kind == DXR_DESKTOP_EVENT_STATE_CHANGED || e.kind == DXR_DESKTOP_EVENT_CAPTURE_STATE_CHANGED) {
+		// Only the latest consent state matters: keep at most one queued per scope, at the tail.
 		for (auto it = g_queue.begin(); it != g_queue.end(); ++it) {
-			if (it->kind == DXR_DESKTOP_EVENT_STATE_CHANGED) {
+			if (it->kind == e.kind) {
 				g_queue.erase(it);
 				break;
 			}
@@ -303,6 +359,96 @@ dxr_prov_desktop_request(const uint8_t *reason_utf8)
 	XrDesktopControlRequestInfoDXR info = {XR_TYPE_DESKTOP_CONTROL_REQUEST_INFO_DXR};
 	info.reason = cstr(reason_utf8);
 	return (int)pfn_request(s, &info);
+}
+
+int
+dxr_prov_desktop_request_scopes(const uint8_t *reason_utf8, uint64_t scopes, const uint8_t *parent_window_utf8)
+{
+	std::lock_guard<std::mutex> clk(g_call_mx);
+	XrSession s;
+	int r = session_for_call(&s);
+	if (r != 0) return r;
+	if ((scopes & (DXR_DESKTOP_SCOPE_CONTROL | DXR_DESKTOP_SCOPE_CAPTURE)) == 0) scopes |= DXR_DESKTOP_SCOPE_CONTROL;
+	int capture;
+	{
+		std::lock_guard<std::mutex> lk(g_mx);
+		capture = g_capture;
+	}
+	bool has_reason = reason_utf8 && *reason_utf8;
+	XrDesktopControlRequestInfoDXR info = {XR_TYPE_DESKTOP_CONTROL_REQUEST_INFO_DXR};
+	info.reason = has_reason ? cstr(reason_utf8) : nullptr;
+	if (!capture) {
+		// A spec v1 runtime: only CONTROL exists, asked for exactly as v1 did.
+		if (!(scopes & DXR_DESKTOP_SCOPE_CONTROL)) return DXR_DESKTOP_E_NO_CAPTURE;
+		return (int)pfn_request(s, has_reason ? &info : nullptr);
+	}
+	XrDesktopControlRequestScopeDXR scope = {XR_TYPE_DESKTOP_CONTROL_REQUEST_SCOPE_DXR};
+	scope.scopes = scopes & (DXR_DESKTOP_SCOPE_CONTROL | DXR_DESKTOP_SCOPE_CAPTURE | DXR_DESKTOP_SCOPE_ASK_AGAIN);
+	XrDesktopControlParentWindowDXR parent = {XR_TYPE_DESKTOP_CONTROL_PARENT_WINDOW_DXR};
+	if (parent_window_utf8 && *parent_window_utf8) {
+		// Verbatim: a Wayland handle may contain (leading / trailing) spaces.
+		parent.parentWindow = cstr(parent_window_utf8);
+		scope.next = &parent;
+	}
+	info.next = &scope;
+	return (int)pfn_request(s, &info);
+}
+
+int
+dxr_prov_desktop_capture_available(void)
+{
+	std::lock_guard<std::mutex> lk(g_mx);
+	return (g_enabled && g_capture && g_session != XR_NULL_HANDLE) ? 1 : 0;
+}
+
+int
+dxr_prov_desktop_get_capture_state(int32_t *state)
+{
+	if (!state) return DXR_DESKTOP_E_BAD_ARGUMENT;
+	*state = XR_DESKTOP_CONTROL_STATE_UNSUPPORTED_DXR;
+	std::lock_guard<std::mutex> clk(g_call_mx);
+	XrSession s;
+	int r = capture_session_for_call(&s);
+	if (r != 0) return r;
+	XrDesktopControlStateDXR st = XR_DESKTOP_CONTROL_STATE_UNSUPPORTED_DXR;
+	XrResult xr = pfn_capture_state(s, &st);
+	if (XR_SUCCEEDED(xr)) *state = (int32_t)st;
+	return (int)xr;
+}
+
+int
+dxr_prov_desktop_capture(const DxrDesktopCaptureInfo *info, uint64_t *capture_id)
+{
+	if (!info || !capture_id) return DXR_DESKTOP_E_BAD_ARGUMENT;
+	*capture_id = 0;
+	std::lock_guard<std::mutex> clk(g_call_mx);
+	XrSession s;
+	int r = capture_session_for_call(&s);
+	if (r != 0) return r;
+	XrDesktopCaptureInfoDXR ci;
+	memset(&ci, 0, sizeof(ci));
+	ci.type = XR_TYPE_DESKTOP_CAPTURE_INFO_DXR;
+	ci.target = (XrDesktopCaptureTargetDXR)info->target;
+	ci.windowId = info->window_id;
+	ci.region.offset.x = info->x;
+	ci.region.offset.y = info->y;
+	ci.region.extent.width = info->width;
+	ci.region.extent.height = info->height;
+	ci.maxWidth = info->max_width;
+	ci.maxHeight = info->max_height;
+	return (int)pfn_capture(s, &ci, capture_id);
+}
+
+int
+dxr_prov_desktop_capture_image(uint64_t capture_id, uint32_t capacity, uint32_t *count, uint8_t *rgba)
+{
+	if (!count || (capacity > 0 && !rgba)) return DXR_DESKTOP_E_BAD_ARGUMENT;
+	*count = 0;
+	std::lock_guard<std::mutex> clk(g_call_mx);
+	XrSession s;
+	int r = capture_session_for_call(&s);
+	if (r != 0) return r;
+	return (int)pfn_capture_image(s, capture_id, capacity, count, capacity ? rgba : nullptr);
 }
 
 int
