@@ -13,8 +13,12 @@
 // completion reaches its waiter through another thread or through the waiter's own
 // pump (Unity's main thread), never C#'s queue; a completion routed before the
 // start filed its id is taken back; timeout, abandon, LIMIT_REACHED at once, session
-// teardown mid-wait, a session restart, and the bounded waiter table. No Unity, no
-// real runtime.
+// teardown mid-wait, a session restart, and the bounded waiter table. Spec v3: held
+// keys / buttons, the modifiers chain (only for CLICK / DRAG / SCROLL with bits set),
+// the shell target, clipboard SET / GET and the two-call text fetch; against a v2
+// runtime every v3 call returns E_NO_V3 without reaching the runtime (a v2 runtime
+// would ignore the modifiers and click plain).
+// No Unity, no real runtime.
 //
 //   c++ -std=c++17 -I native~/displayxr_xrprovider -I <openxr include>
 //       native~/tests/desktop_test.cpp native~/displayxr_xrprovider/displayxr_provider_desktop.cpp
@@ -82,6 +86,12 @@ struct Fake
 	// (what a poll on another thread can do), and checks C# cannot drain it meanwhile.
 	bool capture_completes_inline = false;
 	int inline_next_event = -1;
+	// Spec v3.
+	bool omit_clipboard = false; // gipa does not resolve xrGetDesktopClipboardTextDXR
+	bool last_had_mods = false;
+	uint64_t last_mods = 0;
+	std::string clip_text;
+	uint64_t clip_id = 0;
 } F;
 
 // The runtime's event queue as a waiter's pump sees it (popped on the WAITING thread).
@@ -188,7 +198,16 @@ f_submit(XrSession s, const XrDesktopActionDXR *a, uint64_t *id)
 	F.calls++;
 	F.last_session = s;
 	if (F.force != XR_SUCCESS) return F.force;
-	if (a->type != XR_TYPE_DESKTOP_ACTION_DXR || a->targetWindowId == 0) return XR_ERROR_VALIDATION_FAILURE;
+	bool clip = a->actionType == XR_DESKTOP_ACTION_TYPE_SET_CLIPBOARD_TEXT_DXR ||
+	            a->actionType == XR_DESKTOP_ACTION_TYPE_GET_CLIPBOARD_TEXT_DXR;
+	if (a->type != XR_TYPE_DESKTOP_ACTION_DXR || (a->targetWindowId == 0) != clip) return XR_ERROR_VALIDATION_FAILURE;
+	F.last_had_mods = false;
+	F.last_mods = 0;
+	for (const XrBaseInStructure *n = (const XrBaseInStructure *)a->next; n; n = n->next) {
+		if (n->type != XR_TYPE_DESKTOP_ACTION_MODIFIERS_DXR) return XR_ERROR_VALIDATION_FAILURE;
+		F.last_had_mods = true;
+		F.last_mods = ((const XrDesktopActionModifiersDXR *)n)->modifiers;
+	}
 	F.last_action = *a;
 	F.last_text_null = a->text == nullptr;
 	F.last_keys_null = a->keys == nullptr;
@@ -254,6 +273,19 @@ f_capture_image(XrSession s, uint64_t id, uint32_t cap, uint32_t *count, uint8_t
 	return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL
+f_clipboard_text(XrSession s, uint64_t id, uint32_t cap, uint32_t *count, char *buf)
+{
+	F.calls++;
+	F.last_session = s;
+	if (id == 0 || id != F.clip_id) return XR_ERROR_VALIDATION_FAILURE;
+	*count = (uint32_t)F.clip_text.size() + 1;
+	if (cap == 0) return XR_SUCCESS;
+	if (cap < *count) return XR_ERROR_SIZE_INSUFFICIENT;
+	memcpy(buf, F.clip_text.c_str(), *count);
+	F.clip_id = 0; // copied out: the runtime wipes it
+	return XR_SUCCESS;
+}
+static XrResult XRAPI_CALL
 f_gipa(XrInstance, const char *name, PFN_xrVoidFunction *fn)
 {
 	*fn = nullptr;
@@ -268,6 +300,7 @@ f_gipa(XrInstance, const char *name, PFN_xrVoidFunction *fn)
 	if (!strcmp(name, "xrCaptureDesktopDXR")) *fn = (PFN_xrVoidFunction)f_capture;
 	if (!strcmp(name, "xrGetDesktopCaptureImageDXR") && !F.omit_capture_image)
 		*fn = (PFN_xrVoidFunction)f_capture_image;
+	if (!strcmp(name, "xrGetDesktopClipboardTextDXR") && !F.omit_clipboard) *fn = (PFN_xrVoidFunction)f_clipboard_text;
 	return *fn ? XR_SUCCESS : XR_ERROR_FUNCTION_UNSUPPORTED;
 }
 
@@ -1001,6 +1034,125 @@ main()
 	}
 	CHECK(dxr_prov_desktop_capture_wait(wid, 100, &ev) == 1 && ev.width == 7);
 	dxr_desktop_on_session_destroying();
+
+	// ------------------------------------------------------------ spec v3
+	uint8_t cb[64];
+	// A v2 runtime: every v3 call refused untried — nothing reaches the runtime.
+	dxr_desktop_on_instance(inst, f_gipa, 2, quiet);
+	dxr_desktop_on_session_created(s1);
+	CHECK(dxr_prov_desktop_spec_version() == 2);
+	{
+		int calls0 = F.calls;
+		for (int t = XR_DESKTOP_ACTION_TYPE_KEY_DOWN_DXR; t <= XR_DESKTOP_ACTION_TYPE_GET_CLIPBOARD_TEXT_DXR; t++) {
+			bool clip = t >= XR_DESKTOP_ACTION_TYPE_SET_CLIPBOARD_TEXT_DXR;
+			DxrDesktopAction v3 = action(t, clip ? 0 : 5);
+			id = 7;
+			CHECK(dxr_prov_desktop_submit(&v3, u8("t"), u8("shift"), &id) == DXR_DESKTOP_E_NO_V3 && id == 0);
+		}
+		DxrDesktopAction sh = action(XR_DESKTOP_ACTION_TYPE_CLICK_DXR, DXR_DESKTOP_TARGET_SHELL);
+		CHECK(dxr_prov_desktop_submit(&sh, nullptr, nullptr, &id) == DXR_DESKTOP_E_NO_V3);
+		DxrDesktopAction mc = action(XR_DESKTOP_ACTION_TYPE_CLICK_DXR, 5);
+		mc.modifiers = 0x1;
+		CHECK(dxr_prov_desktop_submit(&mc, nullptr, nullptr, &id) == DXR_DESKTOP_E_NO_V3);
+		CHECK(dxr_prov_desktop_clipboard_text(1000, 0, &count, nullptr) == DXR_DESKTOP_E_NO_V3 && count == 0);
+		CHECK(F.calls == calls0);
+		// The v2 surface is untouched: a plain click goes out with no chain.
+		mc.modifiers = 0;
+		CHECK(dxr_prov_desktop_submit(&mc, nullptr, nullptr, &id) == XR_SUCCESS && id != 0);
+		CHECK(F.last_action.next == nullptr && !F.last_had_mods);
+	}
+	dxr_desktop_on_session_destroying();
+
+	// A v3 runtime.
+	dxr_desktop_on_instance(inst, f_gipa, 3, quiet);
+	CHECK(dxr_prov_desktop_spec_version() == 0); // no session yet
+	dxr_desktop_on_session_created(s2);
+	CHECK(dxr_prov_desktop_spec_version() == 3);
+	{
+		DxrDesktopAction k = action(XR_DESKTOP_ACTION_TYPE_KEY_DOWN_DXR, 77);
+		CHECK(dxr_prov_desktop_submit(&k, nullptr, u8("shift"), &id) == XR_SUCCESS && id != 0);
+		CHECK(F.last_action.actionType == XR_DESKTOP_ACTION_TYPE_KEY_DOWN_DXR && F.last_action.targetWindowId == 77);
+		CHECK(F.last_keys == "shift" && F.last_text_null && F.last_action.next == nullptr);
+		k.action_type = XR_DESKTOP_ACTION_TYPE_KEY_UP_DXR;
+		CHECK(dxr_prov_desktop_submit(&k, nullptr, u8("shift"), &id) == XR_SUCCESS);
+		CHECK(F.last_action.actionType == XR_DESKTOP_ACTION_TYPE_KEY_UP_DXR && F.last_keys == "shift");
+
+		DxrDesktopAction b = action(XR_DESKTOP_ACTION_TYPE_BUTTON_DOWN_DXR, 77);
+		b.x = -5;
+		b.y = 7;
+		b.button = XR_DESKTOP_POINTER_BUTTON_RIGHT_DXR;
+		CHECK(dxr_prov_desktop_submit(&b, nullptr, nullptr, &id) == XR_SUCCESS);
+		CHECK(F.last_action.actionType == XR_DESKTOP_ACTION_TYPE_BUTTON_DOWN_DXR && F.last_action.point.x == -5 &&
+		      F.last_action.point.y == 7 && F.last_action.button == XR_DESKTOP_POINTER_BUTTON_RIGHT_DXR);
+		b.action_type = XR_DESKTOP_ACTION_TYPE_BUTTON_UP_DXR;
+		CHECK(dxr_prov_desktop_submit(&b, nullptr, nullptr, &id) == XR_SUCCESS);
+		CHECK(F.last_action.actionType == XR_DESKTOP_ACTION_TYPE_BUTTON_UP_DXR);
+
+		// Modifiers: chained exactly when set, on what the app asked for.
+		DxrDesktopAction c = action(XR_DESKTOP_ACTION_TYPE_CLICK_DXR, 77);
+		c.modifiers = 0x1 | 0x2;
+		CHECK(dxr_prov_desktop_submit(&c, nullptr, nullptr, &id) == XR_SUCCESS);
+		CHECK(F.last_had_mods && F.last_mods == (XR_DESKTOP_KEY_MODIFIER_CTRL_BIT_DXR | XR_DESKTOP_KEY_MODIFIER_SHIFT_BIT_DXR));
+		c.action_type = XR_DESKTOP_ACTION_TYPE_DRAG_DXR;
+		c.modifiers = 0x4;
+		CHECK(dxr_prov_desktop_submit(&c, nullptr, nullptr, &id) == XR_SUCCESS);
+		CHECK(F.last_had_mods && F.last_mods == XR_DESKTOP_KEY_MODIFIER_ALT_BIT_DXR);
+		c.action_type = XR_DESKTOP_ACTION_TYPE_SCROLL_DXR;
+		c.modifiers = 0x8;
+		CHECK(dxr_prov_desktop_submit(&c, nullptr, nullptr, &id) == XR_SUCCESS);
+		CHECK(F.last_had_mods && F.last_mods == XR_DESKTOP_KEY_MODIFIER_SUPER_BIT_DXR);
+		c.modifiers = 0;
+		CHECK(dxr_prov_desktop_submit(&c, nullptr, nullptr, &id) == XR_SUCCESS && !F.last_had_mods);
+
+		// The shell target is passed through unchanged.
+		DxrDesktopAction sh = action(XR_DESKTOP_ACTION_TYPE_CLICK_DXR, DXR_DESKTOP_TARGET_SHELL);
+		sh.x = 20;
+		sh.y = 15;
+		CHECK(dxr_prov_desktop_submit(&sh, nullptr, nullptr, &id) == XR_SUCCESS);
+		CHECK(F.last_action.targetWindowId == UINT64_MAX && F.last_action.point.x == 20);
+
+		// Clipboard: SET carries the text (UTF-8 intact), GET then the two-call fetch.
+		DxrDesktopAction set = action(XR_DESKTOP_ACTION_TYPE_SET_CLIPBOARD_TEXT_DXR, 0);
+		CHECK(dxr_prov_desktop_submit(&set, u8(kTextZh), nullptr, &id) == XR_SUCCESS);
+		CHECK(F.last_action.actionType == XR_DESKTOP_ACTION_TYPE_SET_CLIPBOARD_TEXT_DXR && F.last_text == kTextZh);
+		DxrDesktopAction get = action(XR_DESKTOP_ACTION_TYPE_GET_CLIPBOARD_TEXT_DXR, 0);
+		uint64_t gid = 0;
+		CHECK(dxr_prov_desktop_submit(&get, nullptr, nullptr, &gid) == XR_SUCCESS && gid != 0);
+		F.clip_id = gid;
+		F.clip_text = kTextZh;
+		uint32_t want = (uint32_t)strlen(kTextZh) + 1;
+		CHECK(dxr_prov_desktop_clipboard_text(gid, 0, &count, nullptr) == XR_SUCCESS && count == want);
+		CHECK(dxr_prov_desktop_clipboard_text(gid, 4, &count, cb) == XR_ERROR_SIZE_INSUFFICIENT);
+		CHECK(dxr_prov_desktop_clipboard_text(gid + 1, sizeof(cb), &count, cb) == XR_ERROR_VALIDATION_FAILURE);
+		CHECK(dxr_prov_desktop_clipboard_text(gid, sizeof(cb), &count, cb) == XR_SUCCESS && count == want);
+		CHECK(str(cb) == kTextZh);
+		CHECK(dxr_prov_desktop_clipboard_text(gid, sizeof(cb), &count, cb) == XR_ERROR_VALIDATION_FAILURE);
+		CHECK(dxr_prov_desktop_clipboard_text(gid, 4, &count, nullptr) == DXR_DESKTOP_E_BAD_ARGUMENT);
+		// An empty clipboard: "" (count 1).
+		F.clip_id = gid;
+		F.clip_text.clear();
+		memset(cb, 'x', sizeof(cb));
+		CHECK(dxr_prov_desktop_clipboard_text(gid, sizeof(cb), &count, cb) == XR_SUCCESS && count == 1 && cb[0] == 0);
+	}
+	dxr_desktop_on_session_destroying();
+	CHECK(dxr_prov_desktop_spec_version() == 0);
+	CHECK(dxr_prov_desktop_clipboard_text(1, 0, &count, nullptr) == DXR_DESKTOP_E_NO_SESSION);
+
+	// A v3 runtime without the clipboard fetch: held input works, GET is refused untried.
+	F.omit_clipboard = true;
+	dxr_desktop_on_instance(inst, f_gipa, 3, quiet);
+	dxr_desktop_on_session_created(s1);
+	{
+		DxrDesktopAction k = action(XR_DESKTOP_ACTION_TYPE_KEY_DOWN_DXR, 77);
+		CHECK(dxr_prov_desktop_submit(&k, nullptr, u8("a"), &id) == XR_SUCCESS);
+		int calls0 = F.calls;
+		DxrDesktopAction get = action(XR_DESKTOP_ACTION_TYPE_GET_CLIPBOARD_TEXT_DXR, 0);
+		CHECK(dxr_prov_desktop_submit(&get, nullptr, nullptr, &id) == DXR_DESKTOP_E_NO_V3 && id == 0);
+		CHECK(dxr_prov_desktop_clipboard_text(1, 0, &count, nullptr) == DXR_DESKTOP_E_NO_V3);
+		CHECK(F.calls == calls0);
+	}
+	dxr_desktop_on_session_destroying();
+	F.omit_clipboard = false;
 
 	if (g_fail) {
 		fprintf(stderr, "%d of %d check(s) failed\n", g_fail, g_checks);

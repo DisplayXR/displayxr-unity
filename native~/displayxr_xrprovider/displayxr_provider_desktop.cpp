@@ -22,7 +22,8 @@ static_assert(offsetof(DxrDesktopWindow, x) == 32 && offsetof(DxrDesktopWindow, 
               "DxrDesktopWindow layout is C# ABI");
 static_assert(sizeof(DxrDesktopPick) == 448 && offsetof(DxrDesktopPick, window) == 16,
               "DxrDesktopPick layout is C# ABI");
-static_assert(sizeof(DxrDesktopAction) == 64 && offsetof(DxrDesktopAction, click_count) == 48,
+static_assert(sizeof(DxrDesktopAction) == 64 && offsetof(DxrDesktopAction, click_count) == 48 &&
+                  offsetof(DxrDesktopAction, modifiers) == 60,
               "DxrDesktopAction layout is C# ABI");
 static_assert(sizeof(DxrDesktopEvent) == 312 && offsetof(DxrDesktopEvent, message) == 24 &&
                   offsetof(DxrDesktopEvent, width) == 280 && offsetof(DxrDesktopEvent, src_x) == 288 &&
@@ -35,6 +36,19 @@ static_assert(sizeof(((DxrDesktopWindow *)0)->app_id) == XR_MAX_DESKTOP_APP_ID_S
                   sizeof(((DxrDesktopWindow *)0)->title) == XR_MAX_DESKTOP_TITLE_SIZE_DXR &&
                   sizeof(((DxrDesktopEvent *)0)->message) == XR_MAX_DESKTOP_MESSAGE_SIZE_DXR,
               "string sizes follow the extension header");
+// Spec v3: the mirror must match the runtime's XR_DXR_desktop_control.h (spec §11.1).
+static_assert(sizeof(XrDesktopActionModifiersDXR) == 24 && offsetof(XrDesktopActionModifiersDXR, next) == 8 &&
+                  offsetof(XrDesktopActionModifiersDXR, modifiers) == 16,
+              "XrDesktopActionModifiersDXR layout follows the extension header");
+static_assert(XR_TYPE_DESKTOP_ACTION_MODIFIERS_DXR == (XrStructureType)1004999421, "spec v3 structure type");
+static_assert(XR_DESKTOP_ACTION_TYPE_KEY_DOWN_DXR == 16 && XR_DESKTOP_ACTION_TYPE_KEY_UP_DXR == 17 &&
+                  XR_DESKTOP_ACTION_TYPE_BUTTON_DOWN_DXR == 18 && XR_DESKTOP_ACTION_TYPE_BUTTON_UP_DXR == 19 &&
+                  XR_DESKTOP_ACTION_TYPE_SET_CLIPBOARD_TEXT_DXR == 20 &&
+                  XR_DESKTOP_ACTION_TYPE_GET_CLIPBOARD_TEXT_DXR == 21,
+              "spec v3 action types");
+static_assert(XR_DESKTOP_TARGET_SHELL_DXR == UINT64_MAX && DXR_DESKTOP_TARGET_SHELL == XR_DESKTOP_TARGET_SHELL_DXR,
+              "spec v3 shell target");
+static_assert(XR_MAX_DESKTOP_CLIPBOARD_TEXT_SIZE_DXR == 1048576, "spec v3 clipboard limit");
 
 namespace {
 
@@ -53,6 +67,7 @@ DxrDesktopLogFn g_log = nullptr;
 int g_enabled = 0; // extension enabled on the instance and all seven PFNs resolved
 uint32_t g_spec_version = 0; // what the runtime ADVERTISED (0 = not enabled)
 int g_capture = 0; // spec >= 2 and the three capture PFNs resolved (implies g_enabled)
+int g_v3 = 0;      // spec >= 3 (implies g_enabled): held input, modifiers, the shell target, clipboard SET
 XrSession g_session = XR_NULL_HANDLE;
 uint32_t g_generation = 0;
 std::deque<DxrDesktopEvent> g_queue;
@@ -74,6 +89,8 @@ PFN_xrSubmitDesktopActionDXR pfn_submit = nullptr;
 PFN_xrGetDesktopCaptureStateDXR pfn_capture_state = nullptr;
 PFN_xrCaptureDesktopDXR pfn_capture = nullptr;
 PFN_xrGetDesktopCaptureImageDXR pfn_capture_image = nullptr;
+// Spec v3 (clipboard text fetch).
+PFN_xrGetDesktopClipboardTextDXR pfn_clipboard_text = nullptr;
 
 // Waitable captures (dxr_prov_desktop_capture_waitable), under g_mx. The runtime has
 // at most one capture in flight per session, so this holds one live entry plus, at
@@ -212,6 +229,16 @@ to_capture_info(const DxrDesktopCaptureInfo *info, XrDesktopCaptureInfoDXR *ci)
 	ci->maxHeight = info->max_height;
 }
 
+// True for what only a spec-v3 runtime understands. A v2 runtime refuses the new action
+// types at submit, completes the shell target WINDOW_LOST — and IGNORES a chained
+// modifiers struct, running the plain click: the reason this is checked here, untried.
+bool
+needs_v3(const DxrDesktopAction &a)
+{
+	return a.action_type >= XR_DESKTOP_ACTION_TYPE_KEY_DOWN_DXR || a.target_window_id == DXR_DESKTOP_TARGET_SHELL ||
+	       a.modifiers != 0;
+}
+
 const char *
 cstr(const uint8_t *p)
 {
@@ -245,7 +272,9 @@ dxr_desktop_on_instance(XrInstance instance, PFN_xrGetInstanceProcAddr gipa, uin
 	g_log = log;
 	g_enabled = 0;
 	g_capture = 0;
+	g_v3 = 0;
 	g_spec_version = 0;
+	pfn_clipboard_text = nullptr;
 	pfn_capture_state = nullptr;
 	pfn_capture = nullptr;
 	pfn_capture_image = nullptr;
@@ -282,8 +311,16 @@ dxr_desktop_on_instance(XrInstance instance, PFN_xrGetInstanceProcAddr gipa, uin
 		pfn_capture_image = (PFN_xrGetDesktopCaptureImageDXR)resolve("xrGetDesktopCaptureImageDXR");
 		g_capture = pfn_capture_state && pfn_capture && pfn_capture_image;
 	}
-	DESK_LOG("[DisplayXR-PROV] desktop control: %s (spec v%u, screen capture %s)\n",
-	         g_enabled ? "extension enabled" : "entry points missing", spec_version, g_capture ? "on" : "off");
+	// Held input, modifiers, the shell target and the clipboard only from a runtime that
+	// advertises spec v3 (see needs_v3). The clipboard fetch has its own entry point; a v3
+	// runtime without it still holds keys, and a GET is refused untried.
+	if (g_enabled && spec_version >= 3) {
+		g_v3 = 1;
+		pfn_clipboard_text = (PFN_xrGetDesktopClipboardTextDXR)resolve("xrGetDesktopClipboardTextDXR");
+	}
+	DESK_LOG("[DisplayXR-PROV] desktop control: %s (spec v%u, screen capture %s, held input / shell / clipboard %s)\n",
+	         g_enabled ? "extension enabled" : "entry points missing", spec_version, g_capture ? "on" : "off",
+	         g_v3 ? (pfn_clipboard_text ? "on" : "on, no clipboard fetch") : "off");
 }
 
 void
@@ -722,6 +759,13 @@ dxr_prov_desktop_submit(const DxrDesktopAction *action, const uint8_t *text_utf8
 	int r = session_for_call(&s);
 	if (r != 0) return r;
 
+	if (needs_v3(*action)) {
+		std::lock_guard<std::mutex> lk(g_mx);
+		if (!g_v3) return DXR_DESKTOP_E_NO_V3;
+		if (action->action_type == XR_DESKTOP_ACTION_TYPE_GET_CLIPBOARD_TEXT_DXR && !pfn_clipboard_text)
+			return DXR_DESKTOP_E_NO_V3; // the text could never be fetched
+	}
+
 	XrDesktopActionDXR a;
 	memset(&a, 0, sizeof(a));
 	a.type = XR_TYPE_DESKTOP_ACTION_DXR;
@@ -741,7 +785,43 @@ dxr_prov_desktop_submit(const DxrDesktopAction *action, const uint8_t *text_utf8
 	a.scrollY = action->scroll_y;
 	a.text = text_utf8 ? cstr(text_utf8) : nullptr;
 	a.keys = keys_utf8 ? cstr(keys_utf8) : nullptr;
+	// Spec v3 (gated above): the modifiers held around a CLICK / DRAG / SCROLL. The runtime
+	// validates the action type and the bits (XR_ERROR_VALIDATION_FAILURE).
+	XrDesktopActionModifiersDXR mods;
+	memset(&mods, 0, sizeof(mods));
+	if (action->modifiers != 0) {
+		mods.type = XR_TYPE_DESKTOP_ACTION_MODIFIERS_DXR;
+		mods.modifiers = action->modifiers;
+		a.next = &mods;
+	}
 	return (int)pfn_submit(s, &a, action_id); // the runtime copies the strings at submit
+}
+
+uint32_t
+dxr_prov_desktop_spec_version(void)
+{
+	std::lock_guard<std::mutex> lk(g_mx);
+	return (g_enabled && g_session != XR_NULL_HANDLE) ? g_spec_version : 0;
+}
+
+int
+dxr_prov_desktop_clipboard_text(uint64_t action_id, uint32_t capacity, uint32_t *count, uint8_t *buffer_utf8)
+{
+	if (!count || (capacity > 0 && !buffer_utf8)) return DXR_DESKTOP_E_BAD_ARGUMENT;
+	*count = 0;
+	std::lock_guard<std::mutex> clk(g_call_mx);
+	XrSession s;
+	int r = session_for_call(&s);
+	if (r != 0) return r;
+	{
+		std::lock_guard<std::mutex> lk(g_mx);
+		if (!g_v3 || !pfn_clipboard_text) return DXR_DESKTOP_E_NO_V3;
+	}
+	XrResult xr = pfn_clipboard_text(s, action_id, capacity, count,
+	                                 capacity ? reinterpret_cast<char *>(buffer_utf8) : nullptr);
+	// Never hand C# an unterminated buffer, whatever the runtime wrote.
+	if (XR_SUCCEEDED(xr) && capacity > 0) buffer_utf8[capacity - 1] = 0;
+	return (int)xr;
 }
 
 int
