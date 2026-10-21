@@ -155,7 +155,12 @@ elseif(UNIX AND NOT APPLE AND NOT ANDROID)
         displayxr_xrprovider/displayxr_provider_wl_capture.cpp
         # ... and forward the weave to libdisplayxr_unity_wayland.so (below), which
         # is dlopened only then, so this library never links libwayland-client.
-        displayxr_linux_wayland_shim.c)
+        displayxr_linux_wayland_shim.c
+        # Read-only desktop info (monitors, windows, pointer, X root scale) over
+        # the session bus, for native-Wayland and X11 players alike; libdbus is
+        # dlopened (displayxr_linux_dbus.c, also in the Wayland library).
+        displayxr_linux_desktop_info.c
+        displayxr_linux_dbus.c)
 endif()
 
 # Provider Vulkan backend (#247 Windows, #249 Linux): enable2 session device +
@@ -221,7 +226,8 @@ if(UNIX AND NOT APPLE AND NOT ANDROID)
     if(DXR_WAYLAND_CLIENT_FOUND AND DXR_WAYLAND_SCANNER)
         add_library(displayxr_unity_wayland SHARED
             displayxr_linux_wayland.c
-            displayxr_linux_wayland_dbus.c)
+            displayxr_linux_wayland_dbus.c
+            displayxr_linux_dbus.c)
         # viewporter + fractional-scale + xdg-output + xdg-foreign glue, generated from the vendored
         # XML (wayland-protocols is not installed everywhere; see wayland-protocols/README.md).
         set(DXR_WL_GEN ${CMAKE_CURRENT_BINARY_DIR}/wayland-generated)
@@ -238,8 +244,8 @@ if(UNIX AND NOT APPLE AND NOT ANDROID)
         target_include_directories(displayxr_unity_wayland PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} ${DXR_WL_GEN})
         target_compile_options(displayxr_unity_wayland PRIVATE -fvisibility=hidden)
         find_package(Threads REQUIRED)
-        # libdbus is dlopened (displayxr_linux_wayland_dbus.c), like Vulkan and Xlib
-        # in the main plugin; libwayland-client is this library's one real dependency.
+        # libdbus is dlopened (displayxr_linux_dbus.c), like Vulkan and Xlib in the
+        # main plugin; libwayland-client is this library's one real dependency.
         target_link_libraries(displayxr_unity_wayland PRIVATE
             PkgConfig::DXR_WAYLAND_CLIENT Threads::Threads ${CMAKE_DL_LIBS} m)
         target_link_options(displayxr_unity_wayland PRIVATE -Wl,--no-undefined)
@@ -335,6 +341,16 @@ else()
     # and macOS (two-level namespace) both reject this by default; Linux is the
     # odd one out, so ask for the same strictness explicitly.
     target_link_options(displayxr_unity PRIVATE -Wl,--no-undefined)
+endif()
+
+# Unit test of the desktop info's parsing and arithmetic (pure: no D-Bus, no
+# desktop). Desktop Linux only, with or without the Wayland library; CI runs it.
+if(UNIX AND NOT APPLE AND NOT ANDROID)
+    enable_testing()
+    add_executable(test_linux_desktop_info tests/test_linux_desktop_info.c)
+    target_include_directories(test_linux_desktop_info PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(test_linux_desktop_info PRIVATE m)
+    add_test(NAME linux_desktop_info COMMAND test_linux_desktop_info)
 endif()
 
 # --- Summary ---

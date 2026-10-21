@@ -443,6 +443,30 @@ DISPLAYXR_EXPORT int displayxr_linux_window_state(void);
 /// while it is not known (see displayxr_linux.c). Reads a cached value: cheap.
 DISPLAYXR_EXPORT int displayxr_linux_window_handle(char *buf, int len);
 
+/// Read-only desktop info for an app's agent (GNOME; native-Wayland and X11 players
+/// alike): what the DisplayXR GNOME extension's read-only members and mutter's
+/// DisplayConfig give any client without consent. NO window titles or UI text, by
+/// design (those come from DisplayXRDesktop after the user's consent). Records and
+/// coordinates: displayxr_linux_desktop_info.h — everything is in mutter's stage
+/// coordinates (logical desktop px in its logical layout mode). Any thread; results
+/// are cached for 100 ms (windows, pointer) / 250 ms (monitors, X root scale); a call
+/// that refreshes waits for a D-Bus round trip (about a millisecond), each D-Bus call
+/// gives up after 250 ms, and after a timeout nothing is asked for a second.
+/// monitors / windows: copy up to @p len records into @p buf and return how many
+/// there are (more than @p len = the list was cut: ask again with a bigger buffer),
+/// or -1 when not available (no mutter DisplayConfig / no DisplayXR GNOME extension).
+/// Windows are top first; each one's `monitor` indexes the monitors list.
+/// pointer: 1 and the pointer in stage px; 0 when not available (no extension, one
+/// older than version 16, the screen locked).
+/// xroot_scale: X root px per stage px (the factor between the plug-in's
+/// window-position API / an X11 client's coordinates and these), 0 when not known.
+struct DisplayXRLinuxMonitor;
+struct DisplayXRLinuxWindow;
+DISPLAYXR_EXPORT int displayxr_linux_monitors(struct DisplayXRLinuxMonitor *buf, int len);
+DISPLAYXR_EXPORT int displayxr_linux_windows(struct DisplayXRLinuxWindow *buf, int len);
+DISPLAYXR_EXPORT int displayxr_linux_pointer(int *x, int *y);
+DISPLAYXR_EXPORT float displayxr_linux_xroot_scale(void);
+
 /// (#266) Centre Unity's window on the given rect (X root coordinates), unless it is
 /// already there. Called by dxr_prov_move_window_to_display with the panel rect the
 /// runtime reported. Returns 1 when the window is on (or was moved to) the rect.

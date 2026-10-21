@@ -216,22 +216,28 @@ static long long lin_now_ns(void);
 
 #define XL_SYM(name)                                                       \
 	do {                                                                   \
-		*(void **)(&s_x.name) = dlsym(s_x.lib, #name);                     \
+		*(void **)(&s_x.name) = dlsym(lib, #name);                         \
 		if (!s_x.name) {                                                   \
 			lin_log("[DisplayXR-LNX] libX11 missing symbol " #name "\n");  \
 			return 0;                                                      \
 		}                                                                  \
 	} while (0)
 
+// Once per process, from whichever thread asks first (the desktop info calls in
+// from any thread): s_x.lib is published only after every symbol resolved, so no
+// caller ever sees a half-loaded table, and a failure is not retried (or logged)
+// on every call.
+static pthread_once_t s_xlib_once = PTHREAD_ONCE_INIT;
+static int s_xlib_ok;
+
 static int
-lin_load_xlib(void)
+lin_load_xlib_now(void)
 {
-	if (s_x.lib) return 1;
 	// SONAME, not the -dev symlink: a runtime box has libX11.so.6 but usually
 	// not the unversioned libX11.so.
-	s_x.lib = dlopen("libX11.so.6", RTLD_NOW | RTLD_LOCAL);
-	if (!s_x.lib) s_x.lib = dlopen("libX11.so", RTLD_NOW | RTLD_LOCAL);
-	if (!s_x.lib) {
+	void *lib = dlopen("libX11.so.6", RTLD_NOW | RTLD_LOCAL);
+	if (!lib) lib = dlopen("libX11.so", RTLD_NOW | RTLD_LOCAL);
+	if (!lib) {
 		lin_log("[DisplayXR-LNX] libX11 not present — no window binding; the runtime "
 		        "will self-host its weave window\n");
 		return 0;
@@ -261,7 +267,21 @@ lin_load_xlib(void)
 	XL_SYM(XGetSelectionOwner);
 	XL_SYM(XQueryPointer);
 	XL_SYM(XSendEvent);
+	s_x.lib = lib;
 	return 1;
+}
+
+static void
+lin_load_xlib_once(void)
+{
+	s_xlib_ok = lin_load_xlib_now();
+}
+
+static int
+lin_load_xlib(void)
+{
+	pthread_once(&s_xlib_once, lin_load_xlib_once);
+	return s_xlib_ok;
 }
 
 #define XA_CARDINAL_ 6L // <X11/Xatom.h>, inlined so we need no X11 headers
@@ -905,8 +925,9 @@ displayxr_linux_set_transparent(int enabled)
 // and borrowed by the runtime's Vulkan surface, and nothing calls XInitThreads. That
 // includes indirect paths — dxr_prov_get_zone_rect_px(0) falls back to a live
 // XGetGeometry(s_dpy) when no zone is active, so the region code reads the cached
-// dxr_prov_get_active_zone_rect_px instead. The one s_hit_dpy request that comes from
-// another thread — the input-region reset at overlay teardown — takes s_hit_mutex,
+// dxr_prov_get_active_zone_rect_px instead. The s_hit_dpy requests that come from
+// other threads — the input-region reset at overlay teardown, and the X root size
+// for the desktop info (displayxr_linux_x_root_size, any thread) — take s_hit_mutex,
 // as does every main-thread use.
 //
 // HUD rects are the layer's whole rect (widened by +-disparity/2), whatever its alpha:
@@ -1575,6 +1596,30 @@ displayxr_get_overlay_position(int *x, int *y)
 		}
 	}
 	pthread_mutex_unlock(&s_hit_mutex);
+}
+
+/// The X root window's size: the whole X screen, which covers every monitor (the
+/// desktop info's X root scale, displayxr_linux_desktop_info.c). 1 when known. Any
+/// thread (the main-thread connection, under its mutex); an X11 player only.
+int
+displayxr_linux_x_root_size(int *out_w, int *out_h)
+{
+	if (!lin_load_xlib()) return 0;
+	int ok = 0;
+	pthread_mutex_lock(&s_hit_mutex);
+	XDpy d = lin_main_dpy_locked();
+	if (d) {
+		XWin root = 0;
+		int gx = 0, gy = 0;
+		unsigned int w = 0, h = 0, b = 0, depth = 0;
+		if (s_x.XGetGeometry(d, s_x.XDefaultRootWindow(d), &root, &gx, &gy, &w, &h, &b, &depth) && w && h) {
+			*out_w = (int)w;
+			*out_h = (int)h;
+			ok = 1;
+		}
+	}
+	pthread_mutex_unlock(&s_hit_mutex);
+	return ok;
 }
 
 /// Move Unity's window so its client origin is at (x, y), size unchanged.

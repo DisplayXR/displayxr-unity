@@ -39,6 +39,9 @@ void dxr_wl_capture_disarm(const char *why);
 //! The player was started with -force-wayland and capture is not disabled
 //! (DXR_WL_CAPTURE_DISABLE=1).
 int dxr_wl_capture_wanted(void);
+//! The player was started with -force-wayland (a native-Wayland player), whether
+//! or not the capture is disabled.
+int dxr_wl_forced_wayland(void);
 //! Warn (once) if `what`, a P/Invoke entry point, runs in a copy of the plugin
 //! that did not arm the capture (Unity loads the library twice).
 void dxr_wl_capture_note_caller(const char *what);

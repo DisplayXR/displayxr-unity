@@ -6,8 +6,9 @@
 
 #define _GNU_SOURCE // pipe2
 #include "displayxr_linux_wayland_dbus.h"
+#include "displayxr_linux_dbus.h"
+#include "displayxr_linux_json.h"
 
-#include <dlfcn.h>
 #include <fcntl.h>
 #include <math.h>
 #include <poll.h>
@@ -22,28 +23,9 @@
 
 /*
  *
- * libdbus, loaded at run time.
+ * libdbus, loaded at run time (displayxr_linux_dbus.h).
  *
  */
-
-typedef struct DxrDBusConnection DxrDBusConnection;
-typedef struct DxrDBusMessage DxrDBusMessage;
-typedef struct DxrDBusError { // DBusError's layout
-	const char *name;
-	const char *message;
-	unsigned int dummy1 : 1, dummy2 : 1, dummy3 : 1, dummy4 : 1, dummy5 : 1;
-	void *padding1;
-} DxrDBusError;
-typedef int (*DxrDBusFilter)(DxrDBusConnection *, DxrDBusMessage *, void *);
-
-#define DXR_DBUS_BUS_SESSION 0
-#define DXR_DBUS_TYPE_INVALID 0
-#define DXR_DBUS_TYPE_BOOLEAN ((int)'b')
-#define DXR_DBUS_TYPE_INT32 ((int)'i')
-#define DXR_DBUS_TYPE_UINT32 ((int)'u')
-#define DXR_DBUS_TYPE_STRING ((int)'s')
-#define DXR_DBUS_HANDLER_RESULT_NOT_YET_HANDLED 1
-#define DXR_DBUS_DISPATCH_DATA_REMAINS 0
 
 #define DXR_EXT_NAME "org.displayxr.WindowGeometry"
 #define DXR_EXT_PLACEMENT_PATH "/org/displayxr/WindowPlacement"
@@ -51,167 +33,25 @@ typedef int (*DxrDBusFilter)(DxrDBusConnection *, DxrDBusMessage *, void *);
 #define DXR_EXT_GEOMETRY_PATH "/org/displayxr/WindowGeometry"
 #define DXR_EXT_GEOMETRY_IFACE "org.displayxr.WindowGeometry1"
 
-static struct {
-	uint32_t (*threads_init_default)(void);
-	void (*error_init)(DxrDBusError *);
-	void (*error_free)(DxrDBusError *);
-	DxrDBusConnection *(*bus_get_private)(int, DxrDBusError *);
-	void (*set_exit_on_disconnect)(DxrDBusConnection *, uint32_t);
-	DxrDBusMessage *(*new_method_call)(const char *, const char *, const char *, const char *);
-	uint32_t (*append_args)(DxrDBusMessage *, int, ...);
-	DxrDBusMessage *(*send_with_reply_and_block)(DxrDBusConnection *, DxrDBusMessage *, int, DxrDBusError *);
-	uint32_t (*get_args)(DxrDBusMessage *, DxrDBusError *, int, ...);
-	void (*unref)(DxrDBusMessage *);
-	void (*add_match)(DxrDBusConnection *, const char *, DxrDBusError *);
-	uint32_t (*add_filter)(DxrDBusConnection *, DxrDBusFilter, void *, void (*)(void *));
-	uint32_t (*read_write)(DxrDBusConnection *, int);
-	int (*dispatch)(DxrDBusConnection *);
-	uint32_t (*get_unix_fd)(DxrDBusConnection *, int *);
-	uint32_t (*is_signal)(DxrDBusMessage *, const char *, const char *);
-	uint32_t (*name_has_owner)(DxrDBusConnection *, const char *, DxrDBusError *);
-	DxrDBusConnection *conn;
-} s_dbus;
+static const DxrDBus *s_dbus;
+static DxrDBusConnection *s_conn;
 
 static int
 dbus_load(void)
 {
-	void *lib = dlopen("libdbus-1.so.3", RTLD_NOW | RTLD_LOCAL);
-	if (!lib) {
-		fprintf(stderr, "[DisplayXR-WL] libdbus-1 not found: no window drag or placement\n");
-		return 0;
-	}
-#define DXR_DBUS_SYM(field, name)                                                                                  \
-	do {                                                                                                       \
-		*(void **)&s_dbus.field = dlsym(lib, name);                                                       \
-		if (!s_dbus.field) {                                                                              \
-			fprintf(stderr, "[DisplayXR-WL] libdbus-1 lacks %s: no window drag or placement\n", name); \
-			return 0;                                                                                 \
-		}                                                                                                 \
-	} while (0)
-	DXR_DBUS_SYM(threads_init_default, "dbus_threads_init_default");
-	DXR_DBUS_SYM(error_init, "dbus_error_init");
-	DXR_DBUS_SYM(error_free, "dbus_error_free");
-	DXR_DBUS_SYM(bus_get_private, "dbus_bus_get_private");
-	DXR_DBUS_SYM(set_exit_on_disconnect, "dbus_connection_set_exit_on_disconnect");
-	DXR_DBUS_SYM(new_method_call, "dbus_message_new_method_call");
-	DXR_DBUS_SYM(append_args, "dbus_message_append_args");
-	DXR_DBUS_SYM(send_with_reply_and_block, "dbus_connection_send_with_reply_and_block");
-	DXR_DBUS_SYM(get_args, "dbus_message_get_args");
-	DXR_DBUS_SYM(unref, "dbus_message_unref");
-	DXR_DBUS_SYM(add_match, "dbus_bus_add_match");
-	DXR_DBUS_SYM(add_filter, "dbus_connection_add_filter");
-	DXR_DBUS_SYM(read_write, "dbus_connection_read_write");
-	DXR_DBUS_SYM(dispatch, "dbus_connection_dispatch");
-	DXR_DBUS_SYM(get_unix_fd, "dbus_connection_get_unix_fd");
-	DXR_DBUS_SYM(is_signal, "dbus_message_is_signal");
-	DXR_DBUS_SYM(name_has_owner, "dbus_bus_name_has_owner");
-#undef DXR_DBUS_SYM
-	s_dbus.threads_init_default();
-	return 1;
+	const char *why = NULL;
+	s_dbus = dxr_dbus_load(&why);
+	if (!s_dbus)
+		fprintf(stderr, "[DisplayXR-WL] %s: no window drag or placement\n", why ? why : "libdbus-1 not loaded");
+	return s_dbus != NULL;
 }
 
 /*
  *
- * The extension's JSON (GetWindows / WindowsChanged): just enough of a parser to
- * walk it without being fooled by a window title.
+ * The extension's JSON (GetWindows / WindowsChanged), read with
+ * displayxr_linux_json.h.
  *
  */
-
-static const char *
-json_ws(const char *p, const char *end)
-{
-	while (p < end && (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r'))
-		p++;
-	return p;
-}
-
-//! One past the JSON value at p, or NULL if it is cut short.
-static const char *
-json_skip(const char *p, const char *end)
-{
-	if (p >= end)
-		return NULL;
-	if (*p == '"') {
-		for (p++; p < end; p++) {
-			if (*p == '\\')
-				p++;
-			else if (*p == '"')
-				return p + 1;
-		}
-		return NULL;
-	}
-	if (*p == '{' || *p == '[') {
-		int depth = 0;
-		for (; p < end; p++) {
-			if (*p == '"') {
-				p = json_skip(p, end);
-				if (!p)
-					return NULL;
-				p--;
-			} else if (*p == '{' || *p == '[') {
-				depth++;
-			} else if (*p == '}' || *p == ']') {
-				if (--depth == 0)
-					return p + 1;
-			}
-		}
-		return NULL;
-	}
-	while (p < end && *p != ',' && *p != '}' && *p != ']' && *p != ' ' && *p != '\n')
-		p++;
-	return p;
-}
-
-//! The value of `key` at the top level of the object [obj, end), or NULL.
-static const char *
-json_field(const char *obj, const char *end, const char *key)
-{
-	const char *p = json_ws(obj, end);
-	if (p >= end || *p != '{')
-		return NULL;
-	size_t key_len = strlen(key);
-	for (p++;;) {
-		p = json_ws(p, end);
-		if (p >= end || *p != '"')
-			return NULL;
-		const char *k = p + 1;
-		const char *after = json_skip(p, end);
-		if (!after)
-			return NULL;
-		int match = (size_t)(after - 1 - k) == key_len && !memcmp(k, key, key_len);
-		p = json_ws(after, end);
-		if (p >= end || *p != ':')
-			return NULL;
-		const char *value = json_ws(p + 1, end);
-		if (match)
-			return value;
-		p = json_skip(value, end);
-		if (!p)
-			return NULL;
-		p = json_ws(p, end);
-		if (p < end && *p == ',')
-			p++;
-		else
-			return NULL;
-	}
-}
-
-//! A JSON string value into out (no unescaping; the values we read have none).
-static void
-json_string(const char *v, const char *end, char *out, size_t size)
-{
-	out[0] = 0;
-	if (!v || v >= end || *v != '"')
-		return;
-	const char *close = json_skip(v, end);
-	if (!close)
-		return;
-	size_t n = (size_t)(close - 1 - (v + 1));
-	if (n >= size)
-		n = size - 1;
-	memcpy(out, v + 1, n);
-	out[n] = 0;
-}
 
 //! Our window and mutter's layout mode from a snapshot.
 static void
@@ -219,41 +59,41 @@ parse_snapshot(const char *json, DxrWlExtWindow *w, char *layout, size_t layout_
 {
 	memset(w, 0, sizeof(*w));
 	const char *end = json + strlen(json);
-	json_string(json_field(json, end, "layout_mode"), end, layout, layout_size);
-	const char *p = json_field(json, end, "windows");
+	dxr_json_string(dxr_json_field(json, end, "layout_mode"), end, layout, layout_size);
+	const char *p = dxr_json_field(json, end, "windows");
 	if (!p || *p != '[')
 		return;
 	long self = (long)getpid();
 	for (p++;;) {
-		p = json_ws(p, end);
+		p = dxr_json_ws(p, end);
 		if (p >= end || *p != '{')
 			return;
-		const char *obj_end = json_skip(p, end);
+		const char *obj_end = dxr_json_skip(p, end);
 		if (!obj_end)
 			return;
-		const char *pid = json_field(p, obj_end, "pid");
+		const char *pid = dxr_json_field(p, obj_end, "pid");
 		if (pid && strtol(pid, NULL, 10) == self) {
 			DxrWlExtWindow c = {0};
 			c.present = 1;
-			const char *minimized = json_field(p, obj_end, "minimized");
-			const char *above = json_field(p, obj_end, "above");
+			const char *minimized = dxr_json_field(p, obj_end, "minimized");
+			const char *above = dxr_json_field(p, obj_end, "above");
 			c.minimized = minimized ? !strncmp(minimized, "true", 4) : -1;
 			c.above = above ? !strncmp(above, "true", 4) : -1;
-			const char *id = json_field(p, obj_end, "id");
+			const char *id = dxr_json_field(p, obj_end, "id");
 			c.id = id ? strtoull(id, NULL, 10) : 0;
-			const char *frame = json_field(p, obj_end, "frame");
+			const char *frame = dxr_json_field(p, obj_end, "frame");
 			if (!frame || sscanf(frame, "[ %d , %d , %d , %d", &c.x, &c.y, &c.w, &c.h) != 4)
 				c.w = c.h = 0;
-			const char *moving = json_field(p, obj_end, "moving");
+			const char *moving = dxr_json_field(p, obj_end, "moving");
 			c.moving = moving && !strncmp(moving, "true", 4);
-			const char *mon = json_field(p, obj_end, "monitor");
-			const char *mon_end = mon ? json_skip(mon, obj_end) : NULL;
-			const char *ds = mon_end ? json_field(mon, mon_end, "device_scale") : NULL;
+			const char *mon = dxr_json_field(p, obj_end, "monitor");
+			const char *mon_end = mon ? dxr_json_skip(mon, obj_end) : NULL;
+			const char *ds = mon_end ? dxr_json_field(mon, mon_end, "device_scale") : NULL;
 			c.device_scale = ds ? strtod(ds, NULL) : 0.0;
-			const char *mx = mon_end ? json_field(mon, mon_end, "x") : NULL;
-			const char *my = mon_end ? json_field(mon, mon_end, "y") : NULL;
-			const char *mw = mon_end ? json_field(mon, mon_end, "w") : NULL;
-			const char *mh = mon_end ? json_field(mon, mon_end, "h") : NULL;
+			const char *mx = mon_end ? dxr_json_field(mon, mon_end, "x") : NULL;
+			const char *my = mon_end ? dxr_json_field(mon, mon_end, "y") : NULL;
+			const char *mw = mon_end ? dxr_json_field(mon, mon_end, "w") : NULL;
+			const char *mh = mon_end ? dxr_json_field(mon, mon_end, "h") : NULL;
 			if (mx && my && mw && mh) {
 				c.mon_x = (int)lround(strtod(mx, NULL));
 				c.mon_y = (int)lround(strtod(my, NULL));
@@ -264,7 +104,7 @@ parse_snapshot(const char *json, DxrWlExtWindow *w, char *layout, size_t layout_
 			if (!w->present || (w->w * w->h == 0 && c.w * c.h > 0))
 				*w = c;
 		}
-		p = json_ws(obj_end, end);
+		p = dxr_json_ws(obj_end, end);
 		if (p < end && *p == ',')
 			p++;
 		else
@@ -333,16 +173,16 @@ filter(DxrDBusConnection *conn, DxrDBusMessage *msg, void *data)
 {
 	(void)conn;
 	(void)data;
-	if (s_dbus.is_signal(msg, DXR_EXT_GEOMETRY_IFACE, "WindowsChanged")) {
+	if (s_dbus->is_signal(msg, DXR_EXT_GEOMETRY_IFACE, "WindowsChanged")) {
 		DxrDBusError err;
-		s_dbus.error_init(&err);
+		s_dbus->error_init(&err);
 		const char *json = NULL;
-		if (s_dbus.get_args(msg, &err, DXR_DBUS_TYPE_STRING, &json, DXR_DBUS_TYPE_INVALID) && json) {
+		if (s_dbus->get_args(msg, &err, DXR_DBUS_TYPE_STRING, &json, DXR_DBUS_TYPE_INVALID) && json) {
 			free(s_latest_json);
 			s_latest_json = strdup(json);
 		}
-		s_dbus.error_free(&err);
-	} else if (s_dbus.is_signal(msg, "org.freedesktop.DBus", "NameOwnerChanged")) {
+		s_dbus->error_free(&err);
+	} else if (s_dbus->is_signal(msg, "org.freedesktop.DBus", "NameOwnerChanged")) {
 		s_owner_changed = 1;
 	}
 	return DXR_DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
@@ -353,7 +193,7 @@ filter(DxrDBusConnection *conn, DxrDBusMessage *msg, void *data)
 static DxrDBusMessage *
 call(const char *path, const char *iface, const char *method, int first_type, ...)
 {
-	DxrDBusMessage *msg = s_dbus.new_method_call(DXR_EXT_NAME, path, iface, method);
+	DxrDBusMessage *msg = s_dbus->new_method_call(DXR_EXT_NAME, path, iface, method);
 	if (!msg)
 		return NULL;
 	if (first_type != DXR_DBUS_TYPE_INVALID) {
@@ -368,19 +208,19 @@ call(const char *path, const char *iface, const char *method, int first_type, ..
 		void *a3 = t3 != DXR_DBUS_TYPE_INVALID ? va_arg(ap, void *) : NULL;
 		va_end(ap);
 		if (t3 != DXR_DBUS_TYPE_INVALID)
-			s_dbus.append_args(msg, t1, a1, t2, a2, t3, a3, DXR_DBUS_TYPE_INVALID);
+			s_dbus->append_args(msg, t1, a1, t2, a2, t3, a3, DXR_DBUS_TYPE_INVALID);
 		else if (t2 != DXR_DBUS_TYPE_INVALID)
-			s_dbus.append_args(msg, t1, a1, t2, a2, DXR_DBUS_TYPE_INVALID);
+			s_dbus->append_args(msg, t1, a1, t2, a2, DXR_DBUS_TYPE_INVALID);
 		else
-			s_dbus.append_args(msg, t1, a1, DXR_DBUS_TYPE_INVALID);
+			s_dbus->append_args(msg, t1, a1, DXR_DBUS_TYPE_INVALID);
 	}
 	DxrDBusError err;
-	s_dbus.error_init(&err);
-	DxrDBusMessage *reply = s_dbus.send_with_reply_and_block(s_dbus.conn, msg, 1000, &err);
-	s_dbus.unref(msg);
+	s_dbus->error_init(&err);
+	DxrDBusMessage *reply = s_dbus->send_with_reply_and_block(s_conn, msg, 1000, &err);
+	s_dbus->unref(msg);
 	if (!reply && s_available > 0)
 		fprintf(stderr, "[DisplayXR-WL] %s failed: %s\n", method, err.message ? err.message : "?");
-	s_dbus.error_free(&err);
+	s_dbus->error_free(&err);
 	return reply;
 }
 
@@ -390,11 +230,11 @@ reply_bool(DxrDBusMessage *reply)
 	if (!reply)
 		return 0;
 	DxrDBusError err;
-	s_dbus.error_init(&err);
+	s_dbus->error_init(&err);
 	uint32_t b = 0;
-	int ok = s_dbus.get_args(reply, &err, DXR_DBUS_TYPE_BOOLEAN, &b, DXR_DBUS_TYPE_INVALID) && b;
-	s_dbus.error_free(&err);
-	s_dbus.unref(reply);
+	int ok = s_dbus->get_args(reply, &err, DXR_DBUS_TYPE_BOOLEAN, &b, DXR_DBUS_TYPE_INVALID) && b;
+	s_dbus->error_free(&err);
+	s_dbus->unref(reply);
 	return ok;
 }
 
@@ -406,15 +246,15 @@ snapshot(int after_move, int moved)
 	if (!reply)
 		return;
 	DxrDBusError err;
-	s_dbus.error_init(&err);
+	s_dbus->error_init(&err);
 	const char *json = NULL;
-	if (s_dbus.get_args(reply, &err, DXR_DBUS_TYPE_STRING, &json, DXR_DBUS_TYPE_INVALID) && json) {
+	if (s_dbus->get_args(reply, &err, DXR_DBUS_TYPE_STRING, &json, DXR_DBUS_TYPE_INVALID) && json) {
 		DxrWlExtWindow w;
 		parse_snapshot(json, &w, s_layout, sizeof(s_layout));
 		s_cb->window(&w, after_move, moved);
 	}
-	s_dbus.error_free(&err);
-	s_dbus.unref(reply);
+	s_dbus->error_free(&err);
+	s_dbus->unref(reply);
 }
 
 //! The extension's bus name got (or lost) an owner, or we are just starting.
@@ -422,9 +262,9 @@ static void
 check_owner(void)
 {
 	DxrDBusError err;
-	s_dbus.error_init(&err);
-	int owned = s_dbus.name_has_owner(s_dbus.conn, DXR_EXT_NAME, &err) ? 1 : 0;
-	s_dbus.error_free(&err);
+	s_dbus->error_init(&err);
+	int owned = s_dbus->name_has_owner(s_conn, DXR_EXT_NAME, &err) ? 1 : 0;
+	s_dbus->error_free(&err);
 	if (owned == s_available)
 		return;
 	s_available = owned;
@@ -434,24 +274,24 @@ check_owner(void)
 		    call(DXR_EXT_PLACEMENT_PATH, DXR_EXT_PLACEMENT_IFACE, "GetPlacementCapabilities", DXR_DBUS_TYPE_INVALID);
 		if (reply) { // extension version 6+; older ones have no capabilities to offer
 			DxrDBusError e2;
-			s_dbus.error_init(&e2);
+			s_dbus->error_init(&e2);
 			uint32_t caps = 0;
-			if (s_dbus.get_args(reply, &e2, DXR_DBUS_TYPE_UINT32, &caps, DXR_DBUS_TYPE_INVALID))
+			if (s_dbus->get_args(reply, &e2, DXR_DBUS_TYPE_UINT32, &caps, DXR_DBUS_TYPE_INVALID))
 				s_caps = caps;
-			s_dbus.error_free(&e2);
-			s_dbus.unref(reply);
+			s_dbus->error_free(&e2);
+			s_dbus->unref(reply);
 		}
 		// The layout mode comes with the first snapshot; report it after that.
 		DxrDBusMessage *r2 = call(DXR_EXT_GEOMETRY_PATH, DXR_EXT_GEOMETRY_IFACE, "GetWindows", DXR_DBUS_TYPE_INVALID);
 		DxrWlExtWindow w = {0};
 		if (r2) {
 			DxrDBusError e3;
-			s_dbus.error_init(&e3);
+			s_dbus->error_init(&e3);
 			const char *json = NULL;
-			if (s_dbus.get_args(r2, &e3, DXR_DBUS_TYPE_STRING, &json, DXR_DBUS_TYPE_INVALID) && json)
+			if (s_dbus->get_args(r2, &e3, DXR_DBUS_TYPE_STRING, &json, DXR_DBUS_TYPE_INVALID) && json)
 				parse_snapshot(json, &w, s_layout, sizeof(s_layout));
-			s_dbus.error_free(&e3);
-			s_dbus.unref(r2);
+			s_dbus->error_free(&e3);
+			s_dbus->unref(r2);
 		}
 		fprintf(stderr, "[DisplayXR-WL] DisplayXR GNOME extension: available (capabilities 0x%x, layout %s)\n", s_caps,
 		        s_layout[0] ? s_layout : "not reported");
@@ -494,7 +334,7 @@ run_jobs(void)
 		DxrDBusMessage *r = call(DXR_EXT_PLACEMENT_PATH, DXR_EXT_PLACEMENT_IFACE, "EndPointerDrag",
 		                         DXR_DBUS_TYPE_UINT32, &pid, DXR_DBUS_TYPE_INVALID);
 		if (r)
-			s_dbus.unref(r);
+			s_dbus->unref(r);
 		snapshot(0, 0); // where the user left it
 	}
 	for (int i = 0; i < job.own_n; i++) {
@@ -531,12 +371,12 @@ run_jobs(void)
 		                                        : NULL;
 		if (reply) {
 			DxrDBusError err;
-			s_dbus.error_init(&err);
+			s_dbus->error_init(&err);
 			const char *json = NULL;
-			if (s_dbus.get_args(reply, &err, DXR_DBUS_TYPE_STRING, &json, DXR_DBUS_TYPE_INVALID) && json)
+			if (s_dbus->get_args(reply, &err, DXR_DBUS_TYPE_STRING, &json, DXR_DBUS_TYPE_INVALID) && json)
 				parse_snapshot(json, &w, s_layout, sizeof(s_layout));
-			s_dbus.error_free(&err);
-			s_dbus.unref(reply);
+			s_dbus->error_free(&err);
+			s_dbus->unref(reply);
 		}
 		s_cb->verify(&w);
 	}
@@ -560,22 +400,22 @@ static int
 connect_bus(void)
 {
 	DxrDBusError err;
-	s_dbus.error_init(&err);
-	s_dbus.conn = s_dbus.bus_get_private(DXR_DBUS_BUS_SESSION, &err);
-	if (!s_dbus.conn) {
+	s_dbus->error_init(&err);
+	s_conn = s_dbus->bus_get_private(DXR_DBUS_BUS_SESSION, &err);
+	if (!s_conn) {
 		fprintf(stderr, "[DisplayXR-WL] session bus unavailable: %s\n", err.message ? err.message : "?");
-		s_dbus.error_free(&err);
+		s_dbus->error_free(&err);
 		return 0;
 	}
 	// A bus connection _exit()s the process when the bus goes away, by default.
-	s_dbus.set_exit_on_disconnect(s_dbus.conn, 0);
-	s_dbus.add_filter(s_dbus.conn, filter, NULL, NULL);
-	s_dbus.add_match(s_dbus.conn,
-	                 "type='signal',sender='org.freedesktop.DBus',interface='org.freedesktop.DBus',"
-	                 "member='NameOwnerChanged',arg0='" DXR_EXT_NAME "'",
-	                 &err);
-	s_dbus.add_match(s_dbus.conn, "type='signal',interface='" DXR_EXT_GEOMETRY_IFACE "',member='WindowsChanged'", &err);
-	s_dbus.error_free(&err);
+	s_dbus->set_exit_on_disconnect(s_conn, 0);
+	s_dbus->add_filter(s_conn, filter, NULL, NULL);
+	s_dbus->add_match(s_conn,
+	                  "type='signal',sender='org.freedesktop.DBus',interface='org.freedesktop.DBus',"
+	                  "member='NameOwnerChanged',arg0='" DXR_EXT_NAME "'",
+	                  &err);
+	s_dbus->add_match(s_conn, "type='signal',interface='" DXR_EXT_GEOMETRY_IFACE "',member='WindowsChanged'", &err);
+	s_dbus->error_free(&err);
 	return 1;
 }
 
@@ -596,12 +436,12 @@ worker(void *arg)
 		}
 	}
 	int fd = -1;
-	s_dbus.get_unix_fd(s_dbus.conn, &fd);
+	s_dbus->get_unix_fd(s_conn, &fd);
 	check_owner();
 	for (;;) {
 		// Everything already read must be dispatched before waiting on the socket
 		// again (a blocking call can leave messages queued).
-		while (s_dbus.dispatch(s_dbus.conn) == DXR_DBUS_DISPATCH_DATA_REMAINS) {
+		while (s_dbus->dispatch(s_conn) == DXR_DBUS_DISPATCH_DATA_REMAINS) {
 		}
 		if (s_owner_changed) {
 			s_owner_changed = 0;
@@ -617,7 +457,7 @@ worker(void *arg)
 				s_cb->window(&w, 0, 0);
 		}
 		run_jobs();
-		while (s_dbus.dispatch(s_dbus.conn) == DXR_DBUS_DISPATCH_DATA_REMAINS) {
+		while (s_dbus->dispatch(s_conn) == DXR_DBUS_DISPATCH_DATA_REMAINS) {
 		}
 		if (s_owner_changed || s_latest_json)
 			continue;
@@ -629,7 +469,7 @@ worker(void *arg)
 				}
 			}
 			if (p[0].revents)
-				s_dbus.read_write(s_dbus.conn, 0);
+				s_dbus->read_write(s_conn, 0);
 		}
 	}
 	return NULL;

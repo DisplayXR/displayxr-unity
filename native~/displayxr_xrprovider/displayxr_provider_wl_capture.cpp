@@ -531,6 +531,12 @@ dxr_wl_capture_wanted(void)
 	return started_with_force_wayland() && !(off && !strcmp(off, "1"));
 }
 
+extern "C" int
+dxr_wl_forced_wayland(void)
+{
+	return started_with_force_wayland() ? 1 : 0;
+}
+
 //! The loader's default explicit-layer folders: VK_LAYER_PATH REPLACES them, so
 //! they go after ours, or an explicit layer Unity asks for (validation) would
 //! not be found while we are armed.
@@ -753,6 +759,12 @@ dxr_wl_capture_disarm(const char *why)
 
 extern "C" int
 dxr_wl_capture_wanted(void)
+{
+	return 0;
+}
+
+extern "C" int
+dxr_wl_forced_wayland(void)
 {
 	return 0;
 }
