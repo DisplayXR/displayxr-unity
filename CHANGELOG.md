@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.30.0] - 2026-10-22
+
+Desktop control for the app's agent, continued: `XR_DXR_desktop_control` spec v3 (held keys and buttons, modifiers, the shell target, clipboard text; DisplayXR/displayxr-runtime#2271), blocking screen capture from any thread (#387), and read-only Linux desktop info (monitors and X root scale always; windows, window at a point and pointer only while desktop control is granted).
+
 ### Added
 - **Blocking screen capture that works from any thread, the main thread included.** `DisplayXRDesktop.CaptureBlocking(RectInt desktopRect, int maxWidth, int maxHeight, int timeoutMs = 5000)`, `CaptureDesktopBlocking(maxWidth, maxHeight, timeoutMs)` and `CaptureWindowBlocking(windowId, maxWidth, maxHeight, timeoutMs)` return the `DesktopCaptureResult` directly. The async captures complete in the provider driver's `LateUpdate`, so main-thread code could not wait for one: blocking would deadlock. The blocking calls poll the runtime for the completion themselves while they wait and fetch the image on the calling thread, with one copy. They never prompt and never fall back to a screenshot portal.
   - `maxWidth` / `maxHeight` have no default: on the main thread the frame stalls for the whole capture plus the copy, so pass what the consumer needs (an agent: at most 1920 x 1080).
