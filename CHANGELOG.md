@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Blocking screen capture that works from any thread, the main thread included.** `DisplayXRDesktop.CaptureBlocking(RectInt desktopRect, int maxWidth, int maxHeight, int timeoutMs = 5000)`, `CaptureDesktopBlocking(maxWidth, maxHeight, timeoutMs)` and `CaptureWindowBlocking(windowId, maxWidth, maxHeight, timeoutMs)` return the `DesktopCaptureResult` directly. The async captures complete in the provider driver's `LateUpdate`, so main-thread code could not wait for one: blocking would deadlock. The blocking calls poll the runtime for the completion themselves while they wait and fetch the image on the calling thread, with one copy. They never prompt and never fall back to a screenshot portal.
+  - `maxWidth` / `maxHeight` have no default: on the main thread the frame stalls for the whole capture plus the copy, so pass what the consumer needs (an agent: at most 1920 x 1080).
+  - The runtime's limits are unchanged. A second capture while one is in flight, async or blocking, from any thread, fails at once with `XR_ERROR_LIMIT_REACHED`, and captures still start at least 250 ms apart. A session that ends during the wait fails it with "session ended". New status `DesktopActionStatus.TimedOut`; new constants `DefaultCaptureTimeoutMs` (5000) and `MaxCaptureTimeoutMs` (60000).
+  - The async API (`CaptureAsync` and siblings) is unchanged.
+  - Native: `dxr_prov_desktop_capture_waitable`, `dxr_prov_desktop_capture_wait`, `dxr_prov_desktop_capture_abandon`. Unit tests cover the waiter across threads, the waiter's own poll, a completion that arrives before the start returns, timeout and abandon, `LIMIT_REACHED`, and session teardown during a wait.
+
+### Changed
+- **Every `xrPollEvent` call now goes through one lock (all platforms).** A thread waiting on a blocking capture polls the runtime's event queue itself. It handles desktop-control events and hands every other event back, in order, to the regular poller (the graphics thread on Windows and Linux, the main thread on macOS), which dispatches it before it polls again. Session-state, rendering-mode and MCP events are therefore still handled on the same thread as before, and no later. Without a blocking capture the lock is never contended. On macOS only the main thread may poll (the runtime's poll drives AppKit), so a worker thread there waits for the main thread's own poll.
+
 ## [2.29.0] - 2026-10-21
 
 Screen capture binding for `XR_DXR_desktop_control` spec v2 (#387): `RequestAccess` with the Capture scope, `CaptureAsync` / `CaptureDesktopAsync` / `CaptureWindowAsync`, `CaptureState`, and the Linux consent dialog parented to the app's window. Plus the Linux window-handle follow-ups (#386).

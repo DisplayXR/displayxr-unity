@@ -9,7 +9,12 @@
 // scope / parent-window chain (parent passed verbatim, spaces included), every
 // capture field marshalled, the two-call image fetch, capture events, and a v1
 // runtime (or missing capture entry points) leaving v1 untouched and capture
-// reporting E_NO_CAPTURE. No Unity, no real runtime.
+// reporting E_NO_CAPTURE. Waitable captures (any thread may block on one): the
+// completion reaches its waiter through another thread or through the waiter's own
+// pump (Unity's main thread), never C#'s queue; a completion routed before the
+// start filed its id is taken back; timeout, abandon, LIMIT_REACHED at once, session
+// teardown mid-wait, a session restart, and the bounded waiter table. No Unity, no
+// real runtime.
 //
 //   c++ -std=c++17 -I native~/displayxr_xrprovider -I <openxr include>
 //       native~/tests/desktop_test.cpp native~/displayxr_xrprovider/displayxr_provider_desktop.cpp
@@ -20,7 +25,12 @@
 
 #include <stdio.h>
 #include <string.h>
+#include <atomic>
+#include <chrono>
+#include <deque>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 static int g_fail = 0;
@@ -68,7 +78,17 @@ struct Fake
 	bool last_text_null = true, last_keys_null = true;
 	uint64_t next_id = 1000;
 	int calls = 0;
+	// Waitable captures: f_capture routes its own completion before it returns the id
+	// (what a poll on another thread can do), and checks C# cannot drain it meanwhile.
+	bool capture_completes_inline = false;
+	int inline_next_event = -1;
 } F;
+
+// The runtime's event queue as a waiter's pump sees it (popped on the WAITING thread).
+static std::mutex g_rt_mx;
+static std::deque<XrEventDataBuffer> g_rt_queue;
+static std::atomic<int> g_pump_calls{0}, g_pump_deferred{0};
+static std::atomic<bool> g_pump_refuses{false}; // another thread polls / macOS worker: no pump
 
 static XrResult XRAPI_CALL
 f_get_state(XrSession s, XrDesktopControlStateDXR *st, XrDesktopControlCapabilityFlagsDXR *caps)
@@ -186,6 +206,22 @@ f_capture_state(XrSession s, XrDesktopControlStateDXR *st)
 	*st = F.capture_state;
 	return XR_SUCCESS;
 }
+static XrEventDataBuffer
+capture_completed(XrSession s, uint64_t id, XrResult r, uint32_t w, uint32_t h)
+{
+	XrEventDataBuffer raw = {XR_TYPE_EVENT_DATA_BUFFER};
+	XrEventDataDesktopCaptureCompletedDXR *cc = (XrEventDataDesktopCaptureCompletedDXR *)&raw;
+	cc->type = XR_TYPE_EVENT_DATA_DESKTOP_CAPTURE_COMPLETED_DXR;
+	cc->session = s;
+	cc->captureId = id;
+	cc->result = r;
+	cc->width = w;
+	cc->height = h;
+	cc->sourceRect = {{10, 20}, {(int32_t)w * 2, (int32_t)h * 2}};
+	cc->frameTime = 777;
+	strncpy(cc->message, r == XR_SUCCESS ? "ok" : "no", sizeof(cc->message) - 1);
+	return raw;
+}
 static XrResult XRAPI_CALL
 f_capture(XrSession s, const XrDesktopCaptureInfoDXR *info, uint64_t *id)
 {
@@ -196,6 +232,12 @@ f_capture(XrSession s, const XrDesktopCaptureInfoDXR *info, uint64_t *id)
 	if (info->maxWidth == 0 || info->maxWidth > 8192) return XR_ERROR_VALIDATION_FAILURE;
 	F.last_capture = *info;
 	*id = F.next_id++;
+	if (F.capture_completes_inline) {
+		XrEventDataBuffer raw = capture_completed(s, *id, XR_SUCCESS, 4, 3);
+		dxr_desktop_handle_event(&raw); // a poll on another thread got it already
+		DxrDesktopEvent e;
+		F.inline_next_event = dxr_prov_desktop_next_event(&e); // C#'s Pump right then
+	}
 	return XR_SUCCESS;
 }
 static XrResult XRAPI_CALL
@@ -232,6 +274,41 @@ f_gipa(XrInstance, const char *name, PFN_xrVoidFunction *fn)
 static void
 quiet(const char *, ...)
 {}
+
+// What the session module's pump does: drain the runtime's queue on THIS thread,
+// desktop events through the binding, everything else held back for the poller.
+static int
+fake_pump(void)
+{
+	g_pump_calls++;
+	if (g_pump_refuses) return 0;
+	int n = 0;
+	for (;;) {
+		XrEventDataBuffer ev;
+		{
+			std::lock_guard<std::mutex> lk(g_rt_mx);
+			if (g_rt_queue.empty()) break;
+			ev = g_rt_queue.front();
+			g_rt_queue.pop_front();
+		}
+		n++;
+		if (!dxr_desktop_handle_event(&ev)) g_pump_deferred++;
+	}
+	return n;
+}
+
+static void
+rt_push(const XrEventDataBuffer &ev)
+{
+	std::lock_guard<std::mutex> lk(g_rt_mx);
+	g_rt_queue.push_back(ev);
+}
+
+static long
+ms_since(std::chrono::steady_clock::time_point t0)
+{
+	return (long)std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count();
+}
 
 static const uint8_t *
 u8(const char *s)
@@ -710,6 +787,192 @@ main()
 	dxr_desktop_on_session_destroying();
 	CHECK(dxr_prov_desktop_capture_available() == 0);
 	CHECK(dxr_prov_desktop_get_capture_state(&st) == DXR_DESKTOP_E_NO_SESSION && st == 0);
+
+	// ================================================================ waitable captures
+
+	using clk = std::chrono::steady_clock;
+	uint64_t wid = 0;
+	CHECK(dxr_prov_desktop_capture_waitable(&ci, &wid) == DXR_DESKTOP_E_NO_SESSION && wid == 0);
+	CHECK(dxr_prov_desktop_capture_waitable(nullptr, &wid) == DXR_DESKTOP_E_BAD_ARGUMENT);
+	CHECK(dxr_prov_desktop_capture_wait(1, 0, nullptr) == DXR_DESKTOP_E_BAD_ARGUMENT);
+	CHECK(dxr_prov_desktop_capture_wait(424242, 0, &ev) == DXR_DESKTOP_E_BAD_ARGUMENT);
+	dxr_prov_desktop_capture_abandon(424242); // unknown: no-op
+
+	// A spec v1 runtime: no capture, waitable or not.
+	dxr_desktop_on_instance(inst, f_gipa, 1, quiet);
+	dxr_desktop_on_session_created(s1);
+	CHECK(dxr_prov_desktop_capture_waitable(&ci, &wid) == DXR_DESKTOP_E_NO_CAPTURE && wid == 0);
+	dxr_desktop_on_session_destroying();
+
+	dxr_desktop_on_instance(inst, f_gipa, 2, quiet);
+	dxr_desktop_on_session_created(s1);
+	dxr_desktop_set_waiter_pump(fake_pump);
+
+	// --- The main-thread case: nobody else polls; the waiter's own pump takes the
+	// completion off the runtime's queue. Events that are not desktop control are held
+	// back for the regular poller; nothing reaches C#'s queue.
+	CHECK(dxr_prov_desktop_capture_waitable(&ci, &wid) == XR_SUCCESS && wid != 0);
+	CHECK(F.last_capture.maxWidth == 512 && F.last_capture.target == XR_DESKTOP_CAPTURE_TARGET_REGION_DXR);
+	CHECK(dxr_prov_desktop_capture_wait(wid, 0, &ev) == 0); // in flight
+	{
+		XrEventDataBuffer other = {XR_TYPE_EVENT_DATA_BUFFER};
+		other.type = XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED;
+		rt_push(other);
+		rt_push(capture_completed(s1, wid, XR_SUCCESS, 6, 5));
+	}
+	g_pump_deferred = 0;
+	clk::time_point t0 = clk::now();
+	CHECK(dxr_prov_desktop_capture_wait(wid, 2000, &ev) == 1);
+	CHECK(ms_since(t0) < 500);
+	CHECK(ev.kind == DXR_DESKTOP_EVENT_CAPTURE_COMPLETED && ev.action_id == wid && ev.result == XR_SUCCESS);
+	CHECK(ev.width == 6 && ev.height == 5 && ev.src_x == 10 && ev.src_width == 12 && ev.frame_time == 777);
+	CHECK(str(ev.message) == "ok");
+	CHECK(g_pump_deferred == 1);
+	CHECK(dxr_prov_desktop_next_event(&ev) == 0);
+	CHECK(dxr_prov_desktop_capture_wait(wid, 0, &ev) == DXR_DESKTOP_E_BAD_ARGUMENT); // collected: forgotten
+
+	// --- A worker thread: the regular poller (another thread) routes the completion and
+	// wakes the waiter; its own pump gets nothing.
+	g_pump_refuses = true;
+	CHECK(dxr_prov_desktop_capture_waitable(&ci, &wid) == XR_SUCCESS);
+	{
+		uint64_t want = wid;
+		std::thread poller([&] {
+			std::this_thread::sleep_for(std::chrono::milliseconds(60));
+			XrEventDataBuffer done = capture_completed(s1, want, XR_ERROR_DESKTOP_CONTROL_REFUSED_DXR, 0, 0);
+			dxr_desktop_handle_event(&done);
+		});
+		int pumps0 = g_pump_calls;
+		t0 = clk::now();
+		int w1 = dxr_prov_desktop_capture_wait(wid, 3000, &ev);
+		long took = ms_since(t0);
+		poller.join();
+		CHECK(w1 == 1 && ev.result == XR_ERROR_DESKTOP_CONTROL_REFUSED_DXR && str(ev.message) == "no");
+		CHECK(took >= 50 && took < 1500);
+		CHECK(g_pump_calls > pumps0); // it kept trying its own poll meanwhile (no busy loop: sliced)
+		CHECK(g_pump_calls - pumps0 < 200);
+	}
+	g_pump_refuses = false;
+
+	// --- An async capture still completes through C#'s queue, next to a waiter.
+	uint64_t aid = 0;
+	CHECK(dxr_prov_desktop_capture(&ci, &aid) == XR_SUCCESS && aid != 0);
+	CHECK(dxr_prov_desktop_capture_waitable(&ci, &wid) == XR_SUCCESS && wid != aid);
+	{
+		XrEventDataBuffer a1 = capture_completed(s1, aid, XR_SUCCESS, 1, 1);
+		XrEventDataBuffer w2 = capture_completed(s1, wid, XR_SUCCESS, 2, 2);
+		CHECK(dxr_desktop_handle_event(&a1) == 1 && dxr_desktop_handle_event(&w2) == 1);
+	}
+	CHECK(dxr_prov_desktop_next_event(&ev) == 1 && ev.action_id == aid);
+	CHECK(dxr_prov_desktop_next_event(&ev) == 0);
+	CHECK(dxr_prov_desktop_capture_wait(wid, 0, &ev) == 1 && ev.width == 2);
+
+	// --- The completion is routed before the start filed the id (the runtime finished and
+	// another thread polled in between): C#'s Pump cannot take it meanwhile, and the
+	// waiter gets it back.
+	F.capture_completes_inline = true;
+	F.inline_next_event = -1;
+	CHECK(dxr_prov_desktop_capture_waitable(&ci, &wid) == XR_SUCCESS);
+	F.capture_completes_inline = false;
+	CHECK(F.inline_next_event == 0);
+	CHECK(dxr_prov_desktop_next_event(&ev) == 0);
+	CHECK(dxr_prov_desktop_capture_wait(wid, 0, &ev) == 1 && ev.action_id == wid && ev.width == 4);
+
+	// --- One in flight / not granted: refused at once, nothing to wait for.
+	F.force = XR_ERROR_LIMIT_REACHED;
+	t0 = clk::now();
+	CHECK(dxr_prov_desktop_capture_waitable(&ci, &wid) == XR_ERROR_LIMIT_REACHED && wid == 0);
+	CHECK(ms_since(t0) < 50);
+	F.force = XR_ERROR_DESKTOP_CONTROL_NOT_GRANTED_DXR;
+	CHECK(dxr_prov_desktop_capture_waitable(&ci, &wid) == XR_ERROR_DESKTOP_CONTROL_NOT_GRANTED_DXR && wid == 0);
+	F.force = XR_SUCCESS;
+	DxrDesktopCaptureInfo bad0 = ci;
+	bad0.max_width = 0;
+	CHECK(dxr_prov_desktop_capture_waitable(&bad0, &wid) == XR_ERROR_VALIDATION_FAILURE && wid == 0);
+
+	// --- Timeout, then abandon: the late completion is dropped, never queued for C#.
+	CHECK(dxr_prov_desktop_capture_waitable(&ci, &wid) == XR_SUCCESS);
+	t0 = clk::now();
+	CHECK(dxr_prov_desktop_capture_wait(wid, 80, &ev) == 0);
+	long tw = ms_since(t0);
+	CHECK(tw >= 75 && tw < 1000);
+	dxr_prov_desktop_capture_abandon(wid);
+	CHECK(dxr_prov_desktop_capture_wait(wid, 0, &ev) == DXR_DESKTOP_E_BAD_ARGUMENT);
+	rt_push(capture_completed(s1, wid, XR_SUCCESS, 9, 9));
+	CHECK(fake_pump() == 1);
+	CHECK(dxr_prov_desktop_next_event(&ev) == 0);
+	// Abandoned after its completion came: forgotten at once.
+	CHECK(dxr_prov_desktop_capture_waitable(&ci, &wid) == XR_SUCCESS);
+	rt_push(capture_completed(s1, wid, XR_SUCCESS, 9, 9));
+	fake_pump();
+	dxr_prov_desktop_capture_abandon(wid);
+	CHECK(dxr_prov_desktop_capture_wait(wid, 0, &ev) == DXR_DESKTOP_E_BAD_ARGUMENT);
+	CHECK(dxr_prov_desktop_next_event(&ev) == 0);
+
+	// --- The table stays bounded: many given up on before their completion.
+	for (int i = 0; i < 40; i++) {
+		CHECK(dxr_prov_desktop_capture_waitable(&ci, &wid) == XR_SUCCESS);
+		dxr_prov_desktop_capture_abandon(wid);
+	}
+	CHECK(dxr_prov_desktop_capture_waitable(&ci, &wid) == XR_SUCCESS);
+	CHECK(dxr_prov_desktop_capture_wait(wid, 0, &ev) == 0); // the live one survives
+	rt_push(capture_completed(s1, wid, XR_SUCCESS, 3, 3));
+	CHECK(dxr_prov_desktop_capture_wait(wid, 1000, &ev) == 1 && ev.width == 3);
+
+	// --- Session teardown while a thread waits: it returns NO_SESSION promptly. A capture
+	// that had completed stays collectable.
+	uint64_t done_id = 0;
+	CHECK(dxr_prov_desktop_capture_waitable(&ci, &done_id) == XR_SUCCESS);
+	rt_push(capture_completed(s1, done_id, XR_SUCCESS, 5, 5));
+	fake_pump();
+	g_pump_refuses = true;
+	CHECK(dxr_prov_desktop_capture_waitable(&ci, &wid) == XR_SUCCESS);
+	{
+		std::atomic<int> wr{99};
+		std::atomic<long> wt{0};
+		uint64_t want = wid;
+		std::thread waiter([&] {
+			DxrDesktopEvent e2;
+			clk::time_point a = clk::now();
+			wr = dxr_prov_desktop_capture_wait(want, 5000, &e2);
+			wt = ms_since(a);
+		});
+		std::this_thread::sleep_for(std::chrono::milliseconds(60));
+		dxr_desktop_on_session_destroying();
+		waiter.join();
+		CHECK(wr == DXR_DESKTOP_E_NO_SESSION);
+		CHECK(wt >= 50 && wt < 1000);
+	}
+	g_pump_refuses = false;
+	CHECK(dxr_prov_desktop_capture_wait(wid, 0, &ev) == DXR_DESKTOP_E_BAD_ARGUMENT); // forgotten
+	CHECK(dxr_prov_desktop_capture_wait(done_id, 0, &ev) == 1 && ev.width == 5);
+	CHECK(dxr_prov_desktop_capture_waitable(&ci, &wid) == DXR_DESKTOP_E_NO_SESSION);
+	// A waiter that was not waiting at teardown learns it on its next wait; a new session
+	// forgets the old one's entirely; a stale completion is dropped.
+	dxr_desktop_on_session_created(s2);
+	CHECK(dxr_prov_desktop_capture_waitable(&ci, &wid) == XR_SUCCESS);
+	dxr_desktop_on_session_destroying();
+	CHECK(dxr_prov_desktop_capture_wait(wid, 0, &ev) == DXR_DESKTOP_E_NO_SESSION);
+	dxr_desktop_on_session_created(s1);
+	CHECK(dxr_prov_desktop_capture_waitable(&ci, &wid) == XR_SUCCESS);
+	uint64_t old_session_id = wid;
+	dxr_desktop_on_session_destroying();
+	dxr_desktop_on_session_created(s2);
+	CHECK(dxr_prov_desktop_capture_wait(old_session_id, 0, &ev) == DXR_DESKTOP_E_BAD_ARGUMENT);
+	{
+		XrEventDataBuffer stale = capture_completed(s1, old_session_id, XR_SUCCESS, 1, 1);
+		CHECK(dxr_desktop_handle_event(&stale) == 1);
+	}
+	CHECK(dxr_prov_desktop_next_event(&ev) == 0);
+	// No pump at all (none registered): a waiter still gets what another thread routes.
+	dxr_desktop_set_waiter_pump(nullptr);
+	CHECK(dxr_prov_desktop_capture_waitable(&ci, &wid) == XR_SUCCESS);
+	{
+		XrEventDataBuffer d = capture_completed(s2, wid, XR_SUCCESS, 7, 7);
+		CHECK(dxr_desktop_handle_event(&d) == 1);
+	}
+	CHECK(dxr_prov_desktop_capture_wait(wid, 100, &ev) == 1 && ev.width == 7);
+	dxr_desktop_on_session_destroying();
 
 	if (g_fail) {
 		fprintf(stderr, "%d of %d check(s) failed\n", g_fail, g_checks);

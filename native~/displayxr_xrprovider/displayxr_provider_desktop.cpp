@@ -6,6 +6,8 @@
 #include "displayxr_provider_desktop.h"
 #include "../displayxr_extensions.h"
 
+#include <chrono>
+#include <condition_variable>
 #include <deque>
 #include <mutex>
 #include <vector>
@@ -41,8 +43,9 @@ namespace {
 //              create/destroy, so a pass-through never runs against a session that
 //              is being destroyed. Runtime calls here never wait on actions, so the
 //              hold is short (text-at: tens of ms at worst).
-//  g_mx      — the event queue + session handle; taken by the poll thread. Never
-//              held across a runtime call.
+//  g_mx      — the event queue + session handle + waitable captures; taken by
+//              the poll thread and by waiting threads. Never held across a runtime
+//              call or a pump (the pump takes g_mx itself, through handle_event).
 std::mutex g_call_mx;
 std::mutex g_mx;
 
@@ -71,6 +74,28 @@ PFN_xrSubmitDesktopActionDXR pfn_submit = nullptr;
 PFN_xrGetDesktopCaptureStateDXR pfn_capture_state = nullptr;
 PFN_xrCaptureDesktopDXR pfn_capture = nullptr;
 PFN_xrGetDesktopCaptureImageDXR pfn_capture_image = nullptr;
+
+// Waitable captures (dxr_prov_desktop_capture_waitable), under g_mx. The runtime has
+// at most one capture in flight per session, so this holds one live entry plus, at
+// worst, a few given up on whose completion has not come yet.
+struct Waiter
+{
+	uint64_t id;
+	bool done;      // ev holds the completion
+	bool ended;     // the session ended first: it never completes
+	bool abandoned; // nobody waits any more: drop the completion
+	DxrDesktopEvent ev;
+};
+std::vector<Waiter> g_waiters;
+constexpr size_t kMaxWaiters = 16;
+// A waitable start is between its runtime call and filing the id it got: its
+// completion may already sit in g_queue, so next_event must not hand that out yet.
+int g_claiming = 0;
+std::condition_variable g_cv;      // with g_mx: a waiter's entry changed
+DxrDesktopPumpFn g_pump = nullptr; // the session module's poll-on-this-thread
+// How long a waiting thread sleeps between its own polls. A completion another
+// thread routes wakes it at once.
+constexpr int kPumpSliceMs = 4;
 
 #define DESK_LOG(...)                                                                                                  \
 	do {                                                                                                               \
@@ -149,6 +174,42 @@ capture_session_for_call(XrSession *s)
 	if (r != 0) return r;
 	std::lock_guard<std::mutex> lk(g_mx);
 	return g_capture ? 0 : DXR_DESKTOP_E_NO_CAPTURE;
+}
+
+// g_mx held. Pointers are valid until g_waiters changes.
+Waiter *
+find_waiter(uint64_t id)
+{
+	for (Waiter &w : g_waiters)
+		if (w.id == id) return &w;
+	return nullptr;
+}
+
+// g_mx held.
+void
+erase_waiter(uint64_t id)
+{
+	for (auto it = g_waiters.begin(); it != g_waiters.end(); ++it) {
+		if (it->id == id) {
+			g_waiters.erase(it);
+			return;
+		}
+	}
+}
+
+void
+to_capture_info(const DxrDesktopCaptureInfo *info, XrDesktopCaptureInfoDXR *ci)
+{
+	memset(ci, 0, sizeof(*ci));
+	ci->type = XR_TYPE_DESKTOP_CAPTURE_INFO_DXR;
+	ci->target = (XrDesktopCaptureTargetDXR)info->target;
+	ci->windowId = info->window_id;
+	ci->region.offset.x = info->x;
+	ci->region.offset.y = info->y;
+	ci->region.extent.width = info->width;
+	ci->region.extent.height = info->height;
+	ci->maxWidth = info->max_width;
+	ci->maxHeight = info->max_height;
 }
 
 const char *
@@ -232,7 +293,9 @@ dxr_desktop_on_session_created(XrSession session)
 	std::lock_guard<std::mutex> lk(g_mx);
 	g_session = session;
 	g_queue.clear();
+	g_waiters.clear(); // all of an older session (ended there; their threads saw that)
 	g_generation++;
+	g_cv.notify_all();
 }
 
 void
@@ -243,7 +306,24 @@ dxr_desktop_on_session_destroying(void)
 	std::lock_guard<std::mutex> lk(g_mx);
 	g_session = XR_NULL_HANDLE;
 	g_queue.clear();
+	// The runtime drops a capture in flight without an event: wake its waiter now.
+	for (auto it = g_waiters.begin(); it != g_waiters.end();) {
+		if (it->abandoned) {
+			it = g_waiters.erase(it);
+		} else {
+			if (!it->done) it->ended = true;
+			++it;
+		}
+	}
 	g_generation++;
+	g_cv.notify_all();
+}
+
+void
+dxr_desktop_set_waiter_pump(DxrDesktopPumpFn pump)
+{
+	std::lock_guard<std::mutex> lk(g_mx);
+	g_pump = pump;
 }
 
 int
@@ -292,6 +372,20 @@ dxr_desktop_handle_event(const XrEventDataBuffer *ev)
 
 	std::lock_guard<std::mutex> lk(g_mx);
 	if (g_session == XR_NULL_HANDLE || from != g_session) return 1; // stale session
+	if (e.kind == DXR_DESKTOP_EVENT_CAPTURE_COMPLETED) {
+		// A waitable capture's completion goes to its waiter, never to C#'s queue.
+		Waiter *w = find_waiter(e.action_id);
+		if (w != nullptr) {
+			if (w->abandoned) {
+				erase_waiter(e.action_id);
+			} else {
+				w->done = true;
+				w->ev = e;
+				g_cv.notify_all();
+			}
+			return 1;
+		}
+	}
 	if (e.kind == DXR_DESKTOP_EVENT_STATE_CHANGED || e.kind == DXR_DESKTOP_EVENT_CAPTURE_STATE_CHANGED) {
 		// Only the latest consent state matters: keep at most one queued per scope, at the tail.
 		for (auto it = g_queue.begin(); it != g_queue.end(); ++it) {
@@ -426,17 +520,111 @@ dxr_prov_desktop_capture(const DxrDesktopCaptureInfo *info, uint64_t *capture_id
 	int r = capture_session_for_call(&s);
 	if (r != 0) return r;
 	XrDesktopCaptureInfoDXR ci;
-	memset(&ci, 0, sizeof(ci));
-	ci.type = XR_TYPE_DESKTOP_CAPTURE_INFO_DXR;
-	ci.target = (XrDesktopCaptureTargetDXR)info->target;
-	ci.windowId = info->window_id;
-	ci.region.offset.x = info->x;
-	ci.region.offset.y = info->y;
-	ci.region.extent.width = info->width;
-	ci.region.extent.height = info->height;
-	ci.maxWidth = info->max_width;
-	ci.maxHeight = info->max_height;
+	to_capture_info(info, &ci);
 	return (int)pfn_capture(s, &ci, capture_id);
+}
+
+int
+dxr_prov_desktop_capture_waitable(const DxrDesktopCaptureInfo *info, uint64_t *capture_id)
+{
+	if (!info || !capture_id) return DXR_DESKTOP_E_BAD_ARGUMENT;
+	*capture_id = 0;
+	std::lock_guard<std::mutex> clk(g_call_mx);
+	XrSession s;
+	int r = capture_session_for_call(&s);
+	if (r != 0) return r;
+	XrDesktopCaptureInfoDXR ci;
+	to_capture_info(info, &ci);
+	{
+		std::lock_guard<std::mutex> lk(g_mx);
+		g_claiming = 1;
+	}
+	uint64_t id = 0;
+	XrResult xr = pfn_capture(s, &ci, &id);
+
+	std::lock_guard<std::mutex> lk(g_mx);
+	g_claiming = 0;
+	if (XR_SUCCEEDED(xr) && id != 0) {
+		if (g_waiters.size() >= kMaxWaiters) {
+			// Full of entries nobody collected (a thread that died mid-wait): drop the
+			// oldest one nobody can be waiting for, else the oldest.
+			auto victim = g_waiters.begin();
+			for (auto it = g_waiters.begin(); it != g_waiters.end(); ++it) {
+				if (it->abandoned || it->ended) {
+					victim = it;
+					break;
+				}
+			}
+			g_waiters.erase(victim);
+		}
+		Waiter w = {};
+		w.id = id;
+		// The runtime may have finished, and a poll queued the completion for C#,
+		// before this line: take it back.
+		for (auto it = g_queue.begin(); it != g_queue.end(); ++it) {
+			if (it->kind == DXR_DESKTOP_EVENT_CAPTURE_COMPLETED && it->action_id == id) {
+				w.done = true;
+				w.ev = *it;
+				g_queue.erase(it);
+				break;
+			}
+		}
+		g_waiters.push_back(w);
+		*capture_id = id;
+	}
+	return (int)xr;
+}
+
+int
+dxr_prov_desktop_capture_wait(uint64_t capture_id, uint32_t timeout_ms, DxrDesktopEvent *ev)
+{
+	if (!ev) return DXR_DESKTOP_E_BAD_ARGUMENT;
+	memset(ev, 0, sizeof(*ev));
+	using clock = std::chrono::steady_clock;
+	const clock::time_point deadline = clock::now() + std::chrono::milliseconds(timeout_ms);
+	std::unique_lock<std::mutex> lk(g_mx);
+	bool pumped = false;
+	for (;;) {
+		Waiter *w = find_waiter(capture_id);
+		if (w == nullptr || w->abandoned) return DXR_DESKTOP_E_BAD_ARGUMENT;
+		if (w->done) {
+			*ev = w->ev;
+			erase_waiter(capture_id);
+			return 1;
+		}
+		if (w->ended) {
+			erase_waiter(capture_id);
+			return DXR_DESKTOP_E_NO_SESSION;
+		}
+		// Take the completion off the runtime's queue on this thread: the thread that
+		// normally polls may be the one blocked here (see the header). Once per slice.
+		DxrDesktopPumpFn pump = g_pump;
+		if (!pumped && pump != nullptr) {
+			pumped = true;
+			lk.unlock();
+			pump();
+			lk.lock();
+			continue;
+		}
+		const clock::time_point now = clock::now();
+		if (now >= deadline) return 0;
+		const clock::time_point slice = now + std::chrono::milliseconds(kPumpSliceMs);
+		g_cv.wait_until(lk, slice < deadline ? slice : deadline);
+		pumped = false;
+	}
+}
+
+void
+dxr_prov_desktop_capture_abandon(uint64_t capture_id)
+{
+	std::lock_guard<std::mutex> lk(g_mx);
+	Waiter *w = find_waiter(capture_id);
+	if (w == nullptr) return;
+	if (w->done || w->ended) {
+		erase_waiter(capture_id); // the runtime frees an uncollected image itself (10 s / next capture)
+	} else {
+		w->abandoned = true; // dropped when (if) its completion comes
+	}
 }
 
 int
@@ -562,6 +750,8 @@ dxr_prov_desktop_next_event(DxrDesktopEvent *ev)
 	if (!ev) return 0;
 	std::lock_guard<std::mutex> lk(g_mx);
 	if (g_queue.empty()) return 0;
+	// A waitable start is filing its id and this may be its completion: next frame.
+	if (g_claiming && g_queue.front().kind == DXR_DESKTOP_EVENT_CAPTURE_COMPLETED) return 0;
 	*ev = g_queue.front();
 	g_queue.pop_front();
 	return 1;

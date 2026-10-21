@@ -109,6 +109,9 @@ namespace DisplayXR
         Unsupported,
         /// <summary>Anything else (invalid action, too many queued, the session ended ...).</summary>
         Failed,
+        /// <summary>A blocking capture (<see cref="DisplayXRDesktop.CaptureBlocking"/>) ran out of time. The
+        /// capture may still be in flight: until it ends, a new one fails with <c>XR_ERROR_LIMIT_REACHED</c>.</summary>
+        TimedOut,
     }
 
     /// <summary>The outcome of one desktop action.</summary>
@@ -325,7 +328,8 @@ namespace DisplayXR
     /// calls (<see cref="ListWindows"/>, <see cref="TryGetPointer"/>, <see cref="TryPick"/>,
     /// <see cref="GetTextAt"/>) are synchronous, never wait on a queued action, and are cheap
     /// enough for a frame loop (text-at may take tens of ms). Use this class from the main
-    /// thread.</para>
+    /// thread, except the blocking captures (<see cref="CaptureBlocking"/> and its siblings), which
+    /// work from any thread.</para>
     ///
     /// <para><b>Never expose these operations as MCP tools</b> (<see cref="DisplayXRMcp"/>), nor
     /// over any other channel other processes can reach (ADR-056 D4). Any local process of the
@@ -337,8 +341,11 @@ namespace DisplayXR
     /// ONE request (<c>RequestAccess(DesktopControlScopes.Control | DesktopControlScopes.Capture, reason)</c>
     /// — on GNOME a later request for CAPTURE alone shows a second dialog that asks about input again),
     /// watch <see cref="CaptureStateChanged"/>, then <see cref="CaptureAsync(RectInt, int, int)"/>. A
-    /// capture never prompts; one is in flight at a time and starts are at least 250 ms apart. Frames are
-    /// for the agent inside this app: never write them anywhere other processes can reach. On Linux the
+    /// capture never prompts; one is in flight at a time and starts are at least 250 ms apart. Code that
+    /// cannot await (a synchronous agent API, a worker thread, the main thread inside <c>Update</c>) uses
+    /// <see cref="CaptureBlocking"/> / <see cref="CaptureDesktopBlocking"/> / <see cref="CaptureWindowBlocking"/>
+    /// instead: they block the calling thread, ANY thread, the main thread included, without deadlocking.
+    /// Frames are for the agent inside this app: never write them anywhere other processes can reach. On Linux the
     /// consent dialog is parented to the app's window automatically
     /// (<see cref="DisplayXRNative"/><c>.LinuxWindowHandle()</c>, read right before each request). On a
     /// runtime whose extension predates spec v2 <see cref="CaptureState"/> is Unsupported and every
@@ -348,7 +355,8 @@ namespace DisplayXR
     /// plug-in, or with no XR session, <see cref="State"/> is
     /// <see cref="DesktopControlState.Unsupported"/>, observation returns nothing and actions
     /// complete with <see cref="DesktopActionStatus.Unsupported"/> / <see cref="DesktopActionStatus.Failed"/>.
-    /// When the session ends, every pending action completes with Failed ("session ended").</para>
+    /// When the session ends, every pending action completes with Failed ("session ended"), and so does a
+    /// blocking capture waiting on any thread.</para>
     /// </summary>
     public static class DisplayXRDesktop
     {
@@ -357,6 +365,7 @@ namespace DisplayXR
         private const int E_NoSession = -2000000002;
         private const int E_BadArgument = -2000000003;
         private const int E_NoCapture = -2000000004;
+        private const int E_Timeout = -2000000005;
 
         private const int XR_ERROR_VALIDATION_FAILURE = -1;
         private const int XR_ERROR_FUNCTION_UNSUPPORTED = -7;
@@ -377,6 +386,16 @@ namespace DisplayXR
         /// <summary>The largest <c>maxWidth</c> / <c>maxHeight</c> a capture accepts (no downscale below it).</summary>
         public const int MaxCaptureSize = 8192;
 
+        /// <summary>The default <c>timeoutMs</c> of the blocking captures (<see cref="CaptureBlocking"/>).</summary>
+        public const int DefaultCaptureTimeoutMs = 5000;
+
+        /// <summary>The longest a blocking capture waits; a negative or larger <c>timeoutMs</c> means this.</summary>
+        public const int MaxCaptureTimeoutMs = 60000;
+
+        // A blocking capture returns to managed code at least this often (a domain reload / thread abort
+        // can land in between); the native wait polls the runtime's queue every few ms within a slice.
+        private const int WaitSliceMs = 50;
+
         private struct Pending
         {
             public TaskCompletionSource<DesktopActionResult> Tcs;
@@ -387,6 +406,7 @@ namespace DisplayXR
         private static readonly Dictionary<ulong, Pending> s_Pending = new Dictionary<ulong, Pending>();
         private static bool s_Missing; // native binary predates the binding (or layout mismatch)
         private static bool s_CaptureMissing; // native binary predates the spec-v2 exports
+        private static bool s_WaitMissing; // native binary predates the waitable-capture exports
         private static uint s_Generation;
         private static DesktopControlState s_LastState = DesktopControlState.Unsupported;
         private static DesktopControlState s_LastCaptureState = DesktopControlState.Unsupported;
@@ -748,6 +768,130 @@ namespace DisplayXR
             return r.ToTexture2D();
         }
 
+        // ---------------------------------------------------------------- blocking capture (any thread)
+
+        /// <summary>
+        /// <see cref="CaptureAsync(RectInt, int, int)"/> for code that cannot await: blocks the calling
+        /// thread until the capture completes, fails, or <paramref name="timeoutMs"/> runs out. Works from
+        /// ANY thread, Unity's main thread included: the completion normally travels through the frame
+        /// loop, which a blocked main thread stops, so the call polls the runtime for it itself while it
+        /// waits. Never prompts, never throws, never falls back to anything else (no screenshot portal).
+        /// <para><b>Cost on the calling thread:</b> the whole capture (tens to hundreds of ms; back-to-back
+        /// captures are at least 250 ms apart, the runtime's 4-per-second limit) plus one copy of the image
+        /// into a new byte[] (<paramref name="maxWidth"/> x <paramref name="maxHeight"/> x 4 bytes at most).
+        /// On the main thread the frame stalls for all of it, so keep the size to what the consumer needs:
+        /// an agent's vision model wants at most 1920 x 1080, while a full 7680 x 2400 desktop is 74 MB.</para>
+        /// <para>One capture is in flight at a time, async and blocking alike, from any thread: a second
+        /// one fails at once with <c>XR_ERROR_LIMIT_REACHED</c> (<see cref="DesktopCaptureResult.XrResult"/>
+        /// -10, status Failed). If the session ends while waiting: Failed, "session ended". On
+        /// <see cref="DesktopActionStatus.TimedOut"/> the capture may still be in flight; its image is
+        /// dropped.</para>
+        /// </summary>
+        /// <param name="desktopRect">Desktop coordinates, top-left origin, y down; clipped to the monitors.</param>
+        /// <param name="maxWidth">1..<see cref="MaxCaptureSize"/>: the image is scaled down to fit, never up.</param>
+        /// <param name="maxHeight">1..<see cref="MaxCaptureSize"/>.</param>
+        /// <param name="timeoutMs">How long to wait at most (default <see cref="DefaultCaptureTimeoutMs"/>,
+        /// at most <see cref="MaxCaptureTimeoutMs"/>).</param>
+        public static DesktopCaptureResult CaptureBlocking(RectInt desktopRect, int maxWidth, int maxHeight,
+                                                           int timeoutMs = DefaultCaptureTimeoutMs) =>
+            CaptureAndWait(new NativeCaptureInfo
+            {
+                target = 1, x = desktopRect.x, y = desktopRect.y, width = desktopRect.width,
+                height = desktopRect.height, maxWidth = (uint)Math.Max(0, maxWidth),
+                maxHeight = (uint)Math.Max(0, maxHeight),
+            }, timeoutMs);
+
+        /// <summary>The bounding box of every monitor (gaps come back transparent), blocking. See
+        /// <see cref="CaptureBlocking"/>.</summary>
+        public static DesktopCaptureResult CaptureDesktopBlocking(int maxWidth, int maxHeight,
+                                                                  int timeoutMs = DefaultCaptureTimeoutMs) =>
+            CaptureAndWait(new NativeCaptureInfo
+            {
+                target = 0, maxWidth = (uint)Math.Max(0, maxWidth), maxHeight = (uint)Math.Max(0, maxHeight),
+            }, timeoutMs);
+
+        /// <summary><paramref name="windowId"/>'s frame as it is on screen (windows overlapping it are in the
+        /// image; a minimized window is Refused), blocking. See <see cref="CaptureBlocking"/>.</summary>
+        public static DesktopCaptureResult CaptureWindowBlocking(ulong windowId, int maxWidth, int maxHeight,
+                                                                 int timeoutMs = DefaultCaptureTimeoutMs) =>
+            CaptureAndWait(new NativeCaptureInfo
+            {
+                target = 2, windowId = windowId, maxWidth = (uint)Math.Max(0, maxWidth),
+                maxHeight = (uint)Math.Max(0, maxHeight),
+            }, timeoutMs);
+
+        // Start a WAITABLE capture (its completion is kept for us, never queued for Pump), wait for it in
+        // slices (the native wait polls the runtime's queue on this thread meanwhile), fetch the image here.
+        // Touches no Unity API: safe on any thread.
+        private static unsafe DesktopCaptureResult CaptureAndWait(NativeCaptureInfo info, int timeoutMs)
+        {
+            if (s_Missing || s_CaptureMissing)
+                return MakeCapture(s_Missing ? E_Unavailable : E_NoCapture, null, default, 0);
+            if (s_WaitMissing)
+                return MakeCapture(E_Unavailable, "this native plug-in build has no blocking capture", default, 0);
+            long budget = timeoutMs < 0 || timeoutMs > MaxCaptureTimeoutMs ? MaxCaptureTimeoutMs : timeoutMs;
+            long start = System.Diagnostics.Stopwatch.GetTimestamp();
+            uint gen;
+            ulong id;
+            int r;
+            try
+            {
+                gen = Native.dxr_prov_desktop_session_generation(); // before the call: see StartCapture
+                r = Native.dxr_prov_desktop_capture_waitable(ref info, out id);
+            }
+            catch (EntryPointNotFoundException)
+            {
+                s_WaitMissing = true;
+                return MakeCapture(E_Unavailable, "this native plug-in build has no blocking capture", default, 0);
+            }
+            catch (DllNotFoundException)
+            {
+                s_Missing = true;
+                return MakeCapture(E_Unavailable, null, default, 0);
+            }
+            if (r < 0 || id == 0) return MakeCapture(r < 0 ? r : XR_ERROR_VALIDATION_FAILURE, null, default, 0);
+
+            bool forgotten = false; // the native side no longer holds the capture
+            try
+            {
+                for (;;)
+                {
+                    long elapsed = (System.Diagnostics.Stopwatch.GetTimestamp() - start) * 1000 /
+                                   System.Diagnostics.Stopwatch.Frequency;
+                    long left = Math.Max(0, budget - elapsed);
+                    int w = Native.dxr_prov_desktop_capture_wait(id, (uint)Math.Min(left, WaitSliceMs), out NativeEvent ev);
+                    if (w == 1)
+                    {
+                        forgotten = true;
+                        return FinishCapture(ev, Utf8Z(ev.message, 256));
+                    }
+                    if (w < 0)
+                    {
+                        forgotten = true;
+                        // Not known any more after a session change: the session that ran it ended.
+                        bool ended = w == E_NoSession ||
+                                     Native.dxr_prov_desktop_session_generation() != gen;
+                        return ended ? SessionEnded() : MakeCapture(w, "lost track of the capture", default, 0);
+                    }
+                    if (left == 0)
+                        return MakeCapture(E_Timeout, $"no result within {budget} ms (the capture may still be " +
+                                                      "in flight: a new one fails with LIMIT_REACHED until it ends)",
+                                           default, 0);
+                }
+            }
+            finally
+            {
+                if (!forgotten)
+                {
+                    try { Native.dxr_prov_desktop_capture_abandon(id); }
+                    catch (EntryPointNotFoundException) { }
+                }
+            }
+        }
+
+        private static DesktopCaptureResult SessionEnded() =>
+            new DesktopCaptureResult(DesktopActionStatus.Failed, "session ended", E_NoSession, 0, 0, default, 0, null);
+
         private static Task<DesktopCaptureResult> StartCapture(NativeCaptureInfo info)
         {
             if (s_Missing || s_CaptureMissing) return CaptureDone(s_Missing ? E_Unavailable : E_NoCapture, null);
@@ -770,7 +914,8 @@ namespace DisplayXR
         }
 
         // A completed capture: fetch the image now (the runtime keeps it 10 s; we are on the main
-        // thread, draining the event the frame it arrived).
+        // thread draining the event the frame it arrived, or the thread of a blocking capture). One copy,
+        // straight from the runtime into the managed array (pinned for the call).
         private static unsafe DesktopCaptureResult FinishCapture(in NativeEvent ev, string message)
         {
             var src = new RectInt(ev.srcX, ev.srcY, ev.srcWidth, ev.srcHeight);
@@ -995,6 +1140,8 @@ namespace DisplayXR
                     fallback = "the runtime (or this plug-in build) has no XR_DXR_desktop_control"; break;
                 case E_NoSession:
                     status = DesktopActionStatus.Failed; fallback = "no XR session"; break;
+                case E_Timeout:
+                    status = DesktopActionStatus.TimedOut; fallback = "timed out"; break;
                 case XR_ERROR_VALIDATION_FAILURE:
                     status = DesktopActionStatus.Failed; fallback = "invalid action (missing window id, text or keys?)"; break;
                 case XR_ERROR_LIMIT_REACHED:
@@ -1165,6 +1312,16 @@ namespace DisplayXR
             [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
             public static extern int dxr_prov_desktop_capture_image(ulong captureId, uint capacity, out uint count,
                                                                     byte[] rgba);
+
+            // Waitable captures (CaptureBlocking): any thread.
+            [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+            public static extern int dxr_prov_desktop_capture_waitable(ref NativeCaptureInfo info, out ulong captureId);
+
+            [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+            public static extern int dxr_prov_desktop_capture_wait(ulong captureId, uint timeoutMs, out NativeEvent ev);
+
+            [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+            public static extern void dxr_prov_desktop_capture_abandon(ulong captureId);
         }
     }
 }

@@ -210,11 +210,12 @@ jobs:
 
       # The XR_DXR_desktop_control binding against a fake runtime: every observation
       # call and submit field marshalled, UTF-8 both ways, events FIFO / bounded /
-      # session-filtered, clean failures with no extension or no session.
+      # session-filtered, clean failures with no extension or no session, waitable
+      # captures across threads.
       - name: Desktop control binding tests
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
-          c++ -std=c++17 -Wall -I native~/displayxr_xrprovider \
+          c++ -std=c++17 -Wall -pthread -I native~/displayxr_xrprovider \
             -I native~/build/_deps/openxr_sdk-src/include \
             native~/tests/desktop_test.cpp native~/displayxr_xrprovider/displayxr_provider_desktop.cpp \
             -o /tmp/desktop_test
