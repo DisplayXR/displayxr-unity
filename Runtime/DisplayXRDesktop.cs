@@ -500,6 +500,14 @@ namespace DisplayXR
             ulong bits = (ulong)scopes | (askAgain ? ScopeAskAgain : 0);
             byte[] parent = ParentWindow();
             int res = CallCapture(() => Native.dxr_prov_desktop_request_scopes(r, bits, parent));
+            if (res == XR_ERROR_VALIDATION_FAILURE && parent != null)
+            {
+                // The parent is only a placement hint (spec v2): a handle the runtime refuses must not cost
+                // the user the prompt. Ask again without it (the dialog then opens unparented).
+                Debug.LogWarning("[DisplayXR] desktop control: the runtime refused the window handle as the " +
+                                 "consent dialog's parent; asking without a parent");
+                res = CallCapture(() => Native.dxr_prov_desktop_request_scopes(r, bits, null));
+            }
             if (s_CaptureMissing)
             {
                 // A native binary without the v2 export: the v1 request, CONTROL only.
@@ -745,10 +753,14 @@ namespace DisplayXR
             if (s_Missing || s_CaptureMissing) return CaptureDone(s_Missing ? E_Unavailable : E_NoCapture, null);
             try
             {
+                // The generation BEFORE the call: the session is torn down on the graphics thread (GfxStop),
+                // and a teardown between the call and a later read would file this capture under the NEW
+                // generation, which Pump does not fail (until yet another session starts) while its
+                // completion was already dropped with the old session.
+                uint gen = Native.dxr_prov_desktop_session_generation();
                 int r = Native.dxr_prov_desktop_capture(ref info, out ulong id);
                 if (r < 0 || id == 0) return CaptureDone(r < 0 ? r : XR_ERROR_VALIDATION_FAILURE, null);
                 var tcs = new TaskCompletionSource<DesktopCaptureResult>();
-                uint gen = Native.dxr_prov_desktop_session_generation();
                 lock (s_Lock) s_PendingCaptures[id] = new PendingCapture { Tcs = tcs, Generation = gen };
                 return tcs.Task;
             }
@@ -806,10 +818,10 @@ namespace DisplayXR
             byte[] k = keys == null ? null : Utf8(keys);
             try
             {
+                uint gen = Native.dxr_prov_desktop_session_generation(); // before the call: see StartCapture
                 int r = Native.dxr_prov_desktop_submit(ref a, t, k, out ulong id);
                 if (r < 0 || id == 0) return Done(r < 0 ? r : XR_ERROR_VALIDATION_FAILURE, null);
                 var tcs = new TaskCompletionSource<DesktopActionResult>();
-                uint gen = Native.dxr_prov_desktop_session_generation();
                 lock (s_Lock) s_Pending[id] = new Pending { Tcs = tcs, Generation = gen };
                 return tcs.Task;
             }
