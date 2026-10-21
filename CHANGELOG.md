@@ -7,6 +7,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.29.0] - 2026-10-21
+
+Screen capture binding for `XR_DXR_desktop_control` spec v2 (#387): `RequestAccess` with the Capture scope, `CaptureAsync` / `CaptureDesktopAsync` / `CaptureWindowAsync`, `CaptureState`, and the Linux consent dialog parented to the app's window. Plus the Linux window-handle follow-ups (#386).
+
 ### Added
 - **Screen capture for the app's agent (`XR_DXR_desktop_control` spec v2, runtime ADR-056 Amendment 1).** Capture is a second consent scope next to CONTROL; needs a runtime that advertises spec v2 (displayxr-runtime#2259 GNOME, #2260 macOS).
   - `DisplayXRDesktop.RequestAccess(DesktopControlScopes scopes, string reason = null, bool askAgain = false)` asks for CONTROL and/or CAPTURE in one prompt. `askAgain` re-shows the prompt for scopes already granted (GNOME: change which screens are shared; macOS: opens System Settings). Ask for both scopes in the first request: on GNOME a later CAPTURE-only request shows a second dialog that asks about input again.
@@ -18,6 +22,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 - **A desktop action submitted while the XR session was being torn down could stay pending.** The session ends on the graphics thread, and the binding read the session generation after the submit call, so a teardown in between filed the action under the new generation: its task failed only when yet another session started. The generation is now read before the call (captures do the same), so the task completes with "session ended" on the next frame.
+- **Linux window handle published atomically (#386).** The X11 window id is scanned into a local and published once with an atomic store, and `displayxr_linux_window_handle` reads it with an atomic load (it may run on any thread while the session thread binds the window); before, the scan wrote intermediate matches straight into the shared value. Docs: on native Wayland the call may wait briefly while a session is starting, and a window only on outputs past the eighth gets no handle (`""`, fails safe). No behaviour change on Windows or macOS.
 
 ## [2.28.0] - 2026-10-20
 
