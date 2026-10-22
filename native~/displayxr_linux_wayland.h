@@ -112,6 +112,13 @@ int dxr_wl_move_player_to_panel(const char *connector, int panel_w, int panel_h)
 //! panel is ignored and the window is centred on the panel instead (#361).
 int dxr_wl_get_player_position_x11(int *out_x, int *out_y);
 int dxr_wl_set_player_position_x11(int x, int y);
+//! Move the window's frame to (x, y) in mutter's stage coordinates (what the GNOME
+//! extension reports), for the side-step (displayxr_linux_side_step.c): no X root
+//! conversion and no saved-position check. A new place gets a fresh correction
+//! budget, as for the app's own moves (#382). @p log: log the placement (a glide logs
+//! its last step only). 1 when asked (asynchronous), 0 without a native-Wayland
+//! session or the extension.
+int dxr_wl_set_player_position_stage(int x, int y, int log);
 //! The runtime's 3D panel rect in X root px (XrDisplayDesktopInfoDXR): what X root
 //! coordinates are converted through.
 void dxr_wl_set_x11_panel_rect(const char *connector, int x, int y, int w, int h);

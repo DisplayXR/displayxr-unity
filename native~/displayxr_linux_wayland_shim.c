@@ -253,6 +253,13 @@ dxr_wl_set_player_position_x11(int x, int y)
 	return a ? a->set_player_position_x11(x, y) : 0;
 }
 
+int
+dxr_wl_set_player_position_stage(int x, int y, int log)
+{
+	const DxrWlApi *a = api();
+	return a ? a->set_player_position_stage(x, y, log) : 0;
+}
+
 unsigned
 dxr_wl_player_generation(void)
 {
