@@ -516,11 +516,13 @@ DISPLAYXR_EXPORT int displayxr_linux_clipboard_write(const char *text, int len);
 
 /// Side-step (native-Wayland player on GNOME with the DisplayXR GNOME extension): the
 /// app's own window steps aside when the window the user is working in covers the
-/// app's content, and goes back once its place is free. Everything about OTHER
-/// windows is read and used inside the plug-in only; the app sets the switch and
-/// the settings and reads its own window's state. Records and rules:
-/// displayxr_linux_side_step.h; why it needs no desktop-control grant:
-/// docs~/architecture/side-step.md.
+/// app's content, and goes back once its place is free. Only while the app's desktop
+/// control is GRANTED (the #389 gate, as for LinuxWindows): before every poll the
+/// worker asks the runtime (dxr_prov_desktop_get_state) and reads nothing unless the
+/// answer is Granted (status: Paused / DXR_SS_REASON_NOT_GRANTED). Everything about
+/// OTHER windows is read and used inside the plug-in only; the app sets the switch
+/// and the settings and reads its own window's state. Records and rules:
+/// displayxr_linux_side_step.h; docs~/architecture/side-step.md.
 /// set: turn it on (1) or off (0) with @p settings (NULL = defaults; out-of-range
 /// values are clamped). Off stops at once (no further moves; the window stays where
 /// it is). Returns 1, or 0 when its thread could not start. Any thread.

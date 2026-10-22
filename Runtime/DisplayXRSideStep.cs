@@ -18,8 +18,9 @@ namespace DisplayXR
         /// <summary>On, but it cannot act yet: no XR session, no DisplayXR GNOME extension,
         /// the window not shown, or the window has just moved and is settling.</summary>
         Waiting = 2,
-        /// <summary>On, holding still: the screen is locked, the user is moving the window,
-        /// it is minimized / maximized / fullscreen, or it stepped aside too often lately.</summary>
+        /// <summary>On, holding still: the app's desktop control is not granted
+        /// (<see cref="SideStepReason.NotGranted"/>), the screen is locked, the user is moving the
+        /// window, it is minimized / maximized / fullscreen, or it stepped aside too often lately.</summary>
         Paused = 3,
         /// <summary>At home, watching.</summary>
         Home = 4,
@@ -49,7 +50,8 @@ namespace DisplayXR
         /// <summary>The window moved (start-up placement, the user, the app) and is settling;
         /// where it stays becomes home.</summary>
         Settling = 6,
-        /// <summary>The screen is locked.</summary>
+        /// <summary>The screen is locked. (Rare: a lock suspends the desktop-control grant, which
+        /// reads as <see cref="NotGranted"/>.)</summary>
         ScreenLocked = 7,
         /// <summary>The user is moving or resizing the window.</summary>
         UserMoving = 8,
@@ -66,6 +68,11 @@ namespace DisplayXR
         NoFreeSpot = 13,
         /// <summary>The native plug-in is older than this feature.</summary>
         NativeMissing = 14,
+        /// <summary>The app's desktop control is not <see cref="DesktopControlState.Granted"/>
+        /// (<see cref="DisplayXRDesktop.State"/> says why: never requested, denied, turned off by the
+        /// user, suspended by the kill switch or a screen lock, or a runtime without desktop
+        /// control). Side-step reads nothing then, and the window stays where it is.</summary>
+        NotGranted = 15,
     }
 
     /// <summary>Which side <see cref="DisplayXRSideStep"/> prefers among equally free places.</summary>
@@ -95,14 +102,28 @@ namespace DisplayXR
     /// <see cref="State"/> is <see cref="SideStepState.Unsupported"/> and nothing happens.
     /// </para>
     /// <para>
+    /// <b>Only while desktop control is granted.</b> Side-step works from the other windows'
+    /// frames and focus, which is what <c>DisplayXRNative.LinuxWindows</c> tells about other
+    /// apps, so it is behind the same consent gate (#389, runtime ADR-056): it runs only while
+    /// <see cref="DisplayXRDesktop.State"/> is <see cref="DesktopControlState.Granted"/>. Ask for
+    /// it with <see cref="DisplayXRDesktop.Request"/> on a user gesture; side-step never asks.
+    /// Before every look at the desktop (4 times a second) the plug-in asks the runtime, the same
+    /// query <see cref="DisplayXRDesktop.State"/> makes. When the answer is no it reads nothing
+    /// (no window list, no lock state) and asks again a second later; <see cref="State"/> is
+    /// <see cref="SideStepState.Paused"/> / <see cref="SideStepReason.NotGranted"/>,
+    /// <see cref="Covered"/> is 0, no rect or home is reported, and no event fires. A revoke, the
+    /// kill switch or a screen lock stops it within one look, mid-move too: the window stays where
+    /// it is and side-step forgets its home. When the grant comes back it starts afresh, as after
+    /// turning it off and on: the place the window stays put at becomes home.
+    /// </para>
+    /// <para>
     /// <b>What the app learns: only its own window.</b> The plug-in reads the other windows'
     /// frames and the keyboard focus from the GNOME extension, decides inside the plug-in, and
     /// moves only the app's own window. No other window's id, process, app id, title or rect
     /// is handed to the app, and none is logged. The app sets the switch and the settings, and
     /// reads its own window's state: <see cref="State"/>, <see cref="Covered"/>,
     /// <see cref="IsAside"/>, its rect and its home, and the <see cref="SteppedAside"/> /
-    /// <see cref="ReturnedHome"/> events. That is why it needs no desktop-control grant, unlike
-    /// <c>DisplayXRNative.LinuxWindows</c> (docs~/architecture/side-step.md).
+    /// <see cref="ReturnedHome"/> events (docs~/architecture/side-step.md).
     /// </para>
     /// <para>
     /// <b>Rules.</b> "Covered": the focused window of another app (a normal window, dialog or
@@ -116,12 +137,13 @@ namespace DisplayXR
     /// <see cref="SetContentRect"/>, or the whole window.
     /// </para>
     /// <para>
-    /// <b>Safety.</b> It never moves another window. It holds still while the user moves the
-    /// window (where they leave it is the new home), while the screen is locked, and while the
-    /// window is minimized, maximized or fullscreen. Its own moves never become home: a place
-    /// the window stays at after anyone else moved it (the user, the app's own
-    /// <c>displayxr_set_overlay_position</c>) does. At most 6 steps aside a minute (going back
-    /// home is never held by that). Turning it off stops at once; the window stays where it is.
+    /// <b>Safety.</b> It never moves another window. It holds still while desktop control is not
+    /// granted, while the user moves the window (where they leave it is the new home), while the
+    /// screen is locked, and while the window is minimized, maximized or fullscreen. Its own moves
+    /// never become home: a place the window stays at after anyone else moved it (the user, the
+    /// app's own <c>displayxr_set_overlay_position</c>) does. At most 6 steps aside a minute (going
+    /// back home is never held by that; a revoke and a re-grant do not reset the count). Turning it
+    /// off stops at once; the window stays where it is.
     /// </para>
     /// <para>
     /// <b>Saving the window's place.</b> While <see cref="IsAside"/>, the window is not where
@@ -134,7 +156,9 @@ namespace DisplayXR
     {
         // --- the switch and the settings ------------------------------------------------
 
-        /// <summary>Turn side-step on. Default off.</summary>
+        /// <summary>Turn side-step on. Default off. It acts only while desktop control is granted
+        /// (<see cref="DisplayXRDesktop.State"/>); until then <see cref="State"/> is
+        /// <see cref="SideStepState.Paused"/> / <see cref="SideStepReason.NotGranted"/>.</summary>
         public static bool Enabled
         {
             get => s_Enabled;
@@ -221,15 +245,18 @@ namespace DisplayXR
         public static SideStepReason Reason { get; private set; }
 
         /// <summary>True while the window is away from home because of side-step (stepped
-        /// aside, or gliding either way). Save <see cref="TryGetHomePosition"/> then.</summary>
+        /// aside, or gliding either way). Save <see cref="TryGetHomePosition"/> then. False while
+        /// desktop control is not granted (side-step has forgotten home then).</summary>
         public static bool IsAside { get; private set; }
 
         /// <summary>The share (0..1) of the app's content the focused window of another app
-        /// covers now. 0 when nothing does or side-step cannot tell.</summary>
+        /// covers now. 0 when nothing does or side-step cannot tell (always 0 while desktop
+        /// control is not granted).</summary>
         public static float Covered { get; private set; }
 
         /// <summary>The app's window frame in GNOME desktop coordinates (the space of
-        /// <c>DisplayXRNative.LinuxMonitor.Rect</c>), as side-step last saw it.</summary>
+        /// <c>DisplayXRNative.LinuxMonitor.Rect</c>), as side-step last saw it. False while
+        /// desktop control is not granted.</summary>
         public static bool TryGetWindowRect(out RectInt rect)
         {
             rect = new RectInt(s_Status.winX, s_Status.winY, s_Status.winW, s_Status.winH);
@@ -237,7 +264,8 @@ namespace DisplayXR
         }
 
         /// <summary>Home: the window frame's place the user (or the app) last left it at, in
-        /// GNOME desktop coordinates, with the window's current size.</summary>
+        /// GNOME desktop coordinates, with the window's current size. False while desktop control
+        /// is not granted.</summary>
         public static bool TryGetHomeRect(out RectInt rect)
         {
             rect = new RectInt(s_Status.homeX, s_Status.homeY, s_Status.winW, s_Status.winH);

@@ -7,7 +7,18 @@
 // _set_body_rect, _status (displayxr_exports.h). The decision and the parsing are
 // pure (displayxr_linux_side_step.h); this file is the worker around them.
 //
-// WHAT IS READ, AND WHERE IT GOES
+// ONLY WHILE GRANTED. Every poll first asks the runtime whether the app's desktop
+// control is Granted (dxr_prov_desktop_get_state: the very query behind
+// DisplayXRDesktop.State, which DisplayXRNative.LinuxWindows / LinuxWindowAt /
+// LinuxPointer answer behind; the #389 consent policy, runtime ADR-056). Not
+// granted (never asked, denied, turned off by the user, the kill switch, the
+// screen locked, a runtime without XR_DXR_desktop_control): nothing below is read,
+// the status is Paused / NotGranted, and what the decision remembered is
+// forgotten; the window stays where it is. A glide asks again before each step.
+// The pure part (dxr_ss_poll, dxr_ss_glide) holds that order; the unit test counts
+// the reads.
+//
+// WHAT IS READ (only while granted), AND WHERE IT GOES
 //  - The DisplayXR GNOME extension's window list (GetAllWindows, else GetWindows):
 //    frames, focus, minimized / maximized / fullscreen, the move grab flag, the
 //    window type, and the app id only to recognise the desktop-icons window. Read
@@ -21,10 +32,9 @@
 //    rect the app sets, or the whole window.
 // None of the other windows' facts leave this file: they are not stored past one
 // tick (except the id of the window the app stepped aside for, to tell when its
-// place is free of it), not logged, and not exported. The app gets its own
-// window's state only (DisplayXRSideStepStatus). That is why this needs no
-// desktop-control grant, unlike DisplayXRNative.LinuxWindows (docs~/architecture/
-// side-step.md).
+// place is free of it, and only while the grant holds), not logged, and not
+// exported. The app gets its own window's state only (DisplayXRSideStepStatus;
+// docs~/architecture/side-step.md).
 //
 // WHAT IS MOVED: only the app's own window, through the Wayland library's own
 // placement (dxr_wl_set_player_position_stage: the GNOME extension's MoveWindow,
@@ -37,6 +47,8 @@
 #include "displayxr_linux_side_step.h"
 #include "displayxr_linux_wayland.h"
 #include "displayxr_exports.h"
+#include "displayxr_extensions.h"                             // XR_DESKTOP_CONTROL_STATE_GRANTED_DXR
+#include "displayxr_xrprovider/displayxr_provider_desktop.h" // dxr_prov_desktop_get_state: the gate
 
 #include <errno.h>
 #include <pthread.h>
@@ -55,9 +67,9 @@ int dxr_linux_desktop_info_screen_locked(void);
 //! displayxr_linux.c: the plug-in's own right-drag of the window is running.
 int dxr_linux_own_pointer_drag(void);
 
-#define DXR_SS_POLL_MS 250
+#define DXR_SS_POLL_MS 250          // granted: a poll (the gate, then the reads) this often
+#define DXR_SS_CLOSED_POLL_MS 1000  // not granted: only the gate is asked, this often
 #define DXR_SS_SIL_EVERY_NS (100 * 1000000LL) // silhouette grid refresh, at most
-#define DXR_SS_GLIDE_STEP_S 0.04              // one glide step per this, roughly
 
 static pthread_mutex_t s_mutex = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t s_cond;
@@ -119,6 +131,9 @@ reason_text(int r)
 	case DXR_SS_REASON_TOO_MANY_MOVES:
 		return "covered, but it already stepped aside 6 times in the last minute: staying for now";
 	case DXR_SS_REASON_NO_FREE_SPOT: return "covered, but no place on this monitor is free: staying";
+	case DXR_SS_REASON_NOT_GRANTED:
+		return "desktop control is not granted (DisplayXRDesktop.State): paused, nothing is read, the window stays "
+		       "where it is";
 	default: return "watching";
 	}
 }
@@ -206,40 +221,75 @@ current_body(DxrSsBody *out, const char **what)
  *
  */
 
+/*
+ *
+ * What a poll reads and does (DxrSsOps): the real calls.
+ *
+ */
+
+//! The #389 gate: the app's desktop control is Granted right now. The same query
+//! DisplayXRDesktop.State makes (a synchronous runtime call, about 1.4 ms, evaluated
+//! afresh each time: the user's deny, the kill switch and a screen lock count at
+//! once), so side-step and DisplayXRNative.LinuxWindows open and close together. Any
+//! failure (no session, a runtime without XR_DXR_desktop_control) is "no". Any thread
+//! (the provider serialises it with its other desktop calls and session teardown).
 static int
-still_enabled(void)
+op_granted(void *ctx)
 {
+	(void)ctx;
+	int32_t state = XR_DESKTOP_CONTROL_STATE_UNSUPPORTED_DXR;
+	uint64_t caps = 0;
+	return dxr_prov_desktop_get_state(&state, &caps) >= 0 && state == XR_DESKTOP_CONTROL_STATE_GRANTED_DXR;
+}
+
+static char *
+op_window_list(void *ctx)
+{
+	(void)ctx;
+	return dxr_linux_desktop_info_window_list_json();
+}
+
+static int
+op_screen_locked(void *ctx)
+{
+	(void)ctx;
+	return dxr_linux_desktop_info_screen_locked();
+}
+
+static int
+op_own_drag(void *ctx)
+{
+	(void)ctx;
+	return dxr_linux_own_pointer_drag();
+}
+
+static int
+op_still_on(void *ctx)
+{
+	(void)ctx;
 	return __atomic_load_n(&s_enabled, __ATOMIC_RELAXED);
 }
 
-//! Glide the window from (fx, fy) to (tx, ty), stage px, in `seconds` (ease-out;
-//! the last step is the target). Stops early when side-step is turned off or the
-//! user starts dragging the window. 0 when the Wayland library cannot move it.
 static int
-glide(int fx, int fy, int tx, int ty, double seconds)
+op_move(void *ctx, int x, int y, int last)
 {
-	int steps = seconds > 0.0 ? (int)lround(seconds / DXR_SS_GLIDE_STEP_S) : 1;
-	if (steps < 1)
-		steps = 1;
-	if (steps > 30)
-		steps = 30;
-	long long step_ns = steps > 1 ? (long long)(seconds / steps * 1e9) : 0;
-	for (int i = 1; i <= steps; i++) {
-		if (!still_enabled() || dxr_linux_own_pointer_drag())
-			return 1;
-		double t = (double)i / steps, e = 1.0 - (1.0 - t) * (1.0 - t);
-		int x = i == steps ? tx : (int)lround(fx + (tx - fx) * e);
-		int y = i == steps ? ty : (int)lround(fy + (ty - fy) * e);
-		if (!dxr_wl_set_player_position_stage(x, y, i == steps))
-			return 0;
-		if (i < steps) {
-			struct timespec ts = {(time_t)(step_ns / 1000000000LL), (long)(step_ns % 1000000000LL)};
-			while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {
-			}
-		}
-	}
-	return 1;
+	(void)ctx;
+	return dxr_wl_set_player_position_stage(x, y, last);
 }
+
+static void
+op_wait_s(void *ctx, double seconds)
+{
+	(void)ctx;
+	long long ns = (long long)(seconds * 1e9);
+	struct timespec ts = {(time_t)(ns / 1000000000LL), (long)(ns % 1000000000LL)};
+	while (nanosleep(&ts, &ts) != 0 && errno == EINTR) {
+	}
+}
+
+static const DxrSsOps s_ops = {
+    NULL, op_granted, op_window_list, op_screen_locked, op_own_drag, op_still_on, op_move, op_wait_s,
+};
 
 //! Publish a tick's status; `ev` (DXR_SS_EV_LANDED_*) bumps its counter in the same
 //! copy, so the app never sees a new count with the previous tick's window rect.
@@ -256,8 +306,10 @@ publish(const DisplayXRSideStepStatus *st, int ev)
 
 typedef struct {
 	DxrSsState st;
+	DxrSsGate gate;              // the desktop-control grant, as the last poll found it
 	int last_state, last_reason; // logged
 	int started;                 // the decision runs (a native-Wayland session's window)
+	int not_granted;             // the last tick ended at the gate (nothing read)
 	const char *body_what;       // logged when it changes
 } Worker;
 
@@ -279,11 +331,25 @@ note_state(Worker *w, int state, int reason)
 		ss_log("watching again\n");
 }
 
+//! Not granted: holding still, and nothing about the window is reported but that
+//! (no rect, no home, Covered 0, no events). The event counters are kept.
+static void
+publish_not_granted(Worker *w)
+{
+	DisplayXRSideStepStatus out;
+	memset(&out, 0, sizeof(out));
+	out.state = DXR_SS_STATE_PAUSED;
+	out.reason = DXR_SS_REASON_NOT_GRANTED;
+	note_state(w, out.state, out.reason);
+	publish(&out, DXR_SS_EV_NONE);
+}
+
 static void
 tick(Worker *w, const DxrSsSettings *s)
 {
 	DisplayXRSideStepStatus out;
 	memset(&out, 0, sizeof(out));
+	w->not_granted = 0;
 	if (!dxr_wl_forced_wayland()) {
 		out.state = DXR_SS_STATE_UNSUPPORTED;
 		out.reason = DXR_SS_REASON_NOT_NATIVE_WAYLAND;
@@ -293,7 +359,8 @@ tick(Worker *w, const DxrSsSettings *s)
 	}
 	if (!dxr_wl_weave_active()) {
 		// No session (yet, or any more): start afresh with the next one, and forget
-		// the last session's silhouette (the next one pushes its own).
+		// the last session's silhouette (the next one pushes its own). The grant is
+		// asked for again with the next session.
 		if (w->started) {
 			dxr_ss_reset(&w->st);
 			pthread_mutex_lock(&s_body_mutex);
@@ -301,18 +368,31 @@ tick(Worker *w, const DxrSsSettings *s)
 			pthread_mutex_unlock(&s_body_mutex);
 		}
 		w->started = 0;
+		w->gate.open = 0;
 		out.state = DXR_SS_STATE_WAITING;
 		out.reason = DXR_SS_REASON_NO_SESSION;
 		note_state(w, out.state, out.reason);
 		publish(&out, DXR_SS_EV_NONE);
 		return;
 	}
-	char *json = dxr_linux_desktop_info_window_list_json();
-	DxrSsInput in;
-	memset(&in, 0, sizeof(in));
-	int ok = json && dxr_ss_parse_windows(json, (int)getpid(), w->st.aside_for, &in);
-	free(json);
-	if (!ok) {
+
+	// The gate first: dxr_ss_poll reads nothing (no window list, no lock state) unless
+	// the app's desktop control is Granted right now.
+	DxrSsBody body;
+	const char *what = NULL;
+	int have_body = current_body(&body, &what);
+	DxrSsPoll p;
+	dxr_ss_poll(&w->st, &w->gate, s, &s_ops, (double)now_ns() / 1e9, (int)getpid(), have_body ? &body : NULL, &p);
+	if (p.gate == DXR_SS_GATE_CLOSED)
+		ss_log("desktop control ended: stopped where it is; home forgotten until it is granted again\n");
+	else if (p.gate == DXR_SS_GATE_OPENED)
+		ss_log("desktop control granted: starting afresh (where the window stays put becomes home)\n");
+	if (!p.granted) {
+		w->not_granted = 1;
+		publish_not_granted(w);
+		return;
+	}
+	if (!p.read) {
 		out.state = DXR_SS_STATE_WAITING;
 		out.reason = DXR_SS_REASON_NO_EXTENSION;
 		note_state(w, out.state, out.reason);
@@ -320,27 +400,21 @@ tick(Worker *w, const DxrSsSettings *s)
 		return;
 	}
 	w->started = 1;
-	in.now = (double)now_ns() / 1e9;
-	in.locked = dxr_linux_desktop_info_screen_locked() == 1;
-	in.own_moving = in.own_moving || dxr_linux_own_pointer_drag();
-	DxrSsBody body;
-	const char *what = NULL;
-	in.body = current_body(&body, &what) ? &body : NULL;
 	if (what != w->body_what) {
 		ss_log("the app's content is %s\n", what);
 		w->body_what = what;
 	}
 
-	DxrSsDecision d;
-	dxr_ss_step(&w->st, s, &in, &d);
+	const DxrSsInput *in = &p.in;
+	const DxrSsDecision *d = &p.d;
 	DxrSsState *st = &w->st;
-	switch (d.event) {
+	switch (d->event) {
 	case DXR_SS_EV_NEW_HOME: ss_log("home is (%d,%d)\n", st->home_x, st->home_y); break;
 	case DXR_SS_EV_LANDED_ASIDE:
-		ss_log("stepped aside: the window is at (%d,%d)%s\n", in.own.x, in.own.y,
+		ss_log("stepped aside: the window is at (%d,%d)%s\n", in->own.x, in->own.y,
 		       st->phase == DXR_SS_PHASE_HOME ? " (not going back: this is home now)" : "");
 		break;
-	case DXR_SS_EV_LANDED_HOME: ss_log("back home at (%d,%d)\n", in.own.x, in.own.y); break;
+	case DXR_SS_EV_LANDED_HOME: ss_log("back home at (%d,%d)\n", in->own.x, in->own.y); break;
 	case DXR_SS_EV_ABORTED: ss_log("the user took the window during the move\n"); break;
 	default: break;
 	}
@@ -350,11 +424,11 @@ tick(Worker *w, const DxrSsSettings *s)
 	out.state = state;
 	out.reason = st->reason;
 	out.covered = st->covered;
-	out.window_valid = in.own_valid;
-	out.win_x = in.own.x;
-	out.win_y = in.own.y;
-	out.win_w = in.own.w;
-	out.win_h = in.own.h;
+	out.window_valid = in->own_valid;
+	out.win_x = in->own.x;
+	out.win_y = in->own.y;
+	out.win_w = in->own.w;
+	out.win_h = in->own.h;
 	out.home_valid = st->have_home;
 	out.home_x = st->home_x;
 	out.home_y = st->home_y;
@@ -365,18 +439,26 @@ tick(Worker *w, const DxrSsSettings *s)
 		out.home_xroot_y = (int32_t)lroundf(st->home_y * k);
 	}
 	out.aside = st->phase == DXR_SS_PHASE_ASIDE || st->phase == DXR_SS_PHASE_MOVING;
-	if (d.move)
+	if (d->move)
 		out.state = DXR_SS_STATE_MOVING;
-	publish(&out, d.event);
+	publish(&out, d->event);
 
-	if (!d.move)
+	if (!d->move)
 		return;
-	if (d.home)
-		ss_log("home (%d,%d) is free again: going back\n", d.x, d.y);
+	if (d->home)
+		ss_log("home (%d,%d) is free again: going back\n", d->x, d->y);
 	else
 		ss_log("%.0f %% of the app's content covered for %.1f s: stepping aside to (%d,%d) (covered there %.0f %%)\n",
-		       d.covered * 100.0, (double)s->dwell_s, d.x, d.y, d.spot_covered * 100.0);
-	if (!glide(in.own.x, in.own.y, d.x, d.y, s->glide_s)) {
+		       d->covered * 100.0, (double)s->dwell_s, d->x, d->y, d->spot_covered * 100.0);
+	int r = dxr_ss_glide(&w->gate, st, &s_ops, in->own.x, in->own.y, d->x, d->y, s->glide_s);
+	if (r == DXR_SS_GLIDE_NOT_GRANTED) {
+		// The grant ended during the glide: it stopped where it is, and the gate is
+		// closed (everything forgotten). Say so now, not at the next poll.
+		ss_log("desktop control ended during a move: stopped where it is; home forgotten until it is granted "
+		       "again\n");
+		w->not_granted = 1;
+		publish_not_granted(w);
+	} else if (r == DXR_SS_GLIDE_CANNOT_MOVE) {
 		static int s_warned;
 		if (!s_warned)
 			ss_log("the window cannot be moved right now (the Wayland library has no extension or window)\n");
@@ -401,6 +483,7 @@ worker_main(void *arg)
 				was_on = 0;
 				dxr_ss_reset(&w.st);
 				w.started = 0;
+				w.gate.open = 0; // on again: the grant is asked for afresh
 				w.last_state = w.last_reason = -1;
 				uint32_t ac = s_status.aside_count, hc = s_status.home_count;
 				memset(&s_status, 0, sizeof(s_status));
@@ -426,11 +509,15 @@ worker_main(void *arg)
 			seen_gen = gen;
 		}
 		tick(&w, &s);
-		// Sleep until the next poll, or until the settings change.
+		// Sleep until the next poll, or until the settings change. Granted: every
+		// DXR_SS_POLL_MS, so a revoke stops it within one poll. Not granted: the next
+		// poll only asks the gate (each answer is a runtime call, with the runtime's
+		// own lock probe), so once a second; a grant starts it within a second.
+		long poll_ms = w.not_granted ? DXR_SS_CLOSED_POLL_MS : DXR_SS_POLL_MS;
 		pthread_mutex_lock(&s_mutex);
 		struct timespec until;
 		clock_gettime(CLOCK_MONOTONIC, &until);
-		until.tv_nsec += DXR_SS_POLL_MS * 1000000L;
+		until.tv_nsec += poll_ms * 1000000L;
 		until.tv_sec += until.tv_nsec / 1000000000L;
 		until.tv_nsec %= 1000000000L;
 		while (s_enabled && s_settings_gen == gen) {

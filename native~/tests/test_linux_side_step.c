@@ -3,9 +3,11 @@
 //
 // Unit test for the side-step's pure part (displayxr_linux_side_step.h): the
 // records' layout, settings, the content grid and its coverage, the place to step
-// to, the extension's window list, and the decision tick by tick (dwell, stepping
-// aside, following, going home, the user's moves, pauses, the move cap). Built and
-// run by CTest on Linux (no D-Bus, no desktop).
+// to, the extension's window list, the decision tick by tick (dwell, stepping
+// aside, following, going home, the user's moves, pauses, the move cap), and the
+// desktop-control gate in front of every poll and glide step (nothing read while
+// not granted; a revoke stops it aside or mid-glide; a re-grant starts afresh).
+// Built and run by CTest on Linux (no D-Bus, no desktop).
 
 #include "displayxr_linux_side_step.h"
 
@@ -599,6 +601,317 @@ test_body_band(void)
 	CHECK(content_top >= 298 + 400 + 24 || content_right <= 2400 - 24 || content_left >= 3400 + 24);
 }
 
+/*
+ *
+ * The desktop-control gate (dxr_ss_poll / dxr_ss_glide), with fake reads that are
+ * counted: the worker's poll, exactly, around a small world built as the
+ * extension's JSON.
+ *
+ */
+
+typedef struct {
+	DxrSsState st;
+	DxrSsGate g;
+	DxrSsSettings s;
+	DxrSsOps ops;
+	double t;
+	int granted;           // the runtime's answer
+	int revoke_at_move;    // > 0: the grant ends right after this many moves (a revoke mid-glide)
+	DxrSsRect own, mon, doc;
+	int doc_on;            // the document is open and focused
+	int n_ask, n_list, n_lock, n_moves;
+	char calls[4096];      // 'g' granted yes, 'n' no, 'L' window list, 'K' lock state, 'M' move
+	int n_calls;
+	int events[16], gates[3];
+	DxrSsPoll last;
+	int glide_r;           // the last glide's result (-1 none)
+} Gw;
+
+static void
+gw_call(Gw *w, char c)
+{
+	if (w->n_calls < (int)sizeof(w->calls) - 1)
+		w->calls[w->n_calls++] = c;
+}
+
+static int
+gw_granted(void *ctx)
+{
+	Gw *w = ctx;
+	w->n_ask++;
+	gw_call(w, w->granted ? 'g' : 'n');
+	return w->granted;
+}
+
+static char *
+gw_list(void *ctx)
+{
+	Gw *w = ctx;
+	w->n_list++;
+	gw_call(w, 'L');
+	char *j = malloc(1024);
+	int n = snprintf(j, 1024,
+	                 "{\"version\": 1, \"windows\": [{\"id\": 14, \"pid\": 100, \"focus\": false, "
+	                 "\"frame\": [%d, %d, %d, %d], \"monitor\": {\"x\": %d, \"y\": %d, \"w\": %d, \"h\": %d}}",
+	                 w->own.x, w->own.y, w->own.w, w->own.h, w->mon.x, w->mon.y, w->mon.w, w->mon.h);
+	if (w->doc_on)
+		n += snprintf(j + n, 1024 - (size_t)n,
+		              ", {\"id\": 42, \"pid\": 200, \"app_id\": \"doc\", \"focus\": true, \"frame\": [%d, %d, %d, %d]}",
+		              w->doc.x, w->doc.y, w->doc.w, w->doc.h);
+	snprintf(j + n, 1024 - (size_t)n, "]}");
+	return j;
+}
+
+static int
+gw_lock(void *ctx)
+{
+	Gw *w = ctx;
+	w->n_lock++;
+	gw_call(w, 'K');
+	return 0;
+}
+
+static int
+gw_no(void *ctx)
+{
+	(void)ctx;
+	return 0;
+}
+
+static int
+gw_on(void *ctx)
+{
+	(void)ctx;
+	return 1;
+}
+
+static int
+gw_move(void *ctx, int x, int y, int last)
+{
+	(void)last;
+	Gw *w = ctx;
+	w->n_moves++;
+	gw_call(w, 'M');
+	w->own.x = x; // lands at once
+	w->own.y = y;
+	if (w->revoke_at_move > 0 && w->n_moves == w->revoke_at_move)
+		w->granted = 0;
+	return 1;
+}
+
+static void
+gw_wait(void *ctx, double s)
+{
+	Gw *w = ctx;
+	w->t += s;
+}
+
+static void
+gw_init(Gw *w)
+{
+	memset(w, 0, sizeof(*w));
+	dxr_ss_reset(&w->st);
+	dxr_ss_default_settings(&w->s);
+	w->ops.ctx = w;
+	w->ops.granted = gw_granted;
+	w->ops.window_list = gw_list;
+	w->ops.screen_locked = gw_lock;
+	w->ops.own_drag = gw_no;
+	w->ops.still_on = gw_on;
+	w->ops.move = gw_move;
+	w->ops.wait_s = gw_wait;
+	w->own = R(2580, 298, 600, 484);
+	w->mon = R(1920, 0, 1920, 1080);
+	w->doc = R(2480, 260, 800, 560); // over the window, room on its right
+	w->glide_r = -1;
+}
+
+//! The worker's loop: a poll every 0.25 s, then the glide its decision asks for.
+static void
+gw_run(Gw *w, double dt)
+{
+	double end = w->t + dt;
+	while (w->t + 1e-9 < end) {
+		w->t += 0.25;
+		dxr_ss_poll(&w->st, &w->g, &w->s, &w->ops, w->t, 100, NULL, &w->last);
+		w->gates[w->last.gate]++;
+		if (w->last.read && w->last.d.event)
+			w->events[w->last.d.event]++;
+		if (w->last.read && w->last.d.move)
+			w->glide_r = dxr_ss_glide(&w->g, &w->st, &w->ops, w->own.x, w->own.y, w->last.d.x, w->last.d.y,
+			                          w->s.glide_s);
+	}
+}
+
+//! Every read of other windows (L, K) and every move (M) came after a 'g' (granted)
+//! with no 'n' (not granted) in between.
+static int
+gw_reads_gated(const Gw *w)
+{
+	char gate = 0;
+	for (int i = 0; i < w->n_calls; i++) {
+		char c = w->calls[i];
+		if (c == 'g' || c == 'n')
+			gate = c;
+		else if (gate != 'g')
+			return 0;
+	}
+	return 1;
+}
+
+static void
+test_gate_never_granted(void)
+{
+	// Never asked / denied / a runtime without the extension: nothing is ever read,
+	// whatever covers the window.
+	Gw w;
+	gw_init(&w);
+	w.doc_on = 1;
+	gw_run(&w, 10.0);
+	CHECK(w.n_ask == 40 && w.n_list == 0 && w.n_lock == 0 && w.n_moves == 0);
+	CHECK(!w.last.granted && !w.last.read && w.last.gate == DXR_SS_GATE_SAME && w.gates[DXR_SS_GATE_CLOSED] == 0);
+	CHECK(w.st.reason == DXR_SS_REASON_NOT_GRANTED && dxr_ss_report_state(&w.st) == DXR_SS_STATE_PAUSED);
+	CHECK(w.st.covered == 0.0f && !w.st.have_home && w.st.aside_for == 0);
+	for (int e = 1; e < 16; e++)
+		CHECK(w.events[e] == 0);
+}
+
+static void
+test_gate_granted_scenario(void)
+{
+	// Granted from the start: the #400 scenario, unchanged: one ask, then the reads,
+	// every poll.
+	Gw w;
+	gw_init(&w);
+	w.granted = 1;
+	gw_run(&w, 3.0);
+	CHECK(w.gates[DXR_SS_GATE_OPENED] == 1 && w.st.have_home && w.st.home_x == 2580 && w.st.home_y == 298);
+	CHECK(w.n_list == 12 && w.n_lock == 12);
+	w.doc_on = 1;
+	gw_run(&w, 1.0);
+	CHECK(w.glide_r == DXR_SS_GLIDE_DONE && w.n_moves == 8); // 0.3 s glide: 8 steps
+	gw_run(&w, 0.25);
+	CHECK(w.events[DXR_SS_EV_LANDED_ASIDE] == 1 && w.st.phase == DXR_SS_PHASE_ASIDE && w.st.aside_for == 42);
+	w.doc_on = 0;
+	gw_run(&w, 3.0);
+	CHECK(w.events[DXR_SS_EV_LANDED_HOME] == 1 && w.own.x == 2580 && w.own.y == 298);
+	CHECK(gw_reads_gated(&w));
+}
+
+static void
+test_gate_revoke_aside_and_regrant(void)
+{
+	Gw w;
+	gw_init(&w);
+	w.granted = 1;
+	gw_run(&w, 3.0);
+	w.doc_on = 1;
+	gw_run(&w, 1.5); // the dwell, the glide, and the poll that sees it landed
+	CHECK(w.st.phase == DXR_SS_PHASE_ASIDE && w.st.aside_for == 42);
+	int ax = w.own.x, ay = w.own.y, moves = w.n_moves, lists = w.n_list, locks = w.n_lock;
+	CHECK(ax != 2580);
+
+	// Revoked (the user's deny, the kill switch, a lock) while aside: the next poll
+	// stops, reads nothing, forgets home and the window it stepped aside for.
+	w.granted = 0;
+	gw_run(&w, 0.25);
+	CHECK(w.last.gate == DXR_SS_GATE_CLOSED && !w.last.granted);
+	CHECK(w.n_list == lists && w.n_lock == locks);
+	CHECK(w.st.reason == DXR_SS_REASON_NOT_GRANTED && dxr_ss_report_state(&w.st) == DXR_SS_STATE_PAUSED);
+	CHECK(!w.st.have_home && w.st.aside_for == 0 && w.st.covered == 0.0f && w.st.phase == DXR_SS_PHASE_SETTLING);
+	// The document closes: no way back home (nothing is read; the window stays).
+	w.doc_on = 0;
+	gw_run(&w, 10.0);
+	CHECK(w.n_moves == moves && w.n_list == lists && w.n_lock == locks && w.own.x == ax && w.own.y == ay);
+	CHECK(w.gates[DXR_SS_GATE_CLOSED] == 1 && w.events[DXR_SS_EV_LANDED_HOME] == 0);
+
+	// Granted again: afresh; where the window is (aside) becomes home, no move back.
+	w.granted = 1;
+	gw_run(&w, 0.25);
+	CHECK(w.last.gate == DXR_SS_GATE_OPENED && w.last.read && w.st.reason == DXR_SS_REASON_SETTLING);
+	gw_run(&w, 2.5);
+	CHECK(w.st.have_home && w.st.home_x == ax && w.st.home_y == ay && w.st.phase == DXR_SS_PHASE_HOME);
+	CHECK(w.events[DXR_SS_EV_NEW_HOME] == 2);
+	gw_run(&w, 5.0);
+	CHECK(w.n_moves == moves && w.own.x == ax && w.own.y == ay);
+	// ... and it works again from the new home.
+	w.doc = R(ax - 20, ay - 18, 640, 520);
+	w.doc_on = 1;
+	gw_run(&w, 1.5);
+	CHECK(w.n_moves > moves && w.st.phase == DXR_SS_PHASE_ASIDE && w.st.home_x == ax);
+	CHECK(gw_reads_gated(&w));
+}
+
+static void
+test_gate_revoke_mid_glide(void)
+{
+	// A slow glide (1 s, 25 steps); the grant ends after its 5th step: the 6th is not
+	// made, the window stays where the 5th put it, nothing lands, everything is forgotten.
+	Gw w;
+	gw_init(&w);
+	w.granted = 1;
+	w.s.glide_s = 1.0f;
+	gw_run(&w, 3.0);
+	w.revoke_at_move = 5;
+	w.doc_on = 1;
+	gw_run(&w, 0.5); // the dwell is not over yet
+	CHECK(w.n_moves == 0);
+	gw_run(&w, 0.5); // the step aside starts and is cut short
+	int lists = w.n_list;
+	CHECK(w.glide_r == DXR_SS_GLIDE_NOT_GRANTED && w.n_moves == 5);
+	CHECK((w.own.x != 2580 || w.own.y != 298) && (w.own.x != w.last.d.x || w.own.y != w.last.d.y)); // part way
+	CHECK(w.g.open == 0 && w.st.reason == DXR_SS_REASON_NOT_GRANTED && !w.st.have_home && w.st.aside_for == 0);
+	int x = w.own.x, y = w.own.y;
+	gw_run(&w, 5.0);
+	CHECK(w.n_moves == 5 && w.n_list == lists && w.own.x == x && w.own.y == y);
+	CHECK(w.events[DXR_SS_EV_LANDED_ASIDE] == 0 && w.events[DXR_SS_EV_LANDED_HOME] == 0);
+	// The glide closed the gate itself: the polls after it report no new closing.
+	CHECK(w.gates[DXR_SS_GATE_CLOSED] == 0);
+	CHECK(gw_reads_gated(&w));
+
+	// Granted again: where the glide stopped becomes home.
+	w.granted = 1;
+	w.revoke_at_move = 0;
+	w.doc_on = 0;
+	gw_run(&w, 3.0);
+	CHECK(w.st.have_home && w.st.home_x == x && w.st.home_y == y && w.n_moves == 5);
+}
+
+static void
+test_gate_keeps_the_cap(void)
+{
+	// Our steps aside still count for the cap across a revoke and a re-grant.
+	Gw w;
+	gw_init(&w);
+	w.granted = 1;
+	w.s.glide_s = 0.0f;
+	gw_run(&w, 3.0);
+	w.doc_on = 1;
+	gw_run(&w, 1.25);
+	CHECK(w.st.n_moves == 1);
+	w.granted = 0;
+	gw_run(&w, 0.5);
+	w.granted = 1;
+	gw_run(&w, 0.25);
+	CHECK(w.last.gate == DXR_SS_GATE_OPENED && w.st.n_moves == 1 && dxr_ss_recent_moves(&w.st, w.t) == 1);
+}
+
+static void
+test_gate_new_session(void)
+{
+	// The worker clears the gate when the session ends (the grant is asked for again
+	// with the next one): the first granted poll after it starts afresh, whatever the
+	// decision remembered.
+	Gw w;
+	gw_init(&w);
+	w.granted = 1;
+	gw_run(&w, 3.0);
+	CHECK(w.st.have_home && w.gates[DXR_SS_GATE_OPENED] == 1);
+	w.g.open = 0;
+	gw_run(&w, 0.25);
+	CHECK(w.last.gate == DXR_SS_GATE_OPENED && !w.st.have_home && w.st.reason == DXR_SS_REASON_SETTLING);
+}
+
 int
 main(void)
 {
@@ -616,6 +929,12 @@ main(void)
 	test_move_cap();
 	test_no_return_home();
 	test_body_band();
+	test_gate_never_granted();
+	test_gate_granted_scenario();
+	test_gate_revoke_aside_and_regrant();
+	test_gate_revoke_mid_glide();
+	test_gate_keeps_the_cap();
+	test_gate_new_session();
 	if (s_failed) {
 		fprintf(stderr, "test_linux_side_step: %d check(s) failed\n", s_failed);
 		return 1;

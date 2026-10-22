@@ -7,17 +7,27 @@
 // and the exports are in displayxr_linux_side_step.c; this header holds the pure
 // part (no D-Bus, no Wayland, no clock), so it is unit-tested on its own
 // (native~/tests/test_linux_side_step.c):
+//   - the desktop-control gate in front of every poll, and the glide that stops
+//     when the grant ends (both through DxrSsOps, so the test counts the reads),
 //   - reading the extension's window list into the few facts the decision needs,
 //   - which other window counts,
 //   - how much of the app's content a rect covers,
 //   - where to step to,
 //   - the decision itself, one tick at a time.
 //
+// CONSENT. Side-step runs only while the app's desktop control is GRANTED (the
+// #389 gate, runtime ADR-056: the same synchronous runtime query that
+// DisplayXRNative.LinuxWindows / LinuxWindowAt / LinuxPointer answer behind).
+// dxr_ss_poll asks the gate first on every poll and reads nothing about other
+// windows (nor the lock state) unless it says yes; when it says no, everything the
+// decision remembered (home, the window it stepped aside for) is forgotten and the
+// window stays where it is (docs~/architecture/side-step.md).
+//
 // PRIVACY. Other windows' frames and focus are read here, inside the plug-in, and
 // never leave it: no other window's id, pid, app id, title or rect is stored past
 // one tick (except the id of the window the app stepped aside for, to tell when
-// it is gone), logged, or handed to the app. The app learns only facts about its
-// OWN window (docs~/architecture/side-step.md).
+// it is gone, and only while the grant holds), logged, or handed to the app. The
+// app learns only facts about its OWN window.
 //
 // COORDINATES. Everything is in mutter's stage coordinates, what the extension
 // reports (logical px in its logical layout mode). The app's content ("body") is
@@ -136,6 +146,7 @@ typedef struct DxrSsSettings {
 #define DXR_SS_REASON_TOO_MANY_MOVES 12   //!< DXR_SS_CAP_MOVES steps aside in DXR_SS_CAP_WINDOW_S: staying
 #define DXR_SS_REASON_NO_FREE_SPOT 13     //!< covered, but no place on this monitor is free
 #define DXR_SS_REASON_NATIVE_MISSING 14   //!< (C# only) a native plug-in without side-step
+#define DXR_SS_REASON_NOT_GRANTED 15      //!< the app's desktop control is not Granted: nothing is read
 
 //! Events of one tick (dxr_ss_step), for the log and the counters.
 #define DXR_SS_EV_NONE 0
@@ -678,7 +689,8 @@ dxr_ss_report_state(const DxrSsState *st)
 	case DXR_SS_REASON_MINIMIZED:
 	case DXR_SS_REASON_MAXIMIZED:
 	case DXR_SS_REASON_FULLSCREEN:
-	case DXR_SS_REASON_TOO_MANY_MOVES: return DXR_SS_STATE_PAUSED;
+	case DXR_SS_REASON_TOO_MANY_MOVES:
+	case DXR_SS_REASON_NOT_GRANTED: return DXR_SS_STATE_PAUSED;
 	default: break;
 	}
 	if (st->phase == DXR_SS_PHASE_MOVING)
@@ -857,6 +869,151 @@ dxr_ss_step(DxrSsState *st, const DxrSsSettings *s, const DxrSsInput *in, DxrSsD
 			return;
 		dxr_ss_start_move(st, d, now, st->home_x, st->home_y, 1);
 	}
+}
+
+/*
+ *
+ * One poll, behind the desktop-control gate, and the glide.
+ *
+ */
+
+//! What a poll reads and does, as calls: displayxr_linux_side_step.c wires the real
+//! ones, the unit test fakes them (and counts them). window_list and screen_locked
+//! are the only reads of other windows and of the desktop; dxr_ss_poll makes them
+//! only after `granted` said yes on that same poll.
+typedef struct DxrSsOps {
+	void *ctx;
+	//! 1 when the app's desktop control is Granted right now: the #389 gate, the same
+	//! synchronous runtime query DisplayXRNative.LinuxWindows answers behind
+	//! (dxr_prov_desktop_get_state, state XR_DESKTOP_CONTROL_STATE_GRANTED_DXR).
+	int (*granted)(void *ctx);
+	char *(*window_list)(void *ctx); //!< the extension's window list (malloc'd JSON; NULL = none)
+	int (*screen_locked)(void *ctx); //!< 1 locked, 0 not, -1 cannot tell
+	int (*own_drag)(void *ctx);      //!< the plug-in's own right-drag of the window is running
+	int (*still_on)(void *ctx);      //!< side-step is still enabled
+	//! Move the app's OWN window's frame to (x, y), stage px; `last`: the glide's last
+	//! step. 1 when asked, 0 when it cannot be moved.
+	int (*move)(void *ctx, int x, int y, int last);
+	void (*wait_s)(void *ctx, double seconds); //!< between glide steps
+} DxrSsOps;
+
+//! The gate's memory between polls.
+typedef struct DxrSsGate {
+	int open; //!< the grant held on the last poll (or glide step) that asked
+} DxrSsGate;
+
+#define DXR_SS_GATE_SAME 0   //!< as on the last poll
+#define DXR_SS_GATE_OPENED 1 //!< granted now, not before: started afresh (the window's place becomes home)
+#define DXR_SS_GATE_CLOSED 2 //!< not granted now, granted before: stopped, everything forgotten
+
+//! One poll's outcome.
+typedef struct DxrSsPoll {
+	int gate;     //!< DXR_SS_GATE_*
+	int granted;  //!< the grant held: the window list was asked for
+	int read;     //!< ... and understood (0: no window list, DXR_SS_REASON_NO_EXTENSION)
+	DxrSsInput in; //!< valid when read
+	DxrSsDecision d; //!< valid when read
+} DxrSsPoll;
+
+//! Start afresh, but keep the times of our own recent steps aside: the move cap
+//! (DXR_SS_CAP_MOVES a minute) still counts across a revoke, a lock, a re-grant.
+static inline void
+dxr_ss_forget(DxrSsState *st)
+{
+	double moves[DXR_SS_CAP_MOVES];
+	memcpy(moves, st->moves, sizeof(moves));
+	int n = st->n_moves;
+	dxr_ss_reset(st);
+	memcpy(st->moves, moves, sizeof(moves));
+	st->n_moves = n;
+}
+
+//! The grant is gone: forget everything the decision remembered (home, the place it
+//! was going to, the window it stepped aside for). The window stays where it is;
+//! when the grant comes back, the decision starts afresh, as after turning
+//! side-step off and on (the place the window stays put at becomes home).
+static inline void
+dxr_ss_gate_close(DxrSsGate *g, DxrSsState *st)
+{
+	g->open = 0;
+	dxr_ss_forget(st);
+	st->reason = DXR_SS_REASON_NOT_GRANTED;
+}
+
+//! One poll (the worker makes one every DXR_SS_POLL_MS). First the gate: not
+//! granted -> nothing is read (no window list, no lock state), the decision's
+//! memory is forgotten if the grant held before, and the reason is NOT_GRANTED.
+//! Granted -> the window list, the lock state, the decision (`now` seconds; `body`
+//! NULL = the whole window).
+static inline void
+dxr_ss_poll(DxrSsState *st, DxrSsGate *g, const DxrSsSettings *s, const DxrSsOps *ops, double now, int own_pid,
+            const DxrSsBody *body, DxrSsPoll *p)
+{
+	memset(p, 0, sizeof(*p));
+	if (!ops->granted(ops->ctx)) {
+		p->gate = g->open ? DXR_SS_GATE_CLOSED : DXR_SS_GATE_SAME;
+		dxr_ss_gate_close(g, st);
+		return;
+	}
+	if (!g->open) {
+		g->open = 1;
+		dxr_ss_forget(st); // afresh: no home from before the grant
+		p->gate = DXR_SS_GATE_OPENED;
+	}
+	p->granted = 1;
+	char *json = ops->window_list(ops->ctx);
+	int ok = json && dxr_ss_parse_windows(json, own_pid, st->aside_for, &p->in);
+	free(json);
+	if (!ok) {
+		st->covered = 0.0f;
+		st->reason = DXR_SS_REASON_NO_EXTENSION;
+		return;
+	}
+	p->read = 1;
+	p->in.now = now;
+	p->in.locked = ops->screen_locked(ops->ctx) == 1;
+	p->in.own_moving = p->in.own_moving || ops->own_drag(ops->ctx);
+	p->in.body = body;
+	dxr_ss_step(st, s, &p->in, &p->d);
+}
+
+#define DXR_SS_GLIDE_STEP_S 0.04 //!< one glide step per this, roughly (at most 30 steps)
+
+#define DXR_SS_GLIDE_DONE 0        //!< all steps asked; the last one is the target
+#define DXR_SS_GLIDE_STOPPED 1     //!< side-step turned off, or the user took the window: it stays where it is
+#define DXR_SS_GLIDE_NOT_GRANTED 2 //!< the grant ended: it stays where it is, the gate is closed (forgotten)
+#define DXR_SS_GLIDE_CANNOT_MOVE 3 //!< the Wayland library cannot move the window
+
+//! Glide the app's own window from (fx, fy) to (tx, ty), stage px, in `seconds`
+//! (ease-out; the last step is the target). Before each step: still on, the user
+//! not dragging it, and still GRANTED (the same gate as the poll's); the first
+//! that fails stops it where it is. A glide stopped for the grant closes the gate
+//! (dxr_ss_gate_close). Returns DXR_SS_GLIDE_*.
+static inline int
+dxr_ss_glide(DxrSsGate *g, DxrSsState *st, const DxrSsOps *ops, int fx, int fy, int tx, int ty, double seconds)
+{
+	int steps = seconds > 0.0 ? (int)lround(seconds / DXR_SS_GLIDE_STEP_S) : 1;
+	if (steps < 1)
+		steps = 1;
+	if (steps > 30)
+		steps = 30;
+	double step_s = steps > 1 ? seconds / steps : 0.0;
+	for (int i = 1; i <= steps; i++) {
+		if (!ops->still_on(ops->ctx) || ops->own_drag(ops->ctx))
+			return DXR_SS_GLIDE_STOPPED;
+		if (!ops->granted(ops->ctx)) {
+			dxr_ss_gate_close(g, st);
+			return DXR_SS_GLIDE_NOT_GRANTED;
+		}
+		double t = (double)i / steps, e = 1.0 - (1.0 - t) * (1.0 - t);
+		int x = i == steps ? tx : (int)lround(fx + (tx - fx) * e);
+		int y = i == steps ? ty : (int)lround(fy + (ty - fy) * e);
+		if (!ops->move(ops->ctx, x, y, i == steps))
+			return DXR_SS_GLIDE_CANNOT_MOVE;
+		if (i < steps)
+			ops->wait_s(ops->ctx, step_s);
+	}
+	return DXR_SS_GLIDE_DONE;
 }
 
 #ifdef __cplusplus
