@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.30.1] - 2026-10-22
+
+Windows: a Unity app whose window was minimized, not sized yet, or briefly behind an IME window no longer fails to start its DisplayXR session (DisplayXR/displayxr-runtime#2275).
+
+### Fixed
+- **The overlay is never born 0x0 when Unity's window is minimized or empty (#392).** The runtime creates its compositor at the overlay's size, so a 0x0 overlay meant a 0x0 atlas, a failed `xrCreateSession` and an app showing nothing but its taskbar button ("No DisplayXR session after 5s"). When Unity's client rect is empty or the window is iconic, the overlay is now born at the work area of Unity's monitor (else 1280x720). One log line on every birth records Unity's window state; the transparent path's snap no longer moves the overlay onto a minimized Unity's off-screen rect. The runtime side was fixed in DisplayXR/displayxr-runtime#2274.
+- **`find_unity_hwnd` no longer takes a zero-size IME window for Unity's window (#393).** The foreground window was accepted unchecked, and `GetForegroundWindow` can answer one of the process's hidden 0x0 IME windows (e.g. Microsoft Pinyin's "MSCTFIME UI"). Now: the foreground window only if it is a Unity player window or visible and wider than 100 px; else, in a player, the `UnityWndClass` window (visible or not); else the first visible window wider than 100 px. Overlay, dedicated and IME windows are never candidates; the editor resolves as before. One log line whenever the answer changes.
+
 ## [2.30.0] - 2026-10-22
 
 Desktop control for the app's agent, continued: `XR_DXR_desktop_control` spec v3 (held keys and buttons, modifiers, the shell target, clipboard text; DisplayXR/displayxr-runtime#2271), blocking screen capture from any thread (#387), and read-only Linux desktop info (monitors and X root scale always; windows, window at a point and pointer only while desktop control is granted).
