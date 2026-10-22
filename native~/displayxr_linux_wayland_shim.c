@@ -113,6 +113,8 @@ api(void)
 // lock covers it, a direct call and the hand-over, so the app's LAST call wins.
 static pthread_mutex_t s_keep_above_mutex = PTHREAD_MUTEX_INITIALIZER;
 static int s_pending_keep_above = -1;
+// File drops asked for before then, the same way (-1 none, else the value).
+static int s_pending_file_drop = -1;
 
 int
 dxr_wl_weave_surface_create(struct wl_display *display, struct wl_surface *parent, int lw, int lh,
@@ -125,6 +127,10 @@ dxr_wl_weave_surface_create(struct wl_display *display, struct wl_surface *paren
 	if (a && s_pending_keep_above >= 0) {
 		a->set_keep_above(s_pending_keep_above);
 		s_pending_keep_above = -1;
+	}
+	if (a && s_pending_file_drop >= 0) {
+		a->file_drop_enable(s_pending_file_drop);
+		s_pending_file_drop = -1;
 	}
 	pthread_mutex_unlock(&s_keep_above_mutex);
 	return created;
@@ -314,4 +320,32 @@ dxr_wl_export_handle(char *buf, int len)
 	if (buf && len > 0)
 		buf[0] = 0;
 	return 0;
+}
+
+int
+dxr_wl_file_drop_enable(int enable)
+{
+	pthread_mutex_lock(&s_keep_above_mutex);
+	const DxrWlApi *a = api();
+	int r;
+	if (a) {
+		s_pending_file_drop = -1; // superseded
+		r = a->file_drop_enable(enable);
+	} else if (!dxr_wl_capture_wanted()) {
+		// Not a native-Wayland player (X11 / XWayland, or the editor): its drops are
+		// XDND ClientMessages to Unity's own X connection, which we cannot receive.
+		r = enable ? -1 : 0;
+	} else {
+		s_pending_file_drop = enable ? 1 : 0;
+		r = 0;
+	}
+	pthread_mutex_unlock(&s_keep_above_mutex);
+	return r;
+}
+
+int
+dxr_wl_file_drop_next(DxrWlDropEvent *event, char *paths, int paths_len)
+{
+	const DxrWlApi *a = api();
+	return a ? a->file_drop_next(event, paths, paths_len) : 0;
 }

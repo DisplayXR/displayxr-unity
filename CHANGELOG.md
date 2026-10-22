@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Files dragged onto the app's window, for a native-Wayland player (opt-in).** A Linux player running natively on Wayland can now receive files dragged onto its window from a file manager. Unity's own Wayland drag and drop is out of a plug-in's reach (SDL is linked into the player and exports nothing), so the plug-in's Wayland support library becomes the window's drop target itself.
+  - `DisplayXRNative.displayxr_linux_file_drop_enable(1)` turns it on (`0` turns it off). It returns `1` when on now, `0` when remembered until the DisplayXR session binds the window (it may be called before the first session), and `-1` when unsupported. Poll `DisplayXRNative.LinuxFileDropNext(out LinuxFileDropEvent ev, out string[] paths)` every frame (any thread): **enter** (files dragged onto the window, with their paths), **move** (coalesced to the latest position), **leave** (they left, or the drag was cancelled) and **drop** (the paths). Each event carries the pointer in window device px (always), and in GNOME's stage px and X root px (the window-position API's space) when known (`flags`). Events arrive while a DisplayXR session runs.
+  - Only local files are offered (`text/uri-list` entries with `file://` and an empty, `localhost` or this machine's host name; percent-decoded). A drag without a local file (text only, web links) is refused. A drop is accepted as COPY only, never MOVE, so the file manager never deletes the source.
+  - **What turning it on costs: Unity's clipboard reads.** GNOME keeps one data device per app, and the plug-in's replaces SDL's for the rest of the run, so Unity gets no new clipboard offers and `GUIUtility.systemCopyBuffer` cannot be relied on for what other apps copy (measured on GNOME 50: `""` when Unity never had an offer, else the text of an offer it still held). Unity's own copies still read back. Turning drops off does not give it back. An app that turns drops on must read the clipboard another way, e.g. the RemoteDesktop portal's clipboard on GNOME.
+  - X11 / XWayland players: unsupported (`-1`); XDND messages go to the window owner's X connection, which is Unity's. Windows, macOS and the editor: the imports are Linux-player only, like the other `displayxr_linux_*` imports.
+  - **No behaviour change for apps that do not turn it on**: the Wayland library then only binds the data-device manager global.
+  - Native: `displayxr_linux_file_drop_enable`, `displayxr_linux_file_drop_next` (`DxrWlDropEvent`, ten int32). `DXR_WL_LIB_ABI` 7 -> 8 (two `DxrWlApi` slots appended); both libraries' NEEDED lists are unchanged. The GNOME extension's window report is now also read for its `focus` and `buffer` (main surface) fields. New header-only parser `native~/displayxr_linux_uri_list.h`; `native~/tests/test_uri_list.c` (CTest) covers the parser and the drop point's coordinates.
+
 ## [2.30.1] - 2026-10-22
 
 Windows: a Unity app whose window was minimized, not sized yet, or briefly behind an IME window no longer fails to start its DisplayXR session (DisplayXR/displayxr-runtime#2275).

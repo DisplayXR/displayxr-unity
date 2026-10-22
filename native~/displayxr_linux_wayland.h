@@ -154,6 +154,23 @@ int dxr_wl_window_state(void);
 //! shown again (a frame or two after it is).
 int dxr_wl_export_handle(char *buf, int len);
 
+//! Files dragged onto the player's window (a file manager's drag and drop), for
+//! the app. enable 1: bind our own wl_data_device on the player's connection;
+//! 0: release it. What that costs (SDL gets no new clipboard offers for the rest
+//! of the run) is in displayxr_linux_wayland.c. Remembered
+//! when asked before the first native-Wayland session (applied once the weave
+//! binds the window). Returns 1 when drops are on now, 0 when remembered (or
+//! turned off), -1 when unsupported: an X11 / XWayland player (XDND goes to the
+//! window owner's X connection, Unity's), or a compositor without
+//! wl_data_device_manager version 3.
+int dxr_wl_file_drop_enable(int enable);
+//! Takes the oldest drop event (DxrWlDropEvent, displayxr_linux_wayland_lib.h)
+//! into @p event and its paths (UTF-8, each NUL-terminated, then one more NUL)
+//! into @p paths. Returns the event's kind; 0 when there is none; -1 when
+//! @p paths_len is smaller than event->paths_bytes (the event stays queued: call
+//! again with that much room). Any thread; it reads a queue the frame thread fills.
+int dxr_wl_file_drop_next(DxrWlDropEvent *event, char *paths, int paths_len);
+
 #ifdef __cplusplus
 }
 #endif

@@ -1794,6 +1794,40 @@ displayxr_linux_window_handle(char *buf, int len)
 }
 
 // ---------------------------------------------------------------------------
+// File drops onto the window (native Wayland)
+// ---------------------------------------------------------------------------
+//
+// Files dragged onto the app's window from a file manager. Native Wayland only:
+// the Wayland library makes its own wl_data_device (dxr_wl_file_drop_enable; the
+// design and what it costs the app are in displayxr_linux_wayland.c, "File
+// drops"). An X11 / XWayland player cannot get them here: XDND sends its
+// ClientMessages to the window owner's X connection, which is Unity's, not ours.
+
+_Static_assert(sizeof(DxrWlDropEvent) == 10 * sizeof(int32_t), "C# reads DxrWlDropEvent as ten int32");
+
+/// Native-Wayland player: receive files dragged onto the window (1) or stop (0).
+/// Turning it on costs the app SDL's clipboard: SDL gets no new clipboard offers,
+/// so GUIUtility.systemCopyBuffer cannot be relied on for what other apps copy, for
+/// the rest of the run (turning it off does not give it back). Returns 1 when on now, 0 when remembered until the 3D
+/// session binds the window (or when turned off), -1 when unsupported (X11 /
+/// XWayland player, or no wl_data_device_manager version 3).
+DISPLAYXR_EXPORT int
+displayxr_linux_file_drop_enable(int enable)
+{
+	return dxr_wl_file_drop_enable(enable);
+}
+
+/// Native-Wayland player: the oldest file-drop event, if any (see
+/// dxr_wl_file_drop_next). Returns its kind (1 enter, 2 move, 3 leave, 4 drop), 0
+/// when there is none, -1 when @p paths is too small (event->paths_bytes says how
+/// big; the event stays queued).
+DISPLAYXR_EXPORT int
+displayxr_linux_file_drop_next(struct DxrWlDropEvent *event, char *paths, int paths_len)
+{
+	return dxr_wl_file_drop_next(event, paths, paths_len);
+}
+
+// ---------------------------------------------------------------------------
 // Foreground query (#332)
 // ---------------------------------------------------------------------------
 //

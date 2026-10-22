@@ -259,6 +259,10 @@ if(UNIX AND NOT APPLE AND NOT ANDROID)
         add_executable(test_wayland_place tests/test_wayland_place.c)
         target_include_directories(test_wayland_place PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         add_test(NAME wayland_place COMMAND test_wayland_place)
+        # File drops: the text/uri-list parser and the drop point's coordinates.
+        add_executable(test_uri_list tests/test_uri_list.c)
+        target_include_directories(test_uri_list PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        add_test(NAME uri_list COMMAND test_uri_list)
     else()
         message(WARNING "displayxr_unity: wayland-client (pkg-config) or wayland-scanner not found - "
                         "building WITHOUT libdisplayxr_unity_wayland.so (no native-Wayland player support). "
