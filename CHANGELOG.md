@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Linux: a second clipboard write in a row through the plug-in is no longer lost (#398, #394).** Two `DisplayXRNative.SetLinuxClipboardText` calls with no input in between carried the same input serial, and mutter ignores a new selection with a serial no newer than the current one while that selection's source still exists, so every second write never reached the clipboard. The plug-in now takes its previous text off the clipboard before it sets the new one in that case (`dxr_clip_drop_before_set`, unit-tested); readers it is still serving keep their own copy.
+
 ## [2.31.0] - 2026-10-22
 
 Linux: side-step (the app's own window steps aside for the window the user works in, only while desktop control is granted) and a clipboard through the plug-in for players with file drops on. Windows: a deferred overlay position reads back.
