@@ -736,18 +736,19 @@ namespace DisplayXR
         /// file manager (1), or stop (0). Poll the events with
         /// <see cref="LinuxFileDropNext"/> (or <see cref="displayxr_linux_file_drop_next"/>)
         /// every frame; they arrive while a DisplayXR session runs.
-        /// <para><b>What turning it on costs:</b> the plugin's own Wayland data device
-        /// replaces SDL's (the compositor keeps one per app), so from then on Unity gets
-        /// no new clipboard offers, for the rest of the run, and
-        /// <c>GUIUtility.systemCopyBuffer</c> cannot be relied on for what other apps
-        /// copy: on GNOME 50 it read "" when Unity had never had an offer, and the
-        /// current text when it still held one from before. Unity's own copies still
-        /// read back; writing still works while the app has keyboard focus, as before
-        /// (GNOME takes clipboard writes only from the focused app). Turning drops off
-        /// does not give it back. An
-        /// app that turns drops on reads the clipboard another way (on GNOME: the
-        /// RemoteDesktop portal's Clipboard, which also works while the app is not
-        /// focused).</para>
+        /// <para><b>What it does to Unity's clipboard:</b> the first time the app loses
+        /// the keyboard focus with drops on, the plugin's own Wayland data device
+        /// replaces SDL's for the rest of the run (GNOME sends a drag to one data device
+        /// per app, and making ours the one unlinks SDL's). From then on
+        /// <c>GUIUtility.systemCopyBuffer</c> cannot read what other apps copy (on GNOME
+        /// 50 it reads "" or an older text); Unity's own copies still read back. Read and
+        /// write the clipboard with <see cref="LinuxClipboardText"/> /
+        /// <see cref="SetLinuxClipboardText"/> then (<see cref="LinuxClipboardState"/> tells
+        /// when: <see cref="LinuxClipboardStateSdlCut"/>; a <c>systemCopyBuffer</c> write
+        /// crashed the test player inside SDL in this state). Turning drops off before the
+        /// first focus loss leaves SDL's clipboard as it was; after it, SDL's does not
+        /// come back (GNOME never re-links a replaced data device) and the plugin keeps
+        /// its own for the clipboard.</para>
         /// Returns 1 when drops are on now; 0 when remembered until the session binds
         /// the window (or when turned off); -1 when unsupported: an X11 / XWayland
         /// player (XDND messages go to Unity's own X connection, which the plugin
@@ -802,6 +803,131 @@ namespace DisplayXR
                 return true;
             }
         }
+
+        /// <summary>What a <see cref="LinuxClipboardText"/> / <see cref="SetLinuxClipboardText"/>
+        /// call came to (the native DXR_CLIP_* codes).</summary>
+        public enum LinuxClipboardResult
+        {
+            /// <summary>Done.</summary>
+            Done = 0,
+            /// <summary>No plugin clipboard here: no DisplayXR session (or an X11 / XWayland
+            /// player, or the editor).</summary>
+            Unavailable = -1,
+            /// <summary>SDL's clipboard still works (file drops never replaced it): use
+            /// <c>GUIUtility.systemCopyBuffer</c>.</summary>
+            UseSystemCopyBuffer = -2,
+            /// <summary>The app does not have the keyboard focus: Wayland gives the clipboard to
+            /// the focused app only. Without the focus, use the runtime's desktop-control
+            /// clipboard (<see cref="DisplayXRDesktop.GetClipboardText"/> /
+            /// <see cref="DisplayXRDesktop.SetClipboardText"/>, spec v3, under the user's consent).</summary>
+            NotFocused = -3,
+            /// <summary>Read: the text is on its way; call again (next frame on the main thread).</summary>
+            Pending = -4,
+            /// <summary>More than <see cref="LinuxClipboardMaxBytes"/>.</summary>
+            TooLarge = -6,
+            /// <summary>The clipboard's owner sent nothing in time, or another error.</summary>
+            Failed = -7,
+            /// <summary>Write: a text with a NUL character.</summary>
+            Invalid = -8,
+        }
+
+        /// <summary>The most text a read or a write takes, in UTF-8 bytes (1 MiB).</summary>
+        public const int LinuxClipboardMaxBytes = 1024 * 1024;
+        /// <summary><see cref="LinuxClipboardState"/>: the plugin's clipboard serves reads and writes.</summary>
+        public const int LinuxClipboardStateAvailable = 1;
+        /// <summary><see cref="LinuxClipboardState"/>: the app has the keyboard focus.</summary>
+        public const int LinuxClipboardStateFocused = 2;
+        /// <summary><see cref="LinuxClipboardState"/>: SDL's data device was replaced (file drops):
+        /// <c>GUIUtility.systemCopyBuffer</c> cannot read other apps' copies for the rest of the run.</summary>
+        public const int LinuxClipboardStateSdlCut = 4;
+        /// <summary><see cref="LinuxClipboardState"/>: the clipboard holds the plugin's last write.</summary>
+        public const int LinuxClipboardStateOwned = 8;
+
+        /// <summary>Native-Wayland player: the plugin clipboard's state, <c>LinuxClipboardState*</c> bits.</summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int displayxr_linux_clipboard_state();
+
+        /// <summary>Native-Wayland player: reads the clipboard's text (see <see cref="LinuxClipboardText"/>):
+        /// its length in bytes, NUL-terminated in <paramref name="buf"/>, or a negative
+        /// <see cref="LinuxClipboardResult"/>; -5 when <paramref name="buf"/> is too small
+        /// (<paramref name="needed"/> bytes; the text is kept for the next call). Waits up to
+        /// <paramref name="timeoutMs"/>; pass 0 on Unity's main thread.</summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int displayxr_linux_clipboard_read([Out] byte[] buf, int len, int timeoutMs, out int needed);
+
+        /// <summary>Native-Wayland player: puts <paramref name="len"/> bytes of UTF-8 text on the
+        /// clipboard (0 empties it): 1, or a negative <see cref="LinuxClipboardResult"/>.</summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int displayxr_linux_clipboard_write(byte[] utf8, int len);
+
+        /// <summary>Native-Wayland player: the plugin clipboard's state, <c>LinuxClipboardState*</c>
+        /// bits; 0 with an older native plugin.</summary>
+        public static int LinuxClipboardState()
+        {
+            try { return displayxr_linux_clipboard_state(); }
+            catch (EntryPointNotFoundException) { return 0; }
+        }
+
+        /// <summary>
+        /// Native-Wayland player: the clipboard's text, read through the plugin's own Wayland
+        /// data device. For an app with file drops on, whose <c>GUIUtility.systemCopyBuffer</c>
+        /// no longer reads other apps' copies (<see cref="displayxr_linux_file_drop_enable"/>);
+        /// until that happens it answers <see cref="LinuxClipboardResult.UseSystemCopyBuffer"/>.
+        /// <para>By the Wayland rules it reads only while the app has the keyboard focus
+        /// (<see cref="LinuxClipboardResult.NotFocused"/> otherwise; for an app that reads the
+        /// clipboard without the focus, e.g. after sending Ctrl+C to another app, use the runtime's
+        /// <see cref="DisplayXRDesktop.GetClipboardText"/>). "" when the clipboard holds no text.</para>
+        /// <para>Never blocks Unity's main thread: there it starts the read and answers
+        /// <see cref="LinuxClipboardResult.Pending"/> until the text is in (call again next frame;
+        /// usually the next call has it). On another thread it waits up to
+        /// <paramref name="timeoutMs"/> (at most 3 s are used). Any thread; the text never reaches a log.</para>
+        /// </summary>
+        public static LinuxClipboardResult LinuxClipboardText(out string text, int timeoutMs = 1000)
+        {
+            text = null;
+            if (DisplayXRDesktopCaptureTimeout.OnMainThread)
+                timeoutMs = 0;
+            var buf = new byte[4096]; // per call: a waiting worker never holds up the main thread
+            try
+            {
+                for (;;)
+                {
+                    int rc = displayxr_linux_clipboard_read(buf, buf.Length, Math.Max(0, timeoutMs), out int needed);
+                    if (rc == -5 && needed > buf.Length)
+                    {
+                        buf = new byte[needed]; // the text waits for this call
+                        continue;
+                    }
+                    if (rc < 0)
+                        return (LinuxClipboardResult)rc;
+                    text = System.Text.Encoding.UTF8.GetString(buf, 0, rc);
+                    return LinuxClipboardResult.Done;
+                }
+            }
+            catch (EntryPointNotFoundException) { return LinuxClipboardResult.Unavailable; }
+        }
+
+        /// <summary>
+        /// Native-Wayland player: puts <paramref name="text"/> on the clipboard through the plugin's
+        /// own Wayland data device ("" or null empties it). Same rules as
+        /// <see cref="LinuxClipboardText"/>: only once file drops replaced SDL's data device
+        /// (<see cref="LinuxClipboardResult.UseSystemCopyBuffer"/> before: systemCopyBuffer works), and
+        /// only while the app has the keyboard focus (without it, use
+        /// <see cref="DisplayXRDesktop.SetClipboardText"/>). Returns at once; the text stays on the
+        /// clipboard while the DisplayXR session runs (GNOME keeps a copy after that), until something
+        /// else is copied. <see cref="LinuxClipboardStateOwned"/> confirms it a frame later.
+        /// </summary>
+        public static LinuxClipboardResult SetLinuxClipboardText(string text)
+        {
+            byte[] b = System.Text.Encoding.UTF8.GetBytes(text ?? "");
+            try
+            {
+                int rc = displayxr_linux_clipboard_write(b, b.Length);
+                return rc >= 0 ? LinuxClipboardResult.Done : (LinuxClipboardResult)rc;
+            }
+            catch (EntryPointNotFoundException) { return LinuxClipboardResult.Unavailable; }
+        }
+
 #endif
 
         /// <summary>
