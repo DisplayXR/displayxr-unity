@@ -1210,6 +1210,67 @@ register_overlay_class(void)
 	return 1;
 }
 
+/*
+ * Birth rect for the overlay when Unity's own client area cannot be used: it is
+ * empty (a window not sized yet) or the window is minimized (an iconic window
+ * reports a 0x0 client rect and an off-screen icon origin).
+ *
+ * The 3D panel's desktop rect would be the ideal answer but is not known yet:
+ * the runtime is first asked in the provider's GfxStart, after LifecycleStart
+ * has created this window. So it is the WORK AREA of the monitor Unity is on --
+ * for a minimized window MonitorFromWindow answers for its restored placement;
+ * for one the pre-cloak parked at (-32000,-32000) (#277) it is the monitor of
+ * the rect the window had before the park -- else 1280x720 at the desktop origin.
+ * Never exactly the monitor rect (an auto-hidden taskbar makes the work area the
+ * whole monitor), for the #131 reason: a window that is exactly the monitor trips
+ * fullscreen optimization and the DWM-alpha white flash.
+ *
+ * DPI: every number here comes from, and goes back into, Win32 calls on THIS
+ * thread -- Unity's main thread, unpinned: the context the rest of the birth and
+ * its CreateWindowExW run in, and the one the pre-cloak captured
+ * s_unity_saved_rect in. Nothing crosses spaces. Do NOT pin this function on its
+ * own: it would hand physical px to an unpinned CreateWindowExW.
+ */
+static const char *
+overlay_birth_fallback_rect(HWND unity_hwnd, int toplevel, int *x, int *y, int *w, int *h)
+{
+	const char *src = "work area of Unity's monitor";
+	HMONITOR mon = NULL;
+	RECT wr = {0, 0, 0, 0};
+	GetWindowRect(unity_hwnd, &wr);
+	const int parked = !IsIconic(unity_hwnd) && wr.left <= -30000;
+	const int saved_ok = s_unity_saved_rect.left > -30000 &&
+	                     s_unity_saved_rect.right > s_unity_saved_rect.left &&
+	                     s_unity_saved_rect.bottom > s_unity_saved_rect.top;
+	if (parked && saved_ok) {
+		mon = MonitorFromRect(&s_unity_saved_rect, MONITOR_DEFAULTTONEAREST);
+		src = "work area of the monitor Unity was on before the early park";
+	} else {
+		mon = MonitorFromWindow(unity_hwnd, MONITOR_DEFAULTTONEAREST);
+	}
+
+	MONITORINFO mi;
+	mi.cbSize = sizeof(mi);
+	if (mon != NULL && GetMonitorInfo(mon, &mi) &&
+	    mi.rcWork.right > mi.rcWork.left && mi.rcWork.bottom > mi.rcWork.top) {
+		*w = (int)(mi.rcWork.right - mi.rcWork.left);
+		*h = (int)(mi.rcWork.bottom - mi.rcWork.top);
+		if (EqualRect(&mi.rcWork, &mi.rcMonitor)) {
+			*w -= 1;
+			*h -= 1;
+		}
+		*x = toplevel ? (int)mi.rcWork.left : 0;
+		*y = toplevel ? (int)mi.rcWork.top : 0;
+		return src;
+	}
+
+	*w = 1280;
+	*h = 720;
+	*x = 0;
+	*y = 0;
+	return "default 1280x720, no monitor info";
+}
+
 void *
 displayxr_get_app_main_view(void)
 {
@@ -1225,10 +1286,16 @@ displayxr_get_app_main_view(void)
 	if (!register_overlay_class())
 		return NULL;
 
-	RECT client_rc;
+	RECT client_rc = {0, 0, 0, 0};
 	GetClientRect(unity_hwnd, &client_rc);
 	int w = client_rc.right - client_rc.left;
 	int h = client_rc.bottom - client_rc.top;
+	// Unity's window as the overlay finds it, logged unconditionally below: the
+	// overlay is born at this size and the runtime creates its compositor at the
+	// overlay's size, so an empty one here is a session that cannot start.
+	const int unity_client_w = w;
+	const int unity_client_h = h;
+	const int unity_iconic = IsIconic(unity_hwnd) ? 1 : 0;
 
 	// Transparent overlay mode (issue #57 / runtime-pvt #191): create the
 	// overlay as a top-level WS_POPUP with WS_EX_NOREDIRECTIONBITMAP.
@@ -1299,6 +1366,7 @@ displayxr_get_app_main_view(void)
 	// never resized later (a resize recreates the swapchain = a flash). If the
 	// pref lands too late, the overlay is born at Unity's window size and
 	// set_overlay_fullscreen sizes it (one flash) as a graceful fallback.
+	int born_fullscreen = 0;
 	if (transparent_mode && s_fullscreen_overlay_pref) {
 		HMONITOR mon = MonitorFromWindow(unity_hwnd, MONITOR_DEFAULTTONEAREST);
 		MONITORINFO mi;
@@ -1308,12 +1376,52 @@ displayxr_get_app_main_view(void)
 			y = mi.rcMonitor.top;
 			w = (mi.rcMonitor.right - mi.rcMonitor.left) - 1;
 			h = (mi.rcMonitor.bottom - mi.rcMonitor.top) - 1;
+			born_fullscreen = 1;
 			displayxr_log("[DisplayXR] overlay born near-fullscreen: "
 			              "(%d,%d) %dx%d (monitor %dx%d, minus 1px to stay "
 			              "DWM-composited)\n", x, y, w, h,
 			              (int)(mi.rcMonitor.right - mi.rcMonitor.left),
 			              (int)(mi.rcMonitor.bottom - mi.rcMonitor.top));
 		}
+	}
+
+	// What the overlay was sized from, on every birth: a field log then says
+	// whether Unity's window was minimized, hidden, cloaked, empty, or simply not
+	// the window we meant (find_unity_hwnd takes the process's foreground window
+	// first). cloaked is DWMWA_CLOAKED (0 = not cloaked, 1 app, 2 shell,
+	// 4 inherited; -1 = query failed).
+	{
+		char cls[64] = {0};
+		GetClassNameA(unity_hwnd, cls, (int)sizeof(cls) - 1);
+		DWORD cloaked = 0;
+		const int cloaked_ok = SUCCEEDED(DwmGetWindowAttribute(unity_hwnd, DWMWA_CLOAKED,
+		                                                       &cloaked, sizeof(cloaked)));
+		displayxr_log("[DisplayXR] overlay birth: Unity window %p class=%s client=%dx%d at (%d,%d) "
+		              "iconic=%d visible=%d cloaked=%d foreground=%d precloaked=%d (t+%llu ms)\n",
+		              (void *)unity_hwnd, cls, unity_client_w, unity_client_h,
+		              (int)client_origin.x, (int)client_origin.y, unity_iconic,
+		              IsWindowVisible(unity_hwnd) ? 1 : 0, cloaked_ok ? (int)cloaked : -1,
+		              GetForegroundWindow() == unity_hwnd ? 1 : 0,
+		              s_unity_early_cloaked, dxr_since_process_start_ms());
+	}
+
+	// Never birth a 0x0 overlay. Unity's client area is empty when its window is
+	// minimized (GetClientRect answers 0x0 for an iconic window) or not sized
+	// yet, and the runtime sizes its compositor from THIS window: a 0x0 overlay
+	// made xrCreateSession fail (0x0 atlas, E_INVALIDARG) on runtimes without
+	// DisplayXR/displayxr-runtime#2274, so the app never got a session. See
+	// overlay_birth_fallback_rect for the rect and the DPI argument. Unity's own
+	// geometry still takes over afterwards wherever it already did: the WS_CHILD
+	// and provider-opaque overlays follow Unity's WM_SIZE, and the transparent
+	// path snaps to Unity's rect in displayxr_set_transparent_overlay.
+	int born_fallback = 0;
+	if (!born_fullscreen && (w <= 0 || h <= 0 || unity_iconic)) {
+		const char *src = overlay_birth_fallback_rect(unity_hwnd, toplevel, &x, &y, &w, &h);
+		born_fallback = 1;
+		displayxr_log("[DisplayXR] overlay birth: Unity's client area is %dx%d (iconic=%d) — a 0x0 "
+		              "overlay would fail the runtime's compositor create; born at %dx%d at (%d,%d) "
+		              "instead (%s)\n",
+		              unity_client_w, unity_client_h, unity_iconic, w, h, x, y, src);
 	}
 
 	// Owner field:
@@ -1412,9 +1520,17 @@ displayxr_get_app_main_view(void)
 	              : provider_opaque ? "TOP-LEVEL WS_POPUP + NOREDIRECTIONBITMAP (provider opaque)"
 	              : "WS_CHILD (opaque)", dxr_since_process_start_ms());
 
+	// A fallback-born top-level overlay is where it was born, not at Unity's
+	// client origin (an iconic window's is its off-screen icon). A WS_CHILD
+	// overlay sits at Unity's client origin either way.
+	POINT vp_origin = client_origin;
+	if (born_fallback && toplevel) {
+		vp_origin.x = x;
+		vp_origin.y = y;
+	}
 	displayxr_set_viewport_size_native(
 		(uint32_t)w, (uint32_t)h,
-		(int32_t)client_origin.x, (int32_t)client_origin.y);
+		(int32_t)vp_origin.x, (int32_t)vp_origin.y);
 
 	return (void *)s_overlay_hwnd;
 }
@@ -2796,6 +2912,10 @@ displayxr_set_transparent_overlay(int enabled, int topmost)
 		early_cloak_revert("session teardown before ApplyWindowing ran");
 
 	if (enabled && !s_overlay_active) {
+		// Read BEFORE the style strip below: IsIconic is the WS_MINIMIZE style
+		// bit, which replacing GWL_STYLE clears while the window is still sized
+		// and placed as an icon.
+		const int unity_iconic = IsIconic(hwnd) ? 1 : 0;
 		s_saved_style   = (DWORD)GetWindowLongPtrW(hwnd, GWL_STYLE);
 		s_saved_exstyle = (DWORD)GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
 
@@ -2881,12 +3001,25 @@ displayxr_set_transparent_overlay(int enabled, int topmost)
 			// swapchain (= flash). The fullscreen overlay is meant to cover
 			// the monitor, not Unity's window, and all downstream C# works
 			// in full-monitor coords, so leave it where it was born.
+			//
+			// Nor when Unity is MINIMIZED (or has no size): its rect is then
+			// the off-screen icon, and snapping to it would park the overlay
+			// with it -- undoing the sane rect the overlay was born at for
+			// exactly this case (overlay_birth_fallback_rect), so the app
+			// would again show nothing but its taskbar button.
+			const int snap_unusable = unity_iconic || w <= 0 || h <= 0;
 			if (s_overlay_hwnd != NULL && IsWindow(s_overlay_hwnd)
-			    && !s_fullscreen_overlay_pref) {
+			    && !s_fullscreen_overlay_pref && !snap_unusable) {
 				SetWindowPos(s_overlay_hwnd, HWND_TOPMOST,
 				             s_unity_saved_rect.left,
 				             s_unity_saved_rect.top, w, h,
 				             SWP_NOACTIVATE);
+			} else if (snap_unusable && !s_fullscreen_overlay_pref) {
+				displayxr_log("[DisplayXR] transparent_overlay: NOT snapping the overlay to "
+				              "Unity's rect (%d,%d %dx%d, iconic=%d) -- it keeps the rect "
+				              "it was born at\n",
+				              (int)s_unity_saved_rect.left, (int)s_unity_saved_rect.top,
+				              w, h, unity_iconic);
 			}
 
 			SetWindowPos(hwnd, NULL,
