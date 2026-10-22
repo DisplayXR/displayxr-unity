@@ -160,7 +160,10 @@ elseif(UNIX AND NOT APPLE AND NOT ANDROID)
         # the session bus, for native-Wayland and X11 players alike; libdbus is
         # dlopened (displayxr_linux_dbus.c, also in the Wayland library).
         displayxr_linux_desktop_info.c
-        displayxr_linux_dbus.c)
+        displayxr_linux_dbus.c
+        # Side-step: the app's own window steps aside for the window the user
+        # works in (reads the window list above inside the plug-in only).
+        displayxr_linux_side_step.c)
 endif()
 
 # Provider Vulkan backend (#247 Windows, #249 Linux): enable2 session device +
@@ -355,6 +358,11 @@ if(UNIX AND NOT APPLE AND NOT ANDROID)
     target_include_directories(test_linux_desktop_info PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(test_linux_desktop_info PRIVATE m)
     add_test(NAME linux_desktop_info COMMAND test_linux_desktop_info)
+    # The side-step's decision, parsing and geometry (pure, header-only).
+    add_executable(test_linux_side_step tests/test_linux_side_step.c)
+    target_include_directories(test_linux_side_step PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_link_libraries(test_linux_side_step PRIVATE m)
+    add_test(NAME linux_side_step COMMAND test_linux_side_step)
 endif()
 
 # --- Summary ---

@@ -960,6 +960,8 @@ static int s_surround_mask_w, s_surround_mask_h;
 static int s_surround_dst_x, s_surround_dst_y, s_surround_dst_w, s_surround_dst_h;
 
 extern uint32_t dxr_prov_get_zone_count(void);
+// displayxr_linux_side_step.c: the silhouette as the app's content (XRectangle-layout rects).
+void dxr_linux_side_step_note_silhouette(const void *rects, int n, int dst_w, int dst_h);
 extern int dxr_prov_get_zone_rect_px(uint32_t zone, int *x, int *y, int *w, int *h);
 extern int dxr_prov_get_active_zone_rect_px(int *x, int *y, int *w, int *h);
 
@@ -1171,6 +1173,7 @@ displayxr_set_overlay_hit_mask(const uint8_t *mask, int mask_w, int mask_h, int 
 		// As on Windows (SetWindowRgn(NULL)): the whole window catches again, until the
 		// next hit_rect / hit_mask push shapes it.
 		lin_reset_input_region_locked();
+		dxr_linux_side_step_note_silhouette(NULL, -1, 0, 0);
 		goto out;
 	}
 
@@ -1201,6 +1204,10 @@ displayxr_set_overlay_hit_mask(const uint8_t *mask, int mask_w, int mask_h, int 
 		lin_rects_from_mask(&v, mask, mask_w, mask_h, cvx, cvy, cvw, cvh);
 	}
 	int n_sil = v.n;
+	// Side-step: the app's content is the silhouette (window device px, before the
+	// Wayland path scales the rects in place). Inert unless side-step is on.
+	if (!v.oom)
+		dxr_linux_side_step_note_silhouette(v.r, n_sil, dst_w, dst_h);
 	lin_rects_add_surround(&v);
 	int n_sur = v.n - n_sil;
 	lin_rects_add_wsui(&v, dst_w, dst_h);
@@ -1394,6 +1401,22 @@ lin_root_pointer(int *x, int *y, unsigned int *mask)
 	return s_x.XQueryPointer(s_hit_dpy, s_win, &r, &c, x, y, &wx, &wy, mask) != 0;
 }
 
+// Native Wayland: the plug-in's own right-drag of the window (the extension's
+// pointer drag): 1 dragging, -1 refused (no retry until released), 0 none. Written
+// by displayxr_linux_drag_window (C# main thread), read by the side-step worker.
+static int s_wl_drag;
+
+//! The plug-in's own right-drag of the window is running (native Wayland). The
+//! extension's window list does not flag it (a pointer drag is not a grab), so the
+//! side-step (displayxr_linux_side_step.c) asks here. Any thread.
+int dxr_linux_own_pointer_drag(void);
+
+int
+dxr_linux_own_pointer_drag(void)
+{
+	return __atomic_load_n(&s_wl_drag, __ATOMIC_RELAXED) == 1;
+}
+
 /// (#332) Right-drag move for the transparent overlay. Call every frame with the
 /// right button's state: the first pressed call starts the drag, later ones move
 /// Unity's window by how far the pointer has moved, the first released call ends
@@ -1405,15 +1428,16 @@ displayxr_linux_drag_window(int right_pressed)
 		// Native Wayland: the compositor moves the window while the button is held
 		// (the DisplayXR GNOME extension); we only start and end it. C# main thread
 		// only, and outside s_hit_mutex: these are D-Bus round trips.
-		static int s_wl_drag; // 1 dragging, -1 refused: don't retry until released
-		if (right_pressed && !s_wl_drag)
-			s_wl_drag = dxr_wl_begin_pointer_drag(3) ? 1 : -1;
-		else if (!right_pressed && s_wl_drag) {
-			if (s_wl_drag == 1)
+		int drag = __atomic_load_n(&s_wl_drag, __ATOMIC_RELAXED);
+		if (right_pressed && !drag)
+			drag = dxr_wl_begin_pointer_drag(3) ? 1 : -1;
+		else if (!right_pressed && drag) {
+			if (drag == 1)
 				dxr_wl_end_pointer_drag();
-			s_wl_drag = 0;
+			drag = 0;
 		}
-		return s_wl_drag == 1;
+		__atomic_store_n(&s_wl_drag, drag, __ATOMIC_RELAXED);
+		return drag == 1;
 	}
 	int active = 0;
 	pthread_mutex_lock(&s_hit_mutex);

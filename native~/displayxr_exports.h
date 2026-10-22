@@ -494,6 +494,26 @@ struct DxrWlDropEvent;
 DISPLAYXR_EXPORT int displayxr_linux_file_drop_enable(int enable);
 DISPLAYXR_EXPORT int displayxr_linux_file_drop_next(struct DxrWlDropEvent *event, char *paths, int paths_len);
 
+/// Side-step (native-Wayland player on GNOME with the DisplayXR GNOME extension): the
+/// app's own window steps aside when the window the user is working in covers the
+/// app's content, and goes back once its place is free. Everything about OTHER
+/// windows is read and used inside the plug-in only; the app sets the switch and
+/// the settings and reads its own window's state. Records and rules:
+/// displayxr_linux_side_step.h; why it needs no desktop-control grant:
+/// docs~/architecture/side-step.md.
+/// set: turn it on (1) or off (0) with @p settings (NULL = defaults; out-of-range
+/// values are clamped). Off stops at once (no further moves; the window stays where
+/// it is). Returns 1, or 0 when its thread could not start. Any thread.
+/// set_body_rect: the app's content inside its window, window DEVICE px (the space
+/// of displayxr_get_overlay_size); w or h <= 0 = automatic (the click-through
+/// silhouette of a transparent overlay, else the whole window).
+/// status: the app's own window as the side-step sees it. Cheap (a copy).
+struct DisplayXRSideStepSettings;
+struct DisplayXRSideStepStatus;
+DISPLAYXR_EXPORT int displayxr_linux_side_step_set(int enabled, const struct DisplayXRSideStepSettings *settings);
+DISPLAYXR_EXPORT void displayxr_linux_side_step_set_body_rect(int x, int y, int w, int h);
+DISPLAYXR_EXPORT void displayxr_linux_side_step_status(struct DisplayXRSideStepStatus *out);
+
 /// (#266) Centre Unity's window on the given rect (X root coordinates), unless it is
 /// already there. Called by dxr_prov_move_window_to_display with the panel rect the
 /// runtime reported. Returns 1 when the window is on (or was moved to) the rect.

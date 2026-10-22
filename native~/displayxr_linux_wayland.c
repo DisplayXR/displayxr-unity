@@ -295,6 +295,9 @@ static struct {
 // resizes, positions and input regions, the extension worker reports. Lock order:
 // this one, then the capture layer's player lock, then the worker's job lock.
 static pthread_mutex_t s_wl_mutex = PTHREAD_MUTEX_INITIALIZER;
+// Under s_wl_mutex: the move being placed is a side-step glide's in-between step,
+// which is not logged (the side-step logs the move once; dxr_wl_set_player_position_stage).
+static int s_quiet_place;
 
 // The main plugin's side (displayxr_linux_wayland_lib.h), set once by dxr_wl_lib_init.
 static const DxrWlHost *s_host;
@@ -1419,7 +1422,8 @@ place_locked(const char *why)
 	s_wl.corrections++;
 	s_wl.move_inflight = 1;
 	s_wl.placing = 1;
-	fprintf(stderr, "[DisplayXR-WL] %s: window -> (%d,%d)\n", why, s_wl.intent_x, s_wl.intent_y);
+	if (!s_quiet_place)
+		fprintf(stderr, "[DisplayXR-WL] %s: window -> (%d,%d)\n", why, s_wl.intent_x, s_wl.intent_y);
 	dxr_wl_ext_move_window(s_wl.intent_x, s_wl.intent_y);
 }
 
@@ -2341,6 +2345,31 @@ dxr_wl_set_player_position_x11(int x, int y)
 	return 1;
 }
 
+//! The side-step's move (displayxr_linux_side_step.c): stage px, straight to the
+//! intent. Like an app's move, a new place gets a fresh correction budget (#382), and
+//! a move off the panel being verified ends that check. Only the glide's last step
+//! (@p log) is logged.
+static int
+dxr_wl_set_player_position_stage(int x, int y, int log)
+{
+	pthread_mutex_lock(&s_wl_mutex);
+	int ok = s_wl.surface && s_wl.ext_available;
+	if (ok) {
+		if (!s_wl.intent_valid || x != s_wl.intent_x || y != s_wl.intent_y) {
+			s_wl.corrections = 0;
+			s_wl.warned &= ~DXR_WARN_GAVE_UP;
+		}
+		s_quiet_place = !log;
+		set_intent_locked(x, y, "side-step");
+		s_quiet_place = 0;
+		struct dxr_wl_output *vp = output_named_locked(s_wl.verify_panel);
+		if (vp && !dxr_wl_window_on_rect(output_rect(vp), x, y, s_wl.win.w, s_wl.win.h))
+			stop_verify_locked();
+	}
+	pthread_mutex_unlock(&s_wl_mutex);
+	return ok;
+}
+
 /*
  *
  * File drops: files dragged onto the player's window from a file manager, for
@@ -3059,6 +3088,7 @@ static const DxrWlApi s_api = {
     .export_handle = dxr_wl_export_handle,
     .file_drop_enable = dxr_wl_file_drop_enable,
     .file_drop_next = dxr_wl_file_drop_next,
+    .set_player_position_stage = dxr_wl_set_player_position_stage,
 };
 
 __attribute__((visibility("default"))) const DxrWlApi *

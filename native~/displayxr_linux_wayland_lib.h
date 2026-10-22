@@ -22,7 +22,7 @@ extern "C" {
 struct wl_display;
 struct wl_surface;
 
-#define DXR_WL_LIB_ABI 8
+#define DXR_WL_LIB_ABI 9
 #define DXR_WL_LIB_NAME "libdisplayxr_unity_wayland.so"
 #define DXR_WL_LIB_INIT "dxr_wl_lib_init"
 
@@ -98,6 +98,7 @@ typedef struct DxrWlApi {
 	int (*export_handle)(char *buf, int len);
 	int (*file_drop_enable)(int enable);
 	int (*file_drop_next)(DxrWlDropEvent *event, char *paths, int paths_len);
+	int (*set_player_position_stage)(int x, int y, int log); // ABI 9: the side-step's moves
 } DxrWlApi;
 
 //! The library's one export. NULL on an ABI mismatch.
