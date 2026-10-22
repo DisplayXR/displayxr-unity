@@ -15,6 +15,7 @@
 #define _GNU_SOURCE // dladdr
 #include "displayxr_linux_wayland.h"
 #include "displayxr_linux_wayland_lib.h"
+#include "displayxr_linux_clipboard.h"
 
 #include <dlfcn.h>
 #include <limits.h>
@@ -355,4 +356,37 @@ dxr_wl_file_drop_next(DxrWlDropEvent *event, char *paths, int paths_len)
 {
 	const DxrWlApi *a = api();
 	return a ? a->file_drop_next(event, paths, paths_len) : 0;
+}
+
+// The clipboard before the library is loaded: drops cannot have been on yet, so a
+// native-Wayland player's SDL clipboard is intact; anything else has none of ours.
+static int
+clip_without_library(void)
+{
+	return dxr_wl_capture_wanted() ? DXR_CLIP_USE_SDL : DXR_CLIP_UNAVAILABLE;
+}
+
+int
+dxr_wl_clipboard_state(void)
+{
+	const DxrWlApi *a = api();
+	return a ? a->clipboard_state() : 0;
+}
+
+int
+dxr_wl_clipboard_read(char *buf, int len, int timeout_ms, int *needed)
+{
+	const DxrWlApi *a = api();
+	if (a)
+		return a->clipboard_read(buf, len, timeout_ms, needed);
+	if (needed)
+		*needed = 0;
+	return clip_without_library();
+}
+
+int
+dxr_wl_clipboard_write(const char *text, int len)
+{
+	const DxrWlApi *a = api();
+	return a ? a->clipboard_write(text, len) : clip_without_library();
 }

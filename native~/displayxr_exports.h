@@ -476,10 +476,11 @@ DISPLAYXR_EXPORT int displayxr_linux_pointer(int *x, int *y);
 DISPLAYXR_EXPORT float displayxr_linux_xroot_scale(void);
 
 /// Native-Wayland player: files dragged onto the app's window (a file manager's
-/// drag and drop). file_drop_enable(1) makes the plugin the window's drop target;
-/// it COSTS SDL's clipboard: SDL gets no new clipboard offers, so
-/// GUIUtility.systemCopyBuffer cannot be relied on for what other apps copy, for
-/// the rest of the run (0 does not give it back). Returns 1 on now,
+/// drag and drop). file_drop_enable(1) makes the plugin the window's drop target.
+/// From the first time the player loses the focus with drops on, SDL's data device
+/// is replaced for the rest of the run: GUIUtility.systemCopyBuffer then cannot read
+/// what other apps copy, and the plug-in's clipboard below takes over (0 before
+/// that leaves SDL's clipboard as it was; after, it does not bring it back). Returns 1 on now,
 /// 0 remembered until the 3D session binds the window (or turned off), -1
 /// unsupported (X11 / XWayland player: XDND goes to Unity's own X connection; or
 /// no wl_data_device_manager version 3). Events arrive only while a 3D session runs.
@@ -493,6 +494,25 @@ DISPLAYXR_EXPORT float displayxr_linux_xroot_scale(void);
 struct DxrWlDropEvent;
 DISPLAYXR_EXPORT int displayxr_linux_file_drop_enable(int enable);
 DISPLAYXR_EXPORT int displayxr_linux_file_drop_next(struct DxrWlDropEvent *event, char *paths, int paths_len);
+
+/// Native-Wayland player: the plug-in's own clipboard, through its Wayland data
+/// device, for when file drops have replaced SDL's (displayxr_linux_clipboard.h).
+/// By the Wayland rules it works only while the app has the keyboard focus; without
+/// it, use the runtime's desktop-control clipboard (DisplayXRDesktop.GetClipboardText /
+/// SetClipboardText, XR_DXR_desktop_control spec v3). Text is UTF-8, at most 1 MiB.
+/// Any thread; the text never reaches a log.
+/// state: DXR_CLIP_STATE_* bits (1 available, 2 focused, 4 SDL's cut, 8 ours on it).
+/// read: the text's length (NUL-terminated in @p buf), or DXR_CLIP_UNAVAILABLE (-1, no
+/// 3D session), DXR_CLIP_USE_SDL (-2, SDL's clipboard works: use systemCopyBuffer),
+/// DXR_CLIP_NOT_FOCUSED (-3), DXR_CLIP_PENDING (-4, waited @p timeout_ms: call again;
+/// pass 0 on Unity's main thread), DXR_CLIP_SPACE (-5, *needed bytes needed: the text
+/// is kept for the next call), DXR_CLIP_TOO_LARGE (-6), DXR_CLIP_FAILED (-7). No text
+/// on the clipboard reads as "" (0).
+/// write: 1 when set (0 bytes empty the clipboard), or -1/-2/-3/-6/-7 as above, or
+/// DXR_CLIP_INVALID (-8: negative length, or a NUL in the text).
+DISPLAYXR_EXPORT int displayxr_linux_clipboard_state(void);
+DISPLAYXR_EXPORT int displayxr_linux_clipboard_read(char *buf, int len, int timeout_ms, int *needed);
+DISPLAYXR_EXPORT int displayxr_linux_clipboard_write(const char *text, int len);
 
 /// Side-step (native-Wayland player on GNOME with the DisplayXR GNOME extension): the
 /// app's own window steps aside when the window the user is working in covers the

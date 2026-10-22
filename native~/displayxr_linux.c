@@ -1830,11 +1830,12 @@ displayxr_linux_window_handle(char *buf, int len)
 _Static_assert(sizeof(DxrWlDropEvent) == 10 * sizeof(int32_t), "C# reads DxrWlDropEvent as ten int32");
 
 /// Native-Wayland player: receive files dragged onto the window (1) or stop (0).
-/// Turning it on costs the app SDL's clipboard: SDL gets no new clipboard offers,
-/// so GUIUtility.systemCopyBuffer cannot be relied on for what other apps copy, for
-/// the rest of the run (turning it off does not give it back). Returns 1 when on now, 0 when remembered until the 3D
-/// session binds the window (or when turned off), -1 when unsupported (X11 /
-/// XWayland player, or no wl_data_device_manager version 3).
+/// From the first time the player loses the focus with drops on, SDL gets no
+/// clipboard offers for the rest of the run, so GUIUtility.systemCopyBuffer cannot
+/// read what other apps copy; displayxr_linux_clipboard_* replace it then. Turning
+/// drops off before that leaves SDL's clipboard as it was. Returns 1 when on now, 0
+/// when remembered until the 3D session binds the window (or when turned off), -1
+/// when unsupported (X11 / XWayland player, or no wl_data_device_manager version 3).
 DISPLAYXR_EXPORT int
 displayxr_linux_file_drop_enable(int enable)
 {
@@ -1849,6 +1850,30 @@ DISPLAYXR_EXPORT int
 displayxr_linux_file_drop_next(struct DxrWlDropEvent *event, char *paths, int paths_len)
 {
 	return dxr_wl_file_drop_next(event, paths, paths_len);
+}
+
+/// Native-Wayland player: the plug-in's own clipboard, which replaces SDL's once
+/// file drops have cut it (displayxr_linux_clipboard.h). State: DXR_CLIP_STATE_* bits.
+DISPLAYXR_EXPORT int
+displayxr_linux_clipboard_state(void)
+{
+	return dxr_wl_clipboard_state();
+}
+
+/// Reads the clipboard's text: its length in bytes (UTF-8, NUL-terminated in @p buf),
+/// or a DXR_CLIP_* error. Waits up to @p timeout_ms for the text (pass 0 on Unity's
+/// main thread, and call again while it answers DXR_CLIP_PENDING).
+DISPLAYXR_EXPORT int
+displayxr_linux_clipboard_read(char *buf, int len, int timeout_ms, int *needed)
+{
+	return dxr_wl_clipboard_read(buf, len, timeout_ms, needed);
+}
+
+/// Puts @p len bytes of UTF-8 text on the clipboard (0 empties it): 1, or a DXR_CLIP_* error.
+DISPLAYXR_EXPORT int
+displayxr_linux_clipboard_write(const char *text, int len)
+{
+	return dxr_wl_clipboard_write(text, len);
 }
 
 // ---------------------------------------------------------------------------

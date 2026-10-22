@@ -266,6 +266,10 @@ if(UNIX AND NOT APPLE AND NOT ANDROID)
         add_executable(test_uri_list tests/test_uri_list.c)
         target_include_directories(test_uri_list PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         add_test(NAME uri_list COMMAND test_uri_list)
+        # The plug-in's clipboard (file drops replace SDL's): text types, write checks, gates.
+        add_executable(test_linux_clipboard tests/test_linux_clipboard.c)
+        target_include_directories(test_linux_clipboard PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        add_test(NAME linux_clipboard COMMAND test_linux_clipboard)
     else()
         message(WARNING "displayxr_unity: wayland-client (pkg-config) or wayland-scanner not found - "
                         "building WITHOUT libdisplayxr_unity_wayland.so (no native-Wayland player support). "

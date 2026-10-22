@@ -64,11 +64,14 @@
 #include "displayxr_linux_wayland_lib.h"
 #include "displayxr_linux_wayland_place.h"
 #include "displayxr_linux_uri_list.h"
+#include "displayxr_linux_clipboard.h"
 
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
+#include <poll.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -88,14 +91,27 @@
 #define DXR_WL_DROP_READ_MAX (1u << 20)    // a longer text/uri-list is not a file list we take
 #define DXR_WL_DROP_READ_NS 3000000000LL   // the drag's source has this long to send it
 #define DXR_WL_URI_LIST "text/uri-list"
+#define DXR_WL_CLIP_READ_NS 3000000000LL   // a clipboard owner has this long to send its text
+#define DXR_WL_CLIP_WRITE_NS 5000000000LL  // a reader has this long to take ours
+#define DXR_WL_CLIP_KEEP_NS 1000000000LL   // a finished read waits this long for the app to take it
+#define DXR_WL_CLIP_WRITERS 8              // reads of our text served at once
 
 enum { DXR_LAYOUT_UNKNOWN, DXR_LAYOUT_LOGICAL, DXR_LAYOUT_PHYSICAL };
 
 //! A wl_data_offer of our data device (file drops) and what it offers.
 struct dxr_wl_offer {
 	struct wl_data_offer *offer;
-	int uri_list;    // it offers text/uri-list
-	uint32_t action; // the drag action the compositor chose (wl_data_offer.action); 0 none
+	int uri_list;       // it offers text/uri-list
+	unsigned text_mask; // the text types it offers (dxr_clip_mime_bit)
+	int ours;           // it lists DXR_CLIP_OWN_MIME: the plug-in's own clipboard text
+	uint32_t action;    // the drag action the compositor chose (wl_data_offer.action); 0 none
+};
+
+//! The plug-in's clipboard text, shared by the selection and the reads it serves.
+struct dxr_wl_clip_text {
+	int refs;
+	size_t len;
+	char data[];
 };
 
 //! A file-drop event waiting for the app (dxr_wl_file_drop_next).
@@ -251,12 +267,38 @@ static struct {
 	struct wl_data_device_manager *ddm;
 	uint32_t ddm_version;
 	struct wl_data_device *ddev;
-	struct wl_keyboard *keyboard; // tells when the player loses keyboard focus
+	struct wl_keyboard *keyboard; // tells when the player loses keyboard focus; serials for writes
+	struct wl_callback *kb_sync;  // the round trip after making it: no enter by then = not focused
 	int kb_focus;                 // the player has keyboard focus (as last dispatched)
+	int kb_known;                 // kb_focus is known (an enter / leave, or kb_sync came back)
+	uint32_t kb_serial;           // the latest input serial our keyboard saw (selection writes)
 	int drop_wanted;              // the app asked for drops
+	int drop_make_pending;        // make the device once the keyboard tells the focus
 	int drop_remake;              // make the device again once unfocused (it lost focus)
+	int sdl_cut;                  // SDL's data device was (or may have been) unlinked: for the rest of the run
+	int sdl_surely_cut;           // ... it was: a device of ours was made while the player was not focused
+	const char *drop_make_why;    // why the pending make was asked for (log)
+	int dd_made_focused;          // our device was made while the player has had the focus since
 	unsigned drop_makes;          // devices made this run (logs)
-	struct dxr_wl_offer *sel_offer; // the clipboard offer sent to our device (unused, kept as the protocol asks)
+	struct dxr_wl_offer *sel_offer; // the clipboard offer sent to our device; NULL = no text, or none yet
+	int sel_have;                   // a selection event arrived since the player last lost the focus
+	struct {                        // a read of the clipboard (displayxr_linux_clipboard_read)
+		int active, fd;
+		char *buf;
+		size_t len, cap;
+		long long deadline_ns, done_ns;
+		int done; // finished: result says how
+		int result;
+	} clip_rd;
+	struct wl_data_source *clip_src;   // our clipboard text, while it is the selection
+	struct dxr_wl_clip_text *clip_txt; // its text
+	struct {
+		int fd;
+		size_t off;
+		long long deadline_ns;
+		struct dxr_wl_clip_text *txt;
+	} clip_wr[DXR_WL_CLIP_WRITERS];
+	int clip_wr_n;
 	struct {
 		struct dxr_wl_offer *o; // the drag's offer; NULL = no drag over the window
 		uint32_t serial;        // its enter's
@@ -516,14 +558,19 @@ static const struct wl_pointer_listener s_pointer_listener = {
     .axis = ptr_axis,
 };
 
-static void drop_keyboard_locked(void);
+static void kb_make_locked(void);
+static void kb_destroy_locked(void);
 
 static void
 seat_capabilities(void *d, struct wl_seat *seat, uint32_t caps)
 {
 	(void)d;
 	s_wl.seat_caps = caps;
-	drop_keyboard_locked(); // file drops follow the keyboard focus, if they are on
+	// Our keyboard (file drops and the clipboard follow the focus) only while our data device is there.
+	if (!(caps & WL_SEAT_CAPABILITY_KEYBOARD))
+		kb_destroy_locked();
+	else if (s_wl.ddev || s_wl.drop_make_pending)
+		kb_make_locked();
 	if ((caps & WL_SEAT_CAPABILITY_POINTER) && !s_wl.pointer) {
 		s_wl.pointer = wl_seat_get_pointer(seat);
 		wl_pointer_add_listener(s_wl.pointer, &s_pointer_listener, NULL);
@@ -849,8 +896,11 @@ static void fix_player_size_locked(void);
 static void export_update_locked(void);
 static void export_drop_locked(void);
 static int drop_supported_locked(void);
-static void drop_device_make_locked(const char *why, int first);
-static void drop_device_destroy_locked(void);
+static void dd_request_locked(const char *why);
+static void dd_destroy_locked(void);
+static void kb_make_locked(void);
+static void kb_destroy_locked(void);
+static void clip_teardown_locked(void);
 static void drop_poll_locked(void);
 
 static int
@@ -912,6 +962,10 @@ dxr_wl_weave_surface_create(struct wl_display *display, struct wl_surface *paren
 		wl_surface_damage_buffer(s_wl.surface, 0, 0, 1, 1);
 	}
 	wl_surface_commit(s_wl.surface);
+	// Our keyboard before the round trip, so that it has told the focus by the time
+	// the data device is made below (whether SDL's survives depends on it).
+	if ((s_wl.drop_wanted || s_wl.sdl_cut) && drop_supported_locked())
+		kb_make_locked();
 	wl_display_roundtrip_queue(display, s_wl.queue);
 	if (!s_wl.scale120) {
 		if (s_wl.win.device_scale > 0.0)
@@ -928,8 +982,8 @@ dxr_wl_weave_surface_create(struct wl_display *display, struct wl_surface *paren
 	stop_verify_locked();
 	s_wl.geometry_dirty = 0; // the create-time size goes into XrWaylandSurfaceGeometryDXR
 	export_update_locked();  // the round trip above has told whether the window is shown
-	if (s_wl.drop_wanted && drop_supported_locked())
-		drop_device_make_locked("the 3D session has bound the window", 1);
+	dd_request_locked(s_wl.drop_wanted ? "the 3D session has bound the window"
+	                                   : "the 3D session has bound the window; the clipboard only");
 	wl_display_flush(display);
 	*out_surface = s_wl.surface;
 	*out_w = s_wl.device_w;
@@ -962,9 +1016,12 @@ dxr_wl_weave_destroy(void)
 		wl_buffer_destroy(s_wl.probe_buffer);
 	// No weave, no export: revoke the handle (the next session exports anew).
 	export_drop_locked();
-	// Nothing dispatches our queue between sessions: no drops either (the next
-	// session makes the device again if the app still wants them).
-	drop_device_destroy_locked();
+	// Nothing dispatches our queue between sessions: no drops and no clipboard
+	// either (the next session makes the device again if it is still wanted), and
+	// no keyboard whose events would pile up on our queue meanwhile.
+	clip_teardown_locked();
+	dd_destroy_locked();
+	kb_destroy_locked();
 	s_wl.frac = NULL;
 	s_wl.viewport = NULL;
 	s_wl.subsurface = NULL;
@@ -2378,33 +2435,42 @@ dxr_wl_set_player_position_stage(int x, int y, int log)
  * Unity's SDL handles Wayland drag and drop itself, but it is linked statically
  * and exports nothing, so its drop events cannot be reached. So this library
  * makes its own wl_data_device for the seat, on our queue, and is the drop
- * target. Opt-in, because of what it costs.
+ * target. Opt-in, because of what it does to SDL's clipboard.
  *
- * The cost. Mutter (50) keeps ONE data device per client: making one unlinks
- * the client's previous one (get_data_device), and an unlinked device is sent
- * neither drags nor clipboard offers again — also after ours is released. So
- * from the moment drops are on, SDL gets no new clipboard offers, for the rest
- * of the run: GUIUtility.systemCopyBuffer can no longer be relied on for what
- * other apps copy. Measured on GNOME 50.1: it read "" for every other app's copy
- * when SDL had never had an offer, and the current text when it still held one
- * from before (mutter answers an old offer with the current clipboard). Unity's
- * own copies still read back. Its writes still reach the compositor (a set_selection on an
- * unlinked device is still the seat's; mutter takes it only from the focused
- * client, drops or not). An app that turns drops on reads the clipboard
- * elsewhere (the RemoteDesktop portal's Clipboard, which also works without
- * keyboard focus). SDL starts no drags in Unity's player, so nothing else is lost.
+ * How mutter (50) treats a client's data devices (meta-wayland-data-device.c):
+ * every device sits on one of two lists, the focused client's and everybody
+ * else's. A keyboard focus change moves the old client's devices to the front of
+ * the unfocused list (in order) and the new client's to the focused list
+ * (reversed). Clipboard offers go to every device of the focused client; a drag
+ * goes to the client's FIRST device on the unfocused list (else on the focused
+ * one); get_data_device unlinks the client's first device on the unfocused list,
+ * for good (it is never put back on a list; releasing ours later does not bring
+ * it back); and a new selection is taken from any device of the focused client.
  *
- * Mutter only unlinks a device that is on its list of UNFOCUSED clients' devices:
- * made while the player has keyboard focus, ours and SDL's both stay linked, and
- * after the next focus change a drag goes to whichever comes first in mutter's
- * list — SDL's, at the first one. So the device is made again each time the
- * player loses focus: ours released first, then a new one made, which unlinks
- * the only other one the player has, SDL's. Our own wl_keyboard (on our queue,
- * made with the first device) says when; on a seat without a keyboard, the GNOME
- * extension's report of the window does (it reports every focus change). While
- * the player has focus, drags go to ours anyway (mutter looks among the
- * unfocused clients' devices first). A drag that starts in the frame between the
- * focus loss and the remake goes to SDL.
+ * So, made while the player has the focus, our device unlinks nothing: SDL's is
+ * on the focused list, ours on the other, and drags reach ours. But once the
+ * player loses the focus SDL's moves in front of ours and would get the drags,
+ * and the only way to put ours first then is to make it again, which unlinks
+ * SDL's. That is done (released first, then made: the only other device on that
+ * list is SDL's) the first time the player loses the focus with drops on; made
+ * while the player is not focused, the first device already does it. Our own
+ * wl_keyboard (made first, so the focus is known when the device is made) says
+ * when; on a seat without a keyboard, the GNOME extension's report of the window
+ * does. A drag that starts in the frame between the focus loss and the remake
+ * goes to SDL.
+ *
+ * What an unlinked SDL device costs: SDL gets no clipboard offers, for the rest
+ * of the run, so GUIUtility.systemCopyBuffer cannot read what other apps copy
+ * (measured on GNOME 50.1: "" when SDL had never had an offer, else the current
+ * text through an old offer it still holds, which mutter answers with whatever
+ * the clipboard has now, if it has SDL's type). Unity's own copies still read
+ * back, and mutter still takes its writes from the focused player (a
+ * systemCopyBuffer write crashed the test player inside SDL in this state, though:
+ * apps write through ours). SDL starts no
+ * drags in Unity's player, so nothing else is lost. From then on our device
+ * carries the clipboard instead ("Clipboard" below), and it stays when drops are
+ * turned off (refusing drags). Turned off before SDL's was unlinked, ours is
+ * released and SDL's clipboard is exactly as it was.
  *
  * A drag over the window: on enter, an offer of text/uri-list over the player's
  * own surface (not a client-side title bar, whose offset we do not know) is
@@ -2440,6 +2506,9 @@ offer_offer(void *data, struct wl_data_offer *offer, const char *mime_type)
 	struct dxr_wl_offer *o = data;
 	if (mime_type && !strcmp(mime_type, DXR_WL_URI_LIST))
 		o->uri_list = 1;
+	o->text_mask |= dxr_clip_mime_bit(mime_type);
+	if (mime_type && !strcmp(mime_type, DXR_CLIP_OWN_MIME))
+		o->ours = 1;
 }
 
 static void
@@ -2641,9 +2710,14 @@ drop_read_locked(void)
 	size_t list_len = s_wl.drag.len;
 	if (done) {
 		s_wl.drag.paths = malloc(s_wl.drag.len + 1);
-		if (s_wl.drag.paths)
+		if (s_wl.drag.paths) {
 			s_wl.drag.path_count = dxr_uri_list_to_paths(s_wl.drag.buf, s_wl.drag.len, self_host(),
 			                                             s_wl.drag.paths, &s_wl.drag.paths_bytes);
+		} else {
+			done = 0; // not "no local file": the list was never parsed
+			fprintf(stderr, "[DisplayXR-WL] file drop: no memory for the dragged file list (%zu bytes): refused\n",
+			        list_len);
+		}
 	} else {
 		fprintf(stderr, "[DisplayXR-WL] file drop: the dragged file list could not be read (%s)\n", failed);
 	}
@@ -2721,7 +2795,8 @@ dd_enter(void *data, struct wl_data_device *dev, uint32_t serial, struct wl_surf
 	s_wl.drag.ly = wl_fixed_to_double(y);
 	// Over the player's own surface only: a client-side title bar is another
 	// surface, at an offset we do not know (the weave takes no input at all).
-	if (!o->uri_list || !surface || surface != s_wl.parent) {
+	// Drops off (the device kept for the clipboard): refused like a non-file drag.
+	if (!s_wl.drop_wanted || !o->uri_list || !surface || surface != s_wl.parent) {
 		wl_data_offer_accept(offer, serial, NULL);
 		wl_display_flush(s_wl.display);
 		return;
@@ -2790,12 +2865,14 @@ dd_selection(void *data, struct wl_data_device *dev, struct wl_data_offer *offer
 {
 	(void)data;
 	(void)dev;
-	// The clipboard, now offered to our device (no longer to SDL's) while the
-	// player has focus. Not read: only the latest is kept, as the protocol asks.
+	// The clipboard, offered to our device while the player has focus (mutter sends
+	// it right after the keyboard enter, and on every change). Valid until the
+	// next one or the focus is lost; displayxr_linux_clipboard_read reads it.
 	struct dxr_wl_offer *o = offer ? wl_data_offer_get_user_data(offer) : NULL;
 	if (s_wl.sel_offer && s_wl.sel_offer != o)
 		offer_destroy(s_wl.sel_offer);
 	s_wl.sel_offer = o;
+	s_wl.sel_have = 1;
 }
 
 static const struct wl_data_device_listener s_data_device_listener = {
@@ -2822,10 +2899,11 @@ kb_enter(void *data, struct wl_keyboard *kb, uint32_t serial, struct wl_surface 
 {
 	(void)data;
 	(void)kb;
-	(void)serial;
 	(void)surface;
 	(void)keys;
 	s_wl.kb_focus = 1;
+	s_wl.kb_known = 1;
+	s_wl.kb_serial = serial;
 }
 
 static void
@@ -2833,10 +2911,15 @@ kb_leave(void *data, struct wl_keyboard *kb, uint32_t serial, struct wl_surface 
 {
 	(void)data;
 	(void)kb;
-	(void)serial;
 	(void)surface;
 	s_wl.kb_focus = 0;
-	if (s_wl.ddev)
+	s_wl.kb_known = 1;
+	s_wl.kb_serial = serial;
+	// The selection offer was valid while focused; the next focus brings a new one
+	// (mutter sends every device of the newly focused client the selection).
+	s_wl.sel_have = 0;
+	s_wl.dd_made_focused = 0;
+	if (s_wl.ddev && s_wl.drop_wanted && !s_wl.sdl_surely_cut)
 		s_wl.drop_remake = 1; // see "File drops": now SDL's device can be unlinked
 }
 
@@ -2845,10 +2928,10 @@ kb_key(void *data, struct wl_keyboard *kb, uint32_t serial, uint32_t time, uint3
 {
 	(void)data;
 	(void)kb;
-	(void)serial;
 	(void)time;
 	(void)key;
 	(void)state;
+	s_wl.kb_serial = serial;
 }
 
 static void
@@ -2857,11 +2940,11 @@ kb_modifiers(void *data, struct wl_keyboard *kb, uint32_t serial, uint32_t depre
 {
 	(void)data;
 	(void)kb;
-	(void)serial;
 	(void)depressed;
 	(void)latched;
 	(void)locked;
 	(void)group;
+	s_wl.kb_serial = serial;
 }
 
 static void
@@ -2883,23 +2966,59 @@ static const struct wl_keyboard_listener s_keyboard_listener = {
     .repeat_info = kb_repeat_info,
 };
 
-//! Our wl_keyboard, once drops have been on (kept: a version-1 seat's keyboard
-//! has no release; its few events are dispatched and ignored afterwards).
 static void
-drop_keyboard_locked(void)
+kb_sync_done(void *data, struct wl_callback *cb, uint32_t time)
 {
-	if (!(s_wl.seat_caps & WL_SEAT_CAPABILITY_KEYBOARD)) {
-		if (s_wl.keyboard) {
-			wl_keyboard_destroy(s_wl.keyboard);
-			s_wl.keyboard = NULL;
-			s_wl.kb_focus = 0;
-		}
-		return;
+	(void)data;
+	(void)time;
+	if (cb == s_wl.kb_sync) {
+		s_wl.kb_sync = NULL;
+		s_wl.kb_known = 1; // no enter by now: the player is not focused
 	}
-	if (s_wl.keyboard || !s_wl.ddev || !s_wl.seat)
+	wl_callback_destroy(cb);
+}
+
+static const struct wl_callback_listener s_kb_sync_listener = {
+    .done = kb_sync_done,
+};
+
+//! Our wl_keyboard: it says when the player gains and loses the keyboard focus, and
+//! gives the input serial a clipboard write needs. It exists exactly while our data
+//! device does (or is about to): made with it, gone with it at the session's end or
+//! when drops are turned off with SDL's device intact. Mutter sends a keyboard made
+//! by the focused client its enter at once, so after the round trip that follows
+//! (kb_sync) the focus is known either way.
+static void
+kb_make_locked(void)
+{
+	if (s_wl.keyboard || !s_wl.seat || !(s_wl.seat_caps & WL_SEAT_CAPABILITY_KEYBOARD))
 		return;
 	s_wl.keyboard = wl_seat_get_keyboard(s_wl.seat);
 	wl_keyboard_add_listener(s_wl.keyboard, &s_keyboard_listener, NULL);
+	s_wl.kb_focus = 0;
+	s_wl.kb_known = 0;
+	s_wl.kb_sync = wl_display_sync(s_wl.display_wrapper);
+	wl_callback_add_listener(s_wl.kb_sync, &s_kb_sync_listener, NULL);
+}
+
+static void
+kb_destroy_locked(void)
+{
+	if (s_wl.kb_sync) {
+		wl_callback_destroy(s_wl.kb_sync);
+		s_wl.kb_sync = NULL;
+	}
+	if (s_wl.keyboard) {
+		// Our seat is bound at version 1, whose keyboard has no release request: the
+		// proxy goes, and libwayland drops whatever the compositor still sends to it.
+		if (wl_keyboard_get_version(s_wl.keyboard) >= WL_KEYBOARD_RELEASE_SINCE_VERSION)
+			wl_keyboard_release(s_wl.keyboard);
+		else
+			wl_keyboard_destroy(s_wl.keyboard);
+		s_wl.keyboard = NULL;
+	}
+	s_wl.kb_focus = 0;
+	s_wl.kb_known = 0;
 }
 
 static int
@@ -2909,13 +3028,13 @@ drop_supported_locked(void)
 }
 
 //! Whether the player has the focus: 1, 0, or -1 when it cannot be told. From
-//! our wl_keyboard (exact) or, on a seat without a keyboard, from the GNOME
-//! extension's report of the window (it reports every focus change).
+//! our wl_keyboard (exact, once it has said) or, on a seat without a keyboard, from
+//! the GNOME extension's report of the window (it reports every focus change).
 static int
 player_focused_locked(void)
 {
 	if (s_wl.keyboard)
-		return s_wl.kb_focus;
+		return s_wl.kb_known ? s_wl.kb_focus : -1;
 	if (s_wl.ext_available && s_wl.win.present && s_wl.win.focus >= 0)
 		return s_wl.win.focus;
 	return -1;
@@ -2926,71 +3045,120 @@ player_focused_locked(void)
 static void
 drop_focus_report_locked(const DxrWlExtWindow *w)
 {
-	if (!s_wl.ddev || s_wl.keyboard || !w->present || w->focus != 0)
+	if (!s_wl.ddev || s_wl.keyboard || !s_wl.drop_wanted || s_wl.sdl_surely_cut || !w->present || w->focus != 0)
 		return;
 	if (!s_wl.win.present || s_wl.win.focus != 0)
 		s_wl.drop_remake = 1;
 }
 
+//! Our data device is wanted: a 3D session runs, and drops are on or SDL's device is
+//! gone already (then ours carries the clipboard: displayxr_linux_clipboard_*).
+static int
+dd_wanted_locked(void)
+{
+	return s_wl.surface && drop_supported_locked() && (s_wl.drop_wanted || s_wl.sdl_cut);
+}
+
+static void clip_read_reset_locked(void);
+static void clip_service_locked(void);
+static void clip_source_drop_locked(void);
+static void clip_writers_close_locked(void);
+
 //! Make our data device (again): ours released first, then a new one, which
-//! unlinks the player's other one (SDL's) if mutter lists it among the unfocused.
-//! @p first: drops were just turned on; if the player may have the focus right
-//! now, SDL's device survived, and the device is made again once it has not.
+//! unlinks the player's other one (SDL's) if mutter lists it among the unfocused
+//! (dxr_dd_make_effect has the rule).
 static void
-drop_device_make_locked(const char *why, int first)
+dd_make_locked(const char *why)
 {
 	if (!drop_supported_locked())
 		return;
+	int focused = player_focused_locked();
 	if (s_wl.ddev) {
 		drag_clear_locked(1);
+		clip_read_reset_locked();
 		offer_destroy(s_wl.sel_offer);
 		s_wl.sel_offer = NULL;
+		s_wl.sel_have = 0;
 		wl_data_device_release(s_wl.ddev);
 	}
 	s_wl.ddev = wl_data_device_manager_get_data_device(s_wl.ddm, s_wl.seat);
 	wl_data_device_add_listener(s_wl.ddev, &s_data_device_listener, NULL);
-	drop_keyboard_locked();
-	s_wl.drop_remake = first && player_focused_locked() != 0;
+	int cut, remake;
+	dxr_dd_make_effect(focused, &cut, &remake);
+	int was_cut = s_wl.sdl_cut;
+	s_wl.sdl_cut |= cut;
+	if (focused == 0)
+		s_wl.sdl_surely_cut = 1;
+	// Made while focused, it sits on mutter's list of unfocused clients' devices, so
+	// it is sent the clipboard only from the next focus on.
+	s_wl.dd_made_focused = focused == 1;
+	s_wl.drop_remake = remake && s_wl.drop_wanted && !s_wl.sdl_surely_cut;
+	s_wl.drop_make_pending = 0;
 	s_wl.drop_makes++;
 	wl_display_flush(s_wl.display);
-	if (s_wl.drop_makes == 1) {
-		fprintf(stderr, "[DisplayXR-WL] file drops on (%s): this app's data device replaces SDL's, so from now on "
-		                "SDL gets no new clipboard offers: GUIUtility.systemCopyBuffer cannot be relied on for what "
-		                "other apps copy, for the rest of this run\n",
-		        why);
-		if (!s_wl.keyboard && !(s_wl.warned & DXR_WARN_DROP_NO_KEYBOARD))
-			fprintf(stderr, "[DisplayXR-WL] file drops: the seat has no keyboard; the focus is followed through the "
-			                "GNOME extension%s\n",
-			        s_wl.ext_available ? "" : " (not running: a drag may go to SDL after the player had the focus)");
-		if (!s_wl.keyboard)
-			s_wl.warned |= DXR_WARN_DROP_NO_KEYBOARD;
-	} else if (s_wl.drop_makes == 2) {
+	if (s_wl.drop_makes == 1)
+		fprintf(stderr, "[DisplayXR-WL] file drops on (%s)%s\n", why,
+		        s_wl.sdl_cut ? ""
+		                     : ": the player has the focus, so SDL's clipboard keeps working until it loses it");
+	else if (s_wl.drop_makes == 2)
 		fprintf(stderr, "[DisplayXR-WL] file drops: data device made again (%s); quietly from now on\n", why);
+	if (s_wl.sdl_cut && !was_cut)
+		fprintf(stderr, "[DisplayXR-WL] SDL's data device is replaced now (%s), for the rest of this run: "
+		                "GUIUtility.systemCopyBuffer cannot read what other apps copy any more. While the app has the "
+		                "focus, read and write the clipboard with DisplayXRNative.LinuxClipboardText / "
+		                "SetLinuxClipboardText; without the focus, with DisplayXRDesktop.GetClipboardText\n",
+		        focused == 0 ? "the player is not focused" : "the player's focus is not known");
+	if (s_wl.drop_makes == 1 && !s_wl.keyboard && !(s_wl.warned & DXR_WARN_DROP_NO_KEYBOARD)) {
+		fprintf(stderr, "[DisplayXR-WL] file drops: the seat has no keyboard; the focus is followed through the "
+		                "GNOME extension%s\n",
+		        s_wl.ext_available ? "" : " (not running: a drag may go to SDL after the player had the focus)");
+		s_wl.warned |= DXR_WARN_DROP_NO_KEYBOARD;
 	}
 }
 
+//! Our data device as soon as the player's focus is known (the keyboard is made
+//! first; dd_make_locked then knows whether SDL's device survives).
 static void
-drop_device_destroy_locked(void)
+dd_request_locked(const char *why)
+{
+	if (!dd_wanted_locked() || s_wl.ddev)
+		return;
+	kb_make_locked();
+	s_wl.drop_make_pending = 1;
+	s_wl.drop_make_why = why;
+	if (!s_wl.keyboard || s_wl.kb_known)
+		dd_make_locked(why);
+}
+
+static void
+dd_destroy_locked(void)
 {
 	drag_clear_locked(1);
+	clip_read_reset_locked();
 	offer_destroy(s_wl.sel_offer);
 	s_wl.sel_offer = NULL;
+	s_wl.sel_have = 0;
 	if (s_wl.ddev) {
 		wl_data_device_release(s_wl.ddev);
 		s_wl.ddev = NULL;
 		wl_display_flush(s_wl.display);
 	}
 	s_wl.drop_remake = 0;
+	s_wl.drop_make_pending = 0;
 }
 
-//! Per frame, after our queue was dispatched: the file list arriving; the device
-//! made again once the player has lost focus (and no drag is over it).
+//! Per frame, after our queue was dispatched: the file list and clipboard text
+//! arriving, ours going out; the device made once the focus is known, and again
+//! once the player has lost the focus (and no drag is over it).
 static void
 drop_poll_locked(void)
 {
 	drop_read_locked();
-	if (s_wl.drop_remake && s_wl.ddev && !s_wl.drag.o && player_focused_locked() == 0)
-		drop_device_make_locked("the player lost the focus", 0);
+	clip_service_locked();
+	if (s_wl.drop_make_pending && !s_wl.ddev && dd_wanted_locked() && (!s_wl.keyboard || s_wl.kb_known))
+		dd_make_locked(s_wl.drop_make_why ? s_wl.drop_make_why : "the app turned them on");
+	if (s_wl.drop_remake && s_wl.ddev && s_wl.drop_wanted && !s_wl.drag.o && player_focused_locked() == 0)
+		dd_make_locked("the player lost the focus");
 }
 
 static int
@@ -3001,10 +3169,24 @@ dxr_wl_file_drop_enable(int enable)
 	int changed = want != s_wl.drop_wanted;
 	s_wl.drop_wanted = want;
 	if (!want) {
-		if (s_wl.ddev) {
-			drop_device_destroy_locked();
-			fprintf(stderr, "[DisplayXR-WL] file drops off (SDL's clipboard does not get other apps' copies back "
-			                "until the app restarts)\n");
+		s_wl.drop_remake = 0;
+		if (changed)
+			drag_clear_locked(1);
+		if (!s_wl.sdl_cut) {
+			// SDL's device was never unlinked: drop ours (and the keyboard), and SDL's
+			// clipboard is exactly as it was.
+			if (s_wl.ddev || s_wl.keyboard) {
+				dd_destroy_locked();
+				kb_destroy_locked();
+				if (changed)
+					fprintf(stderr, "[DisplayXR-WL] file drops off (SDL's data device was never replaced: "
+					                "GUIUtility.systemCopyBuffer works as before)\n");
+			}
+			s_wl.drop_make_pending = 0;
+		} else if (changed && s_wl.ddev) {
+			fprintf(stderr, "[DisplayXR-WL] file drops off; SDL's clipboard does not come back (mutter never "
+			                "re-links a replaced data device), so the plug-in keeps its own for "
+			                "DisplayXRNative.LinuxClipboardText / SetLinuxClipboardText\n");
 		}
 	} else if (s_wl.registry && !drop_supported_locked()) {
 		r = -1;
@@ -3018,11 +3200,469 @@ dxr_wl_file_drop_enable(int enable)
 			fprintf(stderr, "[DisplayXR-WL] file drops: on once the 3D session binds the window\n");
 	} else {
 		if (!s_wl.ddev)
-			drop_device_make_locked("the app turned them on", 1);
-		r = s_wl.ddev ? 1 : -1;
+			dd_request_locked("the app turned them on");
+		else if (changed)
+			fprintf(stderr, "[DisplayXR-WL] file drops on again\n");
+		r = 1;
 	}
 	pthread_mutex_unlock(&s_wl_mutex);
 	return r;
+}
+
+/*
+ *
+ * Clipboard: the plug-in's own, through its data device (displayxr_linux_clipboard.h
+ * says why). Only once SDL's device is gone, only for the focused player (the
+ * Wayland rules: a selection offer is valid while the client has the keyboard
+ * focus, and the compositor takes a new selection only from the focused client).
+ * Reads go through a non-blocking pipe, serviced by the frame thread's poll and by
+ * the caller while it waits (never under our lock); writes offer the text under the
+ * usual text types and serve each reader through a non-blocking pipe the same way.
+ * Clipboard text never reaches a log.
+ *
+ */
+
+static void
+clip_text_unref(struct dxr_wl_clip_text *t)
+{
+	if (t && --t->refs == 0)
+		free(t);
+}
+
+static void
+clip_read_reset_locked(void)
+{
+	if (s_wl.clip_rd.active)
+		close(s_wl.clip_rd.fd);
+	free(s_wl.clip_rd.buf);
+	memset(&s_wl.clip_rd, 0, sizeof(s_wl.clip_rd));
+}
+
+static void
+clip_read_finish_locked(int result)
+{
+	if (s_wl.clip_rd.active)
+		close(s_wl.clip_rd.fd);
+	s_wl.clip_rd.active = 0;
+	s_wl.clip_rd.done = 1;
+	s_wl.clip_rd.result = result;
+	s_wl.clip_rd.done_ns = mono_ns();
+}
+
+//! Takes what has arrived of a clipboard read (non-blocking).
+static void
+clip_read_service_locked(void)
+{
+	if (!s_wl.clip_rd.active)
+		return;
+	for (;;) {
+		if (s_wl.clip_rd.cap - s_wl.clip_rd.len < 4096) {
+			if (s_wl.clip_rd.cap > DXR_CLIP_MAX_BYTES) {
+				clip_read_finish_locked(DXR_CLIP_TOO_LARGE);
+				return;
+			}
+			size_t cap = s_wl.clip_rd.cap ? s_wl.clip_rd.cap * 2 : 16384;
+			char *b = realloc(s_wl.clip_rd.buf, cap);
+			if (!b) {
+				clip_read_finish_locked(DXR_CLIP_FAILED);
+				return;
+			}
+			s_wl.clip_rd.buf = b;
+			s_wl.clip_rd.cap = cap;
+		}
+		ssize_t n = read(s_wl.clip_rd.fd, s_wl.clip_rd.buf + s_wl.clip_rd.len, s_wl.clip_rd.cap - s_wl.clip_rd.len);
+		if (n > 0) {
+			s_wl.clip_rd.len += (size_t)n;
+			if (s_wl.clip_rd.len > DXR_CLIP_MAX_BYTES) {
+				clip_read_finish_locked(DXR_CLIP_TOO_LARGE);
+				return;
+			}
+			continue;
+		}
+		if (n == 0) {
+			clip_read_finish_locked((int)s_wl.clip_rd.len);
+			return;
+		}
+		if (errno == EINTR)
+			continue;
+		if (errno != EAGAIN && errno != EWOULDBLOCK) {
+			clip_read_finish_locked(DXR_CLIP_FAILED);
+			return;
+		}
+		break;
+	}
+	if (mono_ns() >= s_wl.clip_rd.deadline_ns)
+		clip_read_finish_locked(DXR_CLIP_FAILED); // the owner never finished sending
+}
+
+//! A finished read with @p n bytes of @p text (no pipe needed).
+static void
+clip_read_set_locked(const char *text, size_t n)
+{
+	clip_read_reset_locked();
+	if (n) {
+		s_wl.clip_rd.buf = malloc(n);
+		if (!s_wl.clip_rd.buf) {
+			clip_read_finish_locked(DXR_CLIP_FAILED);
+			return;
+		}
+		memcpy(s_wl.clip_rd.buf, text, n);
+	}
+	s_wl.clip_rd.len = s_wl.clip_rd.cap = n;
+	clip_read_finish_locked((int)n);
+}
+
+//! Starts a read of the clipboard: 0 when it is under way or already done, else
+//! why it cannot be read now.
+static int
+clip_read_start_locked(void)
+{
+	int focused = player_focused_locked();
+	int g = dxr_clip_gate(s_wl.surface && s_wl.ddev, s_wl.sdl_cut, focused);
+	if (g)
+		return g;
+	if (s_wl.dd_made_focused)
+		return DXR_CLIP_NOT_FOCUSED; // made during this focus: offered the clipboard from the next one
+	if (!s_wl.sel_have)
+		return DXR_CLIP_PENDING; // this focus' selection event is still on its way
+	struct dxr_wl_offer *o = s_wl.sel_offer;
+	if (!o) {
+		clip_read_set_locked(NULL, 0); // nothing on the clipboard
+		return 0;
+	}
+	if (o->ours && s_wl.clip_txt) {
+		clip_read_set_locked(s_wl.clip_txt->data, s_wl.clip_txt->len);
+		return 0;
+	}
+	int m = dxr_clip_pick(o->text_mask);
+	if (m < 0) {
+		clip_read_set_locked(NULL, 0); // no text on the clipboard
+		return 0;
+	}
+	int fds[2];
+	if (pipe2(fds, O_CLOEXEC | O_NONBLOCK) != 0)
+		return DXR_CLIP_FAILED;
+	clip_read_reset_locked();
+	wl_data_offer_receive(o->offer, dxr_clip_text_mimes[m], fds[1]);
+	close(fds[1]);
+	wl_display_flush(s_wl.display);
+	s_wl.clip_rd.active = 1;
+	s_wl.clip_rd.fd = fds[0];
+	s_wl.clip_rd.deadline_ns = mono_ns() + DXR_WL_CLIP_READ_NS;
+	return 0;
+}
+
+//! One log line each time the answer to a read / write changes (codes only).
+static void
+clip_log_locked(const char *what, int *last, int code)
+{
+	if (code == *last)
+		return;
+	*last = code;
+	const char *why = code == DXR_CLIP_USE_SDL      ? "SDL's clipboard still works: use GUIUtility.systemCopyBuffer"
+	                  : code == DXR_CLIP_UNAVAILABLE ? "no 3D session"
+	                  : code == DXR_CLIP_NOT_FOCUSED ? "the app does not have the keyboard focus"
+	                  : code == DXR_CLIP_TOO_LARGE   ? "more than 1 MiB"
+	                  : code == DXR_CLIP_FAILED      ? "the clipboard's owner sent nothing in time, or an error"
+	                  : code == DXR_CLIP_INVALID     ? "invalid text"
+	                                                 : NULL;
+	if (why)
+		fprintf(stderr, "[DisplayXR-WL] clipboard %s: not done (%s)\n", what, why);
+}
+
+static int s_clip_read_logged = 1, s_clip_write_logged = 1;
+
+static int
+dxr_wl_clipboard_read(char *buf, int len, int timeout_ms, int *needed)
+{
+	if (needed)
+		*needed = 0;
+	pthread_mutex_lock(&s_wl_mutex);
+	// A finished read nobody took for a while is stale: the clipboard may have changed.
+	if (s_wl.clip_rd.done && mono_ns() - s_wl.clip_rd.done_ns > DXR_WL_CLIP_KEEP_NS)
+		clip_read_reset_locked();
+	// At most DXR_WL_CLIP_READ_NS in all, as documented: the wait for this focus'
+	// selection event below is otherwise bounded only by the caller's timeout.
+	long long wait_ns = timeout_ms > 0 ? timeout_ms * 1000000LL : 0;
+	if (wait_ns > DXR_WL_CLIP_READ_NS)
+		wait_ns = DXR_WL_CLIP_READ_NS;
+	long long end = mono_ns() + wait_ns;
+	if (!s_wl.clip_rd.active && !s_wl.clip_rd.done) {
+		int g = clip_read_start_locked();
+		// The selection event can trail the keyboard enter by a dispatch: wait for it.
+		while (g == DXR_CLIP_PENDING && mono_ns() < end) {
+			pthread_mutex_unlock(&s_wl_mutex);
+			struct timespec ts = {0, 5000000};
+			nanosleep(&ts, NULL);
+			pthread_mutex_lock(&s_wl_mutex);
+			g = s_wl.clip_rd.active || s_wl.clip_rd.done ? 0 : clip_read_start_locked();
+		}
+		if (g < 0) {
+			if (g != DXR_CLIP_PENDING)
+				clip_log_locked("read", &s_clip_read_logged, g);
+			pthread_mutex_unlock(&s_wl_mutex);
+			return g;
+		}
+	}
+	clip_read_service_locked();
+	while (s_wl.clip_rd.active && !s_wl.clip_rd.done) {
+		long long left = end - mono_ns();
+		if (left <= 0)
+			break;
+		int fd = dup(s_wl.clip_rd.fd); // waited on without our lock; ours may close meanwhile
+		pthread_mutex_unlock(&s_wl_mutex);
+		if (fd >= 0) {
+			struct pollfd p = {.fd = fd, .events = POLLIN};
+			long long ms = left / 1000000LL;
+			poll(&p, 1, ms < 1 ? 1 : ms > 50 ? 50 : (int)ms);
+			close(fd);
+		} else {
+			struct timespec ts = {0, 2000000};
+			nanosleep(&ts, NULL);
+		}
+		pthread_mutex_lock(&s_wl_mutex);
+		clip_read_service_locked();
+	}
+	int r;
+	if (!s_wl.clip_rd.done) {
+		r = DXR_CLIP_PENDING;
+	} else if (s_wl.clip_rd.result < 0) {
+		r = s_wl.clip_rd.result;
+		clip_read_reset_locked();
+		clip_log_locked("read", &s_clip_read_logged, r);
+	} else {
+		size_t n = (size_t)s_wl.clip_rd.result;
+		if (!buf || len < 0 || (size_t)len < n + 1) {
+			if (needed)
+				*needed = (int)n + 1;
+			r = DXR_CLIP_SPACE; // kept for a call with that much room
+		} else {
+			if (n)
+				memcpy(buf, s_wl.clip_rd.buf, n);
+			buf[n] = 0;
+			r = (int)n;
+			clip_read_reset_locked();
+			s_clip_read_logged = 1;
+		}
+	}
+	pthread_mutex_unlock(&s_wl_mutex);
+	return r;
+}
+
+//! Serves the readers of our text (non-blocking; a reader that left is dropped
+//! without a SIGPIPE reaching the app).
+static void
+clip_writers_service_locked(void)
+{
+	if (!s_wl.clip_wr_n)
+		return;
+	sigset_t pipe_set, old;
+	sigemptyset(&pipe_set);
+	sigaddset(&pipe_set, SIGPIPE);
+	pthread_sigmask(SIG_BLOCK, &pipe_set, &old);
+	long long now = mono_ns();
+	for (int i = 0; i < s_wl.clip_wr_n;) {
+		int gone = 0;
+		while (s_wl.clip_wr[i].off < s_wl.clip_wr[i].txt->len) {
+			ssize_t n = write(s_wl.clip_wr[i].fd, s_wl.clip_wr[i].txt->data + s_wl.clip_wr[i].off,
+			                  s_wl.clip_wr[i].txt->len - s_wl.clip_wr[i].off);
+			if (n > 0) {
+				s_wl.clip_wr[i].off += (size_t)n;
+				continue;
+			}
+			if (n < 0 && errno == EINTR)
+				continue;
+			if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+				break;
+			if (n < 0 && errno == EPIPE) {
+				struct timespec zero = {0, 0};
+				sigtimedwait(&pipe_set, NULL, &zero); // the SIGPIPE this write raised
+			}
+			gone = 1;
+			break;
+		}
+		if (gone || s_wl.clip_wr[i].off >= s_wl.clip_wr[i].txt->len || now >= s_wl.clip_wr[i].deadline_ns) {
+			close(s_wl.clip_wr[i].fd);
+			clip_text_unref(s_wl.clip_wr[i].txt);
+			s_wl.clip_wr[i] = s_wl.clip_wr[--s_wl.clip_wr_n];
+			continue;
+		}
+		i++;
+	}
+	pthread_sigmask(SIG_SETMASK, &old, NULL);
+}
+
+static void
+clip_writers_close_locked(void)
+{
+	while (s_wl.clip_wr_n) {
+		s_wl.clip_wr_n--;
+		close(s_wl.clip_wr[s_wl.clip_wr_n].fd);
+		clip_text_unref(s_wl.clip_wr[s_wl.clip_wr_n].txt);
+	}
+}
+
+static void
+clip_service_locked(void)
+{
+	clip_read_service_locked();
+	clip_writers_service_locked();
+}
+
+static void
+src_target(void *data, struct wl_data_source *src, const char *mime_type)
+{
+	(void)data;
+	(void)src;
+	(void)mime_type;
+}
+
+static void
+src_send(void *data, struct wl_data_source *src, const char *mime_type, int32_t fd)
+{
+	(void)data;
+	if (src != s_wl.clip_src || !s_wl.clip_txt || s_wl.clip_wr_n >= DXR_WL_CLIP_WRITERS || !dxr_clip_mime_bit(mime_type)) {
+		close(fd);
+		return;
+	}
+	int fl = fcntl(fd, F_GETFL);
+	if (fl >= 0)
+		fcntl(fd, F_SETFL, fl | O_NONBLOCK);
+	s_wl.clip_wr[s_wl.clip_wr_n].fd = fd;
+	s_wl.clip_wr[s_wl.clip_wr_n].off = 0;
+	s_wl.clip_wr[s_wl.clip_wr_n].deadline_ns = mono_ns() + DXR_WL_CLIP_WRITE_NS;
+	s_wl.clip_wr[s_wl.clip_wr_n].txt = s_wl.clip_txt;
+	s_wl.clip_txt->refs++;
+	s_wl.clip_wr_n++;
+	clip_writers_service_locked();
+}
+
+static void
+src_cancelled(void *data, struct wl_data_source *src)
+{
+	(void)data;
+	// Another selection replaced ours.
+	if (src == s_wl.clip_src) {
+		s_wl.clip_src = NULL;
+		clip_text_unref(s_wl.clip_txt);
+		s_wl.clip_txt = NULL;
+	}
+	wl_data_source_destroy(src);
+}
+
+static void
+src_dnd_drop_performed(void *data, struct wl_data_source *src)
+{
+	(void)data;
+	(void)src;
+}
+
+static void
+src_dnd_finished(void *data, struct wl_data_source *src)
+{
+	(void)data;
+	(void)src;
+}
+
+static void
+src_action(void *data, struct wl_data_source *src, uint32_t dnd_action)
+{
+	(void)data;
+	(void)src;
+	(void)dnd_action;
+}
+
+static const struct wl_data_source_listener s_clip_source_listener = {
+    .target = src_target,
+    .send = src_send,
+    .cancelled = src_cancelled,
+    .dnd_drop_performed = src_dnd_drop_performed,
+    .dnd_finished = src_dnd_finished,
+    .action = src_action,
+};
+
+//! Our text off the clipboard (the session ends): the compositor's clipboard manager
+//! keeps a copy of a text selection whose owner goes away.
+static void
+clip_source_drop_locked(void)
+{
+	if (s_wl.clip_src) {
+		wl_data_source_destroy(s_wl.clip_src);
+		s_wl.clip_src = NULL;
+	}
+	clip_text_unref(s_wl.clip_txt);
+	s_wl.clip_txt = NULL;
+}
+
+static int
+dxr_wl_clipboard_write(const char *text, int len)
+{
+	int c = dxr_clip_check_write(text, len);
+	if (c)
+		return c;
+	pthread_mutex_lock(&s_wl_mutex);
+	int g = dxr_clip_gate(s_wl.surface && s_wl.ddev, s_wl.sdl_cut, player_focused_locked());
+	if (!g && !s_wl.keyboard)
+		g = DXR_CLIP_FAILED; // no input serial to set the selection with
+	if (g) {
+		clip_log_locked("write", &s_clip_write_logged, g);
+		pthread_mutex_unlock(&s_wl_mutex);
+		return g;
+	}
+	struct wl_data_source *src = NULL;
+	struct dxr_wl_clip_text *t = NULL;
+	if (len > 0) {
+		t = malloc(sizeof(*t) + (size_t)len);
+		if (!t) {
+			pthread_mutex_unlock(&s_wl_mutex);
+			return DXR_CLIP_FAILED;
+		}
+		t->refs = 1;
+		t->len = (size_t)len;
+		memcpy(t->data, text, (size_t)len);
+		src = wl_data_device_manager_create_data_source(s_wl.ddm);
+		wl_data_source_add_listener(src, &s_clip_source_listener, NULL);
+		for (int i = 0; i < DXR_CLIP_TEXT_MIME_COUNT; i++)
+			wl_data_source_offer(src, dxr_clip_text_mimes[i]);
+		wl_data_source_offer(src, DXR_CLIP_OWN_MIME);
+	}
+	// len 0: no source = the clipboard emptied (as SDL does for "").
+	wl_data_device_set_selection(s_wl.ddev, src, s_wl.kb_serial);
+	clip_source_drop_locked(); // the previous one, now that the new selection is set
+	s_wl.clip_src = src;
+	s_wl.clip_txt = t;
+	clip_read_reset_locked(); // a read under way was of the old clipboard
+	wl_display_flush(s_wl.display);
+	s_clip_write_logged = 1;
+	pthread_mutex_unlock(&s_wl_mutex);
+	return 1;
+}
+
+static int
+dxr_wl_clipboard_state(void)
+{
+	pthread_mutex_lock(&s_wl_mutex);
+	int focused = player_focused_locked();
+	unsigned bits = 0;
+	if (s_wl.surface && s_wl.ddev && s_wl.sdl_cut)
+		bits |= DXR_CLIP_STATE_AVAILABLE;
+	if (focused == 1)
+		bits |= DXR_CLIP_STATE_FOCUSED;
+	if (s_wl.sdl_cut)
+		bits |= DXR_CLIP_STATE_SDL_CUT;
+	if (s_wl.clip_txt && s_wl.sel_have && s_wl.sel_offer && s_wl.sel_offer->ours && focused == 1)
+		bits |= DXR_CLIP_STATE_OWNED;
+	pthread_mutex_unlock(&s_wl_mutex);
+	return (int)bits;
+}
+
+//! The session ends: no read, no reader served, and our text off the clipboard.
+static void
+clip_teardown_locked(void)
+{
+	clip_read_reset_locked();
+	clip_writers_close_locked();
+	clip_source_drop_locked();
 }
 
 static int
@@ -3088,6 +3728,9 @@ static const DxrWlApi s_api = {
     .export_handle = dxr_wl_export_handle,
     .file_drop_enable = dxr_wl_file_drop_enable,
     .file_drop_next = dxr_wl_file_drop_next,
+    .clipboard_state = dxr_wl_clipboard_state,
+    .clipboard_read = dxr_wl_clipboard_read,
+    .clipboard_write = dxr_wl_clipboard_write,
     .set_player_position_stage = dxr_wl_set_player_position_stage,
 };
 
