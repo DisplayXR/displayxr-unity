@@ -16,6 +16,7 @@
 #pragma once
 
 #include <stddef.h>
+#include <stdint.h>
 #include <string.h>
 
 #ifdef __cplusplus
@@ -121,6 +122,21 @@ dxr_dd_make_effect(int focused, int *sdl_cut, int *remake)
 {
 	*sdl_cut = focused != 1;
 	*remake = focused != 0;
+}
+
+//! Whether a write must take the plug-in's previous text off the clipboard BEFORE it
+//! sets the new selection. A write sets the selection with the latest input serial,
+//! and mutter ignores a new selection whose serial is not newer than the current
+//! one's while that selection's source still exists
+//! (meta_wayland_data_device_set_selection: selection_serial - serial < UINT32_MAX / 2).
+//! So two writes with no input between them: the second one is dropped. When ours is
+//! still the selection (@p have_source) and @p serial is not newer than the one it was
+//! set with (@p source_serial), ours goes first; otherwise it goes after the new
+//! selection is set, so the clipboard is never briefly without our text.
+static inline int
+dxr_clip_drop_before_set(int have_source, uint32_t source_serial, uint32_t serial)
+{
+	return have_source && (uint32_t)(source_serial - serial) < UINT32_MAX / 2;
 }
 
 #ifdef __cplusplus

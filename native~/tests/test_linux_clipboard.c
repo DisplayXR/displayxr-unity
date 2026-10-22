@@ -99,6 +99,18 @@ test_make_effect(void)
 	CHECK(cut == 1 && remake == 1);
 }
 
+static void
+test_drop_before_set(void)
+{
+	CHECK(!dxr_clip_drop_before_set(0, 7, 7));          // no text of ours on the clipboard
+	CHECK(dxr_clip_drop_before_set(1, 7, 7));           // no input since: mutter would ignore the new one
+	CHECK(!dxr_clip_drop_before_set(1, 7, 8));          // a newer serial: set first, then drop ours
+	CHECK(dxr_clip_drop_before_set(1, 8, 7));           // an older serial (cannot happen): mutter ignores it too
+	CHECK(!dxr_clip_drop_before_set(1, 0xffffffffu, 0)); // the serial wrapped: newer
+	CHECK(dxr_clip_drop_before_set(1, 0, 0xffffffffu));  // ... and back: older
+	CHECK(!dxr_clip_drop_before_set(1, 100, 100 + 0x7fffffffu)); // the far edge of mutter's window
+}
+
 int
 main(void)
 {
@@ -106,6 +118,7 @@ main(void)
 	test_write_checks();
 	test_gate();
 	test_make_effect();
+	test_drop_before_set();
 	if (s_failed) {
 		fprintf(stderr, "%d check(s) failed\n", s_failed);
 		return 1;

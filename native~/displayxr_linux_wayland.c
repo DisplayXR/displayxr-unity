@@ -292,6 +292,7 @@ static struct {
 	} clip_rd;
 	struct wl_data_source *clip_src;   // our clipboard text, while it is the selection
 	struct dxr_wl_clip_text *clip_txt; // its text
+	uint32_t clip_serial;              // the input serial its selection was set with
 	struct {
 		int fd;
 		size_t off;
@@ -3626,11 +3627,17 @@ dxr_wl_clipboard_write(const char *text, int len)
 			wl_data_source_offer(src, dxr_clip_text_mimes[i]);
 		wl_data_source_offer(src, DXR_CLIP_OWN_MIME);
 	}
+	// No input since our previous write: mutter would ignore a selection with the same
+	// serial while ours is still the selection, so ours goes first (a reader it is
+	// serving keeps its own fd and text). Else it goes once the new one is set.
+	if (dxr_clip_drop_before_set(s_wl.clip_src != NULL, s_wl.clip_serial, s_wl.kb_serial))
+		clip_source_drop_locked();
 	// len 0: no source = the clipboard emptied (as SDL does for "").
 	wl_data_device_set_selection(s_wl.ddev, src, s_wl.kb_serial);
 	clip_source_drop_locked(); // the previous one, now that the new selection is set
 	s_wl.clip_src = src;
 	s_wl.clip_txt = t;
+	s_wl.clip_serial = s_wl.kb_serial;
 	clip_read_reset_locked(); // a read under way was of the old clipboard
 	wl_display_flush(s_wl.display);
 	s_clip_write_logged = 1;
