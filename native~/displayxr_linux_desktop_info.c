@@ -690,6 +690,62 @@ xroot_scale_locked(long long now)
 
 /*
  *
+ * Side-step (displayxr_linux_side_step.c): read inside the plug-in, never exported.
+ *
+ */
+
+//! The extension's window list as its JSON reply (GetAllWindows, else GetWindows,
+//! like windows_locked), a malloc'd copy for the caller to free, or NULL when it
+//! cannot be had. Asked afresh each call (the side-step polls 4 times a second) and
+//! never cached or handed to the app.
+char *dxr_linux_desktop_info_window_list_json(void);
+
+char *
+dxr_linux_desktop_info_window_list_json(void)
+{
+	pthread_mutex_lock(&s_mutex);
+	long long now = now_ns();
+	enum call_error e = CALL_FAILED;
+	char *json = NULL;
+	if (!s_ext_no_all) {
+		json = ext_json_locked(now, "GetAllWindows", NULL, &e);
+		if (!json && e == CALL_NO_METHOD)
+			s_ext_no_all = 1; // version < 16: normal windows only
+	}
+	if (!json && s_ext_no_all)
+		json = ext_json_locked(now, "GetWindows", NULL, &e);
+	ext_note_locked(e);
+	pthread_mutex_unlock(&s_mutex);
+	return json;
+}
+
+//! Whether the screen is locked: org.gnome.ScreenSaver.GetActive (gnome-shell). 1
+//! locked, 0 not, -1 cannot tell (no such service: not GNOME).
+int dxr_linux_desktop_info_screen_locked(void);
+
+int
+dxr_linux_desktop_info_screen_locked(void)
+{
+	pthread_mutex_lock(&s_mutex);
+	enum call_error e = CALL_FAILED;
+	DxrDBusMessage *reply = call_locked(now_ns(), "org.gnome.ScreenSaver", "/org/gnome/ScreenSaver",
+	                                    "org.gnome.ScreenSaver", "GetActive", NULL, &e);
+	int r = -1;
+	if (reply) {
+		uint32_t active = 0; // dbus_bool_t
+		DxrDBusError err;
+		s_db->error_init(&err);
+		if (s_db->get_args(reply, &err, DXR_DBUS_TYPE_BOOLEAN, &active, DXR_DBUS_TYPE_INVALID))
+			r = active ? 1 : 0;
+		s_db->error_free(&err);
+		s_db->unref(reply);
+	}
+	pthread_mutex_unlock(&s_mutex);
+	return r;
+}
+
+/*
+ *
  * Plug-in internal.
  *
  */

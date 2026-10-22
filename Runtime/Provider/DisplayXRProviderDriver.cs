@@ -126,6 +126,9 @@ namespace DisplayXR
             // Desktop-control action results + consent changes (XR_DXR_desktop_control),
             // queued by the event pump; tasks complete / StateChanged fires here.
             DisplayXRDesktop.Pump();
+            // Side-step (Linux native Wayland): the app's own window state and its
+            // SteppedAside / ReturnedHome events. One status copy; inert elsewhere.
+            DisplayXRSideStep.Tick();
             if (DisplayXRProviderNative.dxr_prov_session_is_running() == 0)
             {
                 // Falling edge: session lost / restarting (editor dock-undock) / stopping.
