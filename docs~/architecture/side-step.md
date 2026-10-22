@@ -43,7 +43,9 @@ What the app reads, all about its own window: `State` (`Off`, `Unsupported`, `Wa
 `IsAside`, `Covered` (the share of its content covered now), `TryGetWindowRect`,
 `TryGetHomeRect`, `TryGetHomePosition`, and the `SteppedAside`, `ReturnedHome` and
 `StateChanged` events. While desktop control is not granted: `Paused` / `NotGranted`,
-`Covered` 0, `IsAside` false, no rect, no home, no events.
+`Covered` 0, `IsAside` false, no rect, no home, no events. While the screen is locked:
+`Paused` / `ScreenLocked`, `Covered` 0, no events, but home, `IsAside` and the last seen rect
+are kept.
 
 ### The app's content
 
@@ -92,8 +94,8 @@ if (!(DisplayXRSideStep.IsAside && DisplayXRSideStep.TryGetHomePosition(out pos)
   Side-step's own moves never become home.
 - **Only while granted**: nothing at all while desktop control is not granted, and a revoke
   stops it where it is and forgets home (below).
-- **Holds still** while the screen is locked (a lock suspends the grant first, so this reads as
-  `NotGranted`; `org.gnome.ScreenSaver.GetActive` is asked too, after the gate, in case the
+- **Holds still** while the screen is locked (a lock suspends the grant: nothing is read, home is
+  kept, below; `org.gnome.ScreenSaver.GetActive` is asked too, after the gate, in case the
   runtime has not seen the lock yet), while the user moves or resizes the window (the
   extension's move grab flag, or the plug-in's own right-drag), and while the window is
   minimized, maximized or fullscreen. A drag that starts during a glide stops the glide: the
@@ -146,14 +148,32 @@ gate's cost, not a read by side-step.
 | Desktop control | Side-step |
 |---|---|
 | `Granted` | Runs as described above |
-| `NotRequested`, `Pending`, `Denied`, `DisabledByUser` (`displayxr-cli desktop deny`), `Suspended` (kill switch `displayxr-cli desktop stop`, screen locked), `Unsupported` (no session, a runtime without `XR_DXR_desktop_control`) | `Paused` / `NotGranted`. Reads nothing: no window list, no lock state. `Covered` 0, `IsAside` false, no rect, no home, no events. The window stays where it is |
+| `Suspended` after a grant (the screen is locked; the kill switch `displayxr-cli desktop stop` reads the same) | `Paused` / `ScreenLocked`. Reads nothing: no window list, no lock state. `Covered` 0, no events. Keeps the app's own home, whether it is aside and its last seen rect; drops the id of the window it stepped aside for. The window stays where it is |
+| `NotRequested`, `Pending`, `Denied`, `DisabledByUser` (`displayxr-cli desktop deny`), `Unsupported` (no session, a runtime without `XR_DXR_desktop_control`); `Suspended` without an earlier grant | `Paused` / `NotGranted`. Reads nothing: no window list, no lock state. `Covered` 0, `IsAside` false, no rect, no home, no events. The window stays where it is |
 
-**A revoke mid-session** (the user's deny, the kill switch, a lock): the next poll, at most
-250 ms later, finds no grant and stops; a glide stops at its next step (40 ms). The window stays
-where it is, wherever that is (aside, or part way through a glide); no `SteppedAside` /
-`ReturnedHome` fires for the move that was cut short. Everything the decision remembered is
-forgotten: home, where it was going, the window it stepped aside for (only the times of its own
-recent steps aside are kept, for the 6-a-minute cap).
+**A revoke mid-session** (the user's deny, or the kill switch once it is turned off again): the
+next poll, at most 250 ms after the revoke (a second while it was suspended), finds no grant and
+stops; a glide stops at its next step (40 ms). The window stays where it is, wherever that is
+(aside, or part way through a glide); no `SteppedAside` / `ReturnedHome` fires for the move that
+was cut short. Everything the decision remembered is forgotten: home, where it was going, the
+window it stepped aside for (only the times of its own recent steps aside are kept, for the
+6-a-minute cap).
+
+**A screen lock** suspends desktop control (the runtime reports `Suspended`). Side-step stops the
+same way, within one poll or at the next glide step, and reads nothing while the screen is locked.
+But home is the app's own window's data, so it survives the lock: side-step keeps home, whether the
+window is aside (a glide cut short by the lock counts as aside, where its last step put the
+window; with `ReturnHome` off, that place becomes home after the unlock, as a landed step would),
+and the window's last seen rect. It drops only what it knew about the other window: the id of the
+window it stepped aside for. After the unlock (`Granted` again) it carries on from the kept home,
+with no start-up delay and no settling; aside, the normal way back applies, and since the id is
+gone, home only has to be free of the window that has the focus.
+
+The runtime reports the kill switch as `Suspended` too, and side-step cannot tell the two apart
+without reading the lock state, which it must not do without the grant. So while the kill switch
+is on, side-step holds still and keeps home exactly as for a lock: that keeps only the app's own
+window's data and reads nothing. The kill switch ends the grant, so once it is turned off the
+runtime reports `Denied`, and side-step forgets home then.
 
 **When the grant comes back** it starts afresh, as after turning side-step off and on: after the
 start-up delay, the place the window stays put at becomes home. So an avatar that was aside when
@@ -178,7 +198,7 @@ While the grant holds, the plug-in reads, inside its native code, 4 times a seco
 No titles are read: the parser never looks at them, and extension version 18 does not send them
 to this connection at all. Nothing about another window is stored past one poll, except the
 mutter id of the window it stepped aside for (to tell when that window is gone; forgotten when
-the grant ends). Nothing about another window is logged: the log lines speak of the app's own
+the grant ends or the screen locks). Nothing about another window is logged: the log lines speak of the app's own
 window and its covered share only. Without the grant nothing in this table is read.
 
 The app gets only facts about **its own window**: its state, its frame, its home, the share of its
@@ -211,8 +231,9 @@ fights the compositor over one.
 
 - Needs the app's desktop control granted (the GNOME RemoteDesktop portal's consent): an app that
   wants side-step asks for desktop control, even if it uses nothing else of it.
-- A screen lock ends side-step's memory like a revoke: an avatar aside when the screen locked
-  stays there after the unlock, and that place becomes home.
+- After a screen lock, only the focused window keeps the window aside (the id of the window it
+  stepped aside for is dropped at the lock): a document that covers home but no longer has the
+  focus does not hold it aside any more, as it would without the lock.
 - Native Wayland on GNOME only. An X11 (XWayland) player reports `Unsupported` /
   `NotNativeWayland`.
 - The monitor rect is the whole monitor, not its work area: a corner place can end up under

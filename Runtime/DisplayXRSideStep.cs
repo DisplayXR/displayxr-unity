@@ -50,8 +50,13 @@ namespace DisplayXR
         /// <summary>The window moved (start-up placement, the user, the app) and is settling;
         /// where it stays becomes home.</summary>
         Settling = 6,
-        /// <summary>The screen is locked. (Rare: a lock suspends the desktop-control grant, which
-        /// reads as <see cref="NotGranted"/>.)</summary>
+        /// <summary>The screen is locked: desktop control is suspended
+        /// (<see cref="DesktopControlState.Suspended"/>). Side-step reads nothing and holds still, but
+        /// keeps the app's own home and whether it is aside (<see cref="DisplayXRSideStep.IsAside"/>,
+        /// <see cref="DisplayXRSideStep.TryGetHomePosition"/>), and carries on from there after the
+        /// unlock. The user's kill switch also reads as this while it is on (the runtime reports
+        /// both as Suspended); it ends the grant, so after it is turned off the reason becomes
+        /// <see cref="NotGranted"/> and home is forgotten.</summary>
         ScreenLocked = 7,
         /// <summary>The user is moving or resizing the window.</summary>
         UserMoving = 8,
@@ -69,9 +74,10 @@ namespace DisplayXR
         /// <summary>The native plug-in is older than this feature.</summary>
         NativeMissing = 14,
         /// <summary>The app's desktop control is not <see cref="DesktopControlState.Granted"/>
-        /// (<see cref="DisplayXRDesktop.State"/> says why: never requested, denied, turned off by the
-        /// user, suspended by the kill switch or a screen lock, or a runtime without desktop
-        /// control). Side-step reads nothing then, and the window stays where it is.</summary>
+        /// (<see cref="DisplayXRDesktop.State"/> says why: never requested, pending, denied, turned
+        /// off by the user, ended by the kill switch, or a runtime without desktop control; a
+        /// screen lock after a grant is <see cref="ScreenLocked"/> instead). Side-step reads nothing
+        /// then, the window stays where it is, and home is forgotten.</summary>
         NotGranted = 15,
     }
 
@@ -111,10 +117,18 @@ namespace DisplayXR
     /// query <see cref="DisplayXRDesktop.State"/> makes. When the answer is no it reads nothing
     /// (no window list, no lock state) and asks again a second later; <see cref="State"/> is
     /// <see cref="SideStepState.Paused"/> / <see cref="SideStepReason.NotGranted"/>,
-    /// <see cref="Covered"/> is 0, no rect or home is reported, and no event fires. A revoke, the
-    /// kill switch or a screen lock stops it within one look, mid-move too: the window stays where
-    /// it is and side-step forgets its home. When the grant comes back it starts afresh, as after
-    /// turning it off and on: the place the window stays put at becomes home.
+    /// <see cref="Covered"/> is 0, no rect or home is reported, and no event fires. A revoke or the
+    /// kill switch stops it within one look, mid-move too: the window stays where it is and
+    /// side-step forgets its home. When the grant comes back it starts afresh, as after turning it
+    /// off and on: the place the window stays put at becomes home.
+    /// </para>
+    /// <para>
+    /// <b>A screen lock</b> suspends desktop control: side-step stops within one look the same way
+    /// and reads nothing (<see cref="SideStepState.Paused"/> /
+    /// <see cref="SideStepReason.ScreenLocked"/>), but the home is the app's own window's data, so
+    /// it is kept, and so is whether the window is aside. Only the memory of the other window it
+    /// stepped aside for is dropped. After the unlock it carries on: aside, it goes back once home
+    /// is free of the window that has the focus.
     /// </para>
     /// <para>
     /// <b>What the app learns: only its own window.</b> The plug-in reads the other windows'
@@ -245,8 +259,9 @@ namespace DisplayXR
         public static SideStepReason Reason { get; private set; }
 
         /// <summary>True while the window is away from home because of side-step (stepped
-        /// aside, or gliding either way). Save <see cref="TryGetHomePosition"/> then. False while
-        /// desktop control is not granted (side-step has forgotten home then).</summary>
+        /// aside, or gliding either way). Save <see cref="TryGetHomePosition"/> then. Kept while the
+        /// screen is locked; false while desktop control is not granted (side-step has forgotten
+        /// home then).</summary>
         public static bool IsAside { get; private set; }
 
         /// <summary>The share (0..1) of the app's content the focused window of another app
@@ -255,8 +270,8 @@ namespace DisplayXR
         public static float Covered { get; private set; }
 
         /// <summary>The app's window frame in GNOME desktop coordinates (the space of
-        /// <c>DisplayXRNative.LinuxMonitor.Rect</c>), as side-step last saw it. False while
-        /// desktop control is not granted.</summary>
+        /// <c>DisplayXRNative.LinuxMonitor.Rect</c>), as side-step last saw it (kept while the
+        /// screen is locked). False while desktop control is not granted.</summary>
         public static bool TryGetWindowRect(out RectInt rect)
         {
             rect = new RectInt(s_Status.winX, s_Status.winY, s_Status.winW, s_Status.winH);
@@ -264,8 +279,8 @@ namespace DisplayXR
         }
 
         /// <summary>Home: the window frame's place the user (or the app) last left it at, in
-        /// GNOME desktop coordinates, with the window's current size. False while desktop control
-        /// is not granted.</summary>
+        /// GNOME desktop coordinates, with the window's current size. Kept while the screen is
+        /// locked; false while desktop control is not granted.</summary>
         public static bool TryGetHomeRect(out RectInt rect)
         {
             rect = new RectInt(s_Status.homeX, s_Status.homeY, s_Status.winW, s_Status.winH);

@@ -615,14 +615,16 @@ typedef struct {
 	DxrSsSettings s;
 	DxrSsOps ops;
 	double t;
-	int granted;           // the runtime's answer
-	int revoke_at_move;    // > 0: the grant ends right after this many moves (a revoke mid-glide)
+	int granted;           // the runtime's answer: DXR_SS_DC_NO / _GRANTED / _SUSPENDED (a lock)
+	int revoke_at_move;    // > 0: the grant ends right after this many moves (a revoke mid-glide) ...
+	int revoke_to;         // ... and the answer becomes this (DXR_SS_DC_NO, or _SUSPENDED: a lock)
 	DxrSsRect own, mon, doc;
-	int doc_on;            // the document is open and focused
+	int doc_on;            // the document is open ...
+	int doc_unfocused;     // ... and (1) does not have the focus
 	int n_ask, n_list, n_lock, n_moves;
-	char calls[4096];      // 'g' granted yes, 'n' no, 'L' window list, 'K' lock state, 'M' move
+	char calls[4096];      // 'g' granted, 'n' no, 's' suspended, 'L' window list, 'K' lock state, 'M' move
 	int n_calls;
-	int events[16], gates[3];
+	int events[16], gates[5];
 	DxrSsPoll last;
 	int glide_r;           // the last glide's result (-1 none)
 } Gw;
@@ -639,7 +641,7 @@ gw_granted(void *ctx)
 {
 	Gw *w = ctx;
 	w->n_ask++;
-	gw_call(w, w->granted ? 'g' : 'n');
+	gw_call(w, w->granted == DXR_SS_DC_GRANTED ? 'g' : w->granted == DXR_SS_DC_SUSPENDED ? 's' : 'n');
 	return w->granted;
 }
 
@@ -656,8 +658,8 @@ gw_list(void *ctx)
 	                 w->own.x, w->own.y, w->own.w, w->own.h, w->mon.x, w->mon.y, w->mon.w, w->mon.h);
 	if (w->doc_on)
 		n += snprintf(j + n, 1024 - (size_t)n,
-		              ", {\"id\": 42, \"pid\": 200, \"app_id\": \"doc\", \"focus\": true, \"frame\": [%d, %d, %d, %d]}",
-		              w->doc.x, w->doc.y, w->doc.w, w->doc.h);
+		              ", {\"id\": 42, \"pid\": 200, \"app_id\": \"doc\", \"focus\": %s, \"frame\": [%d, %d, %d, %d]}",
+		              w->doc_unfocused ? "false" : "true", w->doc.x, w->doc.y, w->doc.w, w->doc.h);
 	snprintf(j + n, 1024 - (size_t)n, "]}");
 	return j;
 }
@@ -695,7 +697,7 @@ gw_move(void *ctx, int x, int y, int last)
 	w->own.x = x; // lands at once
 	w->own.y = y;
 	if (w->revoke_at_move > 0 && w->n_moves == w->revoke_at_move)
-		w->granted = 0;
+		w->granted = w->revoke_to;
 	return 1;
 }
 
@@ -738,20 +740,19 @@ gw_run(Gw *w, double dt)
 		if (w->last.read && w->last.d.event)
 			w->events[w->last.d.event]++;
 		if (w->last.read && w->last.d.move)
-			w->glide_r = dxr_ss_glide(&w->g, &w->st, &w->ops, w->own.x, w->own.y, w->last.d.x, w->last.d.y,
-			                          w->s.glide_s);
+			w->glide_r = dxr_ss_glide(&w->g, &w->st, &w->s, &w->ops, w->own.x, w->own.y, w->last.d.x, w->last.d.y);
 	}
 }
 
 //! Every read of other windows (L, K) and every move (M) came after a 'g' (granted)
-//! with no 'n' (not granted) in between.
+//! with no 'n' (not granted) or 's' (suspended) in between.
 static int
 gw_reads_gated(const Gw *w)
 {
 	char gate = 0;
 	for (int i = 0; i < w->n_calls; i++) {
 		char c = w->calls[i];
-		if (c == 'g' || c == 'n')
+		if (c == 'g' || c == 'n' || c == 's')
 			gate = c;
 		else if (gate != 'g')
 			return 0;
@@ -811,8 +812,9 @@ test_gate_revoke_aside_and_regrant(void)
 	int ax = w.own.x, ay = w.own.y, moves = w.n_moves, lists = w.n_list, locks = w.n_lock;
 	CHECK(ax != 2580);
 
-	// Revoked (the user's deny, the kill switch, a lock) while aside: the next poll
-	// stops, reads nothing, forgets home and the window it stepped aside for.
+	// Revoked (the user's deny, a resumed kill switch: anything but suspended) while
+	// aside: the next poll stops, reads nothing, forgets home and the window it
+	// stepped aside for.
 	w.granted = 0;
 	gw_run(&w, 0.25);
 	CHECK(w.last.gate == DXR_SS_GATE_CLOSED && !w.last.granted);
@@ -912,6 +914,188 @@ test_gate_new_session(void)
 	CHECK(w.last.gate == DXR_SS_GATE_OPENED && !w.st.have_home && w.st.reason == DXR_SS_REASON_SETTLING);
 }
 
+/*
+ *
+ * A screen lock (the runtime says Suspended): hold still and read nothing, drop the
+ * id of the window it stepped aside for, keep the app's own home and whether it is
+ * aside; carry on from there after the unlock.
+ *
+ */
+
+//! Granted, home, then a document over it: aside (and landed).
+static void
+gw_aside(Gw *w)
+{
+	gw_init(w);
+	w->granted = DXR_SS_DC_GRANTED;
+	gw_run(w, 3.0);
+	w->doc_on = 1;
+	gw_run(w, 1.5);
+}
+
+static void
+test_lock_keeps_home_aside(void)
+{
+	Gw w;
+	gw_aside(&w);
+	CHECK(w.st.phase == DXR_SS_PHASE_ASIDE && w.st.aside_for == 42);
+	int ax = w.own.x, ay = w.own.y, lists = w.n_list, locks = w.n_lock, moves = w.n_moves;
+
+	// Locked: nothing is read, nothing moves; home and "aside" are kept, the id is dropped.
+	w.granted = DXR_SS_DC_SUSPENDED;
+	gw_run(&w, 0.25);
+	CHECK(w.last.gate == DXR_SS_GATE_SUSPENDED && !w.last.granted && w.g.open && w.g.suspended);
+	CHECK(w.st.reason == DXR_SS_REASON_LOCKED && dxr_ss_report_state(&w.st) == DXR_SS_STATE_PAUSED);
+	CHECK(w.st.have_home && w.st.home_x == 2580 && w.st.home_y == 298 && w.st.phase == DXR_SS_PHASE_ASIDE);
+	CHECK(w.st.aside_for == 0 && w.st.covered == 0.0f);
+	w.doc_on = 0; // the document closes while the screen is locked
+	gw_run(&w, 10.0);
+	CHECK(w.n_list == lists && w.n_lock == locks && w.n_moves == moves && w.own.x == ax && w.own.y == ay);
+	CHECK(w.gates[DXR_SS_GATE_SUSPENDED] == 1 && w.gates[DXR_SS_GATE_CLOSED] == 0);
+	CHECK(w.st.have_home && w.st.phase == DXR_SS_PHASE_ASIDE);
+
+	// Unlocked: carries on from the kept home (no settling, no new home); home is free,
+	// so back after ReturnDelay.
+	w.granted = DXR_SS_DC_GRANTED;
+	gw_run(&w, 0.25);
+	CHECK(w.last.gate == DXR_SS_GATE_RESUMED && w.last.read && !w.g.suspended);
+	CHECK(w.st.reason == DXR_SS_REASON_NONE && w.st.phase == DXR_SS_PHASE_ASIDE && w.st.home_x == 2580);
+	gw_run(&w, 3.0);
+	CHECK(w.events[DXR_SS_EV_LANDED_HOME] == 1 && w.own.x == 2580 && w.own.y == 298);
+	CHECK(w.events[DXR_SS_EV_NEW_HOME] == 1 && w.gates[DXR_SS_GATE_OPENED] == 1);
+	CHECK(gw_reads_gated(&w));
+}
+
+static void
+test_lock_then_only_the_focused_window_counts(void)
+{
+	// Unlocked with the focused document still over home: stays aside. The document
+	// loses the focus but stays put: the id it stepped aside for was dropped at the
+	// lock, so only the focused window counts now, and home counts as free.
+	Gw w;
+	gw_aside(&w);
+	int ax = w.own.x, moves = w.n_moves;
+	w.granted = DXR_SS_DC_SUSPENDED;
+	gw_run(&w, 2.0);
+	w.granted = DXR_SS_DC_GRANTED;
+	gw_run(&w, 5.0);
+	CHECK(w.st.phase == DXR_SS_PHASE_ASIDE && w.n_moves == moves && w.own.x == ax);
+	w.doc_unfocused = 1;
+	gw_run(&w, 3.0);
+	CHECK(w.events[DXR_SS_EV_LANDED_HOME] == 1 && w.own.x == 2580 && w.own.y == 298);
+
+	// Without a lock the unfocused document still holds it aside (#400's rule).
+	Gw v;
+	gw_aside(&v);
+	v.doc_unfocused = 1;
+	gw_run(&v, 5.0);
+	CHECK(v.st.phase == DXR_SS_PHASE_ASIDE && v.events[DXR_SS_EV_LANDED_HOME] == 0);
+}
+
+static void
+test_lock_at_home(void)
+{
+	Gw w;
+	gw_init(&w);
+	w.granted = DXR_SS_DC_GRANTED;
+	gw_run(&w, 3.0);
+	CHECK(w.st.phase == DXR_SS_PHASE_HOME);
+	w.granted = DXR_SS_DC_SUSPENDED;
+	gw_run(&w, 5.0);
+	CHECK(w.st.reason == DXR_SS_REASON_LOCKED && w.st.have_home && w.st.phase == DXR_SS_PHASE_HOME);
+	w.granted = DXR_SS_DC_GRANTED;
+	gw_run(&w, 0.25);
+	CHECK(w.last.gate == DXR_SS_GATE_RESUMED && w.st.phase == DXR_SS_PHASE_HOME && w.st.reason == DXR_SS_REASON_NONE);
+	CHECK(w.events[DXR_SS_EV_NEW_HOME] == 1 && w.st.home_x == 2580 && w.st.home_y == 298);
+	// ... and it works at once (no start-up delay, no settling).
+	w.doc_on = 1;
+	gw_run(&w, 1.5);
+	CHECK(w.st.phase == DXR_SS_PHASE_ASIDE && w.st.home_x == 2580);
+}
+
+static void
+test_lock_mid_glide(void)
+{
+	// The screen locks after step 5 of a 25-step glide: step 6 is not made, the window
+	// stays where step 5 put it, nothing lands; home is kept and it counts as aside.
+	Gw w;
+	gw_init(&w);
+	w.granted = DXR_SS_DC_GRANTED;
+	w.s.glide_s = 1.0f;
+	gw_run(&w, 3.0);
+	w.revoke_at_move = 5;
+	w.revoke_to = DXR_SS_DC_SUSPENDED;
+	w.doc_on = 1;
+	gw_run(&w, 1.0);
+	CHECK(w.glide_r == DXR_SS_GLIDE_SUSPENDED && w.n_moves == 5);
+	CHECK((w.own.x != 2580 || w.own.y != 298) && (w.own.x != w.last.d.x || w.own.y != w.last.d.y));
+	CHECK(w.g.open && w.g.suspended && w.st.reason == DXR_SS_REASON_LOCKED);
+	CHECK(w.st.have_home && w.st.home_x == 2580 && w.st.phase == DXR_SS_PHASE_ASIDE && w.st.aside_for == 0);
+	CHECK(w.st.last_x == w.own.x && w.st.last_y == w.own.y);
+	int lists = w.n_list;
+	w.doc_on = 0;
+	gw_run(&w, 5.0);
+	CHECK(w.n_moves == 5 && w.n_list == lists && w.events[DXR_SS_EV_LANDED_ASIDE] == 0);
+	// Unlocked: not a move by someone else (no new home); home is free: back.
+	w.revoke_at_move = 0;
+	w.granted = DXR_SS_DC_GRANTED;
+	w.s.glide_s = 0.3f;
+	gw_run(&w, 0.25);
+	CHECK(w.last.gate == DXR_SS_GATE_RESUMED && w.st.reason == DXR_SS_REASON_NONE);
+	gw_run(&w, 3.0);
+	CHECK(w.events[DXR_SS_EV_LANDED_HOME] == 1 && w.own.x == 2580 && w.own.y == 298);
+	CHECK(w.events[DXR_SS_EV_NEW_HOME] == 1);
+
+	// ReturnHome off: a step aside cut short by a lock ends where it is, which becomes
+	// home after the unlock (as a landed one would); no move.
+	Gw v;
+	gw_init(&v);
+	v.granted = DXR_SS_DC_GRANTED;
+	v.s.glide_s = 1.0f;
+	v.s.return_home = 0;
+	gw_run(&v, 3.0);
+	v.revoke_at_move = 5;
+	v.revoke_to = DXR_SS_DC_SUSPENDED;
+	v.doc_on = 1;
+	gw_run(&v, 1.0);
+	CHECK(v.glide_r == DXR_SS_GLIDE_SUSPENDED && v.st.phase == DXR_SS_PHASE_SETTLING);
+	int x = v.own.x, y = v.own.y;
+	v.doc_on = 0;
+	v.revoke_at_move = 0;
+	v.granted = DXR_SS_DC_GRANTED;
+	gw_run(&v, 2.0);
+	CHECK(v.st.phase == DXR_SS_PHASE_HOME && v.st.home_x == x && v.st.home_y == y && v.n_moves == 5);
+}
+
+static void
+test_lock_then_revoke_forgets(void)
+{
+	// Suspended, then any other no (the kill switch's resume reads Denied; a deny):
+	// everything is forgotten after all. The grant again: afresh.
+	Gw w;
+	gw_aside(&w);
+	int ax = w.own.x, ay = w.own.y;
+	w.granted = DXR_SS_DC_SUSPENDED;
+	gw_run(&w, 2.0);
+	CHECK(w.st.have_home);
+	w.granted = DXR_SS_DC_NO;
+	gw_run(&w, 0.25);
+	CHECK(w.last.gate == DXR_SS_GATE_CLOSED && !w.g.open && !w.g.suspended);
+	CHECK(!w.st.have_home && w.st.reason == DXR_SS_REASON_NOT_GRANTED);
+	w.granted = DXR_SS_DC_GRANTED;
+	gw_run(&w, 3.0);
+	CHECK(w.gates[DXR_SS_GATE_OPENED] == 2 && w.st.home_x == ax && w.st.home_y == ay);
+
+	// Never granted, the screen locks (the runtime says Suspended before "not
+	// requested"): nothing to keep; NotGranted, as before.
+	Gw v;
+	gw_init(&v);
+	v.granted = DXR_SS_DC_SUSPENDED;
+	gw_run(&v, 2.0);
+	CHECK(!v.g.open && !v.g.suspended && v.st.reason == DXR_SS_REASON_NOT_GRANTED && v.n_list == 0);
+	CHECK(v.gates[DXR_SS_GATE_SUSPENDED] == 0);
+}
+
 int
 main(void)
 {
@@ -935,6 +1119,11 @@ main(void)
 	test_gate_revoke_mid_glide();
 	test_gate_keeps_the_cap();
 	test_gate_new_session();
+	test_lock_keeps_home_aside();
+	test_lock_then_only_the_focused_window_counts();
+	test_lock_at_home();
+	test_lock_mid_glide();
+	test_lock_then_revoke_forgets();
 	if (s_failed) {
 		fprintf(stderr, "test_linux_side_step: %d check(s) failed\n", s_failed);
 		return 1;

@@ -10,13 +10,15 @@
 // ONLY WHILE GRANTED. Every poll first asks the runtime whether the app's desktop
 // control is Granted (dxr_prov_desktop_get_state: the very query behind
 // DisplayXRDesktop.State, which DisplayXRNative.LinuxWindows / LinuxWindowAt /
-// LinuxPointer answer behind; the #389 consent policy, runtime ADR-056). Not
-// granted (never asked, denied, turned off by the user, the kill switch, the
-// screen locked, a runtime without XR_DXR_desktop_control): nothing below is read,
-// the status is Paused / NotGranted, and what the decision remembered is
-// forgotten; the window stays where it is. A glide asks again before each step.
-// The pure part (dxr_ss_poll, dxr_ss_glide) holds that order; the unit test counts
-// the reads.
+// LinuxPointer answer behind; the #389 consent policy, runtime ADR-056). Unless it
+// is Granted nothing below is read and the window stays where it is. Suspended
+// (the screen is locked; the user's kill switch reads the same): Paused /
+// ScreenLocked, the app's own home and whether it is aside are kept, the id of the
+// window it stepped aside for is dropped; it carries on once granted again. Any
+// other no (never asked, denied, turned off by the user, a resumed kill switch, a
+// runtime without XR_DXR_desktop_control): Paused / NotGranted, and what the
+// decision remembered is forgotten. A glide asks again before each step. The pure
+// part (dxr_ss_poll, dxr_ss_glide) holds that order; the unit test counts the reads.
 //
 // WHAT IS READ (only while granted), AND WHERE IT GOES
 //  - The DisplayXR GNOME extension's window list (GetAllWindows, else GetWindows):
@@ -123,7 +125,8 @@ reason_text(int r)
 		return "no window list from the DisplayXR GNOME extension (not installed, disabled, not GNOME): waiting";
 	case DXR_SS_REASON_NO_WINDOW: return "the app's window is not shown: waiting";
 	case DXR_SS_REASON_SETTLING: return "waiting for the window to stay put";
-	case DXR_SS_REASON_LOCKED: return "the screen is locked: paused";
+	case DXR_SS_REASON_LOCKED:
+		return "the screen is locked (desktop control suspended): paused, nothing is read, home is kept";
 	case DXR_SS_REASON_USER_MOVING: return "the user is moving the window: paused (where they leave it becomes home)";
 	case DXR_SS_REASON_MINIMIZED: return "the window is minimized: paused";
 	case DXR_SS_REASON_MAXIMIZED: return "the window is maximized: paused";
@@ -239,7 +242,11 @@ op_granted(void *ctx)
 	(void)ctx;
 	int32_t state = XR_DESKTOP_CONTROL_STATE_UNSUPPORTED_DXR;
 	uint64_t caps = 0;
-	return dxr_prov_desktop_get_state(&state, &caps) >= 0 && state == XR_DESKTOP_CONTROL_STATE_GRANTED_DXR;
+	if (dxr_prov_desktop_get_state(&state, &caps) < 0)
+		return DXR_SS_DC_NO;
+	return state == XR_DESKTOP_CONTROL_STATE_GRANTED_DXR     ? DXR_SS_DC_GRANTED
+	       : state == XR_DESKTOP_CONTROL_STATE_SUSPENDED_DXR ? DXR_SS_DC_SUSPENDED
+	                                                         : DXR_SS_DC_NO;
 }
 
 static char *
@@ -310,6 +317,8 @@ typedef struct {
 	int last_state, last_reason; // logged
 	int started;                 // the decision runs (a native-Wayland session's window)
 	int not_granted;             // the last tick ended at the gate (nothing read)
+	int own_valid;               // the app's own window, as last seen (kept while locked)
+	DxrSsRect own;
 	const char *body_what;       // logged when it changes
 } Worker;
 
@@ -331,6 +340,29 @@ note_state(Worker *w, int state, int reason)
 		ss_log("watching again\n");
 }
 
+//! The app's own window's facts the decision keeps: its last seen frame, home (stage
+//! and X root px), and whether it is away from home.
+static void
+fill_own(const Worker *w, DisplayXRSideStepStatus *out)
+{
+	const DxrSsState *st = &w->st;
+	out->window_valid = w->own_valid;
+	out->win_x = w->own.x;
+	out->win_y = w->own.y;
+	out->win_w = w->own.w;
+	out->win_h = w->own.h;
+	out->home_valid = st->have_home;
+	out->home_x = st->home_x;
+	out->home_y = st->home_y;
+	float k = st->have_home ? displayxr_linux_xroot_scale() : 0.0f;
+	if (k > 0.0f) {
+		out->home_xroot_valid = 1;
+		out->home_xroot_x = (int32_t)lroundf(st->home_x * k);
+		out->home_xroot_y = (int32_t)lroundf(st->home_y * k);
+	}
+	out->aside = st->phase == DXR_SS_PHASE_ASIDE || st->phase == DXR_SS_PHASE_MOVING;
+}
+
 //! Not granted: holding still, and nothing about the window is reported but that
 //! (no rect, no home, Covered 0, no events). The event counters are kept.
 static void
@@ -338,8 +370,23 @@ publish_not_granted(Worker *w)
 {
 	DisplayXRSideStepStatus out;
 	memset(&out, 0, sizeof(out));
+	w->own_valid = 0;
 	out.state = DXR_SS_STATE_PAUSED;
 	out.reason = DXR_SS_REASON_NOT_GRANTED;
+	note_state(w, out.state, out.reason);
+	publish(&out, DXR_SS_EV_NONE);
+}
+
+//! Suspended (the screen is locked): holding still. The app's own window's facts
+//! stay as they were (home, aside, its last seen frame); Covered 0, no events.
+static void
+publish_locked(Worker *w)
+{
+	DisplayXRSideStepStatus out;
+	memset(&out, 0, sizeof(out));
+	out.state = DXR_SS_STATE_PAUSED;
+	out.reason = DXR_SS_REASON_LOCKED;
+	fill_own(w, &out);
 	note_state(w, out.state, out.reason);
 	publish(&out, DXR_SS_EV_NONE);
 }
@@ -368,7 +415,8 @@ tick(Worker *w, const DxrSsSettings *s)
 			pthread_mutex_unlock(&s_body_mutex);
 		}
 		w->started = 0;
-		w->gate.open = 0;
+		w->own_valid = 0;
+		memset(&w->gate, 0, sizeof(w->gate));
 		out.state = DXR_SS_STATE_WAITING;
 		out.reason = DXR_SS_REASON_NO_SESSION;
 		note_state(w, out.state, out.reason);
@@ -387,9 +435,17 @@ tick(Worker *w, const DxrSsSettings *s)
 		ss_log("desktop control ended: stopped where it is; home forgotten until it is granted again\n");
 	else if (p.gate == DXR_SS_GATE_OPENED)
 		ss_log("desktop control granted: starting afresh (where the window stays put becomes home)\n");
+	else if (p.gate == DXR_SS_GATE_SUSPENDED)
+		ss_log("desktop control suspended (the screen is locked): holding still, home kept\n");
+	else if (p.gate == DXR_SS_GATE_RESUMED)
+		ss_log("desktop control granted again: carrying on from home%s\n",
+		       w->st.phase == DXR_SS_PHASE_ASIDE ? " (aside: back once home is free)" : "");
 	if (!p.granted) {
 		w->not_granted = 1;
-		publish_not_granted(w);
+		if (w->gate.suspended)
+			publish_locked(w);
+		else
+			publish_not_granted(w);
 		return;
 	}
 	if (!p.read) {
@@ -400,6 +456,8 @@ tick(Worker *w, const DxrSsSettings *s)
 		return;
 	}
 	w->started = 1;
+	w->own_valid = p.in.own_valid;
+	w->own = p.in.own;
 	if (what != w->body_what) {
 		ss_log("the app's content is %s\n", what);
 		w->body_what = what;
@@ -424,21 +482,7 @@ tick(Worker *w, const DxrSsSettings *s)
 	out.state = state;
 	out.reason = st->reason;
 	out.covered = st->covered;
-	out.window_valid = in->own_valid;
-	out.win_x = in->own.x;
-	out.win_y = in->own.y;
-	out.win_w = in->own.w;
-	out.win_h = in->own.h;
-	out.home_valid = st->have_home;
-	out.home_x = st->home_x;
-	out.home_y = st->home_y;
-	float k = st->have_home ? displayxr_linux_xroot_scale() : 0.0f;
-	if (k > 0.0f) {
-		out.home_xroot_valid = 1;
-		out.home_xroot_x = (int32_t)lroundf(st->home_x * k);
-		out.home_xroot_y = (int32_t)lroundf(st->home_y * k);
-	}
-	out.aside = st->phase == DXR_SS_PHASE_ASIDE || st->phase == DXR_SS_PHASE_MOVING;
+	fill_own(w, &out);
 	if (d->move)
 		out.state = DXR_SS_STATE_MOVING;
 	publish(&out, d->event);
@@ -450,7 +494,7 @@ tick(Worker *w, const DxrSsSettings *s)
 	else
 		ss_log("%.0f %% of the app's content covered for %.1f s: stepping aside to (%d,%d) (covered there %.0f %%)\n",
 		       d->covered * 100.0, (double)s->dwell_s, d->x, d->y, d->spot_covered * 100.0);
-	int r = dxr_ss_glide(&w->gate, st, &s_ops, in->own.x, in->own.y, d->x, d->y, s->glide_s);
+	int r = dxr_ss_glide(&w->gate, st, s, &s_ops, in->own.x, in->own.y, d->x, d->y);
 	if (r == DXR_SS_GLIDE_NOT_GRANTED) {
 		// The grant ended during the glide: it stopped where it is, and the gate is
 		// closed (everything forgotten). Say so now, not at the next poll.
@@ -458,6 +502,14 @@ tick(Worker *w, const DxrSsSettings *s)
 		       "again\n");
 		w->not_granted = 1;
 		publish_not_granted(w);
+	} else if (r == DXR_SS_GLIDE_SUSPENDED) {
+		// The screen locked during the glide: it stopped where its last step put the
+		// window (own data: kept as its frame), home kept. Say so now.
+		ss_log("desktop control suspended during a move (the screen is locked): stopped where it is, home kept\n");
+		w->own.x = st->last_x;
+		w->own.y = st->last_y;
+		w->not_granted = 1;
+		publish_locked(w);
 	} else if (r == DXR_SS_GLIDE_CANNOT_MOVE) {
 		static int s_warned;
 		if (!s_warned)
@@ -483,7 +535,8 @@ worker_main(void *arg)
 				was_on = 0;
 				dxr_ss_reset(&w.st);
 				w.started = 0;
-				w.gate.open = 0; // on again: the grant is asked for afresh
+				w.own_valid = 0;
+				memset(&w.gate, 0, sizeof(w.gate)); // on again: the grant is asked for afresh
 				w.last_state = w.last_reason = -1;
 				uint32_t ac = s_status.aside_count, hc = s_status.home_count;
 				memset(&s_status, 0, sizeof(s_status));

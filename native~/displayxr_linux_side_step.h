@@ -19,9 +19,12 @@
 // #389 gate, runtime ADR-056: the same synchronous runtime query that
 // DisplayXRNative.LinuxWindows / LinuxWindowAt / LinuxPointer answer behind).
 // dxr_ss_poll asks the gate first on every poll and reads nothing about other
-// windows (nor the lock state) unless it says yes; when it says no, everything the
-// decision remembered (home, the window it stepped aside for) is forgotten and the
-// window stays where it is (docs~/architecture/side-step.md).
+// windows (nor the lock state) unless it says yes. Suspended (the screen is locked):
+// it holds still and drops the id of the window it stepped aside for, but keeps the
+// app's own home and whether it is aside, and carries on from there once granted
+// again. Any other no: everything the decision remembered (home, the window it
+// stepped aside for) is forgotten. Either way the window stays where it is
+// (docs~/architecture/side-step.md).
 //
 // PRIVACY. Other windows' frames and focus are read here, inside the plug-in, and
 // never leave it: no other window's id, pid, app id, title or rect is stored past
@@ -877,15 +880,21 @@ dxr_ss_step(DxrSsState *st, const DxrSsSettings *s, const DxrSsInput *in, DxrSsD
  *
  */
 
+//! What the gate answers (DxrSsOps.granted).
+#define DXR_SS_DC_NO 0        //!< not granted: never asked, pending, denied, turned off by the user, no extension
+#define DXR_SS_DC_GRANTED 1   //!< granted
+#define DXR_SS_DC_SUSPENDED 2 //!< granted, but suspended: the screen is locked (or the user's kill switch is on)
+
 //! What a poll reads and does, as calls: displayxr_linux_side_step.c wires the real
 //! ones, the unit test fakes them (and counts them). window_list and screen_locked
 //! are the only reads of other windows and of the desktop; dxr_ss_poll makes them
-//! only after `granted` said yes on that same poll.
+//! only after `granted` said DXR_SS_DC_GRANTED on that same poll.
 typedef struct DxrSsOps {
 	void *ctx;
-	//! 1 when the app's desktop control is Granted right now: the #389 gate, the same
+	//! The app's desktop control right now (DXR_SS_DC_*): the #389 gate, the same
 	//! synchronous runtime query DisplayXRNative.LinuxWindows answers behind
-	//! (dxr_prov_desktop_get_state, state XR_DESKTOP_CONTROL_STATE_GRANTED_DXR).
+	//! (dxr_prov_desktop_get_state: XR_DESKTOP_CONTROL_STATE_GRANTED_DXR /
+	//! _SUSPENDED_DXR / anything else).
 	int (*granted)(void *ctx);
 	char *(*window_list)(void *ctx); //!< the extension's window list (malloc'd JSON; NULL = none)
 	int (*screen_locked)(void *ctx); //!< 1 locked, 0 not, -1 cannot tell
@@ -899,12 +908,15 @@ typedef struct DxrSsOps {
 
 //! The gate's memory between polls.
 typedef struct DxrSsGate {
-	int open; //!< the grant held on the last poll (or glide step) that asked
+	int open;      //!< granted on the last poll (or glide step) that asked, or suspended since
+	int suspended; //!< ... and suspended now (the screen is locked): holding still, home kept
 } DxrSsGate;
 
-#define DXR_SS_GATE_SAME 0   //!< as on the last poll
-#define DXR_SS_GATE_OPENED 1 //!< granted now, not before: started afresh (the window's place becomes home)
-#define DXR_SS_GATE_CLOSED 2 //!< not granted now, granted before: stopped, everything forgotten
+#define DXR_SS_GATE_SAME 0      //!< as on the last poll
+#define DXR_SS_GATE_OPENED 1    //!< granted now, not before: started afresh (the window's place becomes home)
+#define DXR_SS_GATE_CLOSED 2    //!< not granted now, granted (or suspended) before: stopped, everything forgotten
+#define DXR_SS_GATE_SUSPENDED 3 //!< suspended now, granted before: holding still, home kept
+#define DXR_SS_GATE_RESUMED 4   //!< granted again after a suspension: carrying on from the kept home
 
 //! One poll's outcome.
 typedef struct DxrSsPoll {
@@ -936,13 +948,31 @@ static inline void
 dxr_ss_gate_close(DxrSsGate *g, DxrSsState *st)
 {
 	g->open = 0;
+	g->suspended = 0;
 	dxr_ss_forget(st);
 	st->reason = DXR_SS_REASON_NOT_GRANTED;
 }
 
-//! One poll (the worker makes one every DXR_SS_POLL_MS). First the gate: not
-//! granted -> nothing is read (no window list, no lock state), the decision's
-//! memory is forgotten if the grant held before, and the reason is NOT_GRANTED.
+//! Suspended (the screen is locked): hold still. The app's own home and whether it
+//! is aside are kept (its own window's data); the id of the window it stepped aside
+//! for is dropped (nothing about other windows is kept while nothing may be read),
+//! and so are the timers that need reads. After the unlock the normal rules carry
+//! on from the kept home: aside, it goes back once home is free of the focused window.
+static inline void
+dxr_ss_suspend(DxrSsGate *g, DxrSsState *st)
+{
+	g->suspended = 1;
+	st->aside_for = 0;
+	st->in_way_since = st->home_clear_since = -1.0;
+	st->streak_reported = 0;
+	st->covered = 0.0f;
+	st->reason = DXR_SS_REASON_LOCKED;
+}
+
+//! One poll (the worker makes one every DXR_SS_POLL_MS). First the gate; nothing
+//! is read (no window list, no lock state) unless it says granted. Suspended after a
+//! grant -> holding still, home kept (dxr_ss_suspend; reason LOCKED). Any other no ->
+//! the decision's memory is forgotten if the grant held before (reason NOT_GRANTED).
 //! Granted -> the window list, the lock state, the decision (`now` seconds; `body`
 //! NULL = the whole window).
 static inline void
@@ -950,7 +980,13 @@ dxr_ss_poll(DxrSsState *st, DxrSsGate *g, const DxrSsSettings *s, const DxrSsOps
             const DxrSsBody *body, DxrSsPoll *p)
 {
 	memset(p, 0, sizeof(*p));
-	if (!ops->granted(ops->ctx)) {
+	int dc = ops->granted(ops->ctx);
+	if (dc == DXR_SS_DC_SUSPENDED && g->open) {
+		p->gate = g->suspended ? DXR_SS_GATE_SAME : DXR_SS_GATE_SUSPENDED;
+		dxr_ss_suspend(g, st);
+		return;
+	}
+	if (dc != DXR_SS_DC_GRANTED) {
 		p->gate = g->open ? DXR_SS_GATE_CLOSED : DXR_SS_GATE_SAME;
 		dxr_ss_gate_close(g, st);
 		return;
@@ -959,7 +995,10 @@ dxr_ss_poll(DxrSsState *st, DxrSsGate *g, const DxrSsSettings *s, const DxrSsOps
 		g->open = 1;
 		dxr_ss_forget(st); // afresh: no home from before the grant
 		p->gate = DXR_SS_GATE_OPENED;
+	} else if (g->suspended) {
+		p->gate = DXR_SS_GATE_RESUMED; // carry on from the kept home
 	}
+	g->suspended = 0;
 	p->granted = 1;
 	char *json = ops->window_list(ops->ctx);
 	int ok = json && dxr_ss_parse_windows(json, own_pid, st->aside_for, &p->in);
@@ -983,25 +1022,43 @@ dxr_ss_poll(DxrSsState *st, DxrSsGate *g, const DxrSsSettings *s, const DxrSsOps
 #define DXR_SS_GLIDE_STOPPED 1     //!< side-step turned off, or the user took the window: it stays where it is
 #define DXR_SS_GLIDE_NOT_GRANTED 2 //!< the grant ended: it stays where it is, the gate is closed (forgotten)
 #define DXR_SS_GLIDE_CANNOT_MOVE 3 //!< the Wayland library cannot move the window
+#define DXR_SS_GLIDE_SUSPENDED 4   //!< the screen locked: it stays where it is, home kept (dxr_ss_suspend)
 
-//! Glide the app's own window from (fx, fy) to (tx, ty), stage px, in `seconds`
+//! Glide the app's own window from (fx, fy) to (tx, ty), stage px, in s->glide_s
 //! (ease-out; the last step is the target). Before each step: still on, the user
 //! not dragging it, and still GRANTED (the same gate as the poll's); the first
-//! that fails stops it where it is. A glide stopped for the grant closes the gate
-//! (dxr_ss_gate_close). Returns DXR_SS_GLIDE_*.
+//! that fails stops it where it is. Stopped for the grant: the gate is closed
+//! (dxr_ss_gate_close). Stopped by a suspension (a lock): the move is over where
+//! the last step put the window, home is kept, and the window counts as away from
+//! home (with ReturnHome off: where it stays becomes home, as a landed step aside
+//! would). Returns DXR_SS_GLIDE_*.
 static inline int
-dxr_ss_glide(DxrSsGate *g, DxrSsState *st, const DxrSsOps *ops, int fx, int fy, int tx, int ty, double seconds)
+dxr_ss_glide(DxrSsGate *g, DxrSsState *st, const DxrSsSettings *s, const DxrSsOps *ops, int fx, int fy, int tx,
+             int ty)
 {
+	double seconds = s->glide_s;
 	int steps = seconds > 0.0 ? (int)lround(seconds / DXR_SS_GLIDE_STEP_S) : 1;
 	if (steps < 1)
 		steps = 1;
 	if (steps > 30)
 		steps = 30;
 	double step_s = steps > 1 ? seconds / steps : 0.0;
+	int at_x = fx, at_y = fy; // where the last step asked the window to be
 	for (int i = 1; i <= steps; i++) {
 		if (!ops->still_on(ops->ctx) || ops->own_drag(ops->ctx))
 			return DXR_SS_GLIDE_STOPPED;
-		if (!ops->granted(ops->ctx)) {
+		int dc = ops->granted(ops->ctx);
+		if (dc == DXR_SS_DC_SUSPENDED && g->open) {
+			if (st->phase == DXR_SS_PHASE_MOVING) {
+				st->last_valid = 1; // where it is now is ours, not a move by someone else
+				st->last_x = at_x;
+				st->last_y = at_y;
+				st->phase = st->have_home && s->return_home ? DXR_SS_PHASE_ASIDE : DXR_SS_PHASE_SETTLING;
+			}
+			dxr_ss_suspend(g, st);
+			return DXR_SS_GLIDE_SUSPENDED;
+		}
+		if (dc != DXR_SS_DC_GRANTED) {
 			dxr_ss_gate_close(g, st);
 			return DXR_SS_GLIDE_NOT_GRANTED;
 		}
@@ -1010,6 +1067,8 @@ dxr_ss_glide(DxrSsGate *g, DxrSsState *st, const DxrSsOps *ops, int fx, int fy, 
 		int y = i == steps ? ty : (int)lround(fy + (ty - fy) * e);
 		if (!ops->move(ops->ctx, x, y, i == steps))
 			return DXR_SS_GLIDE_CANNOT_MOVE;
+		at_x = x;
+		at_y = y;
 		if (i < steps)
 			ops->wait_s(ops->ctx, step_s);
 	}
