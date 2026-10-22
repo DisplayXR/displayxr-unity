@@ -376,37 +376,158 @@ is_displayxr_overlay_class(HWND hwnd)
 	    || wcscmp(cls, DEDICATED_CLASS_NAME) == 0;
 }
 
+// Unity's player main window class. The editor's windows are UnityContainerWndClass
+// (top-level) / UnityGUIViewWndClass (panes), so this is a PLAYER-only signal.
+static const wchar_t UNITY_PLAYER_CLASS_NAME[] = L"UnityWndClass";
+
+// 1 when this process is the Unity editor (Unity.exe), not a player. Cached: the
+// executable never changes, and find_unity_hwnd runs per forwarded mouse event.
+static int
+is_unity_editor_process(void)
+{
+	static int s_is_editor = -1;
+	if (s_is_editor < 0) {
+		int editor = 0;
+		wchar_t exe[MAX_PATH];
+		if (GetModuleFileNameW(NULL, exe, MAX_PATH) > 0) {
+			const wchar_t *base = wcsrchr(exe, L'\\');
+			base = base ? base + 1 : exe;
+			editor = (_wcsicmp(base, L"Unity.exe") == 0) ? 1 : 0;
+		}
+		s_is_editor = editor;
+	}
+	return s_is_editor;
+}
+
+// Every window of ours that is never Unity's: our own overlay / dedicated window,
+// and the per-thread IME windows Windows creates in every GUI process ("Default
+// IME" is class IME; the text-services one is MSCTFIME UI) -- zero-size, hidden,
+// and exactly the kind of window GetForegroundWindow can hand back for our process.
+static int
+is_never_unity_class(const wchar_t *cls)
+{
+	return wcscmp(cls, OVERLAY_CLASS_NAME) == 0 || wcscmp(cls, DEDICATED_CLASS_NAME) == 0 ||
+	       wcscmp(cls, L"IME") == 0 || wcscmp(cls, L"MSCTFIME UI") == 0;
+}
+
+// The generic "looks like the app's main window" rule, for hosts with no Unity
+// player class (the editor, anything else): visible and wider than 100 px. It was
+// the enumeration's rule all along; the foreground window now has to pass it too.
+static int
+is_plausible_app_window(HWND hwnd)
+{
+	RECT rc = {0, 0, 0, 0};
+	return IsWindowVisible(hwnd) && GetClientRect(hwnd, &rc) && (rc.right - rc.left) > 100;
+}
+
+// One line whenever the answer CHANGES (capped): which window, its class and size,
+// and why -- including the foreground window that was turned down, if any.
+// find_unity_hwnd runs per forwarded mouse event, so this must stay change-driven.
+static void
+log_unity_hwnd_choice(HWND chosen, const char *why, HWND fg_rejected)
+{
+	static HWND volatile s_last = NULL;
+	static LONG volatile s_logged = 0;
+	enum { MAX_LINES = 16 };
+	if (InterlockedExchangePointer((PVOID volatile *)&s_last, (PVOID)chosen) == (PVOID)chosen)
+		return;
+	const LONG n = InterlockedIncrement(&s_logged);
+	if (n > MAX_LINES)
+		return;
+
+	char cls[64] = {0};
+	RECT rc = {0, 0, 0, 0};
+	if (chosen != NULL) {
+		GetClassNameA(chosen, cls, (int)sizeof(cls) - 1);
+		GetClientRect(chosen, &rc);
+	}
+	char rej[96] = "";
+	if (fg_rejected != NULL) {
+		char rcls[64] = {0};
+		RECT rrc = {0, 0, 0, 0};
+		GetClassNameA(fg_rejected, rcls, (int)sizeof(rcls) - 1);
+		GetClientRect(fg_rejected, &rrc);
+		snprintf(rej, sizeof(rej), "; foreground %p class=%s %dx%d visible=%d turned down", (void *)fg_rejected,
+		         rcls, (int)(rrc.right - rrc.left), (int)(rrc.bottom - rrc.top),
+		         IsWindowVisible(fg_rejected) ? 1 : 0);
+	}
+	displayxr_log("[DisplayXR] Unity window: %p class=%s client=%dx%d visible=%d (%s)%s%s\n", (void *)chosen, cls,
+	              (int)(rc.right - rc.left), (int)(rc.bottom - rc.top),
+	              (chosen != NULL && IsWindowVisible(chosen)) ? 1 : 0, why, rej,
+	              n == MAX_LINES ? " [further changes not logged]" : "");
+}
+
+/*
+ * The app's main window: what the overlay is born on and sized from, what the
+ * focus hook and the input forwarding target, and what transparent windowing
+ * restyles.
+ *
+ * The process's FOREGROUND window used to be taken with no check at all, while the
+ * enumeration fallback demanded visible and > 100 px. But GetForegroundWindow can
+ * answer one of our process's IME windows (zero-size, hidden), and the overlay was
+ * then born on it at 0x0 -- a session-killing 0x0 atlas on the runtime side
+ * (DisplayXR/displayxr-runtime#2275; #392 stopped the 0x0 birth itself). So:
+ *   1. the foreground window, if it is ours and is a Unity player window
+ *      (UnityWndClass) or passes the generic rule (visible, > 100 px wide);
+ *   2. else, in a player, our UnityWndClass window -- visible or not: before its
+ *      first show, and under the Shell's SW_HIDE launch, the real window is hidden;
+ *   3. else the first visible, > 100 px wide window of ours (the old fallback --
+ *      the editor and other hosts land here, as before).
+ * Our own overlay / dedicated windows and IME windows are never candidates.
+ */
 static HWND
 find_unity_hwnd(void)
 {
-	DWORD our_pid = GetCurrentProcessId();
+	const DWORD our_pid = GetCurrentProcessId();
+	const int player = !is_unity_editor_process();
 	HWND unity_hwnd = NULL;
+	const char *why = "no candidate";
+	HWND fg_rejected = NULL;
 
 	HWND fg = GetForegroundWindow();
-	if (fg != NULL && !is_displayxr_overlay_class(fg)) {
+	if (fg != NULL) {
 		DWORD fg_pid = 0;
 		GetWindowThreadProcessId(fg, &fg_pid);
-		if (fg_pid == our_pid)
-			unity_hwnd = fg;
+		wchar_t cls[64] = {0};
+		if (fg_pid == our_pid && GetClassNameW(fg, cls, 63) > 0 && !is_never_unity_class(cls)) {
+			if (player && _wcsicmp(cls, UNITY_PLAYER_CLASS_NAME) == 0) {
+				unity_hwnd = fg;
+				why = "foreground, Unity player window";
+			} else if (is_plausible_app_window(fg)) {
+				unity_hwnd = fg;
+				why = "foreground, visible and wider than 100 px";
+			}
+		}
+		if (unity_hwnd == NULL && fg_pid == our_pid)
+			fg_rejected = fg;
 	}
 
 	if (unity_hwnd == NULL) {
+		HWND first_plausible = NULL;
 		HWND hwnd = NULL;
 		while ((hwnd = FindWindowExW(NULL, hwnd, NULL, NULL)) != NULL) {
-			if (is_displayxr_overlay_class(hwnd))
-				continue;
 			DWORD pid = 0;
 			GetWindowThreadProcessId(hwnd, &pid);
-			if (pid == our_pid && IsWindowVisible(hwnd)) {
-				RECT rc;
-				if (GetClientRect(hwnd, &rc) && (rc.right - rc.left) > 100) {
-					unity_hwnd = hwnd;
-					break;
-				}
+			if (pid != our_pid)
+				continue;
+			wchar_t cls[64] = {0};
+			if (GetClassNameW(hwnd, cls, 63) == 0 || is_never_unity_class(cls))
+				continue;
+			if (player && _wcsicmp(cls, UNITY_PLAYER_CLASS_NAME) == 0) {
+				unity_hwnd = hwnd;
+				why = "Unity player window of this process";
+				break;
 			}
+			if (first_plausible == NULL && is_plausible_app_window(hwnd))
+				first_plausible = hwnd;
+		}
+		if (unity_hwnd == NULL && first_plausible != NULL) {
+			unity_hwnd = first_plausible;
+			why = "first visible window of this process wider than 100 px";
 		}
 	}
 
+	log_unity_hwnd_choice(unity_hwnd, why, fg_rejected);
 	return unity_hwnd;
 }
 
@@ -2455,13 +2576,8 @@ displayxr_get_unity_main_hwnd(void)
 static HWND
 find_unity_main_hwnd_any(void)
 {
-	wchar_t exe[MAX_PATH];
-	if (GetModuleFileNameW(NULL, exe, MAX_PATH) > 0) {
-		const wchar_t *base = wcsrchr(exe, L'\\');
-		base = base ? base + 1 : exe;
-		if (_wcsicmp(base, L"Unity.exe") == 0)
-			return NULL; // editor, not a player
-	}
+	if (is_unity_editor_process())
+		return NULL; // editor, not a player
 
 	DWORD our_pid = GetCurrentProcessId();
 	HWND hwnd = NULL;
@@ -2472,7 +2588,7 @@ find_unity_main_hwnd_any(void)
 			continue;
 		wchar_t cls[64];
 		if (GetClassNameW(hwnd, cls, 64) > 0
-		    && _wcsicmp(cls, L"UnityWndClass") == 0)
+		    && _wcsicmp(cls, UNITY_PLAYER_CLASS_NAME) == 0)
 			return hwnd;
 	}
 	return NULL;
