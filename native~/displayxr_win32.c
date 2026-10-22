@@ -151,6 +151,11 @@ static RECT  s_hit_rect       = {0, 0, 0, 0};
 static RECT  s_unity_saved_rect = {0, 0, 0, 0};
 static int   s_unity_offscreen  = 0;
 
+// The overlay was born at overlay_birth_fallback_rect because Unity's client was
+// unusable then. The transparent path's snap never undoes that (see the snap in
+// displayxr_set_transparent_overlay). Cleared with the overlay.
+static int   s_overlay_born_fallback = 0;
+
 // Off-screen position used for Unity's HWND in transparent mode. The cursor
 // never lands here, so OS hit-testing routes transparent-zone clicks past
 // our cloaked-but-still-in-z-order Unity HWND to whatever desktop app is at
@@ -191,6 +196,16 @@ static int   s_resize_edge          = 0;   // HT* code of the grabbed border
 static POINT s_resize_anchor_screen = {0, 0};
 static RECT  s_resize_anchor_rect   = {0, 0, 0, 0};
 #define DXR_MIN_WINDOW_PX 200
+
+// displayxr_resize_overlay / displayxr_set_overlay_position requests made while the
+// transparent overlay is not the managed window yet (an app restoring its window
+// from Awake, before ApplyWindowing). Latest wins, size and position separately;
+// replayed once the overlay is active, dropped with the overlay. Main thread only,
+// like the helpers that fill them.
+static int   s_pending_size_set = 0;
+static int   s_pending_w = 0, s_pending_h = 0;
+static int   s_pending_pos_set = 0;
+static int   s_pending_x = 0, s_pending_y = 0;
 
 // (display-zones port) Quit request raised from WM_CLOSE on the overlay HWND
 // (decorated close button or Alt+F4). Default WM_CLOSE would DestroyWindow only
@@ -333,6 +348,8 @@ static POINT   s_simple_drag_anchor_window = {0, 0};
 // (overlay when active, else the dormant simple-window real HWND). Defined
 // with the region helpers further down.
 static HWND    managed_window_hwnd(void);
+// Replays the deferred resize/position requests; defined with those helpers.
+static void    overlay_apply_pending_requests(void);
 
 // ============================================================================
 // Shell mode detection
@@ -1333,8 +1350,9 @@ register_overlay_class(void)
 
 /*
  * Birth rect for the overlay when Unity's own client area cannot be used: it is
- * empty (a window not sized yet) or the window is minimized (an iconic window
- * reports a 0x0 client rect and an off-screen icon origin).
+ * empty (a window not sized yet), the window is minimized (an iconic window
+ * reports a 0x0 client rect and an off-screen icon origin), or -- transparent
+ * overlay only -- it is below DXR_MIN_WINDOW_PX.
  *
  * The 3D panel's desktop rect would be the ideal answer but is not known yet:
  * the runtime is first asked in the provider's GfxStart, after LifecycleStart
@@ -1531,18 +1549,33 @@ displayxr_get_app_main_view(void)
 	// yet, and the runtime sizes its compositor from THIS window: a 0x0 overlay
 	// made xrCreateSession fail (0x0 atlas, E_INVALIDARG) on runtimes without
 	// DisplayXR/displayxr-runtime#2274, so the app never got a session. See
-	// overlay_birth_fallback_rect for the rect and the DPI argument. Unity's own
-	// geometry still takes over afterwards wherever it already did: the WS_CHILD
-	// and provider-opaque overlays follow Unity's WM_SIZE, and the transparent
-	// path snaps to Unity's rect in displayxr_set_transparent_overlay.
+	// overlay_birth_fallback_rect for the rect and the DPI argument. The WS_CHILD
+	// and provider-opaque overlays still follow Unity's WM_SIZE afterwards; the
+	// transparent overlay keeps the fallback rect (its snap never undoes it).
+	//
+	// Nor a TINY transparent overlay: it does not follow Unity's window, so unless
+	// the app resizes it, it keeps its birth size (its snap took Unity's equally
+	// tiny rect): a 9x20 client gave a 9x20 compositor and an invisible app for
+	// the whole session. Below DXR_MIN_WINDOW_PX (the floor every resize of the
+	// overlay already clamps to) counts as empty. Not for the opaque overlays:
+	// they sit over Unity's own window, and a small window is theirs to show.
+	const char *why_fallback = NULL;
+	if (!born_fullscreen) {
+		if (unity_iconic)
+			why_fallback = "minimized: a 0x0 overlay would fail the runtime's compositor create";
+		else if (w <= 0 || h <= 0)
+			why_fallback = "empty: a 0x0 overlay would fail the runtime's compositor create";
+		else if (transparent_mode && (w < DXR_MIN_WINDOW_PX || h < DXR_MIN_WINDOW_PX))
+			why_fallback = "too small: the transparent overlay would not show the app";
+	}
 	int born_fallback = 0;
-	if (!born_fullscreen && (w <= 0 || h <= 0 || unity_iconic)) {
+	if (why_fallback != NULL) {
 		const char *src = overlay_birth_fallback_rect(unity_hwnd, toplevel, &x, &y, &w, &h);
 		born_fallback = 1;
-		displayxr_log("[DisplayXR] overlay birth: Unity's client area is %dx%d (iconic=%d) — a 0x0 "
-		              "overlay would fail the runtime's compositor create; born at %dx%d at (%d,%d) "
-		              "instead (%s)\n",
-		              unity_client_w, unity_client_h, unity_iconic, w, h, x, y, src);
+		displayxr_log("[DisplayXR] overlay birth: Unity's client area is %dx%d (iconic=%d, min %d) "
+		              "— %s; born at %dx%d at (%d,%d) instead (%s)\n",
+		              unity_client_w, unity_client_h, unity_iconic, DXR_MIN_WINDOW_PX,
+		              why_fallback, w, h, x, y, src);
 	}
 
 	// Owner field:
@@ -1572,6 +1605,7 @@ displayxr_get_app_main_view(void)
 	}
 
 	s_overlay_is_toplevel = toplevel;
+	s_overlay_born_fallback = born_fallback;
 	/*
 	 * CURSOR RESPONSIVENESS DURING WARM-UP.
 	 *
@@ -2508,9 +2542,12 @@ displayxr_destroy_app_overlay(void)
 	s_original_wndproc = NULL;
 	s_parent_subclass_hwnd = NULL;
 
-	// 4. Drop the overlay.
+	// 4. Drop the overlay, and what was remembered for it.
 	s_overlay_hwnd = NULL;
 	s_overlay_is_toplevel = 0;
+	s_overlay_born_fallback = 0;
+	s_pending_size_set = 0;
+	s_pending_pos_set = 0;
 	DestroyWindow(h);
 }
 
@@ -3030,8 +3067,13 @@ displayxr_set_transparent_overlay(int enabled, int topmost)
 	if (enabled && !s_overlay_active) {
 		// Read BEFORE the style strip below: IsIconic is the WS_MINIMIZE style
 		// bit, which replacing GWL_STYLE clears while the window is still sized
-		// and placed as an icon.
+		// and placed as an icon. The client too: after the strip the frame
+		// counts as client (a 9x20 client in its 31x76 frame reads 31x76).
 		const int unity_iconic = IsIconic(hwnd) ? 1 : 0;
+		RECT unity_client = {0, 0, 0, 0};
+		GetClientRect(hwnd, &unity_client);
+		const int unity_client_w = unity_client.right - unity_client.left;
+		const int unity_client_h = unity_client.bottom - unity_client.top;
 		s_saved_style   = (DWORD)GetWindowLongPtrW(hwnd, GWL_STYLE);
 		s_saved_exstyle = (DWORD)GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
 
@@ -3123,19 +3165,34 @@ displayxr_set_transparent_overlay(int enabled, int topmost)
 			// with it -- undoing the sane rect the overlay was born at for
 			// exactly this case (overlay_birth_fallback_rect), so the app
 			// would again show nothing but its taskbar button.
-			const int snap_unusable = unity_iconic || w <= 0 || h <= 0;
+			//
+			// Nor when Unity's CLIENT is below DXR_MIN_WINDOW_PX: the overlay
+			// would shrink to it (a 9x20 client snapped the overlay to its
+			// 31x76 frame for a whole session: no app visible). Nor, ever,
+			// over a fallback birth: that rect was chosen because Unity's
+			// was unusable, and the app moves or resizes it from here on.
+			const char *no_snap = NULL;
+			if (unity_iconic)
+				no_snap = "Unity is minimized";
+			else if (unity_client_w <= 0 || unity_client_h <= 0)
+				no_snap = "Unity's client is empty";
+			else if (unity_client_w < DXR_MIN_WINDOW_PX || unity_client_h < DXR_MIN_WINDOW_PX)
+				no_snap = "Unity's client is below the minimum";
+			else if (s_overlay_born_fallback)
+				no_snap = "the overlay was born at the fallback rect";
 			if (s_overlay_hwnd != NULL && IsWindow(s_overlay_hwnd)
-			    && !s_fullscreen_overlay_pref && !snap_unusable) {
+			    && !s_fullscreen_overlay_pref && no_snap == NULL) {
 				SetWindowPos(s_overlay_hwnd, HWND_TOPMOST,
 				             s_unity_saved_rect.left,
 				             s_unity_saved_rect.top, w, h,
 				             SWP_NOACTIVATE);
-			} else if (snap_unusable && !s_fullscreen_overlay_pref) {
+			} else if (no_snap != NULL && !s_fullscreen_overlay_pref) {
 				displayxr_log("[DisplayXR] transparent_overlay: NOT snapping the overlay to "
-				              "Unity's rect (%d,%d %dx%d, iconic=%d) -- it keeps the rect "
-				              "it was born at\n",
+				              "Unity's rect (%d,%d %dx%d, client %dx%d, min %d, iconic=%d): %s "
+				              "-- it keeps the rect it was born at\n",
 				              (int)s_unity_saved_rect.left, (int)s_unity_saved_rect.top,
-				              w, h, unity_iconic);
+				              w, h, unity_client_w, unity_client_h, DXR_MIN_WINDOW_PX,
+				              unity_iconic, no_snap);
 			}
 
 			SetWindowPos(hwnd, NULL,
@@ -3193,6 +3250,11 @@ displayxr_set_transparent_overlay(int enabled, int topmost)
 		s_overlay_active = 1;
 		displayxr_log("[DisplayXR] transparent_overlay: enabled (topmost=%d, child=%p) — overlay is top-level + NOREDIRECTIONBITMAP; Unity parent cloaked; transparency owned by runtime DComp\n",
 		              topmost, (void *)s_overlay_hwnd);
+
+		// The overlay is the managed window from here on: replay any resize /
+		// position the app asked for before it was (after the snap, so the app's
+		// request wins over Unity's rect).
+		overlay_apply_pending_requests();
 
 		// Diagnostic dump — exstyle + layered attrs on parent and overlay
 		// HWND. Note: in transparent mode the overlay is now top-level
@@ -4415,6 +4477,63 @@ displayxr_consume_overlay_close_request(void)
 	return (int)InterlockedExchange(&s_overlay_close_requested, 0);
 }
 
+// A resize / position request with no managed window yet waits ONLY for the
+// transparent overlay: it is the one window that becomes managed later
+// (ApplyWindowing -> displayxr_set_transparent_overlay, built players only). The
+// provider-opaque overlay never does (it follows Unity's window, which the app
+// sizes itself), shell mode never enables the overlay, and the editor never runs
+// ApplyWindowing; a request there stays the no-op it always was instead of waiting
+// forever. The dormant simple-window mode does not replay them either.
+static int
+overlay_request_may_wait(void)
+{
+	DisplayXRState *state = displayxr_get_state();
+	return state != NULL && state->transparent_background_requested &&
+	       !displayxr_is_shell_mode() && !is_unity_editor_process();
+}
+
+// The #61-bracketed SetWindowPos calls behind displayxr_resize_overlay and
+// displayxr_set_overlay_position, shared with the deferred replay. Numbers stay in
+// the calling thread's DPI space (Unity's main thread, unpinned) both ways.
+static void
+overlay_set_size(HWND hwnd, int width, int height, const char *note)
+{
+	if (width  < DXR_MIN_WINDOW_PX) width  = DXR_MIN_WINDOW_PX;
+	if (height < DXR_MIN_WINDOW_PX) height = DXR_MIN_WINDOW_PX;
+	SendMessageW(hwnd, WM_ENTERSIZEMOVE, 0, 0);
+	SetWindowPos(hwnd, NULL, 0, 0, width, height,
+	             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
+	SendMessageW(hwnd, WM_EXITSIZEMOVE, 0, 0);
+	displayxr_log("[DisplayXR] resize_overlay -> %dx%d%s\n", width, height, note);
+}
+
+static void
+overlay_set_position(HWND hwnd, int x, int y, const char *note)
+{
+	SendMessageW(hwnd, WM_ENTERSIZEMOVE, 0, 0);
+	SetWindowPos(hwnd, NULL, x, y, 0, 0,
+	             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+	SendMessageW(hwnd, WM_EXITSIZEMOVE, 0, 0);
+	displayxr_log("[DisplayXR] set_overlay_position -> (%d,%d)%s\n", x, y, note);
+}
+
+// Called once the transparent overlay is the managed window (on the main thread,
+// from displayxr_set_transparent_overlay). Size first: it keeps the origin, and the
+// position keeps the size.
+static void
+overlay_apply_pending_requests(void)
+{
+	HWND hwnd = managed_window_hwnd();
+	if (hwnd == NULL || (!s_pending_size_set && !s_pending_pos_set))
+		return;
+	if (s_pending_size_set)
+		overlay_set_size(hwnd, s_pending_w, s_pending_h, " (deferred request, applied now)");
+	if (s_pending_pos_set)
+		overlay_set_position(hwnd, s_pending_x, s_pending_y, " (deferred request, applied now)");
+	s_pending_size_set = 0;
+	s_pending_pos_set = 0;
+}
+
 void
 displayxr_resize_overlay(int width, int height)
 {
@@ -4427,15 +4546,17 @@ displayxr_resize_overlay(int width, int height)
 	// working right-drag MOVE uses), so it resizes cleanly. #61-bracketed so the
 	// weaver phase-snaps to lenticular-aligned pixels across the size change.
 	HWND hwnd = managed_window_hwnd();
-	if (hwnd == NULL)
+	if (hwnd == NULL) {
+		if (overlay_request_may_wait()) {
+			s_pending_size_set = 1;
+			s_pending_w = width;
+			s_pending_h = height;
+			displayxr_log("[DisplayXR] resize_overlay %dx%d: the transparent overlay is not "
+			              "active yet -- deferred until it is\n", width, height);
+		}
 		return;
-	if (width  < DXR_MIN_WINDOW_PX) width  = DXR_MIN_WINDOW_PX;
-	if (height < DXR_MIN_WINDOW_PX) height = DXR_MIN_WINDOW_PX;
-	SendMessageW(hwnd, WM_ENTERSIZEMOVE, 0, 0);
-	SetWindowPos(hwnd, NULL, 0, 0, width, height,
-	             SWP_NOMOVE | SWP_NOZORDER | SWP_NOACTIVATE);
-	SendMessageW(hwnd, WM_EXITSIZEMOVE, 0, 0);
-	displayxr_log("[DisplayXR] resize_overlay -> %dx%d\n", width, height);
+	}
+	overlay_set_size(hwnd, width, height, "");
 }
 
 void
@@ -4460,15 +4581,20 @@ displayxr_set_overlay_position(int x, int y)
 {
 	// Move the managed window to a screen-space top-left (size unchanged).
 	// #61-bracketed like resize/drag so the weaver phase-snaps. App drives this
-	// to restore a remembered window position at launch.
+	// to restore a remembered window position at launch -- often before the
+	// transparent overlay is active, hence the deferral.
 	HWND hwnd = managed_window_hwnd();
-	if (hwnd == NULL)
+	if (hwnd == NULL) {
+		if (overlay_request_may_wait()) {
+			s_pending_pos_set = 1;
+			s_pending_x = x;
+			s_pending_y = y;
+			displayxr_log("[DisplayXR] set_overlay_position (%d,%d): the transparent overlay is "
+			              "not active yet -- deferred until it is\n", x, y);
+		}
 		return;
-	SendMessageW(hwnd, WM_ENTERSIZEMOVE, 0, 0);
-	SetWindowPos(hwnd, NULL, x, y, 0, 0,
-	             SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
-	SendMessageW(hwnd, WM_EXITSIZEMOVE, 0, 0);
-	displayxr_log("[DisplayXR] set_overlay_position -> (%d,%d)\n", x, y);
+	}
+	overlay_set_position(hwnd, x, y, "");
 }
 
 // ============================================================================
