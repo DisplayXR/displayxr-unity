@@ -5,7 +5,9 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.30.2] - 2026-10-22
+
+Windows: a transparent app whose Unity window was tiny at startup (a 9x20 client was seen in the field) is no longer invisible, and a window size or position an app restores from `Awake` is no longer lost (#396). Linux: a native-Wayland player can opt in to receiving files dragged onto its window (#395).
 
 ### Added
 - **Files dragged onto the app's window, for a native-Wayland player (opt-in).** A Linux player running natively on Wayland can now receive files dragged onto its window from a file manager. Unity's own Wayland drag and drop is out of a plug-in's reach (SDL is linked into the player and exports nothing), so the plug-in's Wayland support library becomes the window's drop target itself.
