@@ -3352,7 +3352,12 @@ dxr_wl_clipboard_read(char *buf, int len, int timeout_ms, int *needed)
 	// A finished read nobody took for a while is stale: the clipboard may have changed.
 	if (s_wl.clip_rd.done && mono_ns() - s_wl.clip_rd.done_ns > DXR_WL_CLIP_KEEP_NS)
 		clip_read_reset_locked();
-	long long end = mono_ns() + (timeout_ms > 0 ? timeout_ms * 1000000LL : 0);
+	// At most DXR_WL_CLIP_READ_NS in all, as documented: the wait for this focus'
+	// selection event below is otherwise bounded only by the caller's timeout.
+	long long wait_ns = timeout_ms > 0 ? timeout_ms * 1000000LL : 0;
+	if (wait_ns > DXR_WL_CLIP_READ_NS)
+		wait_ns = DXR_WL_CLIP_READ_NS;
+	long long end = mono_ns() + wait_ns;
 	if (!s_wl.clip_rd.active && !s_wl.clip_rd.done) {
 		int g = clip_read_start_locked();
 		// The selection event can trail the keyboard enter by a dispatch: wait for it.
