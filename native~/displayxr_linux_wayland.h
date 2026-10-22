@@ -156,8 +156,10 @@ int dxr_wl_export_handle(char *buf, int len);
 
 //! Files dragged onto the player's window (a file manager's drag and drop), for
 //! the app. enable 1: bind our own wl_data_device on the player's connection;
-//! 0: release it. What that costs (SDL gets no new clipboard offers for the rest
-//! of the run) is in displayxr_linux_wayland.c. Remembered
+//! 0: stop. What that does to SDL's clipboard (from the first time the player
+//! loses the focus with drops on, SDL gets no clipboard offers for the rest of the
+//! run, and the plug-in's clipboard below replaces it) is in
+//! displayxr_linux_wayland.c, "File drops". Remembered
 //! when asked before the first native-Wayland session (applied once the weave
 //! binds the window). Returns 1 when drops are on now, 0 when remembered (or
 //! turned off), -1 when unsupported: an X11 / XWayland player (XDND goes to the
@@ -170,6 +172,15 @@ int dxr_wl_file_drop_enable(int enable);
 //! @p paths_len is smaller than event->paths_bytes (the event stays queued: call
 //! again with that much room). Any thread; it reads a queue the frame thread fills.
 int dxr_wl_file_drop_next(DxrWlDropEvent *event, char *paths, int paths_len);
+
+//! The plug-in's own clipboard (displayxr_linux_clipboard.h): DXR_CLIP_STATE_* bits.
+int dxr_wl_clipboard_state(void);
+//! Reads the clipboard's text (UTF-8) into @p buf, NUL-terminated: its length, or a
+//! DXR_CLIP_* error (DXR_CLIP_PENDING after @p timeout_ms: call again; DXR_CLIP_SPACE:
+//! @p needed says how big). Never call it with a timeout on Unity's main thread.
+int dxr_wl_clipboard_read(char *buf, int len, int timeout_ms, int *needed);
+//! Puts @p len bytes of UTF-8 text on the clipboard (0: empties it): 1, or a DXR_CLIP_* error.
+int dxr_wl_clipboard_write(const char *text, int len);
 
 #ifdef __cplusplus
 }
