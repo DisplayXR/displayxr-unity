@@ -4564,11 +4564,20 @@ displayxr_get_overlay_position(int *x, int *y)
 {
 	// Screen-space top-left of the managed window. Pairs with
 	// displayxr_set_overlay_position for app-side window-position persistence.
+	// Before the transparent overlay is active it answers the deferred request, if
+	// any, so a set followed by a get reads back what was set. The size getter
+	// deliberately does not do the same: apps take a non-zero size to mean that
+	// the overlay exists.
 	if (x) *x = 0;
 	if (y) *y = 0;
 	HWND hwnd = managed_window_hwnd();
-	if (hwnd == NULL)
+	if (hwnd == NULL) {
+		if (s_pending_pos_set) {
+			if (x) *x = s_pending_x;
+			if (y) *y = s_pending_y;
+		}
 		return;
+	}
 	RECT r;
 	if (GetWindowRect(hwnd, &r)) {
 		if (x) *x = (int)r.left;

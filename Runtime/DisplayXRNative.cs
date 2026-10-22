@@ -449,7 +449,9 @@ namespace DisplayXR
         /// <summary>
         /// (display-zones port) Get/set the managed overlay window's screen-space
         /// top-left, for app-side window-position persistence. Set is #61-bracketed
-        /// (size unchanged). No-op when there is no managed overlay window.
+        /// (size unchanged). No-op when there is no managed overlay window, except on
+        /// Windows in a transparent app before the overlay is active: there Set is
+        /// remembered and applied once it is, and Get answers the remembered position.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern void displayxr_get_overlay_position(out int x, out int y);

@@ -5,6 +5,11 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+- **Windows: `displayxr_get_overlay_position` reads back a position set before the transparent overlay is active.** Since #396 a `displayxr_set_overlay_position` call made before the overlay is active (from `Awake`, say) is remembered and applied once it is up, but the getter still answered `(0, 0)` until then. It now answers the remembered position, so a set followed by a get reads back what was set. `displayxr_get_overlay_size` is unchanged on purpose: it stays `0x0` until the overlay exists, because apps take a non-zero size to mean that the overlay is up.
+
 ## [2.30.2] - 2026-10-22
 
 Windows: a transparent app whose Unity window was tiny at startup (a 9x20 client was seen in the field) is no longer invisible, and a window size or position an app restores from `Awake` is no longer lost (#396). Linux: a native-Wayland player can opt in to receiving files dragged onto its window (#395).
