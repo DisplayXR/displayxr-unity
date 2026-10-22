@@ -9,9 +9,12 @@ namespace DisplayXR
     /// Drop-in switch for DisplayXR <b>side-step</b>: while this component is enabled, the app's
     /// window steps aside when the window the user is working in covers the app's content, and
     /// goes back once its place is free (Linux, native-Wayland player on GNOME with the DisplayXR
-    /// GNOME extension; elsewhere nothing happens). Put it on any GameObject (one per scene). The
-    /// settings mirror <see cref="DisplayXRSideStep"/>, which code can drive directly instead,
-    /// and which also has the state and the events.
+    /// GNOME extension; elsewhere nothing happens). It acts only while the app's desktop control
+    /// is granted (<see cref="DisplayXRDesktop.State"/> == <see cref="DesktopControlState.Granted"/>;
+    /// the app asks with <see cref="DisplayXRDesktop.Request"/>, this component never does).
+    /// Put it on any GameObject (one per scene). The settings mirror
+    /// <see cref="DisplayXRSideStep"/>, which code can drive directly instead, and which also has
+    /// the state and the events.
     /// </summary>
     [AddComponentMenu("DisplayXR/DisplayXR Window Side-Step")]
     [DisallowMultipleComponent]

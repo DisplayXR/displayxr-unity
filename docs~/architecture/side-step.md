@@ -8,12 +8,20 @@ Linux only: a player running natively on Wayland (`-force-wayland`, what the gen
 picks), on GNOME with the DisplayXR GNOME extension. Everywhere else it reports `Unsupported`
 and does nothing.
 
+It acts only while the app's **desktop control is granted** (`DisplayXRDesktop.State ==
+Granted`), the same consent gate `DisplayXRNative.LinuxWindows` answers behind (#389). See
+[Consent: only while granted](#consent-only-while-granted).
+
 ## Using it
 
 ```csharp
 DisplayXRSideStep.Enabled = true;                   // opt in (default off)
 DisplayXRSideStep.SteppedAside += rect => { ... };  // its own window, after the move
 DisplayXRSideStep.ReturnedHome += rect => { ... };
+
+// It does nothing until the user grants desktop control (on a user gesture; side-step never asks):
+if (DisplayXRDesktop.State != DesktopControlState.Granted)
+    DisplayXRDesktop.Request("so the avatar can step out of the way of the window you work in");
 ```
 
 Or add a **DisplayXR Window Side-Step** component (`DisplayXRWindowSideStep`) to any GameObject.
@@ -30,10 +38,12 @@ It turns side-step on while the component is enabled and exposes the settings.
 | `Margin` | 24 px | Desktop px between the app's content and the other window or the monitor's edge |
 
 What the app reads, all about its own window: `State` (`Off`, `Unsupported`, `Waiting`,
-`Paused`, `Home`, `Moving`, `Aside`), `Reason` (why: `NoSession`, `NoExtension`, `Settling`,
-`ScreenLocked`, `UserMoving`, `Minimized`, `TooManyMoves`, `NoFreeSpot`, ...), `IsAside`,
-`Covered` (the share of its content covered now), `TryGetWindowRect`, `TryGetHomeRect`,
-`TryGetHomePosition`, and the `SteppedAside`, `ReturnedHome` and `StateChanged` events.
+`Paused`, `Home`, `Moving`, `Aside`), `Reason` (why: `NotGranted`, `NoSession`, `NoExtension`,
+`Settling`, `ScreenLocked`, `UserMoving`, `Minimized`, `TooManyMoves`, `NoFreeSpot`, ...),
+`IsAside`, `Covered` (the share of its content covered now), `TryGetWindowRect`,
+`TryGetHomeRect`, `TryGetHomePosition`, and the `SteppedAside`, `ReturnedHome` and
+`StateChanged` events. While desktop control is not granted: `Paused` / `NotGranted`,
+`Covered` 0, `IsAside` false, no rect, no home, no events.
 
 ### The app's content
 
@@ -80,14 +90,19 @@ if (!(DisplayXRSideStep.IsAside && DisplayXRSideStep.TryGetHomePosition(out pos)
 - **Home** is where the window stays put (1 s) after anyone but side-step moved it: the start-up
   placement onto the 3D panel, the user's drag, the app's own `displayxr_set_overlay_position`.
   Side-step's own moves never become home.
-- **Holds still** while the screen is locked (`org.gnome.ScreenSaver.GetActive`), while the user
-  moves or resizes the window (the extension's move grab flag, or the plug-in's own right-drag),
-  and while the window is minimized, maximized or fullscreen. A drag that starts during a glide
-  stops the glide: the user wins.
+- **Only while granted**: nothing at all while desktop control is not granted, and a revoke
+  stops it where it is and forgets home (below).
+- **Holds still** while the screen is locked (a lock suspends the grant first, so this reads as
+  `NotGranted`; `org.gnome.ScreenSaver.GetActive` is asked too, after the gate, in case the
+  runtime has not seen the lock yet), while the user moves or resizes the window (the
+  extension's move grab flag, or the plug-in's own right-drag), and while the window is
+  minimized, maximized or fullscreen. A drag that starts during a glide stops the glide: the
+  user wins.
 - **Rate**: one move at a time; 1 s between a move landing and the next; at most 6 steps aside
-  per minute (then `TooManyMoves`, and it stays). The way back home is never held by that cap,
-  so the cap cannot strand the window away from home. A move the compositor does not carry out
-  (it keeps the window elsewhere) is taken as is after 2 s, never retried.
+  per minute (then `TooManyMoves`, and it stays; a revoke and a re-grant do not reset the
+  count). The way back home is never held by that cap, so the cap cannot strand the window away
+  from home. A move the compositor does not carry out (it keeps the window elsewhere) is taken
+  as is after 2 s, never retried.
 - **Off** stops at once: no further moves, the window stays where it is.
 
 ### Which windows count
@@ -105,9 +120,53 @@ desktop are not in it. Of those, side-step ignores:
 A maximized or fullscreen document covers the whole monitor: there is no free place, so the
 avatar stays.
 
+## Consent: only while granted
+
+Side-step decides from the other windows' frames and focus. That is exactly what
+`DisplayXRNative.LinuxWindows` tells an app about other apps, and the consent policy decided for
+#389 (runtime ADR-056) serves that only while the app's desktop control is `Granted`. So
+side-step sits behind the same gate, even though nothing it reads is handed to the app: the
+app's own window state (`Covered`, the rect it stepped to, `NoFreeSpot`) still lets an app infer
+roughly where the window the user works in is, and polling the window list without consent is
+not something a feature should do quietly.
+
+**The gate.** Before every poll (4 times a second) the worker asks the runtime whether the app's
+desktop control is `Granted`: `dxr_prov_desktop_get_state`, the very query
+`DisplayXRDesktop.State` makes and `LinuxWindows` / `LinuxWindowAt` / `LinuxPointer` answer
+behind (a synchronous runtime call of about 1.4 ms, evaluated afresh each time, so the user's
+deny, the kill switch and a screen lock count at once). Only a yes lets that poll read the window
+list and the lock state. A glide asks again before each of its steps. While the answer is no,
+side-step asks once a second and reads nothing else. One gate, one answer: side-step and
+`LinuxWindows` open and close together.
+
+The runtime answers each of these queries with its own lock probe (`ScreenSaver.GetActive` on
+its desktop-control connection), as it does for any `DisplayXRDesktop.State` read; that is the
+gate's cost, not a read by side-step.
+
+| Desktop control | Side-step |
+|---|---|
+| `Granted` | Runs as described above |
+| `NotRequested`, `Pending`, `Denied`, `DisabledByUser` (`displayxr-cli desktop deny`), `Suspended` (kill switch `displayxr-cli desktop stop`, screen locked), `Unsupported` (no session, a runtime without `XR_DXR_desktop_control`) | `Paused` / `NotGranted`. Reads nothing: no window list, no lock state. `Covered` 0, `IsAside` false, no rect, no home, no events. The window stays where it is |
+
+**A revoke mid-session** (the user's deny, the kill switch, a lock): the next poll, at most
+250 ms later, finds no grant and stops; a glide stops at its next step (40 ms). The window stays
+where it is, wherever that is (aside, or part way through a glide); no `SteppedAside` /
+`ReturnedHome` fires for the move that was cut short. Everything the decision remembered is
+forgotten: home, where it was going, the window it stepped aside for (only the times of its own
+recent steps aside are kept, for the 6-a-minute cap).
+
+**When the grant comes back** it starts afresh, as after turning side-step off and on: after the
+start-up delay, the place the window stays put at becomes home. So an avatar that was aside when
+the grant ended stays at that place, and that place is its new home.
+
+Side-step never asks for the grant: the app asks (`DisplayXRDesktop.Request` /
+`RequestAccess(DesktopControlScopes.Control, ...)`) on a user gesture, and the GNOME
+RemoteDesktop portal names the app. Turning side-step on does not make `LinuxWindows`,
+`LinuxWindowAt` or `LinuxPointer` answer; they follow the grant on their own.
+
 ## Privacy: what is read, what the app gets
 
-The plug-in reads, inside its native code, 4 times a second:
+While the grant holds, the plug-in reads, inside its native code, 4 times a second:
 
 | Read | From | Used for |
 |---|---|---|
@@ -118,25 +177,16 @@ The plug-in reads, inside its native code, 4 times a second:
 
 No titles are read: the parser never looks at them, and extension version 18 does not send them
 to this connection at all. Nothing about another window is stored past one poll, except the
-mutter id of the window it stepped aside for (to tell when that window is gone). Nothing about
-another window is logged: the log lines speak of the app's own window and its covered share only.
+mutter id of the window it stepped aside for (to tell when that window is gone; forgotten when
+the grant ends). Nothing about another window is logged: the log lines speak of the app's own
+window and its covered share only. Without the grant nothing in this table is read.
 
 The app gets only facts about **its own window**: its state, its frame, its home, the share of its
 content covered, and the events. No other window's id, process id, app id, title, focus or rect
 reaches managed code; the native exports (`displayxr_linux_side_step_set`,
-`_set_body_rect`, `_status`) carry nothing else either. What the app can infer is coarse and about
-itself: that something covers part of it (`Covered`), and that the place it moved to was free.
-
-### Why it needs no desktop-control grant
-
-This follows the consent policy decided for #389 (runtime ADR-056): what tells the app about
-OTHER apps (the window list with process ids, the focused window, the window at a point, the live
-pointer) is served only while the app's desktop control is `Granted`, and the monitors and the X
-root scale stay ungated. Side-step does not tell the app about other apps: it uses other windows'
-frames and focus inside the plug-in to move the app's own window, which the extension lets any
-app do (`MoveWindow` acts on the caller's own window only). So, like the plug-in's own placement
-of the window onto the 3D panel, it works without the grant, and it never makes `LinuxWindows`,
-`LinuxWindowAt` or `LinuxPointer` answer.
+`_set_body_rect`, `_status`) carry nothing else either. What the app can infer is coarse (that
+something covers part of it, and that the place it moved to was free), and it can infer it only
+while it may read the whole window list anyway (`LinuxWindows`, behind the same grant).
 
 It never moves, focuses, raises or closes another window, and it sends no input anywhere.
 
@@ -144,11 +194,12 @@ It never moves, focuses, raises or closes another window, and it sends no input 
 
 | Piece | File |
 |---|---|
-| Decision, parsing, content grid, where-to (pure, unit-tested) | `native~/displayxr_linux_side_step.h`, `native~/tests/test_linux_side_step.c` |
-| Worker thread, exports, glide | `native~/displayxr_linux_side_step.c` |
+| The gate in front of every poll and glide step, decision, parsing, content grid, where-to, glide (pure, unit-tested; the reads are calls the test counts) | `native~/displayxr_linux_side_step.h` (`dxr_ss_poll`, `dxr_ss_glide`), `native~/tests/test_linux_side_step.c` |
+| Worker thread, exports, the real reads and the gate query | `native~/displayxr_linux_side_step.c` (`op_granted`: `dxr_prov_desktop_get_state`) |
+| The gate's runtime query (shared with `DisplayXRDesktop.State`) | `native~/displayxr_xrprovider/displayxr_provider_desktop.cpp` |
 | Window list and lock state over the plug-in's own session-bus connection | `native~/displayxr_linux_desktop_info.c` (`dxr_linux_desktop_info_window_list_json`, `_screen_locked`; not exported) |
 | The silhouette as content | `native~/displayxr_linux.c` (`displayxr_set_overlay_hit_mask`) |
-| The move (stage px, the GNOME extension's `MoveWindow`) | `native~/displayxr_linux_wayland.c` (`dxr_wl_set_player_position_stage`, Wayland library ABI 9) |
+| The move (stage px, the GNOME extension's `MoveWindow`) | `native~/displayxr_linux_wayland.c` (`dxr_wl_set_player_position_stage`, Wayland library ABI 10) |
 | C# API, component | `Runtime/DisplayXRSideStep.cs`, `Runtime/DisplayXRWindowSideStep.cs`; pumped by `DisplayXRProviderDriver` |
 
 Everything is in mutter's stage coordinates (GNOME desktop coordinates, the space of
@@ -158,6 +209,10 @@ fights the compositor over one.
 
 ## Limits
 
+- Needs the app's desktop control granted (the GNOME RemoteDesktop portal's consent): an app that
+  wants side-step asks for desktop control, even if it uses nothing else of it.
+- A screen lock ends side-step's memory like a revoke: an avatar aside when the screen locked
+  stays there after the unlock, and that place becomes home.
 - Native Wayland on GNOME only. An X11 (XWayland) player reports `Unsupported` /
   `NotNativeWayland`.
 - The monitor rect is the whole monitor, not its work area: a corner place can end up under
