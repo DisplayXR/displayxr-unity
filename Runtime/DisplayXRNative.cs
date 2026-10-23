@@ -862,6 +862,33 @@ namespace DisplayXR
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern int displayxr_linux_clipboard_write(byte[] utf8, int len);
 
+        /// <summary>Native-Wayland player: the IME state bits of the plug-in's SDL fixups (#415;
+        /// 16 = a DisplayXR input field may take the IME, 32 = one owns it, 64 = the text input has
+        /// the keyboard focus); 0 in an X11 player, for a Unity player build the fixups do not
+        /// know, and with the fix off. Used by the DisplayXR input fields
+        /// (<c>DisplayXRTextIme</c>). Main thread.</summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern uint displayxr_linux_ime_state();
+
+        /// <summary>A DisplayXR input field takes (1) the IME's events: they stop reaching Unity
+        /// and queue for <see cref="displayxr_linux_ime_next"/>. Returns the state. Main thread.</summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern uint displayxr_linux_ime_own(int own);
+
+        /// <summary>The field gives the IME back and its composition is reset;
+        /// <paramref name="dropEcho"/> = 1: the field put the composition into its text itself or
+        /// dropped it, so the IME's own commit of it is dropped. Returns the state. Main thread.</summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern uint displayxr_linux_ime_release(int dropEcho);
+
+        /// <summary>The oldest IME change while a field owns the IME: 1, 0 (none), -1 (a buffer is
+        /// too small: <paramref name="info"/>[4] / [5] = commit / composition bytes; the change
+        /// stays). <paramref name="info"/> (6): cursor begin, cursor end, delete before, delete
+        /// after (UTF-8 bytes), commit bytes, composition bytes (-1 = none). Main thread.</summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int displayxr_linux_ime_next([Out] byte[] commit, int commitCap, [Out] byte[] preedit,
+                                                          int preeditCap, [Out] int[] info);
+
         /// <summary>Native-Wayland player: the plugin clipboard's state, <c>LinuxClipboardState*</c>
         /// bits; 0 with an older native plugin.</summary>
         public static int LinuxClipboardState()

@@ -221,12 +221,41 @@ static class Program
         ExpectDefines(defs, "1.0.0", null, false, false);
     }
 
+    static void ExpectChars(string text, int caret, int bytes, bool before, int want)
+    {
+        int got = DisplayXRTextClipboardRules.ImeCharsForBytes(text, caret, bytes, before);
+        Check(got == want, $"ImeCharsForBytes(\"{text}\", {caret}, {bytes}, before={before}) = {got}, want {want}");
+    }
+
+    static void TestImeCharsForBytes()
+    {
+        // The IME's delete_surrounding_text counts UTF-8 bytes around the caret (#415).
+        ExpectChars("abc", 3, 2, true, 2);
+        ExpectChars("abc", 1, 1, false, 1);
+        ExpectChars("abc", 0, 0, true, 0);
+        ExpectChars("", 0, 3, true, 0);
+        ExpectChars("\u00e9", 1, 2, true, 1);                  // 2-byte
+        ExpectChars("\uac00\ub098\ub2e4", 3, 3, true, 1);     // Hangul: 3 bytes each
+        ExpectChars("\uac00\ub098\ub2e4", 3, 6, true, 2);
+        ExpectChars("\uac00\ub098\ub2e4", 1, 6, false, 2);
+        ExpectChars("a\uac00", 2, 4, true, 2);
+        ExpectChars("x\ud83d\ude00", 3, 4, true, 2);           // a surrogate pair is one 4-byte code point
+        ExpectChars("\ud83d\ude00x", 0, 4, false, 2);
+        ExpectChars("\ud83d\ude00x", 0, 5, false, 3);
+        ExpectChars("ab", 2, 10, true, 2);                      // never past the text's start
+        ExpectChars("ab", 0, 10, false, 2);                     // ... or end
+        ExpectChars("ab", 5, 1, true, 1);                       // caret clamped to the text
+        ExpectChars("ab", -3, 1, false, 1);
+        ExpectChars("a\ud800b", 2, 3, true, 1);                 // a lone surrogate: its 3-byte replacement
+    }
+
     static int Main()
     {
         TestConstants();
         TestRoutes();
         TestClassify();
         TestCopyText();
+        TestImeCharsForBytes();
         TestTmpVersionDefines();
         Console.WriteLine($"{s_pass} passed, {s_fail} failed");
         return s_fail == 0 ? 0 : 1;

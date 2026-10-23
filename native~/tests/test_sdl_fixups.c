@@ -17,6 +17,12 @@
 //    cleared before SDL frees it, another source is left alone, and a model of the next
 //    set_selection never uses the freed source; installed alone ("clipboard"), it still
 //    cross-checks SDL's _this (a change in that signature alone refuses it);
+//  - the IME capture: not owned, every text-input event goes on to SDL unchanged and
+//    nothing is queued; owned, the state events are kept from SDL and come out once per
+//    'done' with the full commit, the composition and its cursor, delete-surrounding;
+//    taking the IME queues its current composition; giving it back resets the IME
+//    (disable, commit, enable, set_content_type, commit) and drops the IME's own commit
+//    of the composition once; "ime" alone, and the kill switch;
 //  - the kill switch (DISPLAYXR_SDL_FIXUPS=off): nothing swapped, and the model walks the freed
 //    node (the crash), so the model reproduces the bug;
 //  - every verification refuses a mismatch (either table entry, each code signature,
@@ -34,6 +40,8 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
+
+typedef void (*fnptr_t)(void);
 
 static int s_failed;
 
@@ -222,6 +230,29 @@ clip_model_set_selection(void *new_source)
 }
 
 /*
+ * A model of this SDL's zwp_text_input_v3 handlers: they log what reaches them.
+ */
+
+static char s_ti_log[1024];
+#define TI_LOG(...) snprintf(s_ti_log + strlen(s_ti_log), sizeof(s_ti_log) - strlen(s_ti_log), __VA_ARGS__)
+static void sdl_ti_enter(void *d, void *t, void *sf) { (void)d, (void)t, (void)sf; TI_LOG("E"); }
+static void sdl_ti_leave(void *d, void *t, void *sf) { (void)d, (void)t, (void)sf; TI_LOG("L"); }
+static void sdl_ti_preedit(void *d, void *t, const char *x, int32_t b, int32_t e) { (void)d, (void)t; TI_LOG("P(%s,%d,%d)", x ? x : "nil", b, e); }
+static void sdl_ti_commit(void *d, void *t, const char *x) { (void)d, (void)t; TI_LOG("C(%s)", x ? x : "nil"); }
+static void sdl_ti_delete(void *d, void *t, uint32_t b, uint32_t a) { (void)d, (void)t; TI_LOG("X(%u,%u)", b, a); }
+static void sdl_ti_done(void *d, void *t, uint32_t sr) { (void)d, (void)t; TI_LOG("D(%u)", sr); }
+
+//! What the IME reset sent (instead of wl_proxy_marshal).
+static char s_reset_log[128];
+static void *s_reset_proxy;
+static void
+reset_send(void *text_input, unsigned opcode)
+{
+	s_reset_proxy = text_input;
+	snprintf(s_reset_log + strlen(s_reset_log), sizeof(s_reset_log) - strlen(s_reset_log), "%u", opcode);
+}
+
+/*
  * The fake image.
  */
 
@@ -234,6 +265,8 @@ static struct {
 	unsigned char clip_sig_bytes[DXR_SDL_CLIPBOARD_SIGS][64];
 	void **table;    // the wl_registry listener (outputs)
 	void **cs_table; // the wl_data_source listener (clipboard)
+	unsigned char ime_sig_bytes[DXR_SDL_IME_SIGS][64];
+	void **ti_table; // the zwp_text_input_v3 listener (ime)
 } img;
 
 enum {
@@ -242,7 +275,9 @@ enum {
 	MUT_SIG0, MUT_SIG1, MUT_SIG2, MUT_SIG3, // outputs: a byte signature off
 	MUT_RW_PAGE,                            // the "RELRO" page left writable
 	MUT_CS_CANCELLED,                       // clipboard: a wrong cancelled entry
-	MUT_CS0, MUT_CS1, MUT_CS2, MUT_CS3, MUT_CS4, MUT_CS5 // clipboard: a byte signature off (CS5: SetClipboardText / _this)
+	MUT_CS0, MUT_CS1, MUT_CS2, MUT_CS3, MUT_CS4, MUT_CS5, // clipboard: a byte signature off (CS5: SetClipboardText / _this)
+	MUT_TI_ENTRY,                           // ime: a wrong table entry
+	MUT_TI0, MUT_TI1, MUT_TI2, MUT_TI3      // ime: a byte signature off
 };
 
 static void
@@ -279,6 +314,27 @@ image_new(int mutation)
 			img.mem[off + cs->len / 2] ^= 0x01;
 		img.b.clipboard_sigs[i] = (struct dxr_sdl_sig){(uintptr_t)off, img.clip_sig_bytes[i], cs->len};
 	}
+	// The IME: SDL's zwp_text_input_v3 listener (a third table in the "RELRO" page), its six
+	// handlers (the model above), and its code signatures at the real bytes.
+	img.b.text_input_listener = (uintptr_t)img.pg + 0x300;
+	const fnptr_t ti_fns[6] = {(fnptr_t)sdl_ti_enter,  (fnptr_t)sdl_ti_leave,  (fnptr_t)sdl_ti_preedit,
+	                           (fnptr_t)sdl_ti_commit, (fnptr_t)sdl_ti_delete, (fnptr_t)sdl_ti_done};
+	for (int i = 0; i < 6; i++)
+		img.b.ti_fns[i] = (uintptr_t)ti_fns[i] - s_base;
+	for (int i = 0; i < DXR_SDL_IME_SIGS; i++) {
+		const struct dxr_sdl_sig *is = &R->ime_sigs[i];
+		unsigned off = 0xa00 + 0x100 * (unsigned)i; // past the clipboard sigs (0x400..0x900)
+		memcpy(img.ime_sig_bytes[i], is->bytes, is->len);
+		memcpy(img.mem + off, is->bytes, is->len);
+		if (mutation == MUT_TI0 + i)
+			img.mem[off + is->len / 2] ^= 0x01;
+		img.b.ime_sigs[i] = (struct dxr_sdl_sig){(uintptr_t)off, img.ime_sig_bytes[i], is->len};
+	}
+	img.ti_table = (void **)(s_base + img.b.text_input_listener);
+	for (int i = 0; i < 6; i++)
+		img.ti_table[i] = (void *)ti_fns[i];
+	if (mutation == MUT_TI_ENTRY)
+		img.ti_table[3] = (void *)&model_add;
 	img.table = (void **)(s_base + img.b.registry_listener);
 	img.table[0] = mutation == MUT_GLOBAL ? (void *)&model_add : (void *)&sdl_global;
 	img.table[1] = mutation == MUT_REMOVE ? (void *)&model_add : (void *)&sdl_remove;
@@ -292,6 +348,10 @@ image_new(int mutation)
 	s_this_slot = (char **)(s_base + img.b.video_device);
 	*s_this_slot = m.dev;
 	clip_model_reset();
+	s_ti_log[0] = 0;
+	s_reset_log[0] = 0;
+	s_reset_proxy = NULL;
+	dxr_sdl_fixups_test_ime_reset(reset_send);
 }
 
 static unsigned
@@ -317,6 +377,35 @@ dispatch_cancelled(void *source_struct)
 	typedef void (*fn)(void *, void *);
 	fn f = (fn)__atomic_load_n(&img.cs_table[2], __ATOMIC_SEQ_CST);
 	f(source_struct, (void *)0x5ec0 /* the wl_data_source proxy: unused by the model */);
+}
+
+//! libwayland dispatching zwp_text_input_v3 events to SDL's listener (data: SDL's struct).
+#define TI_PROXY ((void *)0x7170)
+static void
+ti_preedit(const char *text, int32_t b, int32_t e)
+{
+	((void (*)(void *, void *, const char *, int32_t, int32_t))__atomic_load_n(&img.ti_table[2], __ATOMIC_SEQ_CST))(
+	    NULL, TI_PROXY, text, b, e);
+}
+static void
+ti_commit(const char *text)
+{
+	((void (*)(void *, void *, const char *))__atomic_load_n(&img.ti_table[3], __ATOMIC_SEQ_CST))(NULL, TI_PROXY, text);
+}
+static void
+ti_delete(uint32_t b, uint32_t a)
+{
+	((void (*)(void *, void *, uint32_t, uint32_t))__atomic_load_n(&img.ti_table[4], __ATOMIC_SEQ_CST))(NULL, TI_PROXY, b, a);
+}
+static void
+ti_done(uint32_t serial)
+{
+	((void (*)(void *, void *, uint32_t))__atomic_load_n(&img.ti_table[5], __ATOMIC_SEQ_CST))(NULL, TI_PROXY, serial);
+}
+static void
+ti_enter(void)
+{
+	((void (*)(void *, void *, void *))__atomic_load_n(&img.ti_table[0], __ATOMIC_SEQ_CST))(NULL, TI_PROXY, NULL);
 }
 
 //! The page's protection from /proc/self/maps ("r--p", ...), or "".
@@ -369,6 +458,7 @@ install_with_env(const char *value)
 	unsigned got = image_install();
 	CHECK((img.table[1] != (void *)&sdl_remove) == ((got & DXR_SDLFIX_OUTPUTS) != 0));
 	CHECK((img.cs_table[2] != (void *)&sdl_source_cancelled) == ((got & DXR_SDLFIX_CLIPBOARD) != 0));
+	CHECK((img.ti_table[3] != (void *)&sdl_ti_commit) == ((got & DXR_SDLFIX_IME) != 0));
 	unsetenv("DISPLAYXR_SDL_FIXUPS");
 	return got;
 }
@@ -389,8 +479,11 @@ parse_is(const char *value, unsigned bits, const char *unknown)
 static void
 test_parse(void)
 {
-	const unsigned A = DXR_SDLFIX_ALL, O = DXR_SDLFIX_OUTPUTS, C = DXR_SDLFIX_CLIPBOARD;
-	CHECK(A == (C | O));
+	const unsigned A = DXR_SDLFIX_ALL, O = DXR_SDLFIX_OUTPUTS, C = DXR_SDLFIX_CLIPBOARD, I = DXR_SDLFIX_IME;
+	CHECK(A == (C | I | O));
+	CHECK(parse_is("ime", I, ""));
+	CHECK(parse_is(" ime , outputs", I | O, ""));
+	CHECK(parse_is("imeX", 0, "imeX"));
 	CHECK(parse_is(NULL, A, ""));
 	CHECK(parse_is("", A, ""));
 	CHECK(parse_is("   ", A, ""));
@@ -407,13 +500,14 @@ test_parse(void)
 	CHECK(parse_is(" clipboard ", C, ""));
 	CHECK(parse_is("outputs,clipboard", C | O, ""));
 	CHECK(parse_is("clipboard , outputs", C | O, ""));
+	CHECK(parse_is("clipboard,ime,outputs", A, ""));
 	CHECK(parse_is("clipboardX", 0, "clipboardX"));
 	CHECK(parse_is("clip", 0, "clip"));
 	CHECK(parse_is(",outputs,", O, ""));
 	CHECK(parse_is("outputsX", 0, "outputsX"));
 	CHECK(parse_is("output", 0, "output"));
 	CHECK(parse_is("OUTPUTS", 0, "OUTPUTS"));
-	CHECK(parse_is("clipboard,ime", C, "ime"));
+	CHECK(parse_is("clipboard,ime", C | I, ""));
 	CHECK(parse_is("on,outputs", O, "on")); // the specials are whole values only
 	CHECK(dxr_sdl_fixups_parse("outputsX", NULL, 0) == 0);
 	char tiny[4];
@@ -424,7 +518,8 @@ static void
 test_wanted(void)
 {
 	CHECK(DXR_SDLFIX_CLIPBOARD == 1u);
-	CHECK(DXR_SDLFIX_OUTPUTS == 4u); // 2: the IME fix
+	CHECK(DXR_SDLFIX_IME == 2u);
+	CHECK(DXR_SDLFIX_OUTPUTS == 4u);
 	const unsigned A = DXR_SDLFIX_ALL;
 	CHECK(install_with_env(NULL) == A);
 	CHECK(install_with_env("") == A);
@@ -435,11 +530,13 @@ test_wanted(void)
 	CHECK(install_with_env(" outputs ") == DXR_SDLFIX_OUTPUTS);
 	CHECK(install_with_env("clipboard") == DXR_SDLFIX_CLIPBOARD);
 	CHECK(install_with_env("outputsX") == 0);
-	CHECK(install_with_env("clipboard,outputs") == A);
-	CHECK(install_with_env("clipboard,ime") == DXR_SDLFIX_CLIPBOARD);
+	CHECK(install_with_env("clipboard,outputs") == (DXR_SDLFIX_CLIPBOARD | DXR_SDLFIX_OUTPUTS));
+	CHECK(install_with_env("clipboard,ime") == (DXR_SDLFIX_CLIPBOARD | DXR_SDLFIX_IME));
+	CHECK(install_with_env("ime") == DXR_SDLFIX_IME);
+	CHECK(install_with_env("clipboard,ime,outputs") == A);
 	CHECK(install_with_env("off") == 0);
 	CHECK(install_with_env("0") == 0);
-	CHECK(install_with_env("ime") == 0);
+	CHECK(install_with_env("imeX") == 0);
 }
 
 //! Builds the list @p ids, unlinks @p target_id, returns the ids left ("" for none).
@@ -546,6 +643,20 @@ test_real_entry_consistent(void)
 	CHECK(u32(st->bytes + 40) == 0x288 && st->bytes[49] == 0x4c && st->bytes[50] == 0x89 && st->bytes[51] == 0xf7);
 	// The wl_data_source listener sits in the same RELRO; its cancelled entry is index 2.
 	CHECK(R->data_source_listener >= 0x2734260 && R->data_source_listener + 48 <= 0x2734260 + 0x96da0);
+
+	// IME: the six handlers are the ones the signatures cover. enter / leave / delete_surrounding_text
+	// are a bare ret (0xc3); preedit follows leave, done follows delete_surrounding_text.
+	const struct dxr_sdl_sig *ip = &R->ime_sigs[0], *ic = &R->ime_sigs[1], *is = &R->ime_sigs[2],
+	                         *id = &R->ime_sigs[3];
+	CHECK(ip->at == R->ti_fns[0] && R->ti_fns[1] == ip->at + 1 && R->ti_fns[2] == ip->at + 2);
+	CHECK(ip->bytes[0] == 0xc3 && ip->bytes[1] == 0xc3);
+	CHECK(ic->at == R->ti_fns[3]);
+	CHECK(id->at == R->ti_fns[4] && R->ti_fns[5] == id->at + 1 && id->bytes[0] == 0xc3);
+	// commit_string's loop calls SDL_SendKeyboardText (0x269a82c) with the whole chunk.
+	CHECK(is->at > ic->at && is->at < R->ti_fns[4]);
+	CHECK(is->bytes[18] == 0xe8 && is->at + 23 + (uintptr_t)(intptr_t)rel32(is->bytes + 19) == 0x269a82c);
+	// The listener (6 entries) sits in 6000.4.6f1's RELRO.
+	CHECK(R->text_input_listener >= 0x2734260 && R->text_input_listener + 48 <= 0x2734260 + 0x96da0);
 }
 
 static void
@@ -673,6 +784,112 @@ test_clipboard_kill_switch_reproduces_bug(void)
 }
 
 static void
+test_ime(void)
+{
+	char cm[64], pe[64];
+	int32_t info[6];
+	unsetenv("DISPLAYXR_SDL_FIXUPS");
+	image_new(MUT_NONE);
+	CHECK(image_install() == DXR_SDLFIX_ALL);
+	for (int i = 0; i < 6; i++)
+		CHECK(img.ti_table[i] != (void *)NULL && img.ti_table[i] != img.b.ti_fns[i] + (char *)s_base); // all wrapped
+	CHECK(strncmp(prot_of(img.ti_table), "r--", 3) == 0);
+
+	// Before any text-input event a field cannot take the IME (an X11 player never gets one).
+	CHECK(!(dxr_sdl_ime_state() & DXR_SDL_IME_AVAILABLE));
+	CHECK(!(dxr_sdl_ime_own(1) & DXR_SDL_IME_OWNED));
+	ti_enter();
+	CHECK(strcmp(s_ti_log, "E") == 0); // enter goes on to SDL
+	CHECK(dxr_sdl_ime_state() & DXR_SDL_IME_AVAILABLE);
+	CHECK(dxr_sdl_ime_state() & DXR_SDL_IME_FOCUS);
+
+	// Not owned: SDL gets everything unchanged, nothing is queued.
+	s_ti_log[0] = 0;
+	ti_preedit("ㅎ", 3, 3);
+	ti_done(6);
+	CHECK(strcmp(s_ti_log, "P(ㅎ,3,3)D(6)") == 0);
+	CHECK(dxr_sdl_ime_next(cm, sizeof cm, pe, sizeof pe, info) == 0);
+
+	// Owned: the current composition first; then the state events are kept from SDL and come out per 'done'.
+	s_ti_log[0] = 0;
+	CHECK(dxr_sdl_ime_own(1) & DXR_SDL_IME_OWNED);
+	CHECK(dxr_sdl_ime_next(cm, sizeof cm, pe, sizeof pe, info) == 1 && strcmp(pe, "ㅎ") == 0 && info[4] == -1);
+	ti_preedit(NULL, 0, 0);
+	ti_commit("你好");
+	ti_preedit(NULL, 0, 0);
+	ti_done(6);
+	ti_preedit("ni'hao", 6, 6);
+	ti_done(6);
+	ti_delete(3, 0);
+	ti_done(6);
+	CHECK(s_ti_log[0] == 0); // SDL got none of it
+	CHECK(dxr_sdl_ime_next(cm, sizeof cm, pe, sizeof pe, info) == 1 && strcmp(cm, "你好") == 0 && info[5] == -1);
+	CHECK(dxr_sdl_ime_next(cm, sizeof cm, pe, sizeof pe, info) == 1 && info[4] == -1 && strcmp(pe, "ni'hao") == 0 &&
+	      info[0] == 6 && info[1] == 6);
+	CHECK(dxr_sdl_ime_next(cm, sizeof cm, pe, sizeof pe, info) == 1 && info[2] == 3 && info[3] == 0 && info[5] == -1);
+	CHECK(dxr_sdl_ime_next(cm, sizeof cm, pe, sizeof pe, info) == 0);
+	// Two commits in one group come out as one.
+	ti_commit("한");
+	ti_commit("글");
+	ti_done(6);
+	CHECK(dxr_sdl_ime_next(cm, sizeof cm, pe, sizeof pe, info) == 1 && strcmp(cm, "한글") == 0);
+	// A buffer too small: the change stays, its sizes are told.
+	ti_commit("abcdefghij");
+	ti_done(6);
+	char tiny[4];
+	CHECK(dxr_sdl_ime_next(tiny, sizeof tiny, pe, sizeof pe, info) == -1 && info[4] == 10);
+	CHECK(dxr_sdl_ime_next(cm, sizeof cm, pe, sizeof pe, info) == 1 && strcmp(cm, "abcdefghij") == 0);
+
+	// Given back with a composition showing: the IME is reset on SDL's text input, and its own commit of
+	// that composition is dropped once; the rest goes on to SDL.
+	ti_preedit("한", 3, 3);
+	ti_done(6);
+	while (dxr_sdl_ime_next(cm, sizeof cm, pe, sizeof pe, info) == 1)
+		;
+	s_ti_log[0] = 0;
+	CHECK(!(dxr_sdl_ime_release(1) & DXR_SDL_IME_OWNED));
+	CHECK(strcmp(s_reset_log, "27157") == 0 && s_reset_proxy == TI_PROXY); // disable, commit, enable, content type, commit
+	ti_preedit(NULL, 0, 0);
+	ti_commit("한"); // the IME's flush on the reset
+	ti_done(8);
+	ti_commit("한"); // a real one afterwards
+	ti_done(8);
+	CHECK(strcmp(s_ti_log, "P(nil,0,0)D(8)C(한)D(8)") == 0);
+	CHECK(dxr_sdl_fixups_test_ime_echoes() == 1);
+	// Given back without a composition: no reset needed.
+	s_reset_log[0] = 0;
+	dxr_sdl_ime_own(1);
+	dxr_sdl_ime_release(1);
+	CHECK(s_reset_log[0] == 0);
+}
+
+static void
+test_ime_only_and_kill_switch(void)
+{
+	// "ime" alone: only the IME capture.
+	setenv("DISPLAYXR_SDL_FIXUPS", "ime", 1);
+	image_new(MUT_NONE);
+	CHECK(image_install() == DXR_SDLFIX_IME);
+	CHECK(img.table[1] == (void *)&sdl_remove);
+	CHECK(img.cs_table[2] == (void *)&sdl_source_cancelled);
+	CHECK(img.ti_table[3] != (void *)&sdl_ti_commit);
+	// Off (or not named): SDL's handlers stay, a field cannot take the IME.
+	const char *offs[] = {"off", "0", "clipboard,outputs"};
+	for (int i = 0; i < 3; i++) {
+		setenv("DISPLAYXR_SDL_FIXUPS", offs[i], 1);
+		image_new(MUT_NONE);
+		CHECK((image_install() & DXR_SDLFIX_IME) == 0);
+		CHECK(img.ti_table[3] == (void *)&sdl_ti_commit);
+		ti_enter();
+		ti_commit("你好");
+		ti_done(6);
+		CHECK(strcmp(s_ti_log, "EC(你好)D(6)") == 0); // straight to SDL
+		CHECK(!(dxr_sdl_ime_own(1) & DXR_SDL_IME_OWNED));
+	}
+	unsetenv("DISPLAYXR_SDL_FIXUPS");
+}
+
+static void
 test_kill_switch_reproduces_bug(void)
 {
 	const char *offs[] = {"off", "0", "ime", "clipboard"}; // none of them installs the outputs fix
@@ -699,14 +916,21 @@ test_refusals(void)
 	for (int mut = MUT_GLOBAL; mut <= MUT_SIG3; mut++) {
 		image_new(mut);
 		void *before = img.table[1];
-		CHECK(image_install() == DXR_SDLFIX_CLIPBOARD); // the outputs fix refused, the clipboard one not affected
+		CHECK(image_install() == (DXR_SDLFIX_CLIPBOARD | DXR_SDLFIX_IME)); // the outputs fix refused, the others not affected
 		CHECK(img.table[1] == before);
 	}
 	for (int mut = MUT_CS_CANCELLED; mut <= MUT_CS5; mut++) {
 		image_new(mut);
 		void *before = img.cs_table[2];
-		CHECK(image_install() == DXR_SDLFIX_OUTPUTS); // the clipboard fix refused
+		CHECK(image_install() == (DXR_SDLFIX_IME | DXR_SDLFIX_OUTPUTS)); // the clipboard fix refused
 		CHECK(img.cs_table[2] == before);
+	}
+	for (int mut = MUT_TI_ENTRY; mut <= MUT_TI3; mut++) {
+		image_new(mut);
+		void *before[6];
+		memcpy(before, img.ti_table, sizeof(before));
+		CHECK(image_install() == (DXR_SDLFIX_CLIPBOARD | DXR_SDLFIX_OUTPUTS)); // the IME fix refused
+		CHECK(memcmp(before, img.ti_table, sizeof(before)) == 0);           // no entry swapped
 	}
 	// The plug-in cannot pin itself: nothing is swapped.
 	image_new(MUT_NONE);
@@ -714,6 +938,7 @@ test_refusals(void)
 	CHECK(image_install() == 0);
 	CHECK(img.table[1] == (void *)&sdl_remove);
 	CHECK(img.cs_table[2] == (void *)&sdl_source_cancelled);
+	CHECK(img.ti_table[3] == (void *)&sdl_ti_commit);
 	dxr_sdl_fixups_test_pin(1);
 	CHECK(image_install() == DXR_SDLFIX_ALL);
 	// A table outside RELRO (here: RELRO said to be the data page).
@@ -722,6 +947,7 @@ test_refusals(void)
 	CHECK(dxr_sdl_fixups_install_build(&img.b, s_base) == 0);
 	CHECK(img.table[1] == (void *)&sdl_remove);
 	CHECK(img.cs_table[2] == (void *)&sdl_source_cancelled);
+	CHECK(img.ti_table[3] == (void *)&sdl_ti_commit);
 	CHECK(image_install() == DXR_SDLFIX_ALL); // the same image, RELRO right
 }
 
@@ -741,6 +967,7 @@ test_previous_protection(void)
 	CHECK(image_install() == DXR_SDLFIX_ALL);
 	CHECK(strncmp(prot_of(img.table), "r--", 3) == 0);
 	CHECK(strncmp(prot_of(img.cs_table), "r--", 3) == 0);
+	CHECK(strncmp(prot_of(img.ti_table), "r--", 3) == 0);
 }
 
 static void
@@ -768,6 +995,8 @@ main(void)
 	test_fix();
 	test_clipboard();
 	test_clipboard_only();
+	test_ime();
+	test_ime_only_and_kill_switch();
 	test_kill_switch_reproduces_bug();
 	test_clipboard_kill_switch_reproduces_bug();
 	test_refusals();

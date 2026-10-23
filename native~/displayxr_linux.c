@@ -55,6 +55,7 @@
 
 #if defined(__linux__) && !defined(__ANDROID__)
 
+#include "displayxr_linux_sdl_fixups.h"
 #include "displayxr_linux_wayland.h"
 
 #include <dlfcn.h>
@@ -1874,6 +1875,34 @@ DISPLAYXR_EXPORT int
 displayxr_linux_clipboard_write(const char *text, int len)
 {
 	return dxr_wl_clipboard_write(text, len);
+}
+
+/// Native-Wayland player: the IME for the DisplayXR input fields (Runtime/DisplayXRTextIme.cs),
+/// recorded by the SDL fixups' text-input capture (displayxr_linux_sdl_fixups.c, #415). Inert
+/// (state 0) in the editor, in an X11 player, for an unknown UnityPlayer.so and with the fix
+/// off. Unity's main thread only.
+DISPLAYXR_EXPORT unsigned
+displayxr_linux_ime_state(void)
+{
+	return dxr_sdl_ime_state();
+}
+
+DISPLAYXR_EXPORT unsigned
+displayxr_linux_ime_own(int own)
+{
+	return dxr_sdl_ime_own(own);
+}
+
+DISPLAYXR_EXPORT unsigned
+displayxr_linux_ime_release(int drop_echo)
+{
+	return dxr_sdl_ime_release(drop_echo);
+}
+
+DISPLAYXR_EXPORT int
+displayxr_linux_ime_next(char *commit, int commit_cap, char *preedit, int preedit_cap, int32_t *info)
+{
+	return dxr_sdl_ime_next(commit, commit_cap, preedit, preedit_cap, info);
 }
 
 // ---------------------------------------------------------------------------

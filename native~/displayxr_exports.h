@@ -514,6 +514,27 @@ DISPLAYXR_EXPORT int displayxr_linux_clipboard_state(void);
 DISPLAYXR_EXPORT int displayxr_linux_clipboard_read(char *buf, int len, int timeout_ms, int *needed);
 DISPLAYXR_EXPORT int displayxr_linux_clipboard_write(const char *text, int len);
 
+/// Native-Wayland player: the IME for the DisplayXR input fields (#415). Unity's player
+/// drops the IME's composition and hands a commit to the app as its first character only;
+/// the main plug-in's SDL fixups record SDL's zwp_text_input_v3 events instead
+/// (displayxr_linux_sdl_fixups.c, fix "ime"). Inert (state 0) in the editor, in an X11
+/// player, for an unknown UnityPlayer.so and with the fix off. Unity's main thread only;
+/// typed text never reaches a log.
+/// state: 16 = a field may take the IME, 32 = a field owns it, 64 = the text input has focus.
+/// own(1): a field takes the IME (its events stop reaching Unity; the current composition
+/// comes first); own(0) gives it back without a reset. Returns the state.
+/// release(drop_echo): gives it back and resets the IME's composition; drop_echo = 1: the
+/// field put the composition into its text itself or dropped it (the IME's own commit of
+/// it is dropped, so it never reaches the next field).
+/// next: the oldest change: 1, 0 (none), -1 (a buffer too small: info[4] / info[5] say
+/// the commit / composition bytes; the change stays). info: cursor_begin, cursor_end,
+/// delete_before, delete_after (UTF-8 bytes), commit bytes, composition bytes (-1 none).
+DISPLAYXR_EXPORT unsigned displayxr_linux_ime_state(void);
+DISPLAYXR_EXPORT unsigned displayxr_linux_ime_own(int own);
+DISPLAYXR_EXPORT unsigned displayxr_linux_ime_release(int drop_echo);
+DISPLAYXR_EXPORT int displayxr_linux_ime_next(char *commit, int commit_cap, char *preedit, int preedit_cap,
+                                              int32_t *info);
+
 /// Side-step (native-Wayland player on GNOME with the DisplayXR GNOME extension): the
 /// app's own window steps aside when the window the user is working in covers the
 /// app's content, and goes back once its place is free. Only while the app's desktop

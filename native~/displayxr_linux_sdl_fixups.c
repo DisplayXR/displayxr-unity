@@ -52,6 +52,15 @@
 //   walks its freed MIME list (Unity's "+0x26de152"). Upstream SDL a6179e85c (2.24.0)
 //   clears selection_source when it frees that source; the wrapper of SDL's
 //   wl_data_source cancelled does exactly that, then lets SDL destroy and free it.
+// - ime (DXR_SDLFIX_IME, #415): SDL turns zwp_text_input_v3 preedit_string into
+//   SDL_TEXTEDITING and commit_string into one SDL_TEXTINPUT with the full text, but
+//   Unity's player loop drops SDL_TEXTEDITING and hands an SDL_TEXTINPUT that is not
+//   paired with a key press to the Input System as its first code point only; UGUI
+//   and TextMeshPro fields (IMGUI events, made only from key presses) get nothing. Not
+//   an SDL bug, so nothing upstream to copy: the wrappers of SDL's six text-input
+//   handlers record the protocol's double-buffered state at every 'done' for the
+//   DisplayXR input fields (dxr_sdl_ime_*). While a field owns the IME the events do
+//   not go on to SDL (the text reaches the app once); otherwise they go on unchanged.
 //
 // Adding a fix: its fields and code signatures in struct dxr_sdl_build (one table
 // entry per UnityPlayer.so), a DXR_SDLFIX_* bit (and DXR_SDLFIX_ALL) and its name in
@@ -71,6 +80,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 
 typedef void (*fnptr)(void);
@@ -156,6 +166,29 @@ static const unsigned char k_6046_set_text[] = {
     0x49, 0x8b, 0x86, 0x88, 0x02, 0x00, 0x00, 0x48, 0x85, 0xc0, 0x74, 0x3a, // mov 0x288(%r14),%rax; test; je
     0x4c, 0x89, 0xf7, 0x4c, 0x89, 0xfe, 0xff, 0xd0};                        // mov %r14,%rdi; mov %r15,%rsi; call *%rax
 
+//! SDL's zwp_text_input_v3 handlers: enter, leave (a bare `ret` each), then
+//! text_input_preedit_string's prologue (`movl $1,0x18(%rdi)`: has_preedit).
+static const unsigned char k_6046_ti_preedit[] = {
+    0xc3, 0xc3,                                     // enter: ret; leave: ret
+    0x55, 0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, // push rbp, r15, r14, r13,
+    0x54, 0x53, 0x48, 0x83, 0xec, 0x38,             // push r12, rbx; sub $0x38,%rsp
+    0xc7, 0x47, 0x18, 0x01};                        // movl $1,0x18(%rdi)
+//! text_input_commit_string's prologue (text in %rdx) ...
+static const unsigned char k_6046_ti_commit[] = {
+    0x41, 0x57, 0x41, 0x56, 0x41, 0x55, 0x41, 0x54, // push r15, r14, r13, r12
+    0x53, 0x48, 0x83, 0xec, 0x20, 0x48, 0x85, 0xd2}; // push rbx; sub $0x20,%rsp; test %rdx,%rdx
+//! ... and its loop: SDL_utf8strlcpy into 32 bytes, then SDL_SendKeyboardText (0x269a82c).
+static const unsigned char k_6046_ti_commit_send[] = {
+    0x49, 0x8d, 0x34, 0x1f, 0x4c, 0x89, 0xe7,       // lea (%r15,%rbx),%rsi; mov %r12,%rdi
+    0xe8, 0xc9, 0x76, 0xfc, 0xff,                   // call SDL_utf8strlcpy
+    0x49, 0x89, 0xc5, 0x4c, 0x89, 0xe7,             // mov %rax,%r13; mov %r12,%rdi
+    0xe8, 0x7a, 0xf4, 0xfb, 0xff};                  // call SDL_SendKeyboardText
+//! delete_surrounding_text (a bare `ret`), then text_input_done's prologue.
+static const unsigned char k_6046_ti_done[] = {
+    0xc3,                                           // delete_surrounding_text: ret
+    0x53, 0x48, 0x89, 0xfb, 0x83, 0x7f, 0x18, 0x00, // push rbx; mov %rdi,%rbx; cmpl $0,0x18(%rdi)
+    0x75, 0x10};                                    // jne
+
 static const struct dxr_sdl_build k_builds[] = {
     {
         .build_id = "4ae6b3f45943aa2cf6ca0d0ac4fdec503e60e55c",
@@ -187,6 +220,12 @@ static const struct dxr_sdl_build k_builds[] = {
                            {0x26df11e, k_6046_get_source, sizeof(k_6046_get_source)},
                            {0x26df016, k_6046_set_old, sizeof(k_6046_set_old)},
                            {0x1844b06, k_6046_set_text, sizeof(k_6046_set_text)}},
+        .text_input_listener = 0x27c5238,
+        .ti_fns = {0x26db2bc, 0x26db2bd, 0x26db2be, 0x26db36c, 0x26db3c8, 0x26db3c9},
+        .ime_sigs = {{0x26db2bc, k_6046_ti_preedit, sizeof(k_6046_ti_preedit)},
+                     {0x26db36c, k_6046_ti_commit, sizeof(k_6046_ti_commit)},
+                     {0x26db39b, k_6046_ti_commit_send, sizeof(k_6046_ti_commit_send)},
+                     {0x26db3c8, k_6046_ti_done, sizeof(k_6046_ti_done)}},
     },
 };
 
@@ -470,12 +509,369 @@ install_clipboard(void)
 	return 1;
 }
 
+/*
+ * IME: SDL's zwp_text_input_v3 events, recorded for the DisplayXR input fields.
+ *
+ * The protocol's preedit_string, commit_string and delete_surrounding_text are
+ * double-buffered and take effect at 'done' (the preedit is empty unless one came).
+ * One record per 'done' while a field owns the IME; the field applies it in the
+ * protocol's order (the old composition goes, the text around the caret is deleted,
+ * the commit is inserted, the new composition shows). While owned, the four state
+ * events do not go on to SDL; enter / leave always do. A field that gives the IME
+ * back resets it (disable + commit, enable + set_content_type + commit on SDL's own
+ * text input; SDL keeps it enabled the whole time otherwise and flushes the requests
+ * with its next event pump), and for one second the IME's own commit of the
+ * composition the field showed (ibus-hangul flushes it on a reset) is dropped, so it
+ * reaches neither Unity nor the next field. Everything runs on the thread that
+ * dispatches SDL's events (Unity's main thread), as do the fields' calls; the mutex
+ * only keeps a stray caller safe.
+ */
+
+typedef void (*fnptr_ti_surface)(void *, void *, void *);
+typedef void (*fnptr_ti_preedit)(void *, void *, const char *, int32_t, int32_t);
+typedef void (*fnptr_ti_commit)(void *, void *, const char *);
+typedef void (*fnptr_ti_delete)(void *, void *, uint32_t, uint32_t);
+typedef void (*fnptr_ti_done)(void *, void *, uint32_t);
+
+typedef struct ImeRec {
+	char *commit;  // NULL: none
+	char *preedit; // NULL: empty
+	int32_t cursor_begin, cursor_end;
+	uint32_t del_before, del_after;
+} ImeRec;
+
+#define IME_QUEUE 64
+static pthread_mutex_t s_ime_mx = PTHREAD_MUTEX_INITIALIZER;
+static ImeRec s_q[IME_QUEUE];
+static int s_q_head, s_q_len;
+static fnptr s_ti_orig[6];
+static void *s_ti_proxy; // SDL's zwp_text_input_v3, from its events (for the reset)
+static int s_owned, s_ti_focus;
+static struct {
+	char *commit;
+	char *preedit;
+	int has_preedit;
+	int32_t cursor_begin, cursor_end;
+	uint32_t del_before, del_after;
+	int owned_any;
+} s_pend;
+static char *s_cur_preedit; // the IME's composition as of the last 'done'
+static int32_t s_cur_begin, s_cur_end;
+static char *s_echo; // a composition a field took itself: the IME's commit of it is dropped once
+static int64_t s_echo_until_ns;
+static unsigned s_echoes;
+static void (*s_ime_send)(void *text_input, unsigned opcode); // the reset's requests (tests replace it)
+
+static int64_t
+now_ns(void)
+{
+	struct timespec ts;
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+static void
+rec_free(ImeRec *r)
+{
+	free(r->commit);
+	free(r->preedit);
+	memset(r, 0, sizeof(*r));
+}
+
+static void
+q_push(ImeRec *r) // takes the strings; drops the oldest when full
+{
+	if (s_q_len == IME_QUEUE) {
+		rec_free(&s_q[s_q_head]);
+		s_q_head = (s_q_head + 1) % IME_QUEUE;
+		s_q_len--;
+	}
+	s_q[(s_q_head + s_q_len) % IME_QUEUE] = *r;
+	s_q_len++;
+}
+
+static void
+q_clear(void)
+{
+	while (s_q_len) {
+		rec_free(&s_q[s_q_head]);
+		s_q_head = (s_q_head + 1) % IME_QUEUE;
+		s_q_len--;
+	}
+	s_q_head = 0;
+}
+
+//! Every event: remember SDL's proxy; whether a field owns the IME.
+static int
+ti_event_locked(void *ti)
+{
+	s_ti_proxy = ti;
+	return s_owned;
+}
+
+static void
+fix_ti_enter(void *data, void *ti, void *surface)
+{
+	pthread_mutex_lock(&s_ime_mx);
+	ti_event_locked(ti);
+	s_ti_focus = 1;
+	pthread_mutex_unlock(&s_ime_mx);
+	((fnptr_ti_surface)s_ti_orig[0])(data, ti, surface);
+}
+
+static void
+fix_ti_leave(void *data, void *ti, void *surface)
+{
+	pthread_mutex_lock(&s_ime_mx);
+	ti_event_locked(ti);
+	s_ti_focus = 0;
+	pthread_mutex_unlock(&s_ime_mx);
+	((fnptr_ti_surface)s_ti_orig[1])(data, ti, surface);
+}
+
+static void
+fix_ti_preedit(void *data, void *ti, const char *text, int32_t begin, int32_t end)
+{
+	pthread_mutex_lock(&s_ime_mx);
+	int owned = ti_event_locked(ti);
+	free(s_pend.preedit);
+	s_pend.preedit = (text && *text) ? strdup(text) : NULL;
+	s_pend.has_preedit = 1;
+	s_pend.cursor_begin = begin;
+	s_pend.cursor_end = end;
+	s_pend.owned_any |= owned;
+	pthread_mutex_unlock(&s_ime_mx);
+	if (!owned)
+		((fnptr_ti_preedit)s_ti_orig[2])(data, ti, text, begin, end);
+}
+
+static void
+fix_ti_commit(void *data, void *ti, const char *text)
+{
+	pthread_mutex_lock(&s_ime_mx);
+	int owned = ti_event_locked(ti);
+	if (s_echo && now_ns() > s_echo_until_ns) {
+		free(s_echo);
+		s_echo = NULL;
+	}
+	if (s_echo && text && strcmp(text, s_echo) == 0) {
+		free(s_echo);
+		s_echo = NULL;
+		s_echoes++;
+		pthread_mutex_unlock(&s_ime_mx);
+		if (s_log)
+			logf_("IME: dropped the IME's own commit of a composition the field took itself");
+		return;
+	}
+	if (text && *text) {
+		size_t a = s_pend.commit ? strlen(s_pend.commit) : 0, b = strlen(text);
+		char *n = realloc(s_pend.commit, a + b + 1);
+		if (n) {
+			memcpy(n + a, text, b + 1);
+			s_pend.commit = n;
+		}
+	}
+	s_pend.owned_any |= owned;
+	pthread_mutex_unlock(&s_ime_mx);
+	if (!owned)
+		((fnptr_ti_commit)s_ti_orig[3])(data, ti, text);
+}
+
+static void
+fix_ti_delete(void *data, void *ti, uint32_t before, uint32_t after)
+{
+	pthread_mutex_lock(&s_ime_mx);
+	int owned = ti_event_locked(ti);
+	s_pend.del_before = before;
+	s_pend.del_after = after;
+	s_pend.owned_any |= owned;
+	pthread_mutex_unlock(&s_ime_mx);
+	if (!owned)
+		((fnptr_ti_delete)s_ti_orig[4])(data, ti, before, after);
+}
+
+static void
+fix_ti_done(void *data, void *ti, uint32_t serial)
+{
+	pthread_mutex_lock(&s_ime_mx);
+	int owned = ti_event_locked(ti);
+	free(s_cur_preedit);
+	s_cur_preedit = s_pend.has_preedit ? s_pend.preedit : NULL;
+	s_cur_begin = s_pend.has_preedit ? s_pend.cursor_begin : 0;
+	s_cur_end = s_pend.has_preedit ? s_pend.cursor_end : 0;
+	if (owned || s_pend.owned_any) {
+		ImeRec r = {
+		    .commit = s_pend.commit,
+		    .preedit = s_cur_preedit ? strdup(s_cur_preedit) : NULL,
+		    .cursor_begin = s_cur_begin,
+		    .cursor_end = s_cur_end,
+		    .del_before = s_pend.del_before,
+		    .del_after = s_pend.del_after,
+		};
+		q_push(&r);
+	} else {
+		free(s_pend.commit);
+	}
+	memset(&s_pend, 0, sizeof(s_pend));
+	pthread_mutex_unlock(&s_ime_mx);
+	if (!owned)
+		((fnptr_ti_done)s_ti_orig[5])(data, ti, serial);
+}
+
+//! wl_proxy_marshal from the libwayland-client SDL loaded (never loads it: no NEEDED,
+//! and none in an X11 player, where there is no SDL text input to reset anyway).
+static void
+send_marshal(void *text_input, unsigned opcode)
+{
+	static void (*marshal)(void *, uint32_t, ...);
+	static int tried;
+	if (!tried) {
+		tried = 1;
+		void *wl = dlopen("libwayland-client.so.0", RTLD_NOW | RTLD_NOLOAD);
+		if (wl)
+			marshal = (void (*)(void *, uint32_t, ...))dlsym(wl, "wl_proxy_marshal");
+	}
+	if (!marshal)
+		return;
+	if (opcode == 5) // set_content_type(hint 0, purpose 0): what SDL sends
+		marshal(text_input, opcode, 0u, 0u);
+	else
+		marshal(text_input, opcode);
+}
+
+static int
+install_ime(void)
+{
+	const struct dxr_sdl_build *b = s_b;
+	if (!in_relro(b->text_input_listener, 0, 6)) {
+		logf_("IME fix NOT installed: SDL's zwp_text_input_v3 listener is not in UnityPlayer.so's RELRO");
+		return 0;
+	}
+	if (!sigs_ok(b->ime_sigs, DXR_SDL_IME_SIGS)) {
+		logf_("IME fix NOT installed: SDL's code differs from the known build's");
+		return 0;
+	}
+	for (int i = 0; i < 6; i++)
+		s_ti_orig[i] = (fnptr)(s_base + b->ti_fns[i]);
+	const fnptr wrap[6] = {(fnptr)fix_ti_enter,  (fnptr)fix_ti_leave,  (fnptr)fix_ti_preedit,
+	                       (fnptr)fix_ti_commit, (fnptr)fix_ti_delete, (fnptr)fix_ti_done};
+	int r = swap_entries(b->text_input_listener, 0, 6, b->ti_fns, wrap);
+	if (r != SWAP_OK) {
+		logf_("IME fix NOT installed: %s", swap_why(r, "zwp_text_input_v3 listener"));
+		return 0;
+	}
+	if (!s_ime_send)
+		s_ime_send = send_marshal;
+	return 1;
+}
+
+unsigned
+dxr_sdl_ime_state(void)
+{
+	pthread_mutex_lock(&s_ime_mx);
+	unsigned st = (((s_installed & DXR_SDLFIX_IME) && s_ti_proxy) ? DXR_SDL_IME_AVAILABLE : 0) |
+	              (s_owned ? DXR_SDL_IME_OWNED : 0) | (s_ti_focus ? DXR_SDL_IME_FOCUS : 0);
+	pthread_mutex_unlock(&s_ime_mx);
+	return st;
+}
+
+unsigned
+dxr_sdl_ime_own(int own)
+{
+	pthread_mutex_lock(&s_ime_mx);
+	if (!(s_installed & DXR_SDLFIX_IME) || !s_ti_proxy)
+		own = 0;
+	int was = s_owned;
+	s_owned = own ? 1 : 0;
+	if (s_owned && !was) {
+		q_clear();
+		if (s_cur_preedit) {
+			ImeRec r = {.preedit = strdup(s_cur_preedit), .cursor_begin = s_cur_begin, .cursor_end = s_cur_end};
+			q_push(&r);
+		}
+	} else if (!s_owned && was) {
+		q_clear();
+	}
+	pthread_mutex_unlock(&s_ime_mx);
+	return dxr_sdl_ime_state();
+}
+
+unsigned
+dxr_sdl_ime_release(int drop_echo)
+{
+	pthread_mutex_lock(&s_ime_mx);
+	s_owned = 0;
+	q_clear();
+	free(s_echo);
+	s_echo = (drop_echo && s_cur_preedit) ? strdup(s_cur_preedit) : NULL;
+	s_echo_until_ns = now_ns() + 1000000000LL;
+	void *ti = s_ti_proxy;
+	int had = s_cur_preedit != NULL;
+	free(s_cur_preedit);
+	s_cur_preedit = NULL;
+	void (*send)(void *, unsigned) = s_ime_send;
+	pthread_mutex_unlock(&s_ime_mx);
+	if (ti && had && send) {
+		// zwp_text_input_v3 requests: 2 disable, 7 commit, 1 enable, 5 set_content_type, 7 commit.
+		send(ti, 2);
+		send(ti, 7);
+		send(ti, 1);
+		send(ti, 5);
+		send(ti, 7);
+		if (s_log)
+			logf_("IME: reset (disable / enable)");
+	}
+	return dxr_sdl_ime_state();
+}
+
+int
+dxr_sdl_ime_next(char *commit, int commit_cap, char *preedit, int preedit_cap, int32_t *info)
+{
+	pthread_mutex_lock(&s_ime_mx);
+	if (!s_q_len) {
+		pthread_mutex_unlock(&s_ime_mx);
+		return 0;
+	}
+	ImeRec *r = &s_q[s_q_head];
+	int cl = r->commit ? (int)strlen(r->commit) : -1, pl = r->preedit ? (int)strlen(r->preedit) : -1;
+	if (info) {
+		info[0] = r->cursor_begin;
+		info[1] = r->cursor_end;
+		info[2] = (int32_t)r->del_before;
+		info[3] = (int32_t)r->del_after;
+		info[4] = cl;
+		info[5] = pl;
+	}
+	if ((cl >= 0 && (!commit || commit_cap <= cl)) || (pl >= 0 && (!preedit || preedit_cap <= pl))) {
+		pthread_mutex_unlock(&s_ime_mx);
+		return -1;
+	}
+	if (commit && commit_cap > 0) {
+		if (cl >= 0)
+			memcpy(commit, r->commit, (size_t)cl + 1);
+		else
+			commit[0] = 0;
+	}
+	if (preedit && preedit_cap > 0) {
+		if (pl >= 0)
+			memcpy(preedit, r->preedit, (size_t)pl + 1);
+		else
+			preedit[0] = 0;
+	}
+	rec_free(r);
+	s_q_head = (s_q_head + 1) % IME_QUEUE;
+	s_q_len--;
+	pthread_mutex_unlock(&s_ime_mx);
+	return 1;
+}
+
 //! The fixes by name (DISPLAYXR_SDL_FIXUPS).
 static const struct {
 	const char *name;
 	unsigned bit;
 } k_fix_names[] = {
     {"clipboard", DXR_SDLFIX_CLIPBOARD},
+    {"ime", DXR_SDLFIX_IME},
     {"outputs", DXR_SDLFIX_OUTPUTS},
 };
 
@@ -586,11 +982,13 @@ install_with(const struct dxr_sdl_build *b, uintptr_t base)
 	unsigned got = 0;
 	if ((want & DXR_SDLFIX_CLIPBOARD) && install_clipboard())
 		got |= DXR_SDLFIX_CLIPBOARD;
-	// DXR_SDLFIX_IME: its install_*() goes here.
+	if ((want & DXR_SDLFIX_IME) && install_ime())
+		got |= DXR_SDLFIX_IME;
 	if ((want & DXR_SDLFIX_OUTPUTS) && install_outputs())
 		got |= DXR_SDLFIX_OUTPUTS;
-	logf_("%s (build-id %.8s..., base %p): clipboard %s, monitor re-add %s", b->what, b->build_id, (void *)base,
-	      (got & DXR_SDLFIX_CLIPBOARD) ? "fixed" : (want & DXR_SDLFIX_CLIPBOARD) ? "NOT fixed" : "off",
+	logf_("%s (build-id %.8s..., base %p): clipboard %s, IME %s, monitor re-add %s", b->what, b->build_id,
+	      (void *)base, (got & DXR_SDLFIX_CLIPBOARD) ? "fixed" : (want & DXR_SDLFIX_CLIPBOARD) ? "NOT fixed" : "off",
+	      (got & DXR_SDLFIX_IME) ? "for the DisplayXR fields" : (want & DXR_SDLFIX_IME) ? "NOT fixed" : "off",
 	      (got & DXR_SDLFIX_OUTPUTS) ? "fixed" : (want & DXR_SDLFIX_OUTPUTS) ? "NOT fixed" : "off");
 	return got;
 }
@@ -636,6 +1034,18 @@ dxr_sdl_fixups_find_build(const char *build_id)
 static int s_test_relro_set;
 
 void
+dxr_sdl_fixups_test_ime_reset(void (*send)(void *text_input, unsigned opcode))
+{
+	s_ime_send = send;
+}
+
+unsigned
+dxr_sdl_fixups_test_ime_echoes(void)
+{
+	return s_echoes;
+}
+
+void
 dxr_sdl_fixups_test_pin(int result)
 {
 	s_test_pin = result;
@@ -652,6 +1062,18 @@ dxr_sdl_fixups_test_relro(uintptr_t lo, uintptr_t hi)
 unsigned
 dxr_sdl_fixups_install_build(const struct dxr_sdl_build *b, uintptr_t base)
 {
+	// A fresh IME for every test install.
+	q_clear();
+	s_owned = s_ti_focus = 0;
+	s_ti_proxy = NULL;
+	free(s_cur_preedit);
+	s_cur_preedit = NULL;
+	free(s_echo);
+	s_echo = NULL;
+	free(s_pend.commit);
+	free(s_pend.preedit);
+	memset(&s_pend, 0, sizeof(s_pend));
+	s_echoes = 0;
 	if (!s_test_relro_set) {
 		s_relro_lo = 0;
 		s_relro_hi = UINTPTR_MAX;
