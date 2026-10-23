@@ -23,8 +23,16 @@ namespace DisplayXR
     /// a paste reads the clipboard over the next frames without blocking one, then inserts the text at
     /// the caret, replacing the selection, only if the field still has the focus (nothing after about
     /// 3 s without an answer). It never touches <c>systemCopyBuffer</c> then.</para>
-    /// <para>Before the cut, without file drops, on X11 / XWayland, on Windows and macOS and in the
-    /// editor it is exactly a <c>TMP_InputField</c>. Clipboard text never reaches a log.</para>
+    /// <para>For the clipboard, before the cut, without file drops, on X11 / XWayland, on Windows and
+    /// macOS and in the editor it is exactly a <c>TMP_InputField</c>. Clipboard text never reaches a
+    /// log.</para>
+    /// <para>In a native-Wayland Linux player it also gets IME text (Korean, Chinese, ...), which
+    /// Unity's player loses there (#415), with or without file drops: while it has the focus it owns
+    /// the IME through the plug-in (<c>DisplayXRTextIme</c>), shows the composition with the base
+    /// field's own display (underlined) and inserts each commit once, in full. A composition still
+    /// showing becomes text when the field loses the focus. On X11 / XWayland, for a Unity player
+    /// build the plug-in does not know and with <c>DISPLAYXR_SDL_FIXUPS</c> without <c>ime</c> it types
+    /// exactly as a <c>TMP_InputField</c>.</para>
     /// </summary>
     [AddComponentMenu("DisplayXR/DisplayXR Clipboard Input Field (TextMeshPro)")]
     public class DisplayXRClipboardInputField : TMP_InputField
@@ -47,6 +55,14 @@ namespace DisplayXR
         [System.NonSerialized] Coroutine m_Paste;
 
         public override void OnUpdateSelected(BaseEventData eventData)
+        {
+            ImeBeforeKeys();
+            UpdateSelected(eventData);
+            if (!isFocused)
+                ImeRelease(false);
+        }
+
+        void UpdateSelected(BaseEventData eventData)
         {
             if (!DisplayXRTextClipboard.Routes)
             {
@@ -118,8 +134,30 @@ namespace DisplayXR
             }
         }
 
+        public override void OnDeselect(BaseEventData eventData)
+        {
+            ImeRelease(true); // a composition still showing becomes text, as when a field loses the focus on Windows
+            base.OnDeselect(eventData);
+        }
+
+        // The app lost the keyboard focus: the compositor takes the IME away (the IME's own commit of the
+        // composition does not reach the app then), so the composition still showing becomes text here.
+        void OnApplicationFocus(bool hasFocus)
+        {
+            if (!hasFocus)
+                ImeRelease(true);
+        }
+
+        protected override void LateUpdate()
+        {
+            base.LateUpdate();
+            if (!isFocused)
+                ImeRelease(true);
+        }
+
         protected override void OnDisable()
         {
+            ImeRelease(false);
             if (m_Paste != null)
                 StopCoroutine(m_Paste);
             m_Paste = null;
@@ -156,6 +194,63 @@ namespace DisplayXR
                 return;
             for (int i = 0; i < count; i++)
                 Append(pasted);
+            s_TextUpdateRequired?.SetValue(this, true);
+            UpdateLabel();
+        }
+
+        // IME (native-Wayland Linux player; the plug-in's SDL fixups record the events; DisplayXRTextIme). The frame's
+        // IME changes go in before the frame's keys, in the protocol's order: the old composition goes,
+        // the text around the caret the IME asks for is deleted, the commit is inserted (the base's
+        // Append: validation, character limit, onValueChanged), the new composition shows through the
+        // base's own composition display. The label refresh also updates the base's composition flag,
+        // so a key the IME forwards after a commit (Enter, an arrow) acts as it would without an IME.
+        void ImeBeforeKeys()
+        {
+            if (!isFocused || readOnly)
+                return;
+            if (!DisplayXRTextIme.Owns(this) && !DisplayXRTextIme.Acquire(this))
+                return;
+            bool changed = false;
+            while (DisplayXRTextIme.Next(this, out DisplayXRTextIme.Change change))
+            {
+                changed = true;
+                DisplayXRTextIme.SetComposition(this, "");
+                if (change.DeleteBeforeBytes > 0 || change.DeleteAfterBytes > 0)
+                    ImeDelete(change.DeleteBeforeBytes, change.DeleteAfterBytes);
+                if (!string.IsNullOrEmpty(change.Commit))
+                    Append(change.Commit);
+                DisplayXRTextIme.SetComposition(this, change.Composition);
+            }
+            if (changed)
+            {
+                s_TextUpdateRequired?.SetValue(this, true);
+                UpdateLabel();
+            }
+        }
+
+        void ImeDelete(int beforeBytes, int afterBytes)
+        {
+            int caret = stringPositionInternal;
+            int before = DisplayXRTextIme.CharsForBytes(text, caret, beforeBytes, true);
+            int after = DisplayXRTextIme.CharsForBytes(text, caret, afterBytes, false);
+            if (before + after == 0)
+                return;
+            stringPositionInternal = caret - before;
+            stringSelectPositionInternal = caret + after;
+            KeyPressed(Event.KeyboardEvent("backspace"));
+        }
+
+        void ImeRelease(bool commitComposition)
+        {
+            if (!DisplayXRTextIme.Owns(this))
+                return;
+            string composition = DisplayXRTextIme.Composition;
+            DisplayXRTextIme.SetComposition(this, "");
+            if (commitComposition && composition.Length > 0 && !readOnly)
+                Append(composition);
+            DisplayXRTextIme.Release(this);
+            if (!isActiveAndEnabled)
+                return; // OnDisable: nothing to redraw
             s_TextUpdateRequired?.SetValue(this, true);
             UpdateLabel();
         }

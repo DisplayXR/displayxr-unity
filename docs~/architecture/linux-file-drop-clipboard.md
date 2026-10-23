@@ -61,7 +61,8 @@ the right clipboard (and no longer crashes — see below).
 Unity's `TMP_InputField` and the legacy `InputField` copy and paste through
 `systemCopyBuffer`: Ctrl+C and Ctrl+X write it, Ctrl+V reads it (the legacy field also copies on
 Ctrl+Insert and pastes on Shift+Insert). In an app with drops on, after the cut a stock field's
-paste brings stale text. Use the DisplayXR fields instead:
+paste brings stale text. And in any native-Wayland player a stock field gets no IME text at all
+(Korean, Chinese, ...; see "IME" below). Use the DisplayXR fields instead:
 
 | Instead of | Use | Compiled when the project has |
 |---|---|---|
@@ -95,8 +96,8 @@ while focused):
   TextMeshPro's text refresh flag), so IME composition, Enter / Escape, multi-line, validation and
   read-only behave exactly as in the base. If a later UGUI or TextMeshPro version renames one of
   those, the field still routes the clipboard keys and logs once that IME edge cases may differ.
-- Before the cut, without file drops, in an X11 / XWayland player, on Windows and macOS and in
-  the editor they are exactly the base field: they call the base for everything.
+- For the clipboard, before the cut, without file drops, in an X11 / XWayland player, on Windows
+  and macOS and in the editor they are exactly the base field: they call the base for everything.
 
 Other text widgets that copy or paste through `systemCopyBuffer` (UI Toolkit, IMGUI, an app's own
 fields) are not covered: route their copy and paste the same way, with `LinuxClipboardState()`,
@@ -105,10 +106,32 @@ fields) are not covered: route their copy and paste the same way, with `LinuxCli
 The rules (when to route, which keys, what a copy takes) are pure C#,
 `Runtime/DisplayXRTextClipboardRules.cs`, unit-tested in CI (`Tests~/TextClipboard`).
 
+### IME (Korean, Chinese, ...)
+
+Unity's native-Wayland player loses IME text: the composition is never shown, a stock
+`TMP_InputField` / `InputField` gets no committed text, and `Keyboard.onTextInput` gets only the
+first character of each commit (#415). The DisplayXR fields get it from the plug-in instead (the
+`ime` SDL fixup, [SDL Fixups](linux-sdl-fixups.md)), with or without file drops:
+
+- While a DisplayXR field has the focus it owns the IME: the composition shows in the field with the
+  base field's own composition display (underlined in TextMeshPro with rich text on, inline in the
+  legacy field), each commit is inserted once, in full, through the field's validation and character
+  limit, and Backspace / arrows / Enter inside a composition stay with the IME.
+- A Hangul Enter commits the syllable and submits the field (as GTK apps do); a pinyin Enter that
+  the IME uses (to commit the Latin letters) does not submit.
+- A composition still showing becomes text when the field loses the focus (deselect, the app
+  losing the keyboard focus); a disabled field drops it. It never reaches the next field.
+- Stock fields and `Keyboard.onTextInput` keep Unity's behaviour (they get what they get today).
+  Text widgets other than these two fields that need IME text have no route yet.
+- Inert, and the fields type exactly as the base field, in an X11 / XWayland player, for a Unity
+  player build the plug-in does not know, with `DISPLAYXR_SDL_FIXUPS` off or without `ime`, on
+  Windows and macOS (Unity's own IME support applies there) and in the editor.
+
 ## Unity's embedded SDL
 
 A `GUIUtility.systemCopyBuffer` write (a stock field's Ctrl+C) used to crash the player on native
 Wayland after another app had copied, with drops on or off — a use-after-free in the 2022 SDL2
 snapshot Unity links into `UnityPlayer.so` (SDL #6007, fixed upstream in SDL 2.24.0). The plug-in now
 applies that upstream fix from outside, so stock fields and `systemCopyBuffer` work on native Wayland
-as they do on a desktop. See [SDL Fixups](linux-sdl-fixups.md); `DISPLAYXR_SDL_FIXUPS=0` turns it off.
+as they do on a desktop. The IME text above comes through the same mechanism. See
+[SDL Fixups](linux-sdl-fixups.md); `DISPLAYXR_SDL_FIXUPS=0` turns both off.

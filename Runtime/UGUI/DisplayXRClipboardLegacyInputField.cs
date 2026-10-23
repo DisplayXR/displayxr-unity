@@ -16,8 +16,10 @@ namespace DisplayXR
     /// <para>Once SDL's clipboard is cut it takes Ctrl+C, Ctrl+X and Ctrl+V, and also the legacy
     /// field's Ctrl+Insert (copy) and Shift+Insert (paste), and goes through the plug-in's clipboard,
     /// never through <c>GUIUtility.systemCopyBuffer</c>. Before the cut, without file drops, on X11 /
-    /// XWayland, on Windows and macOS and in the editor it is exactly an <c>InputField</c>. Clipboard
-    /// text never reaches a log.</para>
+    /// XWayland, on Windows and macOS and in the editor it is exactly an <c>InputField</c> for the
+    /// clipboard. Clipboard text never reaches a log.</para>
+    /// <para>In a native-Wayland Linux player it also gets IME text, which Unity's player loses there
+    /// (#415): as <c>DisplayXRClipboardInputField</c>, with the composition shown inline.</para>
     /// </summary>
     [AddComponentMenu("DisplayXR/DisplayXR Clipboard Input Field (Legacy)")]
     public class DisplayXRClipboardLegacyInputField : InputField
@@ -35,6 +37,14 @@ namespace DisplayXR
         [System.NonSerialized] Coroutine m_Paste;
 
         public override void OnUpdateSelected(BaseEventData eventData)
+        {
+            ImeBeforeKeys();
+            UpdateSelected(eventData);
+            if (!isFocused)
+                ImeRelease(false);
+        }
+
+        void UpdateSelected(BaseEventData eventData)
         {
             if (!DisplayXRTextClipboard.Routes)
             {
@@ -92,8 +102,30 @@ namespace DisplayXR
             eventData.Use();
         }
 
+        public override void OnDeselect(BaseEventData eventData)
+        {
+            ImeRelease(true); // a composition still showing becomes text
+            base.OnDeselect(eventData);
+        }
+
+        // The app lost the keyboard focus: the compositor takes the IME away (the IME's own commit of the
+        // composition does not reach the app then), so the composition still showing becomes text here.
+        void OnApplicationFocus(bool hasFocus)
+        {
+            if (!hasFocus)
+                ImeRelease(true);
+        }
+
+        protected override void LateUpdate()
+        {
+            base.LateUpdate();
+            if (!isFocused)
+                ImeRelease(true);
+        }
+
         protected override void OnDisable()
         {
+            ImeRelease(false);
             if (m_Paste != null)
                 StopCoroutine(m_Paste);
             m_Paste = null;
@@ -131,6 +163,53 @@ namespace DisplayXR
             for (int i = 0; i < count; i++)
                 Append(pasted);
             UpdateLabel();
+        }
+
+        // IME: as in DisplayXRClipboardInputField (DisplayXRTextIme).
+        void ImeBeforeKeys()
+        {
+            if (!isFocused || readOnly)
+                return;
+            if (!DisplayXRTextIme.Owns(this) && !DisplayXRTextIme.Acquire(this))
+                return;
+            bool changed = false;
+            while (DisplayXRTextIme.Next(this, out DisplayXRTextIme.Change change))
+            {
+                changed = true;
+                DisplayXRTextIme.SetComposition(this, "");
+                if (change.DeleteBeforeBytes > 0 || change.DeleteAfterBytes > 0)
+                    ImeDelete(change.DeleteBeforeBytes, change.DeleteAfterBytes);
+                if (!string.IsNullOrEmpty(change.Commit))
+                    Append(change.Commit);
+                DisplayXRTextIme.SetComposition(this, change.Composition);
+            }
+            if (changed)
+                UpdateLabel();
+        }
+
+        void ImeDelete(int beforeBytes, int afterBytes)
+        {
+            int caret = caretPositionInternal;
+            int before = DisplayXRTextIme.CharsForBytes(text, caret, beforeBytes, true);
+            int after = DisplayXRTextIme.CharsForBytes(text, caret, afterBytes, false);
+            if (before + after == 0)
+                return;
+            caretPositionInternal = caret - before;
+            caretSelectPositionInternal = caret + after;
+            KeyPressed(Event.KeyboardEvent("backspace"));
+        }
+
+        void ImeRelease(bool commitComposition)
+        {
+            if (!DisplayXRTextIme.Owns(this))
+                return;
+            string composition = DisplayXRTextIme.Composition;
+            DisplayXRTextIme.SetComposition(this, "");
+            if (commitComposition && composition.Length > 0 && !readOnly)
+                Append(composition);
+            DisplayXRTextIme.Release(this);
+            if (isActiveAndEnabled)
+                UpdateLabel();
         }
 
         Event ProcessingEvent()
