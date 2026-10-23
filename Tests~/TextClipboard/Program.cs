@@ -8,6 +8,9 @@
 // `csc` + the .NET runtime that ships inside the Unity editor. Exit code 0 = all passed.
 
 using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Text.RegularExpressions;
 using DisplayXR;
 using K = DisplayXR.DisplayXRTextClipboardRules.Key;
 
@@ -128,12 +131,103 @@ static class Program
         ExpectCopy("abc", 7, 9, false, "");
     }
 
+    // ---- Runtime/TMP/com.displayxr.unity.tmp.asmdef: which TextMeshPro gets which copy of the event loop ----
+    // DisplayXRClipboardInputField copies TMP_InputField.OnUpdateSelected. After Enter / Escape (EditState.Finish)
+    // TextMeshPro 3.0.x goes on with the frame's other events, and every TextMeshPro from 3.2.0-pre.1 on (the 3.2 / 4.0
+    // pre-releases a 2022.3 project can pick, and the one inside ugui 2.0+ in Unity 6) leaves the loop. The copy
+    // follows DISPLAYXR_TMP_32, so that define must be on for exactly those versions.
+
+    static string FindUp(string rel)
+    {
+        foreach (string start in new[] { Directory.GetCurrentDirectory(), AppContext.BaseDirectory })
+        {
+            for (DirectoryInfo d = new DirectoryInfo(start); d != null; d = d.Parent)
+            {
+                string p = Path.Combine(d.FullName, rel);
+                if (File.Exists(p))
+                    return p;
+            }
+        }
+        return null;
+    }
+
+    // Semantic-version order, as Unity's package manager (pre-release identifiers: numeric ones as numbers).
+    static int CompareVersion(string a, string b)
+    {
+        string[] ap = a.Split(new[] { '-' }, 2), bp = b.Split(new[] { '-' }, 2);
+        string[] ac = ap[0].Split('.'), bc = bp[0].Split('.');
+        for (int i = 0; i < 3; i++)
+        {
+            int c = int.Parse(ac[i]).CompareTo(int.Parse(bc[i]));
+            if (c != 0)
+                return c;
+        }
+        if (ap.Length == 1 || bp.Length == 1)
+            return (ap.Length == 1 ? 1 : 0) - (bp.Length == 1 ? 1 : 0); // a release is newer than its pre-releases
+        string[] ai = ap[1].Split('.'), bi = bp[1].Split('.');
+        for (int i = 0; i < Math.Min(ai.Length, bi.Length); i++)
+        {
+            bool an = int.TryParse(ai[i], out int av), bn = int.TryParse(bi[i], out int bv);
+            int c = an && bn ? av.CompareTo(bv) : an ? -1 : bn ? 1 : string.CompareOrdinal(ai[i], bi[i]);
+            if (c != 0)
+                return c;
+        }
+        return ai.Length.CompareTo(bi.Length);
+    }
+
+    static void ExpectDefines(List<string[]> defs, string ugui, string tmp, bool wantTmp, bool want32)
+    {
+        var on = new HashSet<string>();
+        foreach (string[] d in defs)
+        {
+            string have = d[0] == "com.unity.ugui" ? ugui : d[0] == "com.unity.textmeshpro" ? tmp : null;
+            if (have != null && CompareVersion(have, d[1]) >= 0)
+                on.Add(d[2]);
+        }
+        Check(on.Contains("DISPLAYXR_TMP") == wantTmp && on.Contains("DISPLAYXR_TMP_32") == want32,
+              $"ugui {ugui}, textmeshpro {tmp ?? "-"}: defines [{string.Join(", ", on)}], want DISPLAYXR_TMP={wantTmp}, " +
+              $"DISPLAYXR_TMP_32={want32}");
+    }
+
+    static void TestTmpVersionDefines()
+    {
+        string path = FindUp(Path.Combine("Runtime", "TMP", "com.displayxr.unity.tmp.asmdef"));
+        Check(path != null, "Runtime/TMP/com.displayxr.unity.tmp.asmdef found");
+        if (path == null)
+            return;
+        var defs = new List<string[]>();
+        foreach (Match m in Regex.Matches(File.ReadAllText(path),
+                     "\\{\\s*\"name\":\\s*\"([^\"]+)\",\\s*\"expression\":\\s*\"([^\"]*)\",\\s*\"define\":\\s*\"([^\"]+)\"\\s*\\}"))
+        {
+            // Only the plain "at least this version" form is used (and modelled here).
+            Check(Regex.IsMatch(m.Groups[2].Value, @"^\d+\.\d+\.\d+(-[0-9A-Za-z.]+)?$"),
+                  $"version define {m.Groups[3].Value} for {m.Groups[1].Value}: a plain minimum version");
+            defs.Add(new[] { m.Groups[1].Value, m.Groups[2].Value, m.Groups[3].Value });
+        }
+        Check(defs.Count >= 3, $"{defs.Count} version defines read");
+        Check(CompareVersion("3.2.0-pre.15", "3.2.0-pre.1") > 0 && CompareVersion("3.2.0-pre.1", "3.0.9") > 0 &&
+              CompareVersion("3.2.0", "3.2.0-pre.15") > 0 && CompareVersion("4.0.0-pre.2", "3.2.0") > 0,
+              "semantic-version order");
+        // 2022.3 LTS: ugui 1.0.0 + the TextMeshPro package.
+        ExpectDefines(defs, "1.0.0", "3.0.6", true, false);
+        ExpectDefines(defs, "1.0.0", "3.0.9", true, false);
+        ExpectDefines(defs, "1.0.0", "3.2.0-pre.1", true, true);
+        ExpectDefines(defs, "1.0.0", "3.2.0-pre.15", true, true);
+        ExpectDefines(defs, "1.0.0", "4.0.0-pre.2", true, true);
+        // Unity 6: TextMeshPro inside ugui 2.0+.
+        ExpectDefines(defs, "2.0.0", null, true, true);
+        ExpectDefines(defs, "2.0.0", "3.2.0-pre.15", true, true);
+        // No TextMeshPro at all: the assembly is not compiled.
+        ExpectDefines(defs, "1.0.0", null, false, false);
+    }
+
     static int Main()
     {
         TestConstants();
         TestRoutes();
         TestClassify();
         TestCopyText();
+        TestTmpVersionDefines();
         Console.WriteLine($"{s_pass} passed, {s_fail} failed");
         return s_fail == 0 ? 0 : 1;
     }

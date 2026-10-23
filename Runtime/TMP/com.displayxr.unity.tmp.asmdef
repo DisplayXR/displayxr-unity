@@ -24,12 +24,17 @@
         {
             "name": "com.unity.ugui",
             "expression": "2.0.0",
-            "define": "DISPLAYXR_TMP_IN_UGUI"
+            "define": "DISPLAYXR_TMP_32"
         },
         {
             "name": "com.unity.textmeshpro",
             "expression": "3.0.0",
             "define": "DISPLAYXR_TMP"
+        },
+        {
+            "name": "com.unity.textmeshpro",
+            "expression": "3.2.0-pre.1",
+            "define": "DISPLAYXR_TMP_32"
         }
     ],
     "noEngineReferences": false

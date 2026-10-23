@@ -85,10 +85,10 @@ namespace DisplayXR
                         if (!wasCanceled)
                             SendOnSubmit();
                         DeactivateInputField();
-#if DISPLAYXR_TMP_IN_UGUI
-                        break;
+#if DISPLAYXR_TMP_32
+                        break; // TextMeshPro 3.2 and newer (3.2.0-pre, 4.0.0-pre, the one in ugui 2.0+) drop the rest
 #else
-                        continue; // TextMeshPro 3.x goes on with the frame's other events
+                        continue; // TextMeshPro 3.0.x goes on with the frame's other events
 #endif
                     }
 
