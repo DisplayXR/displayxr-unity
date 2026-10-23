@@ -14,15 +14,15 @@
 extern "C" {
 #endif
 
-//! dxr_sdl_fixups_install(): which fixes are in place. (1u and 2u are kept for the
-//! clipboard and IME fixes.)
-#define DXR_SDLFIX_OUTPUTS 4u //!< SDL's output-list use-after-free on a monitor re-add (upstream 5f682e77c, #410)
-#define DXR_SDLFIX_ALL DXR_SDLFIX_OUTPUTS
+//! dxr_sdl_fixups_install(): which fixes are in place. (2u is kept for the IME fix.)
+#define DXR_SDLFIX_CLIPBOARD 1u //!< SDL's clipboard-source use-after-free after another app copies (SDL #6007, upstream a6179e85c, #412)
+#define DXR_SDLFIX_OUTPUTS 4u   //!< SDL's output-list use-after-free on a monitor re-add (upstream 5f682e77c, #410)
+#define DXR_SDLFIX_ALL (DXR_SDLFIX_CLIPBOARD | DXR_SDLFIX_OUTPUTS)
 
 //! Installs every fix this UnityPlayer.so is known and verified for, once (later
 //! calls return the same). Env DISPLAYXR_SDL_FIXUPS (dxr_sdl_fixups_parse): unset,
 //! 1, on or all = all; 0 or off = none (the kill switch); else a comma-separated
-//! list of fix names (outputs) = only those. DISPLAYXR_SDL_FIXUPS_LOG=1 also logs
+//! list of fix names (clipboard, outputs) = only those. DISPLAYXR_SDL_FIXUPS_LOG=1 also logs
 //! SDL's output list after every monitor removal. Returns the DXR_SDLFIX_* bits
 //! installed; 0 without a UnityPlayer.so (the editor, a test), for an unknown build,
 //! on any mismatch, when the plug-in cannot pin itself, or when off.
@@ -42,6 +42,7 @@ struct dxr_sdl_sig {
 };
 
 #define DXR_SDL_OUTPUTS_SIGS 4
+#define DXR_SDL_CLIPBOARD_SIGS 6
 
 struct dxr_sdl_build {
 	const char *build_id; //!< hex GNU build-id of UnityPlayer.so
@@ -60,6 +61,15 @@ struct dxr_sdl_build {
 	unsigned off_output_next;        //!< SDL_WaylandOutputData -> next
 	//! The code that reads every address and offset above (see the build table).
 	struct dxr_sdl_sig outputs_sigs[DXR_SDL_OUTPUTS_SIGS];
+	// clipboard
+	uintptr_t data_source_listener;  //!< static const struct wl_data_source_listener (6 entries)
+	uintptr_t data_source_cancelled; //!< its [2]: data_source_handle_cancelled (a jmp to Wayland_data_source_destroy)
+	unsigned off_driverdata;         //!< SDL_VideoDevice -> driverdata (SDL_VideoData *)
+	unsigned off_input;              //!< SDL_VideoData -> input (SDL_WaylandInput *)
+	unsigned off_data_device;        //!< SDL_WaylandInput -> data_device (SDL_WaylandDataDevice *)
+	unsigned off_selection_source;   //!< SDL_WaylandDataDevice -> selection_source (SDL_WaylandDataSource *)
+	//! The code that reads every clipboard address and offset above, _this included (see the build table).
+	struct dxr_sdl_sig clipboard_sigs[DXR_SDL_CLIPBOARD_SIGS];
 };
 
 //! The build table's entry for a GNU build-id (lower-case hex), or NULL.
@@ -76,6 +86,19 @@ dxr_sdl_output_unlink(void **head, void *target, unsigned off_next)
 	if (!*pp)
 		return 0;
 	*pp = *(void **)((char *)target + off_next);
+	return 1;
+}
+
+//! Before SDL frees a cancelled clipboard source: if the data device still holds it as
+//! its selection_source (at byte @p off_selection_source of @p data_device), clear it,
+//! as upstream SDL a6179e85c does in Wayland_data_source_destroy. 1 if it was cleared.
+static inline int
+dxr_sdl_clipboard_forget(void *data_device, void *source, unsigned off_selection_source)
+{
+	void **sel = data_device ? (void **)((char *)data_device + off_selection_source) : 0;
+	if (!sel || !source || *sel != source)
+		return 0;
+	*sel = 0;
 	return 1;
 }
 

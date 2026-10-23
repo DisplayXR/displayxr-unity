@@ -37,32 +37,51 @@ never unloaded while SDL can call into it, even if the engine closes the handle 
 
 | Fix | Symptom | Upstream | Issue |
 |---|---|---|---|
+| `clipboard` | A stock text field's Ctrl+C (a `GUIUtility.systemCopyBuffer` write) crashes the player after the app copied, another app copied, and the app pasted; with file drops on, a read (Ctrl+V) can crash too. SIGSEGV in `wl_proxy_marshal` from `UnityPlayer.so+0x26de032`. | SDL `a6179e85c` (2.24.0, SDL #6007) | #412 |
 | `outputs` | A monitor removed and added again (GNOME Settings off then Revert, a cable blink, a dock re-enumerating) crashes the player: SIGSEGV at `UnityPlayer.so` vaddr `0x26d98c2`. | SDL `5f682e77c` (2.24.0) | #410 |
+
+`clipboard`: when another client takes the clipboard, SDL gets `wl_data_source.cancelled` and frees
+its source (`data_source_handle_cancelled` → `Wayland_data_source_destroy`) but leaves
+`SDL_WaylandDataDevice::selection_source` pointing at it. The next `systemCopyBuffer` write destroys
+that freed source again (a `wl_proxy_marshal` on freed memory — the crash); a read with no selection
+offer walks its freed MIME list. The wrapper of SDL's `wl_data_source` `cancelled` clears
+`selection_source` when it is the source being freed (the upstream code), then calls SDL's handler.
+Its signatures include `SDL_SetClipboardText`'s read of SDL's `_this`, so it checks `_this` itself when
+it is the only fix on. After the fix, stock fields and `GUIUtility.systemCopyBuffer` work on native
+Wayland as they do on a desktop. With file drops on, after SDL's data device is cut (#398), a stock
+field's paste still reads `""` or an older text — SDL has no clipboard offers then — so the DisplayXR
+input fields (#394) are still the way to paste in that state. Unity's SDL snapshot has a second,
+harmless clipboard bug: on a drag leaving the window `data_device_handle_leave` clears the selection
+offer instead of the drag offer (fixed upstream only in SDL 2.30); with the use-after-free fixed it
+can at most make a paste read `""` until the next selection change.
 
 `outputs`: SDL frees a removed `wl_output`'s `SDL_WaylandOutputData` but leaves it linked in
 `SDL_VideoData::output_list`, so the next `wl_output` that appears makes `Wayland_add_display` walk
 into freed memory. The wrapper of SDL's `wl_registry` `global_remove` unlinks the node first (the
 upstream code), then calls SDL's handler, which deletes the display and frees the data as before.
-A plain Unity player without DisplayXR has the same crash; the plug-in can only fix its own players.
+
+A plain Unity player without DisplayXR has these crashes too; the plug-in can only fix its own players.
 
 ## Log lines (stderr, the player log)
 
 ```
-[DisplayXR-SDLFIX] Unity 6000.4.6f1 Linux x86_64 player (build-id 4ae6b3f4..., base 0x...): monitor re-add fixed
+[DisplayXR-SDLFIX] Unity 6000.4.6f1 Linux x86_64 player (build-id 4ae6b3f4..., base 0x...): clipboard fixed, monitor re-add fixed
+[DisplayXR-SDLFIX] another app took the clipboard: cleared SDL's selection source before SDL frees it
 [DisplayXR-SDLFIX] monitor removed (wl_output global 50): unlinked SDL's output data before SDL frees it
 ```
 
-A refusal says why (`monitor re-add fix NOT installed: SDL's code differs from the known build's`,
-then `... monitor re-add NOT fixed`; or `UnityPlayer.so build-id ... is not a known build: nothing
-installed`).
+A refusal says why, per fix (`clipboard fix NOT installed: SDL's code differs from the known build's`,
+`monitor re-add fix NOT installed: SDL's wl_registry listener is not as expected`, ...), then the
+summary (`... clipboard NOT fixed, monitor re-add fixed`); or `UnityPlayer.so build-id ... is not a known
+build: nothing installed`.
 
 ## Switches
 
 - `DISPLAYXR_SDL_FIXUPS=0` (or `off`): the kill switch, nothing installed; the player behaves as Unity
   ships it.
 - Unset, empty, `1`, `on` or `all`: every fix.
-- `DISPLAYXR_SDL_FIXUPS=outputs`: a comma-separated list of exact fix names (blanks around a name are
-  ignored), only those. A name the plug-in does not know is logged once and ignored.
+- `DISPLAYXR_SDL_FIXUPS=clipboard,outputs`: a comma-separated list of exact fix names (blanks around a
+  name are ignored), only those. A name the plug-in does not know is logged once and ignored.
 - `DISPLAYXR_SDL_FIXUPS_LOG=1`: also log SDL's output list after every monitor removal.
 
 ## Adding a Unity build or a fix

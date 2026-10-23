@@ -41,6 +41,17 @@
 //   at vaddr 0x26d98c2, `mov 0xe8(%rax),%rax` (node->next of the freed node).
 //   Upstream SDL 5f682e77c (2.24.0) unlinks the node first; the wrapper of SDL's
 //   wl_registry global_remove does exactly that, then lets SDL free it.
+// - clipboard (DXR_SDLFIX_CLIPBOARD, #412; SDL #6007): another app copies after a
+//   GUIUtility.systemCopyBuffer write, and the next write crashes the player (a read
+//   can too). wl_data_source.cancelled makes SDL destroy and free its source
+//   (data_source_handle_cancelled -> Wayland_data_source_destroy) while
+//   SDL_WaylandDataDevice::selection_source still points to it; the next
+//   Wayland_data_device_set_selection destroys the freed source again
+//   (wl_proxy_marshal on freed memory: SIGSEGV at vaddr 0x26df02c, Unity's
+//   "UnityPlayer.so+0x26de032"), and Wayland_GetClipboardText with no offer text
+//   walks its freed MIME list (Unity's "+0x26de152"). Upstream SDL a6179e85c (2.24.0)
+//   clears selection_source when it frees that source; the wrapper of SDL's
+//   wl_data_source cancelled does exactly that, then lets SDL destroy and free it.
 //
 // Adding a fix: its fields and code signatures in struct dxr_sdl_build (one table
 // entry per UnityPlayer.so), a DXR_SDLFIX_* bit (and DXR_SDLFIX_ALL) and its name in
@@ -104,6 +115,47 @@ static const unsigned char k_6046_walk[] = {
     0x48, 0x8b, 0x80, 0xe8, 0x00, 0x00, 0x00,       // mov 0xe8(%rax),%rax
     0x48, 0x85, 0xc0, 0x75, 0xf1};                  // test; jne
 
+//! data_source_handle_cancelled: `jmp Wayland_data_source_destroy` (0x26dd1e6).
+static const unsigned char k_6046_cancelled[] = {0xe9, 0x19, 0x25, 0x00, 0x00};
+//! Wayland_data_source_destroy: wl_data_source.destroy (wl_proxy_marshal opcode 1),
+//! wl_proxy_destroy, the MIME list's free, SDL_free(source).
+static const unsigned char k_6046_source_destroy[] = {
+    0x48, 0x85, 0xff, 0x74, 0x43,                   // test %rdi; je
+    0x41, 0x56, 0x53, 0x50, 0x48, 0x89, 0xfb,       // push r14, rbx, rax; mov %rdi,%rbx
+    0x4c, 0x8b, 0x37, 0x4c, 0x89, 0xf7,             // mov (%rdi),%r14; mov %r14,%rdi
+    0xbe, 0x01, 0x00, 0x00, 0x00, 0x31, 0xc0,       // mov $1,%esi; xor %eax,%eax
+    0xff, 0x15, 0x5b, 0x6d, 0x24, 0x00,             // call *wl_proxy_marshal
+    0x4c, 0x89, 0xf7, 0xff, 0x15, 0x8a, 0x6c, 0x24, // mov %r14,%rdi; call *wl_proxy_destroy
+    0x00, 0x48, 0x8d, 0x7b, 0x08,                   // lea 0x8(%rbx),%rdi (the MIME list)
+    0xe8, 0x18, 0x00, 0x00, 0x00,                   // call mime_data_list_free
+    0x48, 0x89, 0xdf, 0xff, 0x15, 0xc8, 0xa4, 0x10, 0x00}; // mov %rbx,%rdi; call *SDL_free
+//! Wayland_GetClipboardText (_this in %rdi): ->driverdata (+0x5c8), ->input (+0xc8),
+//! ->data_device (+0x28).
+static const unsigned char k_6046_get_device[] = {
+    0x48, 0x8b, 0x87, 0xc8, 0x05, 0x00, 0x00, 0x48, 0x85, 0xc0, 0x74, 0x4a, // mov 0x5c8(%rdi),%rax; test; je
+    0x48, 0x8b, 0x80, 0xc8, 0x00, 0x00, 0x00, 0x48, 0x85, 0xc0, 0x74, 0x4c, // mov 0xc8(%rax),%rax; test; je
+    0x48, 0x8b, 0x58, 0x28};                                                // mov 0x28(%rax),%rbx
+//! ... its fallback to the device's ->selection_source (+0x30) when no offer gave text.
+static const unsigned char k_6046_get_source[] = {0x4c, 0x8b, 0x63, 0x30, 0x4d, 0x85, 0xe4, 0x74, 0x65};
+//! Wayland_data_device_set_selection: the old ->selection_source (+0x30) destroyed as
+//! Wayland_data_source_destroy does (the crash: its wl_proxy_marshal on a freed source).
+static const unsigned char k_6046_set_old[] = {
+    0x4c, 0x8b, 0x7d, 0x30, 0x4d, 0x85, 0xff, 0x74, 0x35, // mov 0x30(%rbp),%r15; test; je
+    0x4d, 0x8b, 0x27, 0x4c, 0x89, 0xe7,                   // mov (%r15),%r12; mov %r12,%rdi
+    0xbe, 0x01, 0x00, 0x00, 0x00, 0x31, 0xc0,             // mov $1,%esi; xor %eax,%eax
+    0xff, 0x15, 0x2e, 0x4f, 0x24, 0x00,                   // call *wl_proxy_marshal (0x26df02c)
+    0x4c, 0x89, 0xe7, 0xff, 0x15, 0x5d, 0x4e, 0x24, 0x00, // mov %r12,%rdi; call *wl_proxy_destroy
+    0x49, 0x8d, 0x7f, 0x08, 0xe8, 0xeb, 0xe1, 0xff, 0xff, // lea 0x8(%r15),%rdi; call mime_data_list_free
+    0x4c, 0x89, 0xff, 0xff, 0x15, 0x9b, 0x86, 0x10, 0x00}; // mov %r15,%rdi; call *SDL_free
+//! SDL_SetClipboardText (inlined into Unity's systemCopyBuffer setter): _this
+//! (rip-relative, = video_device) and its SetClipboardText(_this, text) (+0x288).
+static const unsigned char k_6046_set_text[] = {
+    0x4c, 0x8b, 0x35, 0x23, 0xed, 0x0d, 0x01, 0x4d, 0x85, 0xf6, 0x74, 0x41, // mov _this(%rip),%r14; test; je
+    0x80, 0x7c, 0x24, 0x1f, 0x40, 0x72, 0x04, 0x48, 0x8b, 0x1c, 0x24,       // (the text's std::string)
+    0x48, 0x85, 0xdb, 0x4c, 0x8d, 0x3d, 0x61, 0x36, 0xbf, 0xfe, 0x4c, 0x0f, 0x45, 0xfb,
+    0x49, 0x8b, 0x86, 0x88, 0x02, 0x00, 0x00, 0x48, 0x85, 0xc0, 0x74, 0x3a, // mov 0x288(%r14),%rax; test; je
+    0x4c, 0x89, 0xf7, 0x4c, 0x89, 0xfe, 0xff, 0xd0};                        // mov %r14,%rdi; mov %r15,%rsi; call *%rax
+
 static const struct dxr_sdl_build k_builds[] = {
     {
         .build_id = "4ae6b3f45943aa2cf6ca0d0ac4fdec503e60e55c",
@@ -123,6 +175,18 @@ static const struct dxr_sdl_build k_builds[] = {
                          {0x26d9dbe, k_6046_free, sizeof(k_6046_free)},
                          {0x26d0340, k_6046_getdisplay, sizeof(k_6046_getdisplay)},
                          {0x26d98af, k_6046_walk, sizeof(k_6046_walk)}},
+        .data_source_listener = 0x27c5180,
+        .data_source_cancelled = 0x26dacc8,
+        .off_driverdata = 0x5c8,
+        .off_input = 0xc8,
+        .off_data_device = 0x28,
+        .off_selection_source = 0x30,
+        .clipboard_sigs = {{0x26dacc8, k_6046_cancelled, sizeof(k_6046_cancelled)},
+                           {0x26dd1e6, k_6046_source_destroy, sizeof(k_6046_source_destroy)},
+                           {0x26df0a0, k_6046_get_device, sizeof(k_6046_get_device)},
+                           {0x26df11e, k_6046_get_source, sizeof(k_6046_get_source)},
+                           {0x26df016, k_6046_set_old, sizeof(k_6046_set_old)},
+                           {0x1844b06, k_6046_set_text, sizeof(k_6046_set_text)}},
     },
 };
 
@@ -221,12 +285,18 @@ swap_entries(uintptr_t table, int first, int n, const uintptr_t *expect, const f
 	return SWAP_OK;
 }
 
+//! Why a swap of SDL's @p table (e.g. "wl_registry listener") was refused. Called
+//! during the one install (pthread_once), so one static buffer is enough.
 static const char *
-swap_why(int r)
+swap_why(int r, const char *table)
 {
-	return r == SWAP_PROT_UNKNOWN ? "the protection of SDL's wl_registry listener's page could not be read"
-	       : r == SWAP_MPROTECT   ? "SDL's wl_registry listener's page could not be made writable"
-	                              : "SDL's wl_registry listener is not as expected";
+	static char why[160];
+	snprintf(why, sizeof(why),
+	         r == SWAP_PROT_UNKNOWN ? "the protection of SDL's %s's page could not be read"
+	         : r == SWAP_MPROTECT   ? "SDL's %s's page could not be made writable"
+	                                : "SDL's %s is not as expected",
+	         table);
+	return why;
 }
 
 /*
@@ -302,7 +372,7 @@ install_outputs(void)
 	const fnptr wrap[1] = {(fnptr)fix_registry_remove};
 	int r = swap_entries(b->registry_listener, 1, 1, expect, wrap);
 	if (r != SWAP_OK) {
-		logf_("monitor re-add fix NOT installed: %s", swap_why(r));
+		logf_("monitor re-add fix NOT installed: %s", swap_why(r, "wl_registry listener"));
 		return 0;
 	}
 	return 1;
@@ -351,11 +421,61 @@ find_unityplayer(struct dl_phdr_info *info, size_t size, void *arg)
 	return 1;
 }
 
+/*
+ * Clipboard: the cancelled-source use-after-free (SDL #6007).
+ */
+
+typedef void (*source_cancelled_fn)(void *data, void *source);
+static source_cancelled_fn s_orig_source_cancelled;
+
+//! SDL's data device (SDL_WaylandDataDevice), as Wayland_GetClipboardText finds it.
+static void *
+sdl_data_device(void)
+{
+	char *dev = *(char **)(s_base + s_b->video_device);
+	char *video_data = dev ? AT(dev, s_b->off_driverdata, char *) : NULL;
+	char *input = video_data ? AT(video_data, s_b->off_input, char *) : NULL;
+	return input ? AT(input, s_b->off_data_device, void *) : NULL;
+}
+
+//! wl_data_source.cancelled for SDL (its data: the SDL_WaylandDataSource).
+static void
+fix_source_cancelled(void *data, void *source)
+{
+	if (dxr_sdl_clipboard_forget(sdl_data_device(), data, s_b->off_selection_source))
+		logf_("another app took the clipboard: cleared SDL's selection source before SDL frees it");
+	s_orig_source_cancelled(data, source); // SDL: destroy the wl_data_source, free the source
+}
+
+static int
+install_clipboard(void)
+{
+	const struct dxr_sdl_build *b = s_b;
+	if (!in_relro(b->data_source_listener, 0, 6)) {
+		logf_("clipboard fix NOT installed: SDL's wl_data_source listener is not in UnityPlayer.so's RELRO");
+		return 0;
+	}
+	if (!sigs_ok(b->clipboard_sigs, DXR_SDL_CLIPBOARD_SIGS)) {
+		logf_("clipboard fix NOT installed: SDL's code differs from the known build's");
+		return 0;
+	}
+	s_orig_source_cancelled = (source_cancelled_fn)(s_base + b->data_source_cancelled);
+	const uintptr_t expect[1] = {b->data_source_cancelled};
+	const fnptr wrap[1] = {(fnptr)fix_source_cancelled};
+	int r = swap_entries(b->data_source_listener, 2, 1, expect, wrap);
+	if (r != SWAP_OK) {
+		logf_("clipboard fix NOT installed: %s", swap_why(r, "wl_data_source listener"));
+		return 0;
+	}
+	return 1;
+}
+
 //! The fixes by name (DISPLAYXR_SDL_FIXUPS).
 static const struct {
 	const char *name;
 	unsigned bit;
 } k_fix_names[] = {
+    {"clipboard", DXR_SDLFIX_CLIPBOARD},
     {"outputs", DXR_SDLFIX_OUTPUTS},
 };
 
@@ -464,10 +584,13 @@ install_with(const struct dxr_sdl_build *b, uintptr_t base)
 	s_b = b;
 	s_base = base;
 	unsigned got = 0;
-	// DXR_SDLFIX_CLIPBOARD, DXR_SDLFIX_IME: their install_*() go here.
+	if ((want & DXR_SDLFIX_CLIPBOARD) && install_clipboard())
+		got |= DXR_SDLFIX_CLIPBOARD;
+	// DXR_SDLFIX_IME: its install_*() goes here.
 	if ((want & DXR_SDLFIX_OUTPUTS) && install_outputs())
 		got |= DXR_SDLFIX_OUTPUTS;
-	logf_("%s (build-id %.8s..., base %p): monitor re-add %s", b->what, b->build_id, (void *)base,
+	logf_("%s (build-id %.8s..., base %p): clipboard %s, monitor re-add %s", b->what, b->build_id, (void *)base,
+	      (got & DXR_SDLFIX_CLIPBOARD) ? "fixed" : (want & DXR_SDLFIX_CLIPBOARD) ? "NOT fixed" : "off",
 	      (got & DXR_SDLFIX_OUTPUTS) ? "fixed" : (want & DXR_SDLFIX_OUTPUTS) ? "NOT fixed" : "off");
 	return got;
 }
