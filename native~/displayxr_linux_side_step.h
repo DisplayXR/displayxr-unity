@@ -167,6 +167,7 @@ typedef struct DxrSsInput {
 	int own_valid;   //!< the app's window is listed
 	DxrSsRect own;   //!< its frame
 	DxrSsRect mon;   //!< its monitor (w = 0: not reported)
+	DxrSsRect work;  //!< that monitor's work area (extension v19; w = 0: not reported)
 	int own_minimized, own_maximized, own_fullscreen;
 	int own_moving;  //!< a move/resize grab, or the plug-in's own pointer drag
 	int focus_valid; //!< another app's window that counts has the focus ...
@@ -404,25 +405,48 @@ dxr_ss_clampi(int v, int lo, int hi)
 	return v < lo ? lo : v > hi ? hi : v;
 }
 
+//! The part of the monitor `mon` a window may be put in: its work area `work` (what
+//! the top bar and a dock that stays visible leave to windows; extension v19) cut to
+//! the monitor. The whole monitor when the work area is not reported, empty or off
+//! the monitor (an older extension: as before).
+static inline DxrSsRect
+dxr_ss_usable_area(DxrSsRect mon, DxrSsRect work)
+{
+	if (mon.w <= 0 || mon.h <= 0 || work.w <= 0 || work.h <= 0)
+		return mon;
+	long long l = mon.x > work.x ? mon.x : work.x, t = mon.y > work.y ? mon.y : work.y;
+	long long mr = (long long)mon.x + mon.w, wr = (long long)work.x + work.w;
+	long long mb = (long long)mon.y + mon.h, wb = (long long)work.y + work.h;
+	long long r = mr < wr ? mr : wr, bt = mb < wb ? mb : wb;
+	if (r <= l || bt <= t)
+		return mon;
+	DxrSsRect a = {(int)l, (int)t, (int)(r - l), (int)(bt - t)};
+	return a;
+}
+
 #define DXR_SS_N_SPOTS 8
 
 //! Where to step to: beside the covering window `k` (left, right, above, below) or
-//! in a corner of the monitor `mon`, the content `margin` px from either; the whole
-//! window stays on the monitor (a window whose centre crosses to another monitor
-//! would change scale, and the plug-in's own placement check would move it back).
-//! Least covered first; then the preferred side (DXR_SS_SIDE_*); then the shortest
-//! move. A place within DXR_SS_LANDED_PX of where the window is does not count.
-//! Returns 1 and the window's new top-left in (*x, *y), with the share covered
-//! there in *cov; 0 when there is no other place.
+//! in a corner of the monitor `mon`'s work area `work` (dxr_ss_usable_area), the
+//! content `margin` px from either. The whole window stays in the work area, so
+//! never under the top bar or a dock that stays visible, and on the monitor in any
+//! case (a window whose centre crosses to another monitor would change scale, and
+//! the plug-in's own placement check would move it back; a window too big for the
+//! work area reaches past it, never past the monitor). Least covered first; then
+//! the preferred side (DXR_SS_SIDE_*); then the shortest move. A place within
+//! DXR_SS_LANDED_PX of where the window is does not count. Returns 1 and the
+//! window's new top-left in (*x, *y), with the share covered there in *cov; 0 when
+//! there is no other place.
 static inline int
-dxr_ss_find_spot(const DxrSsBody *b, DxrSsRect win, DxrSsRect k, DxrSsRect mon, int margin, int side, int *x,
-                 int *y, float *cov)
+dxr_ss_find_spot(const DxrSsBody *b, DxrSsRect win, DxrSsRect k, DxrSsRect mon, DxrSsRect work, int margin,
+                 int side, int *x, int *y, float *cov)
 {
 	DxrSsRect bb;
 	if (!dxr_ss_body_bbox(b, win.w, win.h, &bb))
 		return 0;
 	if (mon.w <= 0 || mon.h <= 0)
-		mon = win; // no monitor reported: nowhere to go but where it is
+		mon = work = win; // no monitor reported: nowhere to go but where it is
+	DxrSsRect a = dxr_ss_usable_area(mon, work);
 	int m = margin;
 	// The body's top-left (stage) for each candidate, then the window's.
 	int bx = win.x + bb.x, by = win.y + bb.y;
@@ -433,17 +457,20 @@ dxr_ss_find_spot(const DxrSsBody *b, DxrSsRect win, DxrSsRect k, DxrSsRect mon, 
 	    {k.x + k.w + m, by, DXR_SS_SIDE_RIGHT, -1},
 	    {bx, k.y - m - bb.h, DXR_SS_SIDE_ABOVE, -1},
 	    {bx, k.y + k.h + m, DXR_SS_SIDE_BELOW, -1},
-	    {mon.x + m, mon.y + m, DXR_SS_SIDE_LEFT, DXR_SS_SIDE_ABOVE},
-	    {mon.x + mon.w - m - bb.w, mon.y + m, DXR_SS_SIDE_RIGHT, DXR_SS_SIDE_ABOVE},
-	    {mon.x + m, mon.y + mon.h - m - bb.h, DXR_SS_SIDE_LEFT, DXR_SS_SIDE_BELOW},
-	    {mon.x + mon.w - m - bb.w, mon.y + mon.h - m - bb.h, DXR_SS_SIDE_RIGHT, DXR_SS_SIDE_BELOW},
+	    {a.x + m, a.y + m, DXR_SS_SIDE_LEFT, DXR_SS_SIDE_ABOVE},
+	    {a.x + a.w - m - bb.w, a.y + m, DXR_SS_SIDE_RIGHT, DXR_SS_SIDE_ABOVE},
+	    {a.x + m, a.y + a.h - m - bb.h, DXR_SS_SIDE_LEFT, DXR_SS_SIDE_BELOW},
+	    {a.x + a.w - m - bb.w, a.y + a.h - m - bb.h, DXR_SS_SIDE_RIGHT, DXR_SS_SIDE_BELOW},
 	};
 	int found = 0, best_x = 0, best_y = 0, best_pref = 0;
 	float best_cov = 0.0f;
 	double best_dist = 0.0;
 	for (int i = 0; i < DXR_SS_N_SPOTS; i++) {
-		int wx = dxr_ss_clampi(c[i].x - bb.x, mon.x, mon.x + mon.w - win.w);
-		int wy = dxr_ss_clampi(c[i].y - bb.y, mon.y, mon.y + mon.h - win.h);
+		int wx = dxr_ss_clampi(c[i].x - bb.x, a.x, a.x + a.w - win.w);
+		int wy = dxr_ss_clampi(c[i].y - bb.y, a.y, a.y + a.h - win.h);
+		// Too big for the work area: as far into it as fits, still on the monitor.
+		wx = dxr_ss_clampi(wx, mon.x, mon.x + mon.w - win.w);
+		wy = dxr_ss_clampi(wy, mon.y, mon.y + mon.h - win.h);
 		if (abs(wx - win.x) <= DXR_SS_LANDED_PX && abs(wy - win.y) <= DXR_SS_LANDED_PX)
 			continue;
 		DxrSsRect at = {wx, wy, win.w, win.h};
@@ -564,6 +591,7 @@ dxr_ss_parse_windows(const char *json, int own_pid, uint64_t tracked_id, DxrSsIn
 	in->focus_id = 0;
 	memset(&in->own, 0, sizeof(in->own));
 	memset(&in->mon, 0, sizeof(in->mon));
+	memset(&in->work, 0, sizeof(in->work));
 	memset(&in->focus, 0, sizeof(in->focus));
 	memset(&in->tracked, 0, sizeof(in->tracked));
 	if (!json)
@@ -600,6 +628,7 @@ dxr_ss_parse_windows(const char *json, int own_pid, uint64_t tracked_id, DxrSsIn
 				in->own_fullscreen = dxr_json_bool(dxr_json_field(q, o, "fullscreen"), o, 0);
 				in->own_moving = dxr_json_bool(dxr_json_field(q, o, "moving"), o, 0);
 				memset(&in->mon, 0, sizeof(in->mon));
+				memset(&in->work, 0, sizeof(in->work));
 				const char *m = dxr_json_field(q, o, "monitor");
 				const char *m_end = m && *m == '{' ? dxr_json_skip(m, o) : NULL;
 				if (m_end) {
@@ -607,6 +636,8 @@ dxr_ss_parse_windows(const char *json, int own_pid, uint64_t tracked_id, DxrSsIn
 					in->mon.y = (int)lround(dxr_json_number(dxr_json_field(m, m_end, "y"), m_end, 0.0));
 					in->mon.w = (int)lround(dxr_json_number(dxr_json_field(m, m_end, "w"), m_end, 0.0));
 					in->mon.h = (int)lround(dxr_json_number(dxr_json_field(m, m_end, "h"), m_end, 0.0));
+					// Extension v19+; absent before: the whole monitor.
+					in->work = dxr_ss_json_rect4(dxr_json_field(m, m_end, "work_area"), m_end);
 				}
 			}
 		} else if (!minimized && frame.w > 0 && frame.h > 0 && dxr_ss_type_counts(type)) {
@@ -835,7 +866,7 @@ dxr_ss_step(DxrSsState *st, const DxrSsSettings *s, const DxrSsInput *in, DxrSsD
 		int x = 0, y = 0;
 		float spot = 1.0f;
 		float need = s->trigger < covered * 0.5f ? s->trigger : covered * 0.5f;
-		if (dxr_ss_find_spot(in->body, own, in->focus, in->mon, s->margin, s->side, &x, &y, &spot) &&
+		if (dxr_ss_find_spot(in->body, own, in->focus, in->mon, in->work, s->margin, s->side, &x, &y, &spot) &&
 		    spot < need) {
 			d->covered = covered;
 			d->spot_covered = spot;

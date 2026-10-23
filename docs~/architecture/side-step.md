@@ -35,7 +35,7 @@ It turns side-step on while the component is enabled and exposes the settings.
 | `ReturnDelay` | 2 s | Home free this long before it goes back |
 | `GlideSeconds` | 0.3 s | A move glides (ease-out); 0 jumps |
 | `PreferredSide` | `Auto` | Among equally free places: `Left`, `Right`, `Above`, `Below`, or the shortest move |
-| `Margin` | 24 px | Desktop px between the app's content and the other window or the monitor's edge |
+| `Margin` | 24 px | Desktop px between the app's content and the other window or the edge of the monitor's work area |
 
 What the app reads, all about its own window: `State` (`Off`, `Unsupported`, `Waiting`,
 `Paused`, `Home`, `Moving`, `Aside`), `Reason` (why: `NotGranted`, `NoSession`, `NoExtension`,
@@ -80,12 +80,16 @@ if (!(DisplayXRSideStep.IsAside && DisplayXRSideStep.TryGetHomePosition(out pos)
 
 - **Covered**: the focused window of another app covers at least `Trigger` of the app's content
   for `Dwell`. Only the focused window triggers it: that is the window the user is working in.
-- **Where to**: beside that window (left, right, above, below) or in a corner of the monitor,
-  `Margin` from both; least covered first, then `PreferredSide`, then the shortest move. The
-  whole window stays on its monitor (a window whose centre crosses onto another monitor changes
-  scale, and the plug-in's own placement check would move it back). A place counts only if it is
-  covered less than `Trigger` and less than half of the share covered now; otherwise it stays
-  (`NoFreeSpot`).
+- **Where to**: beside that window (left, right, above, below) or in a corner of the monitor's
+  work area, `Margin` from both; least covered first, then `PreferredSide`, then the shortest
+  move. The whole window stays in the work area: the part of the monitor that GNOME's top bar
+  and a dock that stays visible (Ubuntu's, by default) leave to windows, so no place puts it
+  under either. It stays on its monitor in any case (a window whose centre crosses onto another
+  monitor changes scale, and the plug-in's own placement check would move it back); a window
+  too big for the work area goes as far into it as fits. A place counts only if it is covered
+  less than `Trigger` and less than half of the share covered now; otherwise it stays
+  (`NoFreeSpot`). The work area comes from the GNOME extension (`monitor.work_area`, version
+  19+); with an older extension it is the whole monitor, as before.
 - **Back home**: once home is free (covered less than half of `Trigger`) of the focused window
   AND of the window it stepped aside for, for `ReturnDelay`. Clicking the avatar moves the focus
   away from the document, but the document still covers home, so the avatar stays aside.
@@ -192,7 +196,7 @@ While the grant holds, the plug-in reads, inside its native code, 4 times a seco
 |---|---|---|
 | Every listed window's frame, focus flag, minimized flag, window type, process id, mutter id | The DisplayXR GNOME extension's read-only `GetAllWindows` | Which window is focused, how much of the app's content it covers, where is free, whether the window it stepped aside for is still there |
 | Each window's app id | The same reply | Only to recognise the desktop-icons window; not kept |
-| The app's own window: frame, monitor, move grab, minimized / maximized / fullscreen | The same reply | Home, landing, holding still |
+| The app's own window: frame, monitor (and its work area, extension v19+), move grab, minimized / maximized / fullscreen | The same reply | Home, landing, holding still, where it may go |
 | Whether the screen is locked | `org.gnome.ScreenSaver.GetActive` | Holding still |
 
 No titles are read: the parser never looks at them, and extension version 18 does not send them
@@ -236,7 +240,8 @@ fights the compositor over one.
   focus does not hold it aside any more, as it would without the lock.
 - Native Wayland on GNOME only. An X11 (XWayland) player reports `Unsupported` /
   `NotNativeWayland`.
-- The monitor rect is the whole monitor, not its work area: a corner place can end up under
-  GNOME's top bar.
+- With a GNOME extension older than version 19 there is no work area, so the whole monitor
+  counts: a corner place can end up under GNOME's top bar or a dock that stays visible. Update
+  the extension (the DisplayXR runtime package ships it; a new version loads at the next login).
 - Windows on other workspaces are not told apart (the extension does not report the workspace);
   only the focused window triggers a step aside, and that one is always on the current workspace.

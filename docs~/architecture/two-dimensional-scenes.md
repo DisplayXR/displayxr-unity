@@ -124,7 +124,9 @@ Do **not** reach for a `Screen Space - Camera` canvas here. While a session is r
 Unity's XR writes `Camera.fieldOfView` each frame from the runtime's projection, and such a
 canvas sizes itself from that value — so it renders too large and rescales as the viewer's
 head moves. `DisplayXRWindowSpaceUI` sidesteps this completely: it is a composition layer at
-a fixed window rect, not something projected through the camera.
+a fixed window rect, not something projected through the camera. A `Screen Space - Overlay`
+canvas is no way out either: it is not drawn per eye (see
+[`window-space-ui.md`](window-space-ui.md)).
 
 ### Reading (and changing) the FOV you authored
 
