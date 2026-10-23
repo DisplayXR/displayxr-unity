@@ -152,25 +152,11 @@ namespace DisplayXR
                 s_Composition = composition ?? "";
         }
 
-        /// <summary>How many UTF-16 chars the protocol's UTF-8 byte count covers, walking from
-        /// <paramref name="caret"/> in <paramref name="text"/> backwards (<paramref name="before"/>)
-        /// or forwards.</summary>
-        public static int CharsForBytes(string text, int caret, int bytes, bool before)
-        {
-            int chars = 0, done = 0, i = Mathf.Clamp(caret, 0, text.Length);
-            while (done < bytes && (before ? i > 0 : i < text.Length))
-            {
-                int len = 1;
-                if (before && i >= 2 && char.IsLowSurrogate(text[i - 1]) && char.IsHighSurrogate(text[i - 2]))
-                    len = 2;
-                else if (!before && i + 1 < text.Length && char.IsHighSurrogate(text[i]) && char.IsLowSurrogate(text[i + 1]))
-                    len = 2;
-                done += Encoding.UTF8.GetByteCount(text.Substring(before ? i - len : i, len));
-                i += before ? -len : len;
-                chars += len;
-            }
-            return chars;
-        }
+        /// <summary>How many UTF-16 chars the protocol's UTF-8 byte count covers, from
+        /// <paramref name="caret"/> backwards (<paramref name="before"/>) or forwards
+        /// (<see cref="DisplayXRTextClipboardRules.ImeCharsForBytes"/>, unit-tested).</summary>
+        public static int CharsForBytes(string text, int caret, int bytes, bool before) =>
+            DisplayXRTextClipboardRules.ImeCharsForBytes(text, caret, bytes, before);
 
         // The fields read the composition through the input module's BaseInput (their own IME
         // display code); this one answers with ours while a field owns the IME.
