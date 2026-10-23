@@ -877,9 +877,17 @@ namespace DisplayXR
 
         /// <summary>The field gives the IME back and its composition is reset;
         /// <paramref name="dropEcho"/> = 1: the field put the composition into its text itself or
-        /// dropped it, so the IME's own commit of it is dropped. Returns the state. Main thread.</summary>
+        /// dropped it, so the IME's flush of it on the reset (its first commit after the reset,
+        /// equal to it, before any other text-input event) is dropped. Returns the state. Main
+        /// thread.</summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern uint displayxr_linux_ime_release(int dropEcho);
+
+        /// <summary>The owning field's caret rectangle (surface-local logical px, top-left origin;
+        /// width and height above 0) for the IME's candidate window: sent when it changes and with a
+        /// reset. Ignored while no field owns the IME. Returns the state. Main thread.</summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern uint displayxr_linux_ime_cursor_rect(int x, int y, int width, int height);
 
         /// <summary>The oldest IME change while a field owns the IME: 1, 0 (none), -1 (a buffer is
         /// too small: <paramref name="info"/>[4] / [5] = commit / composition bytes; the change

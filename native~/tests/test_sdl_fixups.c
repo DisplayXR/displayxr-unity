@@ -242,14 +242,18 @@ static void sdl_ti_commit(void *d, void *t, const char *x) { (void)d, (void)t; T
 static void sdl_ti_delete(void *d, void *t, uint32_t b, uint32_t a) { (void)d, (void)t; TI_LOG("X(%u,%u)", b, a); }
 static void sdl_ti_done(void *d, void *t, uint32_t sr) { (void)d, (void)t; TI_LOG("D(%u)", sr); }
 
-//! What the IME reset sent (instead of wl_proxy_marshal).
-static char s_reset_log[128];
+//! What the IME's requests sent (instead of wl_proxy_marshal): opcodes, set_cursor_rectangle as 6(x,y,w,h).
+static char s_reset_log[256];
 static void *s_reset_proxy;
 static void
-reset_send(void *text_input, unsigned opcode)
+reset_send(void *text_input, unsigned opcode, const int32_t *args)
 {
 	s_reset_proxy = text_input;
-	snprintf(s_reset_log + strlen(s_reset_log), sizeof(s_reset_log) - strlen(s_reset_log), "%u", opcode);
+	size_t n = strlen(s_reset_log);
+	if (opcode == 6 && args)
+		snprintf(s_reset_log + n, sizeof(s_reset_log) - n, "6(%d,%d,%d,%d)", args[0], args[1], args[2], args[3]);
+	else
+		snprintf(s_reset_log + n, sizeof(s_reset_log) - n, "%u", opcode);
 }
 
 /*
@@ -406,6 +410,11 @@ static void
 ti_enter(void)
 {
 	((void (*)(void *, void *, void *))__atomic_load_n(&img.ti_table[0], __ATOMIC_SEQ_CST))(NULL, TI_PROXY, NULL);
+}
+static void
+ti_leave(void)
+{
+	((void (*)(void *, void *, void *))__atomic_load_n(&img.ti_table[1], __ATOMIC_SEQ_CST))(NULL, TI_PROXY, NULL);
 }
 
 //! The page's protection from /proc/self/maps ("r--p", ...), or "".
@@ -863,6 +872,127 @@ test_ime(void)
 	CHECK(s_reset_log[0] == 0);
 }
 
+//! A fresh install with a field owning the IME and composing @p comp, then given back (the reset).
+static void
+ime_owned_then_released(const char *comp, int drop_echo)
+{
+	char cm[64], pe[64];
+	int32_t info[6];
+	unsetenv("DISPLAYXR_SDL_FIXUPS");
+	image_new(MUT_NONE);
+	CHECK(image_install() == DXR_SDLFIX_ALL);
+	ti_enter();
+	CHECK(dxr_sdl_ime_own(1) & DXR_SDL_IME_OWNED);
+	ti_preedit(comp, (int32_t)strlen(comp), (int32_t)strlen(comp));
+	ti_done(6);
+	while (dxr_sdl_ime_next(cm, sizeof cm, pe, sizeof pe, info) == 1)
+		;
+	s_ti_log[0] = 0;
+	s_reset_log[0] = 0;
+	dxr_sdl_ime_release(drop_echo);
+	CHECK(strncmp(s_reset_log, "2715", 4) == 0);
+}
+
+static void
+test_ime_flush_exact(void)
+{
+	// 1. The IME flushes the composition on the reset (ibus-hangul): that commit is dropped, once.
+	ime_owned_then_released("한", 1);
+	ti_preedit(NULL, 0, 0);
+	ti_commit("한");
+	ti_done(8);
+	CHECK(strcmp(s_ti_log, "P(nil,0,0)D(8)") == 0);
+	CHECK(dxr_sdl_fixups_test_ime_echoes() == 1);
+	ti_commit("한"); // typed again: genuine
+	ti_done(9);
+	CHECK(strcmp(s_ti_log, "P(nil,0,0)D(8)C(한)D(9)") == 0);
+	CHECK(dxr_sdl_fixups_test_ime_echoes() == 1);
+
+	// 2. The IME does not flush; the user then types the same syllable again: it is kept.
+	ime_owned_then_released("한", 1);
+	ti_preedit("ㅎ", 3, 3);
+	ti_done(8);
+	ti_preedit("한", 3, 3);
+	ti_done(8);
+	ti_preedit(NULL, 0, 0);
+	ti_commit("한");
+	ti_done(8);
+	CHECK(strcmp(s_ti_log, "P(ㅎ,3,3)D(8)P(한,3,3)D(8)P(nil,0,0)C(한)D(8)") == 0);
+	CHECK(dxr_sdl_fixups_test_ime_echoes() == 0);
+
+	// 3. The IME's first commit after the reset is a different text: kept, and the drop is disarmed
+	//    (the same text afterwards is kept too).
+	ime_owned_then_released("한", 1);
+	ti_commit("글");
+	ti_done(8);
+	ti_commit("한");
+	ti_done(9);
+	CHECK(strcmp(s_ti_log, "C(글)D(8)C(한)D(9)") == 0);
+	CHECK(dxr_sdl_fixups_test_ime_echoes() == 0);
+
+	// 4. A new composition equal to the old one does not disarm (the IME may restate it before
+	//    flushing); a new focus does: no flush of the old focus comes after it.
+	ime_owned_then_released("한", 1);
+	ti_preedit("한", 3, 3);
+	ti_commit("한");
+	ti_done(8);
+	CHECK(strcmp(s_ti_log, "P(한,3,3)D(8)") == 0 && dxr_sdl_fixups_test_ime_echoes() == 1);
+	ime_owned_then_released("한", 1);
+	ti_leave();
+	ti_enter();
+	ti_commit("한");
+	ti_done(8);
+	CHECK(strcmp(s_ti_log, "LEC(한)D(8)") == 0 && dxr_sdl_fixups_test_ime_echoes() == 0);
+
+	// 5. A delete around the caret first: not a flush, disarmed.
+	ime_owned_then_released("한", 1);
+	ti_delete(3, 0);
+	ti_commit("한");
+	ti_done(8);
+	CHECK(strcmp(s_ti_log, "X(3,0)C(한)D(8)") == 0 && dxr_sdl_fixups_test_ime_echoes() == 0);
+
+	// 6. Not asked to drop (drop_echo 0): the reset is sent, the flush goes on to SDL.
+	ime_owned_then_released("한", 0);
+	ti_commit("한");
+	ti_done(8);
+	CHECK(strcmp(s_ti_log, "C(한)D(8)") == 0 && dxr_sdl_fixups_test_ime_echoes() == 0);
+}
+
+static void
+test_ime_cursor_rect(void)
+{
+	unsetenv("DISPLAYXR_SDL_FIXUPS");
+	image_new(MUT_NONE);
+	CHECK(image_install() == DXR_SDLFIX_ALL);
+	ti_enter();
+	// No field owns the IME: ignored.
+	dxr_sdl_ime_cursor_rect(10, 20, 1, 16);
+	CHECK(s_reset_log[0] == 0);
+	// Owned: sent as SDL_SetTextInputRect would (set_cursor_rectangle + commit), only when it changes.
+	dxr_sdl_ime_own(1);
+	dxr_sdl_ime_cursor_rect(10, 20, 1, 16);
+	CHECK(strcmp(s_reset_log, "6(10,20,1,16)7") == 0 && s_reset_proxy == TI_PROXY);
+	dxr_sdl_ime_cursor_rect(10, 20, 1, 16);
+	CHECK(strcmp(s_reset_log, "6(10,20,1,16)7") == 0);
+	dxr_sdl_ime_cursor_rect(0, 0, 0, 16); // empty: ignored, the last one stays
+	CHECK(strcmp(s_reset_log, "6(10,20,1,16)7") == 0);
+	dxr_sdl_ime_cursor_rect(42, 20, 1, 16);
+	CHECK(strcmp(s_reset_log, "6(10,20,1,16)76(42,20,1,16)7") == 0);
+	// The reset re-sends the last one before its final commit.
+	ti_preedit("한", 3, 3);
+	ti_done(6);
+	s_reset_log[0] = 0;
+	dxr_sdl_ime_release(1);
+	CHECK(strcmp(s_reset_log, "27156(42,20,1,16)7") == 0);
+	// The next owner has not reported one yet: a reset without it.
+	dxr_sdl_ime_own(1);
+	ti_preedit("글", 3, 3);
+	ti_done(7);
+	s_reset_log[0] = 0;
+	dxr_sdl_ime_release(1);
+	CHECK(strcmp(s_reset_log, "27157") == 0);
+}
+
 static void
 test_ime_only_and_kill_switch(void)
 {
@@ -996,6 +1126,8 @@ main(void)
 	test_clipboard();
 	test_clipboard_only();
 	test_ime();
+	test_ime_flush_exact();
+	test_ime_cursor_rect();
 	test_ime_only_and_kill_switch();
 	test_kill_switch_reproduces_bug();
 	test_clipboard_kill_switch_reproduces_bug();

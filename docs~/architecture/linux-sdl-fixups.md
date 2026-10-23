@@ -77,8 +77,14 @@ and shows the composition through the base class's own IME display (TextMeshPro:
 submits, as GTK does (the IME forwards the Enter after its commit). When the field gives the IME back
 (deselect, the app losing the keyboard focus, disable) with a composition showing, the field keeps it
 as text (or drops it on disable) and the IME is reset (`disable` / `enable` on SDL's text input, the
-requests SDL itself sends); the IME's own commit of that composition, which ibus-hangul sends on the
-reset, is dropped once, within a second, so it never lands in the next field. No field owning the
+requests SDL itself sends). ibus-hangul answers the reset by committing that composition (its flush);
+the field already took it, so that commit is dropped and never lands in the next field. Only the
+flush is dropped: the IME's first commit after the reset, equal to the composition the field took,
+before any new composition, other commit, delete or focus change (and within a second, a backstop);
+an IME that does not flush loses nothing, as whatever it sends first disarms the drop. While a field
+owns the IME, its caret (what it reports as `BaseInput.compositionCursorPos`) is sent as
+`set_cursor_rectangle` for the IME's candidate window, and re-sent with the reset: Unity's player
+never passes a text-input rectangle to SDL (it does not link `SDL_SetTextInputRect`). No field owning the
 IME: every event goes on to SDL unchanged, so stock fields and `Keyboard.onTextInput` behave exactly
 as Unity ships them. The reset looks `wl_proxy_marshal` up in the `libwayland-client` SDL already
 loaded (`RTLD_NOLOAD`), so the main plug-in still links no libwayland. A field can take the IME only
@@ -101,8 +107,9 @@ and the IME text only in the DisplayXR input fields.
 [DisplayXR-SDLFIX] monitor removed (wl_output global 50): unlinked SDL's output data before SDL frees it
 ```
 
-With `DISPLAYXR_SDL_FIXUPS_LOG=1` the IME also logs `IME: reset (disable / enable)` and `IME: dropped
-the IME's own commit of a composition the field took itself`. Typed text never reaches a log.
+With `DISPLAYXR_SDL_FIXUPS_LOG=1` the IME also logs `IME: reset (disable / enable)` (plus
+`, cursor rectangle re-sent` when the field reported its caret) and `IME: dropped the IME's own commit
+of a composition the field took itself`. Typed text never reaches a log.
 
 A refusal says why, per fix (`clipboard fix NOT installed: SDL's code differs from the known build's`,
 `IME fix NOT installed: SDL's zwp_text_input_v3 listener is not in UnityPlayer.so's RELRO`,
