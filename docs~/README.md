@@ -14,6 +14,7 @@
 - [Window-Space 2D UI](architecture/window-space-ui.md) — `DisplayXRWindowSpaceUI` rendering model and the input-routing contract (the composition layer carries pixels, not input)
 - [Depth-Aware Cursor](architecture/cursor-depth.md) — `XR_DXR_cursor_depth` (runtime ADR-046): the runtime draws a stereo cursor in front of popped-out content; opt-in API, depth sources, wiring, and the Windows panel verification recipe
 - [Side-Step](architecture/side-step.md) — Linux native Wayland: the app's own window steps aside for the window the user works in and goes back when its place is free; only while the app's desktop control is granted (the #389 gate, checked before every poll); other windows are read inside the plug-in only
+- [File Drops and the Clipboard](architecture/linux-file-drop-clipboard.md) — Linux native Wayland: files dragged onto the window (#395), what that does to Unity's clipboard and the plug-in clipboard that replaces it (#398), and the input fields that copy and paste through it (`DisplayXRClipboardInputField`, `DisplayXRClipboardLegacyInputField`)
 - [Click-Through Silhouette Mask](architecture/click-through-mask.md) — transparent-overlay per-pixel click-through: the mask→`SetWindowRgn` pipeline, the mask/weave rect-alignment invariant, and the debugging pitfalls (the #166 clip)
 
 ### Architecture Decision Records — Why things are the way they are

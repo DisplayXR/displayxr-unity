@@ -1,0 +1,36 @@
+{
+    "name": "com.displayxr.unity.tmp",
+    "rootNamespace": "DisplayXR",
+    "references": [
+        "com.displayxr.unity",
+        "Unity.TextMeshPro",
+        "UnityEngine.UI"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [
+        "DISPLAYXR_TMP"
+    ],
+    "versionDefines": [
+        {
+            "name": "com.unity.ugui",
+            "expression": "2.0.0",
+            "define": "DISPLAYXR_TMP"
+        },
+        {
+            "name": "com.unity.ugui",
+            "expression": "2.0.0",
+            "define": "DISPLAYXR_TMP_IN_UGUI"
+        },
+        {
+            "name": "com.unity.textmeshpro",
+            "expression": "3.0.0",
+            "define": "DISPLAYXR_TMP"
+        }
+    ],
+    "noEngineReferences": false
+}

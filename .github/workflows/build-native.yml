@@ -85,6 +85,10 @@ jobs:
       - name: Desktop capture timeout
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: dotnet run --project "Tests~/DesktopCaptureTimeout" -c Release
+      # Pure C#: when the clipboard input fields take copy / paste from the base field, and which keys.
+      - name: Text field clipboard rules
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: dotnet run --project "Tests~/TextClipboard" -c Release
 
   build-windows:
     name: Windows x64
