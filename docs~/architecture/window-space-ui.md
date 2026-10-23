@@ -7,6 +7,12 @@ readable rather than living in the 3D scene.
 For a whole scene that should be flat, see [`two-dimensional-scenes.md`](two-dimensional-scenes.md)
 — that's a different mechanism (a runtime mode switch), not this one.
 
+**A plain `Screen Space - Overlay` canvas is not a substitute.** While a session is running,
+Unity does not draw an overlay canvas per eye, so it does not reach both eyes: on a BiRP
+MultiPass player on a 3D panel, a full-window text field on such a canvas showed in one eye
+only. To keep the canvas, add `DisplayXRWindowSpaceUI` to it (the component takes it over, see
+below); for UI that belongs in the scene, use a `World Space` canvas.
+
 ## Setup
 
 1. Add a `Canvas` to a GameObject. **Don't share it** with any other UI — the component
