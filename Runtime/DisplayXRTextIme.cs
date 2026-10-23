@@ -89,6 +89,14 @@ namespace DisplayXR
             s_Owner = field;
             s_Composition = "";
             InstallInput();
+            // The field reported its caret when it was activated, a frame before it could take the IME
+            // (TextMeshPro reports it again only after a commit or on a new line): send that one now.
+            if (s_Input)
+            {
+                Vector2 caret = s_Input.compositionCursorPos;
+                if (caret != Vector2.zero)
+                    CursorRect(caret);
+            }
             return true;
         }
 
@@ -159,10 +167,37 @@ namespace DisplayXR
             DisplayXRTextClipboardRules.ImeCharsForBytes(text, caret, bytes, before);
 
         // The fields read the composition through the input module's BaseInput (their own IME
-        // display code); this one answers with ours while a field owns the IME.
+        // display code); this one answers with ours while a field owns the IME. They also report
+        // their caret there (compositionCursorPos: the caret's bottom-left in screen px, top-left
+        // origin, which is the window's logical px on native Wayland), for the IME's candidate
+        // window: Unity's player never passes it on to SDL there, so the plug-in sends it.
         sealed class ImeInput : BaseInput
         {
             public override string compositionString => s_Owner != null ? s_Composition : base.compositionString;
+
+            public override Vector2 compositionCursorPos
+            {
+                get => base.compositionCursorPos;
+                set
+                {
+                    base.compositionCursorPos = value;
+                    if (s_Owner != null)
+                        CursorRect(value);
+                }
+            }
+        }
+
+        static void CursorRect(Vector2 caret)
+        {
+            try
+            {
+                // A 1 px rectangle at the caret's bottom-left: the candidate window opens below it.
+                CursorRectNative(Mathf.RoundToInt(caret.x), Mathf.RoundToInt(caret.y), 1, 1);
+            }
+            catch (Exception e) when (e is DllNotFoundException || e is EntryPointNotFoundException)
+            {
+                s_NoLibrary = true;
+            }
         }
 
         static void InstallInput()
@@ -197,11 +232,13 @@ namespace DisplayXR
         static uint ReleaseNative(int dropEcho) => DisplayXRNative.displayxr_linux_ime_release(dropEcho);
         static int NextNative(byte[] commit, int commitCap, byte[] preedit, int preeditCap, int[] info) =>
             DisplayXRNative.displayxr_linux_ime_next(commit, commitCap, preedit, preeditCap, info);
+        static uint CursorRectNative(int x, int y, int w, int h) => DisplayXRNative.displayxr_linux_ime_cursor_rect(x, y, w, h);
 #else
         static uint State() => 0;
         static uint Own(int own) => 0;
         static uint ReleaseNative(int dropEcho) => 0;
         static int NextNative(byte[] commit, int commitCap, byte[] preedit, int preeditCap, int[] info) => 0;
+        static uint CursorRectNative(int x, int y, int w, int h) => 0;
 #endif
     }
 }

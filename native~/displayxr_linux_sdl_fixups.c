@@ -518,13 +518,22 @@ install_clipboard(void)
  * protocol's order (the old composition goes, the text around the caret is deleted,
  * the commit is inserted, the new composition shows). While owned, the four state
  * events do not go on to SDL; enter / leave always do. A field that gives the IME
- * back resets it (disable + commit, enable + set_content_type + commit on SDL's own
- * text input; SDL keeps it enabled the whole time otherwise and flushes the requests
- * with its next event pump), and for one second the IME's own commit of the
- * composition the field showed (ibus-hangul flushes it on a reset) is dropped, so it
- * reaches neither Unity nor the next field. Everything runs on the thread that
- * dispatches SDL's events (Unity's main thread), as do the fields' calls; the mutex
- * only keeps a stray caller safe.
+ * back with a composition showing resets it (disable + commit, enable +
+ * set_content_type [+ set_cursor_rectangle] + commit on SDL's own text input; SDL
+ * keeps it enabled the whole time otherwise and flushes the requests with its next
+ * event pump). An IME such as ibus-hangul answers the reset by committing that
+ * composition (its "flush"); the field already took it, so that one commit is
+ * dropped and reaches neither Unity nor the next field. Only the flush is: the IME's
+ * first commit after the reset, equal to the composition the field took, with no
+ * new composition, commit, delete or focus change before it (and within a second,
+ * a backstop). An IME that does not flush never costs a genuine commit: whatever it
+ * sends first disarms the drop. The cursor rectangle is the one the owning field
+ * last reported (its caret, as Input.compositionCursorPos): Unity never calls
+ * SDL_SetTextInputRect (6000.4.6f1 does not even link it; SDL's
+ * Wayland_SetTextInputRect is reachable only through its unused device slot), so
+ * SDL itself never sends one. Everything runs on the thread that dispatches SDL's
+ * events (Unity's main thread), as do the fields' calls; the mutex only keeps a stray
+ * caller safe.
  */
 
 typedef void (*fnptr_ti_surface)(void *, void *, void *);
@@ -557,10 +566,21 @@ static struct {
 } s_pend;
 static char *s_cur_preedit; // the IME's composition as of the last 'done'
 static int32_t s_cur_begin, s_cur_end;
-static char *s_echo; // a composition a field took itself: the IME's commit of it is dropped once
+static char *s_echo; // armed at a reset: the composition the field took (the IME's flush of it is dropped)
 static int64_t s_echo_until_ns;
 static unsigned s_echoes;
-static void (*s_ime_send)(void *text_input, unsigned opcode); // the reset's requests (tests replace it)
+static int32_t s_rect[4]; // the owning field's caret rectangle (surface-local logical px)
+static int s_has_rect;
+//! The requests (tests replace it): opcode, and for set_cursor_rectangle (6) x, y, w, h.
+static void (*s_ime_send)(void *text_input, unsigned opcode, const int32_t *args);
+
+//! Disarms the flush drop: the IME sent something else first (or the focus changed).
+static void
+echo_disarm_locked(void)
+{
+	free(s_echo);
+	s_echo = NULL;
+}
 
 static int64_t
 now_ns(void)
@@ -615,6 +635,7 @@ fix_ti_enter(void *data, void *ti, void *surface)
 	pthread_mutex_lock(&s_ime_mx);
 	ti_event_locked(ti);
 	s_ti_focus = 1;
+	echo_disarm_locked(); // a new focus: no flush of the old one comes any more
 	pthread_mutex_unlock(&s_ime_mx);
 	((fnptr_ti_surface)s_ti_orig[0])(data, ti, surface);
 }
@@ -625,6 +646,7 @@ fix_ti_leave(void *data, void *ti, void *surface)
 	pthread_mutex_lock(&s_ime_mx);
 	ti_event_locked(ti);
 	s_ti_focus = 0;
+	echo_disarm_locked();
 	pthread_mutex_unlock(&s_ime_mx);
 	((fnptr_ti_surface)s_ti_orig[1])(data, ti, surface);
 }
@@ -634,6 +656,8 @@ fix_ti_preedit(void *data, void *ti, const char *text, int32_t begin, int32_t en
 {
 	pthread_mutex_lock(&s_ime_mx);
 	int owned = ti_event_locked(ti);
+	if (s_echo && text && *text && strcmp(text, s_echo) != 0)
+		echo_disarm_locked(); // a new composition: the IME did not flush (an empty one may come with the flush)
 	free(s_pend.preedit);
 	s_pend.preedit = (text && *text) ? strdup(text) : NULL;
 	s_pend.has_preedit = 1;
@@ -650,13 +674,14 @@ fix_ti_commit(void *data, void *ti, const char *text)
 {
 	pthread_mutex_lock(&s_ime_mx);
 	int owned = ti_event_locked(ti);
-	if (s_echo && now_ns() > s_echo_until_ns) {
-		free(s_echo);
-		s_echo = NULL;
+	if (s_echo && now_ns() > s_echo_until_ns)
+		echo_disarm_locked();
+	int flush = 0;
+	if (text && *text) { // the IME's first commit after the reset: the flush, or proof that there is none
+		flush = s_echo && strcmp(text, s_echo) == 0;
+		echo_disarm_locked();
 	}
-	if (s_echo && text && strcmp(text, s_echo) == 0) {
-		free(s_echo);
-		s_echo = NULL;
+	if (flush) {
 		s_echoes++;
 		pthread_mutex_unlock(&s_ime_mx);
 		if (s_log)
@@ -682,6 +707,7 @@ fix_ti_delete(void *data, void *ti, uint32_t before, uint32_t after)
 {
 	pthread_mutex_lock(&s_ime_mx);
 	int owned = ti_event_locked(ti);
+	echo_disarm_locked();
 	s_pend.del_before = before;
 	s_pend.del_after = after;
 	s_pend.owned_any |= owned;
@@ -721,7 +747,7 @@ fix_ti_done(void *data, void *ti, uint32_t serial)
 //! wl_proxy_marshal from the libwayland-client SDL loaded (never loads it: no NEEDED,
 //! and none in an X11 player, where there is no SDL text input to reset anyway).
 static void
-send_marshal(void *text_input, unsigned opcode)
+send_marshal(void *text_input, unsigned opcode, const int32_t *args)
 {
 	static void (*marshal)(void *, uint32_t, ...);
 	static int tried;
@@ -735,6 +761,8 @@ send_marshal(void *text_input, unsigned opcode)
 		return;
 	if (opcode == 5) // set_content_type(hint 0, purpose 0): what SDL sends
 		marshal(text_input, opcode, 0u, 0u);
+	else if (opcode == 6 && args) // set_cursor_rectangle(x, y, width, height)
+		marshal(text_input, opcode, args[0], args[1], args[2], args[3]);
 	else
 		marshal(text_input, opcode);
 }
@@ -802,25 +830,52 @@ dxr_sdl_ime_release(int drop_echo)
 	pthread_mutex_lock(&s_ime_mx);
 	s_owned = 0;
 	q_clear();
-	free(s_echo);
-	s_echo = (drop_echo && s_cur_preedit) ? strdup(s_cur_preedit) : NULL;
-	s_echo_until_ns = now_ns() + 1000000000LL;
+	echo_disarm_locked();
 	void *ti = s_ti_proxy;
-	int had = s_cur_preedit != NULL;
+	void (*send)(void *, unsigned, const int32_t *) = s_ime_send;
+	int reset = ti && send && s_cur_preedit;
+	if (reset && drop_echo) {
+		s_echo = strdup(s_cur_preedit);
+		s_echo_until_ns = now_ns() + 1000000000LL; // a backstop only: the first event after the reset decides
+	}
 	free(s_cur_preedit);
 	s_cur_preedit = NULL;
-	void (*send)(void *, unsigned) = s_ime_send;
-	pthread_mutex_unlock(&s_ime_mx);
-	if (ti && had && send) {
-		// zwp_text_input_v3 requests: 2 disable, 7 commit, 1 enable, 5 set_content_type, 7 commit.
-		send(ti, 2);
-		send(ti, 7);
-		send(ti, 1);
-		send(ti, 5);
-		send(ti, 7);
-		if (s_log)
-			logf_("IME: reset (disable / enable)");
+	int32_t rect[4];
+	int has_rect = s_has_rect;
+	memcpy(rect, s_rect, sizeof(rect));
+	s_has_rect = 0; // the next owner reports its own
+	if (reset) {
+		// zwp_text_input_v3 requests, as SDL's StopTextInput + StartTextInput send them: 2 disable,
+		// 7 commit, 1 enable, 5 set_content_type, 6 set_cursor_rectangle (when known), 7 commit.
+		send(ti, 2, NULL);
+		send(ti, 7, NULL);
+		send(ti, 1, NULL);
+		send(ti, 5, NULL);
+		if (has_rect)
+			send(ti, 6, rect);
+		send(ti, 7, NULL);
 	}
+	pthread_mutex_unlock(&s_ime_mx);
+	if (reset && s_log)
+		logf_("IME: reset (disable / enable)%s", has_rect ? ", cursor rectangle re-sent" : "");
+	return dxr_sdl_ime_state();
+}
+
+unsigned
+dxr_sdl_ime_cursor_rect(int32_t x, int32_t y, int32_t w, int32_t h)
+{
+	pthread_mutex_lock(&s_ime_mx);
+	if (s_owned && w > 0 && h > 0) {
+		int changed = !s_has_rect || s_rect[0] != x || s_rect[1] != y || s_rect[2] != w || s_rect[3] != h;
+		s_rect[0] = x, s_rect[1] = y, s_rect[2] = w, s_rect[3] = h;
+		s_has_rect = 1;
+		if (changed && s_ti_proxy && s_ime_send) {
+			// What SDL_SetTextInputRect would send: set_cursor_rectangle + commit.
+			s_ime_send(s_ti_proxy, 6, s_rect);
+			s_ime_send(s_ti_proxy, 7, NULL);
+		}
+	}
+	pthread_mutex_unlock(&s_ime_mx);
 	return dxr_sdl_ime_state();
 }
 
@@ -1034,7 +1089,7 @@ dxr_sdl_fixups_find_build(const char *build_id)
 static int s_test_relro_set;
 
 void
-dxr_sdl_fixups_test_ime_reset(void (*send)(void *text_input, unsigned opcode))
+dxr_sdl_fixups_test_ime_reset(void (*send)(void *text_input, unsigned opcode, const int32_t *args))
 {
 	s_ime_send = send;
 }
@@ -1070,6 +1125,7 @@ dxr_sdl_fixups_install_build(const struct dxr_sdl_build *b, uintptr_t base)
 	s_cur_preedit = NULL;
 	free(s_echo);
 	s_echo = NULL;
+	s_has_rect = 0;
 	free(s_pend.commit);
 	free(s_pend.preedit);
 	memset(&s_pend, 0, sizeof(s_pend));

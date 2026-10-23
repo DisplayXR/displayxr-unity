@@ -124,10 +124,16 @@ unsigned dxr_sdl_ime_state(void);
 //! A field takes (1) or gives back (0, no reset) the IME. Taking it queues the IME's
 //! current composition first. Returns the state (DXR_SDL_IME_OWNED when taken).
 unsigned dxr_sdl_ime_own(int own);
-//! The field gives the IME back and the IME is reset; @p drop_echo: the IME's own commit
-//! of the composition the field showed (taken into its text or dropped) is dropped
-//! within the next second. Returns the state.
+//! The field gives the IME back; with a composition showing, the IME is reset (the
+//! field's last cursor rectangle re-sent with it). @p drop_echo: the field took that
+//! composition into its text or dropped it, so the IME's flush of it (its first commit
+//! after the reset, equal to it, before any other text-input event; within a second)
+//! is dropped; anything else first disarms that. Returns the state.
 unsigned dxr_sdl_ime_release(int drop_echo);
+//! The owning field's caret rectangle (surface-local logical px; w, h > 0), for the IME's
+//! candidate window: sent (set_cursor_rectangle + commit) when it changes, and with a
+//! reset. Ignored while no field owns the IME. Returns the state.
+unsigned dxr_sdl_ime_cursor_rect(int32_t x, int32_t y, int32_t w, int32_t h);
 //! The oldest change while a field owns the IME: 1, 0 (none), -1 (a buffer too small:
 //! info[4] / info[5] say the bytes; the change stays). @p info (6): cursor_begin,
 //! cursor_end, delete_before, delete_after (UTF-8 bytes), commit bytes, composition
@@ -139,8 +145,9 @@ int dxr_sdl_ime_next(char *commit, int commit_cap, char *preedit, int preedit_ca
 unsigned dxr_sdl_fixups_install_build(const struct dxr_sdl_build *b, uintptr_t base);
 //! Unit tests: the RELRO range the next install checks tables against (default: all).
 void dxr_sdl_fixups_test_relro(uintptr_t lo, uintptr_t hi);
-//! Unit tests: what the IME reset sends instead of wl_proxy_marshal (request opcodes, in order).
-void dxr_sdl_fixups_test_ime_reset(void (*send)(void *text_input, unsigned opcode));
+//! Unit tests: what the IME's requests go to instead of wl_proxy_marshal (opcodes in order;
+//! @p args: x, y, w, h for set_cursor_rectangle (6), else NULL).
+void dxr_sdl_fixups_test_ime_reset(void (*send)(void *text_input, unsigned opcode, const int32_t *args));
 //! Unit tests: the IME's commits dropped as echoes so far.
 unsigned dxr_sdl_fixups_test_ime_echoes(void);
 //! Unit tests: what pinning the library answers (1 pinned, 0 failed; -1 = really try).

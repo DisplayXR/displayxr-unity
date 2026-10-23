@@ -1905,6 +1905,12 @@ displayxr_linux_ime_next(char *commit, int commit_cap, char *preedit, int preedi
 	return dxr_sdl_ime_next(commit, commit_cap, preedit, preedit_cap, info);
 }
 
+DISPLAYXR_EXPORT unsigned
+displayxr_linux_ime_cursor_rect(int x, int y, int width, int height)
+{
+	return dxr_sdl_ime_cursor_rect(x, y, width, height);
+}
+
 // ---------------------------------------------------------------------------
 // Foreground query (#332)
 // ---------------------------------------------------------------------------
