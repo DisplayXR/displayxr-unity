@@ -5,7 +5,9 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.32.1] - 2026-10-23
+
+Linux IME follow-ups (#417): the flush drop now drops only the IME's own flush of the composition the field took on reset, so a genuine identical commit is never swallowed; and the DisplayXR input field's caret rectangle is sent to the IME (`zwp_text_input_v3.set_cursor_rectangle`), so the candidate window follows the caret.
 
 ### Fixed
 - **Linux: the IME flush drop no longer swallows a genuine commit (#415).** When a DisplayXR input field gives the IME back with a composition showing, the plug-in resets the IME and drops the IME's own commit of that composition (ibus-hangul "flushes" it on the reset), because the field already took it. That drop used to be armed for a second: an IME that does not flush could lose the user's next commit if it happened to be the same text. Now only the flush is dropped: the IME's first commit after the reset, equal to the composition the field took, before any new composition, other commit, delete or focus change (and still within a second, as a backstop). Whatever else the IME sends first disarms it. Unit-tested: the IME flushes (dropped once), the IME does not flush and the user types the same syllable again (kept), a different first commit (kept).
