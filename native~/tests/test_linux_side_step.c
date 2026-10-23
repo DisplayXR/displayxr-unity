@@ -34,6 +34,15 @@ R(int x, int y, int w, int h)
 	return r;
 }
 
+//! No work area reported (an extension before v19).
+static const DxrSsRect NOWORK = {0, 0, 0, 0};
+
+static int
+same_rect(DxrSsRect a, DxrSsRect b)
+{
+	return a.x == b.x && a.y == b.y && a.w == b.w && a.h == b.h;
+}
+
 //! A body that is the rect (fractions of the window) fx0..fx1 x fy0..fy1.
 static DxrSsBody
 body_frac(double fx0, double fy0, double fx1, double fy1)
@@ -146,47 +155,174 @@ test_find_spot(void)
 	float cov = 1.0f;
 	// A document over the window, with room on its right: there, the shortest free move.
 	DxrSsRect doc = R(2480, 260, 600, 560);
-	CHECK(dxr_ss_find_spot(NULL, win, doc, mon, 24, DXR_SS_SIDE_AUTO, &x, &y, &cov));
+	CHECK(dxr_ss_find_spot(NULL, win, doc, mon, NOWORK, 24, DXR_SS_SIDE_AUTO, &x, &y, &cov));
 	CHECK(cov == 0.0f && x == 2480 + 600 + 24 && y == 298);
 	CHECK(x >= mon.x && x + 600 <= mon.x + mon.w && y >= mon.y && y + 484 <= mon.y + mon.h);
 
 	// A preferred side wins among equally free places (here: the corners on that side).
-	CHECK(dxr_ss_find_spot(NULL, win, doc, mon, 24, DXR_SS_SIDE_BELOW, &x, &y, &cov));
+	CHECK(dxr_ss_find_spot(NULL, win, doc, mon, NOWORK, 24, DXR_SS_SIDE_BELOW, &x, &y, &cov));
 	CHECK(cov == 0.0f && y + 484 == 1080 - 24 && x == 3840 - 24 - 600);
-	CHECK(dxr_ss_find_spot(NULL, win, doc, mon, 24, DXR_SS_SIDE_ABOVE, &x, &y, &cov));
+	CHECK(dxr_ss_find_spot(NULL, win, doc, mon, NOWORK, 24, DXR_SS_SIDE_ABOVE, &x, &y, &cov));
 	CHECK(cov == 0.0f && y == 24);
 	// ... but never a more covered one: left of it is off the monitor (clamped back
 	// onto the document), so LEFT still gets a free place on the right.
-	CHECK(dxr_ss_find_spot(NULL, win, doc, mon, 24, DXR_SS_SIDE_LEFT, &x, &y, &cov));
+	CHECK(dxr_ss_find_spot(NULL, win, doc, mon, NOWORK, 24, DXR_SS_SIDE_LEFT, &x, &y, &cov));
 	CHECK(cov == 0.0f && x >= 2480 + 600);
 
 	// Cramped (a big document, the prototype's DS1 geometry): no place is quite
 	// free; the least covered one is offered, and the caller decides (below half
 	// the trigger here: a corner, 5.5 %).
 	DxrSsRect big = R(2480, 260, 800, 560);
-	CHECK(dxr_ss_find_spot(NULL, win, big, mon, 24, DXR_SS_SIDE_AUTO, &x, &y, &cov));
+	CHECK(dxr_ss_find_spot(NULL, win, big, mon, NOWORK, 24, DXR_SS_SIDE_AUTO, &x, &y, &cov));
 	CHECK(cov > 0.05f && cov < 0.06f);
 
 	// With room on the left, the shorter move wins.
 	DxrSsRect doc2 = R(2700, 260, 500, 560);
-	CHECK(dxr_ss_find_spot(NULL, win, doc2, mon, 24, DXR_SS_SIDE_AUTO, &x, &y, &cov));
+	CHECK(dxr_ss_find_spot(NULL, win, doc2, mon, NOWORK, 24, DXR_SS_SIDE_AUTO, &x, &y, &cov));
 	CHECK(cov == 0.0f && x == 2700 - 24 - 600 && y == 298);
 
 	// The content's box, not the window, is what keeps the margin.
 	DxrSsBody lower = body_frac(0.25, 0.5, 0.75, 1.0); // 150..450 x 242..484 of the window
-	CHECK(dxr_ss_find_spot(&lower, win, doc2, mon, 24, DXR_SS_SIDE_LEFT, &x, &y, &cov));
+	CHECK(dxr_ss_find_spot(&lower, win, doc2, mon, NOWORK, 24, DXR_SS_SIDE_LEFT, &x, &y, &cov));
 	CHECK(cov == 0.0f && x + 150 + 300 == 2700 - 24);
 
 	// The covering window fills the monitor (maximized): nowhere is free.
-	CHECK(dxr_ss_find_spot(NULL, win, mon, mon, 24, DXR_SS_SIDE_AUTO, &x, &y, &cov));
+	CHECK(dxr_ss_find_spot(NULL, win, mon, mon, NOWORK, 24, DXR_SS_SIDE_AUTO, &x, &y, &cov));
 	CHECK(cov >= 0.99f);
 	// No monitor reported: no other place.
-	CHECK(!dxr_ss_find_spot(NULL, win, doc, R(0, 0, 0, 0), 24, DXR_SS_SIDE_AUTO, &x, &y, &cov));
+	CHECK(!dxr_ss_find_spot(NULL, win, doc, R(0, 0, 0, 0), NOWORK, 24, DXR_SS_SIDE_AUTO, &x, &y, &cov));
 	// No content at all: nothing to move.
 	DxrSsBody empty;
 	memset(&empty, 0, sizeof(empty));
 	empty.valid = 1;
-	CHECK(!dxr_ss_find_spot(&empty, win, doc, mon, 24, DXR_SS_SIDE_AUTO, &x, &y, &cov));
+	CHECK(!dxr_ss_find_spot(&empty, win, doc, mon, NOWORK, 24, DXR_SS_SIDE_AUTO, &x, &y, &cov));
+}
+
+//! The monitor's work area (extension v19): corners and the clamp keep out from
+//! under the top bar and a dock that stays visible; without it, as before.
+static void
+test_work_area(void)
+{
+	DxrSsRect mon = R(0, 0, 1920, 1080);
+	DxrSsRect bar = R(0, 32, 1920, 1048);         // a 32 px top bar
+	DxrSsRect bar_dock = R(64, 32, 1856, 1048);   // and a 64 px dock on the left
+	DxrSsRect bar_bottom = R(0, 32, 1920, 976);   // and a 72 px dock at the bottom
+
+	// The usable area: the work area cut to the monitor, else the whole monitor.
+	CHECK(same_rect(dxr_ss_usable_area(mon, NOWORK), mon));
+	CHECK(same_rect(dxr_ss_usable_area(mon, bar), bar));
+	CHECK(same_rect(dxr_ss_usable_area(mon, R(-100, 32, 3000, 2000)), R(0, 32, 1920, 1048)));
+	CHECK(same_rect(dxr_ss_usable_area(mon, R(1920, 0, 1920, 1080)), mon)); // off the monitor
+	CHECK(same_rect(dxr_ss_usable_area(mon, R(0, 32, 0, 1048)), mon));      // empty
+	CHECK(same_rect(dxr_ss_usable_area(mon, R(0, 32, 1920, -5)), mon));
+	CHECK(same_rect(dxr_ss_usable_area(NOWORK, bar), NOWORK)); // no monitor: nothing to cut to
+
+	int x = 0, y = 0;
+	float cov = 1.0f;
+	// A top corner: below the top bar, `margin` px from it (right above the document
+	// is not free any more: the bar pushes that place down onto it).
+	DxrSsRect win = R(700, 400, 400, 300);
+	DxrSsRect doc = R(600, 300, 700, 500);
+	CHECK(dxr_ss_find_spot(NULL, win, doc, mon, bar, 24, DXR_SS_SIDE_ABOVE, &x, &y, &cov));
+	CHECK(cov == 0.0f && y >= bar.y + 24 && y == 32 + 24);
+	// Without it, as before: right above the document, clamped to the monitor's top
+	// edge, under the bar.
+	CHECK(dxr_ss_find_spot(NULL, win, doc, mon, NOWORK, 24, DXR_SS_SIDE_ABOVE, &x, &y, &cov));
+	CHECK(cov == 0.0f && x == 700 && y == 0);
+	// The top-left corner with a dock on the left: right of the dock, below the bar.
+	CHECK(dxr_ss_find_spot(NULL, win, doc, mon, bar_dock, 24, DXR_SS_SIDE_ABOVE, &x, &y, &cov));
+	CHECK(cov == 0.0f && x == 64 + 24 && y == 32 + 24);
+	CHECK(dxr_ss_find_spot(NULL, win, doc, mon, bar, 24, DXR_SS_SIDE_ABOVE, &x, &y, &cov));
+	CHECK(cov == 0.0f && x == 24 && y == 32 + 24); // no dock: 24 px from the monitor's left
+	// A bottom corner with a dock at the bottom: above the dock.
+	CHECK(dxr_ss_find_spot(NULL, win, doc, mon, bar_bottom, 24, DXR_SS_SIDE_BELOW, &x, &y, &cov));
+	CHECK(cov == 0.0f && y + 300 == 32 + 976 - 24);
+	CHECK(dxr_ss_find_spot(NULL, win, doc, mon, NOWORK, 24, DXR_SS_SIDE_BELOW, &x, &y, &cov));
+	CHECK(cov == 0.0f && y + 300 == 1080 - 24); // as before: on the dock
+
+	// Beside the covering window: clamped to the work area too. The window sits at
+	// the very top (under the bar); stepping left of the document keeps its y, which
+	// the work area moves below the bar.
+	DxrSsRect top = R(600, 0, 400, 300);
+	DxrSsRect doc_r = R(800, 0, 600, 500);
+	CHECK(dxr_ss_find_spot(NULL, top, doc_r, mon, bar, 24, DXR_SS_SIDE_LEFT, &x, &y, &cov));
+	CHECK(cov == 0.0f && x == 800 - 24 - 400 && y == 32);
+	CHECK(dxr_ss_find_spot(NULL, top, doc_r, mon, NOWORK, 24, DXR_SS_SIDE_LEFT, &x, &y, &cov));
+	CHECK(cov == 0.0f && x == 800 - 24 - 400 && y == 0); // as before
+	// Left of a document near the dock: never onto the dock.
+	DxrSsRect mid = R(300, 400, 400, 300);
+	DxrSsRect doc_l = R(200, 300, 1000, 500);
+	for (int side = DXR_SS_SIDE_AUTO; side <= DXR_SS_SIDE_BELOW; side++) {
+		if (dxr_ss_find_spot(NULL, mid, doc_l, mon, bar_dock, 24, side, &x, &y, &cov))
+			CHECK(x >= 64 && y >= 32 && x + 400 <= 64 + 1856 && y + 300 <= 32 + 1048);
+		else
+			CHECK(0);
+	}
+
+	// Every spot, every side, many covering windows: always inside the work area.
+	int n = 0;
+	for (int kx = 0; kx < 1920; kx += 160)
+		for (int ky = 0; ky < 1080; ky += 120)
+			for (int side = DXR_SS_SIDE_AUTO; side <= DXR_SS_SIDE_BELOW; side++) {
+				DxrSsRect k = R(kx, ky, 500, 400);
+				if (!dxr_ss_find_spot(NULL, mid, k, mon, bar_bottom, 24, side, &x, &y, &cov))
+					continue;
+				n++;
+				CHECK(x >= 0 && y >= 32 && x + 400 <= 1920 && y + 300 <= 32 + 976);
+			}
+	CHECK(n > 500);
+
+	// No work area, a work area that is the whole monitor, an empty one or one off the
+	// monitor: exactly the results from before.
+	DxrSsRect same_as_mon[4] = {NOWORK, mon, R(0, 32, 0, 0), R(5000, 0, 100, 100)};
+	int diffs = 0;
+	for (int kx = 0; kx < 1920; kx += 240)
+		for (int ky = 0; ky < 1080; ky += 180)
+			for (int side = DXR_SS_SIDE_AUTO; side <= DXR_SS_SIDE_BELOW; side++) {
+				DxrSsRect k = R(kx, ky, 700, 500);
+				int x0 = 0, y0 = 0;
+				float c0 = 0.0f;
+				int f0 = dxr_ss_find_spot(NULL, mid, k, mon, NOWORK, 24, side, &x0, &y0, &c0);
+				for (int i = 1; i < 4; i++) {
+					int x1 = 0, y1 = 0;
+					float c1 = 0.0f;
+					int f1 = dxr_ss_find_spot(NULL, mid, k, mon, same_as_mon[i], 24, side, &x1, &y1, &c1);
+					if (f1 != f0 || (f0 && (x1 != x0 || y1 != y0 || c1 != c0)))
+						diffs++;
+				}
+			}
+	CHECK(diffs == 0);
+
+	// Too tall for the work area: as far below the bar as fits, still on the monitor.
+	DxrSsRect tall = R(900, 10, 600, 1060);
+	CHECK(dxr_ss_find_spot(NULL, tall, R(800, 0, 800, 1080), mon, bar, 24, DXR_SS_SIDE_AUTO, &x, &y, &cov));
+	CHECK(y == 1080 - 1060 && y + 1060 <= 1080);
+
+	// The decision passes it on: a step aside into a top corner lands below the bar.
+	DxrSsInput in;
+	memset(&in, 0, sizeof(in));
+	DxrSsState st;
+	DxrSsSettings s;
+	DxrSsDecision d;
+	dxr_ss_reset(&st);
+	dxr_ss_default_settings(&s);
+	s.side = DXR_SS_SIDE_ABOVE;
+	in.own_valid = 1;
+	in.own = win;
+	in.mon = mon;
+	in.work = bar;
+	int moved = 0;
+	for (double t = 0.25; t < 6.0 && !moved; t += 0.25) {
+		in.now = t;
+		if (t > 3.0) {
+			in.focus_valid = 1;
+			in.focus = doc;
+			in.focus_id = 7;
+		}
+		dxr_ss_step(&st, &s, &in, &d);
+		moved = d.move;
+	}
+	CHECK(moved && !d.home && d.y == 32 + 24);
 }
 
 static void
@@ -210,6 +346,34 @@ test_parse(void)
 	CHECK(in.own_valid && in.own.x == 2580 && in.own.y == 298 && in.own.w == 600 && in.own.h == 484);
 	CHECK(in.own_moving == 1 && in.own_minimized == 0);
 	CHECK(in.mon.x == 1920 && in.mon.w == 1920 && in.mon.h == 1080);
+	CHECK(same_rect(in.work, NOWORK)); // an extension before v19: no work area
+
+	// Extension v19: the monitor's work area, wherever it sits in the object.
+	const char *wa = "{\"version\": 1, \"windows\": [{\"id\": 14, \"pid\": 100, \"frame\": [10, 40, 100, 100],"
+	                 " \"monitor\": {\"x\": 0, \"y\": 0, \"w\": 1920, \"h\": 1080, \"scale\": 1,"
+	                 " \"device_scale\": 1, \"work_area\": [0, 32, 1920, 1048]}}]}";
+	CHECK(dxr_ss_parse_windows(wa, 100, 0, &in));
+	CHECK(same_rect(in.mon, R(0, 0, 1920, 1080)) && same_rect(in.work, R(0, 32, 1920, 1048)));
+	const char *wa_first = "{\"version\": 1, \"windows\": [{\"pid\": 100, \"frame\": [10, 40, 100, 100],"
+	                       " \"monitor\": {\"work_area\": [64, 32, 1856, 1048], \"x\": 0, \"y\": 0, \"w\": 1920,"
+	                       " \"h\": 1080}}]}";
+	CHECK(dxr_ss_parse_windows(wa_first, 100, 0, &in));
+	CHECK(same_rect(in.mon, R(0, 0, 1920, 1080)) && same_rect(in.work, R(64, 32, 1856, 1048)));
+	// Not four numbers: ignored (the whole monitor), the rest still read.
+	const char *wa_bad = "{\"version\": 1, \"windows\": [{\"pid\": 100, \"frame\": [10, 40, 100, 100],"
+	                     " \"monitor\": {\"x\": 0, \"y\": 0, \"w\": 1920, \"h\": 1080,"
+	                     " \"work_area\": [0, 32, 1920]}}]}";
+	CHECK(dxr_ss_parse_windows(wa_bad, 100, 0, &in));
+	CHECK(in.own_valid && same_rect(in.mon, R(0, 0, 1920, 1080)) && same_rect(in.work, NOWORK));
+	// Only the app's own window's monitor: another window's work area is not read.
+	const char *wa_other = "{\"version\": 1, \"windows\": [{\"pid\": 100, \"frame\": [10, 40, 100, 100],"
+	                       " \"monitor\": {\"x\": 0, \"y\": 0, \"w\": 1920, \"h\": 1080}},"
+	                       "{\"pid\": 200, \"focus\": true, \"frame\": [0, 0, 50, 50], \"monitor\": {\"x\": 0,"
+	                       " \"y\": 0, \"w\": 1920, \"h\": 1080, \"work_area\": [0, 32, 1920, 1048]}}]}";
+	CHECK(dxr_ss_parse_windows(wa_other, 100, 0, &in));
+	CHECK(in.focus_valid && same_rect(in.work, NOWORK));
+	CHECK(!dxr_ss_parse_windows(NULL, 100, 0, &in) && same_rect(in.work, NOWORK));
+	CHECK(dxr_ss_parse_windows(json, 100, 4000000000ull, &in)); // as above, for what follows
 	CHECK(in.focus_valid && in.focus.x == 2480 && in.focus.w == 800 && in.focus_id == 4000000000ull);
 	CHECK(in.tracked_valid && in.tracked.y == 260);
 
@@ -1103,6 +1267,7 @@ main(void)
 	test_settings();
 	test_coverage();
 	test_find_spot();
+	test_work_area();
 	test_parse();
 	test_start_and_home();
 	test_scenario();

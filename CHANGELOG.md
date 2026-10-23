@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Linux side-step: no place under GNOME's top bar or a dock that stays visible (#399).** The corner places and the clamp used the whole monitor, so a step aside into a top corner put the window under the top bar (a left or bottom one under Ubuntu's dock). They now use the monitor's work area, the part the top bar and such a dock leave to windows, which the DisplayXR GNOME extension reports from version 19 (`monitor.work_area` in its window list, DisplayXR/displayxr-runtime#2293). The window stays on its monitor as before; one too big for the work area goes as far into it as fits. With an older extension (no work area) nothing changes. Native only (`dxr_ss_usable_area`, `dxr_ss_find_spot` in `native~/displayxr_linux_side_step.h`), unit-tested.
+
 ## [2.31.1] - 2026-10-22
 
 ### Fixed
