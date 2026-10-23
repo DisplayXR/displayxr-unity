@@ -14,6 +14,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   - Off: `DisplayXRTargetDisplay.PlaceOnPanelAtStart = false` before the session's second frame, a `DisplayXRTargetDisplay` with **Move On Start** off, or `DISPLAYXR_PANEL_PLACEMENT=0` (`off`, `no`, `false`) for a run.
   - X11 / XWayland players, Windows and macOS are unchanged (`DisplayXRTargetDisplay` opts in there). Native: `dxr_prov_place_window_at_start`, `dxr_wl_place_player_at_start` (Wayland library ABI 11); the decision is unit-tested (`dxr_wl_startup_action` in `native~/displayxr_linux_wayland_place.h`).
 
+### Fixed
+- **Linux native Wayland: a window moved onto the 3D panel at start no longer shrinks at every launch (#266, #361).** A move onto the panel (`DisplayXRTargetDisplay`, a saved position the app restores) kept the window's device size. A window that opened on a lower-scale monitor (a 133 % laptop, a casting tool's 100 % virtual display) so got a smaller logical size on a 200 % panel, which the player saved and opened with the next time: 600, 400, 267, 178 px wide over four launches in the harness. A placement made while the window is new (shown less than 3 s ago, not moved by the user) now keeps the logical size the window opened with, as if it had opened there. A size the app asks for (`displayxr_resize_overlay`) is unaffected; X11, Windows and macOS are unchanged.
+
 ## [2.33.0] - 2026-10-25
 
 ### Added
