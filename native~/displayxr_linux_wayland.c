@@ -64,7 +64,6 @@
 #include "displayxr_linux_wayland_lib.h"
 #include "displayxr_linux_wayland_output.h"
 #include "displayxr_linux_wayland_place.h"
-#include "displayxr_linux_sdl_fixups.h"
 #include "displayxr_linux_uri_list.h"
 #include "displayxr_linux_clipboard.h"
 
@@ -3756,9 +3755,5 @@ dxr_wl_lib_init(const DxrWlHost *host)
 	    !host->player_presents_alpha)
 		return NULL;
 	s_host = host;
-	// Unity's SDL (displayxr_linux_sdl_fixups.h): from here on this library is never
-	// unloaded (the plugin keeps every library whose init answered), so its wrappers
-	// can sit in SDL's tables.
-	dxr_sdl_fixups_install();
 	return &s_api;
 }

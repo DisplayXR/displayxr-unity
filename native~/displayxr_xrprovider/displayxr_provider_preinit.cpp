@@ -318,10 +318,18 @@ static UnityXRPreInitProvider s_preinit_provider = {
 #if defined(ENABLE_VULKAN) && defined(__linux__) && !defined(__ANDROID__)
 #include "../displayxr_linux_wayland.h"
 #endif
+#if defined(__linux__) && !defined(__ANDROID__)
+#include "../displayxr_linux_sdl_fixups.h"
+#endif
 
 extern "C" UNITY_INTERFACE_EXPORT void UNITY_INTERFACE_API
 XRSDKPreInit(IUnityInterfaces *interfaces)
 {
+#if defined(__linux__) && !defined(__ANDROID__)
+	// Unity's embedded SDL2 (displayxr_linux_sdl_fixups.c): as early as the plug-in
+	// runs, before the player's window or any monitor change. Needs no interface.
+	dxr_sdl_fixups_install();
+#endif
 #if defined(ENABLE_VULKAN)
 	if (!interfaces) return;
 	IUnityXRPreInit *preinit = UNITY_GET_INTERFACE(interfaces, IUnityXRPreInit);

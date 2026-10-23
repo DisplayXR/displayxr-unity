@@ -13,11 +13,12 @@
 // poisoned and remembered, so a walk into one is seen instead of crashing.
 //  - the fix installed: removals at the head, middle and tail and of the only node,
 //    then adds, never walk a freed node;
-//  - the kill switch (DXR_SDLFIX=off): nothing swapped, and the model walks the freed
+//  - the kill switch (DISPLAYXR_SDL_FIXUPS=off): nothing swapped, and the model walks the freed
 //    node (the crash), so the model reproduces the bug;
 //  - every verification refuses a mismatch (either table entry, each code signature,
 //    a table outside RELRO) and leaves the table as it was;
-//  - the real build entry agrees with its own signatures (addresses and offsets).
+//  - the real build entry agrees with its own signatures (addresses and offsets);
+//  - a process without UnityPlayer.so (this test) gets nothing installed.
 
 #include "displayxr_linux_sdl_fixups.h"
 
@@ -38,7 +39,7 @@ static int s_failed;
 		}                                                                                                  \
 	} while (0)
 
-#define AT DXR_SDL_AT
+#define AT(p, off, T) (*(T *)((char *)(p) + (off)))
 #define NODE_SIZE 0xf0 // sizeof(SDL_WaylandOutputData) in this SDL
 
 static const struct dxr_sdl_build *R; // the real 6000.4.6f1 entry: the model uses its offsets
@@ -198,13 +199,13 @@ image_new(int mutation)
 	model_reset();
 	s_this_slot = (char **)(s_base + img.b.video_device);
 	*s_this_slot = m.dev;
-	dxr_sdl_fixups_test_reset();
 }
 
 static unsigned
 image_install(void)
 {
-	return dxr_sdl_fixups_install_image(&img.b, s_base, s_base + (uintptr_t)img.pg, s_base + 2 * (uintptr_t)img.pg);
+	dxr_sdl_fixups_test_relro(s_base + (uintptr_t)img.pg, s_base + 2 * (uintptr_t)img.pg);
+	return dxr_sdl_fixups_install_build(&img.b, s_base);
 }
 
 //! libwayland dispatching wl_registry.global_remove to SDL's listener.
@@ -246,29 +247,42 @@ static void
 test_find_build(void)
 {
 	CHECK(R != NULL);
-	CHECK(dxr_sdl_find_build("4ae6b3f45943aa2cf6ca0d0ac4fdec503e60e55c") == R);
-	CHECK(dxr_sdl_find_build("4AE6B3F45943AA2CF6CA0D0AC4FDEC503E60E55C") == NULL); // we print lower case
-	CHECK(dxr_sdl_find_build("4ae6b3f45943aa2cf6ca0d0ac4fdec503e60e55") == NULL);
-	CHECK(dxr_sdl_find_build("0000000000000000000000000000000000000000") == NULL);
-	CHECK(dxr_sdl_find_build("") == NULL);
-	CHECK(dxr_sdl_find_build(NULL) == NULL);
+	CHECK(dxr_sdl_fixups_find_build("4ae6b3f45943aa2cf6ca0d0ac4fdec503e60e55c") == R);
+	CHECK(dxr_sdl_fixups_find_build("4AE6B3F45943AA2CF6CA0D0AC4FDEC503E60E55C") == NULL); // we print lower case
+	CHECK(dxr_sdl_fixups_find_build("4ae6b3f45943aa2cf6ca0d0ac4fdec503e60e55") == NULL);
+	CHECK(dxr_sdl_fixups_find_build("0000000000000000000000000000000000000000") == NULL);
+	CHECK(dxr_sdl_fixups_find_build("") == NULL);
+	CHECK(dxr_sdl_fixups_find_build(NULL) == NULL);
+}
+
+//! The DISPLAYXR_SDL_FIXUPS values: what an install on a fresh image puts in.
+static unsigned
+install_with_env(const char *value)
+{
+	if (value)
+		setenv("DISPLAYXR_SDL_FIXUPS", value, 1);
+	else
+		unsetenv("DISPLAYXR_SDL_FIXUPS");
+	image_new(MUT_NONE);
+	unsigned got = image_install();
+	CHECK((img.table[1] != (void *)&sdl_remove) == (got == DXR_SDLFIX_OUTPUTS));
+	unsetenv("DISPLAYXR_SDL_FIXUPS");
+	return got;
 }
 
 static void
 test_wanted(void)
 {
-	CHECK(dxr_sdl_fixups_wanted(NULL) == DXR_SDLFIX_ALL);
-	CHECK(dxr_sdl_fixups_wanted("") == DXR_SDLFIX_ALL);
-	CHECK(dxr_sdl_fixups_wanted("1") == DXR_SDLFIX_ALL);
-	CHECK(dxr_sdl_fixups_wanted("on") == DXR_SDLFIX_ALL);
-	CHECK(dxr_sdl_fixups_wanted("off") == 0);
-	CHECK(dxr_sdl_fixups_wanted("0") == 0);
-	CHECK(dxr_sdl_fixups_wanted("outputs") == DXR_SDLFIX_OUTPUTS);
-	CHECK(dxr_sdl_fixups_wanted("clipboard,outputs") == DXR_SDLFIX_OUTPUTS);
-	CHECK(dxr_sdl_fixups_wanted(",outputs,") == DXR_SDLFIX_OUTPUTS);
-	CHECK(dxr_sdl_fixups_wanted("clipboard") == 0);
-	CHECK(dxr_sdl_fixups_wanted("outputsx") == 0);
-	CHECK(dxr_sdl_fixups_wanted("output") == 0);
+	CHECK(DXR_SDLFIX_OUTPUTS == 4u); // 1 and 2: the clipboard and IME fixes
+	CHECK(install_with_env(NULL) == DXR_SDLFIX_OUTPUTS);
+	CHECK(install_with_env("") == DXR_SDLFIX_OUTPUTS);
+	CHECK(install_with_env("1") == DXR_SDLFIX_OUTPUTS);
+	CHECK(install_with_env("outputs") == DXR_SDLFIX_OUTPUTS);
+	CHECK(install_with_env("clipboard,outputs") == DXR_SDLFIX_OUTPUTS);
+	CHECK(install_with_env("off") == 0);
+	CHECK(install_with_env("0") == 0);
+	CHECK(install_with_env("clipboard") == 0);
+	CHECK(install_with_env("clipboard,ime") == 0);
 }
 
 //! Builds the list @p ids, unlinks @p target_id, returns the ids left ("" for none).
@@ -358,7 +372,7 @@ test_real_entry_consistent(void)
 static void
 test_fix(void)
 {
-	unsetenv("DXR_SDLFIX");
+	unsetenv("DISPLAYXR_SDL_FIXUPS");
 	image_new(MUT_NONE);
 	CHECK(image_install() == DXR_SDLFIX_OUTPUTS);
 	CHECK(img.table[0] == (void *)&sdl_global);         // add: untouched
@@ -400,7 +414,7 @@ test_kill_switch_reproduces_bug(void)
 {
 	const char *offs[] = {"off", "0", "clipboard"};
 	for (int i = 0; i < 3; i++) {
-		setenv("DXR_SDLFIX", offs[i], 1);
+		setenv("DISPLAYXR_SDL_FIXUPS", offs[i], 1);
 		image_new(MUT_NONE);
 		CHECK(image_install() == 0);
 		CHECK(img.table[1] == (void *)&sdl_remove);
@@ -412,16 +426,13 @@ test_kill_switch_reproduces_bug(void)
 		model_add(6);
 		CHECK(m.walked_freed == 1); // the player's crash
 	}
-	setenv("DXR_SDLFIX", "outputs", 1);
-	image_new(MUT_NONE);
-	CHECK(image_install() == DXR_SDLFIX_OUTPUTS);
-	unsetenv("DXR_SDLFIX");
+	unsetenv("DISPLAYXR_SDL_FIXUPS");
 }
 
 static void
 test_refusals(void)
 {
-	unsetenv("DXR_SDLFIX");
+	unsetenv("DISPLAYXR_SDL_FIXUPS");
 	for (int mut = MUT_GLOBAL; mut <= MUT_SIG3; mut++) {
 		image_new(mut);
 		void *before = img.table[1];
@@ -430,10 +441,10 @@ test_refusals(void)
 	}
 	// A table outside RELRO (here: RELRO said to be the data page).
 	image_new(MUT_NONE);
-	CHECK(dxr_sdl_fixups_install_image(&img.b, s_base, s_base + 2 * (uintptr_t)img.pg,
-	                                   s_base + 3 * (uintptr_t)img.pg) == 0);
+	dxr_sdl_fixups_test_relro(s_base + 2 * (uintptr_t)img.pg, s_base + 3 * (uintptr_t)img.pg);
+	CHECK(dxr_sdl_fixups_install_build(&img.b, s_base) == 0);
 	CHECK(img.table[1] == (void *)&sdl_remove);
-	CHECK(dxr_sdl_outputs_check(&img.b, s_base, s_base + (uintptr_t)img.pg, s_base + 2 * (uintptr_t)img.pg) == NULL);
+	CHECK(image_install() == DXR_SDLFIX_OUTPUTS); // the same image, RELRO right
 }
 
 static void
@@ -446,7 +457,9 @@ test_process_without_unityplayer(void)
 int
 main(void)
 {
-	R = dxr_sdl_find_build("4ae6b3f45943aa2cf6ca0d0ac4fdec503e60e55c");
+	unsetenv("DISPLAYXR_SDL_FIXUPS");
+	unsetenv("DISPLAYXR_SDL_FIXUPS_LOG");
+	R = dxr_sdl_fixups_find_build("4ae6b3f45943aa2cf6ca0d0ac4fdec503e60e55c");
 	if (!R) {
 		fprintf(stderr, "FAIL: no 6000.4.6f1 entry\n");
 		return 1;
