@@ -105,6 +105,12 @@ int dxr_wl_take_player_size(int *out_w, int *out_h);
 //! only when exactly one output has it), centred. 1 when it is there or will be
 //! once mapped; placement is asynchronous (the GNOME extension's worker).
 int dxr_wl_move_player_to_panel(const char *connector, int panel_w, int panel_h);
+//! The start-up placement (on by default; dxr_prov_place_window_at_start): the same
+//! move, unless the app or the user has placed the window this run, or it is on the
+//! panel already. A window not shown yet is decided once it is (within a few
+//! seconds). Returns a DXR_WL_STARTUP_* (displayxr_linux_wayland_place.h); 0 without
+//! a native-Wayland session, the extension or a single matching output.
+int dxr_wl_place_player_at_start(const char *connector, int panel_w, int panel_h);
 //! The window's position / a new position in X root coordinates (the space the
 //! X11 path saves and restores). get: 1 when known now; otherwise the out values
 //! are the last known position (untouched if there never was one). set: a

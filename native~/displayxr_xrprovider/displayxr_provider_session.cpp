@@ -200,6 +200,7 @@ extern "C" void dxr_pvk_destroy_device(void);
 #if defined(__linux__) && !defined(__ANDROID__)
 // Native-Wayland player: displayxr_provider_wl_capture.cpp + displayxr_linux_wayland.c.
 #include "../displayxr_linux_wayland.h"
+#include "../displayxr_linux_wayland_place.h" // DXR_WL_STARTUP_*, dxr_startup_placement_env_off
 extern "C" void dxr_pvk_keep_instance_alive(void);
 #endif
 extern "C" int  dxr_pvk_device_ready(void);
@@ -8649,6 +8650,45 @@ int dxr_prov_move_window_to_display(void)
 	}
 	return displayxr_linux_move_app_window_to_rect((int)s_ps.desktop_origin_x,
 	                                               (int)s_ps.desktop_origin_y, (int)pw, (int)ph);
+#else
+	return 0;
+#endif
+}
+
+// The start-up placement (on by default; DisplayXRTargetDisplay.PlaceOnPanelAtStart
+// asks once per run, a couple of frames into the session). Native-Wayland players
+// only for now: mutter opens a new window on the monitor under the pointer, which
+// can be a casting tool's virtual monitor nobody sees. X11 / XWayland, Windows and
+// macOS keep today's behaviour (DisplayXRTargetDisplay opts in). The Wayland library
+// decides against the app's and the user's own placement (displayxr_linux_wayland.c,
+// "The start-up placement").
+int dxr_prov_place_window_at_start(void)
+{
+#if defined(__linux__) && !defined(__ANDROID__)
+	const char *env = getenv("DISPLAYXR_PANEL_PLACEMENT");
+	if (dxr_startup_placement_env_off(env)) {
+		ps_log("[DisplayXR-PROV] start-up placement: off (DISPLAYXR_PANEL_PLACEMENT=%s)\n", env);
+		return 0;
+	}
+	if (displayxr_is_shell_mode()) // (always 0 on Linux today; the shell places its tiles)
+		return 0;
+	if (!s_ps.wl_weave) {
+		ps_log("[DisplayXR-PROV] start-up placement: not a native-Wayland player - the window stays where it "
+		       "opened (DisplayXRTargetDisplay moves it)\n");
+		return 0;
+	}
+	// Only onto a panel the runtime located: never onto a fallback-to-primary rect
+	// (sim_display, no 3D display connected).
+	if (s_ps.panel_confirmed != 1) {
+		ps_log("[DisplayXR-PROV] start-up placement: the runtime did not confirm a 3D panel - leaving the window "
+		       "where it opened\n");
+		return 0;
+	}
+	int act = dxr_wl_place_player_at_start(s_ps.panel_connector, (int)s_ps.display_info.pixel_width,
+	                                       (int)s_ps.display_info.pixel_height);
+	ps_log("[DisplayXR-PROV] start-up placement (Wayland): panel '%s' %ux%u px -> %d\n", s_ps.panel_connector,
+	       s_ps.display_info.pixel_width, s_ps.display_info.pixel_height, act);
+	return act;
 #else
 	return 0;
 #endif

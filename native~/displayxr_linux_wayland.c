@@ -87,6 +87,7 @@
 #define DXR_WL_VERIFY_DELAY_MS 350 // ... this long after each: ~1 s for all of them
 #define DXR_WL_RESTORE_WINDOW_NS 3000000000LL // a saved position is checked until 3 s after the first map
 #define DXR_WL_SIZE_SETTLE_NS 1000000000LL    // a size handed to the player is checked 1 s later
+#define DXR_WL_STARTUP_WAIT_NS 5000000000LL   // the start-up placement waits this long for the window to show
 
 #define DXR_WL_DROP_QUEUE 32               // file-drop events kept for the app (oldest dropped past it)
 #define DXR_WL_DROP_READ_MAX (1u << 20)    // a longer text/uri-list is not a file list we take
@@ -256,6 +257,17 @@ static struct {
 	int restore_open;
 	long long first_map_ns;
 	int drag_end_pending; // log where the user left the window, once reported
+
+	// The start-up placement (dxr_wl_place_player_at_start). app_placed: the app
+	// (its own position, a move to the panel, the side-step) or the user (a drag)
+	// placed the window this run, so the start-up placement stands down; never
+	// cleared. startup_pending: the window was not shown yet when it was asked for;
+	// decided at its first report, until startup_until_ns.
+	int app_placed;
+	int startup_pending;
+	long long startup_until_ns;
+	char startup_connector[64];
+	int startup_w, startup_h;
 
 	// The 3D panel as the runtime reports it in X root coordinates: the space the
 	// app-facing position API speaks (displayxr_get/set_overlay_position).
@@ -1042,6 +1054,7 @@ dxr_wl_weave_destroy(void)
 	s_wl.intent_blocked = 0;
 	s_wl.restore_open = 0;
 	s_wl.drag_end_pending = 0;
+	s_wl.startup_pending = 0;
 	stop_verify_locked();
 	s_wl.size_fixups = 0;
 	s_wl.wanted_device_w = s_wl.wanted_device_h = 0;
@@ -1389,6 +1402,8 @@ static void
 user_moved_locked(void)
 {
 	s_wl.restore_open = 0;
+	s_wl.app_placed = 1; // and no start-up placement after it
+	s_wl.startup_pending = 0;
 	stop_verify_locked();
 }
 
@@ -1556,6 +1571,7 @@ take_window_locked(const DxrWlExtWindow *w)
 }
 
 static void drop_focus_report_locked(const DxrWlExtWindow *w);
+static int startup_place_locked(void);
 
 static void
 ext_window(const DxrWlExtWindow *w, int after_move, int moved)
@@ -1637,6 +1653,19 @@ ext_window(const DxrWlExtWindow *w, int after_move, int moved)
 		else
 			fprintf(stderr, "[DisplayXR-WL] window drag: left at (%d,%d) on '%s' (no X root conversion)\n", w->x,
 			        w->y, on ? on->name : "?");
+	}
+	// The start-up placement was asked for before the window was shown: decide now.
+	if (s_wl.startup_pending && !w->moving && !s_wl.drag_state) {
+		if (!was_mapped) {
+			s_wl.corrections = 0;
+			s_wl.intent_blocked = 0;
+		}
+		if (startup_place_locked() == DXR_WL_STARTUP_MOVE) {
+			if (!s_wl.move_inflight)
+				schedule_verify_locked(); // (a move's result schedules it otherwise)
+			pthread_mutex_unlock(&s_wl_mutex);
+			return;
+		}
 	}
 	if (!was_mapped) {
 		// Just (re)mapped: the compositor has placed it by its own rules.
@@ -2221,16 +2250,11 @@ layout_or_warn_locked(void)
 	return layout;
 }
 
-static int
-dxr_wl_move_player_to_panel(const char *connector, int panel_w, int panel_h)
+//! The 3D panel's output: by connector name (unambiguous); by mode only when
+//! exactly one output has it. NULL (logged) when there is none.
+static struct dxr_wl_output *
+panel_output_locked(const char *connector, int panel_w, int panel_h)
 {
-	pthread_mutex_lock(&s_wl_mutex);
-	if (!s_wl.surface) {
-		pthread_mutex_unlock(&s_wl_mutex);
-		return 0;
-	}
-	wl_display_dispatch_queue_pending(s_wl.display, s_wl.queue);
-	// By connector name (unambiguous); by mode only when exactly one output has it.
 	struct dxr_wl_output *panel = output_named_locked(connector);
 	if (!panel) {
 		int matches = 0;
@@ -2244,10 +2268,40 @@ dxr_wl_move_player_to_panel(const char *connector, int panel_w, int panel_h)
 		if (matches > 1)
 			panel = NULL;
 	}
-	if (!panel) {
-		pthread_mutex_unlock(&s_wl_mutex);
+	if (!panel)
 		fprintf(stderr, "[DisplayXR-WL] 3D panel: no single output named '%s' or with a %dx%d mode\n",
 		        connector ? connector : "", panel_w, panel_h);
+	return panel;
+}
+
+//! Centre the window on `panel`; from here on every placement is read back until
+//! the window is there (#361).
+static void
+send_to_panel_locked(struct dxr_wl_output *panel, int layout)
+{
+	snprintf(s_wl.verify_panel, sizeof(s_wl.verify_panel), "%s", panel->name);
+	s_wl.verify_tries = 0;
+	int x, y;
+	panel_centre_locked(panel, layout, &x, &y);
+	char why[96];
+	snprintf(why, sizeof(why), "3D panel '%s' (stage %dx%d at %d,%d)", panel->name, panel->lw, panel->lh, panel->lx,
+	         panel->ly);
+	set_intent_locked(x, y, why);
+	snprintf(s_wl.intent_centred_on, sizeof(s_wl.intent_centred_on), "%s", panel->name);
+}
+
+static int
+dxr_wl_move_player_to_panel(const char *connector, int panel_w, int panel_h)
+{
+	pthread_mutex_lock(&s_wl_mutex);
+	if (!s_wl.surface) {
+		pthread_mutex_unlock(&s_wl_mutex);
+		return 0;
+	}
+	wl_display_dispatch_queue_pending(s_wl.display, s_wl.queue);
+	struct dxr_wl_output *panel = panel_output_locked(connector, panel_w, panel_h);
+	if (!panel) {
+		pthread_mutex_unlock(&s_wl_mutex);
 		return 0;
 	}
 	int layout = layout_or_warn_locked();
@@ -2258,6 +2312,9 @@ dxr_wl_move_player_to_panel(const char *connector, int panel_w, int panel_h)
 			        panel->name);
 		return 0;
 	}
+	// The app placed the window itself: no start-up placement after this.
+	s_wl.app_placed = 1;
+	s_wl.startup_pending = 0;
 	// Already there: leave it, as the X11 and Windows paths do.
 	if (win_mapped(&s_wl.win)) {
 		int cx = s_wl.win.x + s_wl.win.w / 2, cy = s_wl.win.y + s_wl.win.h / 2;
@@ -2266,18 +2323,99 @@ dxr_wl_move_player_to_panel(const char *connector, int panel_w, int panel_h)
 			return 1;
 		}
 	}
-	// From here on, every placement is read back until the window is there (#361).
-	snprintf(s_wl.verify_panel, sizeof(s_wl.verify_panel), "%s", panel->name);
-	s_wl.verify_tries = 0;
-	int x, y;
-	panel_centre_locked(panel, layout, &x, &y);
-	char why[96];
-	snprintf(why, sizeof(why), "3D panel '%s' (stage %dx%d at %d,%d)", panel->name, panel->lw, panel->lh, panel->lx,
-	         panel->ly);
-	set_intent_locked(x, y, why);
-	snprintf(s_wl.intent_centred_on, sizeof(s_wl.intent_centred_on), "%s", panel->name);
+	send_to_panel_locked(panel, layout);
 	pthread_mutex_unlock(&s_wl_mutex);
 	return 1;
+}
+
+/*
+ * The start-up placement (on by default; the provider's
+ * dxr_prov_place_window_at_start asks for it once, a couple of frames after the
+ * session started). mutter opens a new window on the monitor under the pointer,
+ * which can be any monitor: a casting tool's virtual one the user cannot see, the
+ * laptop's. The 3D panel is where a DisplayXR app is meant to be seen, so the
+ * window goes there, centred, unless someone has placed it already:
+ *   - the app: its own position (displayxr_set_overlay_position, e.g. a saved one
+ *     it restores; a stale one is still checked against the panel, #361), a move
+ *     to the panel (DisplayXRTargetDisplay), the side-step;
+ *   - the user: a drag.
+ * Whatever comes first wins: the app's position after the start-up placement
+ * replaces it as any later position does. Once per run (C# asks once); a window
+ * not shown yet is decided when it is, but not after DXR_WL_STARTUP_WAIT_NS (no
+ * late jump).
+ */
+
+//! Decide with the window as last reported (startup_connector / _w / _h). Returns
+//! a DXR_WL_STARTUP_*, 0 when it cannot be done here (logged).
+static int
+startup_place_locked(void)
+{
+	struct dxr_wl_output *panel = panel_output_locked(s_wl.startup_connector, s_wl.startup_w, s_wl.startup_h);
+	int layout = panel ? layout_or_warn_locked() : DXR_LAYOUT_UNKNOWN;
+	if (!panel || layout == DXR_LAYOUT_UNKNOWN || (s_wl.ext_known && !s_wl.ext_available)) {
+		if (panel && layout != DXR_LAYOUT_UNKNOWN)
+			fprintf(stderr, "[DisplayXR-WL] start-up placement: no DisplayXR GNOME extension to move the window\n");
+		s_wl.startup_pending = 0;
+		return 0;
+	}
+	const DxrWlExtWindow *w = &s_wl.win;
+	DxrWlRect4 mon = {w->mon_x, w->mon_y, w->mon_w, w->mon_h};
+	int shown = s_wl.ext_known && win_mapped(w);
+	int act = dxr_wl_startup_action(s_wl.app_placed, shown, output_rect(panel), mon, w->x, w->y, w->w, w->h, mono_ns(),
+	                                s_wl.startup_until_ns);
+	s_wl.startup_pending = act == DXR_WL_STARTUP_WAIT;
+	switch (act) {
+	case DXR_WL_STARTUP_PLACED:
+		fprintf(stderr, "[DisplayXR-WL] start-up placement: the app or the user placed the window: leaving it\n");
+		break;
+	case DXR_WL_STARTUP_EXPIRED:
+		fprintf(stderr, "[DisplayXR-WL] start-up placement: the window was not shown in time: leaving it\n");
+		break;
+	case DXR_WL_STARTUP_WAIT:
+		fprintf(stderr, "[DisplayXR-WL] start-up placement: deciding once the window is shown\n");
+		break;
+	case DXR_WL_STARTUP_THERE:
+		fprintf(stderr, "[DisplayXR-WL] start-up placement: the window opened on the 3D panel '%s': leaving it\n",
+		        panel->name);
+		break;
+	case DXR_WL_STARTUP_MOVE:
+		fprintf(stderr, "[DisplayXR-WL] start-up placement: the window opened at (%d,%d %dx%d) on the monitor at "
+		                "(%d,%d %dx%d), not the 3D panel '%s': moving it there\n",
+		        w->x, w->y, w->w, w->h, w->mon_x, w->mon_y, w->mon_w, w->mon_h, panel->name);
+		// As if it had opened there: the player restored the LOGICAL size it saved
+		// last time, normally on the panel, so keep that size there. Keeping the
+		// device size instead (what a move does) shrinks a window that opened on a
+		// lower-scale monitor at every start, since the player saves the smaller
+		// logical size it then has on the panel. A size the app asked for stands.
+		if (!s_wl.wanted_by_app && s_wl.logical_w > 0 && s_wl.logical_h > 0) {
+			uint32_t p120 = output_scale120_locked(panel, layout);
+			if (p120) {
+				s_wl.wanted_device_w = (int)lround(s_wl.logical_w * (p120 / 120.0));
+				s_wl.wanted_device_h = (int)lround(s_wl.logical_h * (p120 / 120.0));
+			}
+		}
+		send_to_panel_locked(panel, layout);
+		break;
+	}
+	return act;
+}
+
+static int
+dxr_wl_place_player_at_start(const char *connector, int panel_w, int panel_h)
+{
+	pthread_mutex_lock(&s_wl_mutex);
+	if (!s_wl.surface) {
+		pthread_mutex_unlock(&s_wl_mutex);
+		return 0;
+	}
+	wl_display_dispatch_queue_pending(s_wl.display, s_wl.queue);
+	snprintf(s_wl.startup_connector, sizeof(s_wl.startup_connector), "%s", connector ? connector : "");
+	s_wl.startup_w = panel_w;
+	s_wl.startup_h = panel_h;
+	s_wl.startup_until_ns = mono_ns() + DXR_WL_STARTUP_WAIT_NS;
+	int act = startup_place_locked();
+	pthread_mutex_unlock(&s_wl_mutex);
+	return act;
 }
 
 static void
@@ -2357,6 +2495,9 @@ dxr_wl_set_player_position_x11(int x, int y)
 		pthread_mutex_unlock(&s_wl_mutex);
 		return 0;
 	}
+	// The app places its window itself: no start-up placement after this.
+	s_wl.app_placed = 1;
+	s_wl.startup_pending = 0;
 	// A saved position restored at start (#361): one saved under another monitor
 	// layout can lie anywhere today. Off the 3D panel, it is stale: centre on the
 	// panel instead. (Only while the window is new and the user has not moved it;
@@ -2419,6 +2560,8 @@ dxr_wl_set_player_position_stage(int x, int y, int log)
 	pthread_mutex_lock(&s_wl_mutex);
 	int ok = s_wl.surface && s_wl.ext_available;
 	if (ok) {
+		s_wl.app_placed = 1; // (never before the start-up placement in practice: it waits for a still window)
+		s_wl.startup_pending = 0;
 		if (!s_wl.intent_valid || x != s_wl.intent_x || y != s_wl.intent_y) {
 			s_wl.corrections = 0;
 			s_wl.warned &= ~DXR_WARN_GAVE_UP;
@@ -3745,6 +3888,7 @@ static const DxrWlApi s_api = {
     .clipboard_read = dxr_wl_clipboard_read,
     .clipboard_write = dxr_wl_clipboard_write,
     .set_player_position_stage = dxr_wl_set_player_position_stage,
+    .place_player_at_start = dxr_wl_place_player_at_start,
 };
 
 __attribute__((visibility("default"))) const DxrWlApi *

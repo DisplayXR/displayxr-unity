@@ -83,6 +83,52 @@ main(void)
 	CHECK(dxr_wl_sent_size_outcome(until + 5, until, 800, 644, 800, 483) == -1); // half of it
 	CHECK(dxr_wl_sent_size_outcome(until, until, 0, 0, 600, 483) == 1);          // nothing sent
 
+	// The start-up placement. The harness's casting case: the panel (Meta-0) at
+	// stage (0,0) 1920x1080, a casting tool's virtual monitor at (2880,0) 1920x1080
+	// with the pointer on it, where mutter maps the 640x424 window.
+	const DxrWlRect4 panel = {0, 0, 1920, 1080};
+	const DxrWlRect4 virt = {2880, 0, 1920, 1080};
+	const DxrWlRect4 nomon = {0, 0, 0, 0};
+	const long long t0 = 1000000000LL, lim = t0 + 5000000000LL;
+	// Opened on the virtual monitor: move it.
+	CHECK(dxr_wl_startup_action(0, 1, panel, virt, 3520, 328, 640, 424, t0, lim) == DXR_WL_STARTUP_MOVE);
+	// Opened on the panel (the pointer was there): leave it.
+	CHECK(dxr_wl_startup_action(0, 1, panel, panel, 640, 328, 640, 424, t0, lim) == DXR_WL_STARTUP_THERE);
+	// No monitor reported (older extension): the frame's centre decides.
+	CHECK(dxr_wl_startup_action(0, 1, panel, nomon, 640, 328, 640, 424, t0, lim) == DXR_WL_STARTUP_THERE);
+	CHECK(dxr_wl_startup_action(0, 1, panel, nomon, 3520, 328, 640, 424, t0, lim) == DXR_WL_STARTUP_MOVE);
+	// Straddling the panel's right edge: top-left on the panel, centre past it.
+	CHECK(dxr_wl_startup_action(0, 1, panel, nomon, 1700, 0, 640, 424, t0, lim) == DXR_WL_STARTUP_MOVE);
+	// The app (a restored position, DisplayXRTargetDisplay) or the user placed it: theirs, wherever it is.
+	CHECK(dxr_wl_startup_action(1, 1, panel, virt, 3520, 328, 640, 424, t0, lim) == DXR_WL_STARTUP_PLACED);
+	CHECK(dxr_wl_startup_action(1, 0, panel, nomon, 0, 0, 0, 0, t0, lim) == DXR_WL_STARTUP_PLACED);
+	// Not shown yet: wait, but not past the limit; shown after the limit: no late jump.
+	CHECK(dxr_wl_startup_action(0, 0, panel, nomon, 0, 0, 0, 0, t0, lim) == DXR_WL_STARTUP_WAIT);
+	CHECK(dxr_wl_startup_action(0, 0, panel, nomon, 0, 0, 0, 0, lim + 1, lim) == DXR_WL_STARTUP_EXPIRED);
+	CHECK(dxr_wl_startup_action(0, 1, panel, virt, 3520, 328, 640, 424, lim + 1, lim) == DXR_WL_STARTUP_EXPIRED);
+	CHECK(dxr_wl_startup_action(0, 1, panel, virt, 3520, 328, 640, 424, lim, lim) == DXR_WL_STARTUP_MOVE);
+	// No limit (0): decided whenever it is shown.
+	CHECK(dxr_wl_startup_action(0, 1, panel, virt, 3520, 328, 640, 424, lim * 10, 0) == DXR_WL_STARTUP_MOVE);
+	// The panel at a negative origin (left of the primary), the window on the primary.
+	const DxrWlRect4 left = {-1920, 0, 1920, 1080};
+	const DxrWlRect4 primary = {0, 0, 2560, 1440};
+	CHECK(dxr_wl_startup_action(0, 1, left, primary, 960, 508, 640, 424, t0, lim) == DXR_WL_STARTUP_MOVE);
+	CHECK(dxr_wl_startup_action(0, 1, left, left, -1280, 328, 640, 424, t0, lim) == DXR_WL_STARTUP_THERE);
+
+	// DISPLAYXR_PANEL_PLACEMENT.
+	CHECK(!dxr_startup_placement_env_off(NULL));
+	CHECK(!dxr_startup_placement_env_off(""));
+	CHECK(dxr_startup_placement_env_off("0"));
+	CHECK(dxr_startup_placement_env_off("off"));
+	CHECK(dxr_startup_placement_env_off("OFF"));
+	CHECK(dxr_startup_placement_env_off("No"));
+	CHECK(dxr_startup_placement_env_off("false"));
+	CHECK(!dxr_startup_placement_env_off("1"));
+	CHECK(!dxr_startup_placement_env_off("on"));
+	CHECK(!dxr_startup_placement_env_off("offf"));
+	CHECK(!dxr_startup_placement_env_off("of"));
+	CHECK(!dxr_startup_placement_env_off("00"));
+
 	if (s_failed) {
 		fprintf(stderr, "test_wayland_place: %d check(s) failed\n", s_failed);
 		return 1;

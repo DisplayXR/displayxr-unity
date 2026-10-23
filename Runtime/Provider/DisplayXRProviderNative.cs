@@ -622,6 +622,17 @@ namespace DisplayXR
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern int dxr_prov_move_window_to_display();
 
+        /// <summary>
+        /// The start-up placement (on by default; <see cref="DisplayXRTargetDisplay.PlaceOnPanelAtStart"/>):
+        /// the window goes onto the 3D panel unless the app or the user placed it, it is
+        /// there already, the runtime did not confirm a panel, or
+        /// <c>DISPLAYXR_PANEL_PLACEMENT</c> is <c>0</c>/<c>off</c>. Native-Wayland Linux
+        /// players only for now; 0 everywhere else. 1 moving it, 2 it is there, 3 deciding
+        /// once the window is shown, -1 placed already, -2 not shown in time, 0 not done.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int dxr_prov_place_window_at_start();
+
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern int dxr_prov_request_rendering_mode(uint modeIndex);
 
