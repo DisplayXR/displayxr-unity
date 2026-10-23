@@ -33,8 +33,11 @@ loss with drops on** (at once if drops are turned on while the app is not focuse
 for the rest of the run ("SDL's clipboard is cut"):
 
 - `GUIUtility.systemCopyBuffer` reads stale text: `""`, or an older text SDL still holds.
-- **A write to `GUIUtility.systemCopyBuffer` can crash the player** inside SDL.
 - Turning drops off does not bring SDL's clipboard back.
+
+(A `GUIUtility.systemCopyBuffer` write used to crash the player here, with or without drops; the
+plug-in's SDL fixups fix that — see "Unity's embedded SDL" below. With drops on, after the cut, a
+read still brings stale text as above, so the fields below are still the way to paste then.)
 
 `DisplayXRNative.LinuxClipboardState()` tells which state the app is in:
 
@@ -51,15 +54,14 @@ focus (Wayland's rule; without it, the runtime's `DisplayXRDesktop.GetClipboardT
 `SetClipboardText` under the user's consent). On Unity's main thread a read never blocks: it
 answers `Pending` until the text is in, so call it again next frame (the plug-in ends a read
 after about 3 s). Before the cut both answer `UseSystemCopyBuffer`, and `systemCopyBuffer` is
-still the right clipboard.
+the right clipboard (and no longer crashes — see below).
 
 ## Text fields
 
 Unity's `TMP_InputField` and the legacy `InputField` copy and paste through
 `systemCopyBuffer`: Ctrl+C and Ctrl+X write it, Ctrl+V reads it (the legacy field also copies on
-Ctrl+Insert and pastes on Shift+Insert). In an app with drops on, a user who copies in a text
-field after the cut can crash the player, and a paste brings stale text. Use the DisplayXR
-fields instead:
+Ctrl+Insert and pastes on Shift+Insert). In an app with drops on, after the cut a stock field's
+paste brings stale text. Use the DisplayXR fields instead:
 
 | Instead of | Use | Compiled when the project has |
 |---|---|---|
@@ -102,3 +104,11 @@ fields) are not covered: route their copy and paste the same way, with `LinuxCli
 
 The rules (when to route, which keys, what a copy takes) are pure C#,
 `Runtime/DisplayXRTextClipboardRules.cs`, unit-tested in CI (`Tests~/TextClipboard`).
+
+## Unity's embedded SDL
+
+A `GUIUtility.systemCopyBuffer` write (a stock field's Ctrl+C) used to crash the player on native
+Wayland after another app had copied, with drops on or off — a use-after-free in the 2022 SDL2
+snapshot Unity links into `UnityPlayer.so` (SDL #6007, fixed upstream in SDL 2.24.0). The plug-in now
+applies that upstream fix from outside, so stock fields and `systemCopyBuffer` work on native Wayland
+as they do on a desktop. See [SDL Fixups](linux-sdl-fixups.md); `DISPLAYXR_SDL_FIXUPS=0` turns it off.

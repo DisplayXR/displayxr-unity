@@ -11,8 +11,12 @@
 // output data WITHOUT unlinking it from the output list (the bug); add appends to the
 // list by walking it (where the player crashes on a freed node). A freed node is
 // poisoned and remembered, so a walk into one is seen instead of crashing.
-//  - the fix installed: removals at the head, middle and tail and of the only node,
-//    then adds, never walk a freed node;
+//  - the outputs fix installed: removals at the head, middle and tail and of the only
+//    node, then adds, never walk a freed node;
+//  - the clipboard fix installed: a cancelled source that is the device's selection is
+//    cleared before SDL frees it, another source is left alone, and a model of the next
+//    set_selection never uses the freed source; installed alone ("clipboard"), it still
+//    cross-checks SDL's _this (a change in that signature alone refuses it);
 //  - the kill switch (DISPLAYXR_SDL_FIXUPS=off): nothing swapped, and the model walks the freed
 //    node (the crash), so the model reproduces the bug;
 //  - every verification refuses a mismatch (either table entry, each code signature,
@@ -75,7 +79,7 @@ static void
 model_reset(void)
 {
 	memset(&m, 0, sizeof(m));
-	m.dev = calloc(1, 0x400);
+	m.dev = calloc(1, 0x800); // up to ->driverdata (+0x5c8)
 	m.video_data = calloc(1, 0x200);
 	AT(m.dev, R->off_displays, char *) = calloc(64, R->sizeof_display);
 }
@@ -159,6 +163,65 @@ model_list(void)
 }
 
 /*
+ * A model of this SDL's clipboard (SDL_VideoData / SDL_WaylandInput / SDL_WaylandDataDevice,
+ * at the real offsets) and its data_source_handle_cancelled.
+ */
+
+static struct {
+	char *video_data;      // _this->driverdata (+0x5c8)
+	char *input;           // ->input (+0xc8)
+	char *data_device;     // ->data_device (+0x28), its selection_source at +0x30
+	int cancelled_calls;
+	int used_freed_source; // the next set_selection destroyed a freed source: the player's crash
+} cm;
+
+static void
+clip_model_reset(void)
+{
+	memset(&cm, 0, sizeof(cm));
+	cm.video_data = calloc(1, 0x600);
+	cm.input = calloc(1, 0x100);
+	cm.data_device = calloc(1, 0x40);
+	AT(m.dev, R->off_driverdata, char *) = cm.video_data;
+	AT(cm.video_data, R->off_input, char *) = cm.input;
+	AT(cm.input, R->off_data_device, char *) = cm.data_device;
+}
+
+static void *
+clip_selection(void)
+{
+	return AT(cm.data_device, R->off_selection_source, void *);
+}
+
+static void
+clip_set_selection(void *source)
+{
+	AT(cm.data_device, R->off_selection_source, void *) = source;
+}
+
+//! data_source_handle_cancelled -> Wayland_data_source_destroy: SDL frees the source. It
+//! does NOT clear selection_source (the bug); the chunk is poisoned and remembered.
+static void
+sdl_source_cancelled(void *data, void *source)
+{
+	(void)source;
+	cm.cancelled_calls++;
+	memset(data, 0xc1, 0x18); // free(); the allocator writes its own pointer at word 0
+	m.freed[m.n_freed++] = data;
+}
+
+//! A later Wayland_data_device_set_selection destroying the old selection_source: if that
+//! source was freed, this is the use-after-free (wl_proxy_marshal on freed memory).
+static void
+clip_model_set_selection(void *new_source)
+{
+	void *old = clip_selection();
+	if (old && is_freed(old))
+		cm.used_freed_source++;
+	clip_set_selection(new_source);
+}
+
+/*
  * The fake image.
  */
 
@@ -168,10 +231,19 @@ static struct {
 	struct dxr_sdl_build b;
 	struct dxr_sdl_sig sigs[DXR_SDL_OUTPUTS_SIGS];
 	unsigned char sig_bytes[DXR_SDL_OUTPUTS_SIGS][64];
-	void **table;
+	unsigned char clip_sig_bytes[DXR_SDL_CLIPBOARD_SIGS][64];
+	void **table;    // the wl_registry listener (outputs)
+	void **cs_table; // the wl_data_source listener (clipboard)
 } img;
 
-enum { MUT_NONE, MUT_GLOBAL, MUT_REMOVE, MUT_SIG0, MUT_SIG1, MUT_SIG2, MUT_SIG3, MUT_RW_PAGE };
+enum {
+	MUT_NONE,
+	MUT_GLOBAL, MUT_REMOVE,                 // outputs: a wrong table entry
+	MUT_SIG0, MUT_SIG1, MUT_SIG2, MUT_SIG3, // outputs: a byte signature off
+	MUT_RW_PAGE,                            // the "RELRO" page left writable
+	MUT_CS_CANCELLED,                       // clipboard: a wrong cancelled entry
+	MUT_CS0, MUT_CS1, MUT_CS2, MUT_CS3, MUT_CS4, MUT_CS5 // clipboard: a byte signature off (CS5: SetClipboardText / _this)
+};
 
 static void
 image_new(int mutation)
@@ -194,14 +266,32 @@ image_new(int mutation)
 			img.mem[0x100 * i + s->len / 2] ^= 0x01;
 		img.b.outputs_sigs[i] = img.sigs[i];
 	}
+	// The clipboard: SDL's wl_data_source listener (another table in the "RELRO" page), its
+	// cancelled handler, its code signatures (past the outputs ones) at the real bytes.
+	img.b.data_source_listener = (uintptr_t)img.pg + 0x200;
+	img.b.data_source_cancelled = (uintptr_t)&sdl_source_cancelled - s_base;
+	for (int i = 0; i < DXR_SDL_CLIPBOARD_SIGS; i++) {
+		const struct dxr_sdl_sig *cs = &R->clipboard_sigs[i];
+		unsigned off = 0x400 + 0x100 * (unsigned)i;
+		memcpy(img.clip_sig_bytes[i], cs->bytes, cs->len);
+		memcpy(img.mem + off, cs->bytes, cs->len);
+		if (mutation == MUT_CS0 + i)
+			img.mem[off + cs->len / 2] ^= 0x01;
+		img.b.clipboard_sigs[i] = (struct dxr_sdl_sig){(uintptr_t)off, img.clip_sig_bytes[i], cs->len};
+	}
 	img.table = (void **)(s_base + img.b.registry_listener);
 	img.table[0] = mutation == MUT_GLOBAL ? (void *)&model_add : (void *)&sdl_global;
 	img.table[1] = mutation == MUT_REMOVE ? (void *)&model_add : (void *)&sdl_remove;
+	img.cs_table = (void **)(s_base + img.b.data_source_listener);
+	for (int i = 0; i < 6; i++)
+		img.cs_table[i] = (void *)&sdl_global; // the entries that are not swapped
+	img.cs_table[2] = mutation == MUT_CS_CANCELLED ? (void *)&model_add : (void *)&sdl_source_cancelled;
 	if (mutation != MUT_RW_PAGE)
 		CHECK(mprotect(img.mem + img.pg, (size_t)img.pg, PROT_READ) == 0); // RELRO
 	model_reset();
 	s_this_slot = (char **)(s_base + img.b.video_device);
 	*s_this_slot = m.dev;
+	clip_model_reset();
 }
 
 static unsigned
@@ -218,6 +308,15 @@ dispatch_remove(uint32_t name)
 	typedef void (*fn)(void *, void *, uint32_t);
 	fn f = (fn)__atomic_load_n(&img.table[1], __ATOMIC_SEQ_CST);
 	f(m.video_data, NULL, name);
+}
+
+//! libwayland dispatching wl_data_source.cancelled to SDL's listener.
+static void
+dispatch_cancelled(void *source_struct)
+{
+	typedef void (*fn)(void *, void *);
+	fn f = (fn)__atomic_load_n(&img.cs_table[2], __ATOMIC_SEQ_CST);
+	f(source_struct, (void *)0x5ec0 /* the wl_data_source proxy: unused by the model */);
 }
 
 //! The page's protection from /proc/self/maps ("r--p", ...), or "".
@@ -268,7 +367,8 @@ install_with_env(const char *value)
 		unsetenv("DISPLAYXR_SDL_FIXUPS");
 	image_new(MUT_NONE);
 	unsigned got = image_install();
-	CHECK((img.table[1] != (void *)&sdl_remove) == (got == DXR_SDLFIX_OUTPUTS));
+	CHECK((img.table[1] != (void *)&sdl_remove) == ((got & DXR_SDLFIX_OUTPUTS) != 0));
+	CHECK((img.cs_table[2] != (void *)&sdl_source_cancelled) == ((got & DXR_SDLFIX_CLIPBOARD) != 0));
 	unsetenv("DISPLAYXR_SDL_FIXUPS");
 	return got;
 }
@@ -289,7 +389,8 @@ parse_is(const char *value, unsigned bits, const char *unknown)
 static void
 test_parse(void)
 {
-	const unsigned A = DXR_SDLFIX_ALL, O = DXR_SDLFIX_OUTPUTS;
+	const unsigned A = DXR_SDLFIX_ALL, O = DXR_SDLFIX_OUTPUTS, C = DXR_SDLFIX_CLIPBOARD;
+	CHECK(A == (C | O));
 	CHECK(parse_is(NULL, A, ""));
 	CHECK(parse_is("", A, ""));
 	CHECK(parse_is("   ", A, ""));
@@ -302,36 +403,43 @@ test_parse(void)
 	CHECK(parse_is(" off ", 0, ""));
 	CHECK(parse_is("outputs", O, ""));
 	CHECK(parse_is(" outputs ", O, ""));
-	CHECK(parse_is("outputs,clipboard", O, "clipboard"));
-	CHECK(parse_is("clipboard , outputs", O, "clipboard"));
+	CHECK(parse_is("clipboard", C, ""));
+	CHECK(parse_is(" clipboard ", C, ""));
+	CHECK(parse_is("outputs,clipboard", C | O, ""));
+	CHECK(parse_is("clipboard , outputs", C | O, ""));
+	CHECK(parse_is("clipboardX", 0, "clipboardX"));
+	CHECK(parse_is("clip", 0, "clip"));
 	CHECK(parse_is(",outputs,", O, ""));
 	CHECK(parse_is("outputsX", 0, "outputsX"));
 	CHECK(parse_is("output", 0, "output"));
 	CHECK(parse_is("OUTPUTS", 0, "OUTPUTS"));
-	CHECK(parse_is("clipboard,ime", 0, "clipboard,ime"));
+	CHECK(parse_is("clipboard,ime", C, "ime"));
 	CHECK(parse_is("on,outputs", O, "on")); // the specials are whole values only
 	CHECK(dxr_sdl_fixups_parse("outputsX", NULL, 0) == 0);
 	char tiny[4];
-	CHECK(dxr_sdl_fixups_parse("clipboard,outputs", tiny, sizeof(tiny)) == O && strlen(tiny) < sizeof(tiny));
+	CHECK(dxr_sdl_fixups_parse("imeXYZ,outputs", tiny, sizeof(tiny)) == O && strlen(tiny) < sizeof(tiny));
 }
 
 static void
 test_wanted(void)
 {
-	CHECK(DXR_SDLFIX_OUTPUTS == 4u); // 1 and 2: the clipboard and IME fixes
-	CHECK(install_with_env(NULL) == DXR_SDLFIX_OUTPUTS);
-	CHECK(install_with_env("") == DXR_SDLFIX_OUTPUTS);
-	CHECK(install_with_env("1") == DXR_SDLFIX_OUTPUTS);
-	CHECK(install_with_env("on") == DXR_SDLFIX_OUTPUTS);
-	CHECK(install_with_env("all") == DXR_SDLFIX_OUTPUTS);
+	CHECK(DXR_SDLFIX_CLIPBOARD == 1u);
+	CHECK(DXR_SDLFIX_OUTPUTS == 4u); // 2: the IME fix
+	const unsigned A = DXR_SDLFIX_ALL;
+	CHECK(install_with_env(NULL) == A);
+	CHECK(install_with_env("") == A);
+	CHECK(install_with_env("1") == A);
+	CHECK(install_with_env("on") == A);
+	CHECK(install_with_env("all") == A);
 	CHECK(install_with_env("outputs") == DXR_SDLFIX_OUTPUTS);
 	CHECK(install_with_env(" outputs ") == DXR_SDLFIX_OUTPUTS);
+	CHECK(install_with_env("clipboard") == DXR_SDLFIX_CLIPBOARD);
 	CHECK(install_with_env("outputsX") == 0);
-	CHECK(install_with_env("clipboard,outputs") == DXR_SDLFIX_OUTPUTS);
+	CHECK(install_with_env("clipboard,outputs") == A);
+	CHECK(install_with_env("clipboard,ime") == DXR_SDLFIX_CLIPBOARD);
 	CHECK(install_with_env("off") == 0);
 	CHECK(install_with_env("0") == 0);
-	CHECK(install_with_env("clipboard") == 0);
-	CHECK(install_with_env("clipboard,ime") == 0);
+	CHECK(install_with_env("ime") == 0);
 }
 
 //! Builds the list @p ids, unlinks @p target_id, returns the ids left ("" for none).
@@ -416,12 +524,34 @@ test_real_entry_consistent(void)
 	CHECK(u32(wk->bytes + 22) == R->off_output_next);
 	// The listener table sits in 6000.4.6f1's RELRO (vaddr 0x2734260 + 0x96da0).
 	CHECK(R->registry_listener >= 0x2734260 && R->registry_listener + 16 <= 0x2734260 + 0x96da0);
+
+	// Clipboard: the addresses and offsets its own signatures read.
+	const struct dxr_sdl_sig *ca = &R->clipboard_sigs[0], *sd = &R->clipboard_sigs[1], *cgd = &R->clipboard_sigs[2],
+	                         *gs = &R->clipboard_sigs[3], *so = &R->clipboard_sigs[4], *st = &R->clipboard_sigs[5];
+	// cancelled: a jmp (0xe9) to Wayland_data_source_destroy, which frees through SDL_free (slot 0x27e76e8).
+	CHECK(ca->at == R->data_source_cancelled);
+	CHECK(ca->bytes[0] == 0xe9 && ca->at + 5 + (uintptr_t)(intptr_t)rel32(ca->bytes + 1) == sd->at);
+	CHECK(sd->at + sd->len + (uintptr_t)(intptr_t)rel32(sd->bytes + sd->len - 4) == 0x27e76e8);
+	// Wayland_GetClipboardText: _this->driverdata (+0x5c8), ->input (+0xc8), ->data_device (+0x28) ...
+	CHECK(u32(cgd->bytes + 3) == R->off_driverdata);
+	CHECK(u32(cgd->bytes + 15) == R->off_input);
+	CHECK(cgd->bytes[27] == R->off_data_device);
+	// ... its fallback to ->selection_source (+0x30); set_selection destroys the old ->selection_source (+0x30).
+	CHECK(gs->bytes[3] == R->off_selection_source);
+	CHECK(so->bytes[3] == R->off_selection_source);
+	// SDL_SetClipboardText: _this (rip-relative, 7-byte mov) is the video_device the wrapper reads, and its
+	// SetClipboardText(_this, ...) is _this's +0x288. This is the _this check when only "clipboard" is on.
+	CHECK(st->bytes[0] == 0x4c && st->bytes[1] == 0x8b && st->bytes[2] == 0x35);
+	CHECK(st->at + 7 + (uintptr_t)(intptr_t)rel32(st->bytes + 3) == R->video_device);
+	CHECK(u32(st->bytes + 40) == 0x288 && st->bytes[49] == 0x4c && st->bytes[50] == 0x89 && st->bytes[51] == 0xf7);
+	// The wl_data_source listener sits in the same RELRO; its cancelled entry is index 2.
+	CHECK(R->data_source_listener >= 0x2734260 && R->data_source_listener + 48 <= 0x2734260 + 0x96da0);
 }
 
 static void
 test_fix(void)
 {
-	unsetenv("DISPLAYXR_SDL_FIXUPS");
+	setenv("DISPLAYXR_SDL_FIXUPS", "outputs", 1);
 	image_new(MUT_NONE);
 	CHECK(image_install() == DXR_SDLFIX_OUTPUTS);
 	CHECK(img.table[0] == (void *)&sdl_global);         // add: untouched
@@ -456,16 +586,100 @@ test_fix(void)
 	}
 	CHECK(m.walked_freed == 0);
 	CHECK(strcmp(model_list(), "7,28") == 0);
+	unsetenv("DISPLAYXR_SDL_FIXUPS");
+}
+
+static void
+test_clipboard(void)
+{
+	unsetenv("DISPLAYXR_SDL_FIXUPS");
+	image_new(MUT_NONE);
+	CHECK(image_install() == DXR_SDLFIX_ALL);
+	CHECK(img.cs_table[2] != (void *)&sdl_source_cancelled); // cancelled: the wrapper
+	CHECK(img.cs_table[0] == (void *)&sdl_global);           // the others untouched
+	CHECK(strncmp(prot_of(img.cs_table), "r--", 3) == 0);    // RELRO read-only again
+
+	// SDL's selection source cancelled (another app copied): cleared before SDL frees it.
+	void *src = calloc(1, 0x18);
+	clip_set_selection(src);
+	dispatch_cancelled(src);
+	CHECK(cm.cancelled_calls == 1); // SDL's handler ran
+	CHECK(clip_selection() == NULL);
+	clip_model_set_selection(calloc(1, 0x18)); // the next copy
+	CHECK(cm.used_freed_source == 0);
+	// Many copy / other-app-copy cycles.
+	for (int k = 0; k < 20; k++) {
+		void *s2 = calloc(1, 0x18);
+		clip_model_set_selection(s2);
+		dispatch_cancelled(s2);
+		CHECK(clip_selection() == NULL);
+	}
+	clip_model_set_selection(calloc(1, 0x18));
+	CHECK(cm.used_freed_source == 0);
+	// A cancelled source that is not the selection (SDL replaced it): the device is left alone.
+	void *keep = calloc(1, 0x18);
+	clip_set_selection(keep);
+	dispatch_cancelled(calloc(1, 0x18));
+	CHECK(clip_selection() == keep);
+	CHECK(cm.cancelled_calls == 22);
+}
+
+//! DISPLAYXR_SDL_FIXUPS=clipboard: only the clipboard fix, and its own signatures still check
+//! SDL's _this (with the outputs fix off, nothing else would).
+static void
+test_clipboard_only(void)
+{
+	setenv("DISPLAYXR_SDL_FIXUPS", "clipboard", 1);
+	image_new(MUT_NONE);
+	CHECK(image_install() == DXR_SDLFIX_CLIPBOARD);
+	CHECK(img.table[1] == (void *)&sdl_remove);              // outputs: untouched
+	CHECK(img.cs_table[2] != (void *)&sdl_source_cancelled); // clipboard: the wrapper
+	void *src = calloc(1, 0x18);
+	clip_set_selection(src);
+	dispatch_cancelled(src);
+	CHECK(clip_selection() == NULL);
+	// A change in the SetClipboardText / _this signature alone refuses it.
+	image_new(MUT_CS5);
+	CHECK(image_install() == 0);
+	CHECK(img.cs_table[2] == (void *)&sdl_source_cancelled);
+	// The fake image's _this is the one the wrapper follows: a source cancelled through it is found.
+	image_new(MUT_NONE);
+	CHECK(image_install() == DXR_SDLFIX_CLIPBOARD);
+	*s_this_slot = NULL; // no SDL video device: the wrapper must not touch anything
+	void *src2 = calloc(1, 0x18);
+	clip_set_selection(src2);
+	dispatch_cancelled(src2);
+	CHECK(clip_selection() == src2 && cm.cancelled_calls == 1);
+	unsetenv("DISPLAYXR_SDL_FIXUPS");
+}
+
+static void
+test_clipboard_kill_switch_reproduces_bug(void)
+{
+	const char *offs[] = {"off", "0", "outputs"}; // none of them installs the clipboard fix
+	for (int i = 0; i < 3; i++) {
+		setenv("DISPLAYXR_SDL_FIXUPS", offs[i], 1);
+		image_new(MUT_NONE);
+		CHECK((image_install() & DXR_SDLFIX_CLIPBOARD) == 0);
+		CHECK(img.cs_table[2] == (void *)&sdl_source_cancelled);
+		void *src = calloc(1, 0x18);
+		clip_set_selection(src);
+		dispatch_cancelled(src); // SDL frees it and leaves selection_source set
+		CHECK(clip_selection() == src);
+		clip_model_set_selection(calloc(1, 0x18));
+		CHECK(cm.used_freed_source == 1); // the use-after-free: the player's crash
+	}
+	unsetenv("DISPLAYXR_SDL_FIXUPS");
 }
 
 static void
 test_kill_switch_reproduces_bug(void)
 {
-	const char *offs[] = {"off", "0", "clipboard"};
-	for (int i = 0; i < 3; i++) {
+	const char *offs[] = {"off", "0", "ime", "clipboard"}; // none of them installs the outputs fix
+	for (int i = 0; i < 4; i++) {
 		setenv("DISPLAYXR_SDL_FIXUPS", offs[i], 1);
 		image_new(MUT_NONE);
-		CHECK(image_install() == 0);
+		CHECK((image_install() & DXR_SDLFIX_OUTPUTS) == 0);
 		CHECK(img.table[1] == (void *)&sdl_remove);
 		model_add(3);
 		model_add(4);
@@ -485,22 +699,30 @@ test_refusals(void)
 	for (int mut = MUT_GLOBAL; mut <= MUT_SIG3; mut++) {
 		image_new(mut);
 		void *before = img.table[1];
-		CHECK(image_install() == 0);
+		CHECK(image_install() == DXR_SDLFIX_CLIPBOARD); // the outputs fix refused, the clipboard one not affected
 		CHECK(img.table[1] == before);
+	}
+	for (int mut = MUT_CS_CANCELLED; mut <= MUT_CS5; mut++) {
+		image_new(mut);
+		void *before = img.cs_table[2];
+		CHECK(image_install() == DXR_SDLFIX_OUTPUTS); // the clipboard fix refused
+		CHECK(img.cs_table[2] == before);
 	}
 	// The plug-in cannot pin itself: nothing is swapped.
 	image_new(MUT_NONE);
 	dxr_sdl_fixups_test_pin(0);
 	CHECK(image_install() == 0);
 	CHECK(img.table[1] == (void *)&sdl_remove);
+	CHECK(img.cs_table[2] == (void *)&sdl_source_cancelled);
 	dxr_sdl_fixups_test_pin(1);
-	CHECK(image_install() == DXR_SDLFIX_OUTPUTS);
+	CHECK(image_install() == DXR_SDLFIX_ALL);
 	// A table outside RELRO (here: RELRO said to be the data page).
 	image_new(MUT_NONE);
 	dxr_sdl_fixups_test_relro(s_base + 2 * (uintptr_t)img.pg, s_base + 3 * (uintptr_t)img.pg);
 	CHECK(dxr_sdl_fixups_install_build(&img.b, s_base) == 0);
 	CHECK(img.table[1] == (void *)&sdl_remove);
-	CHECK(image_install() == DXR_SDLFIX_OUTPUTS); // the same image, RELRO right
+	CHECK(img.cs_table[2] == (void *)&sdl_source_cancelled);
+	CHECK(image_install() == DXR_SDLFIX_ALL); // the same image, RELRO right
 }
 
 //! The swap puts back whatever protection the page had.
@@ -510,13 +732,15 @@ test_previous_protection(void)
 	unsetenv("DISPLAYXR_SDL_FIXUPS");
 	image_new(MUT_RW_PAGE);
 	CHECK(strncmp(prot_of(img.table), "rw-", 3) == 0);
-	CHECK(image_install() == DXR_SDLFIX_OUTPUTS);
+	CHECK(image_install() == DXR_SDLFIX_ALL);
 	CHECK(img.table[1] != (void *)&sdl_remove);
+	CHECK(img.cs_table[2] != (void *)&sdl_source_cancelled);
 	CHECK(strncmp(prot_of(img.table), "rw-", 3) == 0); // not made read-only
 	image_new(MUT_NONE);
 	CHECK(strncmp(prot_of(img.table), "r--", 3) == 0);
-	CHECK(image_install() == DXR_SDLFIX_OUTPUTS);
+	CHECK(image_install() == DXR_SDLFIX_ALL);
 	CHECK(strncmp(prot_of(img.table), "r--", 3) == 0);
+	CHECK(strncmp(prot_of(img.cs_table), "r--", 3) == 0);
 }
 
 static void
@@ -542,7 +766,10 @@ main(void)
 	test_unlink();
 	test_real_entry_consistent();
 	test_fix();
+	test_clipboard();
+	test_clipboard_only();
 	test_kill_switch_reproduces_bug();
+	test_clipboard_kill_switch_reproduces_bug();
 	test_refusals();
 	test_previous_protection();
 	test_process_without_unityplayer();
