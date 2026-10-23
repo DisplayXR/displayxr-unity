@@ -22,8 +22,10 @@
 // code it relies on were byte-verified against that build (and the table lies in
 // UnityPlayer.so's RELRO); anything else is a log line and the player runs exactly
 // as without this module. The struct offsets a fix uses are verified the same way,
-// in the instructions that read them. Once a wrapper is in, this library pins
-// itself (RTLD_NODELETE): SDL may call it until the process ends.
+// in the instructions that read them. Before any swap this library pins itself
+// (RTLD_NODELETE): SDL may call a wrapper until the process ends, so without the
+// pin nothing is installed. A swap puts the page's previous protection back (read
+// from /proc/self/maps; nothing is swapped if it cannot be read).
 //
 // Threads: libwayland reads a listener entry once per event and every entry is
 // written with one atomic pointer store, so an event sees either SDL's handler or
@@ -41,14 +43,16 @@
 //   wl_registry global_remove does exactly that, then lets SDL free it.
 //
 // Adding a fix: its fields and code signatures in struct dxr_sdl_build (one table
-// entry per UnityPlayer.so), a DXR_SDLFIX_* bit and its name in wanted(), and an
-// install_<fix>() that verifies first, then swaps, called from install_with().
+// entry per UnityPlayer.so), a DXR_SDLFIX_* bit (and DXR_SDLFIX_ALL) and its name in
+// k_fix_names, and an install_<fix>() that verifies first, then swaps, called from
+// install_with().
 
 #define _GNU_SOURCE // dladdr, RTLD_NODELETE
 #include "displayxr_linux_sdl_fixups.h"
 
 #include <dlfcn.h>
 #include <elf.h>
+#include <limits.h>
 #include <link.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -138,7 +142,7 @@ logf_(const char *fmt, ...)
 {
 	va_list ap;
 	va_start(ap, fmt);
-	fputs("[DisplayXR-WL] SDL fixups: ", stderr);
+	fputs("[DisplayXR-SDLFIX] ", stderr);
 	vfprintf(stderr, fmt, ap);
 	fputc('\n', stderr);
 	va_end(ap);
@@ -164,25 +168,65 @@ in_relro(uintptr_t table, int first, int n)
 	return lo >= s_relro_lo && lo + (uintptr_t)n * sizeof(void *) <= s_relro_hi;
 }
 
+//! The protection (PROT_*) of the one mapping that holds [@p lo, @p hi), from
+//! /proc/self/maps; -1 if it cannot be read or one mapping does not hold it all.
+static int
+mapping_prot(uintptr_t lo, uintptr_t hi)
+{
+	FILE *f = fopen("/proc/self/maps", "re");
+	if (!f)
+		return -1;
+	char line[PATH_MAX + 256];
+	int prot = -1;
+	while (fgets(line, sizeof(line), f)) {
+		unsigned long a, b;
+		char perms[8];
+		if (sscanf(line, "%lx-%lx %7s", &a, &b, perms) != 3 || strlen(perms) < 3)
+			continue;
+		if (lo >= a && lo < b) {
+			if (hi <= b)
+				prot = (perms[0] == 'r' ? PROT_READ : 0) | (perms[1] == 'w' ? PROT_WRITE : 0) |
+				       (perms[2] == 'x' ? PROT_EXEC : 0);
+			break;
+		}
+	}
+	fclose(f);
+	return prot;
+}
+
+enum { SWAP_OK = 0, SWAP_NOT_EXPECTED = -1, SWAP_PROT_UNKNOWN = -2, SWAP_MPROTECT = -3 };
+
 //! Swaps @p n entries of the table at vaddr @p table from @p first on: each must
-//! still hold base + @p expect[i]. 0 when done, -1 (nothing changed) otherwise.
+//! still hold base + @p expect[i]. The page gets its previous protection back.
+//! SWAP_OK when done; otherwise nothing changed.
 static int
 swap_entries(uintptr_t table, int first, int n, const uintptr_t *expect, const fnptr *wrappers)
 {
 	void **t = (void **)(s_base + table);
 	for (int i = 0; i < n; i++)
 		if ((uintptr_t)t[first + i] != s_base + expect[i])
-			return -1;
+			return SWAP_NOT_EXPECTED;
 	long pg = sysconf(_SC_PAGESIZE);
 	uintptr_t lo = (uintptr_t)&t[first] & ~(uintptr_t)(pg - 1);
 	uintptr_t hi = ((uintptr_t)&t[first + n] + (uintptr_t)pg - 1) & ~(uintptr_t)(pg - 1);
-	if (mprotect((void *)lo, hi - lo, PROT_READ | PROT_WRITE) != 0)
-		return -1;
+	int prev = mapping_prot(lo, hi);
+	if (prev < 0)
+		return SWAP_PROT_UNKNOWN;
+	if (mprotect((void *)lo, hi - lo, prev | PROT_READ | PROT_WRITE) != 0)
+		return SWAP_MPROTECT;
 	for (int i = 0; i < n; i++)
 		__atomic_store_n(&t[first + i], (void *)wrappers[i], __ATOMIC_SEQ_CST);
-	if (mprotect((void *)lo, hi - lo, PROT_READ) != 0)
-		logf_("could not make SDL's listener table read-only again");
-	return 0;
+	if (mprotect((void *)lo, hi - lo, prev) != 0)
+		logf_("could not give SDL's listener table its previous protection back (it stays writable)");
+	return SWAP_OK;
+}
+
+static const char *
+swap_why(int r)
+{
+	return r == SWAP_PROT_UNKNOWN ? "the protection of SDL's wl_registry listener's page could not be read"
+	       : r == SWAP_MPROTECT   ? "SDL's wl_registry listener's page could not be made writable"
+	                              : "SDL's wl_registry listener is not as expected";
 }
 
 /*
@@ -256,8 +300,9 @@ install_outputs(void)
 	s_orig_registry_remove = (registry_remove_fn)(s_base + b->registry_remove);
 	const uintptr_t expect[1] = {b->registry_remove};
 	const fnptr wrap[1] = {(fnptr)fix_registry_remove};
-	if (swap_entries(b->registry_listener, 1, 1, expect, wrap) != 0) {
-		logf_("monitor re-add fix NOT installed: SDL's wl_registry listener is not as expected");
+	int r = swap_entries(b->registry_listener, 1, 1, expect, wrap);
+	if (r != SWAP_OK) {
+		logf_("monitor re-add fix NOT installed: %s", swap_why(r));
 		return 0;
 	}
 	return 1;
@@ -306,29 +351,98 @@ find_unityplayer(struct dl_phdr_info *info, size_t size, void *arg)
 	return 1;
 }
 
-//! Which fixes the environment allows (DISPLAYXR_SDL_FIXUPS).
-static unsigned
-wanted(void)
+//! The fixes by name (DISPLAYXR_SDL_FIXUPS).
+static const struct {
+	const char *name;
+	unsigned bit;
+} k_fix_names[] = {
+    {"outputs", DXR_SDLFIX_OUTPUTS},
+};
+
+static int
+is_blank(char c)
 {
-	const char *e = getenv("DISPLAYXR_SDL_FIXUPS");
-	if (!e || !*e || strcmp(e, "1") == 0)
-		return DXR_SDLFIX_OUTPUTS;
-	if (strcmp(e, "0") == 0 || strcmp(e, "off") == 0)
+	return c == ' ' || c == '\t';
+}
+
+//! [@p s, @p s + @p n) is exactly @p word.
+static int
+token_is(const char *s, size_t n, const char *word)
+{
+	return strlen(word) == n && strncmp(s, word, n) == 0;
+}
+
+unsigned
+dxr_sdl_fixups_parse(const char *value, char *unknown, size_t unknown_cap)
+{
+	size_t ulen = 0;
+	if (unknown && unknown_cap)
+		unknown[0] = 0;
+	const char *s = value ? value : "";
+	while (is_blank(*s))
+		s++;
+	size_t n = strlen(s);
+	while (n && is_blank(s[n - 1]))
+		n--;
+	if (n == 0 || token_is(s, n, "1") || token_is(s, n, "on") || token_is(s, n, "all"))
+		return DXR_SDLFIX_ALL;
+	if (token_is(s, n, "0") || token_is(s, n, "off"))
 		return 0;
 	unsigned w = 0;
-	if (strstr(e, "outputs"))
-		w |= DXR_SDLFIX_OUTPUTS;
+	for (const char *p = s, *end = s + n; p < end;) {
+		const char *comma = memchr(p, ',', (size_t)(end - p));
+		const char *a = p, *z = comma ? comma : end;
+		p = comma ? comma + 1 : end;
+		while (a < z && is_blank(*a))
+			a++;
+		while (z > a && is_blank(z[-1]))
+			z--;
+		if (a == z)
+			continue;
+		unsigned bit = 0;
+		for (size_t i = 0; i < sizeof(k_fix_names) / sizeof(k_fix_names[0]); i++)
+			if (token_is(a, (size_t)(z - a), k_fix_names[i].name))
+				bit = k_fix_names[i].bit;
+		if (bit) {
+			w |= bit;
+		} else if (unknown && ulen + 1 < unknown_cap) {
+			int k = snprintf(unknown + ulen, unknown_cap - ulen, "%s%.*s", ulen ? "," : "", (int)(z - a), a);
+			if (k > 0)
+				ulen = ulen + (size_t)k < unknown_cap ? ulen + (size_t)k : unknown_cap - 1;
+		}
+	}
 	return w;
 }
 
-//! Once a wrapper is in one of SDL's tables this library must never be unloaded
-//! (the engine may close the handle it took for XRSDKPreInit).
-static void
+//! Which fixes the environment allows; unknown names are logged (once: one install).
+static unsigned
+wanted(void)
+{
+	char unknown[160];
+	unsigned w = dxr_sdl_fixups_parse(getenv("DISPLAYXR_SDL_FIXUPS"), unknown, sizeof(unknown));
+	if (unknown[0])
+		logf_("DISPLAYXR_SDL_FIXUPS: unknown fix name(s) ignored: %s", unknown);
+	return w;
+}
+
+#ifdef DXR_SDLFIX_TEST
+static int s_test_pin = 1; // the test executable cannot pin itself by name: 1 / 0 = pretend, -1 = real
+#endif
+
+//! A wrapper in one of SDL's tables may be called until the process ends, so this
+//! library must never be unloaded (the engine may close the handle it took for
+//! XRSDKPreInit). 1 when pinned.
+static int
 pin_self(void)
 {
+#ifdef DXR_SDLFIX_TEST
+	if (s_test_pin >= 0)
+		return s_test_pin;
+#endif
 	Dl_info info;
-	if (dladdr((void *)&pin_self, &info) && info.dli_fname)
-		(void)dlopen(info.dli_fname, RTLD_NOW | RTLD_NOLOAD | RTLD_NODELETE);
+	if (!dladdr((void *)&pin_self, &info) || !info.dli_fname)
+		return 0;
+	return dlopen(info.dli_fname, RTLD_NOW | RTLD_NOLOAD | RTLD_NODELETE) != NULL; // never closed
 }
 
 static unsigned
@@ -341,14 +455,18 @@ install_with(const struct dxr_sdl_build *b, uintptr_t base)
 		logf_("%s: off (DISPLAYXR_SDL_FIXUPS=%s)", b->what, getenv("DISPLAYXR_SDL_FIXUPS"));
 		return 0;
 	}
+	if (!pin_self()) {
+		logf_("%s: nothing installed: the plug-in could not pin itself in memory (RTLD_NODELETE), and SDL "
+		      "would call into it after an unload",
+		      b->what);
+		return 0;
+	}
 	s_b = b;
 	s_base = base;
 	unsigned got = 0;
 	// DXR_SDLFIX_CLIPBOARD, DXR_SDLFIX_IME: their install_*() go here.
 	if ((want & DXR_SDLFIX_OUTPUTS) && install_outputs())
 		got |= DXR_SDLFIX_OUTPUTS;
-	if (got)
-		pin_self();
 	logf_("%s (build-id %.8s..., base %p): monitor re-add %s", b->what, b->build_id, (void *)base,
 	      (got & DXR_SDLFIX_OUTPUTS) ? "fixed" : (want & DXR_SDLFIX_OUTPUTS) ? "NOT fixed" : "off");
 	return got;
@@ -393,6 +511,12 @@ dxr_sdl_fixups_find_build(const char *build_id)
 
 #ifdef DXR_SDLFIX_TEST
 static int s_test_relro_set;
+
+void
+dxr_sdl_fixups_test_pin(int result)
+{
+	s_test_pin = result;
+}
 
 void
 dxr_sdl_fixups_test_relro(uintptr_t lo, uintptr_t hi)

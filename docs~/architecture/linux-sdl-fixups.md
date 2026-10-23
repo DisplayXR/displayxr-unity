@@ -19,8 +19,9 @@ editor (no `UnityPlayer.so`) nothing happens and nothing is logged. Windows and 
 
 SDL keeps one static, read-only listener table per Wayland interface in `UnityPlayer.so`'s RELRO,
 and libwayland reads the table at every event it dispatches. A fix swaps one entry of such a table
-for a wrapper (the page is made writable, one atomic pointer store, the page is made read-only
-again) that does what the upstream fix does and then calls SDL's own handler. Interposing `wl_*`
+for a wrapper (the page is made writable, one atomic pointer store, the page gets its previous
+protection back, read from `/proc/self/maps`; no swap if that cannot be read) that does what the
+upstream fix does and then calls SDL's own handler. Interposing `wl_*`
 symbols could not do it: `UnityPlayer.so` dlopens libwayland and calls it through pointers it
 looked up itself.
 
@@ -28,9 +29,9 @@ looked up itself.
 (`k_builds`), the table lies in its RELRO, its entries hold exactly the expected SDL handlers, and the
 SDL code that reads every address and struct offset the wrapper uses matches byte for byte. Any
 mismatch (another Unity version, a patched player) is a log line and the player runs exactly as
-without the module. Once a wrapper is installed the plug-in pins itself (`RTLD_NODELETE`), so it is
+without the module. Before any swap the plug-in pins itself in memory (`RTLD_NODELETE`), so it is
 never unloaded while SDL can call into it, even if the engine closes the handle it opened for
-`XRSDKPreInit`.
+`XRSDKPreInit`; if the pin fails, nothing is installed.
 
 ## The fixes
 
@@ -47,8 +48,8 @@ A plain Unity player without DisplayXR has the same crash; the plug-in can only 
 ## Log lines (stderr, the player log)
 
 ```
-[DisplayXR-WL] SDL fixups: Unity 6000.4.6f1 Linux x86_64 player (build-id 4ae6b3f4..., base 0x...): monitor re-add fixed
-[DisplayXR-WL] SDL fixups: monitor removed (wl_output global 50): unlinked SDL's output data before SDL frees it
+[DisplayXR-SDLFIX] Unity 6000.4.6f1 Linux x86_64 player (build-id 4ae6b3f4..., base 0x...): monitor re-add fixed
+[DisplayXR-SDLFIX] monitor removed (wl_output global 50): unlinked SDL's output data before SDL frees it
 ```
 
 A refusal says why (`monitor re-add fix NOT installed: SDL's code differs from the known build's`,
@@ -59,7 +60,9 @@ installed`).
 
 - `DISPLAYXR_SDL_FIXUPS=0` (or `off`): the kill switch, nothing installed; the player behaves as Unity
   ships it.
-- `DISPLAYXR_SDL_FIXUPS=outputs`: a comma list of fixes to install, only those (unset or `1` = all).
+- Unset, empty, `1`, `on` or `all`: every fix.
+- `DISPLAYXR_SDL_FIXUPS=outputs`: a comma-separated list of exact fix names (blanks around a name are
+  ignored), only those. A name the plug-in does not know is logged once and ignored.
 - `DISPLAYXR_SDL_FIXUPS_LOG=1`: also log SDL's output list after every monitor removal.
 
 ## Adding a Unity build or a fix
@@ -68,6 +71,6 @@ A build entry needs the build-id (`readelf -n UnityPlayer.so`), the vaddrs of th
 its handlers (`readelf -rW` shows the table's `R_X86_64_RELATIVE` addends), SDL's `_this`, the struct
 offsets, and the code bytes that read them (`objdump -d`). The unit test
 (`native~/tests/test_sdl_fixups.c`, CTest) checks the 6000.4.6f1 entry's addresses and offsets
-against its own signatures; extend it for a new entry. A new fix gets a `DXR_SDLFIX_*` bit and a
-name in `wanted()`, its fields and signatures in `struct dxr_sdl_build`, and an `install_<fix>()`
+against its own signatures; extend it for a new entry. A new fix gets a `DXR_SDLFIX_*` bit (in
+`DXR_SDLFIX_ALL` too) and a name in `k_fix_names`, its fields and signatures in `struct dxr_sdl_build`, and an `install_<fix>()`
 called from `install_with()` that verifies first and then swaps.

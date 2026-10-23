@@ -16,7 +16,9 @@
 //  - the kill switch (DISPLAYXR_SDL_FIXUPS=off): nothing swapped, and the model walks the freed
 //    node (the crash), so the model reproduces the bug;
 //  - every verification refuses a mismatch (either table entry, each code signature,
-//    a table outside RELRO) and leaves the table as it was;
+//    a table outside RELRO) and leaves the table as it was, and so does a failed pin;
+//  - the swap gives the page back the protection it had (read-only, or writable);
+//  - DISPLAYXR_SDL_FIXUPS is parsed as a list of exact names;
 //  - the real build entry agrees with its own signatures (addresses and offsets);
 //  - a process without UnityPlayer.so (this test) gets nothing installed.
 
@@ -169,7 +171,7 @@ static struct {
 	void **table;
 } img;
 
-enum { MUT_NONE, MUT_GLOBAL, MUT_REMOVE, MUT_SIG0, MUT_SIG1, MUT_SIG2, MUT_SIG3 };
+enum { MUT_NONE, MUT_GLOBAL, MUT_REMOVE, MUT_SIG0, MUT_SIG1, MUT_SIG2, MUT_SIG3, MUT_RW_PAGE };
 
 static void
 image_new(int mutation)
@@ -195,7 +197,8 @@ image_new(int mutation)
 	img.table = (void **)(s_base + img.b.registry_listener);
 	img.table[0] = mutation == MUT_GLOBAL ? (void *)&model_add : (void *)&sdl_global;
 	img.table[1] = mutation == MUT_REMOVE ? (void *)&model_add : (void *)&sdl_remove;
-	CHECK(mprotect(img.mem + img.pg, (size_t)img.pg, PROT_READ) == 0); // RELRO
+	if (mutation != MUT_RW_PAGE)
+		CHECK(mprotect(img.mem + img.pg, (size_t)img.pg, PROT_READ) == 0); // RELRO
 	model_reset();
 	s_this_slot = (char **)(s_base + img.b.video_device);
 	*s_this_slot = m.dev;
@@ -270,6 +273,48 @@ install_with_env(const char *value)
 	return got;
 }
 
+//! dxr_sdl_fixups_parse(@p value) gives @p bits and the unknown names @p unknown.
+static int
+parse_is(const char *value, unsigned bits, const char *unknown)
+{
+	char u[64];
+	unsigned got = dxr_sdl_fixups_parse(value, u, sizeof(u));
+	int ok = got == bits && strcmp(u, unknown) == 0;
+	if (!ok)
+		fprintf(stderr, "  parse(%s%s%s) = %u, unknown '%s'\n", value ? "\"" : "", value ? value : "NULL",
+		        value ? "\"" : "", got, u);
+	return ok;
+}
+
+static void
+test_parse(void)
+{
+	const unsigned A = DXR_SDLFIX_ALL, O = DXR_SDLFIX_OUTPUTS;
+	CHECK(parse_is(NULL, A, ""));
+	CHECK(parse_is("", A, ""));
+	CHECK(parse_is("   ", A, ""));
+	CHECK(parse_is("1", A, ""));
+	CHECK(parse_is("on", A, ""));
+	CHECK(parse_is("all", A, ""));
+	CHECK(parse_is(" on ", A, ""));
+	CHECK(parse_is("0", 0, ""));
+	CHECK(parse_is("off", 0, ""));
+	CHECK(parse_is(" off ", 0, ""));
+	CHECK(parse_is("outputs", O, ""));
+	CHECK(parse_is(" outputs ", O, ""));
+	CHECK(parse_is("outputs,clipboard", O, "clipboard"));
+	CHECK(parse_is("clipboard , outputs", O, "clipboard"));
+	CHECK(parse_is(",outputs,", O, ""));
+	CHECK(parse_is("outputsX", 0, "outputsX"));
+	CHECK(parse_is("output", 0, "output"));
+	CHECK(parse_is("OUTPUTS", 0, "OUTPUTS"));
+	CHECK(parse_is("clipboard,ime", 0, "clipboard,ime"));
+	CHECK(parse_is("on,outputs", O, "on")); // the specials are whole values only
+	CHECK(dxr_sdl_fixups_parse("outputsX", NULL, 0) == 0);
+	char tiny[4];
+	CHECK(dxr_sdl_fixups_parse("clipboard,outputs", tiny, sizeof(tiny)) == O && strlen(tiny) < sizeof(tiny));
+}
+
 static void
 test_wanted(void)
 {
@@ -277,7 +322,11 @@ test_wanted(void)
 	CHECK(install_with_env(NULL) == DXR_SDLFIX_OUTPUTS);
 	CHECK(install_with_env("") == DXR_SDLFIX_OUTPUTS);
 	CHECK(install_with_env("1") == DXR_SDLFIX_OUTPUTS);
+	CHECK(install_with_env("on") == DXR_SDLFIX_OUTPUTS);
+	CHECK(install_with_env("all") == DXR_SDLFIX_OUTPUTS);
 	CHECK(install_with_env("outputs") == DXR_SDLFIX_OUTPUTS);
+	CHECK(install_with_env(" outputs ") == DXR_SDLFIX_OUTPUTS);
+	CHECK(install_with_env("outputsX") == 0);
 	CHECK(install_with_env("clipboard,outputs") == DXR_SDLFIX_OUTPUTS);
 	CHECK(install_with_env("off") == 0);
 	CHECK(install_with_env("0") == 0);
@@ -439,12 +488,35 @@ test_refusals(void)
 		CHECK(image_install() == 0);
 		CHECK(img.table[1] == before);
 	}
+	// The plug-in cannot pin itself: nothing is swapped.
+	image_new(MUT_NONE);
+	dxr_sdl_fixups_test_pin(0);
+	CHECK(image_install() == 0);
+	CHECK(img.table[1] == (void *)&sdl_remove);
+	dxr_sdl_fixups_test_pin(1);
+	CHECK(image_install() == DXR_SDLFIX_OUTPUTS);
 	// A table outside RELRO (here: RELRO said to be the data page).
 	image_new(MUT_NONE);
 	dxr_sdl_fixups_test_relro(s_base + 2 * (uintptr_t)img.pg, s_base + 3 * (uintptr_t)img.pg);
 	CHECK(dxr_sdl_fixups_install_build(&img.b, s_base) == 0);
 	CHECK(img.table[1] == (void *)&sdl_remove);
 	CHECK(image_install() == DXR_SDLFIX_OUTPUTS); // the same image, RELRO right
+}
+
+//! The swap puts back whatever protection the page had.
+static void
+test_previous_protection(void)
+{
+	unsetenv("DISPLAYXR_SDL_FIXUPS");
+	image_new(MUT_RW_PAGE);
+	CHECK(strncmp(prot_of(img.table), "rw-", 3) == 0);
+	CHECK(image_install() == DXR_SDLFIX_OUTPUTS);
+	CHECK(img.table[1] != (void *)&sdl_remove);
+	CHECK(strncmp(prot_of(img.table), "rw-", 3) == 0); // not made read-only
+	image_new(MUT_NONE);
+	CHECK(strncmp(prot_of(img.table), "r--", 3) == 0);
+	CHECK(image_install() == DXR_SDLFIX_OUTPUTS);
+	CHECK(strncmp(prot_of(img.table), "r--", 3) == 0);
 }
 
 static void
@@ -465,12 +537,14 @@ main(void)
 		return 1;
 	}
 	test_find_build();
+	test_parse();
 	test_wanted();
 	test_unlink();
 	test_real_entry_consistent();
 	test_fix();
 	test_kill_switch_reproduces_bug();
 	test_refusals();
+	test_previous_protection();
 	test_process_without_unityplayer();
 	if (s_failed) {
 		fprintf(stderr, "test_sdl_fixups: %d FAILED\n", s_failed);

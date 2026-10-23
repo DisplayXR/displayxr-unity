@@ -7,6 +7,7 @@
 
 #pragma once
 
+#include <stddef.h>
 #include <stdint.h>
 
 #ifdef __cplusplus
@@ -16,14 +17,22 @@ extern "C" {
 //! dxr_sdl_fixups_install(): which fixes are in place. (1u and 2u are kept for the
 //! clipboard and IME fixes.)
 #define DXR_SDLFIX_OUTPUTS 4u //!< SDL's output-list use-after-free on a monitor re-add (upstream 5f682e77c, #410)
+#define DXR_SDLFIX_ALL DXR_SDLFIX_OUTPUTS
 
 //! Installs every fix this UnityPlayer.so is known and verified for, once (later
-//! calls return the same). Env DISPLAYXR_SDL_FIXUPS: unset or 1 = all; 0 or off =
-//! none (kill switch); a comma list of fix names (outputs) = only those.
-//! DISPLAYXR_SDL_FIXUPS_LOG=1 also logs SDL's output list after every monitor
-//! removal. Returns the DXR_SDLFIX_* bits installed; 0 without a UnityPlayer.so
-//! (the editor, a test), for an unknown build, on any mismatch, or when off.
+//! calls return the same). Env DISPLAYXR_SDL_FIXUPS (dxr_sdl_fixups_parse): unset,
+//! 1, on or all = all; 0 or off = none (the kill switch); else a comma-separated
+//! list of fix names (outputs) = only those. DISPLAYXR_SDL_FIXUPS_LOG=1 also logs
+//! SDL's output list after every monitor removal. Returns the DXR_SDLFIX_* bits
+//! installed; 0 without a UnityPlayer.so (the editor, a test), for an unknown build,
+//! on any mismatch, when the plug-in cannot pin itself, or when off.
 unsigned dxr_sdl_fixups_install(void);
+
+//! A DISPLAYXR_SDL_FIXUPS value -> DXR_SDLFIX_* bits. NULL, empty, "1", "on" or
+//! "all" = DXR_SDLFIX_ALL; "0" or "off" = 0; else a comma-separated list of exact
+//! fix names, blanks around each ignored. Names it does not know are ignored and
+//! written to @p unknown, comma-separated (may be NULL).
+unsigned dxr_sdl_fixups_parse(const char *value, char *unknown, size_t unknown_cap);
 
 //! One known UnityPlayer.so (displayxr_linux_sdl_fixups.c, the build table). Vaddrs.
 struct dxr_sdl_sig {
@@ -75,6 +84,8 @@ dxr_sdl_output_unlink(void **head, void *target, unsigned off_next)
 unsigned dxr_sdl_fixups_install_build(const struct dxr_sdl_build *b, uintptr_t base);
 //! Unit tests: the RELRO range the next install checks tables against (default: all).
 void dxr_sdl_fixups_test_relro(uintptr_t lo, uintptr_t hi);
+//! Unit tests: what pinning the library answers (1 pinned, 0 failed; -1 = really try).
+void dxr_sdl_fixups_test_pin(int result);
 #endif
 
 #ifdef __cplusplus
