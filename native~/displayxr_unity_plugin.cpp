@@ -12,6 +12,7 @@
 #include "displayxr_unity_plugin.h"
 #include "displayxr_window_space_ui.h" // DXR_WSUI_MAX_SLOTS, get_pending_slot
 #if defined(__linux__) && !defined(__ANDROID__)
+#include "displayxr_linux_sdl_fixups.h"
 #include "displayxr_linux_wayland.h"
 #endif
 
@@ -185,6 +186,11 @@ on_graphics_device_event(UnityGfxDeviceEventType eventType)
 extern "C" void UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API
 UnityPluginLoad(IUnityInterfaces *unityInterfaces)
 {
+#if defined(__linux__) && !defined(__ANDROID__)
+	// Unity's embedded SDL2 (displayxr_linux_sdl_fixups.c). Usually XRSDKPreInit,
+	// earlier, did it already; this covers a player without the pre-init load.
+	dxr_sdl_fixups_install();
+#endif
 	s_unity_ifaces = unityInterfaces;
 	if (!s_unity_ifaces) return;
 

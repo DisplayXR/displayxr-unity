@@ -163,7 +163,11 @@ elseif(UNIX AND NOT APPLE AND NOT ANDROID)
         displayxr_linux_dbus.c
         # Side-step: the app's own window steps aside for the window the user
         # works in (reads the window list above inside the plug-in only).
-        displayxr_linux_side_step.c)
+        displayxr_linux_side_step.c
+        # Fixes for Unity's embedded SDL2 (a native-Wayland player), installed from
+        # XRSDKPreInit / UnityPluginLoad; they edit tables in UnityPlayer.so only,
+        # no libwayland needed.
+        displayxr_linux_sdl_fixups.c)
 endif()
 
 # Provider Vulkan backend (#247 Windows, #249 Linux): enable2 session device +
@@ -378,6 +382,15 @@ if(UNIX AND NOT APPLE AND NOT ANDROID)
     target_include_directories(test_linux_side_step PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
     target_link_libraries(test_linux_side_step PRIVATE m)
     add_test(NAME linux_side_step COMMAND test_linux_side_step)
+    # The SDL fixups (Unity's embedded SDL): the gate (build table, verification,
+    # kill switch), the swap and the output-list unlink, on a fake UnityPlayer.so
+    # image (no Wayland, no Unity).
+    find_package(Threads REQUIRED)
+    add_executable(test_sdl_fixups tests/test_sdl_fixups.c displayxr_linux_sdl_fixups.c)
+    target_include_directories(test_sdl_fixups PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+    target_compile_definitions(test_sdl_fixups PRIVATE DXR_SDLFIX_TEST)
+    target_link_libraries(test_sdl_fixups PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+    add_test(NAME sdl_fixups COMMAND test_sdl_fixups)
 endif()
 
 # --- Summary ---
