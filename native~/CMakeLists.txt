@@ -224,6 +224,7 @@ if(UNIX AND NOT APPLE AND NOT ANDROID)
     find_package(PkgConfig QUIET)
     if(PkgConfig_FOUND)
         pkg_check_modules(DXR_WAYLAND_CLIENT QUIET IMPORTED_TARGET wayland-client)
+        pkg_check_modules(DXR_WAYLAND_SERVER QUIET IMPORTED_TARGET wayland-server) # tests only
     endif()
     find_program(DXR_WAYLAND_SCANNER wayland-scanner)
     if(DXR_WAYLAND_CLIENT_FOUND AND DXR_WAYLAND_SCANNER)
@@ -270,6 +271,16 @@ if(UNIX AND NOT APPLE AND NOT ANDROID)
         add_executable(test_linux_clipboard tests/test_linux_clipboard.c)
         target_include_directories(test_linux_clipboard PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         add_test(NAME linux_clipboard COMMAND test_linux_clipboard)
+        # A removed output's wl_output binding is kept: an in-process compositor
+        # (libwayland-server, also in libwayland-dev) shows the player's surface never
+        # gets leave(NULL) for it.
+        if(DXR_WAYLAND_SERVER_FOUND)
+            add_executable(test_wayland_output_remove tests/test_wayland_output_remove.c)
+            target_include_directories(test_wayland_output_remove PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+            target_link_libraries(test_wayland_output_remove PRIVATE
+                PkgConfig::DXR_WAYLAND_CLIENT PkgConfig::DXR_WAYLAND_SERVER)
+            add_test(NAME wayland_output_remove COMMAND test_wayland_output_remove)
+        endif()
     else()
         message(WARNING "displayxr_unity: wayland-client (pkg-config) or wayland-scanner not found - "
                         "building WITHOUT libdisplayxr_unity_wayland.so (no native-Wayland player support). "

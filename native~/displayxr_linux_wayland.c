@@ -62,6 +62,7 @@
 
 #include "displayxr_linux_wayland_dbus.h"
 #include "displayxr_linux_wayland_lib.h"
+#include "displayxr_linux_wayland_output.h"
 #include "displayxr_linux_wayland_place.h"
 #include "displayxr_linux_uri_list.h"
 #include "displayxr_linux_clipboard.h"
@@ -356,16 +357,17 @@ out_geometry(void *d, struct wl_output *o, int32_t x, int32_t y, int32_t pw, int
              const char *make, const char *model, int32_t transform)
 {
 	(void)o; (void)x; (void)y; (void)pw; (void)ph; (void)sub; (void)make; (void)model;
-	struct dxr_wl_output *out = d;
-	out->transform = transform;
+	struct dxr_wl_output *out = dxr_wl_output_live(d);
+	if (out)
+		out->transform = transform;
 }
 
 static void
 out_mode(void *d, struct wl_output *o, uint32_t flags, int32_t w, int32_t h, int32_t refresh)
 {
 	(void)o; (void)refresh;
-	struct dxr_wl_output *out = d;
-	if (flags & WL_OUTPUT_MODE_CURRENT) {
+	struct dxr_wl_output *out = dxr_wl_output_live(d);
+	if (out && (flags & WL_OUTPUT_MODE_CURRENT)) {
 		out->mode_w = w;
 		out->mode_h = h;
 	}
@@ -377,8 +379,9 @@ static void
 out_scale(void *d, struct wl_output *o, int32_t factor)
 {
 	(void)o;
-	struct dxr_wl_output *out = d;
-	out->wl_scale = factor;
+	struct dxr_wl_output *out = dxr_wl_output_live(d);
+	if (out)
+		out->wl_scale = factor;
 }
 
 static const struct wl_output_listener s_output_listener = {
@@ -651,11 +654,14 @@ registry_global_remove(void *data, struct wl_registry *reg, uint32_t name)
 		struct dxr_wl_output *out = &s_wl.outputs[i];
 		if (out->registry_name != name)
 			continue;
-		s_wl.weave_on &= ~(1u << i); // its leave can no longer reach us
+		fprintf(stderr, "[DisplayXR-WL] output '%s' removed\n", out->name);
+		s_wl.weave_on &= ~(1u << i); // a leave still to come matches no slot (output_slot)
 		if (out->xdg)
 			zxdg_output_v1_destroy(out->xdg);
-		wl_output_destroy(out->output);
-		memset(out, 0, sizeof(*out));
+		// Kept, not destroyed: the player's surface gets a leave for this binding too,
+		// and a destroyed one reaches Unity's SDL as leave(NULL) (displayxr_linux_wayland_output.h).
+		dxr_wl_output_retire(out->output);
+		memset(out, 0, sizeof(*out)); // the slot is free for the next output at once
 	}
 }
 
@@ -828,7 +834,7 @@ make_probe_buffer(void)
 _Static_assert(DXR_WL_MAX_OUTPUTS <= 32, "weave_on has one bit per output slot");
 
 //! The outputs[] slot of one of OUR wl_output proxies, or -1: another of the
-//! client's (SDL's), or NULL (one destroyed meanwhile).
+//! client's (SDL's), a removed output's we keep, or NULL (one destroyed meanwhile).
 static int
 output_slot(const struct wl_output *output)
 {
