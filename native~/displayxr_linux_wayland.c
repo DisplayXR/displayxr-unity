@@ -2210,6 +2210,24 @@ panel_centre_locked(const struct dxr_wl_output *panel, int layout, int *out_x, i
 	*out_y = y < panel->ly ? panel->ly : y;
 }
 
+//! A placement while the window is new (#361's restore window: on screen under 3 s,
+//! not moved by the user) decides where it opens, as far as anyone can tell: the
+//! start-up placement, DisplayXRTargetDisplay, a saved position the app restores.
+//! Keep the LOGICAL size the player opened with there (the size it restored, saved
+//! where it was last: normally the panel), not the device size it had on the
+//! monitor it happened to open on. Keeping the device size shrinks a window that
+//! opens on a lower-scale monitor at every start, and grows one that opens on a
+//! higher-scale one, because the player saves the logical size it then has. A size
+//! the app asked for stands. @p t120: the target output's scale x 120.
+static void
+keep_opening_size_locked(uint32_t t120)
+{
+	if (s_wl.wanted_by_app || !t120 || s_wl.logical_w <= 0 || s_wl.logical_h <= 0 || !restore_open_locked())
+		return;
+	s_wl.wanted_device_w = (int)lround(s_wl.logical_w * (t120 / 120.0));
+	s_wl.wanted_device_h = (int)lround(s_wl.logical_h * (t120 / 120.0));
+}
+
 //! Where the window should go: size requests use that output's scale from now on,
 //! and it is moved there now if it is on screen, else as soon as it is mapped.
 static void
@@ -2224,6 +2242,7 @@ set_intent_locked(int x, int y, const char *why)
 	uint32_t t120 = target && layout != DXR_LAYOUT_UNKNOWN ? output_scale120_locked(target, layout) : 0;
 	if (t120 && t120 != s_wl.scale120) {
 		s_wl.expect_scale120 = t120;
+		keep_opening_size_locked(t120);
 		// A size the app asked for, at the old scale: re-ask for the target's now.
 		// (A baseline is only re-asked once the window is there: the app usually
 		// asks for its own size right after placing it.)
@@ -2382,19 +2401,7 @@ startup_place_locked(void)
 		fprintf(stderr, "[DisplayXR-WL] start-up placement: the window opened at (%d,%d %dx%d) on the monitor at "
 		                "(%d,%d %dx%d), not the 3D panel '%s': moving it there\n",
 		        w->x, w->y, w->w, w->h, w->mon_x, w->mon_y, w->mon_w, w->mon_h, panel->name);
-		// As if it had opened there: the player restored the LOGICAL size it saved
-		// last time, normally on the panel, so keep that size there. Keeping the
-		// device size instead (what a move does) shrinks a window that opened on a
-		// lower-scale monitor at every start, since the player saves the smaller
-		// logical size it then has on the panel. A size the app asked for stands.
-		if (!s_wl.wanted_by_app && s_wl.logical_w > 0 && s_wl.logical_h > 0) {
-			uint32_t p120 = output_scale120_locked(panel, layout);
-			if (p120) {
-				s_wl.wanted_device_w = (int)lround(s_wl.logical_w * (p120 / 120.0));
-				s_wl.wanted_device_h = (int)lround(s_wl.logical_h * (p120 / 120.0));
-			}
-		}
-		send_to_panel_locked(panel, layout);
+		send_to_panel_locked(panel, layout); // (with the size it opened with: keep_opening_size_locked)
 		break;
 	}
 	return act;
