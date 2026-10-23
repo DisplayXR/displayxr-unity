@@ -15,6 +15,7 @@
 - [Depth-Aware Cursor](architecture/cursor-depth.md) — `XR_DXR_cursor_depth` (runtime ADR-046): the runtime draws a stereo cursor in front of popped-out content; opt-in API, depth sources, wiring, and the Windows panel verification recipe
 - [Side-Step](architecture/side-step.md) — Linux native Wayland: the app's own window steps aside for the window the user works in and goes back when its place is free; only while the app's desktop control is granted (the #389 gate, checked before every poll); other windows are read inside the plug-in only
 - [File Drops and the Clipboard](architecture/linux-file-drop-clipboard.md) — Linux native Wayland: files dragged onto the window (#395), what that does to Unity's clipboard and the plug-in clipboard that replaces it (#398), and the input fields that copy and paste through it (`DisplayXRClipboardInputField`, `DisplayXRClipboardLegacyInputField`)
+- [SDL Fixups](architecture/linux-sdl-fixups.md) — Linux native Wayland: upstream SDL fixes the plug-in applies to Unity's embedded SDL2 from outside (a monitor removed and added again, #410), how they are gated on the exact `UnityPlayer.so`, and the `DXR_SDLFIX=off` kill switch
 - [Click-Through Silhouette Mask](architecture/click-through-mask.md) — transparent-overlay per-pixel click-through: the mask→`SetWindowRgn` pipeline, the mask/weave rect-alignment invariant, and the debugging pitfalls (the #166 clip)
 
 ### Architecture Decision Records — Why things are the way they are

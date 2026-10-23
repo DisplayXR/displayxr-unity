@@ -231,7 +231,8 @@ if(UNIX AND NOT APPLE AND NOT ANDROID)
         add_library(displayxr_unity_wayland SHARED
             displayxr_linux_wayland.c
             displayxr_linux_wayland_dbus.c
-            displayxr_linux_dbus.c)
+            displayxr_linux_dbus.c
+            displayxr_linux_sdl_fixups.c)
         # viewporter + fractional-scale + xdg-output + xdg-foreign glue, generated from the vendored
         # XML (wayland-protocols is not installed everywhere; see wayland-protocols/README.md).
         set(DXR_WL_GEN ${CMAKE_CURRENT_BINARY_DIR}/wayland-generated)
@@ -271,6 +272,14 @@ if(UNIX AND NOT APPLE AND NOT ANDROID)
         add_executable(test_linux_clipboard tests/test_linux_clipboard.c)
         target_include_directories(test_linux_clipboard PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
         add_test(NAME linux_clipboard COMMAND test_linux_clipboard)
+        # The SDL fixups (Unity's embedded SDL): the gate (build table, verification,
+        # kill switch), the swap and the output-list unlink, on a fake UnityPlayer.so
+        # image. No Wayland needed.
+        add_executable(test_sdl_fixups tests/test_sdl_fixups.c displayxr_linux_sdl_fixups.c)
+        target_include_directories(test_sdl_fixups PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+        target_compile_definitions(test_sdl_fixups PRIVATE DXR_SDLFIX_TEST)
+        target_link_libraries(test_sdl_fixups PRIVATE Threads::Threads ${CMAKE_DL_LIBS})
+        add_test(NAME sdl_fixups COMMAND test_sdl_fixups)
         # A removed output's wl_output binding is kept: an in-process compositor
         # (libwayland-server, also in libwayland-dev) shows the player's surface never
         # gets leave(NULL) for it.
