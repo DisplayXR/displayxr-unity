@@ -240,6 +240,13 @@ dxr_wl_move_player_to_panel(const char *connector, int panel_w, int panel_h)
 }
 
 int
+dxr_wl_place_player_at_start(const char *connector, int panel_w, int panel_h)
+{
+	const DxrWlApi *a = api();
+	return a ? a->place_player_at_start(connector, panel_w, panel_h) : 0;
+}
+
+int
 dxr_wl_get_player_position_x11(int *out_x, int *out_y)
 {
 	const DxrWlApi *a = api();

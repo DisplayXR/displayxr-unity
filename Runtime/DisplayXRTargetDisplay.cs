@@ -37,12 +37,27 @@ namespace DisplayXR
     /// would mis-place the window on exactly the mixed-DPI multi-monitor setups this is
     /// for.
     /// </para>
+    ///
+    /// <para>
+    /// <b>Linux native Wayland: on by default, without this component</b>
+    /// (<see cref="PlaceOnPanelAtStart"/>). There mutter opens a new window on the monitor
+    /// under the pointer, which can be a screen-casting tool's virtual monitor nobody
+    /// sees. So the plug-in moves the window onto the panel once, a couple of frames into
+    /// the session, unless the app placed it first (its own
+    /// <c>displayxr_set_overlay_position</c>, e.g. a saved position it restores, or this
+    /// component), the user dragged it, or it opened on the panel. Turn it off with
+    /// <see cref="PlaceOnPanelAtStart"/> = false, this component with
+    /// <see cref="moveOnStart"/> off, or <c>DISPLAYXR_PANEL_PLACEMENT=0</c>.
+    /// X11 / XWayland, Windows and macOS are unchanged: there this component opts in.
+    /// </para>
     /// </summary>
     [AddComponentMenu("DisplayXR/Target Display (move window to the 3D panel)")]
     [DisallowMultipleComponent]
     public class DisplayXRTargetDisplay : MonoBehaviour
     {
-        [Tooltip("Move the window onto the DisplayXR panel when the session starts.")]
+        [Tooltip("Move the window onto the DisplayXR panel when the session starts. Off: " +
+                 "the window stays where it opened, and the default start-up placement " +
+                 "(Linux native Wayland) is turned off too.")]
         public bool moveOnStart = true;
 
         [Tooltip("How long to wait for the session before giving up, in seconds. The " +
@@ -63,6 +78,73 @@ namespace DisplayXR
         void OnEnable()
         {
             if (moveOnStart) StartCoroutine(MoveWhenReady());
+            else PlaceOnPanelAtStart = false; // the app takes placement on itself
+        }
+
+        // ---- The start-up placement (on by default) ------------------------------
+
+        /// <summary>
+        /// Move the window onto the 3D panel once when the session starts, with no
+        /// component in the scene. On by default; Linux native-Wayland players only for
+        /// now (elsewhere nothing changes). It stands down when the app placed the window
+        /// first (<c>displayxr_set_overlay_position</c>, <see cref="MoveNow"/>), the user
+        /// dragged it, or it opened on the panel; it never acts onto a panel the runtime
+        /// did not confirm (sim display, no 3D display) or for a session that comes up
+        /// more than <see cref="StartupWindowSeconds"/> after launch.
+        /// <para>
+        /// To turn it off, set this to false before the session's second frame — from a
+        /// <c>[RuntimeInitializeOnLoadMethod]</c> or the first scene's <c>Awake</c> /
+        /// <c>OnEnable</c> — or add this component with <see cref="moveOnStart"/> off. For
+        /// one run without code: <c>DISPLAYXR_PANEL_PLACEMENT=0</c>.
+        /// </para>
+        /// </summary>
+        public static bool PlaceOnPanelAtStart { get; set; } = true;
+
+        /// <summary>
+        /// The start-up placement applies only to a session that comes up this soon after
+        /// launch: an app that starts XR later, after the user has had the window for a
+        /// while, keeps it where it is.
+        /// </summary>
+        public const float StartupWindowSeconds = 20f;
+
+        static bool s_StartupDone;
+
+        /// <summary>
+        /// Called by the provider driver every frame of a running session; acts once per
+        /// run, at the session's second frame, so the app's own placement in its first
+        /// frames (a saved position it restores) comes first.
+        /// </summary>
+        internal static void TickStartupPlacement(int sessionFrame)
+        {
+            if (s_StartupDone || sessionFrame < 2) return;
+            s_StartupDone = true;
+            if (Application.isEditor) return;
+            if (!PlaceOnPanelAtStart)
+            {
+                Debug.Log("[DisplayXR] start-up placement: turned off by the app — the window stays where it opened.");
+                return;
+            }
+            if (Time.realtimeSinceStartup > StartupWindowSeconds)
+            {
+                Debug.Log($"[DisplayXR] start-up placement: the session came up {Time.realtimeSinceStartup:F0}s after " +
+                          "launch — leaving the window where it is.");
+                return;
+            }
+            if (Screen.fullScreenMode != FullScreenMode.Windowed)
+            {
+                Debug.Log($"[DisplayXR] start-up placement: {Screen.fullScreenMode} — not moved.");
+                return;
+            }
+            int r;
+            try { r = DisplayXRProviderNative.dxr_prov_place_window_at_start(); }
+            catch (System.EntryPointNotFoundException) { return; }
+            if (r != 0)
+                Debug.Log("[DisplayXR] start-up placement: " + (
+                    r == 1 ? "moving the window onto the 3D panel." :
+                    r == 2 ? "the window opened on the 3D panel." :
+                    r == 3 ? "deciding once the window is shown." :
+                    r == -1 ? "the app or the user placed the window — left there." :
+                              "the window was not shown in time — left where it opened."));
         }
 
         /// <summary>

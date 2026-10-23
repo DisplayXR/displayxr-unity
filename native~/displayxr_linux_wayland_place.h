@@ -106,6 +106,56 @@ dxr_wl_sent_size_outcome(long long now_ns, long long until_ns, int sent_w, int s
 	return cur_w == sent_w && cur_h == sent_h ? 1 : -1;
 }
 
+//! The start-up placement (on by default): what to do with the window the
+//! compositor opened where it chose (mutter: on the monitor under the pointer).
+enum {
+	DXR_WL_STARTUP_EXPIRED = -2, //!< not shown in time: no late jump
+	DXR_WL_STARTUP_PLACED = -1,  //!< the app or the user placed it already: theirs
+	DXR_WL_STARTUP_MOVE = 1,     //!< centre it on the 3D panel
+	DXR_WL_STARTUP_THERE = 2,    //!< it is on the panel already: leave it
+	DXR_WL_STARTUP_WAIT = 3,     //!< not shown yet: decide once it is
+};
+
+//! @p placed: the app (its own position, a move to the panel) or the user (a drag)
+//! placed the window this run. @p shown: the extension reports it mapped, with its
+//! frame (x, y, w, h) and monitor (@p mon; w <= 0 = not reported: the frame's centre
+//! decides). A decision put off until the window is shown is dropped after
+//! @p until_ns (0 = no limit), so a window that shows late (an extension that came
+//! back minutes later) does not jump.
+static inline int
+dxr_wl_startup_action(int placed, int shown, DxrWlRect4 panel, DxrWlRect4 mon, int x, int y, int w, int h,
+                      long long now_ns, long long until_ns)
+{
+	if (placed)
+		return DXR_WL_STARTUP_PLACED;
+	if (until_ns && now_ns > until_ns)
+		return DXR_WL_STARTUP_EXPIRED;
+	if (!shown)
+		return DXR_WL_STARTUP_WAIT;
+	int there = mon.w > 0 ? dxr_wl_monitor_is(mon, panel) : dxr_wl_window_on_rect(panel, x, y, w, h);
+	return there ? DXR_WL_STARTUP_THERE : DXR_WL_STARTUP_MOVE;
+}
+
+//! DISPLAYXR_PANEL_PLACEMENT turns the start-up placement off: "0", "off", "no" or
+//! "false", any case. Unset, empty or anything else: on.
+static inline int
+dxr_startup_placement_env_off(const char *v)
+{
+	static const char *const offs[] = {"0", "off", "no", "false"};
+	if (!v || !v[0])
+		return 0;
+	for (unsigned i = 0; i < sizeof(offs) / sizeof(offs[0]); i++) {
+		const char *a = v, *b = offs[i];
+		while (*a && *b && (*a >= 'A' && *a <= 'Z' ? *a + 32 : *a) == *b) {
+			a++;
+			b++;
+		}
+		if (!*a && !*b)
+			return 1;
+	}
+	return 0;
+}
+
 #ifdef __cplusplus
 }
 #endif
