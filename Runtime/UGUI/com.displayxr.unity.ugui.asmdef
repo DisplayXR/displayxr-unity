@@ -1,0 +1,25 @@
+{
+    "name": "com.displayxr.unity.ugui",
+    "rootNamespace": "DisplayXR",
+    "references": [
+        "com.displayxr.unity",
+        "UnityEngine.UI"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [
+        "DISPLAYXR_UGUI"
+    ],
+    "versionDefines": [
+        {
+            "name": "com.unity.ugui",
+            "expression": "1.0.0",
+            "define": "DISPLAYXR_UGUI"
+        }
+    ],
+    "noEngineReferences": false
+}

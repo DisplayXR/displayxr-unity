@@ -5,3 +5,6 @@ using System.Runtime.CompilerServices;
 // (DisplayXRCursorDepthPatch is internal plumbing, not app API).
 [assembly: InternalsVisibleTo("com.displayxr.unity.urp")]
 [assembly: InternalsVisibleTo("com.displayxr.unity.hdrp")]
+// The input-field sub-assemblies share the plug-in clipboard helpers (DisplayXRTextClipboard*).
+[assembly: InternalsVisibleTo("com.displayxr.unity.tmp")]
+[assembly: InternalsVisibleTo("com.displayxr.unity.ugui")]
