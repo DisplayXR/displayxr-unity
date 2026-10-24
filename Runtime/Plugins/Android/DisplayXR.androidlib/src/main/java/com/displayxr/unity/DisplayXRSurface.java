@@ -88,6 +88,11 @@ public final class DisplayXRSurface
     private final int[] mLocInWindow = new int[2];
     private final Point mReal = new Point();
     private final int[] mLastRect = new int[7];
+    // Rotation ordering (#418 follow-up): frames a geometry sample has been held back
+    // because the panel extent already reports the new rotation while the view has
+    // not been laid out for it yet. Bounded by MAX_ROTATION_HOLD_FRAMES.
+    private int mRotationHold;
+    private static final int MAX_ROTATION_HOLD_FRAMES = 30; // 0.5 s at 60 Hz
 
     /**
      * Install the provider's SurfaceView over the activity's content. Idempotent; safe
@@ -193,6 +198,25 @@ public final class DisplayXRSurface
         if (mLastRect[0] == mLoc[0] && mLastRect[1] == mLoc[1] && mLastRect[2] == w
                 && mLastRect[3] == h && mLastRect[4] == mReal.x && mLastRect[5] == mReal.y
                 && mLastRect[6] == id) return;
+        // A rotation reaches the Display (getRealSize) one or more frames BEFORE the
+        // view is re-laid out for it: for that window the sample pairs the NEW panel
+        // extent with the OLD view rect, and the runtime would place / phase the weave
+        // for a window that never existed (measured: one ~20 ms sample per rotation).
+        // So when the panel extent changed but the view's size did not, hold the
+        // sample until the layout catches up — bounded, because a window that really
+        // keeps its size across a rotation (freeform) must still be reported.
+        if (mLastRect[4] != Integer.MIN_VALUE && (mLastRect[4] != mReal.x || mLastRect[5] != mReal.y)
+                && mLastRect[2] == w && mLastRect[3] == h && mRotationHold < MAX_ROTATION_HOLD_FRAMES) {
+            if (mRotationHold++ == 0)
+                Log.i(TAG, "[DisplayXR-AND] rotation: panel now " + mReal.x + "x" + mReal.y
+                        + ", view still " + w + "x" + h + " — holding the geometry until it is re-laid out");
+            return;
+        }
+        if (mRotationHold > 0) {
+            Log.i(TAG, "[DisplayXR-AND] rotation: geometry released after " + mRotationHold
+                    + " held frame(s): view " + w + "x" + h + " panel " + mReal.x + "x" + mReal.y);
+            mRotationHold = 0;
+        }
         mLastRect[0] = mLoc[0]; mLastRect[1] = mLoc[1]; mLastRect[2] = w; mLastRect[3] = h;
         mLastRect[4] = mReal.x; mLastRect[5] = mReal.y; mLastRect[6] = id;
         nativeWindowGeometry(mLoc[0], mLoc[1], w, h, mReal.x, mReal.y, id);
