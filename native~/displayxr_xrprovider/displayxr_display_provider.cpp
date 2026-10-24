@@ -48,6 +48,9 @@ extern "C" uint32_t dxr_prov_get_extra_zone_acquired_index(uint32_t ei);
 #include "../unity_pluginapi/IUnityXRDisplay.h"
 
 #include "displayxr_provider_session.h"
+#if defined(__ANDROID__)
+#include "../displayxr_android.h" // session-thread ALooper pump (#418 D4)
+#endif
 
 // Renderer id (IUnityGraphics::GetRenderer()) — defined in displayxr_unity_plugin.cpp.
 // -1 if IUnityGraphics isn't available. Used to select the graphics backend (#195).
@@ -63,6 +66,9 @@ extern "C" bool displayxr_unity_get_vulkan(void **out_instance, void **out_physi
 extern "C" void  dxr_pvk_set_unity_objects(void *, void *, void *, uint32_t, void *);
 extern "C" void *dxr_pvk_unity_image_ptr(int eye);
 extern "C" int   dxr_pvk_device_ready(void);
+extern "C" uint32_t dxr_pvk_bridge_ring(void);
+extern "C" void *dxr_pvk_unity_image_ptr_at(int eye, uint32_t slot);
+extern "C" uint32_t dxr_pvk_frame_begin(void);
 #endif
 
 // #247 crash bisect — see the call site in create_textures(). Latched so the env var
@@ -198,7 +204,9 @@ extern "C" void dxr_prov_file_log(const char *s); // defined in the session TU
 
 void prov_log(const char *msg)
 {
+#if !defined(__ANDROID__) // Android: stderr goes nowhere; dxr_prov_file_log -> logcat
 	fprintf(stderr, "%s", msg);
+#endif
 #ifdef _WIN32
 	OutputDebugStringA(msg);
 #endif
@@ -620,6 +628,58 @@ void create_textures_if_ready()
 		return;
 	}
 
+#if defined(ENABLE_VULKAN)
+	// Vulkan bridge RING (Android, #418 P3b): one Unity texture per ring slot (per eye
+	// in MultiPass) — s_tex_ids[slot] for SPI, s_tex_ids[slot*2+eye] for MultiPass.
+	// PopulateNextFrameDesc picks this frame's slot from dxr_pvk_frame_begin(). With a
+	// ring of 1 (desktop) this arm is skipped and the single-bridge arms below run.
+	if (dxr_prov_get_graphics_api() == DXR_GFX_VULKAN && dxr_pvk_bridge_ring() > 1 &&
+	    !prov_vk_unity_alloc_probe()) {
+		const uint32_t ring = dxr_pvk_bridge_ring();
+		const bool sp = dxr_prov_get_single_pass() != 0;
+		uint32_t w = 0, h = 0, arr = 0;
+		if (sp) {
+			if (!dxr_prov_get_bridge_unity_texture(&w, &h, &arr) || w == 0) return;
+		} else {
+			if (!dxr_prov_get_bridge_unity_texture_eye(0, &w, &h) || w == 0) return;
+			arr = 1;
+		}
+		uint32_t n = 0;
+		for (uint32_t r = 0; r < ring; r++) {
+			for (uint32_t e = 0; e < (sp ? 1u : 2u); e++) {
+				void *img = dxr_pvk_unity_image_ptr_at(sp ? -1 : (int)e, r);
+				if (!img) return; // bridge set not created yet (await session-ready)
+				UnityXRRenderTextureDesc desc;
+				memset(&desc, 0, sizeof(desc));
+				desc.colorFormat = kUnityXRRenderTextureFormatRGBA32;
+				desc.color.nativePtr = img;
+				desc.depthFormat = kUnityXRDepthTextureFormat24bitOrGreater;
+				desc.depth.nativePtr = (void *)(uintptr_t)kUnityXRRenderTextureIdDontCare;
+				desc.width = w;
+				desc.height = h;
+				desc.textureArrayLength = sp ? arr : 1;
+				desc.flags = prov_eye_tex_flags();
+				UnityXRRenderTextureId id = 0;
+				if (s_display->CreateTexture(s_handle, &desc, &id) != kUnitySubsystemErrorCodeSuccess) {
+					prov_log("[DisplayXR-PROV] CreateTexture (Vulkan ring bridge) failed\n");
+					for (uint32_t i = 0; i < n; i++) s_display->DestroyTexture(s_handle, s_tex_ids[i]);
+					memset(s_tex_ids, 0, sizeof(s_tex_ids));
+					return;
+				}
+				s_tex_ids[sp ? r : r * 2 + e] = id;
+				n++;
+			}
+		}
+		s_tex_count = n;
+		s_textures_created = true;
+		char m[160];
+		snprintf(m, sizeof(m), "[DisplayXR-PROV] CreateTexture: wrapped %u-slot Vulkan bridge ring (%s, %u textures)\n",
+		         ring, sp ? "SPI" : "MultiPass", n);
+		prov_log(m);
+		return;
+	}
+#endif
+
 	if (dxr_prov_get_single_pass()) {
 		// SPI: ONE Unity texture wrapping the shared 2-slice-array BRIDGE. Unity
 		// renders both eyes into it (slices 0/1); the provider copies it into the
@@ -823,6 +883,25 @@ GfxStart(UnitySubsystemHandle handle, void *userData, UnityXRRenderingCapabiliti
 		// because XR_DXR_xlib_window_binding hands presentation of that window to the
 		// runtime, and Unity already owns a swapchain on its main window.
 		caps->skipPresentToMainScreen = false;
+#elif defined(__ANDROID__)
+		// Android/Vulkan (#418): same own-device bridge as Linux — the provider
+		// records and submits its own Vulkan command buffers, so re-validate Unity's
+		// render state around each callback.
+		caps->invalidateRenderStateAfterEachCallback = true;
+		// Skip Unity's own present (#418 follow-up). The weave goes to the provider's
+		// SurfaceView, stacked above Unity's (DisplayXRSurface.java), so nothing Unity
+		// presents is ever seen. Measured on a Nubia Pad 2: Unity's layer receives 0
+		// buffers instead of 60/s, Screen.* / touch / wsui hit-testing are unchanged
+		// (Unity's surface keeps its size). GPU busy is unchanged too — Unity's present
+		// and back buffer cost ~nothing; the gap to a bare VK app is Unity's own eye
+		// rendering + the bridge copy. Unity still allocates its swapchain (~60 MB); the
+		// only way to reclaim it, shrinking Unity's surface, breaks Screen.* vs touch
+		// coordinates, so it is not done.
+		// A/B: setprop debug.displayxr.unity_present 1 (or DISPLAYXR_ANDROID_UNITY_PRESENT=1).
+		caps->skipPresentToMainScreen =
+		    dxr_android_flag("DISPLAYXR_ANDROID_UNITY_PRESENT", "debug.displayxr.unity_present") ? false : true;
+		prov_log(caps->skipPresentToMainScreen ? "[DisplayXR-PROV] Android: skipPresentToMainScreen=1\n"
+		                                       : "[DisplayXR-PROV] Android: skipPresentToMainScreen=0 (A/B flag)\n");
 #else
 		// macOS zero-copy touches NO Unity render state in the callbacks (no
 		// provider command buffers at all), and the invalidation path is what
@@ -887,6 +966,15 @@ GfxStart(UnitySubsystemHandle handle, void *userData, UnityXRRenderingCapabiliti
 		backend_kind = DXR_GFX_VULKAN; dev_ptr = nullptr; queue_ptr = nullptr;
 	} else
 #endif
+#elif defined(__ANDROID__)
+#if defined(ENABLE_VULKAN)
+	// Android (#418) is Vulkan-only for this provider (no GLES backend): the same
+	// enable2 own-device bridge as Windows/Linux — see prov_bind_vulkan_backend().
+	if (renderer == kUnityGfxRendererVulkan) {
+		if (!prov_bind_vulkan_backend()) return kUnitySubsystemErrorCodeFailure;
+		backend_kind = DXR_GFX_VULKAN; dev_ptr = nullptr; queue_ptr = nullptr;
+	} else
+#endif
 #elif defined(__APPLE__)
 	if (renderer == kUnityGfxRendererMetal) {
 		// Metal (#204): the session binds a provider-created MTLCommandQueue on
@@ -912,6 +1000,11 @@ GfxStart(UnitySubsystemHandle handle, void *userData, UnityXRRenderingCapabiliti
 		         "[DisplayXR-PROV] WARN: unsupported graphics API (renderer=%d). The DisplayXR "
 		         "provider requires Vulkan on Linux — session not started (#249). Set Vulkan "
 		         "first in Project Settings > Player > Graphics APIs.\n", renderer);
+#elif defined(__ANDROID__)
+		snprintf(msg, sizeof(msg),
+		         "[DisplayXR-PROV] WARN: unsupported graphics API (renderer=%d). The DisplayXR "
+		         "provider requires Vulkan on Android (no OpenGL ES backend) — session not "
+		         "started (#418). Put Vulkan first in Player > Android > Graphics APIs.\n", renderer);
 #else
 		snprintf(msg, sizeof(msg),
 		         "[DisplayXR-PROV] WARN: unsupported graphics API (renderer=%d). The DisplayXR "
@@ -958,6 +1051,11 @@ GfxStart(UnitySubsystemHandle handle, void *userData, UnityXRRenderingCapabiliti
 		             // read as a contradiction against the xlib-binding line that
 		             // follows it. The session logs the real target.
 		             : "[DisplayXR-PROV] weave target: X11 window binding (decided at session create)\n");
+#elif defined(__ANDROID__)
+		             // P3a (#418 D3): no surface binding — the runtime hosts its own
+		             // fullscreen SurfaceView. That is the shipping shape for now, not a
+		             // diagnostic, so don't call it SELFHOST.
+		             : "[DisplayXR-PROV] weave target: runtime-hosted SurfaceView (#418 P3a)\n");
 #else
 		             : "[DisplayXR-PROV] weave target: runtime self-hosted window (SELFHOST diagnostic)\n");
 #endif
@@ -1010,6 +1108,14 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 	// copies. Linux originally inherited the macOS arm below and hit exactly that
 	// (#249); it has no AppKit constraint, so it belongs on the Windows side.
 	dxr_prov_poll_events();
+#elif defined(__ANDROID__)
+	// Android (#418 D5) pumps on the graphics thread too, for the same reason as
+	// Linux above (no AppKit-style main-thread constraint; without the pump the
+	// session sits at READY forever). The C# LateUpdate pump stays macOS-only, so
+	// this is the ONE pump on Android. Also service the session thread's ALooper
+	// (#418 D4) — a no-op with one WARN if xrCreateSession ran on another thread.
+	dxr_prov_poll_events();
+	dxr_android_looper_poll();
 #endif
 #if defined(__linux__) && !defined(__ANDROID__)
 	// Keep the plugin-owned weave overlay parked over — and ABOVE — Unity's window.
@@ -1176,6 +1282,17 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 	s_current_image_index = img;
 	s_frame_in_flight = true;
 
+	// Vulkan bridge ring (Android, #418 P3b): advance to this frame's slot, after the
+	// copy that last read it has retired. 0 (and a no-op) with a ring of 1.
+	uint32_t vk_slot = 0;
+#if defined(ENABLE_VULKAN)
+	const bool vk_ring = dxr_prov_get_graphics_api() == DXR_GFX_VULKAN && dxr_pvk_bridge_ring() > 1 &&
+	                     s_tex_count >= dxr_pvk_bridge_ring();
+	if (vk_ring) vk_slot = dxr_pvk_frame_begin();
+#else
+	const bool vk_ring = false;
+#endif
+
 	// Arm the DXR_AVATAR_PRESENT_HZ cap only after the session has been genuinely
 	// renderable for ~2 s of panel time. Before that the pump must run every tick to
 	// climb SYNCHRONIZED -> VISIBLE (see above), and a cap that started early would
@@ -1207,7 +1324,7 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 		bool rotate = (dxr_prov_get_graphics_api() == DXR_GFX_D3D11 && !dxr_prov_d3d11_bridge_active())
 		              || dxr_prov_get_graphics_api() == DXR_GFX_METAL;
 		UnityXRNextFrameDesc::UnityXRRenderPass &pass = next->renderPasses[0];
-		pass.textureId = rotate ? s_tex_ids[s_current_image_index] : s_tex_ids[0];
+		pass.textureId = rotate ? s_tex_ids[s_current_image_index] : s_tex_ids[vk_ring ? vk_slot : 0];
 		pass.cullingPassIndex = 0;
 		pass.renderParamsCount = 2;
 
@@ -1247,7 +1364,7 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 			                     ? s_tex_ids[s_current_image_index * 2 + eye]
 			                     : s_tex_ids[eye];
 #else
-			pass.textureId = s_tex_ids[eye];
+			pass.textureId = s_tex_ids[vk_ring ? vk_slot * 2 + eye : eye];
 #endif
 			pass.cullingPassIndex = eye;
 			pass.renderParamsCount = 1;
@@ -1909,6 +2026,13 @@ LifecycleStart(UnitySubsystemHandle handle, void *userData)
 		             ? "[DisplayXR-PROV] Lifecycle Start (Linux: plugin-owned overlay weave window)\n"
 		             : "[DisplayXR-PROV] Lifecycle Start (Linux: no overlay window — runtime self-hosted weave window)\n");
 	}
+#elif defined(__ANDROID__)
+	// Android (#418 P3a): no window to create or find — the runtime hosts its own
+	// fullscreen SurfaceView inside xrCreateSession (#418 D3). P3b creates the
+	// provider-owned SurfaceView here (main thread) and binds it via
+	// XR_DXR_android_surface_binding.
+	s_overlay_hwnd = nullptr;
+	prov_log("[DisplayXR-PROV] Lifecycle Start (Android: runtime-hosted SurfaceView, no window binding)\n");
 #else
 	if (displayxr_is_shell_mode()) {
 		// Workspace tile (shell/IPC). The Shell launched us with
@@ -2099,6 +2223,10 @@ LifecycleStop(UnitySubsystemHandle handle, void *userData)
 	// Both are safe no-ops if the other shape was used this session.
 	displayxr_metal_destroy_app_overlay();     // built-player in-app overlay
 	displayxr_metal_destroy_preview_window();  // editor / fallback window
+	s_overlay_hwnd = nullptr;
+#elif defined(__ANDROID__)
+	// Android (#418 P3a): nothing to tear down — the runtime-hosted SurfaceView goes
+	// with xrDestroySession (GfxStop). P3b destroys the provider-owned view here.
 	s_overlay_hwnd = nullptr;
 #else
 	// Linux (#249): drop the plugin-owned overlay on the MAIN thread, after GfxStop

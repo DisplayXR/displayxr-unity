@@ -279,6 +279,7 @@ namespace DisplayXR
             //   Windows × Vulkan    | SPI | SPI  | MultiPass
             //   macOS   × Metal     | SPI | SPI  | MultiPass
             //   Linux   × Vulkan    | SPI | SPI  | MultiPass   (#249)
+            //   Android × Vulkan    | SPI | SPI  | MultiPass   (#418 P4)
             //   anything else       | MultiPass (moot — the native GfxStart no-starts)
             //
             // Rationale: URP and HDRP both consume the provider's full per-eye
@@ -294,6 +295,9 @@ namespace DisplayXR
             // three APIs (per-eye single-slice textures woven into slices 0/1: D3D
             // #195, Metal zero-copy slice views #204).
             var plat = Application.platform;
+            // Android (#418 P4): same rule as Linux — Vulkan is the only API, URP/HDRP
+            // render into one 2-layer bridge image per ring slot, BiRP stays MultiPass.
+            bool isAndroid = plat == RuntimePlatform.Android;
             bool isWindows = plat == RuntimePlatform.WindowsPlayer
                           || plat == RuntimePlatform.WindowsEditor;
             bool isMac = plat == RuntimePlatform.OSXPlayer
@@ -314,7 +318,8 @@ namespace DisplayXR
             bool isMetal = gdt == GraphicsDeviceType.Metal;
             bool apiEligible = (isWindows && (isD3D11 || isD3D12 || isVulkan))
                             || (isMac && isMetal)
-                            || (isLinux && isVulkan);
+                            || (isLinux && isVulkan)
+                            || (isAndroid && isVulkan);
             if (!apiEligible)
                 return false; // unsupported platform/API: MultiPass (native no-starts)
 

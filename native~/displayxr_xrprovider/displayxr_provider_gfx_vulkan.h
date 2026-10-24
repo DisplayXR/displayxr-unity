@@ -30,12 +30,15 @@
 // the semaphore playing the role of the shared ID3D12Fence. Intercept-based
 // zero-copy stays available as a player-only optimisation later.
 //
-// PLATFORMS: Windows (#247) and desktop Linux (#249). The two differ only in the
-// external-memory handle flavour — OPAQUE_WIN32 `HANDLE`s vs OPAQUE_FD file
-// descriptors — which the .cpp isolates behind a handful of PVK_* macros. Vulkan
-// on macOS is out of scope (Metal is the macOS backend, #202/#204), and Android
-// is a separate leg: its runtime is out-of-process, so this in-process bridge is
-// the wrong shape for it.
+// PLATFORMS: Windows (#247), desktop Linux (#249) and Android (#418). They differ
+// only in the external-memory handle flavour — OPAQUE_WIN32 `HANDLE`s vs OPAQUE_FD
+// file descriptors (Linux and Android) — which the .cpp isolates behind a handful
+// of PVK_* macros. Vulkan on macOS is out of scope (Metal is the macOS backend,
+// #202/#204). On Android the runtime runs IN-PROCESS by default (that is the
+// production path there, ADR-036 D2; out-of-process is the opt-in fallback), and
+// it creates its device through enable2 exactly as on desktop, so this same
+// own-device bridge is the right shape (#418 D2). Intercept-based zero-copy is the
+// later optimisation there too — Android has no editor Play Mode to rule it out.
 
 #pragma once
 
@@ -139,6 +142,29 @@ int dxr_pvk_copy_to_swapchain_image(int eye, uint32_t image_index);
 /// above waits for Unity's renders to land. Called from the render thread after
 /// Unity has submitted the eye work.
 void dxr_pvk_signal_unity_done(void);
+
+/// Number of bridge sets (ring slots): 1 on desktop, 2 on Android (#418 P3b),
+/// where the copy is GPU-ordered and frame N renders into slot N % 2. Valid once
+/// dxr_pvk_create_device() has run; the display provider wraps one Unity texture
+/// per slot (per eye).
+uint32_t dxr_pvk_bridge_ring(void);
+
+/// dxr_pvk_unity_image_ptr for ring slot `slot` (slot 0 == dxr_pvk_unity_image_ptr).
+void *dxr_pvk_unity_image_ptr_at(int eye, uint32_t slot);
+
+/// Start a frame: advance to the next ring slot and make sure the copy that last
+/// read that slot's bridge has retired (two frames old, so normally already done),
+/// then return the slot Unity must render into this frame. Call once per
+/// renderable frame, BEFORE handing Unity the eye textures. Always 0 on desktop.
+uint32_t dxr_pvk_frame_begin(void);
+
+/// Per-frame: order after Unity's eye renders and copy this frame's ring slot into
+/// swapchain image `image_index` — `n_eyes` MultiPass eyes (slices 0..n-1), or the
+/// whole SPI bridge when `spi`. Desktop: dxr_pvk_signal_unity_done + one
+/// fence-waited dxr_pvk_copy_to_swapchain_image per eye, exactly as before.
+/// Android: one batched submit that GPU-waits Unity's queue via a SYNC_FD
+/// semaphore and is not CPU-waited (see "Asynchronous copy" in the .cpp).
+int dxr_pvk_copy_frame(int spi, uint32_t n_eyes, uint32_t image_index);
 
 // ---------------------------------------------------------------------------
 // 2D overlay layers (Local2D, window-space UI) — #336

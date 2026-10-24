@@ -45,10 +45,13 @@ namespace DisplayXR
                 {
                     loaderName = "DisplayXR Display",
                     loaderType = typeof(DisplayXRDisplayLoader).FullName,
-                    // M2: Windows / D3D12. Standalone covers the Win64 player.
+                    // Standalone covers the Windows / macOS / Linux players. Android
+                    // (arm64, Vulkan) is #418: the native plugin builds for it and the
+                    // toggle appears on the Android tab; on-device bring-up is P3a.
                     supportedBuildTargets = new List<BuildTargetGroup>
                     {
-                        BuildTargetGroup.Standalone
+                        BuildTargetGroup.Standalone,
+                        BuildTargetGroup.Android
                     }
                 }
             }

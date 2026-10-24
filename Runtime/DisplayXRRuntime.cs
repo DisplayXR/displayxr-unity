@@ -75,6 +75,14 @@ namespace DisplayXR
         /// Whether a managed probe exists for this platform at all. False means
         /// <see cref="IsInstalled"/> is uninformative (always false) and callers must NOT
         /// read a false as "no runtime" — the XR loader treats it as "don't decline".
+        /// <para>
+        /// Android (#418) is deliberately in the "no probe" group: there is no manifest
+        /// FILE there — the Khronos loader finds the runtime APK through its
+        /// runtime_broker ContentProvider — so the loader never declines on Android and a
+        /// missing runtime surfaces as an <c>xrCreateInstance</c> failure in the native
+        /// log instead. (An installed-package check would need a PackageManager query;
+        /// not worth it before on-device bring-up.)
+        /// </para>
         /// </summary>
         internal static bool ProbeSupported
         {

@@ -17,6 +17,9 @@
 #endif
 
 #include <stdio.h>
+#if defined(__ANDROID__)
+extern "C" void dxr_prov_file_log(const char *s); // provider session TU -> logcat (#418)
+#endif
 
 // Pull in Vulkan type defs (VK_NO_PROTOTYPES — no symbols, just types) BEFORE
 // the Unity Vulkan header, which does `#include <vulkan/vulkan.h>`.
@@ -150,10 +153,23 @@ static void capture_vulkan_instance(void)
 		// its chain if it was armed: take the layer out of the environment now.
 		dxr_wl_capture_disarm("Unity's graphics device is up");
 #endif
+#if defined(__ANDROID__)
+		// Android (#418): stderr goes nowhere — logcat via the provider's sink.
+		{
+			char line[256];
+			snprintf(line, sizeof(line),
+			         "[DisplayXR] Unity Vulkan device captured: instance=%p physicalDevice=%p device=%p queue=%p qf=%u\n",
+			         (void *)s_vk_inst.instance, (void *)s_vk_inst.physicalDevice,
+			         (void *)s_vk_inst.device, (void *)s_vk_inst.graphicsQueue,
+			         s_vk_inst.queueFamilyIndex);
+			dxr_prov_file_log(line);
+		}
+#else
 		fprintf(stderr, "[DisplayXR] Unity Vulkan device captured: instance=%p physicalDevice=%p device=%p queue=%p qf=%u\n",
 		        (void *)s_vk_inst.instance, (void *)s_vk_inst.physicalDevice,
 		        (void *)s_vk_inst.device, (void *)s_vk_inst.graphicsQueue,
 		        s_vk_inst.queueFamilyIndex);
+#endif
 	}
 }
 #endif
@@ -253,6 +269,22 @@ dxr_prov_get_render_event_func(void)
 	return nullptr;
 #endif
 }
+
+#if defined(DXR_HAVE_UNITY_VULKAN) && defined(__ANDROID__)
+// Android (#418): the provider's work on UNITY's VkQueue (the per-frame semaphore
+// signal that orders the bridge copy, and the drains of the fallback paths) goes
+// through IUnityGraphicsVulkan::AccessQueue — the documented way for a plug-in to
+// submit to that queue. vkQueueSubmit / vkQueueWaitIdle need the queue externally
+// synchronised, and Unity may submit from more than one thread. Returns 0 (and does
+// nothing) when the interface is unavailable; the caller then uses its direct path.
+extern "C" int
+displayxr_unity_vk_access_queue(UnityRenderingEventAndData cb, int event_id, void *user_data, int flush)
+{
+	if (!s_unity_vk || !s_unity_vk->AccessQueue || !cb) return 0;
+	s_unity_vk->AccessQueue(cb, event_id, user_data, flush != 0);
+	return 1;
+}
+#endif
 
 extern "C" int
 displayxr_unity_get_renderer(void)

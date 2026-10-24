@@ -27,6 +27,11 @@ namespace DisplayXR.Editor
 
         public void OnPostprocessBuild(BuildReport report)
         {
+            // Android (#418): the workspace sidecar manifest + icons below are a desktop
+            // Shell feature, and the output path is an .apk/.aab, not an executable.
+            if (report.summary.platform == BuildTarget.Android)
+                return;
+
             // Bundle the OpenXR loader into macOS standalone builds. Unity's own
             // OpenXRBuildProcessor only handles Windows + Android; on macOS the
             // .app ships without a loader and OpenXR session init fails with

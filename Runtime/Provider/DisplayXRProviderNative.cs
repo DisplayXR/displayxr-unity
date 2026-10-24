@@ -51,6 +51,14 @@ namespace DisplayXR
         public static extern int dxr_prov_session_is_running();
 
         /// <summary>
+        /// Count of successful session starts in this process. A change while running =
+        /// the session was stopped and restarted between two polls (Android pause/resume
+        /// does exactly that while the main thread is paused, #418).
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern uint dxr_prov_session_serial();
+
+        /// <summary>
         /// 1 once the runtime signals the app to terminate (session EXITING / LOSS_PENDING —
         /// e.g. the shell's workspace close request). The driver calls Application.Quit() on it
         /// (#223: the tile was ignoring the shell's close request).

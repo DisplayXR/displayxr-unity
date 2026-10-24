@@ -146,6 +146,13 @@ void dxr_prov_session_stop(void);
 /// Whether the session is currently running.
 DISPLAYXR_EXPORT int  dxr_prov_session_is_running(void);
 
+/// Monotonic count of successful session starts in this process (0 = none yet). A
+/// change while the session reads as running means it was stopped and restarted
+/// between two polls — on Android, Unity tears the session down on pause and brings a
+/// new one up on resume while its main thread is paused, so a running-flag edge
+/// detector on the main thread never sees the gap (#418 P3b). Never reset.
+DISPLAYXR_EXPORT uint32_t dxr_prov_session_serial(void);
+
 /// 1 once the runtime signals the app to terminate (session EXITING / LOSS_PENDING —
 /// e.g. the shell's workspace close request). The C# driver calls Application.Quit() on it.
 DISPLAYXR_EXPORT int  dxr_prov_exit_requested(void);

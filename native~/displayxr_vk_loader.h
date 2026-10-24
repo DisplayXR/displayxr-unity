@@ -62,6 +62,7 @@ struct VkApi {
 	PFN_vkCreateCommandPool        vkCreateCommandPool;
 	PFN_vkDestroyCommandPool       vkDestroyCommandPool;
 	PFN_vkAllocateCommandBuffers   vkAllocateCommandBuffers;
+	PFN_vkFreeCommandBuffers       vkFreeCommandBuffers;
 	PFN_vkBeginCommandBuffer       vkBeginCommandBuffer;
 	PFN_vkEndCommandBuffer         vkEndCommandBuffer;
 	PFN_vkResetCommandBuffer       vkResetCommandBuffer;
@@ -72,6 +73,7 @@ struct VkApi {
 	PFN_vkDestroyFence             vkDestroyFence;
 	PFN_vkResetFences              vkResetFences;
 	PFN_vkWaitForFences            vkWaitForFences;
+	PFN_vkGetFenceStatus           vkGetFenceStatus;
 	PFN_vkQueueSubmit              vkQueueSubmit;
 	PFN_vkQueueWaitIdle            vkQueueWaitIdle;
 	PFN_vkDeviceWaitIdle           vkDeviceWaitIdle;
