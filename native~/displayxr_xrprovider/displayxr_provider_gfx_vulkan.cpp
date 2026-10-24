@@ -36,6 +36,8 @@
 #include <stdio.h>
 #include <string.h>
 #if defined(__ANDROID__)
+#include <errno.h>
+#include <pthread.h>
 #include <time.h>
 #endif
 
@@ -1102,6 +1104,159 @@ pvk_barrier(VkImage img, VkImageLayout old_layout, VkImageLayout new_layout,
 
 static void pvk_grave_tick(void); // overlay graveyard (see the 2D overlay section)
 
+#if defined(__ANDROID__)
+// ---------------------------------------------------------------------------
+// Work on UNITY's queue (Android, #418 follow-up)
+// ---------------------------------------------------------------------------
+//
+// vkQueueSubmit and vkQueueWaitIdle require the VkQueue to be externally
+// synchronised, and Unity's graphics queue is Unity's: it may submit to it from
+// its render thread and, with graphics jobs, from worker threads. So every
+// provider operation on that queue — the per-frame semaphore signal that orders
+// the bridge copy, and the drains of the fallback paths — runs inside an
+// IUnityGraphicsVulkan::AccessQueue callback, the documented way for a plug-in to
+// get exclusive use of it. flush=true: Unity first submits every command buffer
+// of the frame recorded so far, so the eye renders are on the queue AHEAD of our
+// signal by construction rather than by the observation that Unity happened to
+// have submitted them by SubmitCurrentFrame.
+//
+// AccessQueue "may or may not be called synchronously". The callers need the
+// result now (the sync_file goes into this frame's copy submit), so the op is
+// done in the callback when Unity runs it synchronously; if Unity defers it, the
+// caller waits for it (bounded). A deferred callback that arrives after the wait
+// gave up finds its op retired (generation mismatch) and does nothing.
+extern "C" int displayxr_unity_vk_access_queue(UnityRenderingEventAndData cb, int event_id, void *user_data,
+                                               int flush);
+
+enum PvkQueueOpKind { PVK_QOP_SIGNAL = 1, PVK_QOP_DRAIN = 2 };
+
+struct PvkQueueOp {
+	pthread_mutex_t mx = PTHREAD_MUTEX_INITIALIZER;
+	pthread_cond_t  cv = PTHREAD_COND_INITIALIZER;
+	uint32_t        gen = 0;      // bumped per request; the callback carries it in eventId
+	int             kind = 0;
+	bool            done = false;
+	VkResult        vr = VK_SUCCESS;
+	int             fd = -1;
+	pid_t           cb_tid = 0;
+};
+static PvkQueueOp s_qop;
+static int s_qop_mode_logged = 0;
+static int s_qop_direct = 0; // AccessQueue unavailable / unusable: use the queue directly
+
+static void UNITY_INTERFACE_API
+pvk_queue_op_cb(int event_id, void *ud)
+{
+	PvkQueueOp *op = (PvkQueueOp *)ud;
+	pthread_mutex_lock(&op->mx);
+	if ((uint32_t)event_id != op->gen || op->done) { // stale (the caller gave up) — do nothing
+		pthread_mutex_unlock(&op->mx);
+		return;
+	}
+	op->cb_tid = gettid();
+	if (op->kind == PVK_QOP_SIGNAL) {
+		VkSubmitInfo si = {};
+		si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+		si.signalSemaphoreCount = 1;
+		si.pSignalSemaphores = &s_pvk.unity_done_sem;
+		op->vr = s_pvk.unity_api.vkQueueSubmit(s_pvk.unity_queue, 1, &si, VK_NULL_HANDLE);
+		op->fd = -1;
+		if (op->vr == VK_SUCCESS) {
+			VkSemaphoreGetFdInfoKHR gi = {};
+			gi.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR;
+			gi.semaphore = s_pvk.unity_done_sem;
+			gi.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+			op->vr = s_pvk.unity_api.vkGetSemaphoreFdKHR(s_pvk.unity_device, &gi, &op->fd);
+		}
+	} else if (op->kind == PVK_QOP_DRAIN) {
+		op->vr = s_pvk.unity_api.vkQueueWaitIdle ? s_pvk.unity_api.vkQueueWaitIdle(s_pvk.unity_queue)
+		                                         : VK_ERROR_INITIALIZATION_FAILED;
+	}
+	op->done = true;
+	pthread_cond_broadcast(&op->cv);
+	pthread_mutex_unlock(&op->mx);
+}
+
+// Run one operation on Unity's queue. SIGNAL: *out_fd = the exported sync_file
+// (-1 = already signalled). Returns the VkResult; VK_ERROR_INITIALIZATION_FAILED
+// when the operation could not be run at all.
+static VkResult
+pvk_unity_queue_op(int kind, int *out_fd)
+{
+	if (out_fd) *out_fd = -1;
+	if (s_pvk.unity_queue == VK_NULL_HANDLE) return VK_ERROR_INITIALIZATION_FAILED;
+	PvkQueueOp *op = &s_qop;
+	pthread_mutex_lock(&op->mx);
+	op->gen = (op->gen + 1) & 0x7fffffffu;
+	if (op->gen == 0) op->gen = 1;
+	const uint32_t gen = op->gen;
+	op->kind = kind;
+	op->done = false;
+	op->vr = VK_ERROR_INITIALIZATION_FAILED;
+	op->fd = -1;
+	op->cb_tid = 0;
+	pthread_mutex_unlock(&op->mx);
+
+	bool queued = !s_qop_direct &&
+	              displayxr_unity_vk_access_queue(pvk_queue_op_cb, (int)gen, op, /*flush=*/1) != 0;
+	pthread_mutex_lock(&op->mx);
+	const bool sync = queued && op->done;
+	if (queued && !op->done) {
+		// Deferred by Unity: wait for it, bounded. Unity's submission thread runs
+		// independently of this (render) thread, so this cannot self-deadlock; the
+		// bound only turns a wedged queue into one logged fallback.
+		struct timespec dl;
+		clock_gettime(CLOCK_REALTIME, &dl);
+		dl.tv_nsec += 200L * 1000000L;
+		if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; }
+		while (!op->done) {
+			if (pthread_cond_timedwait(&op->cv, &op->mx, &dl) == ETIMEDOUT) break;
+		}
+	}
+	bool done = op->done;
+	VkResult vr = op->vr;
+	int fd = op->fd;
+	pid_t cb_tid = op->cb_tid;
+	if (!done) {
+		op->done = true; // retire it: a late callback for `gen` is now a no-op
+	}
+	pthread_mutex_unlock(&op->mx);
+
+	if (!s_qop_mode_logged) {
+		s_qop_mode_logged = 1;
+		pvk_log("[DisplayXR-PROV-VK] Unity-queue access: %s (op=%s, callback tid=%d, caller tid=%d)\n",
+		        !queued ? "DIRECT (IUnityGraphicsVulkan::AccessQueue unavailable)"
+		        : sync  ? "AccessQueue, synchronous (flush=1)"
+		        : done  ? "AccessQueue, deferred — waited for the callback (flush=1)"
+		                : "AccessQueue callback did not run within 200 ms — direct for the rest of the session",
+		        kind == PVK_QOP_SIGNAL ? "signal" : "drain", (int)cb_tid, (int)gettid());
+	}
+	if (queued && !done) {
+		// Never ran (and now never will act): use the queue directly from here on,
+		// for THIS op too. A wedged Unity queue is the only way to get here.
+		s_qop_direct = 1;
+		queued = false;
+	}
+	if (!queued) {
+		PvkQueueOp direct;
+		direct.gen = 1;
+		direct.kind = kind;
+		pvk_queue_op_cb(1, &direct);
+		vr = direct.vr;
+		fd = direct.fd;
+	}
+	if (out_fd) *out_fd = fd;
+	return vr;
+}
+
+// Drain Unity's queue (fallback paths only; the steady state never drains).
+static void
+pvk_unity_drain(void)
+{
+	(void)pvk_unity_queue_op(PVK_QOP_DRAIN, nullptr);
+}
+#endif // __ANDROID__
+
 void
 dxr_pvk_signal_unity_done(void)
 {
@@ -1117,6 +1272,10 @@ dxr_pvk_signal_unity_done(void)
 	// access (kUnityVulkanGraphicsQueueAccess_Allow) that the IUnityXRDisplay
 	// callbacks do not carry today. Landing the drain first keeps Phase 1
 	// verifiable; the semaphore is a measured optimisation, not a correctness fix.
+#if defined(__ANDROID__)
+	if (s_pvk.unity_queue != VK_NULL_HANDLE) pvk_unity_drain(); // via AccessQueue
+	else
+#endif
 	if (s_pvk.unity_api.vkQueueWaitIdle && s_pvk.unity_queue != VK_NULL_HANDLE)
 		s_pvk.unity_api.vkQueueWaitIdle(s_pvk.unity_queue);
 	else if (s_pvk.unity_api.vkDeviceWaitIdle && s_pvk.unity_device != VK_NULL_HANDLE)
@@ -1237,8 +1396,7 @@ pvk_copy_bridge(PvkBridge *b, VkImage dst, uint32_t dst_base_layer, uint32_t lay
 #if defined(__ANDROID__)
 	// Asynchronous mode never drained Unity's queue this frame: a synchronous copy
 	// that reads a Unity-written bridge (the overlay fallback) must still drain it.
-	if (s_pvk.async && s_pvk.unity_api.vkQueueWaitIdle && s_pvk.unity_queue != VK_NULL_HANDLE)
-		s_pvk.unity_api.vkQueueWaitIdle(s_pvk.unity_queue);
+	if (s_pvk.async && s_pvk.unity_queue != VK_NULL_HANDLE) pvk_unity_drain();
 #endif
 	s_pvk.api.vkResetFences(s_pvk.device, 1, &s_pvk.copy_fence);
 	if (s_pvk.api.vkQueueSubmit(s_pvk.queue, 1, &si, s_pvk.copy_fence) != VK_SUCCESS) {
@@ -1552,8 +1710,7 @@ pvk_async_destroy(void)
 	if (s_pvk.unity_done_sem) {
 		// Its last signal may still be pending on Unity's queue; a semaphore must not
 		// be destroyed under a pending operation. Teardown only.
-		if (s_pvk.unity_api.vkQueueWaitIdle && s_pvk.unity_queue)
-			s_pvk.unity_api.vkQueueWaitIdle(s_pvk.unity_queue);
+		if (s_pvk.unity_queue) pvk_unity_drain();
 		if (s_pvk.unity_api.vkDestroySemaphore)
 			s_pvk.unity_api.vkDestroySemaphore(s_pvk.unity_device, s_pvk.unity_done_sem, NULL);
 		s_pvk.unity_done_sem = VK_NULL_HANDLE;
@@ -1569,23 +1726,11 @@ pvk_async_destroy(void)
 static int
 pvk_unity_signal_fd(void)
 {
-	VkSubmitInfo si = {};
-	si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-	si.signalSemaphoreCount = 1;
-	si.pSignalSemaphores = &s_pvk.unity_done_sem;
-	VkResult r = s_pvk.unity_api.vkQueueSubmit(s_pvk.unity_queue, 1, &si, VK_NULL_HANDLE);
-	if (r != VK_SUCCESS) {
-		pvk_log("[DisplayXR-PROV-VK] async copy: Unity-queue signal submit failed (vk=%d)\n", (int)r);
-		return -2;
-	}
-	VkSemaphoreGetFdInfoKHR gi = {};
-	gi.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR;
-	gi.semaphore = s_pvk.unity_done_sem;
-	gi.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
 	int fd = -1;
-	r = s_pvk.unity_api.vkGetSemaphoreFdKHR(s_pvk.unity_device, &gi, &fd);
+	VkResult r = pvk_unity_queue_op(PVK_QOP_SIGNAL, &fd);
 	if (r != VK_SUCCESS) {
-		pvk_log("[DisplayXR-PROV-VK] async copy: SYNC_FD export failed (vk=%d)\n", (int)r);
+		if (fd >= 0) close(fd);
+		pvk_log("[DisplayXR-PROV-VK] async copy: Unity-queue signal/SYNC_FD export failed (vk=%d)\n", (int)r);
 		return -2;
 	}
 	return fd; // -1 is legal: already signalled
@@ -1628,7 +1773,7 @@ pvk_copy_frame_async(int spi, uint32_t n_eyes, uint32_t image_index)
 			s_pvk.async = false;
 			pvk_log("[DisplayXR-PROV-VK] async copy: OFF after repeated failures — synchronous copy\n");
 		}
-		if (s_pvk.unity_api.vkQueueWaitIdle) s_pvk.unity_api.vkQueueWaitIdle(s_pvk.unity_queue);
+		pvk_unity_drain();
 		int ok = 1;
 		if (spi) ok = dxr_pvk_copy_to_swapchain_image(-1, image_index);
 		else for (uint32_t e = 0; e < n_eyes; e++) ok &= dxr_pvk_copy_to_swapchain_image((int)e, image_index);
@@ -1652,7 +1797,7 @@ pvk_copy_frame_async(int spi, uint32_t n_eyes, uint32_t image_index)
 			si.pWaitDstStageMask = &wait_stage;
 		} else {
 			// No GPU ordering available for this frame: fall back to the drain.
-			if (s_pvk.unity_api.vkQueueWaitIdle) s_pvk.unity_api.vkQueueWaitIdle(s_pvk.unity_queue);
+			pvk_unity_drain();
 		}
 	}
 	si.commandBufferCount = ncb;
