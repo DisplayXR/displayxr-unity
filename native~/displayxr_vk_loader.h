@@ -73,6 +73,7 @@ struct VkApi {
 	PFN_vkDestroyFence             vkDestroyFence;
 	PFN_vkResetFences              vkResetFences;
 	PFN_vkWaitForFences            vkWaitForFences;
+	PFN_vkGetFenceStatus           vkGetFenceStatus;
 	PFN_vkQueueSubmit              vkQueueSubmit;
 	PFN_vkQueueWaitIdle            vkQueueWaitIdle;
 	PFN_vkDeviceWaitIdle           vkDeviceWaitIdle;

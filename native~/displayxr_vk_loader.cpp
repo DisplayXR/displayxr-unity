@@ -131,6 +131,7 @@ dxr_vk_load_device(VkApi *api, VkDevice device)
 	DXR_VK_DEV(api, device, vkDestroyFence);
 	DXR_VK_DEV(api, device, vkResetFences);
 	DXR_VK_DEV(api, device, vkWaitForFences);
+	DXR_VK_DEV(api, device, vkGetFenceStatus);
 	DXR_VK_DEV(api, device, vkQueueSubmit);
 	DXR_VK_DEV(api, device, vkQueueWaitIdle);
 	DXR_VK_DEV(api, device, vkDeviceWaitIdle);

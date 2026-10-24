@@ -194,6 +194,7 @@ extern "C" int  dxr_pvk_create_bridge(int eye, uint32_t, uint32_t, uint32_t, int
 extern "C" void *dxr_pvk_unity_image_ptr(int eye);
 extern "C" int  dxr_pvk_copy_to_swapchain_image(int eye, uint32_t image_index);
 extern "C" void dxr_pvk_signal_unity_done(void);
+extern "C" int  dxr_pvk_copy_frame(int spi, uint32_t n_eyes, uint32_t image_index);
 extern "C" void dxr_pvk_destroy(void);
 extern "C" void dxr_pvk_destroy_device(void);
 #if defined(__linux__) && !defined(__ANDROID__)
@@ -7862,14 +7863,10 @@ int dxr_prov_submit_frame(uint32_t image_index)
 	// of CopyTextureRegion. Platform-neutral, hence outside the per-OS branch.
 #if defined(ENABLE_VULKAN)
 	if (s_ps.graphics_api == DXR_GFX_VULKAN) {
-		int sp = dxr_prov_get_single_pass();
-		dxr_pvk_signal_unity_done(); // once per frame, before any copy
-		if (sp) {
-			dxr_pvk_copy_to_swapchain_image(-1, image_index);
-		} else {
-			for (uint32_t e = 0; e < submit_n; e++)
-				dxr_pvk_copy_to_swapchain_image((int)e, image_index);
-		}
+		// Desktop: drain Unity's queue, then one fence-waited copy per eye (unchanged).
+		// Android (#418 P3b): one GPU-ordered batch, not CPU-waited — see
+		// dxr_pvk_copy_frame / "Asynchronous copy" in displayxr_provider_gfx_vulkan.cpp.
+		dxr_pvk_copy_frame(dxr_prov_get_single_pass(), submit_n, image_index);
 	} else
 #endif
 #ifdef _WIN32

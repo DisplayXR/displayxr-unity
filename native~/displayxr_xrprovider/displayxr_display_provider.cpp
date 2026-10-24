@@ -66,6 +66,9 @@ extern "C" bool displayxr_unity_get_vulkan(void **out_instance, void **out_physi
 extern "C" void  dxr_pvk_set_unity_objects(void *, void *, void *, uint32_t, void *);
 extern "C" void *dxr_pvk_unity_image_ptr(int eye);
 extern "C" int   dxr_pvk_device_ready(void);
+extern "C" uint32_t dxr_pvk_bridge_ring(void);
+extern "C" void *dxr_pvk_unity_image_ptr_at(int eye, uint32_t slot);
+extern "C" uint32_t dxr_pvk_frame_begin(void);
 #endif
 
 // #247 crash bisect — see the call site in create_textures(). Latched so the env var
@@ -624,6 +627,58 @@ void create_textures_if_ready()
 		prov_log("[DisplayXR-PROV] CreateTexture: wrapped D3D11 swapchain images directly (zero-copy SPI)\n");
 		return;
 	}
+
+#if defined(ENABLE_VULKAN)
+	// Vulkan bridge RING (Android, #418 P3b): one Unity texture per ring slot (per eye
+	// in MultiPass) — s_tex_ids[slot] for SPI, s_tex_ids[slot*2+eye] for MultiPass.
+	// PopulateNextFrameDesc picks this frame's slot from dxr_pvk_frame_begin(). With a
+	// ring of 1 (desktop) this arm is skipped and the single-bridge arms below run.
+	if (dxr_prov_get_graphics_api() == DXR_GFX_VULKAN && dxr_pvk_bridge_ring() > 1 &&
+	    !prov_vk_unity_alloc_probe()) {
+		const uint32_t ring = dxr_pvk_bridge_ring();
+		const bool sp = dxr_prov_get_single_pass() != 0;
+		uint32_t w = 0, h = 0, arr = 0;
+		if (sp) {
+			if (!dxr_prov_get_bridge_unity_texture(&w, &h, &arr) || w == 0) return;
+		} else {
+			if (!dxr_prov_get_bridge_unity_texture_eye(0, &w, &h) || w == 0) return;
+			arr = 1;
+		}
+		uint32_t n = 0;
+		for (uint32_t r = 0; r < ring; r++) {
+			for (uint32_t e = 0; e < (sp ? 1u : 2u); e++) {
+				void *img = dxr_pvk_unity_image_ptr_at(sp ? -1 : (int)e, r);
+				if (!img) return; // bridge set not created yet (await session-ready)
+				UnityXRRenderTextureDesc desc;
+				memset(&desc, 0, sizeof(desc));
+				desc.colorFormat = kUnityXRRenderTextureFormatRGBA32;
+				desc.color.nativePtr = img;
+				desc.depthFormat = kUnityXRDepthTextureFormat24bitOrGreater;
+				desc.depth.nativePtr = (void *)(uintptr_t)kUnityXRRenderTextureIdDontCare;
+				desc.width = w;
+				desc.height = h;
+				desc.textureArrayLength = sp ? arr : 1;
+				desc.flags = prov_eye_tex_flags();
+				UnityXRRenderTextureId id = 0;
+				if (s_display->CreateTexture(s_handle, &desc, &id) != kUnitySubsystemErrorCodeSuccess) {
+					prov_log("[DisplayXR-PROV] CreateTexture (Vulkan ring bridge) failed\n");
+					for (uint32_t i = 0; i < n; i++) s_display->DestroyTexture(s_handle, s_tex_ids[i]);
+					memset(s_tex_ids, 0, sizeof(s_tex_ids));
+					return;
+				}
+				s_tex_ids[sp ? r : r * 2 + e] = id;
+				n++;
+			}
+		}
+		s_tex_count = n;
+		s_textures_created = true;
+		char m[160];
+		snprintf(m, sizeof(m), "[DisplayXR-PROV] CreateTexture: wrapped %u-slot Vulkan bridge ring (%s, %u textures)\n",
+		         ring, sp ? "SPI" : "MultiPass", n);
+		prov_log(m);
+		return;
+	}
+#endif
 
 	if (dxr_prov_get_single_pass()) {
 		// SPI: ONE Unity texture wrapping the shared 2-slice-array BRIDGE. Unity
@@ -1218,6 +1273,17 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 	s_current_image_index = img;
 	s_frame_in_flight = true;
 
+	// Vulkan bridge ring (Android, #418 P3b): advance to this frame's slot, after the
+	// copy that last read it has retired. 0 (and a no-op) with a ring of 1.
+	uint32_t vk_slot = 0;
+#if defined(ENABLE_VULKAN)
+	const bool vk_ring = dxr_prov_get_graphics_api() == DXR_GFX_VULKAN && dxr_pvk_bridge_ring() > 1 &&
+	                     s_tex_count >= dxr_pvk_bridge_ring();
+	if (vk_ring) vk_slot = dxr_pvk_frame_begin();
+#else
+	const bool vk_ring = false;
+#endif
+
 	// Arm the DXR_AVATAR_PRESENT_HZ cap only after the session has been genuinely
 	// renderable for ~2 s of panel time. Before that the pump must run every tick to
 	// climb SYNCHRONIZED -> VISIBLE (see above), and a cap that started early would
@@ -1249,7 +1315,7 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 		bool rotate = (dxr_prov_get_graphics_api() == DXR_GFX_D3D11 && !dxr_prov_d3d11_bridge_active())
 		              || dxr_prov_get_graphics_api() == DXR_GFX_METAL;
 		UnityXRNextFrameDesc::UnityXRRenderPass &pass = next->renderPasses[0];
-		pass.textureId = rotate ? s_tex_ids[s_current_image_index] : s_tex_ids[0];
+		pass.textureId = rotate ? s_tex_ids[s_current_image_index] : s_tex_ids[vk_ring ? vk_slot : 0];
 		pass.cullingPassIndex = 0;
 		pass.renderParamsCount = 2;
 
@@ -1289,7 +1355,7 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 			                     ? s_tex_ids[s_current_image_index * 2 + eye]
 			                     : s_tex_ids[eye];
 #else
-			pass.textureId = s_tex_ids[eye];
+			pass.textureId = s_tex_ids[vk_ring ? vk_slot * 2 + eye : eye];
 #endif
 			pass.cullingPassIndex = eye;
 			pass.renderParamsCount = 1;
