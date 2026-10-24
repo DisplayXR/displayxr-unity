@@ -13,7 +13,7 @@ namespace DisplayXR
     /// WASD = move horizontally, QE = move up/down, left-mouse drag = rotate.
     /// Scroll wheel = zoom (scale). Space = reset to initial pose.
     /// Touch (Android tablets, #418): one-finger drag = orbit (the same rotation as a
-    /// mouse drag), two-finger pinch = zoom (scale / FOV, like the scroll wheel),
+    /// mouse drag), two-finger pinch = zoom (dolly on a display rig, FOV on a camera rig),
     /// two-finger drag = pan, double tap = reset.
     /// Attach to the same GameObject as DisplayXRDisplay or DisplayXRCamera.
     /// Works in Play Mode and built players (the custom display provider drives rendering).
@@ -55,6 +55,10 @@ namespace DisplayXR
                  "(height maps to half of it). 180 = a full-width drag turns the rig half " +
                  "way round, the DisplayXR runtime's own touch-provider convention.")]
         public float touchOrbitDegreesPerScreen = 180f;
+
+        [Tooltip("Display rig: how far a pinch dollies, in virtual-display heights per unit of " +
+                 "finger-spread ratio (spreading the fingers to 2x moves ~this many heights closer).")]
+        public float touchPinchDolly = 1.0f;
 
         private float m_Yaw;
         private float m_Pitch;
@@ -390,6 +394,8 @@ namespace DisplayXR
         private bool m_TouchOrbiting, m_TouchMoved;
         private float m_TouchDownTime, m_LastTapTime = -10f;
         private Vector2 m_LastTapPos;
+        private float m_GestureZoom = 1f;          // accumulated pinch ratio this gesture
+        private Vector2 m_GesturePan, m_GestureOrbit; // accumulated px this gesture
 
         private struct TouchSample { public int id; public Vector2 pos; }
         private readonly TouchSample[] m_Touches = new TouchSample[10];
@@ -455,6 +461,9 @@ namespace DisplayXR
                         m_LastTapPos = m_TouchStart;
                     }
                 }
+                if (m_TouchCount > 0 && (m_GestureZoom != 1f || m_GesturePan != Vector2.zero || m_GestureOrbit != Vector2.zero))
+                    Debug.Log($"[DisplayXR] touch gesture: orbit {m_GestureOrbit} px, pinch x{m_GestureZoom:F2}, pan {m_GesturePan} px ({(m_IsCameraCentric ? "camera rig: FOV" : "display rig: position")} {(m_IsCameraCentric ? m_Camera.fieldOfView.ToString("F1") : transform.position.ToString("F2"))})");
+                m_GestureZoom = 1f; m_GesturePan = m_GestureOrbit = Vector2.zero;
                 m_TouchCount = 0;
                 m_TouchIdA = m_TouchIdB = -1;
                 m_TouchOrbiting = false;
@@ -496,6 +505,7 @@ namespace DisplayXR
                 if (m_TouchOrbiting && mouseLookEnabled)
                 {
                     Vector2 d = p - m_TouchPosA;
+                    m_GestureOrbit += d;
                     float perW = touchOrbitDegreesPerScreen * Mathf.Deg2Rad;
                     // Same signs as the mouse drag above, so desktop and tablet agree.
                     m_Yaw += d.x / w * perW;
@@ -517,20 +527,31 @@ namespace DisplayXR
                 float d0 = (m_TouchPosB - m_TouchPosA).magnitude, d1 = (b - a).magnitude;
                 Vector2 c0 = (m_TouchPosA + m_TouchPosB) * 0.5f, c1 = (a + b) * 0.5f;
 
-                // Pinch = zoom. Display rig: scale-as-zoom (spreading the fingers makes the
-                // content bigger = a smaller rig). Camera rig: narrower FOV.
+                // Pinch = zoom: spreading the fingers makes the content bigger. Camera rig:
+                // a narrower FOV. Display rig: DOLLY the rig toward what it looks at, the
+                // runtime touch provider's own pinch semantics. (Measured on a Nubia Pad 2:
+                // the scroll wheel's scale-as-zoom leaves the projected size unchanged
+                // there, so a pinch through localScale did nothing visible.) The step is a
+                // fraction of the virtual display's world height, so it feels the same at
+                // every rig scale.
                 if (scrollZoomEnabled && d0 > 1f && d1 > 1f)
                 {
                     float ratio = Mathf.Clamp(d1 / d0, 0.8f, 1.25f);
+                    m_GestureZoom *= ratio;
                     if (m_IsCameraCentric)
                         m_Camera.fieldOfView = Mathf.Clamp(m_Camera.fieldOfView / ratio, 5f, 120f);
                     else
-                        transform.localScale = ClampScale(transform.localScale / ratio);
+                    {
+                        float worldH = PanWorldPerPixel(h) * h;
+                        Quaternion o = Quaternion.Euler(m_Pitch * Mathf.Rad2Deg, m_Yaw * Mathf.Rad2Deg, 0f);
+                        transform.position += (o * Vector3.forward) * ((ratio - 1f) * worldH * touchPinchDolly);
+                    }
                 }
 
                 // Two-finger drag = pan: the content follows the fingers, 1:1 on the virtual
                 // display plane.
                 Vector2 dc = c1 - c0;
+                m_GesturePan += dc;
                 if (dc.sqrMagnitude > 0f)
                 {
                     float worldPerPx = PanWorldPerPixel(h);
@@ -544,14 +565,6 @@ namespace DisplayXR
             m_TouchMoved = true;
             m_TouchOrbiting = false;
             m_TouchCount = n;
-        }
-
-        private Vector3 ClampScale(Vector3 sc)
-        {
-            float rel = m_InitialScale.x != 0f ? sc.x / m_InitialScale.x : 1f;
-            if (rel < 0.1f) return m_InitialScale * 0.1f;
-            if (rel > 10f) return m_InitialScale * 10f;
-            return sc;
         }
 
         // World units per screen pixel on the plane the content sits at.
