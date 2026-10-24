@@ -354,6 +354,7 @@ jobs:
           path: |
             Runtime/Plugins/Android/arm64-v8a/libdisplayxr_unity.so
             Runtime/Plugins/Android/arm64-v8a/libopenxr_loader.so
+            Runtime/Plugins/Android/arm64-v8a/libVkLayer_DXR_queue_lock.so
 
   # ── Release job: runs on v* tags ──────────────────────────────────────
   release:
@@ -499,6 +500,7 @@ jobs:
           git add -f Runtime/Plugins/Linux/x86_64/libdisplayxr_unity_wayland.so
           git add -f Runtime/Plugins/Android/arm64-v8a/libdisplayxr_unity.so
           git add -f Runtime/Plugins/Android/arm64-v8a/libopenxr_loader.so
+          git add -f Runtime/Plugins/Android/arm64-v8a/libVkLayer_DXR_queue_lock.so
 
           # Fail loudly rather than silently shipping an incomplete upm
           # branch: every platform binary must be staged at this point.
@@ -507,7 +509,8 @@ jobs:
                    Runtime/Plugins/Linux/x86_64/libdisplayxr_unity.so \
                  Runtime/Plugins/Linux/x86_64/libdisplayxr_unity_wayland.so \
                  Runtime/Plugins/Android/arm64-v8a/libdisplayxr_unity.so \
-                 Runtime/Plugins/Android/arm64-v8a/libopenxr_loader.so; do
+                 Runtime/Plugins/Android/arm64-v8a/libopenxr_loader.so \
+                 Runtime/Plugins/Android/arm64-v8a/libVkLayer_DXR_queue_lock.so; do
             git diff --cached --name-only | grep -qxF "$f" || \
               git ls-files --error-unmatch "$f" >/dev/null 2>&1 || {
                 echo "::error::$f is not staged for the upm branch — refusing to publish an incomplete package."
