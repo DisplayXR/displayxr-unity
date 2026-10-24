@@ -9,8 +9,9 @@ using UnityEngine;
 namespace DisplayXR.Editor
 {
     /// <summary>
-    /// The DisplayXR boot splash is on by default, so for standalone builds we
-    /// turn Unity's stock splash off (otherwise both would play). This is done
+    /// The DisplayXR boot splash is on by default, so for standalone and Android
+    /// builds we turn Unity's stock splash off (otherwise both would play — on
+    /// Android the stock one also shows badly scaled under the weave, #418). This is done
     /// transiently per build — saved in preprocess, restored in postprocess —
     /// so the developer's Player Settings are never persistently changed.
     ///
@@ -32,7 +33,8 @@ namespace DisplayXR.Editor
         {
             s_disabledThisBuild = false;
 
-            if (report.summary.platformGroup != BuildTargetGroup.Standalone)
+            if (report.summary.platformGroup != BuildTargetGroup.Standalone &&
+                report.summary.platformGroup != BuildTargetGroup.Android)
                 return;
 
             if (OptedOut(report.summary.platformGroup))
