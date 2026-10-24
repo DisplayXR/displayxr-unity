@@ -478,10 +478,31 @@ jni_window_geometry(JNIEnv *, jclass, jint x, jint y, jint w, jint h, jint pw, j
 	pthread_mutex_unlock(&s_surf_mx);
 }
 
+// Touch policy (#418 follow-up). Every touch is still delivered to Unity (the copy
+// below never consumes it): the APP's rig owns the camera — the sample's
+// DisplayXRInputController orbits / pinches / pans it. A COPY also goes to the
+// runtime's touch input provider, which is harmless and verified so: its gestures
+// drive the runtime's navigation rig, and that rig never moves an external-window
+// session that declares XR_DXR_view_rig (oxr_session.c locate-views: such a session
+// keeps the physical display plane / its own chained rig pose) — measured
+// pixel-identical atlases before / after runtime-only swipes. Its other output, an
+// emulated khr/simple_controller, is not bound by this provider. Forwarding keeps
+// runtime-side touch features (and #1996's workspace routing) working without a
+// plugin change. Opt out: setprop debug.displayxr.no_touch_submit 1 (or
+// DISPLAYXR_ANDROID_NO_TOUCH_SUBMIT=1), read once.
+static int s_touch_submit_off = -1;
+
 static void JNICALL
 jni_touch(JNIEnv *, jclass, jint action, jint pointer_id, jint pointer_count, jfloat x, jfloat y, jint sw,
           jint sh, jlong t_ns)
 {
+	if (s_touch_submit_off < 0) {
+		s_touch_submit_off =
+		    dxr_android_flag("DISPLAYXR_ANDROID_NO_TOUCH_SUBMIT", "debug.displayxr.no_touch_submit") ? 1 : 0;
+		if (s_touch_submit_off)
+			and_log("[DisplayXR-AND] touch: runtime submission OFF (no_touch_submit) — touches reach Unity only");
+	}
+	if (s_touch_submit_off) return;
 	pthread_mutex_lock(&s_surf_mx);
 	XrResult r = XR_ERROR_SESSION_NOT_RUNNING;
 	if (s_surf_session != XR_NULL_HANDLE && s_pfn_submit_input) {
