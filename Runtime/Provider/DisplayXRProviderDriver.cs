@@ -103,7 +103,9 @@ namespace DisplayXR
 #if UNITY_EDITOR_OSX || UNITY_STANDALONE_OSX
             // macOS (#204): pump xrPollEvent from the MAIN thread — the runtime's
             // poll drains NSApp events and flushes CATransaction (main-thread-only;
-            // AppKit throws off-main). Windows keeps the graphics-thread pump.
+            // AppKit throws off-main). Windows, Linux and Android (#418) keep the
+            // native graphics-thread pump (GfxPopulateNextFrameDesc) — do NOT add them
+            // here, or the events would be pumped from two threads.
             DisplayXRProviderNative.dxr_prov_poll_events();
 #endif
             // #223: the shell's workspace close request reaches us as session EXITING. A

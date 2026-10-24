@@ -279,6 +279,7 @@ namespace DisplayXR
             //   Windows × Vulkan    | SPI | SPI  | MultiPass
             //   macOS   × Metal     | SPI | SPI  | MultiPass
             //   Linux   × Vulkan    | SPI | SPI  | MultiPass   (#249)
+            //   Android × Vulkan    | MultiPass, all pipelines (#418; URP/HDRP SPI = P4)
             //   anything else       | MultiPass (moot — the native GfxStart no-starts)
             //
             // Rationale: URP and HDRP both consume the provider's full per-eye
@@ -294,6 +295,11 @@ namespace DisplayXR
             // three APIs (per-eye single-slice textures woven into slices 0/1: D3D
             // #195, Metal zero-copy slice views #204).
             var plat = Application.platform;
+            // Android (#418): MultiPass first, whatever the pipeline. The provider's
+            // Android leg is brought up on BiRP MultiPass (P3a); URP SPI on Vulkan/Adreno
+            // is its own phase (P4), so don't hand it SPI before then.
+            if (plat == RuntimePlatform.Android)
+                return false;
             bool isWindows = plat == RuntimePlatform.WindowsPlayer
                           || plat == RuntimePlatform.WindowsEditor;
             bool isMac = plat == RuntimePlatform.OSXPlayer
