@@ -120,6 +120,7 @@ dxr_vk_load_device(VkApi *api, VkDevice device)
 	DXR_VK_DEV(api, device, vkCreateCommandPool);
 	DXR_VK_DEV(api, device, vkDestroyCommandPool);
 	DXR_VK_DEV(api, device, vkAllocateCommandBuffers);
+	DXR_VK_DEV(api, device, vkFreeCommandBuffers);
 	DXR_VK_DEV(api, device, vkBeginCommandBuffer);
 	DXR_VK_DEV(api, device, vkEndCommandBuffer);
 	DXR_VK_DEV(api, device, vkResetCommandBuffer);

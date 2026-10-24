@@ -239,6 +239,16 @@ struct PvkState {
 	VkCommandBuffer  cmd_buf = VK_NULL_HANDLE;
 	VkFence          copy_fence = VK_NULL_HANDLE;
 	bool             device_ready = false;
+
+	// Pre-recorded bridge-copy command buffers, one per (source bridge, destination
+	// swapchain image, layer range) — see pvk_copy_bridge. Invalidated (freed) by
+	// pvk_copy_cache_clear() whenever a bridge or a swapchain image set changes.
+	struct CopyCmd {
+		VkImage         src = VK_NULL_HANDLE;
+		VkImage         dst = VK_NULL_HANDLE;
+		uint32_t        dst_base_layer = 0, layer_count = 0;
+		VkCommandBuffer cb = VK_NULL_HANDLE;
+	} copy_cmds[32];
 	bool             keep_instance = false; // dxr_pvk_keep_instance_alive()
 
 	// --- Unity's device (captured from IUnityGraphicsVulkan) ---
@@ -274,6 +284,8 @@ struct PvkState {
 };
 
 static PvkState s_pvk;
+
+static void pvk_copy_cache_clear(void); // defined with pvk_copy_bridge
 
 static PvkBridge *
 pvk_slot(int eye)
@@ -644,6 +656,7 @@ dxr_pvk_set_swapchain_images(const void *images, uint32_t count,
 {
 	const XrSwapchainImageVulkanKHR *imgs = (const XrSwapchainImageVulkanKHR *)images;
 	if (count > PVK_MAX_SWAPCHAIN_IMAGES) count = PVK_MAX_SWAPCHAIN_IMAGES;
+	pvk_copy_cache_clear(); // recorded copies name the old images
 	for (uint32_t i = 0; i < count; i++) s_pvk.sc_images[i] = imgs[i].image;
 	s_pvk.sc_image_count = count;
 	s_pvk.sc_width = width;
@@ -1040,6 +1053,25 @@ dxr_pvk_signal_unity_done(void)
 	pvk_grave_tick();
 }
 
+// Drop every pre-recorded copy command buffer. Called whenever an image a recorded
+// copy names is destroyed or replaced (bridge (re)create/destroy, new swapchain
+// images, teardown): a command buffer that references a destroyed image is invalid,
+// and a recreated image can come back with the same handle value, so the cache must
+// not outlive any of them. Nothing is pending here — every copy submit is
+// fence-waited before pvk_copy_bridge returns.
+static void
+pvk_copy_cache_clear(void)
+{
+	for (auto &e : s_pvk.copy_cmds) {
+		if (e.cb != VK_NULL_HANDLE && s_pvk.cmd_pool != VK_NULL_HANDLE && s_pvk.api.vkFreeCommandBuffers)
+			s_pvk.api.vkFreeCommandBuffers(s_pvk.device, s_pvk.cmd_pool, 1, &e.cb);
+		e = PvkState::CopyCmd{};
+	}
+}
+
+static bool pvk_record_copy(VkCommandBuffer cb, PvkBridge *b, VkImage dst,
+                            uint32_t dst_base_layer, uint32_t layer_count);
+
 // Copy `layer_count` layers of bridge `b` (from layer 0) into `dst` starting at
 // `dst_base_layer`, on the session queue, and wait for it. Shared by the eye bridges
 // and the 2D overlay bridges — the copy, the GENERAL-parked source and the
@@ -1049,11 +1081,72 @@ pvk_copy_bridge(PvkBridge *b, VkImage dst, uint32_t dst_base_layer, uint32_t lay
 {
 	if (!b || !b->valid || !s_pvk.device_ready || dst == VK_NULL_HANDLE) return 0;
 
+	// The copy is the same commands every frame for a given (bridge, swapchain
+	// image, layer range), so it is recorded ONCE into its own command buffer and
+	// resubmitted (#418 P3a). Re-recording per frame is what this used to do, and on
+	// Adreno it is ruinous: vkResetCommandBuffer hands the command memory back to
+	// the kernel and the next vkCmdCopyImage allocates + zeroes it again (kgsl
+	// gpuobj_alloc -> clear_page / dcache clean). Measured on a Nubia Pad 2: ~77% of
+	// Unity's render thread in those two calls, capping a trivial cube at ~30 fps
+	// with the GPU 80% idle. Same failure + fix as the runtime's own sRGB staging
+	// copy (displayxr-runtime#1935 / #1936).
+	PvkState::CopyCmd *slot = nullptr;
+	for (auto &e : s_pvk.copy_cmds) {
+		if (e.cb != VK_NULL_HANDLE && e.src == b->session_image && e.dst == dst &&
+		    e.dst_base_layer == dst_base_layer && e.layer_count == layer_count) {
+			slot = &e;
+			break;
+		}
+	}
+	if (slot == nullptr) {
+		for (auto &e : s_pvk.copy_cmds)
+			if (e.cb == VK_NULL_HANDLE) { slot = &e; break; }
+		if (slot == nullptr) { // full (should not happen: <= 3 bridges x 8 images)
+			pvk_copy_cache_clear();
+			slot = &s_pvk.copy_cmds[0];
+		}
+		VkCommandBufferAllocateInfo cbai = {};
+		cbai.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
+		cbai.commandPool = s_pvk.cmd_pool;
+		cbai.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+		cbai.commandBufferCount = 1;
+		VkCommandBuffer cb = VK_NULL_HANDLE;
+		if (s_pvk.api.vkAllocateCommandBuffers(s_pvk.device, &cbai, &cb) != VK_SUCCESS) return 0;
+		if (!pvk_record_copy(cb, b, dst, dst_base_layer, layer_count)) {
+			s_pvk.api.vkFreeCommandBuffers(s_pvk.device, s_pvk.cmd_pool, 1, &cb);
+			return 0;
+		}
+		slot->src = b->session_image;
+		slot->dst = dst;
+		slot->dst_base_layer = dst_base_layer;
+		slot->layer_count = layer_count;
+		slot->cb = cb;
+	}
+
+	VkSubmitInfo si = {};
+	si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+	si.commandBufferCount = 1;
+	si.pCommandBuffers = &slot->cb;
+	s_pvk.api.vkResetFences(s_pvk.device, 1, &s_pvk.copy_fence);
+	if (s_pvk.api.vkQueueSubmit(s_pvk.queue, 1, &si, s_pvk.copy_fence) != VK_SUCCESS) {
+		pvk_log("[DisplayXR-PROV-VK] copy: vkQueueSubmit failed\n");
+		return 0;
+	}
+	// xrReleaseSwapchainImage must not run before the copy lands. This wait also
+	// keeps the recorded command buffer from being resubmitted while pending.
+	s_pvk.api.vkWaitForFences(s_pvk.device, 1, &s_pvk.copy_fence, VK_TRUE, UINT64_MAX);
+	return 1;
+}
+
+// Record the bridge -> swapchain copy into `cb` (no ONE_TIME_SUBMIT: it is replayed).
+static bool
+pvk_record_copy(VkCommandBuffer cb, PvkBridge *b, VkImage dst, uint32_t dst_base_layer,
+                uint32_t layer_count)
+{
 	VkCommandBufferBeginInfo bi = {};
 	bi.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
-	bi.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-	s_pvk.api.vkResetCommandBuffer(s_pvk.cmd_buf, 0);
-	if (s_pvk.api.vkBeginCommandBuffer(s_pvk.cmd_buf, &bi) != VK_SUCCESS) return 0;
+	bi.flags = 0;
+	if (s_pvk.api.vkBeginCommandBuffer(cb, &bi) != VK_SUCCESS) return false;
 
 	// The bridge STAYS in GENERAL (see dxr_pvk_create_bridge): GENERAL is valid as a
 	// transfer-read source, so this is a pure memory/execution barrier making Unity's
@@ -1071,7 +1164,7 @@ pvk_copy_bridge(PvkBridge *b, VkImage dst, uint32_t dst_base_layer, uint32_t lay
 	                                          0, VK_ACCESS_TRANSFER_WRITE_BIT,
 	                                          dst_base_layer, layer_count);
 	VkImageMemoryBarrier pre[2] = {to_src, to_dst};
-	s_pvk.api.vkCmdPipelineBarrier(s_pvk.cmd_buf,
+	s_pvk.api.vkCmdPipelineBarrier(cb,
 	                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
 	                               VK_PIPELINE_STAGE_TRANSFER_BIT,
 	                               0, 0, NULL, 0, NULL, 2, pre);
@@ -1088,7 +1181,7 @@ pvk_copy_bridge(PvkBridge *b, VkImage dst, uint32_t dst_base_layer, uint32_t lay
 	region.extent.width = b->width;
 	region.extent.height = b->height;
 	region.extent.depth = 1;
-	s_pvk.api.vkCmdCopyImage(s_pvk.cmd_buf,
+	s_pvk.api.vkCmdCopyImage(cb,
 	                         b->session_image, VK_IMAGE_LAYOUT_GENERAL,
 	                         dst, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
 	                         1, &region);
@@ -1108,25 +1201,12 @@ pvk_copy_bridge(PvkBridge *b, VkImage dst, uint32_t dst_base_layer, uint32_t lay
 	                                            VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT,
 	                                            dst_base_layer, layer_count);
 	VkImageMemoryBarrier post[2] = {back_src, back_dst};
-	s_pvk.api.vkCmdPipelineBarrier(s_pvk.cmd_buf,
+	s_pvk.api.vkCmdPipelineBarrier(cb,
 	                               VK_PIPELINE_STAGE_TRANSFER_BIT,
 	                               VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
 	                               0, 0, NULL, 0, NULL, 2, post);
 
-	if (s_pvk.api.vkEndCommandBuffer(s_pvk.cmd_buf) != VK_SUCCESS) return 0;
-
-	VkSubmitInfo si = {};
-	si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
-	si.commandBufferCount = 1;
-	si.pCommandBuffers = &s_pvk.cmd_buf;
-	s_pvk.api.vkResetFences(s_pvk.device, 1, &s_pvk.copy_fence);
-	if (s_pvk.api.vkQueueSubmit(s_pvk.queue, 1, &si, s_pvk.copy_fence) != VK_SUCCESS) {
-		pvk_log("[DisplayXR-PROV-VK] copy: vkQueueSubmit failed\n");
-		return 0;
-	}
-	// xrReleaseSwapchainImage must not run before the copy lands.
-	s_pvk.api.vkWaitForFences(s_pvk.device, 1, &s_pvk.copy_fence, VK_TRUE, UINT64_MAX);
-	return 1;
+	return s_pvk.api.vkEndCommandBuffer(cb) == VK_SUCCESS;
 }
 
 int
@@ -1164,6 +1244,7 @@ static void
 pvk_destroy_bridge(PvkBridge *b)
 {
 	if (!b) return;
+	pvk_copy_cache_clear(); // recorded copies may name this bridge's session image
 	if (b->unity_image && s_pvk.unity_api.vkDestroyImage)
 		s_pvk.unity_api.vkDestroyImage(s_pvk.unity_device, b->unity_image, NULL);
 	if (b->unity_memory && s_pvk.unity_api.vkFreeMemory)
@@ -1307,6 +1388,7 @@ dxr_pvk_overlay_set_swapchain_images(int kind, const void *images, uint32_t coun
 	if (!o) return;
 	const XrSwapchainImageVulkanKHR *imgs = (const XrSwapchainImageVulkanKHR *)images;
 	if (count > PVK_MAX_SWAPCHAIN_IMAGES) count = PVK_MAX_SWAPCHAIN_IMAGES;
+	pvk_copy_cache_clear(); // recorded copies name the old images
 	for (uint32_t i = 0; i < count; i++) o->sc_images[i] = imgs[i].image;
 	o->sc_image_count = count;
 	o->sc_format = pvk_format_from_xr(format);
@@ -1506,6 +1588,7 @@ dxr_pvk_destroy(void)
 	// Overlays: session side now, Unity side to the graveyard (see the overlay section).
 	for (int k = 0; k < DXR_PVK_OVERLAY_COUNT; k++) pvk_overlay_reset(k);
 
+	pvk_copy_cache_clear(); // before the pool that owns them goes
 	if (s_pvk.copy_fence && s_pvk.api.vkDestroyFence)
 		s_pvk.api.vkDestroyFence(s_pvk.device, s_pvk.copy_fence, NULL);
 	if (s_pvk.cmd_pool && s_pvk.api.vkDestroyCommandPool)
