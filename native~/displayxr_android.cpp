@@ -12,6 +12,10 @@
 #include <jni.h>
 #include <android/log.h>
 #include <android/looper.h>
+#include <android/native_window.h>
+#include <android/native_window_jni.h>
+#include <errno.h>
+#include <time.h>
 #include <dlfcn.h>
 #include <pthread.h>
 #include <stdarg.h>
@@ -22,6 +26,8 @@
 #define XR_USE_PLATFORM_ANDROID
 #include <openxr/openxr.h>
 #include <openxr/openxr_platform.h>
+
+#include "displayxr_extensions.h" // XR_DXR_android_surface_binding structs (#418 P3b)
 
 #define DXR_ANDROID_LOG_TAG "DisplayXRUnity"
 
@@ -135,16 +141,15 @@ and_clear_exc(JNIEnv *env)
 	return false;
 }
 
-// com.unity3d.player.UnityPlayer, resolved through the APP's class loader. A
-// plain FindClass on a native thread that attached itself (Unity's render thread,
-// say) only sees the boot class loader and fails, so fall back to
+// An app class (dotted name), resolved through the APP's class loader. A plain
+// FindClass on a native thread that attached itself (Unity's render thread, say)
+// only sees the boot class loader and fails, so fall back to
 // ActivityThread.currentApplication().getClassLoader().loadClass(...): both
 // ActivityThread and ClassLoader are framework classes FindClass always sees.
 static jclass
-and_find_unity_player(JNIEnv *env)
+and_load_app_class(JNIEnv *env, const char *slashed, const char *dotted)
 {
-	if (s_unity_player_cls) return (jclass)env->NewLocalRef(s_unity_player_cls);
-	jclass cls = env->FindClass("com/unity3d/player/UnityPlayer");
+	jclass cls = env->FindClass(slashed);
 	if (cls && !and_clear_exc(env)) return cls;
 	and_clear_exc(env);
 
@@ -169,12 +174,20 @@ and_find_unity_player(JNIEnv *env)
 	                        : nullptr;
 	if (cl_cls) env->DeleteLocalRef(cl_cls);
 	if (!load || and_clear_exc(env)) { env->DeleteLocalRef(loader); return nullptr; }
-	jstring name = env->NewStringUTF("com.unity3d.player.UnityPlayer");
+	jstring name = env->NewStringUTF(dotted);
 	jclass up = (jclass)env->CallObjectMethod(loader, load, name);
 	env->DeleteLocalRef(name);
 	env->DeleteLocalRef(loader);
 	if (!up || and_clear_exc(env)) return nullptr;
 	return up;
+}
+
+// com.unity3d.player.UnityPlayer (cached by JNI_OnLoad when it was visible there).
+static jclass
+and_find_unity_player(JNIEnv *env)
+{
+	if (s_unity_player_cls) return (jclass)env->NewLocalRef(s_unity_player_cls);
+	return and_load_app_class(env, "com/unity3d/player/UnityPlayer", "com.unity3d.player.UnityPlayer");
 }
 
 // Attach (if needed) for the duration of one call. A thread we attached is
@@ -317,6 +330,310 @@ dxr_android_looper_poll(void)
 		return;
 	}
 	ALooper_pollOnce(0, nullptr, nullptr, nullptr);
+}
+
+// ---------------------------------------------------------------------------
+// Provider-owned weave surface (D3, #418 P3b)
+// ---------------------------------------------------------------------------
+//
+// The Java half is com.displayxr.unity.DisplayXRSurface (DisplayXR.androidlib). It
+// owns a SurfaceView stacked above Unity's and calls the natives below from the UI
+// thread. This half keeps the facts it reports (the window, its size, the last
+// geometry) and forwards each to the runtime the moment it changes — or, when no
+// session exists yet, re-applies all of them authoritatively the moment one does
+// (dxr_android_on_session): a session restart must never depend on Java re-sending
+// something it already sent once.
+//
+// LOCKING. s_surf_mx guards the window, the geometry and the session handle + entry
+// points. The UI thread holds it across its xrSet*/xrSubmit* call so the render
+// thread cannot destroy the session under it; the render thread only takes it to
+// install / clear the handle and never calls into the runtime while holding it.
+
+static pthread_mutex_t s_surf_mx = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t s_surf_cv = PTHREAD_COND_INITIALIZER;
+static ANativeWindow *s_win = nullptr;    // our own reference (ANativeWindow_fromSurface)
+static int32_t s_win_w = 0, s_win_h = 0;  // buffer size (surfaceChanged)
+static unsigned s_win_publishes = 0;
+static XrAndroidWindowGeometryDXR s_geom; // last sample from the Choreographer poll
+static int s_geom_valid = 0;
+static XrSession s_surf_session = XR_NULL_HANDLE;
+static PFN_xrSetAndroidSurfaceDXR s_pfn_set_surface = nullptr;
+static PFN_xrSetAndroidWindowGeometryDXR s_pfn_set_geometry = nullptr;
+static PFN_xrSubmitAndroidInputEventDXR s_pfn_submit_input = nullptr;
+static int s_surf_attach_requested = 0;
+static unsigned long s_touch_events = 0;
+static XrAndroidSurfaceBindingCreateInfoDXR s_binding;
+
+// Caller holds s_surf_mx and has checked s_surf_session / s_pfn_set_surface.
+static void
+surf_publish_locked(const char *why)
+{
+	XrAndroidSurfaceBindingCreateInfoDXR b = {};
+	b.type = XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_DXR;
+	b.nativeWindow = (struct ANativeWindow *)s_win;
+	b.screenOffsetX = s_geom_valid ? s_geom.windowRect.offset.x : 0;
+	b.screenOffsetY = s_geom_valid ? s_geom.windowRect.offset.y : 0;
+	b.transparentBackgroundEnabled = XR_FALSE;
+	XrResult r = s_pfn_set_surface(s_surf_session, s_win ? &b : nullptr);
+	and_log("[DisplayXR-AND] xrSetAndroidSurfaceDXR(%p %dx%d) [%s] -> %d", (void *)s_win, (int)s_win_w,
+	        (int)s_win_h, why, (int)r);
+}
+
+static void
+surf_push_geometry_locked(const char *why)
+{
+	XrResult r = s_pfn_set_geometry(s_surf_session, &s_geom);
+	and_log("[DisplayXR-AND] xrSetAndroidWindowGeometryDXR rect=%d,%d %dx%d panel=%dx%d display=%d [%s] -> %d",
+	        s_geom.windowRect.offset.x, s_geom.windowRect.offset.y, s_geom.windowRect.extent.width,
+	        s_geom.windowRect.extent.height, s_geom.panelExtent.width, s_geom.panelExtent.height,
+	        s_geom.displayId, why, (int)r);
+}
+
+static void JNICALL
+jni_surface_created(JNIEnv *env, jclass, jobject surface, jint w, jint h)
+{
+	ANativeWindow *win = surface ? ANativeWindow_fromSurface(env, surface) : nullptr;
+	pthread_mutex_lock(&s_surf_mx);
+	if (s_win) ANativeWindow_release(s_win);
+	s_win = win;
+	s_win_w = w;
+	s_win_h = h;
+	s_win_publishes++;
+	and_log("[DisplayXR-AND] surfaceCreated: window=%p %dx%d (#%u)", (void *)win, (int)w, (int)h, s_win_publishes);
+	if (s_surf_session != XR_NULL_HANDLE && s_pfn_set_surface) surf_publish_locked("surfaceCreated");
+	pthread_cond_broadcast(&s_surf_cv);
+	pthread_mutex_unlock(&s_surf_mx);
+}
+
+static void JNICALL
+jni_surface_changed(JNIEnv *, jclass, jint w, jint h)
+{
+	pthread_mutex_lock(&s_surf_mx);
+	if (w != s_win_w || h != s_win_h)
+		and_log("[DisplayXR-AND] surfaceChanged: %dx%d -> %dx%d", (int)s_win_w, (int)s_win_h, (int)w, (int)h);
+	s_win_w = w;
+	s_win_h = h;
+	pthread_mutex_unlock(&s_surf_mx);
+}
+
+static void JNICALL
+jni_surface_destroyed(JNIEnv *, jclass)
+{
+	pthread_mutex_lock(&s_surf_mx);
+	and_log("[DisplayXR-AND] surfaceDestroyed: window=%p", (void *)s_win);
+	// Tell the runtime BEFORE the window dies (we are inside surfaceDestroyed, the
+	// last moment it is guaranteed alive): it drops its VkSurfaceKHR and pauses the
+	// display processor instead of presenting into a dead window.
+	ANativeWindow *dying = s_win;
+	s_win = nullptr;
+	s_win_w = s_win_h = 0;
+	if (s_surf_session != XR_NULL_HANDLE && s_pfn_set_surface) surf_publish_locked("surfaceDestroyed");
+	if (dying) ANativeWindow_release(dying);
+	pthread_mutex_unlock(&s_surf_mx);
+}
+
+static void JNICALL
+jni_window_geometry(JNIEnv *, jclass, jint x, jint y, jint w, jint h, jint pw, jint ph, jint display_id)
+{
+	pthread_mutex_lock(&s_surf_mx);
+	memset(&s_geom, 0, sizeof(s_geom));
+	s_geom.type = XR_TYPE_ANDROID_WINDOW_GEOMETRY_DXR;
+	s_geom.windowRect.offset.x = x;
+	s_geom.windowRect.offset.y = y;
+	s_geom.windowRect.extent.width = w;
+	s_geom.windowRect.extent.height = h;
+	s_geom.panelExtent.width = pw;
+	s_geom.panelExtent.height = ph;
+	s_geom.displayId = display_id;
+	s_geom_valid = 1;
+	if (s_surf_session != XR_NULL_HANDLE && s_pfn_set_geometry) surf_push_geometry_locked("changed");
+	else and_log("[DisplayXR-AND] window geometry %d,%d %dx%d panel=%dx%d (no session yet: held)", (int)x,
+	             (int)y, (int)w, (int)h, (int)pw, (int)ph);
+	pthread_mutex_unlock(&s_surf_mx);
+}
+
+static void JNICALL
+jni_touch(JNIEnv *, jclass, jint action, jint pointer_id, jint pointer_count, jfloat x, jfloat y, jint sw,
+          jint sh, jlong t_ns)
+{
+	pthread_mutex_lock(&s_surf_mx);
+	XrResult r = XR_ERROR_SESSION_NOT_RUNNING;
+	if (s_surf_session != XR_NULL_HANDLE && s_pfn_submit_input) {
+		XrAndroidInputEventDXR e = {};
+		e.type = XR_TYPE_ANDROID_INPUT_EVENT_DXR;
+		e.action = (XrAndroidInputActionDXR)action;
+		e.pointerId = (uint32_t)pointer_id;
+		e.pointerCount = (uint32_t)pointer_count;
+		e.position.x = x;
+		e.position.y = y;
+		e.surfaceExtent.width = sw;
+		e.surfaceExtent.height = sh;
+		e.eventTimeNs = (int64_t)t_ns;
+		r = s_pfn_submit_input(s_surf_session, &e);
+	}
+	const bool submitted = s_surf_session != XR_NULL_HANDLE && s_pfn_submit_input != nullptr;
+	unsigned long n = ++s_touch_events;
+	pthread_mutex_unlock(&s_surf_mx);
+	// Lifecycle-rate logging: every DOWN/UP/CANCEL is a gesture edge; MOVEs only
+	// as a running count. A runtime below surface-binding spec v3 has no
+	// xrSubmitAndroidInputEventDXR: say so once, then stay quiet.
+	static int s_no_submit_logged = 0;
+	if (!submitted) {
+		if (!s_no_submit_logged) {
+			s_no_submit_logged = 1;
+			and_log("[DisplayXR-AND] touch: runtime has no xrSubmitAndroidInputEventDXR (surface binding spec "
+			        "< 3, runtime < v2.47.1) — touches still reach Unity, the runtime's touch provider just "
+			        "does not see them");
+		}
+		return;
+	}
+	if (action != XR_ANDROID_INPUT_ACTION_MOVE_DXR || (n % 120) == 0)
+		and_log("[DisplayXR-AND] touch -> xrSubmitAndroidInputEventDXR action=%d id=%d count=%d (%.0f,%.0f) "
+		        "in %dx%d -> %d (events=%lu)",
+		        (int)action, (int)pointer_id, (int)pointer_count, x, y, (int)sw, (int)sh, (int)r, n);
+}
+
+static void JNICALL
+jni_lifecycle(JNIEnv *, jclass, jint resumed)
+{
+	and_log("[DisplayXR-AND] activity %s", resumed ? "RESUMED" : "PAUSED");
+}
+
+extern "C" int
+dxr_android_surface_attach(void)
+{
+	if (s_surf_attach_requested) return 1;
+	JavaVM *vm = and_get_vm();
+	jobject act = and_get_activity();
+	if (!vm || !act) return 0;
+	AndEnv e(vm);
+	if (!e.env) return 0;
+	JNIEnv *env = e.env;
+	jclass cls = and_load_app_class(env, "com/displayxr/unity/DisplayXRSurface", "com.displayxr.unity.DisplayXRSurface");
+	if (!cls) {
+		and_log("[DisplayXR-AND] DisplayXRSurface class not found (DisplayXR.androidlib not in the build?) — "
+		        "the runtime will host its own surface");
+		return 0;
+	}
+	static const JNINativeMethod methods[] = {
+	    {(char *)"nativeSurfaceCreated", (char *)"(Landroid/view/Surface;II)V", (void *)jni_surface_created},
+	    {(char *)"nativeSurfaceChanged", (char *)"(II)V", (void *)jni_surface_changed},
+	    {(char *)"nativeSurfaceDestroyed", (char *)"()V", (void *)jni_surface_destroyed},
+	    {(char *)"nativeWindowGeometry", (char *)"(IIIIIII)V", (void *)jni_window_geometry},
+	    {(char *)"nativeTouch", (char *)"(IIIFFIIJ)V", (void *)jni_touch},
+	    {(char *)"nativeLifecycle", (char *)"(I)V", (void *)jni_lifecycle},
+	};
+	if (env->RegisterNatives(cls, methods, (jint)(sizeof(methods) / sizeof(methods[0]))) != JNI_OK ||
+	    and_clear_exc(env)) {
+		env->DeleteLocalRef(cls);
+		and_log("[DisplayXR-AND] DisplayXRSurface: RegisterNatives failed");
+		return 0;
+	}
+	jmethodID attach = env->GetStaticMethodID(cls, "attach", "(Landroid/app/Activity;)V");
+	if (!attach || and_clear_exc(env)) {
+		env->DeleteLocalRef(cls);
+		and_log("[DisplayXR-AND] DisplayXRSurface.attach(Activity) not found");
+		return 0;
+	}
+	env->CallStaticVoidMethod(cls, attach, act);
+	bool exc = and_clear_exc(env);
+	env->DeleteLocalRef(cls);
+	if (exc) {
+		and_log("[DisplayXR-AND] DisplayXRSurface.attach threw");
+		return 0;
+	}
+	s_surf_attach_requested = 1;
+	and_log("[DisplayXR-AND] DisplayXRSurface.attach posted to the UI thread (tid=%d)", (int)gettid());
+	return 1;
+}
+
+extern "C" const void *
+dxr_android_surface_binding(const void *next, int wait_ms)
+{
+	if (!s_surf_attach_requested) return nullptr;
+	pthread_mutex_lock(&s_surf_mx);
+	if (!s_win && wait_ms > 0) {
+		struct timespec dl;
+		clock_gettime(CLOCK_REALTIME, &dl);
+		dl.tv_sec += wait_ms / 1000;
+		dl.tv_nsec += (long)(wait_ms % 1000) * 1000000L;
+		if (dl.tv_nsec >= 1000000000L) { dl.tv_sec++; dl.tv_nsec -= 1000000000L; }
+		while (!s_win) {
+			if (pthread_cond_timedwait(&s_surf_cv, &s_surf_mx, &dl) == ETIMEDOUT) break;
+		}
+	}
+	const void *out = nullptr;
+	if (s_win) {
+		memset(&s_binding, 0, sizeof(s_binding));
+		s_binding.type = XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_DXR;
+		s_binding.next = next;
+		s_binding.nativeWindow = (struct ANativeWindow *)s_win;
+		s_binding.screenOffsetX = s_geom_valid ? s_geom.windowRect.offset.x : 0;
+		s_binding.screenOffsetY = s_geom_valid ? s_geom.windowRect.offset.y : 0;
+		s_binding.transparentBackgroundEnabled = XR_FALSE;
+		out = &s_binding;
+		and_log("[DisplayXR-AND] binding the provider SurfaceView at xrCreateSession: window=%p %dx%d offset=%d,%d",
+		        (void *)s_win, (int)s_win_w, (int)s_win_h, s_binding.screenOffsetX, s_binding.screenOffsetY);
+	} else {
+		and_log("[DisplayXR-AND] WARN: provider SurfaceView not created within %d ms — no surface binding, the "
+		        "runtime hosts its own surface",
+		        wait_ms);
+	}
+	pthread_mutex_unlock(&s_surf_mx);
+	return out;
+}
+
+extern "C" void
+dxr_android_on_session(XrSession session, PFN_xrGetInstanceProcAddr gipa, XrInstance instance, int bound)
+{
+	PFN_xrVoidFunction f1 = nullptr, f2 = nullptr, f3 = nullptr;
+	if (bound && gipa) {
+		gipa(instance, "xrSetAndroidSurfaceDXR", &f1);
+		gipa(instance, "xrSetAndroidWindowGeometryDXR", &f2);
+		gipa(instance, "xrSubmitAndroidInputEventDXR", &f3);
+	}
+	pthread_mutex_lock(&s_surf_mx);
+	s_surf_session = bound ? session : XR_NULL_HANDLE;
+	s_pfn_set_surface = (PFN_xrSetAndroidSurfaceDXR)f1;
+	s_pfn_set_geometry = (PFN_xrSetAndroidWindowGeometryDXR)f2;
+	s_pfn_submit_input = (PFN_xrSubmitAndroidInputEventDXR)f3;
+	if (s_surf_session != XR_NULL_HANDLE) {
+		and_log("[DisplayXR-AND] session %p bound to the provider surface (set_surface=%p set_geometry=%p "
+		        "submit_input=%p) — re-applying the surface + geometry authoritatively",
+		        (void *)session, (void *)f1, (void *)f2, (void *)f3);
+		// Authoritative re-apply on EVERY session start: the window may have been
+		// destroyed or replaced between the binding fetch and now, and a restarted
+		// session has never seen the geometry Java pushed (and de-duplicated) before.
+		if (s_pfn_set_surface) surf_publish_locked("session start");
+		if (s_pfn_set_geometry && s_geom_valid) surf_push_geometry_locked("session start");
+	}
+	pthread_mutex_unlock(&s_surf_mx);
+}
+
+extern "C" void
+dxr_android_on_session_end(void)
+{
+	pthread_mutex_lock(&s_surf_mx);
+	if (s_surf_session != XR_NULL_HANDLE)
+		and_log("[DisplayXR-AND] session %p ending: surface/geometry/touch calls stop", (void *)s_surf_session);
+	s_surf_session = XR_NULL_HANDLE;
+	s_pfn_set_surface = nullptr;
+	s_pfn_set_geometry = nullptr;
+	s_pfn_submit_input = nullptr;
+	pthread_mutex_unlock(&s_surf_mx);
+}
+
+extern "C" int
+dxr_android_surface_size(uint32_t *w, uint32_t *h)
+{
+	pthread_mutex_lock(&s_surf_mx);
+	int ok = (s_win && s_win_w > 0 && s_win_h > 0) ? 1 : 0;
+	if (ok) {
+		if (w) *w = (uint32_t)s_win_w;
+		if (h) *h = (uint32_t)s_win_h;
+	}
+	pthread_mutex_unlock(&s_surf_mx);
+	return ok;
 }
 
 #endif // __ANDROID__

@@ -49,6 +49,31 @@ void dxr_android_looper_prepare(void);
 /// WARN) on any other thread. Called once per frame from the provider pump.
 void dxr_android_looper_poll(void);
 
+// --- Provider-owned weave surface (D3, #418 P3b) -----------------------------
+// Java half: com.displayxr.unity.DisplayXRSurface (Runtime/Plugins/Android/
+// DisplayXR.androidlib). See the section comment in displayxr_android.cpp.
+
+/// Ask the UI thread to add the provider's SurfaceView over Unity's view (once per
+/// process). @return 1 if the request was posted, 0 if the Java class is missing.
+int dxr_android_surface_attach(void);
+
+/// The XrAndroidSurfaceBindingCreateInfoDXR to chain at xrCreateSession (its `next`
+/// set to @p next), waiting up to @p wait_ms for the surface to exist. NULL when
+/// there is none — the session then runs hosted (the runtime's own SurfaceView).
+const void *dxr_android_surface_binding(const void *next, int wait_ms);
+
+/// After xrCreateSession: resolve the surface-binding entry points and, when the
+/// session was created with the binding (@p bound), re-apply the current surface and
+/// geometry. From here on the UI thread forwards every change to this session.
+void dxr_android_on_session(XrSession session, PFN_xrGetInstanceProcAddr gipa, XrInstance instance,
+                            int bound);
+
+/// Before xrDestroySession: stop forwarding (the UI thread never touches a dead session).
+void dxr_android_on_session_end(void);
+
+/// The bound surface's buffer size. @return 0 while there is no surface.
+int dxr_android_surface_size(uint32_t *w, uint32_t *h);
+
 #ifdef __cplusplus
 }
 #endif
