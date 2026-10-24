@@ -180,7 +180,7 @@ The provider supports **D3D11, D3D12, Metal, and Vulkan** (selected at session c
 `DisplayXRDisplayLoader.IsSinglePassEligible()` and pushed to native via
 `dxr_prov_set_single_pass` **before** the session starts:
 
-| Pipeline | D3D11 | D3D12 | Metal (macOS) | Vulkan (Linux) |
+| Pipeline | D3D11 | D3D12 | Metal (macOS) | Vulkan (Linux, Android) |
 |----------|-------|-------|---------------|----------------|
 | **URP**  | **SPI** | **SPI** | **SPI** | **SPI** |
 | **HDRP** | **SPI** | **SPI** | **SPI** | **SPI** |
