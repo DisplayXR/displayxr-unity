@@ -4,9 +4,16 @@
 # Produces, in Runtime/Plugins/Android/arm64-v8a/:
 #  - libdisplayxr_unity.so  — the plugin, Vulkan provider backend (ENABLE_VULKAN);
 #  - libopenxr_loader.so    — the Khronos OpenXR loader for Android it links
-#                             against (fetched from Maven Central, pinned below).
-# Both are gitignored (CI builds them, like the Linux .so); their .meta files are
-# committed.
+#                             against (fetched from Maven Central, pinned below);
+#  - libVkLayer_DXR_queue_lock.so — the DisplayXR runtime's per-queue Vulkan layer
+#                             (#418 P3b), taken from the runtime's released client
+#                             AAR (pinned below). Not linked: the Android Vulkan
+#                             loader discovers it by file name in the app's native
+#                             lib dir, and the runtime enables it itself in
+#                             xrCreateVulkanInstanceKHR (runtime android-build-guide,
+#                             "The queue-lock layer ships in the client AAR").
+# All three are gitignored (CI builds/fetches them, like the Linux .so); their .meta
+# files are committed.
 #
 # NDK: $ANDROID_NDK_ROOT (or $ANDROID_NDK_HOME), else the NDK bundled with a
 # Unity Hub editor install (macOS path below). Needs cmake + ninja (or make),
@@ -30,6 +37,20 @@ OPENXR_LOADER_VERSION="${OPENXR_LOADER_VERSION:-1.1.63}"
 ANDROID_ABI=arm64-v8a
 ANDROID_PLATFORM="${ANDROID_PLATFORM:-29}"   # Android 10; Vulkan 1.1 + AHardwareBuffer
 MAVEN="https://repo1.maven.org/maven2/org/khronos/openxr/openxr_loader_for_android"
+
+# VK_LAYER_DXR_queue_lock: the runtime release whose DisplayXR-Client AAR we take the
+# layer from, and that AAR's sha256 (GitHub release assets publish no checksum, so it
+# is pinned here). Why the layer has to ride in the APP and not the runtime APK: on
+# Adreno the app's and the runtime's vkQueueSubmit calls share one GSL context, and the
+# Android Vulkan loader only searches the app's own lib path for layers. With it live
+# the runtime turns on mid-frame fills + the non-blocking xrEndFrame hand-off
+# (runtime #1905/#1910/#1923); without it everything works, at app rate, with a
+# blocking hand-off. We ship the .so alone, not the AAR: the AAR's other content is an
+# androidx.startup wake initializer, a dependency a stock Unity Gradle build does not
+# carry (the runtime queries it needs are already in DisplayXR.androidlib).
+QUEUE_LOCK_RUNTIME_VERSION="${QUEUE_LOCK_RUNTIME_VERSION:-2.47.0}"
+QUEUE_LOCK_AAR_SHA256="${QUEUE_LOCK_AAR_SHA256:-38f716a17d262d8e3ac26f9c6cc52da306377941a7e6fc4f4b841d7e7a20daa0}"
+QUEUE_LOCK_URL="https://github.com/DisplayXR/displayxr-runtime/releases/download/v${QUEUE_LOCK_RUNTIME_VERSION}/DisplayXR-Client-${QUEUE_LOCK_RUNTIME_VERSION}.aar"
 
 if [ "${1:-}" = "--clean" ]; then
     echo "=== --clean: removing build-android/ ==="
@@ -94,6 +115,39 @@ if [ ! -f "$LOADER_SO" ]; then
     fi
 fi
 
+# --- VK_LAYER_DXR_queue_lock (from the runtime's client AAR) -----------------
+# Same untrusted-download discipline as the loader: own directory, checksum, one
+# member extracted, nothing executed.
+QL_DIR="$SCRIPT_DIR/build-android/queue_lock_${QUEUE_LOCK_RUNTIME_VERSION}"
+QL_SO="$QL_DIR/libVkLayer_DXR_queue_lock.so"
+if [ ! -f "$QL_SO" ]; then
+    echo "=== Fetching VK_LAYER_DXR_queue_lock from DisplayXR-Client-${QUEUE_LOCK_RUNTIME_VERSION}.aar ==="
+    rm -rf "$QL_DIR"
+    mkdir -p "$QL_DIR/extract"
+    QL_AAR="$QL_DIR/DisplayXR-Client-${QUEUE_LOCK_RUNTIME_VERSION}.aar"
+    curl -fsSL -o "$QL_AAR" "$QUEUE_LOCK_URL"
+    if command -v sha256sum >/dev/null 2>&1; then
+        QL_SHA="$(sha256sum "$QL_AAR" | cut -d' ' -f1)"
+    else
+        QL_SHA="$(shasum -a 256 "$QL_AAR" | cut -d' ' -f1)"
+    fi
+    if [ "$QL_SHA" != "$QUEUE_LOCK_AAR_SHA256" ]; then
+        echo "ERROR: client AAR sha256 mismatch (expected $QUEUE_LOCK_AAR_SHA256, got $QL_SHA)" >&2
+        exit 1
+    fi
+    member="jni/$ANDROID_ABI/libVkLayer_DXR_queue_lock.so"
+    unzip -q -o "$QL_AAR" "$member" -d "$QL_DIR/extract"
+    if [ ! -f "$QL_DIR/extract/$member" ]; then
+        echo "ERROR: no $member in the client AAR" >&2
+        exit 1
+    fi
+    cp -f "$QL_DIR/extract/$member" "$QL_SO"
+    if ! file "$QL_SO" | grep -q 'ELF 64-bit.*aarch64'; then
+        echo "ERROR: $QL_SO is not an arm64 ELF" >&2
+        exit 1
+    fi
+fi
+
 # --- Configure + build ------------------------------------------------------
 GEN=()
 if command -v ninja >/dev/null 2>&1; then GEN=(-G Ninja); fi
@@ -110,6 +164,7 @@ cmake --build build-android --config Release -j"$(getconf _NPROCESSORS_ONLN 2>/d
 OUT="$SCRIPT_DIR/../Runtime/Plugins/Android/$ANDROID_ABI"
 mkdir -p "$OUT"
 cp -f "$LOADER_SO" "$OUT/libopenxr_loader.so"
+cp -f "$QL_SO" "$OUT/libVkLayer_DXR_queue_lock.so"
 
 SO="$OUT/libdisplayxr_unity.so"
 LOADER_OUT="$OUT/libopenxr_loader.so"
@@ -177,7 +232,7 @@ fi
 # gated (1.0.x loaders are 4 KB; 1.1.4x+ are 16 KB).
 echo ""
 echo "=== LOAD alignment (16 KB page devices) ==="
-for f in "$SO" "$LOADER_OUT"; do
+for f in "$SO" "$LOADER_OUT" "$OUT/libVkLayer_DXR_queue_lock.so"; do
     ALIGN="$("$READELF" -lW "$f" | awk '/LOAD/{print $NF}' | sort -u | tr '\n' ' ')"
     echo "$(basename "$f"): $ALIGN"
 done
