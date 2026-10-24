@@ -294,7 +294,13 @@ struct PvkState {
 	VkSemaphore ring_wait_sem[PVK_RING_MAX] = {};      // session device, sync_file imported per frame
 	VkFence     ring_fence[PVK_RING_MAX] = {};         // the copy batch that last READ ring slot r
 	bool        ring_pending[PVK_RING_MAX] = {};
-	VkSemaphore ov_wait_sem = VK_NULL_HANDLE;          // overlay copies' import of the same sync_file
+	// 2D overlay copies (#418 P4): one asynchronous copy per overlay per frame, each
+	// with its OWN import of the frame's sync_file and its own fence. Re-importing a
+	// binary semaphore with a wait still pending is invalid, and the overlay bridge is
+	// single-buffered, so the next use of either waits ov_fence[k] first.
+	VkSemaphore ov_wait_sem[DXR_PVK_OVERLAY_COUNT] = {};
+	VkFence     ov_fence[DXR_PVK_OVERLAY_COUNT] = {};
+	bool        ov_pending[DXR_PVK_OVERLAY_COUNT] = {};
 	// Stats, one line per 600 frames: how long frame_begin waited for slot reuse.
 	uint64_t    st_wait_ns = 0, st_wait_max_ns = 0;
 	uint32_t    st_frames = 0, st_waited = 0, st_already = 0;
@@ -1124,6 +1130,7 @@ dxr_pvk_signal_unity_done(void)
 
 #if defined(__ANDROID__)
 static void pvk_ring_wait(uint32_t r, bool stats);
+static void pvk_ov_wait(int kind);
 #endif
 
 // Wait until no recorded copy is pending on the GPU. Synchronous mode never leaves
@@ -1134,6 +1141,7 @@ pvk_wait_copies_idle(void)
 {
 #if defined(__ANDROID__)
 	for (uint32_t r = 0; r < PVK_RING_MAX; r++) pvk_ring_wait(r, false);
+	for (int k = 0; k < DXR_PVK_OVERLAY_COUNT; k++) pvk_ov_wait(k);
 #endif
 }
 
@@ -1227,17 +1235,10 @@ pvk_copy_bridge(PvkBridge *b, VkImage dst, uint32_t dst_base_layer, uint32_t lay
 	si.commandBufferCount = 1;
 	si.pCommandBuffers = &cb;
 #if defined(__ANDROID__)
-	// Asynchronous mode never drained Unity's queue this frame: order this copy
-	// after Unity's work through a second import of the same sync_file.
-	VkPipelineStageFlags ov_stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
-	if (s_pvk.async && s_pvk.frame_fd >= 0) {
-		int fd = dup(s_pvk.frame_fd);
-		if (fd >= 0 && pvk_import_wait(s_pvk.ov_wait_sem, fd)) {
-			si.waitSemaphoreCount = 1;
-			si.pWaitSemaphores = &s_pvk.ov_wait_sem;
-			si.pWaitDstStageMask = &ov_stage;
-		}
-	}
+	// Asynchronous mode never drained Unity's queue this frame: a synchronous copy
+	// that reads a Unity-written bridge (the overlay fallback) must still drain it.
+	if (s_pvk.async && s_pvk.unity_api.vkQueueWaitIdle && s_pvk.unity_queue != VK_NULL_HANDLE)
+		s_pvk.unity_api.vkQueueWaitIdle(s_pvk.unity_queue);
 #endif
 	s_pvk.api.vkResetFences(s_pvk.device, 1, &s_pvk.copy_fence);
 	if (s_pvk.api.vkQueueSubmit(s_pvk.queue, 1, &si, s_pvk.copy_fence) != VK_SUCCESS) {
@@ -1426,6 +1427,22 @@ pvk_ring_wait(uint32_t r, bool stats)
 	}
 }
 
+// Retire overlay `kind`'s last asynchronous copy (normally already retired: it was
+// submitted a frame ago). Bounded like pvk_ring_wait.
+static void
+pvk_ov_wait(int kind)
+{
+	if (kind < 0 || kind >= DXR_PVK_OVERLAY_COUNT || !s_pvk.ov_pending[kind] ||
+	    s_pvk.ov_fence[kind] == VK_NULL_HANDLE)
+		return;
+	VkResult wr = s_pvk.api.vkWaitForFences(s_pvk.device, 1, &s_pvk.ov_fence[kind], VK_TRUE,
+	                                        2000000000ull);
+	if (wr != VK_SUCCESS)
+		pvk_log("[DisplayXR-PROV-VK] WARN: overlay %d copy did not retire in 2 s (vk=%d)\n", kind,
+		        (int)wr);
+	s_pvk.ov_pending[kind] = false;
+}
+
 static bool
 pvk_import_wait(VkSemaphore sem, int fd)
 {
@@ -1499,7 +1516,12 @@ pvk_async_init(void)
 			return; // pvk_async_destroy() frees whatever was made
 		}
 	}
-	s_pvk.ov_wait_sem = pvk_session_semaphore();
+	for (int k = 0; k < DXR_PVK_OVERLAY_COUNT; k++) {
+		s_pvk.ov_wait_sem[k] = pvk_session_semaphore();
+		if (s_pvk.api.vkCreateFence(s_pvk.device, &fci, NULL, &s_pvk.ov_fence[k]) != VK_SUCCESS)
+			s_pvk.ov_fence[k] = VK_NULL_HANDLE;
+		s_pvk.ov_pending[k] = false;
+	}
 	s_pvk.async = true;
 	pvk_log("[DisplayXR-PROV-VK] async copy: ON — Unity queue -> SYNC_FD semaphore -> one batched "
 	        "session copy per frame, %u-deep bridge ring, no CPU wait on the frame just submitted "
@@ -1518,9 +1540,15 @@ pvk_async_destroy(void)
 		s_pvk.ring_fence[r] = VK_NULL_HANDLE;
 		s_pvk.ring_wait_sem[r] = VK_NULL_HANDLE;
 	}
-	if (s_pvk.ov_wait_sem && s_pvk.api.vkDestroySemaphore)
-		s_pvk.api.vkDestroySemaphore(s_pvk.device, s_pvk.ov_wait_sem, NULL);
-	s_pvk.ov_wait_sem = VK_NULL_HANDLE;
+	for (int k = 0; k < DXR_PVK_OVERLAY_COUNT; k++) {
+		pvk_ov_wait(k);
+		if (s_pvk.ov_fence[k] && s_pvk.api.vkDestroyFence)
+			s_pvk.api.vkDestroyFence(s_pvk.device, s_pvk.ov_fence[k], NULL);
+		if (s_pvk.ov_wait_sem[k] && s_pvk.api.vkDestroySemaphore)
+			s_pvk.api.vkDestroySemaphore(s_pvk.device, s_pvk.ov_wait_sem[k], NULL);
+		s_pvk.ov_fence[k] = VK_NULL_HANDLE;
+		s_pvk.ov_wait_sem[k] = VK_NULL_HANDLE;
+	}
 	if (s_pvk.unity_done_sem) {
 		// Its last signal may still be pending on Unity's queue; a semaphore must not
 		// be destroyed under a pending operation. Teardown only.
@@ -1944,6 +1972,12 @@ dxr_pvk_overlay_record_unity_copy(int kind, void *cmd_buf, void *src_image,
 	uint32_t w = src_w < b->width ? src_w : b->width;
 	uint32_t h = src_h < b->height ? src_h : b->height;
 	if (w == 0 || h == 0) return 0;
+#if defined(__ANDROID__)
+	// The bridge is single-buffered: last frame's asynchronous session copy must have
+	// read it before this write executes. That copy was submitted a frame ago, so
+	// this wait is normally a no-op.
+	pvk_ov_wait(kind);
+#endif
 
 	// The bridge stays parked in GENERAL (see pvk_create_bridge). Make the session
 	// copy's earlier read of it finish before this write, then write, then make the
@@ -2011,6 +2045,40 @@ dxr_pvk_overlay_copy_to_swapchain_image(int kind, uint32_t image_index)
 {
 	PvkState::Overlay *o = pvk_overlay(kind);
 	if (!o || image_index >= o->sc_image_count) return 0;
+#if defined(__ANDROID__)
+	// Asynchronous (#418 P4): GPU-ordered after Unity's frame through this overlay's
+	// own import of the frame's sync_file; no CPU wait. Ordering against the runtime's
+	// read of the swapchain image is queue order: the runtime composes on this same
+	// queue after xrReleaseSwapchainImage/xrEndFrame (the eye copy relies on the same).
+	// Desktop and the no-sync_file case keep the synchronous copy.
+	if (s_pvk.async && s_pvk.frame_fd >= 0 && s_pvk.ov_fence[kind] != VK_NULL_HANDLE &&
+	    s_pvk.ov_wait_sem[kind] != VK_NULL_HANDLE && o->bridge.valid && s_pvk.device_ready &&
+	    o->sc_images[image_index] != VK_NULL_HANDLE) {
+		pvk_ov_wait(kind); // its semaphore and command buffers are about to be reused
+		VkCommandBuffer cb = pvk_copy_cb(&o->bridge, o->sc_images[image_index], 0, 1);
+		int fd = cb != VK_NULL_HANDLE ? dup(s_pvk.frame_fd) : -1;
+		if (fd >= 0 && pvk_import_wait(s_pvk.ov_wait_sem[kind], fd)) {
+			VkPipelineStageFlags stage = VK_PIPELINE_STAGE_TRANSFER_BIT;
+			VkSubmitInfo si = {};
+			si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+			si.waitSemaphoreCount = 1;
+			si.pWaitSemaphores = &s_pvk.ov_wait_sem[kind];
+			si.pWaitDstStageMask = &stage;
+			si.commandBufferCount = 1;
+			si.pCommandBuffers = &cb;
+			s_pvk.api.vkResetFences(s_pvk.device, 1, &s_pvk.ov_fence[kind]);
+			if (s_pvk.api.vkQueueSubmit(s_pvk.queue, 1, &si, s_pvk.ov_fence[kind]) == VK_SUCCESS) {
+				s_pvk.ov_pending[kind] = true;
+				return 1;
+			}
+			pvk_log("[DisplayXR-PROV-VK] %s: async overlay submit failed — synchronous copy\n",
+			        pvk_overlay_label(kind));
+			// The failed submit left the imported payload unconsumed; the synchronous
+			// copy below does not touch this semaphore, and the next frame re-imports
+			// (TEMPORARY import replaces the payload).
+		}
+	}
+#endif
 	return pvk_copy_bridge(&o->bridge, o->sc_images[image_index], 0, 1);
 }
 
