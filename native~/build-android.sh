@@ -4,8 +4,7 @@
 # Produces, in Runtime/Plugins/Android/arm64-v8a/:
 #  - libdisplayxr_unity.so  — the plugin, Vulkan provider backend (ENABLE_VULKAN);
 #  - libopenxr_loader.so    — the Khronos OpenXR loader for Android it links
-#                             against, version-matched to the OpenXR headers the
-#                             CMake build uses (fetched from Maven Central).
+#                             against (fetched from Maven Central, pinned below).
 # Both are gitignored (CI builds them, like the Linux .so); their .meta files are
 # committed.
 #
@@ -18,14 +17,16 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
 
 # --- Pins -------------------------------------------------------------------
-# The loader version MUST match the OpenXR-SDK header tag in CMakeLists.txt
-# (release-X.Y.Z -> X.Y.Z): the loader and the headers share XR_CURRENT_API_VERSION.
-OPENXR_HEADER_TAG="$(sed -n 's/^ *GIT_TAG release-\([0-9.]*\)$/\1/p' CMakeLists.txt | head -1)"
-OPENXR_LOADER_VERSION="${OPENXR_LOADER_VERSION:-$OPENXR_HEADER_TAG}"
-if [ -z "$OPENXR_LOADER_VERSION" ]; then
-    echo "ERROR: could not read the OpenXR-SDK GIT_TAG from CMakeLists.txt" >&2
-    exit 1
-fi
+# The loader is pinned on its own, NOT to the OpenXR-SDK header tag in CMakeLists.txt
+# (release-1.0.34). Measured on device (#418 P3a): the 1.0.34 Android loader queries
+# the runtime broker at .../runtimes/active/0, a URI shape the DisplayXR runtime's
+# broker (OpenXRRuntimeBroker.kt) does not recognise -> null cursor ->
+# xrCreateInstance fails with nothing else in the log. 1.1.x queries
+# .../runtimes/active, which is what every DisplayXR client ships (the runtime's
+# cube_handle_vk_android pins 1.1.63). A newer loader serves an app built against
+# older headers (the app's requested apiVersion 1.0.x is accepted), and 1.1.63 is
+# also 16 KB-page aligned. Keep this equal to the runtime's client pin.
+OPENXR_LOADER_VERSION="${OPENXR_LOADER_VERSION:-1.1.63}"
 ANDROID_ABI=arm64-v8a
 ANDROID_PLATFORM="${ANDROID_PLATFORM:-29}"   # Android 10; Vulkan 1.1 + AHardwareBuffer
 MAVEN="https://repo1.maven.org/maven2/org/khronos/openxr/openxr_loader_for_android"
