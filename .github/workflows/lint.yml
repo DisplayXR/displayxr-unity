@@ -29,8 +29,11 @@ jobs:
           # Tier-A allowlist (ALLOW): legitimate names of the vendor hardware /
           # plug-in / SDK / OEM the ecosystem integrates with - like naming NVIDIA in
           # CUDA code. A line containing any of these tokens is permitted.
+          # leia.headtrackingservice: the vendor head-tracking service PACKAGE an
+          # Android player must declare in <queries> (runtime INV-11.9, #418) until
+          # platforms advertise the neutral VENDOR_DISPLAY_SERVICE action.
           FORBIDDEN="le""ia"
-          ALLOW='cnsdk|leia_cnsdk|libdxrp050_leia_cnsdk|leiasdk|leiasr|displayxr-leia|leia-plugin|leiaplugin|leia_plugin|leia_tag|leia-sr|leia sr|leia hardware|leia display|leia dp|leia android dp|leia sdk|leia plug|leia panel|leia weave|leia face|leia viewer|leia-viewer|leia convention|leia lif|leia heif|leia image format|leiaschema|classic leia|leialoft|leiainc/|LEIA_EXE|LEIA_VER|LEIA_TAG|SecLeia|G_Leia|LeiaUnrealSDK|LeiaPlayerWin'
+          ALLOW='cnsdk|leia_cnsdk|libdxrp050_leia_cnsdk|leiasdk|leiasr|displayxr-leia|leia-plugin|leiaplugin|leia_plugin|leia_tag|leia-sr|leia sr|leia hardware|leia display|leia dp|leia android dp|leia sdk|leia plug|leia panel|leia weave|leia face|leia viewer|leia-viewer|leia convention|leia lif|leia heif|leia image format|leiaschema|classic leia|leialoft|leiainc/|LEIA_EXE|LEIA_VER|LEIA_TAG|SecLeia|G_Leia|LeiaUnrealSDK|LeiaPlayerWin|leia.headtrackingservice'
           hits=$(grep -rniI \
                    --exclude-dir=.git --exclude-dir=.claude \
                    --exclude-dir=openxr --exclude-dir=displayxr-common \
