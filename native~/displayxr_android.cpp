@@ -14,12 +14,14 @@
 #include <android/looper.h>
 #include <android/native_window.h>
 #include <android/native_window_jni.h>
+#include <sys/system_properties.h>
 #include <errno.h>
 #include <time.h>
 #include <dlfcn.h>
 #include <pthread.h>
 #include <stdarg.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -54,6 +56,30 @@ and_log(const char *fmt, ...)
 	vsnprintf(buf, sizeof(buf), fmt, ap);
 	va_end(ap);
 	dxr_android_log(buf);
+}
+
+// ---------------------------------------------------------------------------
+// A/B switches
+// ---------------------------------------------------------------------------
+
+static int
+and_flag_value_on(const char *v)
+{
+	return v && v[0] && strcmp(v, "0") != 0 && strcmp(v, "false") != 0;
+}
+
+extern "C" int
+dxr_android_flag(const char *env, const char *prop)
+{
+	if (env) {
+		const char *v = getenv(env);
+		if (v) return and_flag_value_on(v);
+	}
+	if (prop) {
+		char v[PROP_VALUE_MAX] = {0};
+		if (__system_property_get(prop, v) > 0) return and_flag_value_on(v);
+	}
+	return 0;
 }
 
 // ---------------------------------------------------------------------------

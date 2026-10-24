@@ -888,11 +888,20 @@ GfxStart(UnitySubsystemHandle handle, void *userData, UnityXRRenderingCapabiliti
 		// records and submits its own Vulkan command buffers, so re-validate Unity's
 		// render state around each callback.
 		caps->invalidateRenderStateAfterEachCallback = true;
-		// Unity keeps presenting to its own surface: in P3a the runtime weaves into a
-		// SurfaceView it hosts itself (a separate BufferQueue layered over Unity's
-		// view), so the two never contend for one surface. Revisit at P3a bring-up if
-		// Unity's own present shows through or costs too much.
-		caps->skipPresentToMainScreen = false;
+		// Skip Unity's own present (#418 follow-up). The weave goes to the provider's
+		// SurfaceView, stacked above Unity's (DisplayXRSurface.java), so nothing Unity
+		// presents is ever seen. Measured on a Nubia Pad 2: Unity's layer receives 0
+		// buffers instead of 60/s, Screen.* / touch / wsui hit-testing are unchanged
+		// (Unity's surface keeps its size). GPU busy is unchanged too — Unity's present
+		// and back buffer cost ~nothing; the gap to a bare VK app is Unity's own eye
+		// rendering + the bridge copy. Unity still allocates its swapchain (~60 MB); the
+		// only way to reclaim it, shrinking Unity's surface, breaks Screen.* vs touch
+		// coordinates, so it is not done.
+		// A/B: setprop debug.displayxr.unity_present 1 (or DISPLAYXR_ANDROID_UNITY_PRESENT=1).
+		caps->skipPresentToMainScreen =
+		    dxr_android_flag("DISPLAYXR_ANDROID_UNITY_PRESENT", "debug.displayxr.unity_present") ? false : true;
+		prov_log(caps->skipPresentToMainScreen ? "[DisplayXR-PROV] Android: skipPresentToMainScreen=1\n"
+		                                       : "[DisplayXR-PROV] Android: skipPresentToMainScreen=0 (A/B flag)\n");
 #else
 		// macOS zero-copy touches NO Unity render state in the callbacks (no
 		// provider command buffers at all), and the invalidation path is what

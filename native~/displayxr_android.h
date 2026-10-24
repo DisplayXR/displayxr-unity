@@ -74,6 +74,12 @@ void dxr_android_on_session_end(void);
 /// The bound surface's buffer size. @return 0 while there is no surface.
 int dxr_android_surface_size(uint32_t *w, uint32_t *h);
 
+/// A/B switch read from the environment variable @p env (set in-process, e.g. by a
+/// C# script at SubsystemRegistration) or, failing that, the system property
+/// @p prop (`adb shell setprop debug.displayxr.<name> 1`, no rebuild). "0", "" and
+/// "false" read as off. @return 1 when set and on.
+int dxr_android_flag(const char *env, const char *prop);
+
 #ifdef __cplusplus
 }
 #endif
