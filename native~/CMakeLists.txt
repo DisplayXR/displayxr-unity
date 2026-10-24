@@ -44,11 +44,12 @@ endif()
 # is gone; do NOT re-add it (see the no-vendored-math drift guard).
 
 # --- Which platforms build the Vulkan backend ---
-# Windows (#247) and desktop Linux (#249). Apple is excluded on purpose: Metal is
-# the macOS backend (#202/#204). Android is a future leg (#249 follow-on) and is
-# deliberately NOT switched on here — its runtime is out-of-process, so the
-# in-process bridge this backend implements is the wrong shape for it.
-if(WIN32 OR (UNIX AND NOT APPLE AND NOT ANDROID))
+# Windows (#247), desktop Linux (#249) and Android (#418). Apple is excluded on
+# purpose: Metal is the macOS backend (#202/#204). On Android Vulkan is the ONLY
+# backend, and the in-process runtime (the production default there) creates its
+# device through XR_KHR_vulkan_enable2 exactly as on desktop, so the same
+# external-memory eye bridge applies (#418 D2).
+if(WIN32 OR ANDROID OR (UNIX AND NOT APPLE))
     set(DXR_VULKAN_BACKEND ON)
 else()
     set(DXR_VULKAN_BACKEND OFF)
@@ -168,6 +169,14 @@ elseif(UNIX AND NOT APPLE AND NOT ANDROID)
         # XRSDKPreInit / UnityPluginLoad; they edit tables in UnityPlayer.so only,
         # no libwayland needed.
         displayxr_linux_sdl_fixups.c)
+elseif(ANDROID)
+    # Android (#418): JNI_OnLoad (JavaVM), the Unity activity, the Khronos Android
+    # loader init (xrInitializeLoaderKHR + XrInstanceCreateInfoAndroidKHR), the
+    # session-thread ALooper, the logcat sink and the shell-mode stub every
+    # platform must define. None of the desktop-Linux TUs above (X11, Wayland,
+    # D-Bus, SDL fixups) are compiled here.
+    list(APPEND SOURCES displayxr_android.cpp)
+    list(APPEND HEADERS displayxr_android.h)
 endif()
 
 # Provider Vulkan backend (#247 Windows, #249 Linux): enable2 session device +
@@ -343,6 +352,42 @@ elseif(APPLE)
         LIBRARY_OUTPUT_DIRECTORY "${PLUGIN_OUTPUT_DIR}"
         MACOSX_BUNDLE_GUI_IDENTIFIER "com.displayxr.unity.native"
     )
+elseif(ANDROID)
+    # Android arm64 (#418). Same `lib` prefix convention as desktop Linux; lands
+    # beside the Khronos loader in the arm64-v8a plugin folder.
+    set(PLUGIN_OUTPUT_DIR "${CMAKE_CURRENT_SOURCE_DIR}/../Runtime/Plugins/Android/arm64-v8a")
+    set_target_properties(displayxr_unity PROPERTIES
+        LIBRARY_OUTPUT_DIRECTORY "${PLUGIN_OUTPUT_DIR}"
+        LIBRARY_OUTPUT_DIRECTORY_RELEASE "${PLUGIN_OUTPUT_DIR}"
+        LIBRARY_OUTPUT_DIRECTORY_DEBUG "${PLUGIN_OUTPUT_DIR}"
+    )
+    # The Khronos OpenXR loader for Android (#418 D1), version-matched to the
+    # OpenXR headers above and shipped beside this library in the same APK lib
+    # dir (native~/build-android.sh fetches it from Maven Central). Linked, not
+    # dlopened: on Android the loader IS the runtime-discovery path (the
+    # runtime_broker ContentProvider + OpenXRRuntimeService intent), there is no
+    # manifest file to dlopen a runtime from, and a DT_NEEDED on a library in the
+    # same APK lib dir always resolves inside the app's linker namespace.
+    # Vulkan stays dlopened (libvulkan.so, displayxr_vk_loader.cpp) like desktop.
+    set(DXR_ANDROID_OPENXR_LOADER "" CACHE FILEPATH
+        "Path to arm64-v8a libopenxr_loader.so (from org.khronos.openxr:openxr_loader_for_android)")
+    if(NOT DXR_ANDROID_OPENXR_LOADER OR NOT EXISTS "${DXR_ANDROID_OPENXR_LOADER}")
+        message(FATAL_ERROR "displayxr_unity (Android): set DXR_ANDROID_OPENXR_LOADER to the "
+                            "arm64-v8a libopenxr_loader.so — native~/build-android.sh fetches it.")
+    endif()
+    add_library(dxr_openxr_loader SHARED IMPORTED)
+    set_target_properties(dxr_openxr_loader PROPERTIES
+        IMPORTED_LOCATION "${DXR_ANDROID_OPENXR_LOADER}"
+        IMPORTED_NO_SONAME FALSE)
+    find_library(ANDROID_LOG_LIB log REQUIRED)
+    find_library(ANDROID_LIB android REQUIRED)
+    target_link_libraries(displayxr_unity PRIVATE
+        dxr_openxr_loader ${ANDROID_LIB} ${ANDROID_LOG_LIB} ${CMAKE_DL_LIBS})
+    # Same strictness as desktop Linux (#249): an unresolved symbol is a link error.
+    # --exclude-libs,ALL: the statically linked libc++/libc++abi (ANDROID_STL=c++_static,
+    # so the plugin needs no libc++_shared.so in the APK) must not re-export its
+    # symbols — -fvisibility=hidden only covers our own TUs.
+    target_link_options(displayxr_unity PRIVATE -Wl,--no-undefined -Wl,--exclude-libs,ALL)
 else()
     # Desktop Linux (#249). Unity's Linux plugin importer expects the SONAME-style
     # `lib` prefix, so — unlike Windows — we keep CMake's default naming and land

@@ -30,12 +30,15 @@
 // the semaphore playing the role of the shared ID3D12Fence. Intercept-based
 // zero-copy stays available as a player-only optimisation later.
 //
-// PLATFORMS: Windows (#247) and desktop Linux (#249). The two differ only in the
-// external-memory handle flavour — OPAQUE_WIN32 `HANDLE`s vs OPAQUE_FD file
-// descriptors — which the .cpp isolates behind a handful of PVK_* macros. Vulkan
-// on macOS is out of scope (Metal is the macOS backend, #202/#204), and Android
-// is a separate leg: its runtime is out-of-process, so this in-process bridge is
-// the wrong shape for it.
+// PLATFORMS: Windows (#247), desktop Linux (#249) and Android (#418). They differ
+// only in the external-memory handle flavour — OPAQUE_WIN32 `HANDLE`s vs OPAQUE_FD
+// file descriptors (Linux and Android) — which the .cpp isolates behind a handful
+// of PVK_* macros. Vulkan on macOS is out of scope (Metal is the macOS backend,
+// #202/#204). On Android the runtime runs IN-PROCESS by default (that is the
+// production path there, ADR-036 D2; out-of-process is the opt-in fallback), and
+// it creates its device through enable2 exactly as on desktop, so this same
+// own-device bridge is the right shape (#418 D2). Intercept-based zero-copy is the
+// later optimisation there too — Android has no editor Play Mode to rule it out.
 
 #pragma once
 

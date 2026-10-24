@@ -47,7 +47,9 @@ pvk_log(const char *fmt, ...)
 	va_start(ap, fmt);
 	vsnprintf(buf, sizeof(buf), fmt, ap);
 	va_end(ap);
+#if !defined(__ANDROID__) // Android: stderr goes nowhere; dxr_prov_file_log -> logcat
 	fputs(buf, stderr);
+#endif
 #if defined(_WIN32)
 	OutputDebugStringA(buf);
 #endif

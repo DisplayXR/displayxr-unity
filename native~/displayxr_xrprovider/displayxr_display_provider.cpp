@@ -48,6 +48,9 @@ extern "C" uint32_t dxr_prov_get_extra_zone_acquired_index(uint32_t ei);
 #include "../unity_pluginapi/IUnityXRDisplay.h"
 
 #include "displayxr_provider_session.h"
+#if defined(__ANDROID__)
+#include "../displayxr_android.h" // session-thread ALooper pump (#418 D4)
+#endif
 
 // Renderer id (IUnityGraphics::GetRenderer()) — defined in displayxr_unity_plugin.cpp.
 // -1 if IUnityGraphics isn't available. Used to select the graphics backend (#195).
@@ -198,7 +201,9 @@ extern "C" void dxr_prov_file_log(const char *s); // defined in the session TU
 
 void prov_log(const char *msg)
 {
+#if !defined(__ANDROID__) // Android: stderr goes nowhere; dxr_prov_file_log -> logcat
 	fprintf(stderr, "%s", msg);
+#endif
 #ifdef _WIN32
 	OutputDebugStringA(msg);
 #endif
@@ -823,6 +828,16 @@ GfxStart(UnitySubsystemHandle handle, void *userData, UnityXRRenderingCapabiliti
 		// because XR_DXR_xlib_window_binding hands presentation of that window to the
 		// runtime, and Unity already owns a swapchain on its main window.
 		caps->skipPresentToMainScreen = false;
+#elif defined(__ANDROID__)
+		// Android/Vulkan (#418): same own-device bridge as Linux — the provider
+		// records and submits its own Vulkan command buffers, so re-validate Unity's
+		// render state around each callback.
+		caps->invalidateRenderStateAfterEachCallback = true;
+		// Unity keeps presenting to its own surface: in P3a the runtime weaves into a
+		// SurfaceView it hosts itself (a separate BufferQueue layered over Unity's
+		// view), so the two never contend for one surface. Revisit at P3a bring-up if
+		// Unity's own present shows through or costs too much.
+		caps->skipPresentToMainScreen = false;
 #else
 		// macOS zero-copy touches NO Unity render state in the callbacks (no
 		// provider command buffers at all), and the invalidation path is what
@@ -887,6 +902,15 @@ GfxStart(UnitySubsystemHandle handle, void *userData, UnityXRRenderingCapabiliti
 		backend_kind = DXR_GFX_VULKAN; dev_ptr = nullptr; queue_ptr = nullptr;
 	} else
 #endif
+#elif defined(__ANDROID__)
+#if defined(ENABLE_VULKAN)
+	// Android (#418) is Vulkan-only for this provider (no GLES backend): the same
+	// enable2 own-device bridge as Windows/Linux — see prov_bind_vulkan_backend().
+	if (renderer == kUnityGfxRendererVulkan) {
+		if (!prov_bind_vulkan_backend()) return kUnitySubsystemErrorCodeFailure;
+		backend_kind = DXR_GFX_VULKAN; dev_ptr = nullptr; queue_ptr = nullptr;
+	} else
+#endif
 #elif defined(__APPLE__)
 	if (renderer == kUnityGfxRendererMetal) {
 		// Metal (#204): the session binds a provider-created MTLCommandQueue on
@@ -912,6 +936,11 @@ GfxStart(UnitySubsystemHandle handle, void *userData, UnityXRRenderingCapabiliti
 		         "[DisplayXR-PROV] WARN: unsupported graphics API (renderer=%d). The DisplayXR "
 		         "provider requires Vulkan on Linux — session not started (#249). Set Vulkan "
 		         "first in Project Settings > Player > Graphics APIs.\n", renderer);
+#elif defined(__ANDROID__)
+		snprintf(msg, sizeof(msg),
+		         "[DisplayXR-PROV] WARN: unsupported graphics API (renderer=%d). The DisplayXR "
+		         "provider requires Vulkan on Android (no OpenGL ES backend) — session not "
+		         "started (#418). Put Vulkan first in Player > Android > Graphics APIs.\n", renderer);
 #else
 		snprintf(msg, sizeof(msg),
 		         "[DisplayXR-PROV] WARN: unsupported graphics API (renderer=%d). The DisplayXR "
@@ -958,6 +987,11 @@ GfxStart(UnitySubsystemHandle handle, void *userData, UnityXRRenderingCapabiliti
 		             // read as a contradiction against the xlib-binding line that
 		             // follows it. The session logs the real target.
 		             : "[DisplayXR-PROV] weave target: X11 window binding (decided at session create)\n");
+#elif defined(__ANDROID__)
+		             // P3a (#418 D3): no surface binding — the runtime hosts its own
+		             // fullscreen SurfaceView. That is the shipping shape for now, not a
+		             // diagnostic, so don't call it SELFHOST.
+		             : "[DisplayXR-PROV] weave target: runtime-hosted SurfaceView (#418 P3a)\n");
 #else
 		             : "[DisplayXR-PROV] weave target: runtime self-hosted window (SELFHOST diagnostic)\n");
 #endif
@@ -1010,6 +1044,14 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 	// copies. Linux originally inherited the macOS arm below and hit exactly that
 	// (#249); it has no AppKit constraint, so it belongs on the Windows side.
 	dxr_prov_poll_events();
+#elif defined(__ANDROID__)
+	// Android (#418 D5) pumps on the graphics thread too, for the same reason as
+	// Linux above (no AppKit-style main-thread constraint; without the pump the
+	// session sits at READY forever). The C# LateUpdate pump stays macOS-only, so
+	// this is the ONE pump on Android. Also service the session thread's ALooper
+	// (#418 D4) — a no-op with one WARN if xrCreateSession ran on another thread.
+	dxr_prov_poll_events();
+	dxr_android_looper_poll();
 #endif
 #if defined(__linux__) && !defined(__ANDROID__)
 	// Keep the plugin-owned weave overlay parked over — and ABOVE — Unity's window.
@@ -1909,6 +1951,13 @@ LifecycleStart(UnitySubsystemHandle handle, void *userData)
 		             ? "[DisplayXR-PROV] Lifecycle Start (Linux: plugin-owned overlay weave window)\n"
 		             : "[DisplayXR-PROV] Lifecycle Start (Linux: no overlay window — runtime self-hosted weave window)\n");
 	}
+#elif defined(__ANDROID__)
+	// Android (#418 P3a): no window to create or find — the runtime hosts its own
+	// fullscreen SurfaceView inside xrCreateSession (#418 D3). P3b creates the
+	// provider-owned SurfaceView here (main thread) and binds it via
+	// XR_DXR_android_surface_binding.
+	s_overlay_hwnd = nullptr;
+	prov_log("[DisplayXR-PROV] Lifecycle Start (Android: runtime-hosted SurfaceView, no window binding)\n");
 #else
 	if (displayxr_is_shell_mode()) {
 		// Workspace tile (shell/IPC). The Shell launched us with
@@ -2099,6 +2148,10 @@ LifecycleStop(UnitySubsystemHandle handle, void *userData)
 	// Both are safe no-ops if the other shape was used this session.
 	displayxr_metal_destroy_app_overlay();     // built-player in-app overlay
 	displayxr_metal_destroy_preview_window();  // editor / fallback window
+	s_overlay_hwnd = nullptr;
+#elif defined(__ANDROID__)
+	// Android (#418 P3a): nothing to tear down — the runtime-hosted SurfaceView goes
+	// with xrDestroySession (GfxStop). P3b destroys the provider-owned view here.
 	s_overlay_hwnd = nullptr;
 #else
 	// Linux (#249): drop the plugin-owned overlay on the MAIN thread, after GfxStop

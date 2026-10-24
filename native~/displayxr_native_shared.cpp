@@ -18,6 +18,10 @@
 #include "displayxr_win32.h"
 #endif
 
+#if defined(__ANDROID__)
+extern "C" void dxr_prov_file_log(const char *s); // provider session TU -> logcat
+#endif
+
 // --- Logging helper ---
 // On Windows built apps, fprintf(stderr) goes nowhere (no console).
 // Write to a file at an absolute path so logs are always findable.
@@ -111,6 +115,11 @@ void displayxr_log(const char *fmt, ...)
 	if (tn < 0) tn = 0;
 	vsnprintf(buf + tn, sizeof(buf) - (size_t)tn, fmt, args);
 	OutputDebugStringA(buf);
+#elif defined(__ANDROID__)
+	// Android (#418): logcat via the provider's sink (stderr goes nowhere there).
+	char buf[2048];
+	vsnprintf(buf, sizeof(buf), fmt, args);
+	dxr_prov_file_log(buf);
 #else
 	vfprintf(stderr, fmt, args);
 #endif

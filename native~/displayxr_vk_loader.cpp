@@ -12,8 +12,19 @@
 #define DXR_VK_LIBNAME L"vulkan-1.dll"
 #elif defined(__APPLE__)
 #define DXR_VK_LIBNAME "libvulkan.dylib"
+#elif defined(__ANDROID__)
+// Android ships the loader as an unversioned libvulkan.so (the NDK has no .so.1).
+#define DXR_VK_LIBNAME "libvulkan.so"
 #else
 #define DXR_VK_LIBNAME "libvulkan.so.1"
+#endif
+
+#if defined(__ANDROID__)
+// Android (#418): stderr goes nowhere — route these through the provider's logcat sink.
+extern "C" void dxr_prov_file_log(const char *s);
+#define DXR_VK_LOADER_LOG(msg) dxr_prov_file_log(msg)
+#else
+#define DXR_VK_LOADER_LOG(msg) fprintf(stderr, msg) // exactly the original calls (literal formats)
 #endif
 
 #if defined(_WIN32)
@@ -47,14 +58,14 @@ dxr_vk_load_global(VkApi *api)
 #endif
 	}
 	if (!s_vk_lib) {
-		fprintf(stderr, "[DisplayXR-SA-VK] vulkan-1 loader not present — Vulkan standalone unavailable\n");
+		DXR_VK_LOADER_LOG("[DisplayXR-SA-VK] vulkan-1 loader not present — Vulkan standalone unavailable\n");
 		return false;
 	}
 
 	api->vkGetInstanceProcAddr =
 	    (PFN_vkGetInstanceProcAddr)dxr_dlsym("vkGetInstanceProcAddr");
 	if (!api->vkGetInstanceProcAddr) {
-		fprintf(stderr, "[DisplayXR-SA-VK] vkGetInstanceProcAddr not found in loader\n");
+		DXR_VK_LOADER_LOG("[DisplayXR-SA-VK] vkGetInstanceProcAddr not found in loader\n");
 		return false;
 	}
 
@@ -62,7 +73,7 @@ dxr_vk_load_global(VkApi *api)
 	*(PFN_vkVoidFunction *)&api->vkCreateInstance =
 	    api->vkGetInstanceProcAddr(VK_NULL_HANDLE, "vkCreateInstance");
 	if (!api->vkCreateInstance) {
-		fprintf(stderr, "[DisplayXR-SA-VK] vkCreateInstance not resolvable\n");
+		DXR_VK_LOADER_LOG("[DisplayXR-SA-VK] vkCreateInstance not resolvable\n");
 		return false;
 	}
 	return true;
