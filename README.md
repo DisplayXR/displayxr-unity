@@ -21,6 +21,7 @@ Unity plugin for rendering on eye-tracked 3D light field displays via the Displa
   - [Windows Standalone](#windows-standalone)
   - [macOS Standalone](#macOS-standalone)
   - [Linux Standalone](#linux-standalone)
+  - [Android (arm64, Vulkan)](#android-arm64-vulkan)
   - [Cross-Compiling (macOS Editor to Windows Build)](#cross-compiling-macos-editor-to-windows-build)
 - [Deploying to End Users](#deploying-to-end-users)
 - [Testing Without Hardware](#testing-without-hardware)
@@ -65,6 +66,7 @@ DisplayXR ships as a custom **Unity display provider** (`IUnityXRDisplay`, the s
 | macOS | macOS | `libdisplayxr_unity.dylib` | Supported |
 | macOS | Windows x64 | `displayxr_unity.dll` | Supported (cross-compile) |
 | Linux | Linux x86_64 (Vulkan) | `libdisplayxr_unity.so` (+ `libdisplayxr_unity_wayland.so`) | Supported: X11/XWayland and native Wayland |
+| Windows / macOS / Linux | Android arm64 (Vulkan) | `libdisplayxr_unity.so` (+ `libopenxr_loader.so`, `libVkLayer_DXR_queue_lock.so`) | Supported: tested on a Nubia Pad 2 (Android 13) |
 
 ---
 
@@ -104,9 +106,9 @@ In Unity: **Window > Package Manager > + > Add package from disk...** → select
    https://github.com/DisplayXR/displayxr-unity.git#upm
    ```
 
-Both URLs install from the `upm` branch, which includes pre-built native binaries (Windows x64, macOS Universal, Linux x86_64) — no local build required. See the [releases page](https://github.com/DisplayXR/displayxr-unity/releases) for available versions.
+Both URLs install from the `upm` branch, which includes pre-built native binaries (Windows x64, macOS Universal, Linux x86_64, Android arm64) — no local build required. See the [releases page](https://github.com/DisplayXR/displayxr-unity/releases) for available versions.
 
-> **Pin `#upm/vX.Y.Z`, not `#vX.Y.Z`.** The plain `vX.Y.Z` tags are the *source* tags: the Linux `.so` files are built by CI and are not committed there, so a `#vX.Y.Z` install has only the two `.meta` files in `Runtime/Plugins/Linux/x86_64/` and a Linux build has no plugin binary. Only the `upm/…` refs carry every platform's binaries.
+> **Pin `#upm/vX.Y.Z`, not `#vX.Y.Z`.** The plain `vX.Y.Z` tags are the *source* tags: the Linux and Android `.so` files are built by CI and are not committed there, so a `#vX.Y.Z` install has only their `.meta` files (`Runtime/Plugins/Linux/x86_64/`, `Runtime/Plugins/Android/arm64-v8a/`) and a Linux or Android build has no plugin binary. Only the `upm/…` refs carry every platform's binaries.
 
 To **update** to a newer version later: change the URL fragment (e.g., `#upm/v1.0.1`) in `Packages/manifest.json` and use **Package Manager → Refresh**, or re-add the package with the new URL.
 
@@ -313,6 +315,32 @@ Next to the player, the build writes **`<name>.sh`**, a launcher: start the app 
 
 `DISPLAYXR_LINUX_BACKEND=wayland` or `=x11` forces one. Other arguments are passed through to the player.
 
+### Android (arm64, Vulkan)
+
+1. **File > Build Settings**, platform **Android**
+2. **Player Settings > Other Settings:**
+   - **Graphics APIs:** **Vulkan** only (remove OpenGLES3). There is no fallback API on Android.
+   - **Scripting Backend:** IL2CPP; **Target Architectures:** ARM64 only
+   - **Minimum API Level:** 29 (Android 10) or higher
+3. **Player Settings > XR Plug-in Management > Android:** enable **DisplayXR Display**
+4. Click **Build** or **Build And Run**
+
+Render path: URP/HDRP default to single-pass instanced, the Built-in pipeline to multi-pass (the same as Linux Vulkan). The package adds what the player needs on its own:
+- the runtime-discovery manifest entries (`Runtime/Plugins/Android/DisplayXR.androidlib`);
+- the Khronos OpenXR loader for Android (1.1.63);
+- the runtime's `VK_LAYER_DXR_queue_lock` layer (needed for full frame rate);
+- R8 keep rules when **Minify** is on;
+- Unity's stock splash screen turned off (the runtime shows its own).
+
+The provider draws into its own `SurfaceView` above Unity's and binds it with `XR_DXR_android_surface_binding`. Pause/resume, rotation (`configChanges`) and window geometry are handled. Every touch reaches Unity, and a copy goes to the runtime (`xrSubmitAndroidInputEventDXR`). The samples' `DisplayXRInputController` turns touch into orbit (one finger), pinch dolly, two-finger pan and double-tap reset.
+
+Known limits:
+- **Window-space UI panel:** while one is shown, the frame rate drops to about 30 fps unless the GPU clock is high. The runtime blocks `xrEndFrame` for frames with a window-space layer ([displayxr-runtime#2356](https://github.com/DisplayXR/displayxr-runtime/issues/2356)).
+- **Zones:** one 3D zone plus Local2D works. More than one 3D zone is not supported on Vulkan on any platform.
+- **Unity's own swapchain memory:** Unity still allocates its own (hidden) swapchain, about 60 MB. `Screen.SetResolution` can shrink it, but it changes the size every `Screen` pixel consumer sees.
+
+Logs: `adb logcat -s DisplayXRUnity`. Switches that need no rebuild: `adb shell setprop debug.displayxr.unity_present 1` (Unity presents to its own surface again) and `debug.displayxr.no_touch_submit 1` (no touch copy to the runtime).
+
 ### Cross-Compiling (macOS Editor to Windows Build)
 
 **Yes, you can build a Windows app from Unity for Mac.** Unity's cross-compilation support handles this:
@@ -405,6 +433,10 @@ If the DisplayXR runtime is not installed, the provider fails to bind an OpenXR 
 The plugin logs a warning but doesn't crash — your app runs in mono (non-stereo) mode. Query the DisplayXR runtime status (via the rig components / `DisplayXRProvider`) to detect this and show a user-facing message.
 
 ---
+
+### Android Deployment
+
+The device needs the **DisplayXR runtime APK**: v2.47.0 or newer. v2.53.0 is the tested version. On v2.47.0 everything works except the touch copy to the runtime, which needs `xrSubmitAndroidInputEventDXR` (first shipped in v2.47.1); the provider logs that once and carries on. On a Leia device, use the Leia variant (the vendor plug-in is bundled in that APK, ADR-038), installed per the runtime's [Android guide](https://github.com/DisplayXR/displayxr-runtime/blob/main/docs/getting-started/android-build-guide.md). Launch the runtime app once after installing it so its broker is registered. The Unity APK finds the runtime through the Khronos loader. Nothing else needs installing.
 
 ## Testing Without Hardware
 
