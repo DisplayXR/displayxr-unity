@@ -343,6 +343,26 @@ and has no real window geometry (the tracking origin floats to standing height).
 Use it only for bring-up/diagnostics. If the app-owned overlay HWND fails to
 create, GfxStart also falls back to self-host as a safety net.
 
+## Android (arm64, Vulkan) — #418
+
+The Android arm follows the **desktop Linux Vulkan** arm: the same own-device + bridge model, the same render-path table (URP/HDRP SPI, BiRP MultiPass), the same provider/session code with `__ANDROID__` arms wherever a plain `#else` would have picked the Metal or Windows path. Android-only glue is in `native~/displayxr_android.{h,cpp}` (logcat tag `DisplayXRUnity`) and `Runtime/Plugins/Android/DisplayXR.androidlib` (manifest entries + the `DisplayXRSurface` Java helper). Design and decisions D1–D7: issue #418; device results: PR #419.
+
+| Concern | Android behaviour | Why |
+|---|---|---|
+| Runtime loading | Khronos Android loader **1.1.63** (`libopenxr_loader.so`), `xrInitializeLoaderKHR(XrLoaderInitInfoAndroidKHR{vm, activity})` + `XrInstanceCreateInfoAndroidKHR`. `JavaVM` from `JNI_OnLoad` (main thread), activity from `UnityPlayer.currentActivity`. | No manifest file to `dlopen` on Android; the runtime broker is the supported discovery path. The 1.0.34 loader asks the broker for `runtimes/active/0`, which the DisplayXR broker rejects. |
+| Graphics | Runtime creates its `VkDevice` via `XR_KHR_vulkan_enable2` (its own queue + the queue-lock layer). Unity renders on its own device into `OPAQUE_FD` external-memory bridge images. Pre-init adapter query declined (single GPU). | Same as Linux. Adreno exports semaphores only as `SYNC_FD`. |
+| Bridge copy | Android-only **GPU-ordered** copy: Unity's queue signals a `SYNC_FD` semaphore, the provider imports it and records **one** batched copy per frame into a double-buffered bridge ring. Unity-queue work goes through `IUnityGraphicsVulkan::AccessQueue(flush=true)`. `DISPLAYXR_VK_SYNC_COPY=1` forces the old CPU-waited path. | The per-frame re-recorded, CPU-waited copy was 77 % of the render thread and parked the GPU clock at the floor (36.9 fps unpinned → 59.8). |
+| Queue-lock layer | `libVkLayer_DXR_queue_lock.so` ships in the package (from the runtime's client AAR, checksum-pinned). The runtime injects it at `xrCreateVulkanInstanceKHR`. | Without it the runtime keeps `xrEndFrame` blocking (Adreno shared-GSL-context submit race, runtime #1905/#1910). |
+| Session thread | The provider runs `ALooper_prepare` on Unity's render thread and `ALooper_pollOnce(0)` every frame. | The vendor display processor needs a pumped looper on the `xrCreateSession` thread; Unity's render thread has none. |
+| Surface | Provider-owned `SurfaceView` added above Unity's view, bound with `XR_DXR_android_surface_binding`. `xrSetAndroidSurfaceDXR(NULL/new)` on surface destroy/create; Choreographer-sampled `xrSetAndroidWindowGeometryDXR`. During a rotation, one geometry sample is held so a new panel extent is never sent with the old view rect. Unity's own present is skipped (`skipPresentToMainScreen`). | One BufferQueue allows one producer, so Unity's surface cannot be the bound one. Unity's present costs no measurable GPU, but it is a hidden 60 Hz layer. |
+| Lifecycle | Rendering begins at READY. Unity **destroys and recreates** the session on pause while its main thread is paused, so C# never sees the restart. The native `dxr_prov_session_serial()` counter lets C# notice and replay stop/start, so all pushed state is re-sent. | `dxr_prov_session_stop` clears the native state, and the C#→native pushes are change-detected. |
+| Touch | Every MotionEvent goes to Unity (the app rig owns the camera; sample `DisplayXRInputController`) **and** a copy goes to `xrSubmitAndroidInputEventDXR` (surface binding spec v3, runtime ≥ v2.47.1). The runtime's touch rig never moves an external-window `XR_DXR_view_rig` session (verified pixel-identical), so there is no double drive. `debug.displayxr.no_touch_submit 1` turns the copy off. | |
+| Packaging | `.so` files gitignored and built by CI (`build-android` job, `native~/build-android.sh`: NDK r27c, API 29, exact NEEDED allow-list, no undefined symbols, 16 KB LOAD alignment), `.meta` committed. `Editor/DisplayXRAndroidProguardProcessor.cs` appends `consumer-rules.pro` to the generated `proguard-unity.txt`. | R8 ignores `META-INF/proguard` in an androidlib; without the rule it strips the JNI-only helper class. |
+
+**Measured on a Nubia Pad 2 (runtime v2.53.0 with the vendor plug-in, unpinned GPU clock):** BiRP cube 59.9 fps (= the runtime's bare `cube_handle_vk_android`), URP SPI 59.9, URP 3D zone + Local2D 59.7, a minified release build 59.8. A **window-space UI panel** drops this to ~30 fps unless the GPU clock is pinned high: the runtime keeps `xrEndFrame` blocking for frames with a window-space layer (displayxr-runtime#2356). Nothing on the provider side avoids this except not submitting the layer.
+
+**Capture:** the runtime's file trigger cannot work in-process on Android (no `TMPDIR`); use `xrCaptureAtlasDXR`.
+
 ## Porting hook-path features to provider mode — the inert-`DisplayXRFeature` rule
 
 > **Rule of thumb:** in provider mode there is **no OpenXR API-layer hook and no

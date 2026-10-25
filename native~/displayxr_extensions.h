@@ -361,6 +361,97 @@ typedef struct XrWaylandSurfaceGeometryDXR {
 typedef XrResult(XRAPI_PTR *PFN_xrSetWaylandSurfaceGeometryDXR)(XrSession session, uint32_t width,
                                                                 uint32_t height, uint32_t refreshMilliHertz);
 
+// --- XR_DXR_android_surface_binding (Android, #418) ---
+// The Android sibling of the win32 / cocoa / xlib / wayland bindings: the app hands
+// the runtime its own Surface (ANativeWindow*) so the runtime weaves into it instead
+// of spawning a SurfaceView of its own. Mirrored from the runtime's
+// src/external/openxr_includes/openxr/XR_DXR_android_surface_binding.h (spec v3);
+// field order, types and XrStructureType values must stay identical to that header.
+// Not chained yet: P3a (#418 D3) lets the runtime host its own fullscreen
+// SurfaceView; P3b binds a provider-owned SurfaceView with these, republishes it
+// with xrSetAndroidSurfaceDXR across surfaceDestroyed/surfaceCreated and feeds
+// xrSetAndroidWindowGeometryDXR; P4 submits touch with xrSubmitAndroidInputEventDXR.
+// The runtime header's function prototypes are deliberately not mirrored — the
+// provider resolves every entry point through xrGetInstanceProcAddr.
+#define XR_DXR_android_surface_binding 1
+#define XR_DXR_android_surface_binding_SPEC_VERSION 3
+#define XR_DXR_ANDROID_SURFACE_BINDING_EXTENSION_NAME "XR_DXR_android_surface_binding"
+
+#define XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_DXR ((XrStructureType)1004999005)
+#define XR_TYPE_ANDROID_WINDOW_GEOMETRY_DXR ((XrStructureType)1004999220)
+#define XR_TYPE_EVENT_DATA_ANDROID_WINDOW_LAYOUT_HINT_DXR ((XrStructureType)1004999221)
+#define XR_TYPE_ANDROID_INPUT_EVENT_DXR ((XrStructureType)1004999222)
+
+#if defined(__ANDROID__)
+
+// Opaque stand-in so this header needs no <android/native_window.h> (same as the runtime header).
+struct ANativeWindow;
+
+typedef struct XrAndroidSurfaceBindingCreateInfoDXR {
+    XrStructureType             type;           // XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_DXR
+    const void* XR_MAY_ALIAS    next;
+    struct ANativeWindow*       nativeWindow;   // NULL => derive it from `surface`
+    void*                       surface;        // jobject android.view.Surface (global ref), optional
+    int32_t                     screenOffsetX;  // initial on-screen origin, physical px, current rotation
+    int32_t                     screenOffsetY;
+    XrBool32                    transparentBackgroundEnabled;
+} XrAndroidSurfaceBindingCreateInfoDXR;
+
+typedef struct XrAndroidWindowGeometryDXR {
+    XrStructureType             type;         // XR_TYPE_ANDROID_WINDOW_GEOMETRY_DXR
+    const void* XR_MAY_ALIAS    next;
+    XrRect2Di                   windowRect;   // on-screen rect, current rotation, physical px
+    XrExtent2Di                 panelExtent;  // panel extent in the same rotation, physical px
+    int32_t                     displayId;    // Display.getDisplayId(); 0 = default display
+} XrAndroidWindowGeometryDXR;
+
+typedef struct XrEventDataAndroidWindowLayoutHintDXR {
+    XrStructureType             type;          // XR_TYPE_EVENT_DATA_ANDROID_WINDOW_LAYOUT_HINT_DXR
+    const void* XR_MAY_ALIAS    next;
+    XrSession                   session;
+    XrBool32                    active;
+    float                       scale;
+    XrExtent2Di                 layoutSize;
+    XrExtent2Di                 bufferSize;
+    XrRect2Di                   physicalRect;
+} XrEventDataAndroidWindowLayoutHintDXR;
+
+typedef enum XrAndroidInputActionDXR {
+    XR_ANDROID_INPUT_ACTION_DOWN_DXR = 1,
+    XR_ANDROID_INPUT_ACTION_MOVE_DXR = 2,
+    XR_ANDROID_INPUT_ACTION_UP_DXR = 3,
+    XR_ANDROID_INPUT_ACTION_CANCEL_DXR = 4,
+    XR_ANDROID_INPUT_ACTION_MAX_ENUM_DXR = 0x7FFFFFFF
+} XrAndroidInputActionDXR;
+
+typedef struct XrAndroidInputEventDXR {
+    XrStructureType             type;           // XR_TYPE_ANDROID_INPUT_EVENT_DXR
+    const void* XR_MAY_ALIAS    next;
+    XrAndroidInputActionDXR     action;
+    uint32_t                    pointerId;
+    uint32_t                    pointerCount;
+    XrVector2f                  position;       // surface px, origin top-left, y down
+    XrExtent2Di                 surfaceExtent;  // {0,0} => last published geometry extent
+    int64_t                     eventTimeNs;    // CLOCK_MONOTONIC ns; 0 => time of the call
+} XrAndroidInputEventDXR;
+
+typedef XrResult(XRAPI_PTR *PFN_xrSetAndroidSurfaceDXR)(XrSession session,
+                                                        const XrAndroidSurfaceBindingCreateInfoDXR *binding);
+typedef XrResult(XRAPI_PTR *PFN_xrSetAndroidWindowGeometryDXR)(XrSession session,
+                                                               const XrAndroidWindowGeometryDXR *geometry);
+typedef XrResult(XRAPI_PTR *PFN_xrSubmitAndroidInputEventDXR)(XrSession session,
+                                                              const XrAndroidInputEventDXR *event);
+
+#if defined(__cplusplus) && defined(__LP64__)
+// LP64 (arm64-v8a) layouts of the runtime header, pinned so a drift fails the build.
+static_assert(sizeof(XrAndroidSurfaceBindingCreateInfoDXR) == 48, "XR_DXR_android_surface_binding layout");
+static_assert(sizeof(XrAndroidWindowGeometryDXR) == 48, "XR_DXR_android_surface_binding layout");
+static_assert(sizeof(XrEventDataAndroidWindowLayoutHintDXR) == 64, "XR_DXR_android_surface_binding layout");
+static_assert(sizeof(XrAndroidInputEventDXR) == 56, "XR_DXR_android_surface_binding layout");
+#endif
+
+#endif // __ANDROID__
+
 // --- XR_KHR_metal_enable ---
 // Hand-defined: the fetched OpenXR-SDK release-1.0.34 headers predate the
 // Metal enable extension (it landed in the 1.1.x line), so openxr_platform.h

@@ -66,7 +66,9 @@ extern "C" void dxr_prov_file_log(const char *s);
 
 static void pre_log(const char *msg)
 {
+#if !defined(__ANDROID__) // Android: stderr goes nowhere; dxr_prov_file_log -> logcat
 	fprintf(stderr, "%s", msg);
+#endif
 #ifdef _WIN32
 	OutputDebugStringA(msg);
 #endif
@@ -167,7 +169,14 @@ preinit_get_adapter(void *, UnityXRPreInitRenderer renderer,
 	// is exactly what a Linux player run has to answer. If it does, Linux Vulkan
 	// is blocked upstream the same way Windows is, and this callback is where a
 	// Linux-appropriate mitigation would go.
+	// ANDROID (#418 D2) takes this same arm, deliberately: single GPU, and no other
+	// graphics API to steer to either (this provider has no GLES backend).
 	if (instance == VK_NULL_HANDLE) {
+#if defined(__ANDROID__)
+		pre_log("[DisplayXR-PREINIT] Android: declining the instance-less adapter query "
+		        "(single GPU; same policy as Linux, displayxr-unity#418 D2).\n");
+		return false;
+#endif
 		pre_log("[DisplayXR-PREINIT] Linux: declining the instance-less adapter query — correct "
 		        "on a single-GPU box, and there is no alternative graphics API to steer to "
 		        "(displayxr-unity#249). The runtime aligns to Unity's device via DXR_VK_FORCE_GPU "

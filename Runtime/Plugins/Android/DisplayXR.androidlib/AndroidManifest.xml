@@ -1,0 +1,89 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+    Copyright 2026, DisplayXR contributors
+    SPDX-License-Identifier: Apache-2.0
+
+    DisplayXR Unity provider: manifest entries every Android player needs to reach the
+    DisplayXR runtime (displayxr-unity#418, D1). Unity merges this Android Library into
+    the player's manifest; no build.gradle is shipped, so Unity generates one from its
+    libTemplate.gradle and takes the namespace from the package attribute below.
+
+    Source of truth: the runtime's reference app
+    test_apps/handle/cube_handle_vk_android/src/main/AndroidManifest.xml
+    (displayxr-runtime), plus the entries the Khronos openxr_loader_for_android AAR
+    would have merged itself — this package ships only the loader's .so
+    (Runtime/Plugins/Android/arm64-v8a/libopenxr_loader.so), not its AAR, so its
+    manifest entries have to be carried here.
+-->
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    package="com.displayxr.unity.androidlib">
+
+    <!-- From the Khronos loader AAR's own manifest (see header): the runtime-broker
+         permissions the loader expects its host app to hold. -->
+    <uses-permission android:name="org.khronos.openxr.permission.OPENXR" />
+    <uses-permission android:name="org.khronos.openxr.permission.OPENXR_SYSTEM" />
+
+    <queries>
+        <!-- Android 11+ package visibility: without this the Khronos loader's
+             PackageManager scan for org.khronos.openxr.OpenXRRuntimeService returns
+             nothing and xrCreateInstance fails with XR_ERROR_RUNTIME_UNAVAILABLE even
+             with the DisplayXR runtime installed. (cube_handle_vk_android manifest;
+             https://developer.android.com/training/package-visibility) -->
+        <intent>
+            <action android:name="org.khronos.openxr.OpenXRRuntimeService" />
+        </intent>
+        <!-- The loader resolves the active runtime through this broker
+             ContentProvider; under package visibility it is invisible unless its
+             authority is declared here (runtime #510: null cursor -> black screen).
+             tools:replace resolves the merge conflict with the Khronos loader AAR
+             (1.1.41+), which declares the same provider — e.g. when a project also
+             carries Unity's OpenXR package. Copied from cube_handle_vk_android. -->
+        <provider
+            android:authorities="org.khronos.openxr.runtime_broker"
+            tools:replace="android:authorities" />
+        <!-- From the Khronos loader AAR: API-layer services are discovered the same
+             way as runtimes. -->
+        <intent>
+            <action android:name="org.khronos.openxr.OpenXRApiLayerService" />
+        </intent>
+        <!-- Explicit visibility of both DisplayXR runtime flavours, so the player can
+             wake the runtime out of Android's "stopped" state and bind its service
+             before xrCreateInstance: in_process (the production default, ADR-036 D2)
+             and out_of_process (#510). Copied from cube_handle_vk_android. -->
+        <package android:name="org.freedesktop.monado.openxr_runtime.in_process" />
+        <package android:name="org.freedesktop.monado.openxr_runtime.out_of_process" />
+        <!-- IPC bind to the out-of-process runtime service. -->
+        <intent>
+            <action android:name="org.freedesktop.monado.ipc.CONNECT" />
+        </intent>
+        <!-- INV-11.9 (docs/guides/displayxr-app-rules.md): the in-process vendor
+             display processor calls PackageManager.getPackageInfo() on the vendor
+             display services FROM THIS PROCESS, and package visibility is per calling
+             uid — the runtime APK declaring them does not help. Without these the
+             process aborts ~150 ms after the plug-in loads, inside xrCreateSession,
+             with a CheckJNI java_object == null and nothing naming a manifest
+             (modelviewer#97, mediaplayer#49, earthview#42). The neutral action is the
+             preferred form (ADR-036 D5); the two vendor packages are the documented
+             fallback until platforms advertise it, and are copied verbatim from
+             cube_handle_vk_android. -->
+        <intent>
+            <action android:name="org.displayxr.action.VENDOR_DISPLAY_SERVICE" />
+        </intent>
+        <package android:name="com.leialoft.display.config" />
+        <package android:name="com.leia.headtrackingservice" />
+    </queries>
+
+    <application>
+        <!-- ADR-036 D6 / runtime#1033, INV-1.4: the runtime samples the window's
+             on-screen origin (View.getLocationOnScreen) to anchor the weave's
+             interlace phase. An OEM that applies the OVERRIDE_SANDBOX_VIEW_BOUNDS_APIS
+             compat change makes that call return WINDOW-relative coordinates — every
+             window reports (0,0) and weaves at the wrong phase with no error anywhere.
+             The opt-out is per APP, so it lives in the client's manifest, not the
+             runtime's. Copied from cube_handle_vk_android. -->
+        <property
+            android:name="android.window.PROPERTY_COMPAT_ALLOW_SANDBOXING_VIEW_BOUNDS_APIS"
+            android:value="false" />
+    </application>
+</manifest>

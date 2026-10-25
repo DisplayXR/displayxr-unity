@@ -308,17 +308,44 @@ namespace DisplayXR.Samples
         //
         // Getting this backwards is silent — the panel simply never responds — so the
         // branch is on the same flag the provider itself uses, not on UNITY_EDITOR alone.
+        //
+        // The native overlay pointer is a Windows export (the overlay window's WndProc
+        // tracker), so the whole branch compiles only for a Windows editor.
         static bool UseNativeOverlayPointer()
         {
-#if UNITY_EDITOR
+#if UNITY_EDITOR_WIN
             return !DisplayXRProviderDriver.GameViewTextureModeEnabled();
 #else
             return false;
 #endif
         }
 
+        // Touch (Android, #418): the primary touch is the pointer — finger down = left
+        // button down, and its position the cursor. Touchscreen.current positions are in
+        // Unity's screen space (bottom-left origin), the same space as Mouse.current, so
+        // the fractional mapping below is shared. Unity's view and the provider's weave
+        // surface cover the same window, so a fraction of one is a fraction of the other.
+        // A finger that lifted this frame still reports its last position (with the press
+        // released), so the release lands on the control that was pressed. A tap whose
+        // down AND up both land between two Updates is invisible to this polling (the
+        // Input System coalesces it to "not pressed"); a finger tap lasts ~80+ ms so it is
+        // seen, but an instant `adb shell input tap` is not — use `input swipe x y x y 120`.
+        private static bool TryGetPrimaryTouch(out Vector2 pos, out bool down)
+        {
+            pos = Vector2.zero; down = false;
+            var ts = Touchscreen.current;
+            if (ts == null) return false;
+            var t = ts.primaryTouch;
+            var phase = t.phase.ReadValue();
+            if (phase == UnityEngine.InputSystem.TouchPhase.None) return false;
+            pos = t.position.ReadValue();
+            down = t.press.isPressed;
+            return true;
+        }
+
         private bool TryGetWindowMouseFractional(out Vector2 frac)
         {
+#if UNITY_EDITOR_WIN
             if (UseNativeOverlayPointer())
             {
                 try
@@ -334,6 +361,13 @@ namespace DisplayXR.Samples
                 catch (System.EntryPointNotFoundException) { /* older native binary */ }
                 frac = Vector2.zero;
                 return false;
+            }
+#endif
+
+            if (Screen.width > 0 && Screen.height > 0 && TryGetPrimaryTouch(out Vector2 tp, out bool _))
+            {
+                frac = new Vector2(tp.x / Screen.width, 1f - tp.y / Screen.height);
+                return frac.x >= 0f && frac.x <= 1f && frac.y >= 0f && frac.y <= 1f;
             }
 
             // Input System Package: legacy UnityEngine.Input returns zeros when
@@ -357,6 +391,7 @@ namespace DisplayXR.Samples
 
         private bool IsLeftDown()
         {
+#if UNITY_EDITOR_WIN
             if (UseNativeOverlayPointer())
             {
                 try
@@ -366,6 +401,9 @@ namespace DisplayXR.Samples
                 }
                 catch (System.EntryPointNotFoundException) { return false; }
             }
+#endif
+            if (TryGetPrimaryTouch(out Vector2 _, out bool touchDown))
+                return touchDown;
             var mouse = Mouse.current;
             return mouse != null && mouse.leftButton.isPressed;
         }

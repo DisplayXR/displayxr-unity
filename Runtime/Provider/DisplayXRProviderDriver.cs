@@ -35,6 +35,7 @@ namespace DisplayXR
         public static bool IsActive { get; private set; }
 
         bool  m_SessionStarted;
+        uint  m_SessionSerial;
         bool  m_QuitRequested;
         float m_DisplayHeightM;
 
@@ -103,7 +104,9 @@ namespace DisplayXR
 #if UNITY_EDITOR_OSX || UNITY_STANDALONE_OSX
             // macOS (#204): pump xrPollEvent from the MAIN thread — the runtime's
             // poll drains NSApp events and flushes CATransaction (main-thread-only;
-            // AppKit throws off-main). Windows keeps the graphics-thread pump.
+            // AppKit throws off-main). Windows, Linux and Android (#418) keep the
+            // native graphics-thread pump (GfxPopulateNextFrameDesc) — do NOT add them
+            // here, or the events would be pumped from two threads.
             DisplayXRProviderNative.dxr_prov_poll_events();
 #endif
             // #223: the shell's workspace close request reaches us as session EXITING. A
@@ -147,9 +150,28 @@ namespace DisplayXR
                 return;
             }
 
+            // A restart the running flag hid: Unity stops the session on an Android pause
+            // and starts a new one on resume while this (main) thread is paused, so the
+            // flag reads 1 on both sides of the gap. The native start serial does not lie —
+            // play the missed falling edge now so everything that re-arms on
+            // SessionStarted (display mode, cursor depth, Local2D, the app's own
+            // handlers) re-applies to the NEW session (#418 P3b).
+            uint serial = 0;
+            try { serial = DisplayXRProviderNative.dxr_prov_session_serial(); }
+            catch (System.EntryPointNotFoundException) { serial = m_SessionSerial; } // older native
+            if (m_SessionStarted && serial != m_SessionSerial)
+            {
+                Debug.Log($"[DisplayXR] provider session restarted under a paused main thread (serial {m_SessionSerial} -> {serial}) — re-arming SessionStarted");
+                m_SessionStarted = false;
+                DisplayXRProvider.OnSessionStopped();
+                DisplayXRDepthBudget.Reset();
+                DisplayXRCursorDepth.Reset();
+            }
+
             if (!m_SessionStarted)
             {
                 m_SessionStarted = true;
+                m_SessionSerial = serial;
                 DisplayXRProviderNative.dxr_prov_get_display_info(out var di);
                 m_DisplayHeightM = di.isValid != 0 ? di.heightM : 0f;
                 DisplayXRProvider.OnSessionStarted();

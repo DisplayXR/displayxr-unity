@@ -310,10 +310,56 @@ jobs:
             Runtime/Plugins/Linux/x86_64/libdisplayxr_unity.so
             Runtime/Plugins/Linux/x86_64/libdisplayxr_unity_wayland.so
 
+  build-android:
+    name: Android arm64
+    needs: DetectChanges
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+
+      # NDK pinned to r27c — the NDK Unity 6000.4 bundles (27.2.12479018), so the
+      # CI binary is built with the same toolchain a maintainer gets from Unity Hub.
+      - name: Set up NDK r27c
+        id: setup-ndk
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: nttld/setup-ndk@v1
+        with:
+          ndk-version: r27c
+          add-to-path: false
+          link-to-sdk: false
+
+      - name: Install build tools
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: sudo apt-get update -qq && sudo apt-get install -y --no-install-recommends ninja-build unzip file
+
+      # build-android.sh fetches the version-matched Khronos loader from Maven Central
+      # (sha1-checked), builds, and then runs the SAME gates the Linux job runs:
+      # required exports (UnityPluginLoad, UnityPluginUnload, XRSDKPreInit,
+      # JNI_OnLoad), an exact NEEDED allow-list (libvulkan must NOT appear — it is
+      # dlopened; libopenxr_loader.so must — it ships beside the plugin and is the
+      # runtime-discovery path on Android, #418 D1), and every undefined symbol
+      # resolved against the NEEDED libraries. A failed gate fails the script.
+      - name: Build + verify
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        env:
+          ANDROID_NDK_ROOT: ${{ steps.setup-ndk.outputs.ndk-path }}
+        run: bash native~/build-android.sh
+
+      - name: Upload artifact
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        uses: actions/upload-artifact@v6
+        with:
+          name: displayxr_unity-android-arm64
+          path: |
+            Runtime/Plugins/Android/arm64-v8a/libdisplayxr_unity.so
+            Runtime/Plugins/Android/arm64-v8a/libopenxr_loader.so
+            Runtime/Plugins/Android/arm64-v8a/libVkLayer_DXR_queue_lock.so
+
   # ── Release job: runs on v* tags ──────────────────────────────────────
   release:
     name: Create GitHub Release
-    needs: [build-windows, build-macos, build-linux]
+    needs: [build-windows, build-macos, build-linux, build-android]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/v')
     permissions:
@@ -355,6 +401,14 @@ jobs:
         with:
           name: displayxr_unity-linux-x86_64
           path: Runtime/Plugins/Linux/x86_64/
+
+      # Android (#418): like the Linux .so, never committed — the artifact is the only
+      # source; the .meta files are committed.
+      - name: Download Android artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: displayxr_unity-android-arm64
+          path: Runtime/Plugins/Android/arm64-v8a/
 
       - name: Get version from tag
         id: version
@@ -438,18 +492,25 @@ jobs:
           # Linux leg landed (#249), so v2.12.0's upm branch shipped only the
           # .so.meta and git-URL installs got no Linux plugin, while the .tgz
           # (packed with tar, which ignores .gitignore) was fine. Keep all
-          # three adds in sync with the download-artifact steps.
+          # three adds in sync with the download-artifact steps. The Android
+          # pair (#418) follows the same rule as the Linux .so.
           git add -f Runtime/Plugins/Windows/x64/displayxr_unity.dll
           git add -f Runtime/Plugins/macOS/displayxr_unity.bundle
           git add -f Runtime/Plugins/Linux/x86_64/libdisplayxr_unity.so
           git add -f Runtime/Plugins/Linux/x86_64/libdisplayxr_unity_wayland.so
+          git add -f Runtime/Plugins/Android/arm64-v8a/libdisplayxr_unity.so
+          git add -f Runtime/Plugins/Android/arm64-v8a/libopenxr_loader.so
+          git add -f Runtime/Plugins/Android/arm64-v8a/libVkLayer_DXR_queue_lock.so
 
           # Fail loudly rather than silently shipping an incomplete upm
           # branch: every platform binary must be staged at this point.
           for f in Runtime/Plugins/Windows/x64/displayxr_unity.dll \
                    Runtime/Plugins/macOS/displayxr_unity.bundle/Contents/MacOS/displayxr_unity \
                    Runtime/Plugins/Linux/x86_64/libdisplayxr_unity.so \
-                 Runtime/Plugins/Linux/x86_64/libdisplayxr_unity_wayland.so; do
+                 Runtime/Plugins/Linux/x86_64/libdisplayxr_unity_wayland.so \
+                 Runtime/Plugins/Android/arm64-v8a/libdisplayxr_unity.so \
+                 Runtime/Plugins/Android/arm64-v8a/libopenxr_loader.so \
+                 Runtime/Plugins/Android/arm64-v8a/libVkLayer_DXR_queue_lock.so; do
             git diff --cached --name-only | grep -qxF "$f" || \
               git ls-files --error-unmatch "$f" >/dev/null 2>&1 || {
                 echo "::error::$f is not staged for the upm branch — refusing to publish an incomplete package."
@@ -501,7 +562,7 @@ jobs:
   # ── Package job: runs on main push (non-tag) ─────────────────────────
   package:
     name: Package Plugin Binaries
-    needs: [DetectChanges, build-windows, build-macos, build-linux]
+    needs: [DetectChanges, build-windows, build-macos, build-linux, build-android]
     runs-on: ubuntu-latest
     # Skip on docs-only / empty (marker) main pushes — the build jobs
     # short-circuit and upload no artifacts, so there's nothing to package.
@@ -539,6 +600,14 @@ jobs:
         with:
           name: displayxr_unity-linux-x86_64
           path: Runtime/Plugins/Linux/x86_64/
+
+      # Android (#418): like the Linux .so, never committed — the artifact is the only
+      # source; the .meta files are committed.
+      - name: Download Android artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: displayxr_unity-android-arm64
+          path: Runtime/Plugins/Android/arm64-v8a/
 
       - name: Upload combined artifact
         uses: actions/upload-artifact@v6

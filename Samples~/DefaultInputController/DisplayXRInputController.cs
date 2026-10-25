@@ -9,9 +9,12 @@ using UnityEngine.InputSystem;
 namespace DisplayXR
 {
     /// <summary>
-    /// Basic keyboard + mouse input for navigating around a DisplayXR rig.
+    /// Basic keyboard + mouse + touch input for navigating around a DisplayXR rig.
     /// WASD = move horizontally, QE = move up/down, left-mouse drag = rotate.
     /// Scroll wheel = zoom (scale). Space = reset to initial pose.
+    /// Touch (Android tablets, #418): one-finger drag = orbit (the same rotation as a
+    /// mouse drag), two-finger pinch = zoom (dolly on a display rig, FOV on a camera rig),
+    /// two-finger drag = pan, double tap = reset.
     /// Attach to the same GameObject as DisplayXRDisplay or DisplayXRCamera.
     /// Works in Play Mode and built players (the custom display provider drives rendering).
     /// </summary>
@@ -42,6 +45,20 @@ namespace DisplayXR
                  "for an avatar-style zoom-in-window). Mouse-look and WASD " +
                  "are unaffected.")]
         public bool scrollZoomEnabled = true;
+
+        [Header("Touch")]
+        [Tooltip("When false, touch gestures (one-finger orbit, pinch zoom, two-finger " +
+                 "pan, double-tap reset) are ignored.")]
+        public bool touchEnabled = true;
+
+        [Tooltip("Orbit for a one-finger drag across the full screen WIDTH, in degrees " +
+                 "(height maps to half of it). 180 = a full-width drag turns the rig half " +
+                 "way round, the DisplayXR runtime's own touch-provider convention.")]
+        public float touchOrbitDegreesPerScreen = 180f;
+
+        [Tooltip("Display rig: how far a pinch dollies, in virtual-display heights per unit of " +
+                 "finger-spread ratio (spreading the fingers to 2x moves ~this many heights closer).")]
+        public float touchPinchDolly = 1.0f;
 
         private float m_Yaw;
         private float m_Pitch;
@@ -92,6 +109,25 @@ namespace DisplayXR
             // effect), making users press V twice to reach 3D. Inert until the
             // provider session is running.
             DisplayXRProvider.RequestDisplayMode(m_CurrentRenderingMode != 0);
+
+            // ...and AGAIN on every later session start. A session restart loses every
+            // request pushed into the old one, and the request above is usually dropped
+            // anyway (the session is not up yet at Start). On Android a session restart is
+            // routine: Unity stops the session on pause and starts a new one on resume (#418).
+            DisplayXRProvider.SessionStarted += OnProviderSessionStarted;
+            if (DisplayXRProvider.IsSessionReady) OnProviderSessionStarted();
+        }
+
+        void OnDestroy()
+        {
+            DisplayXRProvider.SessionStarted -= OnProviderSessionStarted;
+        }
+
+        private void OnProviderSessionStarted()
+        {
+            DisplayXRProvider.RequestDisplayMode(m_CurrentRenderingMode != 0);
+            m_TouchCount = 0; // a gesture in flight when the app paused never got its UP
+            m_TouchIdA = m_TouchIdB = -1;
         }
 
         // Rendering mode cycling
@@ -140,6 +176,7 @@ namespace DisplayXR
             UpdateShellMouse();
 #endif
             HandleMouseRotation();
+            HandleTouch();
             HandleKeyboardMovement();
             HandleScrollZoom();
             HandleReset();
@@ -258,6 +295,18 @@ namespace DisplayXR
             }
         }
 
+        // True when the custom IUnityXRDisplay provider is driving rendering (built
+        // player OR editor Play Mode, #166/#173). Used to route mouse rotation through
+        // the Raw-Input delta path (the woven output is a separate window, so
+        // Mouse.current.position doesn't track the cursor there).
+        // Defined on every platform: ShouldIgnoreInput's UNITY_EDITOR arm needs it in a
+        // macOS/Linux editor too (an Android build from a macOS editor did not compile).
+        private static bool IsProviderActive()
+        {
+            try { return DisplayXRProviderDriver.IsActive; }
+            catch { return false; }
+        }
+
         // --- Shell mode mouse input (bypasses Input System entirely) ---
         // Unity reads mouse buttons from legacy WM_LBUTTONDOWN which only goes
         // to the foreground window. In shell mode we read button state directly
@@ -278,15 +327,6 @@ namespace DisplayXR
             return s_shellMode;
         }
 
-        // True when the custom IUnityXRDisplay provider is driving rendering (built
-        // player OR editor Play Mode, #166/#173). Used to route mouse rotation through
-        // the Raw-Input delta path (the woven output is a separate window, so
-        // Mouse.current.position doesn't track the cursor there).
-        private static bool IsProviderActive()
-        {
-            try { return DisplayXRProviderDriver.IsActive; }
-            catch { return false; }
-        }
 
 #if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
         private static bool IsOurProcessForeground()
@@ -337,6 +377,209 @@ namespace DisplayXR
         }
 #endif
 
+        // --- Touch (#418) ---
+        //
+        // Policy lives HERE, with the rig, not in the runtime: the runtime's touch input
+        // provider drives its own navigation rig, which only moves the views of a session
+        // whose window the RUNTIME owns. An app that renders through XR_DXR_view_rig (this
+        // plug-in) owns its camera, so the gestures have to move the Unity rig itself.
+        // The provider still forwards every touch to the runtime (xrSubmitAndroidInputEventDXR)
+        // for its emulated controller; this is the camera half.
+        private const float kTouchSlop = 12f;     // px before a one-finger drag orbits
+        private const float kDoubleTapSec = 0.3f;
+        private const float kDoubleTapSlop = 40f; // px between the two taps
+        private int m_TouchCount;                 // touches down last frame
+        private int m_TouchIdA = -1, m_TouchIdB = -1;
+        private Vector2 m_TouchPosA, m_TouchPosB, m_TouchStart;
+        private bool m_TouchOrbiting, m_TouchMoved;
+        private float m_TouchDownTime, m_LastTapTime = -10f;
+        private Vector2 m_LastTapPos;
+        private float m_GestureZoom = 1f;          // accumulated pinch ratio this gesture
+        private Vector2 m_GesturePan, m_GestureOrbit; // accumulated px this gesture
+
+        private struct TouchSample { public int id; public Vector2 pos; }
+        private readonly TouchSample[] m_Touches = new TouchSample[10];
+
+        private int ReadTouches()
+        {
+            int n = 0;
+#if ENABLE_INPUT_SYSTEM
+            var ts = Touchscreen.current;
+            if (ts == null) return 0;
+            foreach (var t in ts.touches)
+            {
+                if (!t.press.isPressed) continue;
+                if (n >= m_Touches.Length) break;
+                m_Touches[n].id = t.touchId.ReadValue();
+                m_Touches[n].pos = t.position.ReadValue();
+                n++;
+            }
+#else
+            if (!Input.touchSupported) return 0;
+            for (int i = 0; i < Input.touchCount && n < m_Touches.Length; i++)
+            {
+                var t = Input.GetTouch(i);
+                if (t.phase == TouchPhase.Ended || t.phase == TouchPhase.Canceled) continue;
+                m_Touches[n].id = t.fingerId;
+                m_Touches[n].pos = t.position;
+                n++;
+            }
+#endif
+            return n;
+        }
+
+        private bool FindTouch(int id, int n, out Vector2 pos)
+        {
+            for (int i = 0; i < n; i++)
+                if (m_Touches[i].id == id) { pos = m_Touches[i].pos; return true; }
+            pos = Vector2.zero;
+            return false;
+        }
+
+        private void HandleTouch()
+        {
+            if (!touchEnabled) { m_TouchCount = 0; return; }
+            int n = ReadTouches();
+            float now = Time.unscaledTime;
+
+            if (n == 0)
+            {
+                // Release: a short, still single touch is a tap; two of them close
+                // together in time and place reset the rig.
+                if (m_TouchCount == 1 && !m_TouchMoved && now - m_TouchDownTime < kDoubleTapSec)
+                {
+                    if (now - m_LastTapTime < kDoubleTapSec &&
+                        (m_TouchStart - m_LastTapPos).sqrMagnitude < kDoubleTapSlop * kDoubleTapSlop)
+                    {
+                        ResetPose();
+                        m_LastTapTime = -10f;
+                        Debug.Log("[DisplayXR] touch: double tap -> reset");
+                    }
+                    else
+                    {
+                        m_LastTapTime = now;
+                        m_LastTapPos = m_TouchStart;
+                    }
+                }
+                if (m_TouchCount > 0 && (m_GestureZoom != 1f || m_GesturePan != Vector2.zero || m_GestureOrbit != Vector2.zero))
+                    Debug.Log($"[DisplayXR] touch gesture: orbit {m_GestureOrbit} px, pinch x{m_GestureZoom:F2}, pan {m_GesturePan} px ({(m_IsCameraCentric ? "camera rig: FOV" : "display rig: position")} {(m_IsCameraCentric ? m_Camera.fieldOfView.ToString("F1") : transform.position.ToString("F2"))})");
+                m_GestureZoom = 1f; m_GesturePan = m_GestureOrbit = Vector2.zero;
+                m_TouchCount = 0;
+                m_TouchIdA = m_TouchIdB = -1;
+                m_TouchOrbiting = false;
+                return;
+            }
+            if (ShouldIgnoreInput()) { m_TouchCount = n; m_TouchIdA = m_TouchIdB = -1; return; }
+
+            float w = Mathf.Max(1f, Screen.width), h = Mathf.Max(1f, Screen.height);
+
+            if (n == 1)
+            {
+                Vector2 p = m_Touches[0].pos;
+                if (m_TouchCount == 0)
+                {
+                    // First finger down: arm a tap / an orbit.
+                    m_TouchIdA = m_Touches[0].id;
+                    m_TouchPosA = p;
+                    m_TouchStart = p;
+                    m_TouchDownTime = now;
+                    m_TouchMoved = false;
+                    m_TouchOrbiting = false;
+                }
+                else if (m_TouchIdA != m_Touches[0].id)
+                {
+                    // Came down from two fingers (or a new finger): restart from here
+                    // instead of jumping by the distance between the two fingers.
+                    m_TouchIdA = m_Touches[0].id;
+                    m_TouchPosA = p;
+                    m_TouchStart = p;
+                    m_TouchMoved = true; // never a tap
+                    m_TouchOrbiting = true;
+                }
+                if (!m_TouchOrbiting && (p - m_TouchStart).sqrMagnitude > kTouchSlop * kTouchSlop)
+                {
+                    m_TouchOrbiting = true;
+                    m_TouchMoved = true;
+                    m_TouchPosA = p; // start from here: the slop is not part of the orbit
+                }
+                if (m_TouchOrbiting && mouseLookEnabled)
+                {
+                    Vector2 d = p - m_TouchPosA;
+                    m_GestureOrbit += d;
+                    float perW = touchOrbitDegreesPerScreen * Mathf.Deg2Rad;
+                    // Same signs as the mouse drag above, so desktop and tablet agree.
+                    m_Yaw += d.x / w * perW;
+                    m_Pitch -= d.y / h * perW * 0.5f;
+                    m_Pitch = Mathf.Clamp(m_Pitch, -1.4f, 1.4f);
+                    transform.rotation = Quaternion.Euler(m_Pitch * Mathf.Rad2Deg, m_Yaw * Mathf.Rad2Deg, 0f);
+                }
+                m_TouchPosA = p;
+                m_TouchCount = 1;
+                return;
+            }
+
+            // Two (or more) fingers: the first two by id.
+            int ia = 0, ib = 1;
+            Vector2 a = m_Touches[ia].pos, b = m_Touches[ib].pos;
+            bool same = m_TouchCount >= 2 && m_Touches[ia].id == m_TouchIdA && m_Touches[ib].id == m_TouchIdB;
+            if (same)
+            {
+                float d0 = (m_TouchPosB - m_TouchPosA).magnitude, d1 = (b - a).magnitude;
+                Vector2 c0 = (m_TouchPosA + m_TouchPosB) * 0.5f, c1 = (a + b) * 0.5f;
+
+                // Pinch = zoom: spreading the fingers makes the content bigger. Camera rig:
+                // a narrower FOV. Display rig: DOLLY the rig toward what it looks at, the
+                // runtime touch provider's own pinch semantics. (Measured on a Nubia Pad 2:
+                // the scroll wheel's scale-as-zoom leaves the projected size unchanged
+                // there, so a pinch through localScale did nothing visible.) The step is a
+                // fraction of the virtual display's world height, so it feels the same at
+                // every rig scale.
+                if (scrollZoomEnabled && d0 > 1f && d1 > 1f)
+                {
+                    float ratio = Mathf.Clamp(d1 / d0, 0.8f, 1.25f);
+                    m_GestureZoom *= ratio;
+                    if (m_IsCameraCentric)
+                        m_Camera.fieldOfView = Mathf.Clamp(m_Camera.fieldOfView / ratio, 5f, 120f);
+                    else
+                    {
+                        float worldH = PanWorldPerPixel(h) * h;
+                        Quaternion o = Quaternion.Euler(m_Pitch * Mathf.Rad2Deg, m_Yaw * Mathf.Rad2Deg, 0f);
+                        transform.position += (o * Vector3.forward) * ((ratio - 1f) * worldH * touchPinchDolly);
+                    }
+                }
+
+                // Two-finger drag = pan: the content follows the fingers, 1:1 on the virtual
+                // display plane.
+                Vector2 dc = c1 - c0;
+                m_GesturePan += dc;
+                if (dc.sqrMagnitude > 0f)
+                {
+                    float worldPerPx = PanWorldPerPixel(h);
+                    Quaternion ori = Quaternion.Euler(m_Pitch * Mathf.Rad2Deg, m_Yaw * Mathf.Rad2Deg, 0f);
+                    transform.position -= (ori * Vector3.right) * (dc.x * worldPerPx)
+                                        + (ori * Vector3.up) * (dc.y * worldPerPx);
+                }
+            }
+            m_TouchIdA = m_Touches[ia].id; m_TouchIdB = m_Touches[ib].id;
+            m_TouchPosA = a; m_TouchPosB = b;
+            m_TouchMoved = true;
+            m_TouchOrbiting = false;
+            m_TouchCount = n;
+        }
+
+        // World units per screen pixel on the plane the content sits at.
+        private float PanWorldPerPixel(float screenH)
+        {
+            var disp = GetComponent<DisplayXRDisplay>();
+            if (disp != null && disp.TryGetVirtualDisplayPullback(m_Camera, out _, out float worldH))
+                return worldH / screenH;
+            // Camera rig: the plane at the convergence distance (1 m if unset).
+            var cam = GetComponent<DisplayXRCamera>();
+            float dist = (cam != null && cam.invConvergenceDistance > 1e-3f) ? 1f / cam.invConvergenceDistance : 1f;
+            float fov = m_Camera != null ? m_Camera.fieldOfView : 60f;
+            return 2f * dist * Mathf.Tan(fov * 0.5f * Mathf.Deg2Rad) / screenH;
+        }
+
         private void HandleKeyboardMovement()
         {
             // Compute direction vectors from stored yaw/pitch, NOT from transform.
@@ -385,6 +628,11 @@ namespace DisplayXR
         private void HandleReset()
         {
             if (GetKeyDown(KeyCode.Space))
+                ResetPose();
+        }
+
+        private void ResetPose()
+        {
             {
                 transform.position = m_InitialPosition;
                 transform.localScale = m_InitialScale;

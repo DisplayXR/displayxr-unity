@@ -5,6 +5,26 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+- **Android arm64 (Vulkan) (#418).** The display provider now runs in an Android player against the DisplayXR runtime APK (v2.47.0+, tested v2.53.0). Tested on a Nubia Pad 2: correct stereo, 60 fps unpinned (the same as the runtime's bare Vulkan cube), pause/resume, rotation, touch, URP/HDRP single-pass instanced, one 3D zone + Local2D, and the window-space UI panel.
+  - It reuses the Linux Vulkan own-device + bridge model, with an Android-only GPU-ordered bridge copy (Unity's queue → `SYNC_FD` semaphore → one batched copy).
+  - It loads the runtime through the Khronos Android loader (1.1.63).
+  - The provider draws into its own `SurfaceView`, bound with `XR_DXR_android_surface_binding`.
+  - Touch goes to Unity, and a copy goes to the runtime (`xrSubmitAndroidInputEventDXR`). The samples' input controller gets touch gestures.
+  - The package ships the runtime-discovery manifest entries (`DisplayXR.androidlib`), the loader, and the runtime's `VK_LAYER_DXR_queue_lock` layer. It adds R8 keep rules for minified builds and turns off Unity's stock splash on Android.
+  - Built by CI (`build-android` job, `native~/build-android.sh`); the `.so` files ship on the `upm` branch.
+  - Setup: README § *Android (arm64, Vulkan)*; internals: `docs~/architecture/xr-display-provider.md` § *Android*.
+  - Known limit: a window-space UI panel holds the frame rate to ~30 fps at the GPU floor clock until displayxr-runtime#2356 is fixed.
+
+### Fixed
+- **Editor: the docked Game-view weave phase offset since v2.16.0 is fixed (#420).** #263's letterbox centring no longer stacks on the #740 RT-centring.
+
+### Changed
+- **The session-restart replay runs on every platform.** C# now detects a native session restart through `dxr_prov_session_serial()` and replays stop/start, so pushed state is re-sent. On desktop the restart already went through the normal path, so the replay stays silent there (verified on Windows: editor dock/undock and built players).
+- `DisplayXRWsuiMouseRouter` (WindowSpaceUI sample): the editor native-pointer branch is limited to the Windows editor, and touchscreen input takes priority over the mouse.
+
 ## [2.32.1] - 2026-10-23
 
 Linux IME follow-ups (#417): the flush drop now drops only the IME's own flush of the composition the field took on reset, so a genuine identical commit is never swallowed; and the DisplayXR input field's caret rectangle is sent to the IME (`zwp_text_input_v3.set_cursor_rectangle`), so the candidate window follows the caret.

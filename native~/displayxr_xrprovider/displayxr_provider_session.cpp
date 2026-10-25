@@ -29,6 +29,9 @@
 #pragma comment(lib, "advapi32.lib") // RegGetValueA — ActiveRuntime registry fallback (#173)
 #else
 #include <dlfcn.h> // dlopen/dlsym runtime load (macOS mirror of LoadLibraryExA)
+#if defined(__ANDROID__)
+#include "../displayxr_android.h" // Khronos Android loader + session-thread ALooper (#418)
+#endif
 #include "../displayxr_metal.h" // weave-window NSView backing size (#204)
 #define _strdup strdup
 #include "displayxr_provider_gfx_metal.h" // Metal blit/texture glue (#204)
@@ -191,6 +194,7 @@ extern "C" int  dxr_pvk_create_bridge(int eye, uint32_t, uint32_t, uint32_t, int
 extern "C" void *dxr_pvk_unity_image_ptr(int eye);
 extern "C" int  dxr_pvk_copy_to_swapchain_image(int eye, uint32_t image_index);
 extern "C" void dxr_pvk_signal_unity_done(void);
+extern "C" int  dxr_pvk_copy_frame(int spi, uint32_t n_eyes, uint32_t image_index);
 extern "C" void dxr_pvk_destroy(void);
 extern "C" void dxr_pvk_destroy_device(void);
 #if defined(__linux__) && !defined(__ANDROID__)
@@ -217,6 +221,15 @@ extern "C" void *dxr_pvk_overlay_content_source(int kind);
 // different session than the one you last saw" (#336, Vulkan overlay getters).
 // Atomic: bumped on the thread that polls events, read by the C# main thread.
 static std::atomic<uint32_t> s_session_generation{0};
+static void s_session_serial_bump(void); // dxr_prov_session_serial (#418 P3b)
+// XR_DXR_android_surface_binding (#418 P3b): advertised spec version (0 = absent),
+// and whether THIS session was created with the provider's SurfaceView bound.
+// File statics, not s_ps: they must not be wiped by the session-stop memset
+// between the probe and the create.
+#if defined(__ANDROID__)
+static int  s_has_android_surface_binding = 0;
+static bool s_android_surface_bound = false;
+#endif
 
 // Set if xrEndFrame rejects a frame that carried a Vulkan wsui layer: the runtime may
 // not take window-space layers on this backend, and every further frame would be
@@ -752,6 +765,12 @@ void dxr_prov_set_log_callback(DxrProvLogCallback cb) { s_log_cb = cb; }
 // after a run (M1 bring-up aid). Shared by the provider TU via dxr_prov_file_log.
 extern "C" void dxr_prov_file_log(const char *s)
 {
+#if defined(__ANDROID__)
+	// Android (#418): neither a /tmp file nor stderr is visible there — logcat is
+	// the sink (tag "DisplayXRUnity"). Every provider logger funnels through here.
+	dxr_android_log(s);
+	return;
+#endif
 #ifdef _WIN32
 	char path[MAX_PATH];
 	DWORD n = GetTempPathA(MAX_PATH, path);
@@ -777,7 +796,9 @@ static void ps_log(const char *fmt, ...)
 	va_start(ap, fmt);
 	vsnprintf(buf, sizeof(buf), fmt, ap);
 	va_end(ap);
+#if !defined(__ANDROID__) // Android: stderr goes nowhere; dxr_prov_file_log -> logcat
 	fputs(buf, stderr);
+#endif
 #ifdef _WIN32
 	OutputDebugStringA(buf);
 #endif
@@ -1222,6 +1243,12 @@ static void ps_window_size(uint32_t *w, uint32_t *h)
 	// the per-view sizes agree and live resize lands via the #172 reconcile.
 	if (s_ps.overlay_hwnd)
 		displayxr_metal_view_backing_size(s_ps.overlay_hwnd, &ww, &hh);
+#elif defined(__ANDROID__)
+	// Android (#418 P3b): the provider-owned SurfaceView's buffer size — what the
+	// runtime weaves into, and what flips on rotation / system-bar changes (the #172
+	// live realloc follows it). No surface bound (hosted fallback) => fall through to
+	// the display pixel dims below, which IS the runtime-hosted surface's size.
+	if (s_android_surface_bound) dxr_android_surface_size(&ww, &hh);
 #else
 	// Linux (#249): live geometry of the bound X11 window, same role as the
 	// macOS backing size above. Returns 0 when no window is bound (runtime
@@ -4717,6 +4744,23 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	// or editor bridge) and submit copies each into swapchain slice 0/1 — the D3D11
 	// analogue of the D3D12 MultiPass bridge. No render-mode gate remains.
 
+#if defined(__ANDROID__)
+	// Android (#418 D1): no manifest file and no direct dlopen of the runtime. The
+	// linked Khronos Android loader discovers the runtime APK (runtime_broker
+	// provider + OpenXRRuntimeService intent) once xrInitializeLoaderKHR has the
+	// JavaVM + activity; its xrGetInstanceProcAddr is the entry point from here on.
+	(void)runtime_json_path;
+	if (!dxr_android_loader_gipa(&s_ps.gipa)) {
+		ps_log("[DisplayXR-PROV] Android: OpenXR loader init failed (no JavaVM/activity, or "
+		       "xrInitializeLoaderKHR failed) — see the DisplayXR-AND lines\n");
+		return 0;
+	}
+	ps_log("[DisplayXR-PROV] Android: runtime via the Khronos OpenXR loader (broker discovery)\n");
+	// D3 (#418 P3b): ask the UI thread for the provider's SurfaceView NOW, so it has
+	// the whole instance/system/device bring-up to get its Surface before
+	// xrCreateSession waits for it (dxr_android_surface_binding).
+	dxr_android_surface_attach();
+#else
 	char *json = ps_resolve_runtime_json(runtime_json_path);
 	if (!json) { ps_log("[DisplayXR-PROV] No runtime JSON (set XR_RUNTIME_JSON)\n"); return 0; }
 	char *lib_rel = ps_parse_library_path(json);
@@ -4769,8 +4813,13 @@ int dxr_prov_session_start(const char *runtime_json_path,
 		return 0;
 	}
 	s_ps.gipa = rr.getInstanceProcAddr;
+#endif // !__ANDROID__ (runtime manifest + negotiate)
 
 	// --- Probe XR_DXR_view_rig before requesting it (older runtimes reject unknown) ---
+#if defined(__ANDROID__)
+	s_has_android_surface_binding = 0; // re-probed per session start
+	s_android_surface_bound = false;
+#endif
 	{
 		PFN_xrVoidFunction fn = NULL;
 		s_ps.gipa(XR_NULL_HANDLE, "xrEnumerateInstanceExtensionProperties", &fn);
@@ -4797,6 +4846,10 @@ int dxr_prov_session_start(const char *runtime_json_path,
 							s_ps.has_desktop_control = props[i].extensionVersion ? props[i].extensionVersion : 1;
 						else if (strcmp(props[i].extensionName, XR_DXR_WAYLAND_SURFACE_BINDING_EXTENSION_NAME) == 0)
 							s_ps.has_wayland_binding = 1;
+#if defined(__ANDROID__)
+						else if (strcmp(props[i].extensionName, XR_DXR_ANDROID_SURFACE_BINDING_EXTENSION_NAME) == 0)
+							s_has_android_surface_binding = (int)props[i].extensionVersion;
+#endif
 						else if (strcmp(props[i].extensionName, XR_DXR_DEPTH_BUDGET_EXTENSION_NAME) == 0) {
 							s_ps.has_depth_budget = 1;
 							// The spec VERSION, not just the name: v3 adds the content
@@ -4810,6 +4863,12 @@ int dxr_prov_session_start(const char *runtime_json_path,
 				free(props);
 			}
 		}
+#if defined(__ANDROID__)
+		ps_log("[DisplayXR-PROV] XR_DXR_android_surface_binding: %s (spec v%d%s)\n",
+		       s_has_android_surface_binding ? "AVAILABLE" : "no (runtime hosts its own surface)",
+		       s_has_android_surface_binding,
+		       s_has_android_surface_binding >= 3 ? ", touch submission" : ", no touch submission");
+#endif
 		ps_log("[DisplayXR-PROV] display_zones: %s; local_3d_zone: %s\n",
 		       s_ps.has_display_zones ? "AVAILABLE" : "no",
 		       s_ps.has_local_3d_zone ? "AVAILABLE" : "no");
@@ -4890,6 +4949,17 @@ int dxr_prov_session_start(const char *runtime_json_path,
 		extensions[ext_count++] = XR_DXR_WAYLAND_SURFACE_BINDING_EXTENSION_NAME;
 	else
 		s_ps.has_wayland_binding = 0;
+#elif defined(__ANDROID__)
+	// Android (#418): Vulkan only, enable2 for the same reason as above, plus the
+	// Khronos Android instance extension (the XrInstanceCreateInfoAndroidKHR chained
+	// below) and, when advertised, the surface binding for the provider's own
+	// SurfaceView (#418 D3).
+	extensions[ext_count++] = "XR_KHR_vulkan_enable2";
+	extensions[ext_count++] = "XR_KHR_android_create_instance";
+	// D3 (#418 P3b): the provider-owned SurfaceView is bound with this. Spec v3 adds
+	// xrSubmitAndroidInputEventDXR (touch); v1/v2 still bind the surface.
+	if (s_has_android_surface_binding)
+		extensions[ext_count++] = XR_DXR_ANDROID_SURFACE_BINDING_EXTENSION_NAME;
 #else
 	extensions[ext_count++] = XR_KHR_METAL_ENABLE_EXTENSION_NAME;
 	extensions[ext_count++] = XR_DXR_COCOA_WINDOW_BINDING_EXTENSION_NAME;
@@ -4939,6 +5009,10 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	ici.applicationInfo.apiVersion = XR_MAKE_VERSION(1, 0, 0);
 	ici.enabledExtensionCount = ext_count;
 	ici.enabledExtensionNames = extensions;
+#if defined(__ANDROID__)
+	// The runtime rejects an Android instance without the JavaVM + activity.
+	ici.next = dxr_android_instance_create_info(NULL);
+#endif
 	if (XR_FAILED(((PFN_xrCreateInstance)fn_create)(&ici, &s_ps.instance))) {
 		ps_log("[DisplayXR-PROV] xrCreateInstance failed\n");
 		return 0;
@@ -5413,6 +5487,28 @@ int dxr_prov_session_start(const char *runtime_json_path,
 		s_ps.gipa(s_ps.instance, "xrSetWaylandSurfaceGeometryDXR", &fn);
 		s_ps.pfn_set_wl_geometry = (PFN_xrSetWaylandSurfaceGeometryDXR)fn;
 	}
+#elif defined(ENABLE_VULKAN) && defined(__ANDROID__)
+	// --- Session: Vulkan graphics binding + the provider's own SurfaceView ---
+	// D3 (#418 P3b): XrAndroidSurfaceBindingCreateInfoDXR names the SurfaceView that
+	// DisplayXRSurface (Java) stacked above Unity's, chained IN FRONT of the enable2
+	// binding (the runtime reference app's order). The runtime takes its own
+	// ANativeWindow reference. No surface within the wait (the Java class missing from
+	// the build, or a UI thread that never ran) => chain nothing and the runtime hosts
+	// its own fullscreen SurfaceView, the P3a shape.
+	(void)use_transparent; // no transparent overlay on Android (out of scope, #418)
+	const void *gfx_binding = dxr_pvk_session_binding(NULL);
+	if (!gfx_binding) {
+		ps_log("[DisplayXR-PROV] Vulkan session binding unavailable\n");
+		dxr_prov_session_stop();
+		return 0;
+	}
+	const void *surf_binding =
+	    s_has_android_surface_binding ? dxr_android_surface_binding(gfx_binding, 2000) : NULL;
+	if (surf_binding) gfx_binding = surf_binding;
+	s_android_surface_bound = surf_binding != NULL;
+	// D4: the vendor display processor is created on THIS thread inside
+	// xrCreateSession and needs a prepared ALooper here; the provider pump polls it.
+	dxr_android_looper_prepare();
 #else
 	// --- Session: Metal graphics binding (client queue) + cocoa window binding ---
 	// viewHandle == NULL → the runtime self-hosts its NSWindow + CAMetalLayer (the
@@ -5439,6 +5535,11 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	if (XR_FAILED(s_ps.pfn_create_session(s_ps.instance, &sci, &s_ps.session))) {
 		ps_log("[DisplayXR-PROV] xrCreateSession failed\n"); dxr_prov_session_stop(); return 0;
 	}
+#if defined(__ANDROID__)
+	// From here the UI thread forwards surface/geometry/touch to this session, and the
+	// current surface + geometry are re-applied now (a restart re-sends everything).
+	dxr_android_on_session(s_ps.session, s_ps.gipa, s_ps.instance, s_android_surface_bound);
+#endif
 	// Re-apply the app's MCP id + tools to every new session (they live on the session).
 	dxr_mcp_on_session_created(s_ps.session);
 	dxr_desktop_on_session_created(s_ps.session);
@@ -5453,6 +5554,11 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	ps_log("[DisplayXR-PROV] Session created (Metal client queue=%p, NSView=%p%s)\n",
 	       s_ps.metal_queue, s_ps.overlay_hwnd,
 	       s_ps.overlay_hwnd ? "" : " — runtime self-hosted window");
+#elif defined(__ANDROID__)
+	ps_log("[DisplayXR-PROV] Session created (runtime-created Vulkan device, enable2 + "
+	       "external-memory bridge; %s)\n",
+	       s_android_surface_bound ? "provider-owned SurfaceView bound (XR_DXR_android_surface_binding)"
+	                               : "runtime-hosted surface");
 #else
 	ps_log("[DisplayXR-PROV] Session created (runtime-created Vulkan device, enable2 + "
 	       "external-memory bridge; runtime self-hosted window)\n");
@@ -5487,6 +5593,7 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	// Desktop-capture waiters may poll from now on (see ps_pump_for_waiter).
 	ps_pump_enable(1);
 	dxr_desktop_set_waiter_pump(ps_pump_for_waiter);
+	s_session_serial_bump();
 	ps_log("[DisplayXR-PROV] Session start OK\n");
 	return 1;
 }
@@ -5949,6 +6056,9 @@ void dxr_prov_session_stop(void)
 	dxr_mcp_on_session_destroying();
 	dxr_desktop_on_session_destroying();
 	if (s_ps.session && s_ps.session_ready && s_ps.pfn_end_session) s_ps.pfn_end_session(s_ps.session);
+#if defined(__ANDROID__)
+	dxr_android_on_session_end(); // the UI thread must stop calling into this session first
+#endif
 	if (s_ps.session && s_ps.pfn_destroy_session) s_ps.pfn_destroy_session(s_ps.session);
 	if (s_ps.instance && s_ps.pfn_destroy_instance) s_ps.pfn_destroy_instance(s_ps.instance);
 #if defined(ENABLE_VULKAN)
@@ -6017,6 +6127,11 @@ void dxr_prov_session_stop(void)
 }
 
 int dxr_prov_session_is_running(void) { return s_ps.running; }
+// Incremented once per successful dxr_prov_session_start; a file static so the
+// session-stop memset never resets it (see the header).
+static std::atomic<uint32_t> s_session_serial{0};
+uint32_t dxr_prov_session_serial(void) { return s_session_serial.load(); }
+static void s_session_serial_bump(void) { s_session_serial++; }
 
 // #223 follow-up: 1 once the runtime signals the app to terminate (session EXITING /
 // LOSS_PENDING — e.g. the shell's workspace exit request). The C# driver polls this and
@@ -7806,14 +7921,10 @@ int dxr_prov_submit_frame(uint32_t image_index)
 	// of CopyTextureRegion. Platform-neutral, hence outside the per-OS branch.
 #if defined(ENABLE_VULKAN)
 	if (s_ps.graphics_api == DXR_GFX_VULKAN) {
-		int sp = dxr_prov_get_single_pass();
-		dxr_pvk_signal_unity_done(); // once per frame, before any copy
-		if (sp) {
-			dxr_pvk_copy_to_swapchain_image(-1, image_index);
-		} else {
-			for (uint32_t e = 0; e < submit_n; e++)
-				dxr_pvk_copy_to_swapchain_image((int)e, image_index);
-		}
+		// Desktop: drain Unity's queue, then one fence-waited copy per eye (unchanged).
+		// Android (#418 P3b): one GPU-ordered batch, not CPU-waited — see
+		// dxr_pvk_copy_frame / "Asynchronous copy" in displayxr_provider_gfx_vulkan.cpp.
+		dxr_pvk_copy_frame(dxr_prov_get_single_pass(), submit_n, image_index);
 	} else
 #endif
 #ifdef _WIN32
