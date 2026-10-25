@@ -436,7 +436,7 @@ The plugin logs a warning but doesn't crash — your app runs in mono (non-stere
 
 ### Android Deployment
 
-The device needs the **DisplayXR runtime APK**: v2.47.0 or newer. v2.53.0 is the tested version. On v2.47.0 everything works except the touch copy to the runtime, which needs `xrSubmitAndroidInputEventDXR` (first shipped in v2.47.1); the provider logs that once and carries on. On a Leia device, use the Leia variant (the vendor plug-in is bundled in that APK, ADR-038), installed per the runtime's [Android guide](https://github.com/DisplayXR/displayxr-runtime/blob/main/docs/getting-started/android-build-guide.md). Launch the runtime app once after installing it so its broker is registered. The Unity APK finds the runtime through the Khronos loader. Nothing else needs installing.
+The device needs the **DisplayXR runtime APK**: v2.47.0 or newer. v2.53.0 is the tested version. On v2.47.0 everything works except the touch copy to the runtime, which needs `xrSubmitAndroidInputEventDXR` (first shipped in v2.47.1); the provider logs that once and carries on. On a device whose display needs a vendor plug-in, use the runtime APK variant that bundles it (ADR-038), installed per the runtime's [Android guide](https://github.com/DisplayXR/displayxr-runtime/blob/main/docs/getting-started/android-build-guide.md). Launch the runtime app once after installing it so its broker is registered. The Unity APK finds the runtime through the Khronos loader. Nothing else needs installing.
 
 ## Testing Without Hardware
 
