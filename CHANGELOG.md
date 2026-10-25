@@ -5,7 +5,7 @@ All notable changes to the DisplayXR Unity plugin will be documented in this fil
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [2.33.0] - 2026-10-25
 
 ### Added
 - **Android arm64 (Vulkan) (#418).** The display provider now runs in an Android player against the DisplayXR runtime APK (v2.47.0+, tested v2.53.0). Tested on a Nubia Pad 2: correct stereo, 60 fps unpinned (the same as the runtime's bare Vulkan cube), pause/resume, rotation, touch, URP/HDRP single-pass instanced, one 3D zone + Local2D, and the window-space UI panel.
