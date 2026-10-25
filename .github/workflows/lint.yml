@@ -46,6 +46,23 @@ jobs:
           fi
           echo "OK: no non-allowlisted vendor-name references in authored files."
 
+      - name: Extension mirror matches the published headers
+        # native~/displayxr_extensions.h is a hand-written mirror of the
+        # XR_DXR_* headers (the plugin keeps no source dependency on the
+        # runtime). A mirrored value that drifts from the published one is a
+        # silent wire break, so compare them here: type values, extension
+        # names, struct members, entry points, and SPEC_VERSIONs (the mirror
+        # may lag, never lead). Fetched at CI time only, nothing vendored.
+        # Pinned so an upstream renumbering arrives as a deliberate bump of
+        # EXTENSIONS_SHA in a PR, not as a red main.
+        env:
+          EXTENSIONS_SHA: 1df6f8d2f874f7d18cc8553c048b0328aa705502
+        run: |
+          git init -q "$RUNNER_TEMP/ext"
+          git -C "$RUNNER_TEMP/ext" fetch -q --depth 1 https://github.com/DisplayXR/displayxr-extensions "$EXTENSIONS_SHA"
+          git -C "$RUNNER_TEMP/ext" checkout -q FETCH_HEAD
+          python3 "Scripts~/check_extensions_drift.py" "$RUNNER_TEMP/ext/include/openxr"
+
       - name: Workflow YAML is valid
         run: |
           python3 -m pip install --quiet pyyaml
