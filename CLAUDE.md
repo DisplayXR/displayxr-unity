@@ -302,7 +302,7 @@ The plugin drives OpenXR through the custom `IUnityXRDisplay` provider (`native~
 
 ### Wire Protocol
 
-Extension struct definitions in `native~/displayxr_extensions.h` must match the runtime's implementation. These are versioned by extension spec version. When changing extensions, update the runtime first, then the plugin.
+Extension struct definitions in `native~/displayxr_extensions.h` must match the runtime's implementation. These are versioned by extension spec version. When changing extensions, update the runtime first, then the plugin. `lint.yml` enforces this: `Scripts~/check_extensions_drift.py` diffs every mirrored type value, extension name, struct, entry point and SPEC_VERSION against `DisplayXR/displayxr-extensions` at the pinned `EXTENSIONS_SHA` (the mirror may lag a spec version, never lead). To pick up a new upstream, bump the sha in a PR; known, harmless drift lives in the script's `KNOWN_DRIFT` table with its reason, and an entry that stops drifting fails the check until it is deleted. `Scripts~/` matches a common global `*~` gitignore rule, so new files there need `git add -f`.
 
 ## Development Workflow
 
