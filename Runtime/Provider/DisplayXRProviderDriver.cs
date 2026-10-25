@@ -1013,6 +1013,7 @@ namespace DisplayXR
         // 2/3 with sub-pixel phase); only the runtime canvas_offset can null that fractional
         // part. Stable-but-slightly-off beats jumpy.
         static int s_rtCentX = -1;   // -1 = never latched a plausible value
+        static int s_lastChromeSlackOnly = -1; // matched-pane placement mode (-1 unseen), logged on change
         static int RtCentringOffsetX(int rtWidth)
         {
             if (!s_hwndCorrValid || s_hwndCorrHwnd == System.IntPtr.Zero)
@@ -1283,6 +1284,16 @@ namespace DisplayXR
                     // area. Free Aspect makes the RT track the pane, the ratios match, and
                     // this collapses to a no-op. Derived rather than read, because the draw
                     // rect demonstrably does not carry it.
+                    //
+                    // The docked chrome slack and a letterbox are two descriptions of the SAME
+                    // slack — apply exactly one. The (#740) RT-centring corrections were measured
+                    // against a BOTTOM-ALIGNED base (top = client height - RT height), not
+                    // against this toolbar-inset, centred one: stacking them double-counted the
+                    // X centring (+3 letterbox, +4 RtCentX at slack 7) and halved the measured
+                    // 4 px bottom margin before subtracting it in full — about +3 / -2 px, which
+                    // the slanted lens turns into a near half-cycle docked phase flip (#420; bisected
+                    // v2.15.0 good -> a7d3fe1 bad). Free Aspect docked = chrome slack only (a few
+                    // px): restore the HW-verified #740 placement, in this pane's physical px.
                     if (size.x > 1f && size.y > 1f && rw > 0 && rh > 0)
                     {
                         // Unity NEVER UPSCALES the render target past 1:1 here — when the
@@ -1294,7 +1305,30 @@ namespace DisplayXR
                         // to BOTH axes together so the aspect cannot drift.
                         int rtW = Mathf.RoundToInt(size.x * sizeScale);
                         int rtH = Mathf.RoundToInt(size.y * sizeScale);
-                        if (rtW > 0 && rtH > 0)
+                        const int kChromeSlackMax = 64; // RtCentringOffsetX's own plausibility bound
+                        bool chromeSlackOnly = s_lastAppliedDocked && !IsMatchedGameViewMaximized()
+                            && rtW > 0 && rtH > 0
+                            && pcw - rtW >= 0 && pcw - rtW <= kChromeSlackMax
+                            // -2: mainSize is fractional (859.5 pt-derived px rounds to 860)
+                            // while the toolbar-inset area rounds to 859 — a 1 px deficit
+                            // that is rounding, not a letterbox (measured, 250% panel).
+                            && rh - rtH >= -2 && rh - rtH <= kChromeSlackMax;
+                        if ((chromeSlackOnly ? 1 : 0) != s_lastChromeSlackOnly)
+                        {
+                            s_lastChromeSlackOnly = chromeSlackOnly ? 1 : 0;
+                            Debug.Log("[DisplayXR] GameView glue placement: "
+                                      + (chromeSlackOnly ? "docked chrome slack (#740 RT-centring)" : "letterbox centring")
+                                      + " (pane=" + pcw + "x" + pch + " area=" + rw + "x" + rh
+                                      + " rt=" + rtW + "x" + rtH + ")");
+                        }
+                        if (chromeSlackOnly)
+                        {
+                            rx = s_panePhysWin.left + RtCentringOffsetX(rtW);       // Unity centres the RT horizontally
+                            ry = s_panePhysWin.top + (pch - rtH) + RtCentringOffsetY(rtH, ppp); // …above a bottom margin
+                            rw = rtW;
+                            rh = rtH;
+                        }
+                        else if (rtW > 0 && rtH > 0)
                         {
                             float fit = Mathf.Min(1f, Mathf.Min((float)rw / rtW, (float)rh / rtH));
                             int fitW = Mathf.RoundToInt(rtW * fit);
@@ -1307,14 +1341,6 @@ namespace DisplayXR
                                 rh = fitH;
                             }
                         }
-                    }
-
-                    // The RT-centring corrections (#740) are expressed in the same physical
-                    // px as the client rect they were measured from, so they still apply.
-                    if (s_lastAppliedDocked && !IsMatchedGameViewMaximized())
-                    {
-                        rx += RtCentringOffsetX(rw);
-                        ry += RtCentringOffsetY(rh, ppp);
                     }
                 }
             }
