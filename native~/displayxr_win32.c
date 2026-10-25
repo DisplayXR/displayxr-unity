@@ -2568,9 +2568,8 @@ displayxr_get_unity_main_hwnd(void)
 //   1) The OpenXR session is opted into XR_ENVIRONMENT_BLEND_MODE_ALPHA_BLEND
 //      (see DisplayXRFeature.OnInstanceCreate), so Unity emits real per-pixel
 //      alpha into the swapchain — including alpha=0 for transparent camera
-//      clears. The plugin sets chromaKeyColor=0 in the binding extension
-//      (see displayxr_hooks.cpp), telling the runtime to skip the legacy
-//      post-weave chroma-key conversion: it isn't needed.
+//      clears. No post-weave chroma-key conversion is involved (the binding's
+//      chromaKeyColor field was removed in win32 spec 8).
 //
 //   2) The runtime DP uses the compose-under-bg + alpha-gate path: it captures
 //      the desktop background under each tile pre-weave, blends with the

@@ -5246,10 +5246,8 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	win_binding.readbackUserdata = NULL;
 	win_binding.sharedTextureHandle = NULL;
 	// Transparent background (#166 Phase A): opt the runtime's DComp swapchain into
-	// per-pixel alpha over the desktop. chromaKeyColor=0 (no post-weave conversion —
-	// the runtime composes-under-bg + alpha-gates, same as the hook path).
+	// per-pixel alpha over the desktop (the runtime composes-under-bg + alpha-gates).
 	win_binding.transparentBackgroundEnabled = use_transparent ? XR_TRUE : XR_FALSE;
-	win_binding.chromaKeyColor = 0;
 
 	// Weave-to-texture (editor GameView default, #740): bind in TEXTURE MODE so the
 	// runtime weaves into our shared texture instead of presenting to the overlay window.

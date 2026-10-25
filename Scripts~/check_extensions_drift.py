@@ -51,15 +51,7 @@ TYPE_EQUIV = [
 
 # Drift that is known, harmless and owned elsewhere. Each entry is printed on
 # every run so it stays visible; delete it once the mirror is reconciled.
-KNOWN_DRIFT = {
-    "struct XrWin32WindowBindingCreateInfoDXR":
-        "mirror keeps the trailing chromaKeyColor that win32 spec 8 removed (#573); "
-        "the provider writes 0 into what is tail padding of the published 56-byte "
-        "struct, so the size and every published offset are unchanged",
-    "entry point xrSetSharedTextureOutputRectDXR":
-        "removed upstream (ADR-031); referenced only by the dormant, uncompiled "
-        "standalone render path, which resolves it through xrGetInstanceProcAddr",
-}
+KNOWN_DRIFT: dict[str, str] = {}
 
 
 def strip_comments(text: str) -> str:
