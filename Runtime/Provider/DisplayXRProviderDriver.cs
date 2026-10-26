@@ -1015,41 +1015,9 @@ namespace DisplayXR
             catch { return false; }
         }
 
-        // (#420) Where Unity itself puts a letterboxed RT inside the Game view's render area.
-        // GameView.OnGUI centres the target in the zoom area and then rounds the draw rect to
-        // WHOLE POINTS: `drawRect.x = Mathf.Round(x); drawRect.y = Mathf.Round(y)`, where on a
-        // UV-starts-at-top device (D3D11/12, Vulkan, Metal) the rect is flipped first, so the y
-        // it rounds is the BOTTOM edge. Pixel-centring ((area - rt) / 2 in px) misses that by up
-        // to half a point: measured maximized 16:9 on a 300% DS1, (3840 - 2823) / 2 = 508 px
-        // while Unity draws at Round(169.5 pt) = 170 pt = 510 px, which the eye saw as an
-        // inverted view. Inputs are Unity's own numbers: hostWPt = HostView.screenPosition
-        // width, drawWPt / drawHPt = the zoom area drawRect (= position minus the toolbar), so
-        // (hostWPt - drawWPt) / 2 is the dock's side border (1 pt docked, 0 maximized/floating).
-        // Y is returned RELATIVE to a full-area RT under the same rule, so a letterbox keeps the
-        // exact anchor-to-content relation of the HW-verified Free Aspect placement (the same
-        // RT height gives the same anchor with or without side bars). Leaves the fallback
-        // values untouched when the inputs are implausible. roundsBottomEdge =
-        // SystemInfo.graphicsUVStartsAtTop of the device the Game view draws with (a
-        // parameter, so the rule has no hidden global input and can be exercised both ways).
-        static void LetterboxOffsetsLikeUnity(float hostWPt, float drawWPt, float drawHPt, int fitW, int fitH,
-                                              float ptToPx, bool roundsBottomEdge, ref int offX, ref int offY)
-        {
-            float side = (hostWPt - drawWPt) * 0.5f;
-            if (!(side >= 0f && side <= 4f) || !(drawHPt > 1f)) return;
-            // ptToPx is MEASURED (pane px / pane pt, e.g. 2213 / 737.6666 = 3.0000003) while Unity
-            // converts with the exact backing scale; a whole-percent Windows scale is a multiple of
-            // 0.01, so snap to it — otherwise a Round(x.5) tie can land on the wrong side.
-            float snapped = Mathf.Round(ptToPx * 100f) / 100f;
-            if (Mathf.Abs(snapped - ptToPx) < 1e-3f) ptToPx = snapped;
-            float rtWPt = fitW / ptToPx, rtHPt = fitH / ptToPx;
-            // pt -> px rounds HALF UP: at 250% a whole-point edge can fall on x.5 px and Unity's RT
-            // then starts on the NEXT pixel (#740: 5 px of slack measured as +3, not +2).
-            offX = Mathf.FloorToInt((side + Mathf.Round((drawWPt - rtWPt) * 0.5f)) * ptToPx + 0.5f);
-            float yPt = roundsBottomEdge ? Mathf.Round((drawHPt + rtHPt) * 0.5f) - rtHPt
-                                         : Mathf.Round((drawHPt - rtHPt) * 0.5f);
-            float fullPt = roundsBottomEdge ? Mathf.Round(drawHPt) - drawHPt : 0f;
-            offY = Mathf.FloorToInt((yPt - fullPt) * ptToPx + 0.5f);
-        }
+        // (#420) The letterbox rule Unity itself uses (whole-point rounding of the flipped target
+        // rect) and the rest of the matched-pane arithmetic live in DisplayXRGameViewPlacement
+        // (pure C#, unit-tested in Tests~/GameViewPlacement).
 
         // (#740) RT-CENTRING offset — the docked-only interlace phase error, measured.
         // Unity draws the Game view's render target CENTRED inside the pane: the pane's
@@ -1094,7 +1062,7 @@ namespace DisplayXR
             int slack = clientW - rtWidth;
             if (slack <= 0 || slack > 64)          // transient realloc / implausible match:
                 return s_rtCentX < 0 ? 0 : s_rtCentX; // hold last good, never pop to 0
-            int cand = (slack + 1) / 2;
+            int cand = DisplayXRGameViewPlacement.CentringX(slack);
             if (cand != s_rtCentX)
             {
                 Debug.Log("[DisplayXR] #740 RtCentX latch " + s_rtCentX + "->" + cand
@@ -1131,7 +1099,7 @@ namespace DisplayXR
         // global value is 1.0 (never latched, it must exceed 1.1), so the margin came out -2 px
         // instead of -5 and the docked anchor sat 3-4 px low, the size of error the eye sees as
         // inverted. physClientH: as RtCentringOffsetX's physClientW, the guard in one DPI space.
-        const float kRtBottomMarginPt = 1.6f;
+        // (= DisplayXRGameViewPlacement.RtBottomMarginPt, 1.6 pt)
         static int s_rtCentY = 0;   // latched (0 is the correct default: no margin until seen)
         static int RtCentringOffsetY(int rtHeight, float scale, int physClientH = -1)
         {
@@ -1141,7 +1109,7 @@ namespace DisplayXR
             else if (GetClientRect(s_hwndCorrHwnd, out var cr)) clientH = cr.bottom - cr.top;
             else return s_rtCentY;
             if (clientH <= rtHeight) return s_rtCentY; // transient realloc: hold last good
-            int cand = -Mathf.RoundToInt(kRtBottomMarginPt * scale);
+            int cand = DisplayXRGameViewPlacement.BottomMarginPx(scale);
             if (cand != s_rtCentY)
             {
                 Debug.Log("[DisplayXR] #740 RtCentY latch " + s_rtCentY + "->" + cand
@@ -1344,7 +1312,7 @@ namespace DisplayXR
                     int toolbarPhys;
                     bool haveDraw = TryGetPaneDrawRectPoints(out Rect draw) && host.height > draw.height;
                     if (haveDraw)
-                        toolbarPhys = Mathf.RoundToInt((host.height - draw.height) * ptToPx);
+                        toolbarPhys = DisplayXRGameViewPlacement.ToolbarPx(host.height, draw.height, ptToPx);
                     else
                         toolbarPhys = Mathf.RoundToInt(toolbar * s_paneScaleK);
                     if (toolbarPhys < 0) toolbarPhys = 0;
@@ -1383,22 +1351,22 @@ namespace DisplayXR
                         // to BOTH axes together so the aspect cannot drift.
                         int rtW = Mathf.RoundToInt(size.x * sizeScale);
                         int rtH = Mathf.RoundToInt(size.y * sizeScale);
-                        const int kChromeSlackMax = 64; // RtCentringOffsetX's own plausibility bound
-                        // Vertically the dock chrome is ALREADY out of `rh`: toolbarPhys is
-                        // host.height - draw.height, which holds the tab strip, the Game-view
-                        // toolbar AND the dock's 2 pt bottom border (DockArea.kBottomBorders).
-                        // So a Free Aspect RT matches `rh` to rounding (0 px at 300%, -1 at
-                        // 250%) and anything more is a real top/bottom letterbox, which this
-                        // bottom-aligned path would misplace by half the bar height (23 px
-                        // measured with 23/22 px bars, 300% DS1, #420).
-                        const int kRoundingSlackMax = 2;
-                        bool chromeSlackOnly = s_lastAppliedDocked && !IsMatchedGameViewMaximized()
-                            && rtW > 0 && rtH > 0
-                            && pcw - rtW >= 0 && pcw - rtW <= kChromeSlackMax
-                            // -2: mainSize is fractional (859.5 pt-derived px rounds to 860)
-                            // while the toolbar-inset area rounds to 859 — a 1 px deficit
-                            // that is rounding, not a letterbox (measured, 250% panel).
-                            && rh - rtH >= -kRoundingSlackMax && rh - rtH <= kRoundingSlackMax;
+                        // (#420) The chrome-slack vs letterbox decision and both placements are
+                        // DisplayXRGameViewPlacement (pure C#, unit-tested): see its comments for
+                        // the measurements behind each term. Everything is in THIS pane's
+                        // physical px and its own ptToPx, never the global ppp.
+                        var pane = new DisplayXRGameViewPlacement.Pane
+                        {
+                            Left = s_panePhysWin.left, Top = s_panePhysWin.top,
+                            ClientW = pcw, ClientH = pch, ToolbarPx = toolbarPhys,
+                            RtW = rtW, RtH = rtH,
+                            DockedNonMaximized = s_lastAppliedDocked && !IsMatchedGameViewMaximized(),
+                            HaveDrawRect = haveDraw,
+                            HostWPt = host.width, DrawWPt = draw.width, DrawHPt = draw.height,
+                            PtToPx = ptToPx,
+                            RoundsBottomEdge = SystemInfo.graphicsUVStartsAtTop,
+                        };
+                        bool chromeSlackOnly = DisplayXRGameViewPlacement.IsChromeSlackOnly(pane);
                         if ((chromeSlackOnly ? 1 : 0) != s_lastChromeSlackOnly)
                         {
                             s_lastChromeSlackOnly = chromeSlackOnly ? 1 : 0;
@@ -1407,48 +1375,13 @@ namespace DisplayXR
                                       + " (pane=" + pcw + "x" + pch + " area=" + rw + "x" + rh
                                       + " rt=" + rtW + "x" + rtH + ")");
                         }
-                        if (chromeSlackOnly)
-                        {
-                            // This pane's own scale and physical client, never the global ppp (#420).
-                            rx = s_panePhysWin.left + RtCentringOffsetX(rtW, pcw);       // Unity centres the RT horizontally
-                            ry = s_panePhysWin.top + (pch - rtH) + RtCentringOffsetY(rtH, ptToPx, pch); // …above a bottom margin
-                            rw = rtW;
-                            rh = rtH;
-                        }
-                        else if (rtW > 0 && rtH > 0)
-                        {
-                            float fit = Mathf.Min(1f, Mathf.Min((float)rw / rtW, (float)rh / rtH));
-                            int fitW = Mathf.RoundToInt(rtW * fit);
-                            int fitH = Mathf.RoundToInt(rtH * fit);
-                            if (fitW > 0 && fitH > 0 && (fitW != rw || fitH != rh))
-                            {
-                                int offX = (rw - fitW) / 2;   // fallback: pixel centring
-                                int offY = (rh - fitH) / 2;
-                                if (haveDraw && ptToPx > 0.5f && ptToPx < 8f)
-                                    LetterboxOffsetsLikeUnity(host.width, draw.width, draw.height, fitW, fitH,
-                                                              ptToPx, SystemInfo.graphicsUVStartsAtTop,
-                                                              ref offX, ref offY);
-                                rx += offX;
-                                ry += offY;
-                                rw = fitW;
-                                rh = fitH;
-                                // (#420) The toolbar-inset area [top + toolbarPhys, bottom) has the
-                                // right HEIGHT but sits one dock bottom border too LOW: that border
-                                // (2 pt) is inside toolbarPhys yet lies BELOW the render area, not
-                                // above it. Measured on a 300% DS1: Unity's area starts at
-                                // pane.top + 135 px while toolbarPhys = 141, so every docked
-                                // fixed-aspect anchor was 6-7 px low (inverted). The chrome-slack
-                                // path corrects this with the HW-verified #740 bottom margin; use
-                                // the same term here so a letterbox keeps exactly the
-                                // anchor-to-content relation of the verified Free Aspect placement.
-                                // (v2.32.1 applied it too, stacked with RtCentX; #421 dropped both.)
-                                // Not for maximized (area measured at pane.top + toolbarPhys) or
-                                // floating (its extra 2 pt is a TOP border, DockArea
-                                // kFloatingWindowTopBorderWidth, so the inset area is already right).
-                                if (s_lastAppliedDocked && !IsMatchedGameViewMaximized())
-                                    ry += RtCentringOffsetY(fitH, ptToPx, pch);
-                            }
-                        }
+                        // The #740 latches (they hold the last good value through realloc
+                        // transients and log changes); each is read only where it applies.
+                        // The Y guard takes the drawn height, which never exceeds the area.
+                        int centX = chromeSlackOnly ? RtCentringOffsetX(rtW, pcw) : 0;
+                        int centY = pane.DockedNonMaximized
+                            ? RtCentringOffsetY(Mathf.Min(rtH, rh), ptToPx, pch) : 0;
+                        DisplayXRGameViewPlacement.Place(pane, centX, centY, out rx, out ry, out rw, out rh);
                     }
                 }
             }
