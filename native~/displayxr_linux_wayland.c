@@ -740,6 +740,7 @@ update_device_size_locked(void)
 
 static struct dxr_wl_output *output_at_locked(int x, int y);
 static struct dxr_wl_output *output_for_window_at_locked(int x, int y);
+static void window_size_on_locked(const struct dxr_wl_output *o, int layout, int *out_w, int *out_h);
 static int layout_locked(void);
 
 //! Fit a logical window size into 95 % of the output the window is going to (the
@@ -1370,32 +1371,36 @@ win_on_output(const DxrWlExtWindow *w, const struct dxr_wl_output *panel)
 	return dxr_wl_window_on_rect(output_rect(panel), w->x, w->y, w->w, w->h);
 }
 
-//! The output the window is on once its top-left is at (x, y), stage px, or NULL:
-//! the one under its centre at its size now, as mutter tells it
-//! (dxr_wl_output_for_window). A placement sizes the window for that output's
-//! scale; for a window across a monitor edge the output under its top-left is
-//! another one (the side the app's saved position starts on), and sizing for that
-//! one gets the window resized for the other once it is there, which can move its
-//! centre back across the edge.
+//! The output the window is sized for once its top-left is at (x, y), stage px, or
+//! NULL (dxr_wl_output_for_window): judged, like a restored saved position
+//! (dxr_wl_set_player_position_x11), at the size the window will have on each
+//! output (window_size_on_locked), not at the size it has now. The two differ in
+//! mutter's physical layout (stage px = device px: a window from a 100 % monitor is
+//! twice as wide on a 200 % panel), where judging at today's size picked the
+//! laptop for a position the check had honoured as on the panel: the window, partly
+//! on the panel, got the panel's scale, was sized for the laptop's, shrank off the
+//! panel, got the laptop's scale back, grew onto it again, and so on. For a window
+//! across a monitor edge the output under its top-left is another one again.
 static struct dxr_wl_output *
 output_for_window_at_locked(int x, int y)
 {
 	DxrWlRect4 r[DXR_WL_MAX_OUTPUTS];
+	int ws[DXR_WL_MAX_OUTPUTS], hs[DXR_WL_MAX_OUTPUTS];
+	unsigned s120[DXR_WL_MAX_OUTPUTS];
+	int layout = layout_locked();
 	for (int i = 0; i < DXR_WL_MAX_OUTPUTS; i++) {
 		const struct dxr_wl_output *o = &s_wl.outputs[i];
 		DxrWlRect4 none = {0, 0, 0, 0};
-		r[i] = o->registry_name && o->lw > 0 ? output_rect(o) : none;
+		r[i] = none;
+		ws[i] = hs[i] = 0;
+		s120[i] = 0;
+		if (!o->registry_name || o->lw <= 0)
+			continue;
+		r[i] = output_rect(o);
+		window_size_on_locked(o, layout, &ws[i], &hs[i]);
+		s120[i] = output_scale120_locked(o, layout);
 	}
-	int w = 0, h = 0;
-	if (win_mapped(&s_wl.win)) {
-		w = s_wl.win.w;
-		h = s_wl.win.h;
-	} else if (s_wl.logical_w > 0 && s_wl.logical_h > 0) { // not shown yet: its surface size, stage px
-		double k = layout_locked() == DXR_LAYOUT_PHYSICAL && s_wl.scale120 ? s_wl.scale120 / 120.0 : 1.0;
-		w = (int)lround(s_wl.logical_w * k);
-		h = (int)lround(s_wl.logical_h * k);
-	}
-	int i = dxr_wl_output_for_window(r, DXR_WL_MAX_OUTPUTS, x, y, w, h);
+	int i = dxr_wl_output_for_window(r, ws, hs, s120, DXR_WL_MAX_OUTPUTS, x, y);
 	return i >= 0 ? &s_wl.outputs[i] : NULL;
 }
 
@@ -2214,17 +2219,19 @@ keeps_opening_size_locked(void)
 	return dxr_wl_keeps_opening_size(s_wl.wanted_by_app, s_startup_move, restore_open_locked());
 }
 
-//! The size the window will have on `panel` once moved there, stage px
-//! (dxr_wl_size_after_move): the logical size it opened with when the move keeps
-//! that (keeps_opening_size_locked), else the device size it keeps (the app's, or
-//! its baseline) at the panel's scale. Centring the window on the panel and judging
-//! a restored saved position against it go by this.
+//! The size the window will have on output @p o (the 3D panel, or any output a
+//! placement may put it on) once moved there, stage px (dxr_wl_size_after_move):
+//! the logical size it opened with when the move keeps that
+//! (keeps_opening_size_locked), else the device size it keeps (the app's, or its
+//! baseline) at that output's scale. Centring the window on the panel, judging a
+//! restored saved position against it and picking the output a placement sizes the
+//! window for (output_for_window_at_locked) go by this.
 static void
-window_size_on_locked(const struct dxr_wl_output *panel, int layout, int *out_w, int *out_h)
+window_size_on_locked(const struct dxr_wl_output *o, int layout, int *out_w, int *out_h)
 {
 	dxr_wl_size_after_move(keeps_opening_size_locked(), s_wl.logical_w, s_wl.logical_h, s_wl.wanted_device_w,
-	                       s_wl.wanted_device_h, output_scale120_locked(panel, layout), s_wl.scale120,
-	                       layout == DXR_LAYOUT_PHYSICAL, panel->lw, panel->lh, out_w, out_h);
+	                       s_wl.wanted_device_h, output_scale120_locked(o, layout), s_wl.scale120,
+	                       layout == DXR_LAYOUT_PHYSICAL, o->lw, o->lh, out_w, out_h);
 }
 
 //! The top-left that centres the window on `panel` at the size it will have there.

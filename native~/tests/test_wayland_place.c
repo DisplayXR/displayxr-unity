@@ -205,17 +205,49 @@ main(void)
 	CHECK(!dxr_wl_saved_position_on_panel(panel200, 2380, 80, 2, 400, 320));
 	CHECK(dxr_wl_saved_position_on_panel(panel200, 2380, 80, 2, sw, sh));
 	// ... and that window, honoured there, is sized for the panel, the output under
-	// its centre (where mutter puts it), not for the laptop under its top-left.
+	// its centre (where mutter puts it), not for the laptop under its top-left. The
+	// output is judged at the size the window will have on each output (here its
+	// logical size everywhere: a move that keeps it, in logical layout).
 	const DxrWlRect4 outs[3] = {{0, 0, 1440, 900}, {0, 0, 0, 0}, {1440, 0, 1920, 1080}}; // laptop, a free slot, panel
-	CHECK(dxr_wl_output_for_window(outs, 3, 1190, 40, 600, 480) == 2);
-	CHECK(dxr_wl_output_for_window(outs, 3, 1190, 40, 400, 320) == 0); // smaller: its centre stays on the laptop
-	CHECK(dxr_wl_output_for_window(outs, 3, 1190, 40, 0, 0) == 0);     // no size: the top-left decides
-	CHECK(dxr_wl_output_for_window(outs, 3, 2100, 300, 600, 480) == 2); // centred on the panel
+	const unsigned sc[3] = {160, 0, 240};
+	const int w600[3] = {600, 0, 600}, h480[3] = {480, 0, 480};
+	CHECK(dxr_wl_output_for_window(outs, w600, h480, sc, 3, 1190, 40) == 2);
+	// Device-kept, it would be 400x320 on the panel: its centre would stay on the laptop.
+	const int wkept[3] = {600, 0, 400}, hkept[3] = {480, 0, 320};
+	CHECK(dxr_wl_output_for_window(outs, wkept, hkept, sc, 3, 1190, 40) == 0);
+	const int w0[3] = {0, 0, 0};
+	CHECK(dxr_wl_output_for_window(outs, w0, w0, sc, 3, 1190, 40) == 0);     // no size: the top-left decides
+	CHECK(dxr_wl_output_for_window(outs, w600, h480, sc, 3, 2100, 300) == 2); // centred on the panel
 	// Its centre past the desktop's right edge: the output under its top-left.
-	CHECK(dxr_wl_output_for_window(outs, 3, 3110, 40, 600, 480) == 2);
+	CHECK(dxr_wl_output_for_window(outs, w600, h480, sc, 3, 3110, 40) == 2);
 	// Off the desktop altogether.
-	CHECK(dxr_wl_output_for_window(outs, 3, -900, -900, 600, 480) == -1);
-	CHECK(dxr_wl_output_for_window(outs, 0, 100, 100, 600, 480) == -1);
+	CHECK(dxr_wl_output_for_window(outs, w600, h480, sc, 3, -900, -900) == -1);
+	CHECK(dxr_wl_output_for_window(outs, w600, h480, sc, 0, 100, 100) == -1);
+
+	// mutter's physical layout (stage px = device px): a 100 % laptop at (0,0)
+	// 1920x1080 and the 200 % panel at (1920,0) 3840x2160. The 600x480 window is
+	// 600x480 stage px on the laptop and 1200x960 on the panel (its logical size
+	// kept). A saved position at stage (1470,100): at the laptop's size its centre
+	// (1770) is on the laptop, at the panel's (2070) on the panel, and the saved-
+	// position check, judging at the panel's size, honours it as on the panel. The
+	// move is sized for the panel too: of the two, the higher scale, which mutter
+	// gives a window partly on the panel. (Judged at today's size, the move was sized
+	// for the laptop and the window flapped between 600 and 300 px wide.)
+	const DxrWlRect4 phys[2] = {{0, 0, 1920, 1080}, {1920, 0, 3840, 2160}};
+	const unsigned psc[2] = {120, 240};
+	const int pw[2] = {600, 1200}, ph[2] = {480, 960};
+	CHECK(dxr_wl_saved_position_on_panel(phys[1], 1470, 100, 1, pw[1], ph[1]));
+	CHECK(dxr_wl_output_for_window(phys, pw, ph, psc, 2, 1470, 100) == 1);
+	// The same with the outputs listed the other way round.
+	const DxrWlRect4 phys_r[2] = {{1920, 0, 3840, 2160}, {0, 0, 1920, 1080}};
+	const unsigned psc_r[2] = {240, 120};
+	const int pw_r[2] = {1200, 600}, ph_r[2] = {960, 480};
+	CHECK(dxr_wl_output_for_window(phys_r, pw_r, ph_r, psc_r, 2, 1470, 100) == 0);
+	// Further left (1220): on the laptop at both sizes; the check calls it stale.
+	CHECK(dxr_wl_output_for_window(phys, pw, ph, psc, 2, 1220, 100) == 0);
+	CHECK(!dxr_wl_saved_position_on_panel(phys[1], 1220, 100, 1, pw[1], ph[1]));
+	// Further right (1720): on the panel at both sizes.
+	CHECK(dxr_wl_output_for_window(phys, pw, ph, psc, 2, 1720, 100) == 1);
 
 	// DISPLAYXR_PANEL_PLACEMENT.
 	CHECK(!dxr_startup_placement_env_off(NULL));
