@@ -69,18 +69,28 @@ dxr_wl_window_on_rect(DxrWlRect4 panel, int x, int y, int w, int h)
 }
 
 //! The output (an index into @p outs, @p n of them; a rect with no size = no
-//! output) a window of size w x h with its top-left at (x, y) is on once there: the
-//! one under its centre (dxr_wl_window_on_rect), where mutter puts it and whose
-//! scale it then gets; when its centre is on none (partly off the desktop), the one
-//! under (x, y). -1: neither. For a window across a monitor edge the output under
-//! its top-left is another one, with another scale.
+//! output) a window with its top-left at (x, y) is sized for once there. @p ws /
+//! @p hs [i]: the size it will have on outs[i] once there (dxr_wl_size_after_move,
+//! the size the saved-position check judges a position with too; 0 = unknown);
+//! @p scale120 [i]: that output's scale x 120. An output qualifies when the window's
+//! centre, at the size it has there, is on it (dxr_wl_window_on_rect; for a window
+//! across a monitor edge the output under its top-left can be another one, with
+//! another scale). Of those, the one with the highest scale: a window across a
+//! monitor edge gets the highest scale of the monitors it is on (measured: mutter
+//! 50, physical layout), so one that would be on the panel at the panel's size and on
+//! the laptop at the laptop's gets the panel's. When none qualifies (partly off the
+//! desktop), the one under (x, y). -1: neither.
 static inline int
-dxr_wl_output_for_window(const DxrWlRect4 *outs, int n, int x, int y, int w, int h)
+dxr_wl_output_for_window(const DxrWlRect4 *outs, const int *ws, const int *hs, const unsigned *scale120, int n, int x,
+                         int y)
 {
-	if (w > 0 && h > 0)
-		for (int i = 0; i < n; i++)
-			if (dxr_wl_window_on_rect(outs[i], x, y, w, h))
-				return i;
+	int best = -1;
+	for (int i = 0; i < n; i++)
+		if (ws[i] > 0 && hs[i] > 0 && dxr_wl_window_on_rect(outs[i], x, y, ws[i], hs[i]) &&
+		    (best < 0 || scale120[i] > scale120[best]))
+			best = i;
+	if (best >= 0)
+		return best;
 	for (int i = 0; i < n; i++)
 		if (dxr_wl_window_on_rect(outs[i], x, y, 0, 0))
 			return i;
