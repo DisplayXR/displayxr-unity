@@ -89,6 +89,11 @@ jobs:
       - name: Text field clipboard rules
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: dotnet run --project "Tests~/TextClipboard" -c Release
+      # Pure C#: where the editor Game-view glue anchors the weave for a docked / maximized /
+      # letterboxed view (#420), pinned to hardware-measured placements.
+      - name: Game view placement
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: dotnet run --project "Tests~/GameViewPlacement" -c Release
 
   build-windows:
     name: Windows x64
