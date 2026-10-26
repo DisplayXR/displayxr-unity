@@ -118,7 +118,10 @@ namespace DisplayXR
         {
             if (s_StartupDone || sessionFrame < 2) return;
             s_StartupDone = true;
-            if (Application.isEditor) return;
+            // Linux players only for now (the native call is 0 everywhere else): no
+            // start-up placement lines in a Windows / macOS player's log, and none in
+            // the editor.
+            if (Application.platform != RuntimePlatform.LinuxPlayer) return;
             if (!PlaceOnPanelAtStart)
             {
                 Debug.Log("[DisplayXR] start-up placement: turned off by the app — the window stays where it opened.");
