@@ -738,34 +738,26 @@ update_device_size_locked(void)
 }
 
 static struct dxr_wl_output *output_at_locked(int x, int y);
+static struct dxr_wl_output *output_for_window_at_locked(int x, int y);
 static int layout_locked(void);
 
 //! Fit a logical window size into 95 % of the output the window is going to (the
-//! intent's) or else is on, keeping its aspect.
+//! intent's) or else is on, keeping its aspect (dxr_wl_fit_output).
 static void
 clamp_to_destination_locked(int *lw, int *lh)
 {
 	struct dxr_wl_output *o = NULL;
 	if (s_wl.intent_valid)
-		o = output_at_locked(s_wl.intent_x, s_wl.intent_y);
+		o = output_for_window_at_locked(s_wl.intent_x, s_wl.intent_y);
 	if (!o && s_wl.win.present && s_wl.win.w > 0)
 		o = output_at_locked(s_wl.win.x + s_wl.win.w / 2, s_wl.win.y + s_wl.win.h / 2);
-	if (!o || o->lw <= 0 || o->lh <= 0 || *lw <= 0 || *lh <= 0)
+	if (!o)
 		return;
 	// Stage px per logical (surface) px: 1 in logical layout, the scale in physical.
 	double stage = 1.0;
 	if (layout_locked() == DXR_LAYOUT_PHYSICAL)
 		stage = o->wl_scale > 0 ? o->wl_scale : 1;
-	double max_w = 0.95 * o->lw / stage, max_h = 0.95 * o->lh / stage;
-	double f = 1.0;
-	if (*lw > max_w)
-		f = max_w / *lw;
-	if (*lh * f > max_h)
-		f = max_h / *lh;
-	if (f < 1.0) {
-		*lw = (int)floor(*lw * f);
-		*lh = (int)floor(*lh * f);
-	}
+	dxr_wl_fit_output(lw, lh, o->lw, o->lh, stage);
 }
 
 //! The size to keep, in device px, is the app's request; until it makes one, the
@@ -1377,6 +1369,35 @@ win_on_output(const DxrWlExtWindow *w, const struct dxr_wl_output *panel)
 	return dxr_wl_window_on_rect(output_rect(panel), w->x, w->y, w->w, w->h);
 }
 
+//! The output the window is on once its top-left is at (x, y), stage px, or NULL:
+//! the one under its centre at its size now, as mutter tells it
+//! (dxr_wl_output_for_window). A placement sizes the window for that output's
+//! scale; for a window across a monitor edge the output under its top-left is
+//! another one (the side the app's saved position starts on), and sizing for that
+//! one gets the window resized for the other once it is there, which can move its
+//! centre back across the edge.
+static struct dxr_wl_output *
+output_for_window_at_locked(int x, int y)
+{
+	DxrWlRect4 r[DXR_WL_MAX_OUTPUTS];
+	for (int i = 0; i < DXR_WL_MAX_OUTPUTS; i++) {
+		const struct dxr_wl_output *o = &s_wl.outputs[i];
+		DxrWlRect4 none = {0, 0, 0, 0};
+		r[i] = o->registry_name && o->lw > 0 ? output_rect(o) : none;
+	}
+	int w = 0, h = 0;
+	if (win_mapped(&s_wl.win)) {
+		w = s_wl.win.w;
+		h = s_wl.win.h;
+	} else if (s_wl.logical_w > 0 && s_wl.logical_h > 0) { // not shown yet: its surface size, stage px
+		double k = layout_locked() == DXR_LAYOUT_PHYSICAL && s_wl.scale120 ? s_wl.scale120 / 120.0 : 1.0;
+		w = (int)lround(s_wl.logical_w * k);
+		h = (int)lround(s_wl.logical_h * k);
+	}
+	int i = dxr_wl_output_for_window(r, DXR_WL_MAX_OUTPUTS, x, y, w, h);
+	return i >= 0 ? &s_wl.outputs[i] : NULL;
+}
+
 //! Re-read the window a little later to check it reached the 3D panel (#361).
 static void
 schedule_verify_locked(void)
@@ -1480,7 +1501,7 @@ place_locked(const char *why)
 	}
 	// Size requests use the target output's scale from here on.
 	int layout = layout_locked();
-	struct dxr_wl_output *target = output_at_locked(s_wl.intent_x, s_wl.intent_y);
+	struct dxr_wl_output *target = output_for_window_at_locked(s_wl.intent_x, s_wl.intent_y);
 	uint32_t t120 = target && layout != DXR_LAYOUT_UNKNOWN ? output_scale120_locked(target, layout) : 0;
 	if (t120 && t120 != s_wl.scale120)
 		s_wl.expect_scale120 = t120;
@@ -1614,7 +1635,7 @@ ext_window(const DxrWlExtWindow *w, int after_move, int moved)
 		if (!moved)
 			fprintf(stderr, "[DisplayXR-WL] the extension did not move the window (a move grab in progress?)\n");
 		if (moved && mapped && (w->x != s_wl.intent_x || w->y != s_wl.intent_y)) {
-			struct dxr_wl_output *target = output_at_locked(s_wl.intent_x, s_wl.intent_y);
+			struct dxr_wl_output *target = output_for_window_at_locked(s_wl.intent_x, s_wl.intent_y);
 			int fits = target && w->w <= target->lw && w->h <= target->lh;
 			if (!fits || s_wl.sent_w || s_wl.pending_w) {
 				fprintf(stderr, "[DisplayXR-WL] the window (%dx%d) does not fit at (%d,%d) yet: moving it there "
@@ -2182,21 +2203,27 @@ dxr_wl_end_pointer_drag(void)
 	}
 }
 
-//! The size the window will have on `panel`, stage px: the size the app asked for
-//! (device px) in the panel's stage px, else its current size.
+//! The move being placed now decides where the window opens, as far as anyone can
+//! tell (dxr_wl_keeps_opening_size): the start-up placement, or a placement while
+//! the window is new (#361's restore window: on screen under 3 s, not moved by the
+//! user), e.g. DisplayXRTargetDisplay or a saved position the app restores.
+static int
+keeps_opening_size_locked(void)
+{
+	return dxr_wl_keeps_opening_size(s_wl.wanted_by_app, s_startup_move, restore_open_locked());
+}
+
+//! The size the window will have on `panel` once moved there, stage px
+//! (dxr_wl_size_after_move): the logical size it opened with when the move keeps
+//! that (keeps_opening_size_locked), else the device size it keeps (the app's, or
+//! its baseline) at the panel's scale. Centring the window on the panel and judging
+//! a restored saved position against it go by this.
 static void
 window_size_on_locked(const struct dxr_wl_output *panel, int layout, int *out_w, int *out_h)
 {
-	uint32_t p120 = output_scale120_locked(panel, layout);
-	double stage_per_device = layout == DXR_LAYOUT_PHYSICAL ? 1.0 : 120.0 / (p120 ? p120 : 120);
-	if (s_wl.wanted_device_w > 0 && s_wl.wanted_device_h > 0) {
-		*out_w = (int)lround(s_wl.wanted_device_w * stage_per_device);
-		*out_h = (int)lround(s_wl.wanted_device_h * stage_per_device);
-	} else {
-		double scale = layout == DXR_LAYOUT_PHYSICAL ? p120 / 120.0 : 1.0; // surface px -> stage px
-		*out_w = (int)lround(s_wl.logical_w * scale);
-		*out_h = (int)lround(s_wl.logical_h * scale);
-	}
+	dxr_wl_size_after_move(keeps_opening_size_locked(), s_wl.logical_w, s_wl.logical_h, s_wl.wanted_device_w,
+	                       s_wl.wanted_device_h, output_scale120_locked(panel, layout), s_wl.scale120,
+	                       layout == DXR_LAYOUT_PHYSICAL, panel->lw, panel->lh, out_w, out_h);
 }
 
 //! The top-left that centres the window on `panel` at the size it will have there.
@@ -2211,22 +2238,13 @@ panel_centre_locked(const struct dxr_wl_output *panel, int layout, int *out_x, i
 	*out_y = y < panel->ly ? panel->ly : y;
 }
 
-//! The move being placed now decides where the window opens, as far as anyone can
-//! tell (dxr_wl_keeps_opening_size): the start-up placement, or a placement while
-//! the window is new (#361's restore window: on screen under 3 s, not moved by the
-//! user), e.g. DisplayXRTargetDisplay or a saved position the app restores.
-static int
-keeps_opening_size_locked(void)
-{
-	return dxr_wl_keeps_opening_size(s_wl.wanted_by_app, s_startup_move, restore_open_locked());
-}
-
-//! Such a move keeps the LOGICAL size the player opened with (the size it restored,
-//! saved where it was last: normally the panel), not the device size it had on the
-//! monitor it happened to open on. Keeping the device size shrinks a window that
-//! opens on a lower-scale monitor at every start, and grows one that opens on a
-//! higher-scale one, because the player saves the logical size it then has. A size
-//! the app asked for stands. @p t120: the target output's scale x 120.
+//! A move that decides where the window opens (keeps_opening_size_locked) keeps the
+//! LOGICAL size the player opened with (the size it restored, saved where it was
+//! last: normally the panel), not the device size it had on the monitor it happened
+//! to open on. Keeping the device size shrinks a window that opens on a lower-scale
+//! monitor at every start, and grows one that opens on a higher-scale one, because
+//! the player saves the logical size it then has. A size the app asked for stands.
+//! @p t120: the target output's scale x 120.
 static void
 keep_opening_size_locked(uint32_t t120)
 {
@@ -2246,7 +2264,7 @@ set_intent_locked(int x, int y, const char *why)
 	s_wl.intent_x = x;
 	s_wl.intent_y = y;
 	int layout = layout_locked();
-	struct dxr_wl_output *target = output_at_locked(x, y);
+	struct dxr_wl_output *target = output_for_window_at_locked(x, y);
 	uint32_t t120 = target && layout != DXR_LAYOUT_UNKNOWN ? output_scale120_locked(target, layout) : 0;
 	if (t120 && t120 != s_wl.scale120) {
 		s_wl.expect_scale120 = t120;
