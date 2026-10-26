@@ -1079,13 +1079,17 @@ namespace DisplayXR
         // part. Stable-but-slightly-off beats jumpy.
         static int s_rtCentX = -1;   // -1 = never latched a plausible value
         static int s_lastChromeSlackOnly = -1; // matched-pane placement mode (-1 unseen), logged on change
-        static int RtCentringOffsetX(int rtWidth)
+        // physClientW: the matched pane's client width in PHYSICAL px (s_panePhysClient), passed
+        // by the matched path so the slack never mixes Unity's DPI space (GetClientRect from
+        // managed code) with the physical RT width. -1 = unmatched fallback, read GetClientRect.
+        static int RtCentringOffsetX(int rtWidth, int physClientW = -1)
         {
             if (!s_hwndCorrValid || s_hwndCorrHwnd == System.IntPtr.Zero)
                 return s_rtCentX < 0 ? 0 : s_rtCentX;
-            if (!GetClientRect(s_hwndCorrHwnd, out var cr))
-                return s_rtCentX < 0 ? 0 : s_rtCentX;
-            int clientW = cr.right - cr.left;
+            int clientW;
+            if (physClientW > 0) clientW = physClientW;
+            else if (GetClientRect(s_hwndCorrHwnd, out var cr)) clientW = cr.right - cr.left;
+            else return s_rtCentX < 0 ? 0 : s_rtCentX;
             int slack = clientW - rtWidth;
             if (slack <= 0 || slack > 64)          // transient realloc / implausible match:
                 return s_rtCentX < 0 ? 0 : s_rtCentX; // hold last good, never pop to 0
@@ -1121,19 +1125,26 @@ namespace DisplayXR
         // toolbar and the clientH−rtH we assume. Expressed in points × ppp so it tracks
         // HiDPI. If a future Unity/DPI shifts docked phase, re-measure via the woven-texture
         // vs screen cross-correlation (δy) and update this constant.
+        // (#420) `scale` must be THIS PANE's points->px (ptToPx in the matched path), not the
+        // global EditorGUIUtility.pixelsPerPoint: on a 300 % secondary with a 100 % primary the
+        // global value is 1.0 (never latched, it must exceed 1.1), so the margin came out -2 px
+        // instead of -5 and the docked anchor sat 3-4 px low, the size of error the eye sees as
+        // inverted. physClientH: as RtCentringOffsetX's physClientW, the guard in one DPI space.
         const float kRtBottomMarginPt = 1.6f;
         static int s_rtCentY = 0;   // latched (0 is the correct default: no margin until seen)
-        static int RtCentringOffsetY(int rtHeight, float ppp)
+        static int RtCentringOffsetY(int rtHeight, float scale, int physClientH = -1)
         {
             if (!s_hwndCorrValid || s_hwndCorrHwnd == System.IntPtr.Zero) return s_rtCentY;
-            if (!GetClientRect(s_hwndCorrHwnd, out var cr)) return s_rtCentY;
-            int clientH = cr.bottom - cr.top;
+            int clientH;
+            if (physClientH > 0) clientH = physClientH;
+            else if (GetClientRect(s_hwndCorrHwnd, out var cr)) clientH = cr.bottom - cr.top;
+            else return s_rtCentY;
             if (clientH <= rtHeight) return s_rtCentY; // transient realloc: hold last good
-            int cand = -Mathf.RoundToInt(kRtBottomMarginPt * ppp);
+            int cand = -Mathf.RoundToInt(kRtBottomMarginPt * scale);
             if (cand != s_rtCentY)
             {
                 Debug.Log("[DisplayXR] #740 RtCentY latch " + s_rtCentY + "->" + cand
-                          + " (clientH=" + clientH + " rtH=" + rtHeight + " ppp=" + ppp + ")");
+                          + " (clientH=" + clientH + " rtH=" + rtHeight + " scale=" + scale + ")");
                 s_rtCentY = cand;
             }
             return s_rtCentY;
@@ -1397,8 +1408,9 @@ namespace DisplayXR
                         }
                         if (chromeSlackOnly)
                         {
-                            rx = s_panePhysWin.left + RtCentringOffsetX(rtW);       // Unity centres the RT horizontally
-                            ry = s_panePhysWin.top + (pch - rtH) + RtCentringOffsetY(rtH, ppp); // …above a bottom margin
+                            // This pane's own scale and physical client, never the global ppp (#420).
+                            rx = s_panePhysWin.left + RtCentringOffsetX(rtW, pcw);       // Unity centres the RT horizontally
+                            ry = s_panePhysWin.top + (pch - rtH) + RtCentringOffsetY(rtH, ptToPx, pch); // …above a bottom margin
                             rw = rtW;
                             rh = rtH;
                         }
@@ -1432,7 +1444,7 @@ namespace DisplayXR
                                 // floating (its extra 2 pt is a TOP border, DockArea
                                 // kFloatingWindowTopBorderWidth, so the inset area is already right).
                                 if (s_lastAppliedDocked && !IsMatchedGameViewMaximized())
-                                    ry += RtCentringOffsetY(fitH, ppp);
+                                    ry += RtCentringOffsetY(fitH, ptToPx, pch);
                             }
                         }
                     }
