@@ -136,6 +136,21 @@ main(void)
 	CHECK(!dxr_wl_is_start_move(1, 1));
 	CHECK(!dxr_wl_is_start_move(0, 0));
 	CHECK(!dxr_wl_is_start_move(0, 1));
+	// What a move to the panel does, as move_player_to_panel applies it: the _at_start
+	// entry point (DisplayXRTargetDisplay once the session runs) on a window nobody has
+	// placed is a start-up move (s_startup_move: the opening size is kept); MoveNow is
+	// not; nor is a move at start after the app or the user placed the window; a window
+	// on the panel already is left alone.
+	DxrWlPanelMove pm = dxr_wl_panel_move(1, 0, 0);
+	CHECK(pm.move && pm.start_move);
+	pm = dxr_wl_panel_move(0, 0, 0);
+	CHECK(pm.move && !pm.start_move);
+	pm = dxr_wl_panel_move(1, 1, 0);
+	CHECK(pm.move && !pm.start_move);
+	pm = dxr_wl_panel_move(1, 0, 1);
+	CHECK(!pm.move && !pm.start_move);
+	pm = dxr_wl_panel_move(0, 1, 1);
+	CHECK(!pm.move && !pm.start_move);
 	// DisplayXRTargetDisplay at start after a slow first frame (the window shown more
 	// than 3 s ago: restore window closed) keeps the opening size; MoveNow then does
 	// not; the app's size stands either way.

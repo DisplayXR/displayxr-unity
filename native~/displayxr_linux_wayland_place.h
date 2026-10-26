@@ -257,6 +257,25 @@ dxr_wl_is_start_move(int at_start, int placed)
 	return at_start && !placed;
 }
 
+//! What a move of the window to the 3D panel does (move_player_to_panel, behind
+//! dxr_wl_move_player_to_panel and dxr_wl_move_player_to_panel_at_start), which it
+//! applies as it is: @p at_start: the _at_start entry point (DisplayXRTargetDisplay's
+//! move once the session runs); @p placed: the app or the user placed the window
+//! before; @p there: the window is on the panel already.
+typedef struct DxrWlPanelMove {
+	int move;       //!< centre the window on the panel (0: it is there: leave it)
+	int start_move; //!< as a start-up move (s_startup_move): it keeps the size it opened with
+} DxrWlPanelMove;
+
+static inline DxrWlPanelMove
+dxr_wl_panel_move(int at_start, int placed, int there)
+{
+	DxrWlPanelMove m;
+	m.move = !there;
+	m.start_move = m.move && dxr_wl_is_start_move(at_start, placed);
+	return m;
+}
+
 //! Fit a window's logical size *lw x *lh into 95 % of an output (stage px
 //! out_w x out_h), keeping its aspect: a window the compositor cannot fit gets
 //! squeezed or maximized, and the player then resets it to the desktop size (and
