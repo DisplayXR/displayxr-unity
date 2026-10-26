@@ -354,6 +354,10 @@ static pthread_mutex_t s_wl_mutex = PTHREAD_MUTEX_INITIALIZER;
 // Under s_wl_mutex: the move being placed is a side-step glide's in-between step,
 // which is not logged (the side-step logs the move once; dxr_wl_set_player_position_stage).
 static int s_quiet_place;
+// Under s_wl_mutex: the move being placed is the start-up placement's
+// (startup_place_locked), which keeps the size the window opened with
+// (keep_opening_size_locked) whenever it moves it.
+static int s_startup_move;
 
 // The main plugin's side (displayxr_linux_wayland_lib.h), set once by dxr_wl_lib_init.
 static const DxrWlHost *s_host;
@@ -2210,11 +2214,18 @@ panel_centre_locked(const struct dxr_wl_output *panel, int layout, int *out_x, i
 	*out_y = y < panel->ly ? panel->ly : y;
 }
 
-//! A placement while the window is new (#361's restore window: on screen under 3 s,
-//! not moved by the user) decides where it opens, as far as anyone can tell: the
-//! start-up placement, DisplayXRTargetDisplay, a saved position the app restores.
-//! Keep the LOGICAL size the player opened with there (the size it restored, saved
-//! where it was last: normally the panel), not the device size it had on the
+//! The move being placed now decides where the window opens, as far as anyone can
+//! tell (dxr_wl_keeps_opening_size): the start-up placement, or a placement while
+//! the window is new (#361's restore window: on screen under 3 s, not moved by the
+//! user), e.g. DisplayXRTargetDisplay or a saved position the app restores.
+static int
+keeps_opening_size_locked(void)
+{
+	return dxr_wl_keeps_opening_size(s_wl.wanted_by_app, s_startup_move, restore_open_locked());
+}
+
+//! Such a move keeps the LOGICAL size the player opened with (the size it restored,
+//! saved where it was last: normally the panel), not the device size it had on the
 //! monitor it happened to open on. Keeping the device size shrinks a window that
 //! opens on a lower-scale monitor at every start, and grows one that opens on a
 //! higher-scale one, because the player saves the logical size it then has. A size
@@ -2222,7 +2233,7 @@ panel_centre_locked(const struct dxr_wl_output *panel, int layout, int *out_x, i
 static void
 keep_opening_size_locked(uint32_t t120)
 {
-	if (s_wl.wanted_by_app || !t120 || s_wl.logical_w <= 0 || s_wl.logical_h <= 0 || !restore_open_locked())
+	if (!t120 || s_wl.logical_w <= 0 || s_wl.logical_h <= 0 || !keeps_opening_size_locked())
 		return;
 	s_wl.wanted_device_w = (int)lround(s_wl.logical_w * (t120 / 120.0));
 	s_wl.wanted_device_h = (int)lround(s_wl.logical_h * (t120 / 120.0));
@@ -2401,7 +2412,13 @@ startup_place_locked(void)
 		fprintf(stderr, "[DisplayXR-WL] start-up placement: the window opened at (%d,%d %dx%d) on the monitor at "
 		                "(%d,%d %dx%d), not the 3D panel '%s': moving it there\n",
 		        w->x, w->y, w->w, w->h, w->mon_x, w->mon_y, w->mon_w, w->mon_h, panel->name);
-		send_to_panel_locked(panel, layout); // (with the size it opened with: keep_opening_size_locked)
+		// With the size it opened with (keep_opening_size_locked), also when the
+		// window has been on screen longer than #361's restore window by now: a slow
+		// first frame (shader warm-up) delays the session's second frame, it does
+		// not make anyone place the window.
+		s_startup_move = 1;
+		send_to_panel_locked(panel, layout);
+		s_startup_move = 0;
 		break;
 	}
 	return act;
