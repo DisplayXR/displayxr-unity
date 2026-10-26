@@ -1444,13 +1444,37 @@ user_moved_locked(void)
 }
 
 //! Where the window is now, the extension says what scale its monitor has, ahead of
-//! the fractional-scale protocol: compute sizes for that.
+//! the fractional-scale protocol: compute sizes for that (dxr_wl_window_scale120).
+//! In mutter's physical layout the extension's figure (device px per stage px) is 1
+//! on every monitor, which is not the window's scale there: taking it for one, a
+//! window that had just landed on a 200 % panel was "expected" at 100 %, and the
+//! size it keeps in device px (1200x960 for a 600x480 window kept at its logical
+//! size, #266) was asked for at 100 % as 1200x960 logical px, then doubled again
+//! when the panel's scale came (2400x1920 device px). There the window's scale is the
+//! highest of the monitors its frame is on (dxr_wl_highest_scale_under).
 static void
 follow_window_scale_locked(void)
 {
-	if (!win_mapped(&s_wl.win) || s_wl.win.device_scale <= 0.0)
+	if (!win_mapped(&s_wl.win))
 		return;
-	uint32_t t120 = (uint32_t)lround(120.0 * s_wl.win.device_scale);
+	int physical = layout_locked() == DXR_LAYOUT_PHYSICAL;
+	unsigned under120 = 0;
+	if (physical) {
+		DxrWlRect4 r[DXR_WL_MAX_OUTPUTS];
+		unsigned s120[DXR_WL_MAX_OUTPUTS];
+		for (int i = 0; i < DXR_WL_MAX_OUTPUTS; i++) {
+			const struct dxr_wl_output *o = &s_wl.outputs[i];
+			DxrWlRect4 none = {0, 0, 0, 0};
+			int on = o->registry_name && o->lw > 0;
+			r[i] = on ? output_rect(o) : none;
+			s120[i] = on ? output_scale120_locked(o, DXR_LAYOUT_PHYSICAL) : 0;
+		}
+		under120 = dxr_wl_highest_scale_under(r, s120, DXR_WL_MAX_OUTPUTS, s_wl.win.x, s_wl.win.y, s_wl.win.w,
+		                                      s_wl.win.h);
+	}
+	uint32_t t120 = dxr_wl_window_scale120(physical, s_wl.win.device_scale, under120);
+	if (!t120)
+		return;
 	s_wl.expect_scale120 = t120 != s_wl.scale120 ? t120 : 0;
 }
 
