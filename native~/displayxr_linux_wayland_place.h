@@ -68,6 +68,25 @@ dxr_wl_window_on_rect(DxrWlRect4 panel, int x, int y, int w, int h)
 	return cx >= panel.x && cx < panel.x + panel.w && cy >= panel.y && cy < panel.y + panel.h;
 }
 
+//! The output (an index into @p outs, @p n of them; a rect with no size = no
+//! output) a window of size w x h with its top-left at (x, y) is on once there: the
+//! one under its centre (dxr_wl_window_on_rect), where mutter puts it and whose
+//! scale it then gets; when its centre is on none (partly off the desktop), the one
+//! under (x, y). -1: neither. For a window across a monitor edge the output under
+//! its top-left is another one, with another scale.
+static inline int
+dxr_wl_output_for_window(const DxrWlRect4 *outs, int n, int x, int y, int w, int h)
+{
+	if (w > 0 && h > 0)
+		for (int i = 0; i < n; i++)
+			if (dxr_wl_window_on_rect(outs[i], x, y, w, h))
+				return i;
+	for (int i = 0; i < n; i++)
+		if (dxr_wl_window_on_rect(outs[i], x, y, 0, 0))
+			return i;
+	return -1;
+}
+
 //! A saved position (X root px, as the app restores it) is a place on the 3D
 //! panel today: converted back to stage px with the XWayland scale n, the window
 //! (stage size w x h; 0 = unknown) would sit on `panel`. A position saved under
@@ -151,6 +170,56 @@ static inline int
 dxr_wl_keeps_opening_size(int asked, int startup, int window_new)
 {
 	return !asked && (startup || window_new);
+}
+
+//! Fit a window's logical size *lw x *lh into 95 % of an output (stage px
+//! out_w x out_h), keeping its aspect: a window the compositor cannot fit gets
+//! squeezed or maximized, and the player then resets it to the desktop size (and
+//! saves that). @p stage_per_px: stage px per logical px, 1 in logical layout, the
+//! output's integer scale in physical layout.
+static inline void
+dxr_wl_fit_output(int *lw, int *lh, int out_w, int out_h, double stage_per_px)
+{
+	if (out_w <= 0 || out_h <= 0 || *lw <= 0 || *lh <= 0)
+		return;
+	if (stage_per_px <= 0.0)
+		stage_per_px = 1.0;
+	double max_w = 0.95 * out_w / stage_per_px, max_h = 0.95 * out_h / stage_per_px;
+	double f = 1.0;
+	if (*lw > max_w)
+		f = max_w / *lw;
+	if (*lh * f > max_h)
+		f = max_h / *lh;
+	if (f < 1.0) {
+		*lw = (int)(*lw * f); // (positive: truncation = floor)
+		*lh = (int)(*lh * f);
+	}
+}
+
+//! The size the window will have on an output once moved there, stage px: what
+//! centring it there or judging a saved position there has to go by.
+//! @p keep_logical (dxr_wl_keeps_opening_size): the move keeps its logical size
+//! lw x lh; else it keeps the device size dw x dh (the app's request, or the size
+//! where its scale was first known; <= 0 = none: lw x lh). @p t120: the output's
+//! device px per logical px x 120 (0 = unknown: taken as 1); @p cur120: the
+//! window's now. On another scale the player is asked for the size anew, fitted
+//! into the output (dxr_wl_fit_output); on the same one the window keeps its size.
+//! @p physical: mutter's physical layout (stage px = device px), else logical
+//! (stage px = logical px). out_w x out_h: the output's stage size.
+static inline void
+dxr_wl_size_after_move(int keep_logical, int lw, int lh, int dw, int dh, unsigned t120, unsigned cur120, int physical,
+                       int out_w, int out_h, int *res_w, int *res_h)
+{
+	double s = t120 ? t120 / 120.0 : 1.0;
+	int w = lw, h = lh; // logical px there
+	if (!keep_logical && dw > 0 && dh > 0) {
+		w = dxr_wl_round(dw / s);
+		h = dxr_wl_round(dh / s);
+	}
+	if (t120 && t120 != cur120)
+		dxr_wl_fit_output(&w, &h, out_w, out_h, physical ? s : 1.0);
+	*res_w = physical ? dxr_wl_round(w * s) : w;
+	*res_h = physical ? dxr_wl_round(h * s) : h;
 }
 
 //! DISPLAYXR_PANEL_PLACEMENT turns the start-up placement off: "0", "off", "no" or
