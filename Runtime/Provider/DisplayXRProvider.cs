@@ -157,6 +157,17 @@ namespace DisplayXR
         public static bool MoveWindowToDisplay() =>
             IsRunning && DisplayXRProviderNative.dxr_prov_move_window_to_display() != 0;
 
+        // The same move as part of the app's start (DisplayXRTargetDisplay's moveOnStart):
+        // on Linux native Wayland it keeps the size the window opened with while nobody
+        // has placed the window, as the start-up placement does, however late the
+        // session's first frames come. Elsewhere it is MoveWindowToDisplay.
+        internal static bool MoveWindowToDisplayAtStart()
+        {
+            if (!IsRunning) return false;
+            try { return DisplayXRProviderNative.dxr_prov_move_window_to_display_at_start() != 0; }
+            catch (System.EntryPointNotFoundException) { return MoveWindowToDisplay(); } // older native
+        }
+
         /// <summary>
         /// (#266) The panel's origin on the Windows virtual desktop, in signed physical
         /// pixels. False when the runtime predates <c>XR_DXR_display_info</c> v16.

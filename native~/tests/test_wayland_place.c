@@ -128,6 +128,20 @@ main(void)
 	CHECK(!dxr_wl_keeps_opening_size(1, 1, 1));
 	CHECK(!dxr_wl_keeps_opening_size(1, 1, 0));
 	CHECK(!dxr_wl_keeps_opening_size(1, 0, 1));
+	// Which moves are start-up moves (one rule for all of them): the start-up
+	// placement and DisplayXRTargetDisplay's move at start, while nobody has placed
+	// the window. A move the app asks for later (MoveNow) is not one, nor is a move at
+	// start after the app (a restored position) or the user (a drag) placed it.
+	CHECK(dxr_wl_is_start_move(1, 0));
+	CHECK(!dxr_wl_is_start_move(1, 1));
+	CHECK(!dxr_wl_is_start_move(0, 0));
+	CHECK(!dxr_wl_is_start_move(0, 1));
+	// DisplayXRTargetDisplay at start after a slow first frame (the window shown more
+	// than 3 s ago: restore window closed) keeps the opening size; MoveNow then does
+	// not; the app's size stands either way.
+	CHECK(dxr_wl_keeps_opening_size(0, dxr_wl_is_start_move(1, 0), 0));
+	CHECK(!dxr_wl_keeps_opening_size(0, dxr_wl_is_start_move(0, 0), 0));
+	CHECK(!dxr_wl_keeps_opening_size(1, dxr_wl_is_start_move(1, 0), 0));
 
 	// Fitting into 95 % of an output, aspect kept (to a pixel: the limit is not exact
 	// in binary floating point).

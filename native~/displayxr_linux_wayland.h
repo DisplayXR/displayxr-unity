@@ -105,6 +105,11 @@ int dxr_wl_take_player_size(int *out_w, int *out_h);
 //! only when exactly one output has it), centred. 1 when it is there or will be
 //! once mapped; placement is asynchronous (the GNOME extension's worker).
 int dxr_wl_move_player_to_panel(const char *connector, int panel_w, int panel_h);
+//! The same, as the app's move at start (DisplayXRTargetDisplay once the session
+//! runs): while neither the app nor the user has placed the window it keeps the
+//! size the window opened with, as the start-up placement does
+//! (dxr_wl_is_start_move). A move the app asks for later uses the one above.
+int dxr_wl_move_player_to_panel_at_start(const char *connector, int panel_w, int panel_h);
 //! The start-up placement (on by default; dxr_prov_place_window_at_start): the same
 //! move, unless the app or the user has placed the window this run, or it is on the
 //! panel already. A window not shown yet answers DXR_WL_STARTUP_WAIT: ask again
