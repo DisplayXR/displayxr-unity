@@ -97,6 +97,38 @@ dxr_wl_output_for_window(const DxrWlRect4 *outs, const int *ws, const int *hs, c
 	return -1;
 }
 
+//! The highest scale (x 120) of the outputs (@p outs, their scales @p scale120, @p n
+//! of them; a rect with no size = no output) a window frame (x, y, w, h) is on, even
+//! partly: the scale mutter gives a window across monitors (measured: mutter 50,
+//! physical layout). 0: it is on none.
+static inline unsigned
+dxr_wl_highest_scale_under(const DxrWlRect4 *outs, const unsigned *scale120, int n, int x, int y, int w, int h)
+{
+	unsigned best = 0;
+	for (int i = 0; i < n; i++) {
+		const DxrWlRect4 o = outs[i];
+		if (o.w > 0 && o.h > 0 && w > 0 && h > 0 && x < o.x + o.w && o.x < x + w && y < o.y + o.h && o.y < y + h &&
+		    scale120[i] > best)
+			best = scale120[i];
+	}
+	return best;
+}
+
+//! The scale (x 120) the window gets where the GNOME extension reports it now,
+//! ahead of the fractional-scale protocol. The extension reports device px per
+//! stage px (@p device_scale) for the window's monitor: that monitor's scale in
+//! mutter's logical layout, but 1 on every monitor in the physical layout
+//! (@p physical: stage px = device px), where the window's scale is the highest
+//! scale of the monitors it is on (@p under120: dxr_wl_highest_scale_under). 0:
+//! cannot be told.
+static inline unsigned
+dxr_wl_window_scale120(int physical, double device_scale, unsigned under120)
+{
+	if (physical)
+		return under120;
+	return device_scale > 0.0 ? (unsigned)dxr_wl_round(120.0 * device_scale) : 0;
+}
+
 //! A saved position (X root px, as the app restores it) is a place on the 3D
 //! panel today: converted back to stage px with the XWayland scale n, the window
 //! (stage size w x h; 0 = unknown) would sit on `panel`. A position saved under

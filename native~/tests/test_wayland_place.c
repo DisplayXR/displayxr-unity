@@ -249,6 +249,23 @@ main(void)
 	// Further right (1720): on the panel at both sizes.
 	CHECK(dxr_wl_output_for_window(phys, pw, ph, psc, 2, 1720, 100) == 1);
 
+	// The scale the window gets where the extension reports it. Logical layout: the
+	// extension's device px per stage px for its monitor. Physical layout: that figure
+	// is 1 everywhere; the window gets the highest scale of the monitors it is on
+	// (it flapped at 2 while 150 px of it were on the panel, its centre on the laptop).
+	CHECK(dxr_wl_window_scale120(0, 2.0, 0) == 240);
+	CHECK(dxr_wl_window_scale120(0, 4.0 / 3.0, 0) == 160);
+	CHECK(dxr_wl_window_scale120(0, 0.0, 240) == 0); // not reported
+	CHECK(dxr_wl_window_scale120(1, 1.0, 240) == 240);
+	CHECK(dxr_wl_window_scale120(1, 1.0, 0) == 0);
+	CHECK(dxr_wl_highest_scale_under(phys, psc, 2, 3240, 600, 1200, 1008) == 240); // centred on the panel
+	CHECK(dxr_wl_highest_scale_under(phys, psc, 2, 660, 304, 600, 504) == 120);    // on the laptop
+	CHECK(dxr_wl_highest_scale_under(phys, psc, 2, 1470, 100, 600, 504) == 240);   // 150 px on the panel
+	CHECK(dxr_wl_highest_scale_under(phys, psc, 2, 1470, 100, 300, 264) == 120);   // shrunk off it
+	CHECK(dxr_wl_highest_scale_under(phys, psc, 2, 1620, 100, 300, 264) == 120);   // touching the edge only
+	CHECK(dxr_wl_highest_scale_under(phys, psc, 2, -900, -900, 300, 264) == 0);    // on none
+	CHECK(dxr_wl_highest_scale_under(phys, psc, 2, 0, 0, 0, 0) == 0);              // no frame
+
 	// DISPLAYXR_PANEL_PLACEMENT.
 	CHECK(!dxr_startup_placement_env_off(NULL));
 	CHECK(!dxr_startup_placement_env_off(""));
