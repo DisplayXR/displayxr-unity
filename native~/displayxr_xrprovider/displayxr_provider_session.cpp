@@ -8604,6 +8604,57 @@ static void ps_fit_window_to_monitor(HWND hwnd, const MONITORINFO *mi)
 	       (int)(mi->rcMonitor.right - mi->rcMonitor.left), (int)(mi->rcMonitor.bottom - mi->rcMonitor.top),
 	       resized ? "fitted" : "re-centred", fvw, fvh, x + bl, y + bt, ok ? 1 : 0);
 }
+
+// A full-screen window: no title bar and no sizing frame (WS_POPUP-style), not maximized,
+// and covering the whole of the monitor it is on. That is Unity's FullScreenWindow
+// ("borderless full screen", a WS_POPUP window the size of the monitor), and the same
+// shape made any other way. Windows does not report it as maximized, so IsZoomed() does
+// not catch it. Read it BEFORE the move, on the monitor the window is leaving: after the
+// move it covers nothing yet. A borderless window that does not cover its monitor (a
+// chrome-less windowed app; a transparent overlay app's main window, parked off-screen)
+// is an ordinary window and gets ps_fit_window_to_monitor.
+static bool ps_window_is_full_screen(LONG_PTR style, const RECT *wr, HMONITOR cur)
+{
+	if ((style & WS_CAPTION) == WS_CAPTION || (style & WS_THICKFRAME) != 0) return false;
+	if ((style & (WS_MAXIMIZE | WS_MINIMIZE)) != 0) return false; // left alone, as before
+	MONITORINFO cmi;
+	cmi.cbSize = sizeof(MONITORINFO);
+	if (!cur || !GetMonitorInfo(cur, &cmi)) return false;
+	return wr->left <= cmi.rcMonitor.left && wr->top <= cmi.rcMonitor.top &&
+	       wr->right >= cmi.rcMonitor.right && wr->bottom >= cmi.rcMonitor.bottom;
+}
+
+// After the move, make a full-screen window (ps_window_is_full_screen) cover the panel's
+// whole monitor: rcMonitor, not the work area, and no aspect fit. Same inside-the-pinned-
+// scope rule as ps_fit_window_to_monitor. It is what Unity does itself when it moves a
+// full-screen window to another display (Screen.MoveMainWindowTo "snaps the position to
+// the top left corner of the display and resizes it to fit"). The work-area fit would
+// make it a letterboxed borderless window that leaves the taskbar strip of the panel
+// uncovered. Leaving it alone would keep whatever WM_DPICHANGED made of it, which on a
+// higher-scale panel is a window larger than the panel (2560x1600 at 150 % becomes
+// 5120x3200 on a 300 % panel): the black-panel case above. A no-op when the player
+// already re-fitted itself to the panel.
+static void ps_cover_monitor(HWND hwnd, const MONITORINFO *mi)
+{
+	const RECT &m = mi->rcMonitor;
+	const int mw = (int)(m.right - m.left), mh = (int)(m.bottom - m.top);
+	RECT wr = {0, 0, 0, 0};
+	if (!GetWindowRect(hwnd, &wr)) return;
+	if (EqualRect(&wr, &m)) {
+		ps_log("[DisplayXR-PROV] move_window_to_display: the full-screen window covers the panel "
+		       "(%d,%d %dx%d)\n",
+		       (int)m.left, (int)m.top, mw, mh);
+		return;
+	}
+	const BOOL ok = SetWindowPos(hwnd, NULL, (int)m.left, (int)m.top, mw, mh, SWP_NOZORDER | SWP_NOACTIVATE);
+	RECT now = {0, 0, 0, 0};
+	GetWindowRect(hwnd, &now);
+	ps_log("[DisplayXR-PROV] move_window_to_display: after the move the full-screen window is %dx%d "
+	       "at (%d,%d) - covering the panel (%d,%d %dx%d) rc=%d, now %dx%d at (%d,%d)\n",
+	       (int)(wr.right - wr.left), (int)(wr.bottom - wr.top), (int)wr.left, (int)wr.top, (int)m.left,
+	       (int)m.top, mw, mh, ok ? 1 : 0, (int)(now.right - now.left), (int)(now.bottom - now.top),
+	       (int)now.left, (int)now.top);
+}
 #endif
 
 // @p at_start: DisplayXRTargetDisplay's move once the session runs, not one the app
@@ -8664,6 +8715,9 @@ static int ps_move_window_to_display(int at_start)
 			ps_log("[DisplayXR-PROV] move_window_to_display: already on the 3D display\n");
 			rc = 1;
 		} else {
+			// Full-screen on the monitor it is leaving? Only answerable now.
+			const LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+			const bool full_screen = ps_window_is_full_screen(style, &wr, cur);
 			// Centre it, and clamp so a window LARGER than the panel still lands
 			// with its top-left on the panel rather than off the top/left edge
 			// where the title bar becomes unreachable.
@@ -8674,11 +8728,15 @@ static int ps_move_window_to_display(int at_start)
 			rc = SetWindowPos(hwnd, NULL, x, y, 0, 0,
 			                  SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE) ? 1 : 0;
 			ps_log("[DisplayXR-PROV] move_window_to_display: (%d,%d) %dx%d -> (%d,%d) on "
-			       "monitor (%d,%d %dx%d) rc=%d\n",
+			       "monitor (%d,%d %dx%d) rc=%d style=0x%08x%s\n",
 			       (int)wr.left, (int)wr.top, ww, wh, x, y,
-			       (int)mi.rcMonitor.left, (int)mi.rcMonitor.top, mw, mh, rc);
+			       (int)mi.rcMonitor.left, (int)mi.rcMonitor.top, mw, mh, rc,
+			       (unsigned)(DWORD)style, full_screen ? " full-screen" : "");
 			if (rc && !IsZoomed(hwnd) && !IsIconic(hwnd)) {
-				ps_fit_window_to_monitor(hwnd, &mi);
+				if (full_screen)
+					ps_cover_monitor(hwnd, &mi);
+				else
+					ps_fit_window_to_monitor(hwnd, &mi);
 			}
 		}
 	}
