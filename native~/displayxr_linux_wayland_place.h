@@ -215,6 +215,37 @@ dxr_wl_keeps_opening_size(int asked, int startup, int window_new)
 	return !asked && (startup || window_new);
 }
 
+//! #361's restore window, the window "is new": a saved position the app restores is
+//! checked against the 3D panel, and a placement keeps the size the window opened
+//! with (dxr_wl_keeps_opening_size's @p window_new), while it is open. It is the
+//! app's start, so it is measured in the time the app has been RUNNING since its
+//! window was shown, not on the wall clock: a slow first frame (shader warm-up, a
+//! stalled main thread) would otherwise close it before the app's first frames, and
+//! with them its own placement (a saved position restored on its first frame, then
+//! DisplayXRTargetDisplay's move), have run. dxr_wl_running_after_frame adds one
+//! frame to @p running_ns; the window is open while @p running_ns is at most
+//! @p running_limit_ns and the wall-clock time since the window was shown
+//! (@p shown_ns) at most @p wall_limit_ns (an app paused for minutes does not keep it
+//! open). The user moving the window closes it too (not here).
+static inline int
+dxr_wl_restore_window_open(long long running_ns, long long shown_ns, long long running_limit_ns,
+                           long long wall_limit_ns)
+{
+	return running_ns <= running_limit_ns && shown_ns <= wall_limit_ns;
+}
+
+//! One frame of the app's: the time since the previous one (@p prev_ns, 0 = none:
+//! nothing to add), but at most @p max_gap_ns, so a frame that took longer (a stall)
+//! counts as a normal one would. Returns the new running time.
+static inline long long
+dxr_wl_running_after_frame(long long running_ns, long long prev_ns, long long now_ns, long long max_gap_ns)
+{
+	if (prev_ns <= 0 || now_ns <= prev_ns)
+		return running_ns;
+	long long d = now_ns - prev_ns;
+	return running_ns + (d < max_gap_ns ? d : max_gap_ns);
+}
+
 //! A move is a start-up move (dxr_wl_keeps_opening_size's @p startup): one made as
 //! part of the app's start (@p at_start: the start-up placement, which only moves a
 //! window nobody has placed, or DisplayXRTargetDisplay's move once the session runs,

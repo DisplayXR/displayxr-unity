@@ -85,7 +85,9 @@
 #define DXR_WL_MAX_CORRECTIONS 3 // re-placements per map: never fight the compositor
 #define DXR_WL_VERIFY_TRIES 3      // panel moves re-checked and retried (#361)
 #define DXR_WL_VERIFY_DELAY_MS 350 // ... this long after each: ~1 s for all of them
-#define DXR_WL_RESTORE_WINDOW_NS 3000000000LL // a saved position is checked until 3 s after the first map
+#define DXR_WL_RESTORE_WINDOW_NS 3000000000LL // the window is new for 3 s of the app RUNNING after its first map
+#define DXR_WL_RESTORE_WALL_NS 20000000000LL  // ... and 20 s on the clock at most
+#define DXR_WL_FRAME_GAP_NS 250000000LL       // a frame counts this long at most (a stall: one frame)
 #define DXR_WL_SIZE_SETTLE_NS 1000000000LL    // a size handed to the player is checked 1 s later
 #define DXR_WL_STARTUP_WAIT_NS 5000000000LL   // the start-up placement waits this long for the window to show
 
@@ -253,9 +255,13 @@ static struct {
 
 	// A saved position the app restores (displayxr_set_overlay_position) is
 	// checked against the 3D panel until the window has been on screen a moment
-	// and the user has not moved it (#361): restore_open, first_map_ns.
+	// and the user has not moved it (#361): restore_open, first_map_ns. "A moment"
+	// is the app's running time since then (running_ns, one frame at a time from
+	// weave_poll, last_frame_ns), not the wall clock (dxr_wl_restore_window_open).
 	int restore_open;
 	long long first_map_ns;
+	long long running_ns;
+	long long last_frame_ns;
 	int drag_end_pending; // log where the user left the window, once reported
 
 	// The start-up placement (dxr_wl_place_player_at_start). app_placed: the app
@@ -999,6 +1005,8 @@ dxr_wl_weave_surface_create(struct wl_display *display, struct wl_surface *paren
 	// A new session: a saved position the app restores now is checked (#361).
 	s_wl.restore_open = 1;
 	s_wl.first_map_ns = win_mapped(&s_wl.win) ? mono_ns() : 0;
+	s_wl.running_ns = 0;
+	s_wl.last_frame_ns = 0;
 	s_wl.drag_end_pending = 0;
 	stop_verify_locked();
 	s_wl.geometry_dirty = 0; // the create-time size goes into XrWaylandSurfaceGeometryDXR
@@ -1101,6 +1109,14 @@ dxr_wl_weave_poll(int *out_w, int *out_h)
 		pthread_mutex_unlock(&s_wl_mutex);
 		return 0;
 	}
+	// One frame of the app's (the provider polls once per frame): the restore
+	// window's clock, from the window's first show on (restore_open_locked).
+	long long now = mono_ns();
+	if (s_wl.first_map_ns) {
+		long long prev = s_wl.last_frame_ns > s_wl.first_map_ns ? s_wl.last_frame_ns : s_wl.first_map_ns;
+		s_wl.running_ns = dxr_wl_running_after_frame(s_wl.running_ns, prev, now, DXR_WL_FRAME_GAP_NS);
+	}
+	s_wl.last_frame_ns = now;
 	// The player made a new window surface (it does on a resolution change, and
 	// may recreate the wl_surface itself, possibly at the same address): re-attach.
 	// The sub-surface of a destroyed parent is inert, and re-attaching to a live
@@ -1423,11 +1439,18 @@ stop_verify_locked(void)
 }
 
 //! A position the app sets now is (still) a restore of a saved one: the window
-//! has not been on screen long, and the user has not moved it.
+//! has not been on screen long (3 s of the app running since, 20 s at most on the
+//! clock: dxr_wl_restore_window_open), and the user has not moved it. A slow first
+//! frame does not use the window up, so a saved position the app restores on its
+//! first frame, and DisplayXRTargetDisplay's move after it, still count as the
+//! app's start: the restore is checked against the panel and keeps the size the
+//! window opened with, as the move does.
 static int
 restore_open_locked(void)
 {
-	if (s_wl.restore_open && s_wl.first_map_ns && mono_ns() - s_wl.first_map_ns > DXR_WL_RESTORE_WINDOW_NS)
+	if (s_wl.restore_open && s_wl.first_map_ns &&
+	    !dxr_wl_restore_window_open(s_wl.running_ns, mono_ns() - s_wl.first_map_ns, DXR_WL_RESTORE_WINDOW_NS,
+	                                DXR_WL_RESTORE_WALL_NS))
 		s_wl.restore_open = 0;
 	return s_wl.restore_open;
 }
