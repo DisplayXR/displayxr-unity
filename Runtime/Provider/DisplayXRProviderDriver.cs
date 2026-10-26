@@ -1028,9 +1028,11 @@ namespace DisplayXR
         // Y is returned RELATIVE to a full-area RT under the same rule, so a letterbox keeps the
         // exact anchor-to-content relation of the HW-verified Free Aspect placement (the same
         // RT height gives the same anchor with or without side bars). Leaves the fallback
-        // values untouched when the inputs are implausible.
+        // values untouched when the inputs are implausible. roundsBottomEdge =
+        // SystemInfo.graphicsUVStartsAtTop of the device the Game view draws with (a
+        // parameter, so the rule has no hidden global input and can be exercised both ways).
         static void LetterboxOffsetsLikeUnity(float hostWPt, float drawWPt, float drawHPt, int fitW, int fitH,
-                                              float ptToPx, ref int offX, ref int offY)
+                                              float ptToPx, bool roundsBottomEdge, ref int offX, ref int offY)
         {
             float side = (hostWPt - drawWPt) * 0.5f;
             if (!(side >= 0f && side <= 4f) || !(drawHPt > 1f)) return;
@@ -1043,7 +1045,6 @@ namespace DisplayXR
             // pt -> px rounds HALF UP: at 250% a whole-point edge can fall on x.5 px and Unity's RT
             // then starts on the NEXT pixel (#740: 5 px of slack measured as +3, not +2).
             offX = Mathf.FloorToInt((side + Mathf.Round((drawWPt - rtWPt) * 0.5f)) * ptToPx + 0.5f);
-            bool roundsBottomEdge = SystemInfo.graphicsUVStartsAtTop;
             float yPt = roundsBottomEdge ? Mathf.Round((drawHPt + rtHPt) * 0.5f) - rtHPt
                                          : Mathf.Round((drawHPt - rtHPt) * 0.5f);
             float fullPt = roundsBottomEdge ? Mathf.Round(drawHPt) - drawHPt : 0f;
@@ -1425,7 +1426,8 @@ namespace DisplayXR
                                 int offY = (rh - fitH) / 2;
                                 if (haveDraw && ptToPx > 0.5f && ptToPx < 8f)
                                     LetterboxOffsetsLikeUnity(host.width, draw.width, draw.height, fitW, fitH,
-                                                              ptToPx, ref offX, ref offY);
+                                                              ptToPx, SystemInfo.graphicsUVStartsAtTop,
+                                                              ref offX, ref offY);
                                 rx += offX;
                                 ry += offY;
                                 rw = fitW;
