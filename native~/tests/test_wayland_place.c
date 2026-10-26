@@ -115,6 +115,20 @@ main(void)
 	CHECK(dxr_wl_startup_action(0, 1, left, primary, 960, 508, 640, 424, t0, lim) == DXR_WL_STARTUP_MOVE);
 	CHECK(dxr_wl_startup_action(0, 1, left, left, -1280, 328, 640, 424, t0, lim) == DXR_WL_STARTUP_THERE);
 
+	// Which moves keep the size the window opened with (logical) rather than its
+	// device size. The start-up placement does, also after #361's 3 s restore window
+	// (a slow first frame delays the session's second frame past it).
+	CHECK(dxr_wl_keeps_opening_size(0, 1, 1));
+	CHECK(dxr_wl_keeps_opening_size(0, 1, 0));
+	// Another placement while the window is new (a move to the panel, a restore).
+	CHECK(dxr_wl_keeps_opening_size(0, 0, 1));
+	// ... but not later: as on X11, a later move keeps the device size.
+	CHECK(!dxr_wl_keeps_opening_size(0, 0, 0));
+	// A size the app asked for always stands.
+	CHECK(!dxr_wl_keeps_opening_size(1, 1, 1));
+	CHECK(!dxr_wl_keeps_opening_size(1, 1, 0));
+	CHECK(!dxr_wl_keeps_opening_size(1, 0, 1));
+
 	// DISPLAYXR_PANEL_PLACEMENT.
 	CHECK(!dxr_startup_placement_env_off(NULL));
 	CHECK(!dxr_startup_placement_env_off(""));
