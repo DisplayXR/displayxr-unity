@@ -194,10 +194,6 @@ typedef struct XrEventDataEyeTrackingStateChangedDXR {
     XrEyeTrackingModeDXR activeMode; // Session's MANAGED/MANUAL preference
 } XrEventDataEyeTrackingStateChangedDXR;
 
-// --- Shared texture output rect (canvas positioning for weaver alignment) ---
-typedef XrResult (XRAPI_PTR *PFN_xrSetSharedTextureOutputRectDXR)(
-    XrSession session, int32_t x, int32_t y, uint32_t width, uint32_t height);
-
 // --- 2D surround texture (post-weave fill of the non-canvas region) ---
 // XR_DXR_win32_window_binding spec v6 (D3D11 keyed-mutex) / v7 (D3D12 fence).
 // The runtime blits the non-canvas pixels of the output (HWND back buffer or
@@ -224,9 +220,10 @@ typedef void (*PFN_xrReadbackCallback)(const uint8_t *pixels, uint32_t width, ui
 #define XR_DXR_WIN32_WINDOW_BINDING_EXTENSION_NAME "XR_DXR_win32_window_binding"
 // SPEC_VERSION 7 adds xrSetSharedTextureSurround2DFenceEXT (D3D12 fence-synced
 // 2D surround); v6 added xrSetSharedTextureSurround2DEXT (D3D11 keyed-mutex).
-// SPEC_VERSION 5 adds chromaKeyColor — runtime-side post-weave chroma-key
-// conversion that writes alpha=0 for matching pixels before the DComp
-// (D3D12) or BitBlt (D3D11) present (runtime-pvt #191).
+// SPEC_VERSION 5 added chromaKeyColor (runtime-side post-weave chroma-key);
+// spec 8 removed it again. The plugin always sent 0, and the field was the
+// struct's trailing member sitting in what is now tail padding, so dropping it
+// changes neither the size nor any published offset.
 // SPEC_VERSION 4 added transparentBackgroundEnabled.
 // SPEC_VERSION 3 added sharedTextureHandle. The CreateInfo struct is unchanged
 // since v5 (surround is a separate entry-point family, not new struct fields);
@@ -244,7 +241,6 @@ typedef struct XrWin32WindowBindingCreateInfoDXR {
     void *readbackUserdata;
     void *sharedTextureHandle; // D3D11 shared HANDLE
     XrBool32 transparentBackgroundEnabled; // SPEC_VERSION 4: opt-in BitBlt/DComp swapchain
-    uint32_t chromaKeyColor; // SPEC_VERSION 5: Win32 COLORREF (0x00BBGGRR); 0 = no post-weave conversion
 } XrWin32WindowBindingCreateInfoDXR;
 
 typedef struct XrCompositionLayerWindowSpaceDXR {

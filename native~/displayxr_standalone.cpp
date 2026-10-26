@@ -169,7 +169,6 @@ typedef struct StandaloneState {
 	PFN_xrRequestDisplayModeDXR pfn_request_display_mode;
 	PFN_xrRequestDisplayRenderingModeDXR pfn_request_rendering_mode;
 	PFN_xrEnumerateDisplayRenderingModesDXR pfn_enumerate_rendering_modes;
-	PFN_xrSetSharedTextureOutputRectDXR pfn_set_output_rect;
 	PFN_xrSetSharedTextureSurround2DFenceEXT pfn_set_surround_fence;
 	uint32_t canvas_width;
 	uint32_t canvas_height;
@@ -385,11 +384,6 @@ resolve_functions(void)
 		if (XR_SUCCEEDED(s_sa.gipa(s_sa.instance, "xrEnumerateDisplayRenderingModesDXR", &fn)) && fn) {
 			s_sa.pfn_enumerate_rendering_modes = (PFN_xrEnumerateDisplayRenderingModesDXR)fn;
 			sa_log("[DisplayXR-SA] Resolved xrEnumerateDisplayRenderingModesDXR\n");
-		}
-		fn = NULL;
-		if (XR_SUCCEEDED(s_sa.gipa(s_sa.instance, "xrSetSharedTextureOutputRectDXR", &fn)) && fn) {
-			s_sa.pfn_set_output_rect = (PFN_xrSetSharedTextureOutputRectDXR)fn;
-			sa_log("[DisplayXR-SA] Resolved xrSetSharedTextureOutputRectDXR\n");
 		}
 		fn = nullptr;
 		if (XR_SUCCEEDED(s_sa.gipa(s_sa.instance, "xrSetSharedTextureSurround2DFenceEXT", &fn)) && fn) {
@@ -660,30 +654,13 @@ destroy_atlas_swapchain(void)
 
 
 #if defined(_WIN32)
-// Push the canvas rect to the runtime via xrSetSharedTextureOutputRectDXR.
-// canvas_offset_x/y are WINDOW-RELATIVE (offset within the client area),
-// not screen-relative — the SR weaver adds these to its own window position
-// when computing phase alignment. Since our canvas IS the full window with
-// no letterbox, the offset is always (0, 0) and the size is the client area.
+// Canvas rect push: a no-op. xrSetSharedTextureOutputRectDXR was removed from
+// the runtime (ADR-031; display zones are the sole region mechanism), so a quilt
+// path revived from this file must declare its canvas through XR_DXR_display_zones
+// instead. Kept as a stub so the call sites below stay in place.
 static void
 sa_push_canvas_rect_to_runtime(void)
 {
-	if (!s_sa.pfn_set_output_rect || s_sa.session == XR_NULL_HANDLE)
-		return;
-	// 2D surround (#131): when a sub-rect is registered, the 3D weaves into it
-	// (window-relative pixels) and the rest becomes the surround region.
-	if (s_sa.surround_subrect_valid &&
-	    s_sa.surround_subrect_w > 0 && s_sa.surround_subrect_h > 0) {
-		s_sa.pfn_set_output_rect(s_sa.session,
-		                          s_sa.surround_subrect_x, s_sa.surround_subrect_y,
-		                          s_sa.surround_subrect_w, s_sa.surround_subrect_h);
-		return;
-	}
-	if (s_sa.canvas_width > 0 && s_sa.canvas_height > 0) {
-		s_sa.pfn_set_output_rect(s_sa.session,
-		                          0, 0,
-		                          s_sa.canvas_width, s_sa.canvas_height);
-	}
 }
 
 static void
@@ -1552,7 +1529,7 @@ displayxr_standalone_begin_frame(int *should_render)
 		// XR_DXR_view_rig (#396): chain a rig descriptor so the runtime returns
 		// render-ready XrView{pose,fov}, and chain the raw channel to recover the
 		// raw display-space eyes (for the gizmo / eye cache). The runtime owns the
-		// window/canvas resolve (we pushed it via xrSetSharedTextureOutputRectDXR).
+		// window/canvas resolve.
 		XrDisplayRigDXR display_rig = {XR_TYPE_DISPLAY_RIG_DXR};
 		XrCameraRigDXR camera_rig = {XR_TYPE_CAMERA_RIG_DXR};
 		XrViewDisplayRawDXR raw_probe = {XR_TYPE_VIEW_DISPLAY_RAW_DXR};
