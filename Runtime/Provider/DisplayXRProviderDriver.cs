@@ -1015,6 +1015,41 @@ namespace DisplayXR
             catch { return false; }
         }
 
+        // (#420) Where Unity itself puts a letterboxed RT inside the Game view's render area.
+        // GameView.OnGUI centres the target in the zoom area and then rounds the draw rect to
+        // WHOLE POINTS: `drawRect.x = Mathf.Round(x); drawRect.y = Mathf.Round(y)`, where on a
+        // UV-starts-at-top device (D3D11/12, Vulkan, Metal) the rect is flipped first, so the y
+        // it rounds is the BOTTOM edge. Pixel-centring ((area - rt) / 2 in px) misses that by up
+        // to half a point: measured maximized 16:9 on a 300% DS1, (3840 - 2823) / 2 = 508 px
+        // while Unity draws at Round(169.5 pt) = 170 pt = 510 px, which the eye saw as an
+        // inverted view. Inputs are Unity's own numbers: hostWPt = HostView.screenPosition
+        // width, drawWPt / drawHPt = the zoom area drawRect (= position minus the toolbar), so
+        // (hostWPt - drawWPt) / 2 is the dock's side border (1 pt docked, 0 maximized/floating).
+        // Y is returned RELATIVE to a full-area RT under the same rule, so a letterbox keeps the
+        // exact anchor-to-content relation of the HW-verified Free Aspect placement (the same
+        // RT height gives the same anchor with or without side bars). Leaves the fallback
+        // values untouched when the inputs are implausible.
+        static void LetterboxOffsetsLikeUnity(float hostWPt, float drawWPt, float drawHPt, int fitW, int fitH,
+                                              float ptToPx, ref int offX, ref int offY)
+        {
+            float side = (hostWPt - drawWPt) * 0.5f;
+            if (!(side >= 0f && side <= 4f) || !(drawHPt > 1f)) return;
+            // ptToPx is MEASURED (pane px / pane pt, e.g. 2213 / 737.6666 = 3.0000003) while Unity
+            // converts with the exact backing scale; a whole-percent Windows scale is a multiple of
+            // 0.01, so snap to it — otherwise a Round(x.5) tie can land on the wrong side.
+            float snapped = Mathf.Round(ptToPx * 100f) / 100f;
+            if (Mathf.Abs(snapped - ptToPx) < 1e-3f) ptToPx = snapped;
+            float rtWPt = fitW / ptToPx, rtHPt = fitH / ptToPx;
+            // pt -> px rounds HALF UP: at 250% a whole-point edge can fall on x.5 px and Unity's RT
+            // then starts on the NEXT pixel (#740: 5 px of slack measured as +3, not +2).
+            offX = Mathf.FloorToInt((side + Mathf.Round((drawWPt - rtWPt) * 0.5f)) * ptToPx + 0.5f);
+            bool roundsBottomEdge = SystemInfo.graphicsUVStartsAtTop;
+            float yPt = roundsBottomEdge ? Mathf.Round((drawHPt + rtHPt) * 0.5f) - rtHPt
+                                         : Mathf.Round((drawHPt - rtHPt) * 0.5f);
+            float fullPt = roundsBottomEdge ? Mathf.Round(drawHPt) - drawHPt : 0f;
+            offY = Mathf.FloorToInt((yPt - fullPt) * ptToPx + 0.5f);
+        }
+
         // (#740) RT-CENTRING offset — the docked-only interlace phase error, measured.
         // Unity draws the Game view's render target CENTRED inside the pane: the pane's
         // client is 1733 px wide while the RT is 1728 (5 px of dock chrome), so the woven
@@ -1295,7 +1330,8 @@ namespace DisplayXR
                     // derived toolbar (pane height - mainSize height) is what silently
                     // absorbed the letterbox; this one cannot, because mainSize is not in it.
                     int toolbarPhys;
-                    if (TryGetPaneDrawRectPoints(out Rect draw) && host.height > draw.height)
+                    bool haveDraw = TryGetPaneDrawRectPoints(out Rect draw) && host.height > draw.height;
+                    if (haveDraw)
                         toolbarPhys = Mathf.RoundToInt((host.height - draw.height) * ptToPx);
                     else
                         toolbarPhys = Mathf.RoundToInt(toolbar * s_paneScaleK);
@@ -1373,8 +1409,13 @@ namespace DisplayXR
                             int fitH = Mathf.RoundToInt(rtH * fit);
                             if (fitW > 0 && fitH > 0 && (fitW != rw || fitH != rh))
                             {
-                                rx += (rw - fitW) / 2;
-                                ry += (rh - fitH) / 2;
+                                int offX = (rw - fitW) / 2;   // fallback: pixel centring
+                                int offY = (rh - fitH) / 2;
+                                if (haveDraw && ptToPx > 0.5f && ptToPx < 8f)
+                                    LetterboxOffsetsLikeUnity(host.width, draw.width, draw.height, fitW, fitH,
+                                                              ptToPx, ref offX, ref offY);
+                                rx += offX;
+                                ry += offY;
                                 rw = fitW;
                                 rh = fitH;
                                 // (#420) The toolbar-inset area [top + toolbarPhys, bottom) has the
