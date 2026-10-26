@@ -1336,13 +1336,21 @@ namespace DisplayXR
                         int rtW = Mathf.RoundToInt(size.x * sizeScale);
                         int rtH = Mathf.RoundToInt(size.y * sizeScale);
                         const int kChromeSlackMax = 64; // RtCentringOffsetX's own plausibility bound
+                        // Vertically the dock chrome is ALREADY out of `rh`: toolbarPhys is
+                        // host.height - draw.height, which holds the tab strip, the Game-view
+                        // toolbar AND the dock's 2 pt bottom border (DockArea.kBottomBorders).
+                        // So a Free Aspect RT matches `rh` to rounding (0 px at 300%, -1 at
+                        // 250%) and anything more is a real top/bottom letterbox, which this
+                        // bottom-aligned path would misplace by half the bar height (23 px
+                        // measured with 23/22 px bars, 300% DS1, #420).
+                        const int kRoundingSlackMax = 2;
                         bool chromeSlackOnly = s_lastAppliedDocked && !IsMatchedGameViewMaximized()
                             && rtW > 0 && rtH > 0
                             && pcw - rtW >= 0 && pcw - rtW <= kChromeSlackMax
                             // -2: mainSize is fractional (859.5 pt-derived px rounds to 860)
                             // while the toolbar-inset area rounds to 859 — a 1 px deficit
                             // that is rounding, not a letterbox (measured, 250% panel).
-                            && rh - rtH >= -2 && rh - rtH <= kChromeSlackMax;
+                            && rh - rtH >= -kRoundingSlackMax && rh - rtH <= kRoundingSlackMax;
                         if ((chromeSlackOnly ? 1 : 0) != s_lastChromeSlackOnly)
                         {
                             s_lastChromeSlackOnly = chromeSlackOnly ? 1 : 0;
@@ -1369,6 +1377,21 @@ namespace DisplayXR
                                 ry += (rh - fitH) / 2;
                                 rw = fitW;
                                 rh = fitH;
+                                // (#420) The toolbar-inset area [top + toolbarPhys, bottom) has the
+                                // right HEIGHT but sits one dock bottom border too LOW: that border
+                                // (2 pt) is inside toolbarPhys yet lies BELOW the render area, not
+                                // above it. Measured on a 300% DS1: Unity's area starts at
+                                // pane.top + 135 px while toolbarPhys = 141, so every docked
+                                // fixed-aspect anchor was 6-7 px low (inverted). The chrome-slack
+                                // path corrects this with the HW-verified #740 bottom margin; use
+                                // the same term here so a letterbox keeps exactly the
+                                // anchor-to-content relation of the verified Free Aspect placement.
+                                // (v2.32.1 applied it too, stacked with RtCentX; #421 dropped both.)
+                                // Not for maximized (area measured at pane.top + toolbarPhys) or
+                                // floating (its extra 2 pt is a TOP border, DockArea
+                                // kFloatingWindowTopBorderWidth, so the inset area is already right).
+                                if (s_lastAppliedDocked && !IsMatchedGameViewMaximized())
+                                    ry += RtCentringOffsetY(fitH, ppp);
                             }
                         }
                     }
