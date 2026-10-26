@@ -55,9 +55,22 @@ namespace DisplayXR
     [DisallowMultipleComponent]
     public class DisplayXRTargetDisplay : MonoBehaviour
     {
+        /// <summary>
+        /// Move the window onto the DisplayXR panel when the session starts. Off: the
+        /// window stays where it opened, and the default start-up placement (Linux
+        /// native Wayland, <see cref="PlaceOnPanelAtStart"/>) is turned off too, from
+        /// this component's <c>OnEnable</c>. That has to run before the session's
+        /// second frame: on a GameObject that is inactive then, or in a scene loaded
+        /// later, it is too late; set <see cref="PlaceOnPanelAtStart"/> = false from a
+        /// <c>[RuntimeInitializeOnLoadMethod]</c> instead (or
+        /// <c>DISPLAYXR_PANEL_PLACEMENT=0</c> for one run).
+        /// </summary>
         [Tooltip("Move the window onto the DisplayXR panel when the session starts. Off: " +
                  "the window stays where it opened, and the default start-up placement " +
-                 "(Linux native Wayland) is turned off too.")]
+                 "(Linux native Wayland) is turned off too, if this component is enabled " +
+                 "before the session's second frame. On an inactive object or in a scene " +
+                 "loaded later that is too late: set PlaceOnPanelAtStart = false from a " +
+                 "[RuntimeInitializeOnLoadMethod] instead.")]
         public bool moveOnStart = true;
 
         [Tooltip("How long to wait for the session before giving up, in seconds. The " +
@@ -96,6 +109,12 @@ namespace DisplayXR
         /// <c>[RuntimeInitializeOnLoadMethod]</c> or the first scene's <c>Awake</c> /
         /// <c>OnEnable</c> — or add this component with <see cref="moveOnStart"/> off. For
         /// one run without code: <c>DISPLAYXR_PANEL_PLACEMENT=0</c>.
+        /// </para>
+        /// <para>
+        /// The component turns it off from its <c>OnEnable</c>, so only when that runs
+        /// before the session's second frame: not on a GameObject that is inactive then,
+        /// nor in a scene loaded later. Use a <c>[RuntimeInitializeOnLoadMethod]</c> for
+        /// those.
         /// </para>
         /// </summary>
         public static bool PlaceOnPanelAtStart { get; set; } = true;
