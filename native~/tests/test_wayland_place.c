@@ -266,6 +266,36 @@ main(void)
 	CHECK(dxr_wl_highest_scale_under(phys, psc, 2, -900, -900, 300, 264) == 0);    // on none
 	CHECK(dxr_wl_highest_scale_under(phys, psc, 2, 0, 0, 0, 0) == 0);              // no frame
 
+	// #361's restore window, in the app's running time. A frame adds the time since
+	// the previous one, at most the gap limit (250 ms).
+	const long long ms = 1000000LL, gap = 250 * ms, run3 = 3000 * ms, wall20 = 20000 * ms;
+	CHECK(dxr_wl_running_after_frame(0, 0, 5000 * ms, gap) == 0);                   // no previous frame
+	CHECK(dxr_wl_running_after_frame(0, 1000 * ms, 1016 * ms, gap) == 16 * ms);     // a 60 Hz frame
+	CHECK(dxr_wl_running_after_frame(100 * ms, 1000 * ms, 5500 * ms, gap) == 350 * ms); // a 4.5 s stall: 250 ms
+	CHECK(dxr_wl_running_after_frame(100 * ms, 1000 * ms, 1000 * ms, gap) == 100 * ms); // no time passed
+	CHECK(dxr_wl_restore_window_open(2900 * ms, 10000 * ms, run3, wall20));
+	CHECK(!dxr_wl_restore_window_open(3100 * ms, 4000 * ms, run3, wall20));
+	CHECK(!dxr_wl_restore_window_open(500 * ms, 21000 * ms, run3, wall20)); // paused for long: closed anyway
+	// The late-restore case (#431 follow-up): the window shown, 0.5 s of frames,
+	// a 4.5 s slow frame, then the app restores its saved position on its next
+	// frame. 5 s on the clock (the old 3 s rule: closed), 0.75 s of running: open.
+	long long run = 0, prev = 1000 * ms;
+	for (long long t = 1016 * ms; t <= 1500 * ms; t += 16 * ms) {
+		run = dxr_wl_running_after_frame(run, prev, t, gap);
+		prev = t;
+	}
+	run = dxr_wl_running_after_frame(run, prev, prev + 4500 * ms, gap);
+	CHECK(run < 800 * ms);
+	CHECK(dxr_wl_restore_window_open(run, 5000 * ms, run3, wall20));
+	// So the restore is checked against the panel and keeps the opening size, and so
+	// does DisplayXRTargetDisplay's move right after it, though the restore placed the
+	// window (not a start-up move by dxr_wl_is_start_move, but the window is new).
+	CHECK(dxr_wl_keeps_opening_size(0, 0, dxr_wl_restore_window_open(run, 5000 * ms, run3, wall20)));
+	CHECK(dxr_wl_keeps_opening_size(0, dxr_wl_is_start_move(1, 1),
+	                                dxr_wl_restore_window_open(run, 5000 * ms, run3, wall20)));
+	// A move the app asks for 3 s of frames later is not part of its start.
+	CHECK(!dxr_wl_keeps_opening_size(0, 0, dxr_wl_restore_window_open(run + run3, 9000 * ms, run3, wall20)));
+
 	// DISPLAYXR_PANEL_PLACEMENT.
 	CHECK(!dxr_startup_placement_env_off(NULL));
 	CHECK(!dxr_startup_placement_env_off(""));
