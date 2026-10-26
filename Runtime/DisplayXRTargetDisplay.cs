@@ -127,39 +127,71 @@ namespace DisplayXR
         public const float StartupWindowSeconds = 20f;
 
         static bool s_StartupDone;
+        // The native side answered "deciding once the window is shown" (3): asked again
+        // every frame until it decides (it gives up by itself when the window is not
+        // shown within 5 s; the time limit here only guards against asking forever).
+        static bool s_StartupWaiting;
+        static float s_StartupAskUntil;
 
         /// <summary>
         /// Called by the provider driver every frame of a running session; acts once per
         /// run, at the session's second frame, so the app's own placement in its first
-        /// frames (a saved position it restores) comes first.
+        /// frames (a saved position it restores) comes first. A window not shown by then
+        /// is decided on the first frame after it is: the checks run again right before,
+        /// so an app that went fullscreen, or turned the placement off, in the meantime
+        /// keeps its window where it is.
         /// </summary>
         internal static void TickStartupPlacement(int sessionFrame)
         {
+            if (s_StartupWaiting)
+            {
+                // A session that started anew (its frame count restarts) is not asked:
+                // once per run.
+                if (sessionFrame < 2 || Time.realtimeSinceStartup > s_StartupAskUntil) s_StartupWaiting = false;
+                else AskStartupPlacement(true);
+                return;
+            }
             if (s_StartupDone || sessionFrame < 2) return;
             s_StartupDone = true;
             // Linux players only for now (the native call is 0 everywhere else): no
             // start-up placement lines in a Windows / macOS player's log, and none in
             // the editor.
             if (Application.platform != RuntimePlatform.LinuxPlayer) return;
-            if (!PlaceOnPanelAtStart)
-            {
-                Debug.Log("[DisplayXR] start-up placement: turned off by the app — the window stays where it opened.");
-                return;
-            }
-            if (Time.realtimeSinceStartup > StartupWindowSeconds)
+            if (PlaceOnPanelAtStart && Time.realtimeSinceStartup > StartupWindowSeconds)
             {
                 Debug.Log($"[DisplayXR] start-up placement: the session came up {Time.realtimeSinceStartup:F0}s after " +
                           "launch — leaving the window where it is.");
                 return;
             }
+            AskStartupPlacement(false);
+        }
+
+        // @p again: the window was not shown at the first ask; asking again now.
+        static void AskStartupPlacement(bool again)
+        {
+            string meanwhile = again ? " before the window was shown" : "";
+            s_StartupWaiting = false;
+            if (!PlaceOnPanelAtStart)
+            {
+                Debug.Log($"[DisplayXR] start-up placement: turned off by the app{meanwhile} — the window stays " +
+                          "where it opened.");
+                return;
+            }
+            // A fullscreen window is not ours to move: Unity and the app choose its output.
             if (Screen.fullScreenMode != FullScreenMode.Windowed)
             {
-                Debug.Log($"[DisplayXR] start-up placement: {Screen.fullScreenMode} — not moved.");
+                Debug.Log($"[DisplayXR] start-up placement: {Screen.fullScreenMode}{meanwhile} — not moved.");
                 return;
             }
             int r;
             try { r = DisplayXRProviderNative.dxr_prov_place_window_at_start(); }
             catch (System.EntryPointNotFoundException) { return; }
+            if (r == 3)
+            {
+                s_StartupWaiting = true;
+                if (again) return; // still not shown: said so at the first ask
+                s_StartupAskUntil = Time.realtimeSinceStartup + 60f;
+            }
             if (r != 0)
                 Debug.Log("[DisplayXR] start-up placement: " + (
                     r == 1 ? "moving the window onto the 3D panel." :
