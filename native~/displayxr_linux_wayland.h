@@ -107,9 +107,11 @@ int dxr_wl_take_player_size(int *out_w, int *out_h);
 int dxr_wl_move_player_to_panel(const char *connector, int panel_w, int panel_h);
 //! The start-up placement (on by default; dxr_prov_place_window_at_start): the same
 //! move, unless the app or the user has placed the window this run, or it is on the
-//! panel already. A window not shown yet is decided once it is (within a few
-//! seconds). Returns a DXR_WL_STARTUP_* (displayxr_linux_wayland_place.h); 0 without
-//! a native-Wayland session, the extension or a single matching output.
+//! panel already. A window not shown yet answers DXR_WL_STARTUP_WAIT: ask again
+//! (every frame, from the main thread) and it is decided on the first ask after it
+//! is shown, as of when it was (within a few seconds). Returns a DXR_WL_STARTUP_*
+//! (displayxr_linux_wayland_place.h); 0 without a native-Wayland session, the
+//! extension or a single matching output.
 int dxr_wl_place_player_at_start(const char *connector, int panel_w, int panel_h);
 //! The window's position / a new position in X root coordinates (the space the
 //! X11 path saves and restores). get: 1 when known now; otherwise the out values

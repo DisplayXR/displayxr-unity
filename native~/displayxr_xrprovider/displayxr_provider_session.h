@@ -688,10 +688,12 @@ DISPLAYXR_EXPORT int  dxr_prov_move_window_to_display(void);
 /// unless the app or the user has placed it, it is there already, the runtime did not
 /// confirm a panel, or DISPLAYXR_PANEL_PLACEMENT is 0/off. Called once per run from
 /// C# (DisplayXRTargetDisplay.PlaceOnPanelAtStart), a couple of frames after the
-/// session started, on the main thread. Native-Wayland players only for now; 0
-/// everywhere else. Returns a DXR_WL_STARTUP_* (displayxr_linux_wayland_place.h): 1
-/// moving it, 2 it is there, 3 deciding once the window is shown, -1 placed already,
-/// -2 not shown in time; 0 not done.
+/// session started, on the main thread, and again every frame while it returns 3
+/// (the window not shown yet; C# re-checks fullscreen and its opt-out before each
+/// ask). Native-Wayland players only for now; 0 everywhere else. Returns a
+/// DXR_WL_STARTUP_* (displayxr_linux_wayland_place.h): 1 moving it, 2 it is there, 3
+/// deciding once the window is shown, -1 placed already, -2 not shown in time; 0 not
+/// done.
 DISPLAYXR_EXPORT int  dxr_prov_place_window_at_start(void);
 
 /// Request a vendor rendering mode by modeIndex (xrRequestDisplayRenderingModeDXR).

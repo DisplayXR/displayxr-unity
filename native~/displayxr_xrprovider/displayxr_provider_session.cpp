@@ -8656,12 +8656,12 @@ int dxr_prov_move_window_to_display(void)
 }
 
 // The start-up placement (on by default; DisplayXRTargetDisplay.PlaceOnPanelAtStart
-// asks once per run, a couple of frames into the session). Native-Wayland players
-// only for now: mutter opens a new window on the monitor under the pointer, which
-// can be a casting tool's virtual monitor nobody sees. X11 / XWayland, Windows and
-// macOS keep today's behaviour (DisplayXRTargetDisplay opts in). The Wayland library
-// decides against the app's and the user's own placement (displayxr_linux_wayland.c,
-// "The start-up placement").
+// asks once per run, a couple of frames into the session, and again every frame while
+// the window is not shown). Native-Wayland players only for now: mutter opens a new
+// window on the monitor under the pointer, which can be a casting tool's virtual
+// monitor nobody sees. X11 / XWayland, Windows and macOS keep today's behaviour
+// (DisplayXRTargetDisplay opts in). The Wayland library decides against the app's and
+// the user's own placement (displayxr_linux_wayland.c, "The start-up placement").
 int dxr_prov_place_window_at_start(void)
 {
 #if defined(__linux__) && !defined(__ANDROID__)
@@ -8684,10 +8684,15 @@ int dxr_prov_place_window_at_start(void)
 		       "where it opened\n");
 		return 0;
 	}
+	// C# asks again every frame while the answer is "deciding once the window is
+	// shown" (3): logged once.
+	static int s_waiting;
 	int act = dxr_wl_place_player_at_start(s_ps.panel_connector, (int)s_ps.display_info.pixel_width,
 	                                       (int)s_ps.display_info.pixel_height);
-	ps_log("[DisplayXR-PROV] start-up placement (Wayland): panel '%s' %ux%u px -> %d\n", s_ps.panel_connector,
-	       s_ps.display_info.pixel_width, s_ps.display_info.pixel_height, act);
+	if (!s_waiting || act != DXR_WL_STARTUP_WAIT)
+		ps_log("[DisplayXR-PROV] start-up placement (Wayland): panel '%s' %ux%u px -> %d\n", s_ps.panel_connector,
+		       s_ps.display_info.pixel_width, s_ps.display_info.pixel_height, act);
+	s_waiting = act == DXR_WL_STARTUP_WAIT;
 	return act;
 #else
 	return 0;

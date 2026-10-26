@@ -262,10 +262,14 @@ static struct {
 	// (its own position, a move to the panel, the side-step) or the user (a drag)
 	// placed the window this run, so the start-up placement stands down; never
 	// cleared. startup_pending: the window was not shown yet when it was asked for;
-	// decided at its first report, until startup_until_ns.
+	// C# asks again every frame (on the main thread, where it re-checks what the
+	// window report cannot tell: fullscreen, its own opt-out) and the window is
+	// decided once shown, as of its first report (startup_shown_ns), which must come
+	// by startup_until_ns.
 	int app_placed;
 	int startup_pending;
 	long long startup_until_ns;
+	long long startup_shown_ns; // the first report of the window shown while pending; 0 = none yet
 	char startup_connector[64];
 	int startup_w, startup_h;
 
@@ -1059,6 +1063,7 @@ dxr_wl_weave_destroy(void)
 	s_wl.restore_open = 0;
 	s_wl.drag_end_pending = 0;
 	s_wl.startup_pending = 0;
+	s_wl.startup_shown_ns = 0;
 	stop_verify_locked();
 	s_wl.size_fixups = 0;
 	s_wl.wanted_device_w = s_wl.wanted_device_h = 0;
@@ -1575,7 +1580,6 @@ take_window_locked(const DxrWlExtWindow *w)
 }
 
 static void drop_focus_report_locked(const DxrWlExtWindow *w);
-static int startup_place_locked(void);
 
 static void
 ext_window(const DxrWlExtWindow *w, int after_move, int moved)
@@ -1658,19 +1662,12 @@ ext_window(const DxrWlExtWindow *w, int after_move, int moved)
 			fprintf(stderr, "[DisplayXR-WL] window drag: left at (%d,%d) on '%s' (no X root conversion)\n", w->x,
 			        w->y, on ? on->name : "?");
 	}
-	// The start-up placement was asked for before the window was shown: decide now.
-	if (s_wl.startup_pending && !w->moving && !s_wl.drag_state) {
-		if (!was_mapped) {
-			s_wl.corrections = 0;
-			s_wl.intent_blocked = 0;
-		}
-		if (startup_place_locked() == DXR_WL_STARTUP_MOVE) {
-			if (!s_wl.move_inflight)
-				schedule_verify_locked(); // (a move's result schedules it otherwise)
-			pthread_mutex_unlock(&s_wl_mutex);
-			return;
-		}
-	}
+	// The start-up placement was asked for before the window was shown: it is shown
+	// now. Not decided here but on C#'s next ask, on the main thread, where it can
+	// check what this report cannot tell (the app went fullscreen meanwhile, or
+	// turned the placement off), as of this report.
+	if (s_wl.startup_pending && !s_wl.startup_shown_ns)
+		s_wl.startup_shown_ns = mono_ns();
 	if (!was_mapped) {
 		// Just (re)mapped: the compositor has placed it by its own rules.
 		s_wl.corrections = 0;
@@ -2370,15 +2367,19 @@ dxr_wl_move_player_to_panel(const char *connector, int panel_w, int panel_h)
  *     to the panel (DisplayXRTargetDisplay), the side-step;
  *   - the user: a drag.
  * Whatever comes first wins: the app's position after the start-up placement
- * replaces it as any later position does. Once per run (C# asks once); a window
- * not shown yet is decided when it is, but not after DXR_WL_STARTUP_WAIT_NS (no
- * late jump).
+ * replaces it as any later position does. Once per run: C# asks at the session's
+ * second frame. A window not shown by then is decided once it is, as of its first
+ * report, which must come within DXR_WL_STARTUP_WAIT_NS (no late jump); C# asks
+ * again every frame meanwhile and the decision is taken then, on the main thread,
+ * right after C# has checked what the extension's report cannot tell: that the app
+ * has made the window fullscreen, or turned the placement off, in the meantime.
  */
 
-//! Decide with the window as last reported (startup_connector / _w / _h). Returns
-//! a DXR_WL_STARTUP_*, 0 when it cannot be done here (logged).
+//! Decide with the window as last reported (startup_connector / _w / _h); @p again:
+//! C# asks again while the window is not shown (quiet while it still is not).
+//! Returns a DXR_WL_STARTUP_*, 0 when it cannot be done here (logged).
 static int
-startup_place_locked(void)
+startup_place_locked(int again)
 {
 	struct dxr_wl_output *panel = panel_output_locked(s_wl.startup_connector, s_wl.startup_w, s_wl.startup_h);
 	int layout = panel ? layout_or_warn_locked() : DXR_LAYOUT_UNKNOWN;
@@ -2391,7 +2392,10 @@ startup_place_locked(void)
 	const DxrWlExtWindow *w = &s_wl.win;
 	DxrWlRect4 mon = {w->mon_x, w->mon_y, w->mon_w, w->mon_h};
 	int shown = s_wl.ext_known && win_mapped(w);
-	int act = dxr_wl_startup_action(s_wl.app_placed, shown, output_rect(panel), mon, w->x, w->y, w->w, w->h, mono_ns(),
+	// Shown since the first ask: decided as of its first report (the limit is about
+	// when the window showed, not about when C#'s next frame came).
+	long long t = shown && s_wl.startup_shown_ns ? s_wl.startup_shown_ns : mono_ns();
+	int act = dxr_wl_startup_action(s_wl.app_placed, shown, output_rect(panel), mon, w->x, w->y, w->w, w->h, t,
 	                                s_wl.startup_until_ns);
 	s_wl.startup_pending = act == DXR_WL_STARTUP_WAIT;
 	switch (act) {
@@ -2402,7 +2406,8 @@ startup_place_locked(void)
 		fprintf(stderr, "[DisplayXR-WL] start-up placement: the window was not shown in time: leaving it\n");
 		break;
 	case DXR_WL_STARTUP_WAIT:
-		fprintf(stderr, "[DisplayXR-WL] start-up placement: deciding once the window is shown\n");
+		if (!again)
+			fprintf(stderr, "[DisplayXR-WL] start-up placement: deciding once the window is shown\n");
 		break;
 	case DXR_WL_STARTUP_THERE:
 		fprintf(stderr, "[DisplayXR-WL] start-up placement: the window opened on the 3D panel '%s': leaving it\n",
@@ -2433,11 +2438,16 @@ dxr_wl_place_player_at_start(const char *connector, int panel_w, int panel_h)
 		return 0;
 	}
 	wl_display_dispatch_queue_pending(s_wl.display, s_wl.queue);
-	snprintf(s_wl.startup_connector, sizeof(s_wl.startup_connector), "%s", connector ? connector : "");
-	s_wl.startup_w = panel_w;
-	s_wl.startup_h = panel_h;
-	s_wl.startup_until_ns = mono_ns() + DXR_WL_STARTUP_WAIT_NS;
-	int act = startup_place_locked();
+	// The first ask, or C# asking again while the window is not shown (WAIT).
+	int again = s_wl.startup_pending;
+	if (!again) {
+		snprintf(s_wl.startup_connector, sizeof(s_wl.startup_connector), "%s", connector ? connector : "");
+		s_wl.startup_w = panel_w;
+		s_wl.startup_h = panel_h;
+		s_wl.startup_until_ns = mono_ns() + DXR_WL_STARTUP_WAIT_NS;
+		s_wl.startup_shown_ns = 0;
+	}
+	int act = startup_place_locked(again);
 	pthread_mutex_unlock(&s_wl_mutex);
 	return act;
 }

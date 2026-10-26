@@ -36,7 +36,7 @@ namespace DisplayXR
 
         bool  m_SessionStarted;
         uint  m_SessionSerial;
-        int   m_SessionFrame; // frames of the running session (1 = the frame it started)
+        int   m_SessionFrame; // frames of the running session (1 = the frame it started), up to 2
         bool  m_QuitRequested;
         float m_DisplayHeightM;
 
@@ -179,8 +179,11 @@ namespace DisplayXR
                 DisplayXRProvider.OnSessionStarted();
             }
             // The start-up placement (on by default; Linux native Wayland): once per run,
-            // at the session's second frame, after the app's own placement had its turn.
-            if (m_SessionFrame < 2) DisplayXRTargetDisplay.TickStartupPlacement(++m_SessionFrame);
+            // at the session's second frame, after the app's own placement had its turn;
+            // every frame after while its decision waits for the window's first show (a
+            // static field read otherwise).
+            if (m_SessionFrame < 2) ++m_SessionFrame;
+            DisplayXRTargetDisplay.TickStartupPlacement(m_SessionFrame);
 
             DisplayXRProvider.PumpEvents();
             // Rear depth budget (#318): republish the last locate's advisory value
