@@ -2416,19 +2416,21 @@ move_player_to_panel(const char *connector, int panel_w, int panel_h, int at_sta
 			        panel->name);
 		return 0;
 	}
-	int start_move = dxr_wl_is_start_move(at_start, s_wl.app_placed);
+	int there = 0;
+	if (win_mapped(&s_wl.win)) {
+		int cx = s_wl.win.x + s_wl.win.w / 2, cy = s_wl.win.y + s_wl.win.h / 2;
+		there = output_at_locked(cx, cy) == panel;
+	}
+	DxrWlPanelMove m = dxr_wl_panel_move(at_start, s_wl.app_placed, there);
 	// The app placed the window itself: no start-up placement after this.
 	s_wl.app_placed = 1;
 	s_wl.startup_pending = 0;
 	// Already there: leave it, as the X11 and Windows paths do.
-	if (win_mapped(&s_wl.win)) {
-		int cx = s_wl.win.x + s_wl.win.w / 2, cy = s_wl.win.y + s_wl.win.h / 2;
-		if (output_at_locked(cx, cy) == panel) {
-			pthread_mutex_unlock(&s_wl_mutex);
-			return 1;
-		}
+	if (!m.move) {
+		pthread_mutex_unlock(&s_wl_mutex);
+		return 1;
 	}
-	s_startup_move = start_move;
+	s_startup_move = m.start_move;
 	send_to_panel_locked(panel, layout);
 	s_startup_move = 0;
 	pthread_mutex_unlock(&s_wl_mutex);
