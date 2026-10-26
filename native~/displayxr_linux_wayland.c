@@ -358,9 +358,10 @@ static pthread_mutex_t s_wl_mutex = PTHREAD_MUTEX_INITIALIZER;
 // Under s_wl_mutex: the move being placed is a side-step glide's in-between step,
 // which is not logged (the side-step logs the move once; dxr_wl_set_player_position_stage).
 static int s_quiet_place;
-// Under s_wl_mutex: the move being placed is the start-up placement's
-// (startup_place_locked), which keeps the size the window opened with
-// (keep_opening_size_locked) whenever it moves it.
+// Under s_wl_mutex: the move being placed is a start-up move (dxr_wl_is_start_move):
+// the start-up placement's (startup_place_locked) or DisplayXRTargetDisplay's at
+// start (dxr_wl_move_player_to_panel_at_start). It keeps the size the window opened
+// with (keep_opening_size_locked).
 static int s_startup_move;
 
 // The main plugin's side (displayxr_linux_wayland_lib.h), set once by dxr_wl_lib_init.
@@ -2335,8 +2336,12 @@ send_to_panel_locked(struct dxr_wl_output *panel, int layout)
 	snprintf(s_wl.intent_centred_on, sizeof(s_wl.intent_centred_on), "%s", panel->name);
 }
 
+//! @p at_start: the app's move at start (DisplayXRTargetDisplay once the session
+//! runs), not one it asks for later: as a start-up move (dxr_wl_is_start_move) it
+//! keeps the size the window opened with, as the start-up placement does, however
+//! late the session's first frames come.
 static int
-dxr_wl_move_player_to_panel(const char *connector, int panel_w, int panel_h)
+move_player_to_panel(const char *connector, int panel_w, int panel_h, int at_start)
 {
 	pthread_mutex_lock(&s_wl_mutex);
 	if (!s_wl.surface) {
@@ -2357,6 +2362,7 @@ dxr_wl_move_player_to_panel(const char *connector, int panel_w, int panel_h)
 			        panel->name);
 		return 0;
 	}
+	int start_move = dxr_wl_is_start_move(at_start, s_wl.app_placed);
 	// The app placed the window itself: no start-up placement after this.
 	s_wl.app_placed = 1;
 	s_wl.startup_pending = 0;
@@ -2368,9 +2374,23 @@ dxr_wl_move_player_to_panel(const char *connector, int panel_w, int panel_h)
 			return 1;
 		}
 	}
+	s_startup_move = start_move;
 	send_to_panel_locked(panel, layout);
+	s_startup_move = 0;
 	pthread_mutex_unlock(&s_wl_mutex);
 	return 1;
+}
+
+static int
+dxr_wl_move_player_to_panel(const char *connector, int panel_w, int panel_h)
+{
+	return move_player_to_panel(connector, panel_w, panel_h, 0);
+}
+
+static int
+dxr_wl_move_player_to_panel_at_start(const char *connector, int panel_w, int panel_h)
+{
+	return move_player_to_panel(connector, panel_w, panel_h, 1);
 }
 
 /*
@@ -2439,7 +2459,7 @@ startup_place_locked(int again)
 		// window has been on screen longer than #361's restore window by now: a slow
 		// first frame (shader warm-up) delays the session's second frame, it does
 		// not make anyone place the window.
-		s_startup_move = 1;
+		s_startup_move = dxr_wl_is_start_move(1, s_wl.app_placed); // (1: it only gets here unplaced)
 		send_to_panel_locked(panel, layout);
 		s_startup_move = 0;
 		break;
@@ -3941,6 +3961,7 @@ static const DxrWlApi s_api = {
     .clipboard_write = dxr_wl_clipboard_write,
     .set_player_position_stage = dxr_wl_set_player_position_stage,
     .place_player_at_start = dxr_wl_place_player_at_start,
+    .move_player_to_panel_at_start = dxr_wl_move_player_to_panel_at_start,
 };
 
 __attribute__((visibility("default"))) const DxrWlApi *

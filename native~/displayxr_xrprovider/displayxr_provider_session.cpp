@@ -8544,9 +8544,13 @@ int dxr_prov_get_runtime_version(char *buf, int len)
 	return 1;
 }
 
-int dxr_prov_move_window_to_display(void)
+// @p at_start: DisplayXRTargetDisplay's move once the session runs, not one the app
+// asks for later. Only the native-Wayland path tells them apart (the size the window
+// keeps, see dxr_wl_move_player_to_panel_at_start); Windows and X11 move the same.
+static int ps_move_window_to_display(int at_start)
 {
 #if defined(_WIN32)
+	(void)at_start;
 	if (!s_ps.desktop_origin_valid) {
 		ps_log("[DisplayXR-PROV] move_window_to_display: no desktop origin (runtime < v16)\n");
 		return 0;
@@ -8622,11 +8626,12 @@ int dxr_prov_move_window_to_display(void)
 	// panel's connector name (else its device-pixel mode) identifies its output, and
 	// the window is centred on it through the GNOME extension.
 	if (s_ps.wl_weave) {
-		int moved = dxr_wl_move_player_to_panel(s_ps.panel_connector, (int)s_ps.display_info.pixel_width,
-		                                        (int)s_ps.display_info.pixel_height);
-		ps_log("[DisplayXR-PROV] move_window_to_display (Wayland): panel '%s' %ux%u px -> %s\n",
-		       s_ps.panel_connector, s_ps.display_info.pixel_width, s_ps.display_info.pixel_height,
-		       moved ? "on it" : "not moved");
+		int pw = (int)s_ps.display_info.pixel_width, ph = (int)s_ps.display_info.pixel_height;
+		int moved = at_start ? dxr_wl_move_player_to_panel_at_start(s_ps.panel_connector, pw, ph)
+		                     : dxr_wl_move_player_to_panel(s_ps.panel_connector, pw, ph);
+		ps_log("[DisplayXR-PROV] move_window_to_display%s (Wayland): panel '%s' %ux%u px -> %s\n",
+		       at_start ? " (at start)" : "", s_ps.panel_connector, s_ps.display_info.pixel_width,
+		       s_ps.display_info.pixel_height, moved ? "on it" : "not moved");
 		return moved;
 	}
 	// (#266, Linux) The runtime reports the panel rect in X root coordinates (its desktop
@@ -8651,8 +8656,19 @@ int dxr_prov_move_window_to_display(void)
 	return displayxr_linux_move_app_window_to_rect((int)s_ps.desktop_origin_x,
 	                                               (int)s_ps.desktop_origin_y, (int)pw, (int)ph);
 #else
+	(void)at_start;
 	return 0;
 #endif
+}
+
+int dxr_prov_move_window_to_display(void)
+{
+	return ps_move_window_to_display(0);
+}
+
+int dxr_prov_move_window_to_display_at_start(void)
+{
+	return ps_move_window_to_display(1);
 }
 
 // The start-up placement (on by default; DisplayXRTargetDisplay.PlaceOnPanelAtStart

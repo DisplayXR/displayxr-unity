@@ -684,6 +684,14 @@ DISPLAYXR_EXPORT int  dxr_prov_get_runtime_version(char *buf, int len);
 /// longer at that origin (arrangement changed since session start). Windows only.
 DISPLAYXR_EXPORT int  dxr_prov_move_window_to_display(void);
 
+/// The same move, made as part of the app's start (DisplayXRTargetDisplay's once the
+/// session runs). On a native-Wayland player it keeps the logical size the window
+/// opened with while neither the app nor the user has placed it, by the same rule as
+/// the start-up placement (dxr_wl_is_start_move), however late the session's first
+/// frames come; a move the app asks for later (dxr_prov_move_window_to_display) keeps
+/// the device size after #361's 3 s restore window. Elsewhere it is the move above.
+DISPLAYXR_EXPORT int  dxr_prov_move_window_to_display_at_start(void);
+
 /// The start-up placement (on by default): put the app's window on the 3D panel
 /// unless the app or the user has placed it, it is there already, the runtime did not
 /// confirm a panel, or DISPLAYXR_PANEL_PLACEMENT is 0/off. Called once per run from

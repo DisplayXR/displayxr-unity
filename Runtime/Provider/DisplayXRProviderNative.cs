@@ -623,6 +623,16 @@ namespace DisplayXR
         public static extern int dxr_prov_move_window_to_display();
 
         /// <summary>
+        /// The same move as part of the app's start (<see cref="DisplayXRTargetDisplay"/>
+        /// once the session runs): on Linux native Wayland it keeps the logical size the
+        /// window opened with while neither the app nor the user has placed it, as the
+        /// start-up placement does. Elsewhere identical to
+        /// <see cref="dxr_prov_move_window_to_display"/>.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int dxr_prov_move_window_to_display_at_start();
+
+        /// <summary>
         /// The start-up placement (on by default; <see cref="DisplayXRTargetDisplay.PlaceOnPanelAtStart"/>):
         /// the window goes onto the 3D panel unless the app or the user placed it, it is
         /// there already, the runtime did not confirm a panel, or

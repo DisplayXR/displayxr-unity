@@ -159,17 +159,29 @@ dxr_wl_startup_action(int placed, int shown, DxrWlRect4 panel, DxrWlRect4 mon, i
 //! with: the player restores the size it saved where it was last, normally the 3D
 //! panel) instead of its DEVICE size, when nobody asked for a size (@p asked: a
 //! size the app asked for stands) and the move decides where the window opens:
-//!  - @p startup: the start-up placement. It moves the window only while neither
-//!    the app nor the user has placed it, so the window is still as it opened,
-//!    however late the session's second frame comes (a slow first frame);
+//!  - @p startup: a start-up move (dxr_wl_is_start_move): the start-up placement,
+//!    or the app's own move to the panel at start (DisplayXRTargetDisplay), while
+//!    neither the app nor the user has placed the window, so the window is still
+//!    as it opened, however late it comes (a slow first frame);
 //!  - @p window_new: any other placement while the window is new (#361's restore
-//!    window: shown less than 3 s ago, not moved by the user): a move to the panel
-//!    or a saved position the app restores. An app can ask for those at any time;
-//!    a later one keeps the device size, as on X11.
+//!    window: shown less than 3 s ago, not moved by the user): a later move to the
+//!    panel or a saved position the app restores. An app can ask for those at any
+//!    time; a later one keeps the device size, as on X11.
 static inline int
 dxr_wl_keeps_opening_size(int asked, int startup, int window_new)
 {
 	return !asked && (startup || window_new);
+}
+
+//! A move is a start-up move (dxr_wl_keeps_opening_size's @p startup): one made as
+//! part of the app's start (@p at_start: the start-up placement, which only moves a
+//! window nobody has placed, or DisplayXRTargetDisplay's move once the session runs,
+//! which says so on the native call) while neither the app nor the user has placed
+//! the window yet (@p placed). A move the app asks for later (MoveNow) is not one.
+static inline int
+dxr_wl_is_start_move(int at_start, int placed)
+{
+	return at_start && !placed;
 }
 
 //! Fit a window's logical size *lw x *lh into 95 % of an output (stage px

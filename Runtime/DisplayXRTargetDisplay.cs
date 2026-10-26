@@ -204,11 +204,21 @@ namespace DisplayXR
         /// <summary>
         /// Move now, if the session is running. Returns false when it is not, when the
         /// runtime does not report the panel position, or on macOS.
+        /// <para>
+        /// This is a move the app asks for: on Linux native Wayland, after the first 3 s
+        /// the window has been on screen it keeps the window's device size (as on X11).
+        /// The component's own move at start (<see cref="moveOnStart"/>) keeps the size the
+        /// window opened with instead, as the default start-up placement does.
+        /// </para>
         /// </summary>
-        public bool MoveNow()
+        public bool MoveNow() => Move(false);
+
+        // @p atStart: the component's own move once the session runs (moveOnStart), as
+        // opposed to one the app asks for later through MoveNow.
+        bool Move(bool atStart)
         {
             Attempted = true;
-            Succeeded = DisplayXRProvider.MoveWindowToDisplay();
+            Succeeded = atStart ? DisplayXRProvider.MoveWindowToDisplayAtStart() : DisplayXRProvider.MoveWindowToDisplay();
             if (logResult)
             {
                 if (Succeeded)
@@ -252,7 +262,7 @@ namespace DisplayXR
                 Attempted = true;
                 yield break;
             }
-            MoveNow();
+            Move(true);
         }
     }
 }
