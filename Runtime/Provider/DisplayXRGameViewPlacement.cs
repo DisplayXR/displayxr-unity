@@ -23,8 +23,8 @@ namespace DisplayXR
         /// 250 % (1.6 pt); really DockArea.kBottomBorders = 2 pt less rounding.</summary>
         public const float RtBottomMarginPt = 1.6f;
 
-        /// <summary>Most dock chrome the horizontal "chrome slack" path accepts (and the
-        /// plausibility bound of the #740 X latch).</summary>
+        /// <summary>The plausibility bound of the #740 X latch, and the horizontal slack the
+        /// chrome-slack path accepts when the pane's scale is implausible.</summary>
         public const int ChromeSlackMaxPx = 64;
 
         /// <summary>Vertical slack that is rounding, not a letterbox: the vertical chrome is
@@ -36,6 +36,10 @@ namespace DisplayXR
         /// render area. It is inside the host height, so host - drawRect height = tab strip +
         /// Game-view toolbar + this.</summary>
         public const float DockBottomBorderPt = 2f;
+
+        /// <summary>DockArea's side borders, 1 pt left and right of a docked pane's render area
+        /// (host width - drawRect width).</summary>
+        public const float DockSideBordersPt = 2f;
 
         /// <summary>
         /// (#420) Where the docked anchor sits relative to the screen row that shows the RT's
@@ -127,13 +131,23 @@ namespace DisplayXR
             return (int)Math.Ceiling(bottomPx - 1e-3) - p.RtH;
         }
 
+        /// <summary>(#420) The most horizontal slack that is dock chrome: the two side borders
+        /// plus rounding (8 px at 300 %, 7 at 250 %, 5 at 150 %). A Free Aspect RT is the area's
+        /// width, so it leaves the borders (6 / 5 / 3 px); anything wider is a left/right bar.</summary>
+        public static int SideChromeSlackMaxPx(float ptToPx) =>
+            ptToPx > 0.5f && ptToPx < 8f
+                ? RoundToInt(DockSideBordersPt * SnapScale(ptToPx)) + RoundingSlackMaxPx
+                : ChromeSlackMaxPx;
+
         /// <summary>True when the RT fills the pane up to dock chrome (Free Aspect): the
-        /// HW-verified #740 bottom-aligned placement applies instead of letterbox centring.</summary>
+        /// HW-verified #740 bottom-aligned placement applies instead of letterbox centring.
+        /// Thin left/right bars are a letterbox: up to 64 px of them used to count as chrome, and
+        /// the #740 pixel centring then put X 1-2 px off Unity's whole-point rule (#420).</summary>
         public static bool IsChromeSlackOnly(in Pane p)
         {
             int areaH = p.ClientH - p.ToolbarPx;
             return p.DockedNonMaximized && p.RtW > 0 && p.RtH > 0
-                && p.ClientW - p.RtW >= 0 && p.ClientW - p.RtW <= ChromeSlackMaxPx
+                && p.ClientW - p.RtW >= 0 && p.ClientW - p.RtW <= SideChromeSlackMaxPx(p.PtToPx)
                 && areaH - p.RtH >= -RoundingSlackMaxPx && areaH - p.RtH <= RoundingSlackMaxPx;
         }
 
@@ -163,8 +177,12 @@ namespace DisplayXR
             }
 
             // Letterbox: Unity never upscales the RT, it fits it into the area (min 1) and
-            // centres it, leaving grey bars.
-            float fit = Math.Min(1f, Math.Min((float)w / p.RtW, (float)h / p.RtH));
+            // centres it, leaving grey bars. Docked on D3D, an RT up to RoundingSlackMaxPx
+            // taller than the area is rounding, not a fit: Unity fits its TARGET, which for
+            // left/right bars is the area's own height (859.5 px in an 859 px area at 250 %),
+            // and GVFIT owns the rows. Fitting the RT's 860 rows drew the anchor 2 px narrow.
+            int fitAreaH = row0 && p.RtH > h && p.RtH - h <= RoundingSlackMaxPx ? p.RtH : h;
+            float fit = Math.Min(1f, Math.Min((float)w / p.RtW, (float)fitAreaH / p.RtH));
             int fitW = RoundToInt(p.RtW * fit);
             int fitH = RoundToInt(p.RtH * fit);
             if (fitW <= 0 || fitH <= 0 || (fitW == w && fitH == h)) return;

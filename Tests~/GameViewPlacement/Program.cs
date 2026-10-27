@@ -81,7 +81,8 @@ static class Program
         double targetH = (g.Target > 0 ? g.Target : g.RtH) / s;
         // The zoom area's default scale is min(1, area / target) on both axes, but the plug-in's GVFIT
         // then overwrites scale.y every frame with h / (h - 0.5): X is fitted, Y is drawn stretched.
-        double fit = Math.Min(1, Math.Min(wPt / rtW, hPt / rtH));
+        // The target is Unity's (859.5 px at 250 % fits an 859.5 px area), not the RT's rounded rows.
+        double fit = Math.Min(1, Math.Min(wPt / rtW, hPt / targetH));
         double xPt = lb + Math.Round(wPt / 2 - rtW * fit / 2);
         double bottom = Math.Round(hPt / 2 + targetH * stretch / 2);
         ox = g.L + xPt * s;
@@ -200,6 +201,77 @@ static class Program
                              RtW = 1916, RtH = 1078, Target = 1078f, Scale = 1.5f };
         Check(DisplayXRGameViewPlacement.IsChromeSlackOnly(PaneOf(near)), near.Name + " is chrome slack");
         Pinned(near, 1002, 186, 1916, 1078);
+
+        // ---- Thin left/right bars are a letterbox, not chrome: the chrome-slack path accepts only
+        // the dock's two side borders + rounding, so a 7-64 px bar gets Unity's whole-point X instead
+        // of the #740 pixel centring, which was 1-2 px off it (logged 2026-10-27). ----
+        foreach (var (scale, want) in new[] { (3f, 8), (3.0000003f, 8), (2.5f, 7), (1.5f, 5), (1.4999998f, 5), (1.25f, 4), (0f, 64) })
+            Check(DisplayXRGameViewPlacement.SideChromeSlackMaxPx(scale) == want, $"SideChromeSlackMaxPx({scale:R}) == {want}");
+        // Free Aspect leaves exactly the side borders and keeps its path: 6 px at 300 % (main and
+        // secondary), 5 at 250 %, 3 at 150 %, 2 at 125 %.
+        var b1 = new Geo { Name = "B1 150% docked Free", L = 726, T = 118, W = 2207, H = 1150, Hw = 1471.333f, Hh = 766.6667f,
+                           RtW = 2204, RtH = 1080, Target = 1079.5f, Scale = 1.5f };
+        var c1 = new Geo { Name = "C1 300% secondary Free", L = -3113, T = 233, W = 2206, H = 1020, Hw = 735.3334f, Hh = 340f,
+                           RtW = 2200, RtH = 879, Target = 879f, Scale = 3f };
+        var f125 = new Geo { Name = "125% docked Free", L = 480, T = 160, W = 1230, H = 568, Hw = 1230 / 1.25f, Hh = 568 / 1.25f,
+                             RtW = 1228, RtH = 509, Target = (568 / 1.25f - 47f) * 1.25f, Scale = 1.25f };
+        foreach (var g in new[] { v1, c1, d250, b1, f125 })
+            Check(DisplayXRGameViewPlacement.IsChromeSlackOnly(PaneOf(g)), g.Name + $" (slack {g.W - g.RtW}) is chrome slack");
+        // ...for every pane width and height a model sweep tries, 125-300 %.
+        {
+            int notCs = 0;
+            foreach (float scale in new[] { 1.25f, 1.5f, 1.75f, 2f, 2.25f, 2.5f, 3f })
+                for (int pw = 900; pw <= 2400; pw += 7)
+                    for (int ph = 700; ph <= 1250; ph += 13)
+                    {
+                        float hw = pw / scale, hh = ph / scale;
+                        var g = new Geo { Name = "Free", L = 0, T = 160, W = pw, H = ph, Hw = hw, Hh = hh, Scale = scale,
+                                          RtW = (int)Math.Round((hw - 2f) * scale), RtH = (int)Math.Round((hh - 47f) * scale),
+                                          Target = (hh - 47f) * scale };
+                        if (!DisplayXRGameViewPlacement.IsChromeSlackOnly(PaneOf(g))) notCs++;
+                    }
+            Check(notCs == 0, $"Free Aspect at 125-300 % is always chrome slack ({notCs} panes are not)");
+        }
+        // The logged cases. 300 % (427-A, 25 px of slack): #427 put X at 1357 (pixel centring 13),
+        // Unity at the pane's 1 pt border + Round(3.17 pt) = 4 pt = 12 px. 150 % (427-B, 49 px, a
+        // pane from the same drag as B4): 990 vs Unity's (1 + 15) pt = 24 px.
+        var lr25 = Logged("300% 16:9 12/13 px bars", 1344, 1589, 1021, 529.6667f, 340.3333f, 1564, 880);
+        var lr49 = new Geo { Name = "150% 16:9 24/25 px bars", L = 965, T = 118, W = 1968, H = 1150, Hw = 1312f, Hh = 766.6667f,
+                             RtW = 1919, RtH = 1080, Target = 1079.5f, Scale = 1.5f };
+        foreach (var g in new[] { lr25, lr49 })
+            Check(!DisplayXRGameViewPlacement.IsChromeSlackOnly(PaneOf(g)), g.Name + " is not chrome slack");
+        Pinned(lr25, 1356, 367, 1564, 880);
+        Pinned(lr49,  989, 186, 1919, 1080);
+        // Every bar from the side borders + 1 up to the old 64 px bound lands on Unity's first column
+        // (a whole-point edge on an x.5 px rounds up, as B4 shows) at the RT's size. At 250 % the
+        // 16:9 RT is one row taller than the area (860 vs 859: the 117.5 px chrome rounds up) and
+        // must not be fitted down for it: Unity fits its 859.5 px target. Where the centring is an
+        // exact half point (300 %: slack 9, 15, ...), float noise picks Unity's side; either is taken.
+        foreach (var (scale, l, t, ph, hh, rtW, rtH, target) in new[]
+        {
+            (3f,   1344, 233, 1021, 340.3333f, 1564,  880,  880f),
+            (2.5f, 1017, 293,  977, 390.8f,    1528,  860,  859.5f),
+            (1.5f,  965, 118, 1150, 766.6667f, 1919, 1080, 1079.5f),
+        })
+        {
+            int bad = 0; string first = null;
+            for (int slack = DisplayXRGameViewPlacement.SideChromeSlackMaxPx(scale) + 1; slack <= 64; slack++)
+            {
+                var g = new Geo { Name = $"{scale * 100}% bars, slack {slack}", L = l, T = t, W = rtW + slack, H = ph,
+                                  Hw = (rtW + slack) / scale, Hh = hh, RtW = rtW, RtH = rtH, Target = target, Scale = scale };
+                Place(g, out int x, out int y, out int w, out int h);
+                UnityOrigin(g, out double ox, out _, out int row0);
+                int col = (int)Math.Floor(ox + 0.5 + 1e-6);
+                double half = (slack / (double)scale - 2) / 2;               // the centring, exact
+                bool tie = Math.Abs(half - Math.Floor(half) - 0.5) < 1e-9;
+                int Col(double pt) => l + (int)Math.Floor((1 + pt) * scale + 0.5);
+                bool onCol = x == col || (tie && (x == Col(Math.Floor(half)) || x == Col(Math.Ceiling(half))));
+                if (DisplayXRGameViewPlacement.IsChromeSlackOnly(PaneOf(g)) || !onCol || y != row0 + DisplayXRGameViewPlacement.DockedRowBiasPx
+                    || w != rtW || h != rtH)
+                { bad++; first ??= $"{g.Name}: ({x},{y} {w}x{h}), Unity ({col},{row0} {rtW}x{rtH})"; }
+            }
+            Check(bad == 0, $"{scale * 100}% left/right bars up to 64 px on Unity's first column and row 0 ({bad} off; {first})");
+        }
 
         // ---- The review case (#427): a 300 % secondary with a 100 % primary. The global
         // pixelsPerPoint is 1.0 there; the pane's own scale is 3. Same anchors, shifted. ----
