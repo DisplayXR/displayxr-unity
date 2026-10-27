@@ -1792,11 +1792,19 @@ static WNDPROC s_follow_host_orig_proc = NULL;
 // Unity's own), follow_unsubclass_host leaves the chain alone instead of cutting that
 // subclass out, and that subclass keeps calling our proc. There it must stay a pure
 // pass-through to the proc it replaced, so that proc is also kept as a property of the
-// host, which lives as long as our proc can be in its chain. The property also marks
-// the host: a later subclass of it takes our proc back where it is, never installs it a
-// second time (our proc would then be its own previous proc: endless recursion on the
-// host's first message).
+// host, which lives as long as our proc can be in its chain. A later subclass of the
+// host asks the chain whether ours is in it (FOLLOW_PING_MSG) and takes it back where it
+// is, never installs it a second time (our proc would then be its own previous proc:
+// endless recursion on the host's first message).
 static const wchar_t FOLLOW_HOST_ORIG_PROP[] = L"DisplayXR.FollowHostOrigProc";
+// (#428) The chain probe. Our proc answers this registered message itself and never
+// forwards it; every other proc passes it on, down to Unity's, which returns 0. The
+// property alone cannot tell: another subclass's restore can take ours out under it (the
+// SR weaver's did at every Stop on 2026-10-27), and a later subclass can sit at the very
+// address ours replaced (the next SR weaver did).
+static const wchar_t FOLLOW_PING_MSG[] = L"DisplayXR.FollowPing";
+#define FOLLOW_PING_ANSWER ((LRESULT)0x44585246) // 'DXRF'
+static UINT s_follow_ping_msg = 0;
 // (#740) Custom host MOVE drag: DefWindowProc's modal move loop blocks Unity's PlayerLoop,
 // so the per-frame pump (window-relative Kooima / POV) freezes until mouse-up. Instead of
 // handing the OS the loop, run the #61 capture-based custom drag (dedicated_wnd_proc's
@@ -1878,6 +1886,8 @@ static LRESULT CALLBACK follow_host_subclass_proc(HWND host, UINT msg, WPARAM wP
 	WNDPROC orig = (host == s_follow_host_hwnd && s_follow_host_orig_proc)
 	                   ? s_follow_host_orig_proc
 	                   : (WNDPROC)(LONG_PTR)GetPropW(host, FOLLOW_HOST_ORIG_PROP);
+	if (s_follow_ping_msg != 0 && msg == s_follow_ping_msg)
+		return FOLLOW_PING_ANSWER; // ours is in this chain (follow_host_chain_has_ours)
 	if (msg == WM_NCDESTROY) {
 		// The host's last message. Unhook only while ours is the outermost proc
 		// (anything else is a later subclass's to unwind, #428), and forget the host.
@@ -2008,33 +2018,62 @@ static void follow_unsubclass_host(void)
 	s_follow_host_hwnd = NULL; s_follow_host_orig_proc = NULL;
 }
 
+// (#428) Is our proc in `host`'s WndProc chain? Asks the chain (FOLLOW_PING_MSG): 1 yes,
+// 0 no, -1 could not ask. The host is Unity's window on this (the main) thread, so the
+// send is a direct call down the chain; the timeout only guards a host on a hung thread.
+static int follow_host_chain_has_ours(HWND host)
+{
+	if (s_follow_ping_msg == 0)
+		s_follow_ping_msg = RegisterWindowMessageW(FOLLOW_PING_MSG);
+	if (s_follow_ping_msg == 0)
+		return -1;
+	DWORD_PTR answer = 0;
+	if (!SendMessageTimeoutW(host, s_follow_ping_msg, 0, 0, SMTO_BLOCK | SMTO_ABORTIFHUNG, 200, &answer))
+		return -1;
+	return answer == (DWORD_PTR)FOLLOW_PING_ANSWER ? 1 : 0;
+}
+
 // (#740) Subclass `host` for the lockstep follow. (#428) Where our proc is still in the
 // host's chain (follow_unsubclass_host left it there), take it back as it is instead.
 static void follow_subclass_host(HWND host)
 {
 	WNDPROC kept = (WNDPROC)(LONG_PTR)GetPropW(host, FOLLOW_HOST_ORIG_PROP);
 	WNDPROC cur = (WNDPROC)GetWindowLongPtrW(host, GWLP_WNDPROC);
-	if (kept != NULL && cur != kept) {
-		// Ours is outermost again, or still under the subclass that was installed after
-		// it: either way in the chain.
+	int ours = follow_host_chain_has_ours(host);
+	if (ours < 0) {
+		// Neither take back nor install blind; the WM_TIMER follows.
+		displayxr_log("[DisplayXR][PaneFollow] host %p: could not ask its WndProc chain for "
+		              "ours — not subclassing (#428)\n", (void *)host);
+		return;
+	}
+	if (ours) {
+		// Outermost again, or under a subclass installed after it. Never install it over
+		// itself: without the proc it replaced it has nothing to forward to (cannot happen
+		// while the property is set whenever ours is installed); the WM_TIMER follows.
+		if (kept == NULL) {
+			displayxr_log("[DisplayXR][PaneFollow] host %p: our WndProc is in its chain without "
+			              "its previous proc — not subclassing (#428)\n", (void *)host);
+			return;
+		}
 		s_follow_host_orig_proc = kept;
 		s_follow_host_hwnd = host;
-		displayxr_log("[DisplayXR][PaneFollow] host %p: the proc ours replaced (%p) is not "
-		              "outermost (%p) — taking our WndProc back as still in its chain (#428)\n",
-		              (void *)host, (void *)kept, (void *)cur);
+		displayxr_log("[DisplayXR][PaneFollow] host %p: our WndProc answered from its chain "
+		              "(outermost %p) — taking it back; previous proc %p (#428)\n",
+		              (void *)host, (void *)cur, (void *)kept);
 		return;
 	}
-	if (cur == follow_host_subclass_proc) {
-		// Ours, with nothing kept to forward to: cannot happen while the property is set
-		// whenever ours is installed. Never install it over itself; the WM_TIMER follows.
-		displayxr_log("[DisplayXR][PaneFollow] host %p: our WndProc without its previous "
-		              "proc — not subclassing (#428)\n", (void *)host);
-		return;
+	// Not in the chain: never was, or another subclass's restore took it out (the SR
+	// weaver's at Stop). A kept previous proc is stale: drop it, install afresh.
+	if (kept != NULL) {
+		RemovePropW(host, FOLLOW_HOST_ORIG_PROP);
+		if (kept == cur)
+			displayxr_log("[DisplayXR][PaneFollow] host %p: the proc ours replaced (%p) is "
+			              "outermost again — installing afresh (#428)\n", (void *)host, (void *)kept);
+		else
+			displayxr_log("[DisplayXR][PaneFollow] host %p: our WndProc is no longer in its chain "
+			              "(outermost %p, kept previous proc %p) — installing afresh (#428)\n",
+			              (void *)host, (void *)cur, (void *)kept);
 	}
-	// Not in the chain (never was, or the proc it replaced was put back over it).
-	if (kept != NULL)
-		displayxr_log("[DisplayXR][PaneFollow] host %p: the proc ours replaced (%p) is outermost "
-		              "again — installing afresh (#428)\n", (void *)host, (void *)kept);
 	WNDPROC prev = (WNDPROC)SetWindowLongPtrW(host, GWLP_WNDPROC, (LONG_PTR)follow_host_subclass_proc);
 	if (prev == NULL)
 		return; // not subclassed; the WM_TIMER follows
