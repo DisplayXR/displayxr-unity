@@ -1359,10 +1359,11 @@ namespace DisplayXR
                         {
                             Left = s_panePhysWin.left, Top = s_panePhysWin.top,
                             ClientW = pcw, ClientH = pch, ToolbarPx = toolbarPhys,
-                            RtW = rtW, RtH = rtH,
+                            RtW = rtW, RtH = rtH, TargetHPx = size.y * sizeScale,
                             DockedNonMaximized = s_lastAppliedDocked && !IsMatchedGameViewMaximized(),
                             HaveDrawRect = haveDraw,
                             HostWPt = host.width, DrawWPt = draw.width, DrawHPt = draw.height,
+                            HostHPt = host.height,
                             PtToPx = ptToPx,
                             RoundsBottomEdge = SystemInfo.graphicsUVStartsAtTop,
                         };
@@ -1378,6 +1379,9 @@ namespace DisplayXR
                         // The #740 latches (they hold the last good value through realloc
                         // transients and log changes); each is read only where it applies.
                         // The Y guard takes the drawn height, which never exceeds the area.
+                        // (#420) A docked pane on D3D with the draw rect takes its Y from the
+                        // row Unity shows the RT's row 0 on (DisplayXRGameViewPlacement.RtRow0Y);
+                        // the Y latch is then only the fallback (no draw rect, GL).
                         int centX = chromeSlackOnly ? RtCentringOffsetX(rtW, pcw) : 0;
                         int centY = pane.DockedNonMaximized
                             ? RtCentringOffsetY(Mathf.Min(rtH, rh), ptToPx, pch) : 0;
