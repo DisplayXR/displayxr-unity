@@ -1472,7 +1472,11 @@ namespace DisplayXR
             {
                 s_haveLastGood = true; s_lgX = rx; s_lgY = ry; s_lgW = rw; s_lgH = rh;
                 px = rx; py = ry; pw = rw; ph = rh;
-                dbg = $"mainSize=({size.x}x{size.y}) host(points)=({host.x},{host.y} {host.width}x{host.height}) " +
+                // (#420) GetMainGameViewTargetSize reports POINTS for the first frames (while
+                // "Low Resolution Aspect Ratios" is still on) and px after; say which, so a
+                // 1469.333x719.6667 at 150 % does not read as a 1.5x-too-small RT.
+                string units = sizeScale != 1f ? $" pt x{sizeScale:F3}" : "";
+                dbg = $"mainSize=({size.x}x{size.y}{units}) host(points)=({host.x},{host.y} {host.width}x{host.height}) " +
                       $"ppp={ppp:F3} toolbar={toolbar} -> render=({px},{py} {pw}x{ph})";
                 return true;
             }
