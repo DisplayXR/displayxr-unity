@@ -1792,11 +1792,19 @@ static WNDPROC s_follow_host_orig_proc = NULL;
 // Unity's own), follow_unsubclass_host leaves the chain alone instead of cutting that
 // subclass out, and that subclass keeps calling our proc. There it must stay a pure
 // pass-through to the proc it replaced, so that proc is also kept as a property of the
-// host, which lives as long as our proc can be in its chain. The property also marks
-// the host: a later subclass of it takes our proc back where it is, never installs it a
-// second time (our proc would then be its own previous proc: endless recursion on the
-// host's first message).
+// host, which lives as long as our proc can be in its chain. A later subclass of the
+// host asks the chain whether ours is in it (FOLLOW_PING_MSG) and takes it back where it
+// is, never installs it a second time (our proc would then be its own previous proc:
+// endless recursion on the host's first message).
 static const wchar_t FOLLOW_HOST_ORIG_PROP[] = L"DisplayXR.FollowHostOrigProc";
+// (#428) The chain probe. Our proc answers this registered message itself and never
+// forwards it; every other proc passes it on, down to Unity's, which returns 0. The
+// property alone cannot tell: another subclass's restore can take ours out under it (the
+// SR weaver's did at every Stop on 2026-10-27), and a later subclass can sit at the very
+// address ours replaced (the next SR weaver did).
+static const wchar_t FOLLOW_PING_MSG[] = L"DisplayXR.FollowPing";
+#define FOLLOW_PING_ANSWER ((LRESULT)0x44585246) // 'DXRF'
+static UINT s_follow_ping_msg = 0;
 // (#740) Custom host MOVE drag: DefWindowProc's modal move loop blocks Unity's PlayerLoop,
 // so the per-frame pump (window-relative Kooima / POV) freezes until mouse-up. Instead of
 // handing the OS the loop, run the #61 capture-based custom drag (dedicated_wnd_proc's
@@ -1878,6 +1886,8 @@ static LRESULT CALLBACK follow_host_subclass_proc(HWND host, UINT msg, WPARAM wP
 	WNDPROC orig = (host == s_follow_host_hwnd && s_follow_host_orig_proc)
 	                   ? s_follow_host_orig_proc
 	                   : (WNDPROC)(LONG_PTR)GetPropW(host, FOLLOW_HOST_ORIG_PROP);
+	if (s_follow_ping_msg != 0 && msg == s_follow_ping_msg)
+		return FOLLOW_PING_ANSWER; // ours is in this chain (follow_host_chain_has_ours)
 	if (msg == WM_NCDESTROY) {
 		// The host's last message. Unhook only while ours is the outermost proc
 		// (anything else is a later subclass's to unwind, #428), and forget the host.
@@ -1981,9 +1991,11 @@ static void follow_unsubclass_host(void)
 	// out of the chain, and when it later restores ITS previous proc (ours), ours would
 	// be back with nothing to forward to, cutting Unity's own proc out; the next Play
 	// would then subclass on top of ours and make ours its own previous proc. So leave
-	// the chain alone: our proc stays in it as a pass-through to the proc it replaced
-	// (FOLLOW_HOST_ORIG_PROP), and the next subclass of this host takes it back
-	// (follow_subclass_host).
+	// the chain alone. Whether ours is still in it is not known here: under a later
+	// subclass it is, as a pass-through to the proc it replaced (FOLLOW_HOST_ORIG_PROP),
+	// and the next subclass of this host takes it back (follow_subclass_host); but that
+	// subclass's own restore may already have taken it out (the SR weaver's did, before
+	// this ran, at every Stop on 2026-10-27).
 	HWND host = s_follow_host_hwnd;
 	if (host && IsWindow(host)) {
 		WNDPROC cur = (WNDPROC)GetWindowLongPtrW(host, GWLP_WNDPROC);
@@ -1999,11 +2011,26 @@ static void follow_unsubclass_host(void)
 			GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_PIN,
 			                   (LPCWSTR)(void *)&s_follow_host_hwnd, &self);
 			displayxr_log("[DisplayXR][PaneFollow] host %p: WndProc is not ours (%p) — leaving the "
-			              "chain alone, ours stays in it as a pass-through (#428)\n",
-			              (void *)host, (void *)cur);
+			              "chain alone; kept previous proc %p (#428)\n",
+			              (void *)host, (void *)cur, (void *)s_follow_host_orig_proc);
 		}
 	}
 	s_follow_host_hwnd = NULL; s_follow_host_orig_proc = NULL;
+}
+
+// (#428) Is our proc in `host`'s WndProc chain? Asks the chain (FOLLOW_PING_MSG): 1 yes,
+// 0 no, -1 could not ask. The host is Unity's window on this (the main) thread, so the
+// send is a direct call down the chain; the timeout only guards a host on a hung thread.
+static int follow_host_chain_has_ours(HWND host)
+{
+	if (s_follow_ping_msg == 0)
+		s_follow_ping_msg = RegisterWindowMessageW(FOLLOW_PING_MSG);
+	if (s_follow_ping_msg == 0)
+		return -1;
+	DWORD_PTR answer = 0;
+	if (!SendMessageTimeoutW(host, s_follow_ping_msg, 0, 0, SMTO_BLOCK | SMTO_ABORTIFHUNG, 200, &answer))
+		return -1;
+	return answer == (DWORD_PTR)FOLLOW_PING_ANSWER ? 1 : 0;
 }
 
 // (#740) Subclass `host` for the lockstep follow. (#428) Where our proc is still in the
@@ -2012,23 +2039,41 @@ static void follow_subclass_host(HWND host)
 {
 	WNDPROC kept = (WNDPROC)(LONG_PTR)GetPropW(host, FOLLOW_HOST_ORIG_PROP);
 	WNDPROC cur = (WNDPROC)GetWindowLongPtrW(host, GWLP_WNDPROC);
-	if (kept != NULL && cur != kept) {
-		// Ours is outermost again, or still under the subclass that was installed after
-		// it: either way in the chain.
+	int ours = follow_host_chain_has_ours(host);
+	if (ours < 0) {
+		// Neither take back nor install blind; the WM_TIMER follows.
+		displayxr_log("[DisplayXR][PaneFollow] host %p: could not ask its WndProc chain for "
+		              "ours — not subclassing (#428)\n", (void *)host);
+		return;
+	}
+	if (ours) {
+		// Outermost again, or under a subclass installed after it. Never install it over
+		// itself: without the proc it replaced it has nothing to forward to (cannot happen
+		// while the property is set whenever ours is installed); the WM_TIMER follows.
+		if (kept == NULL) {
+			displayxr_log("[DisplayXR][PaneFollow] host %p: our WndProc is in its chain without "
+			              "its previous proc — not subclassing (#428)\n", (void *)host);
+			return;
+		}
 		s_follow_host_orig_proc = kept;
 		s_follow_host_hwnd = host;
-		displayxr_log("[DisplayXR][PaneFollow] host %p: our WndProc is still in its chain — "
-		              "taking it back (#428)\n", (void *)host);
+		displayxr_log("[DisplayXR][PaneFollow] host %p: our WndProc answered from its chain "
+		              "(outermost %p) — taking it back; previous proc %p (#428)\n",
+		              (void *)host, (void *)cur, (void *)kept);
 		return;
 	}
-	if (cur == follow_host_subclass_proc) {
-		// Ours, with nothing kept to forward to: cannot happen while the property is set
-		// whenever ours is installed. Never install it over itself; the WM_TIMER follows.
-		displayxr_log("[DisplayXR][PaneFollow] host %p: our WndProc without its previous "
-		              "proc — not subclassing (#428)\n", (void *)host);
-		return;
+	// Not in the chain: never was, or another subclass's restore took it out (the SR
+	// weaver's at Stop). A kept previous proc is stale: drop it, install afresh.
+	if (kept != NULL) {
+		RemovePropW(host, FOLLOW_HOST_ORIG_PROP);
+		if (kept == cur)
+			displayxr_log("[DisplayXR][PaneFollow] host %p: the proc ours replaced (%p) is "
+			              "outermost again — installing afresh (#428)\n", (void *)host, (void *)kept);
+		else
+			displayxr_log("[DisplayXR][PaneFollow] host %p: our WndProc is no longer in its chain "
+			              "(outermost %p, kept previous proc %p) — installing afresh (#428)\n",
+			              (void *)host, (void *)cur, (void *)kept);
 	}
-	// Not in the chain (never was, or the proc it replaced was put back over it).
 	WNDPROC prev = (WNDPROC)SetWindowLongPtrW(host, GWLP_WNDPROC, (LONG_PTR)follow_host_subclass_proc);
 	if (prev == NULL)
 		return; // not subclassed; the WM_TIMER follows
@@ -4475,6 +4520,47 @@ displayxr_set_overlay_hit_active(int active)
 	// path logs from displayxr_set_overlay_hit_region instead.)
 }
 
+// A button release the overlay never received. Its polled state (s_vkey_state)
+// changes only when a window of ours gets the button message, and the overlay takes
+// no capture on a left or middle press: once a left drag leaves the model, the C#
+// side turns hit-testing off and the window region + WS_EX_TRANSPARENT route the
+// WM_LBUTTONUP to the window under the cursor, so the state stayed pressed and the
+// drag kept following the mouse until the next click on the model. Alt+Tab
+// mid-press, or a right drag whose capture was taken away, loses a release the same
+// way.
+//
+// A pressed bit is dropped once its PHYSICAL button is up and no button message is
+// waiting in this thread's queue (the overlay, Unity's window and this poll all run
+// on Unity's main thread): a press pumped this frame and released before this poll
+// still has its WM_*BUTTONUP queued, and must be seen. Never touches capture, so the
+// right-drag move and the frame resize keep their own release paths.
+static void
+overlay_drop_lost_releases(void)
+{
+	static const int logical_vk[3] = {VK_LBUTTON, VK_RBUTTON, VK_MBUTTON};
+	static const char *const name[3] = {"left", "right", "middle"};
+	// GetAsyncKeyState reads PHYSICAL buttons; with the buttons swapped the logical
+	// left (WM_LBUTTONDOWN) is the physical right, and vice versa.
+	const int swapped = GetSystemMetrics(SM_SWAPBUTTON) != 0;
+	for (int i = 0; i < 3; i++) {
+		const int vk = logical_vk[i];
+		if (!(s_vkey_state[vk] & 0x8000))
+			continue;
+		int phys = vk;
+		if (swapped && vk == VK_LBUTTON)
+			phys = VK_RBUTTON;
+		else if (swapped && vk == VK_RBUTTON)
+			phys = VK_LBUTTON;
+		if (GetAsyncKeyState(phys) & 0x8000)
+			continue;
+		if (HIWORD(GetQueueStatus(QS_MOUSEBUTTON)) & QS_MOUSEBUTTON)
+			continue;
+		s_vkey_state[vk] = 0x0001; // what the WM_*BUTTONUP would have written
+		displayxr_log("[DisplayXR][OvlWnd] %s release went to another window - "
+		              "the button is up, clearing its pressed state\n", name[i]);
+	}
+}
+
 int
 displayxr_get_overlay_pointer(int *clientX, int *clientY, int *buttons)
 {
@@ -4538,6 +4624,7 @@ displayxr_get_overlay_pointer(int *clientX, int *clientY, int *buttons)
 		// (installed via displayxr_install_focus_hook from the transparent
 		// path). PostMessage'd left/right/middle clicks from overlay_wnd_proc
 		// flow through Unity's wndproc → subclass → here.
+		overlay_drop_lost_releases();
 		if (s_vkey_state[VK_LBUTTON] & 0x8000) b |= 1;
 		if (s_vkey_state[VK_RBUTTON] & 0x8000) b |= 2;
 		if (s_vkey_state[VK_MBUTTON] & 0x8000) b |= 4;
