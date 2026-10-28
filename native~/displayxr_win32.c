@@ -4520,6 +4520,47 @@ displayxr_set_overlay_hit_active(int active)
 	// path logs from displayxr_set_overlay_hit_region instead.)
 }
 
+// A button release the overlay never received. Its polled state (s_vkey_state)
+// changes only when a window of ours gets the button message, and the overlay takes
+// no capture on a left or middle press: once a left drag leaves the model, the C#
+// side turns hit-testing off and the window region + WS_EX_TRANSPARENT route the
+// WM_LBUTTONUP to the window under the cursor, so the state stayed pressed and the
+// drag kept following the mouse until the next click on the model. Alt+Tab
+// mid-press, or a right drag whose capture was taken away, loses a release the same
+// way.
+//
+// A pressed bit is dropped once its PHYSICAL button is up and no button message is
+// waiting in this thread's queue (the overlay, Unity's window and this poll all run
+// on Unity's main thread): a press pumped this frame and released before this poll
+// still has its WM_*BUTTONUP queued, and must be seen. Never touches capture, so the
+// right-drag move and the frame resize keep their own release paths.
+static void
+overlay_drop_lost_releases(void)
+{
+	static const int logical_vk[3] = {VK_LBUTTON, VK_RBUTTON, VK_MBUTTON};
+	static const char *const name[3] = {"left", "right", "middle"};
+	// GetAsyncKeyState reads PHYSICAL buttons; with the buttons swapped the logical
+	// left (WM_LBUTTONDOWN) is the physical right, and vice versa.
+	const int swapped = GetSystemMetrics(SM_SWAPBUTTON) != 0;
+	for (int i = 0; i < 3; i++) {
+		const int vk = logical_vk[i];
+		if (!(s_vkey_state[vk] & 0x8000))
+			continue;
+		int phys = vk;
+		if (swapped && vk == VK_LBUTTON)
+			phys = VK_RBUTTON;
+		else if (swapped && vk == VK_RBUTTON)
+			phys = VK_LBUTTON;
+		if (GetAsyncKeyState(phys) & 0x8000)
+			continue;
+		if (HIWORD(GetQueueStatus(QS_MOUSEBUTTON)) & QS_MOUSEBUTTON)
+			continue;
+		s_vkey_state[vk] = 0x0001; // what the WM_*BUTTONUP would have written
+		displayxr_log("[DisplayXR][OvlWnd] %s release went to another window - "
+		              "the button is up, clearing its pressed state\n", name[i]);
+	}
+}
+
 void
 displayxr_get_overlay_pointer(int *clientX, int *clientY, int *buttons)
 {
@@ -4577,6 +4618,7 @@ displayxr_get_overlay_pointer(int *clientX, int *clientY, int *buttons)
 		// (installed via displayxr_install_focus_hook from the transparent
 		// path). PostMessage'd left/right/middle clicks from overlay_wnd_proc
 		// flow through Unity's wndproc → subclass → here.
+		overlay_drop_lost_releases();
 		if (s_vkey_state[VK_LBUTTON] & 0x8000) b |= 1;
 		if (s_vkey_state[VK_RBUTTON] & 0x8000) b |= 2;
 		if (s_vkey_state[VK_MBUTTON] & 0x8000) b |= 4;
