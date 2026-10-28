@@ -259,7 +259,9 @@ namespace DisplayXR
         /// Meaningful in a standalone Windows or Linux build with transparent mode
         /// active. Windows: updated each frame from native polling — works regardless
         /// of Unity input focus, unlike Mouse.current.position. Linux: taken from the
-        /// Input System, which is live there.</summary>
+        /// Input System, which is live there. Outside the window it keeps following
+        /// the cursor (negative left of or above it), so a drag that leaves the
+        /// window keeps its delta.</summary>
         public Vector2 PointerPosition { get; private set; }
 
         /// <summary>Cursor movement this frame, in window pixels. Same axes as
@@ -568,12 +570,17 @@ namespace DisplayXR
                 return;
 
             int clientX, clientY, buttons, overlayW, overlayH;
+            // (#437) Whether there is a pointer at all comes out of band, not
+            // from the sign of clientX/Y: a cursor left of or above the window
+            // has negative client coordinates, and a drag that leaves the window
+            // there must keep following it.
+            bool havePointer;
             if (m_SimpleWindow)
             {
                 // Simple-window mode: Unity IS the real on-screen foreground
                 // window, so Mouse.current and Screen.* are live — no cloaked-
                 // HWND polling needed. Read the cursor in top-left client px.
-                GetRealWindowPointer(out clientX, out clientY, out buttons);
+                havePointer = GetRealWindowPointer(out clientX, out clientY, out buttons);
                 overlayW = Screen.width;
                 overlayH = Screen.height;
             }
@@ -583,8 +590,8 @@ namespace DisplayXR
                 // + ScreenToClient on the overlay HWND, plus s_vkey_state from
                 // raw input). Bypasses Unity's New Input System, which is broken
                 // for the cloaked off-screen Unity HWND — see header comment.
-                DisplayXRNative.displayxr_get_overlay_pointer(
-                    out clientX, out clientY, out buttons);
+                havePointer = DisplayXRNative.displayxr_get_overlay_pointer(
+                    out clientX, out clientY, out buttons) != 0;
                 // Overlay's actual client size — needed for cursor → NDC. Cannot
                 // use Screen.width/height because Unity's HWND is parked off-
                 // screen with frozen dimensions; the overlay can be scroll-
@@ -618,8 +625,12 @@ namespace DisplayXR
             // current animated silhouette (no AABB false-positives).
             UpdateBakedHitColliders();
 
+            // Hit-test only while the cursor is over the window, on all four
+            // sides: a ray from outside the viewport hits nothing the user sees.
+            bool overWindow = havePointer
+                && clientX >= 0 && clientY >= 0 && clientX < overlayW && clientY < overlayH;
             Renderer hitRenderer = null;
-            if (clientX >= 0 && clientY >= 0
+            if (overWindow
                 && TryGetStereoMatrices(out Matrix4x4 leftView, out Matrix4x4 leftProj,
                                          out Matrix4x4 rightView, out Matrix4x4 rightProj))
             {
@@ -708,7 +719,7 @@ namespace DisplayXR
             // / Mouse.current.delta — both of which are frozen for cloaked
             // HWNDs, the same Unity limitation that motivates this whole
             // polling architecture.
-            Vector2 pos = (clientX >= 0 && clientY >= 0)
+            Vector2 pos = havePointer
                 ? new Vector2(clientX, clientY)
                 : PointerPosition;
             PointerDelta = m_HasPrevPointerPos ? (pos - m_PrevPointerPos) : Vector2.zero;
@@ -733,7 +744,7 @@ namespace DisplayXR
             // SKIPPED in simple-window mode: Unity's real HWND is the on-screen
             // foreground window, so Mouse.current is already live — re-injecting
             // our polled copy would fight Unity's own raw input.
-            if (!m_SimpleWindow && Mouse.current != null && clientX >= 0 && clientY >= 0)
+            if (!m_SimpleWindow && Mouse.current != null && havePointer)
             {
                 // Y-flip relative to the overlay's height (not Screen.height,
                 // which is the off-screen Unity HWND's frozen size).
@@ -768,7 +779,9 @@ namespace DisplayXR
             {
                 s_diagCounter = 0;
                 Debug.LogWarning("[DisplayXR.Inject] skipped: " +
-                    (Mouse.current == null ? "Mouse.current is null" : $"clientX={clientX} clientY={clientY}"));
+                    (Mouse.current == null ? "Mouse.current is null"
+                     : m_SimpleWindow ? "simple-window mode (Unity's own input is live)"
+                     : "no overlay window"));
             }
 #endif
 
@@ -1121,12 +1134,14 @@ namespace DisplayXR
         // input (Mouse.current is live because the real HWND is foreground).
         // Returns top-left-origin client pixels to match the overlay path's
         // GetCursorPos+ScreenToClient convention. buttons: bit0=L,1=R,2=M.
-        private void GetRealWindowPointer(out int clientX, out int clientY, out int buttons)
+        // Returns false when there is no mouse to read (#437: absence is the
+        // return value; negative coordinates are a cursor outside the window).
+        private bool GetRealWindowPointer(out int clientX, out int clientY, out int buttons)
         {
             clientX = -1; clientY = -1; buttons = 0;
 #if HAS_INPUT_SYSTEM
             var m = Mouse.current;
-            if (m == null) return;
+            if (m == null) return false;
             Vector2 raw = m.position.ReadValue();        // bottom-left origin
             clientX = Mathf.RoundToInt(raw.x);
             clientY = Mathf.RoundToInt(Screen.height - raw.y); // → top-left origin
@@ -1141,6 +1156,7 @@ namespace DisplayXR
             if (Input.GetMouseButton(1)) buttons |= 2;
             if (Input.GetMouseButton(2)) buttons |= 4;
 #endif
+            return true;
         }
 
 #endif
