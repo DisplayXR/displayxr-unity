@@ -157,7 +157,9 @@ int displayxr_is_our_process_foreground(void);
 /// subclass. @param clientX Set to client-space X (-1 if no overlay).
 /// @param clientY Set to client-space Y (-1 if no overlay).
 /// @param buttons Bit 0 = left, 1 = right, 2 = middle.
-void displayxr_get_overlay_pointer(int *clientX, int *clientY, int *buttons);
+/// @return 1 if clientX/Y hold the cursor, 0 if there is no overlay (#437).
+/// Negative coordinates are real: the cursor is left of or above the overlay.
+int displayxr_get_overlay_pointer(int *clientX, int *clientY, int *buttons);
 
 /// (v1.2.2) Atomically read + zero the overlay's accumulated mouse-wheel
 /// delta. Returns Win32 raw units (120 per notch; positive = wheel forward).

@@ -4475,17 +4475,23 @@ displayxr_set_overlay_hit_active(int active)
 	// path logs from displayxr_set_overlay_hit_region instead.)
 }
 
-void
+int
 displayxr_get_overlay_pointer(int *clientX, int *clientY, int *buttons)
 {
+	// (#437) Whether there is a pointer is the RETURN value, not a coordinate:
+	// a cursor left of or above the overlay has negative client coordinates,
+	// and a drag that leaves the window there must keep reporting them. -1/-1
+	// is still written when there is none, for callers that predate the return.
+	int have = 0;
 	if (clientX != NULL) *clientX = -1;
 	if (clientY != NULL) *clientY = -1;
 
 	POINT pt;
-	if (GetCursorPos(&pt) && s_overlay_hwnd != NULL && IsWindow(s_overlay_hwnd)) {
-		ScreenToClient(s_overlay_hwnd, &pt);
+	if (GetCursorPos(&pt) && s_overlay_hwnd != NULL && IsWindow(s_overlay_hwnd) &&
+	    ScreenToClient(s_overlay_hwnd, &pt)) {
 		if (clientX != NULL) *clientX = pt.x;
 		if (clientY != NULL) *clientY = pt.y;
+		have = 1;
 	}
 
 	if (buttons != NULL) {
@@ -4526,7 +4532,7 @@ displayxr_get_overlay_pointer(int *clientX, int *clientY, int *buttons)
 				if (down && s_btn_inside[i]) b |= (1 << i);
 			}
 			*buttons = b;
-			return;
+			return have;
 		}
 		// s_vkey_state is updated by shell_subclass_proc on Unity's HWND
 		// (installed via displayxr_install_focus_hook from the transparent
@@ -4537,6 +4543,7 @@ displayxr_get_overlay_pointer(int *clientX, int *clientY, int *buttons)
 		if (s_vkey_state[VK_MBUTTON] & 0x8000) b |= 4;
 		*buttons = b;
 	}
+	return have;
 }
 
 int

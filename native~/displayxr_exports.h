@@ -307,11 +307,13 @@ DISPLAYXR_EXPORT void displayxr_get_overlay_size(int *width, int *height);
 /// (issue #57) Read cursor position (overlay-client coords, top-left origin)
 /// + mouse button state. Designed for transparent overlay mode where Unity's
 /// New Input System Mouse.current.position is frozen because the cloaked
-/// Unity HWND isn't OS-foreground (documented Unity limitation). Returns
-/// (-1, -1) for clientX/Y if no overlay HWND. Buttons: bit 0 = left, 1 =
-/// right, 2 = middle.
-DISPLAYXR_EXPORT void displayxr_get_overlay_pointer(int *clientX, int *clientY,
-                                                    int *buttons);
+/// Unity HWND isn't OS-foreground (documented Unity limitation). Returns 1
+/// when clientX/Y hold the cursor and 0 when there is no overlay HWND (then
+/// clientX/Y are -1, as before). (#437) Test the return value, not the sign:
+/// a cursor left of or above the overlay has negative coordinates. Buttons:
+/// bit 0 = left, 1 = right, 2 = middle.
+DISPLAYXR_EXPORT int displayxr_get_overlay_pointer(int *clientX, int *clientY,
+                                                   int *buttons);
 
 /// (v1.2.2) Atomically read + zero the overlay's accumulated mouse-wheel
 /// delta. Returns Win32 raw units (120 per notch; positive = wheel forward).

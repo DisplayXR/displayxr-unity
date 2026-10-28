@@ -397,11 +397,13 @@ namespace DisplayXR
         /// mouse button state. Designed for transparent overlay mode where
         /// Unity's New Input System Mouse.current.position is frozen because
         /// the cloaked Unity HWND isn't OS-foreground (documented Unity
-        /// limitation). Returns (-1, -1) for clientX/Y if no overlay HWND.
-        /// Buttons: bit 0 = left, 1 = right, 2 = middle.
+        /// limitation). Returns 1 when clientX/Y hold the cursor and 0 when
+        /// there is no overlay HWND (then clientX/Y are -1). (#437) Test the
+        /// return value, not the sign: a cursor left of or above the overlay
+        /// has negative coordinates. Buttons: bit 0 = left, 1 = right, 2 = middle.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern void displayxr_get_overlay_pointer(
+        public static extern int displayxr_get_overlay_pointer(
             out int clientX, out int clientY, out int buttons);
 
         /// <summary>
