@@ -39,6 +39,12 @@ namespace DisplayXR
     /// </para>
     ///
     /// <para>
+    /// <b>Full screen (Windows).</b> A <c>FullScreenWindow</c> player is moved and made to
+    /// cover the whole panel, as <c>Screen.MoveMainWindowTo</c> does for a full-screen
+    /// window. An <c>ExclusiveFullScreen</c> one is not moved (a warning says so).
+    /// </para>
+    ///
+    /// <para>
     /// <b>Linux native Wayland: on by default, without this component</b>
     /// (<see cref="PlaceOnPanelAtStart"/>). There mutter opens a new window on the monitor
     /// under the pointer, which can be a screen-casting tool's virtual monitor nobody
@@ -218,6 +224,20 @@ namespace DisplayXR
         bool Move(bool atStart)
         {
             Attempted = true;
+            // Windows: an exclusive-fullscreen window holds the display it is on (its
+            // swapchain owns that output), so it is not moved from under Unity. A
+            // FullScreenWindow player is moved and made to cover the whole panel (the
+            // native move tells a borderless window that covered its monitor from a
+            // windowed one, #266); Windowed and MaximizedWindow as before.
+            if (Application.platform == RuntimePlatform.WindowsPlayer &&
+                Screen.fullScreenMode == FullScreenMode.ExclusiveFullScreen)
+            {
+                Succeeded = false;
+                if (logResult)
+                    Debug.LogWarning("[DisplayXR] TargetDisplay: ExclusiveFullScreen — not moved. Use " +
+                                     "FullScreenWindow to have the window cover the 3D panel.");
+                return false;
+            }
             Succeeded = atStart ? DisplayXRProvider.MoveWindowToDisplayAtStart() : DisplayXRProvider.MoveWindowToDisplay();
             if (logResult)
             {

@@ -25,8 +25,10 @@
 #include <d3d11.h>   // D3D11 zero-copy backend (#195)
 #include <d3d11_4.h> // ID3D11Multithread (shared-device weave protection, #195)
 #include <dxgi1_4.h>
+#include <dwmapi.h>  // DwmGetWindowAttribute — visible frame for the TargetDisplay fit
 
 #pragma comment(lib, "advapi32.lib") // RegGetValueA — ActiveRuntime registry fallback (#173)
+#pragma comment(lib, "dwmapi.lib")   // DwmGetWindowAttribute (MinGW: CMakeLists link_libraries)
 #else
 #include <dlfcn.h> // dlopen/dlsym runtime load (macOS mirror of LoadLibraryExA)
 #if defined(__ANDROID__)
@@ -8542,6 +8544,119 @@ int dxr_prov_get_runtime_version(char *buf, int len)
 	return 1;
 }
 
+#if defined(_WIN32)
+// Re-read the window after a move onto the panel, and fit it there if it does not fit.
+// Call it only inside the per-monitor-aware scope dxr_prov_move_window_to_display pins:
+// every rect here is a physical virtual-desktop rect, and so is the monitor's.
+//
+// The move crosses monitors, so Windows sends WM_DPICHANGED and Unity's player applies
+// the suggested rect: the window keeps its LOGICAL size, which on a higher-scale panel is
+// a larger PHYSICAL one, and keeps the top-left that was centred for the OLD size.
+// Measured on a 150 % main display + 300 % 3840x2160 panel: 1942x1136 at (-2891,512)
+// became 3884x2272 (client 3848x2169) - bigger than the panel and overhanging onto the
+// main display. A window larger than the panel is one the runtime's output-device split
+// refuses every frame (COPY EXTENT MISMATCH -> black panel; runtime #1575 / #1603 class),
+// and the saved size is what the player opens with next time.
+//
+// Same rule as the Linux placement (#357): a window that does not fit is reduced to fit
+// the panel's work area, keeping its aspect, and centred; one that fits but overhangs is
+// only re-centred. The comparison uses the VISIBLE frame (DWM extended frame bounds), so
+// the invisible resize borders of a window that sits flush with the panel do not count
+// as overhang. A no-op when the window already lies inside the panel.
+static void ps_fit_window_to_monitor(HWND hwnd, const MONITORINFO *mi)
+{
+	RECT wr = {0, 0, 0, 0};
+	if (!GetWindowRect(hwnd, &wr)) return;
+	RECT vis = wr;
+	if (FAILED(DwmGetWindowAttribute(hwnd, DWMWA_EXTENDED_FRAME_BOUNDS, &vis, sizeof(vis))) ||
+	    vis.right <= vis.left || vis.bottom <= vis.top) {
+		vis = wr;
+	}
+	if (vis.left >= mi->rcMonitor.left && vis.top >= mi->rcMonitor.top &&
+	    vis.right <= mi->rcMonitor.right && vis.bottom <= mi->rcMonitor.bottom) {
+		return; // inside the panel: nothing to do
+	}
+
+	const RECT *area = &mi->rcWork;
+	if (area->right <= area->left || area->bottom <= area->top) area = &mi->rcMonitor;
+	const int aw = (int)(area->right - area->left), ah = (int)(area->bottom - area->top);
+
+	// Invisible border on each side = window rect minus visible frame.
+	const int bl = (int)(vis.left - wr.left), bt = (int)(vis.top - wr.top);
+	const int bx = bl + (int)(wr.right - vis.right), by = bt + (int)(wr.bottom - vis.bottom);
+	const int vw = (int)(vis.right - vis.left), vh = (int)(vis.bottom - vis.top);
+
+	int fvw = vw, fvh = vh;
+	if (vw > aw || vh > ah) {
+		const double sx = (double)aw / (double)vw, sy = (double)ah / (double)vh;
+		const double s = sx < sy ? sx : sy;
+		fvw = (int)((double)vw * s);
+		fvh = (int)((double)vh * s);
+	}
+	const bool resized = (fvw != vw || fvh != vh);
+	const int x = (int)area->left + (aw - fvw) / 2 - bl;
+	const int y = (int)area->top + (ah - fvh) / 2 - bt;
+	const BOOL ok = SetWindowPos(hwnd, NULL, x, y, fvw + bx, fvh + by,
+	                             SWP_NOZORDER | SWP_NOACTIVATE | (resized ? 0 : SWP_NOSIZE));
+	ps_log("[DisplayXR-PROV] move_window_to_display: after the move the window is %dx%d at "
+	       "(%d,%d), not inside the panel (%d,%d %dx%d) - %s to %dx%d at (%d,%d) rc=%d\n",
+	       vw, vh, (int)vis.left, (int)vis.top, (int)mi->rcMonitor.left, (int)mi->rcMonitor.top,
+	       (int)(mi->rcMonitor.right - mi->rcMonitor.left), (int)(mi->rcMonitor.bottom - mi->rcMonitor.top),
+	       resized ? "fitted" : "re-centred", fvw, fvh, x + bl, y + bt, ok ? 1 : 0);
+}
+
+// A full-screen window: no title bar and no sizing frame (WS_POPUP-style), not maximized,
+// and covering the whole of the monitor it is on. That is Unity's FullScreenWindow
+// ("borderless full screen", a WS_POPUP window the size of the monitor), and the same
+// shape made any other way. Windows does not report it as maximized, so IsZoomed() does
+// not catch it. Read it BEFORE the move, on the monitor the window is leaving: after the
+// move it covers nothing yet. A borderless window that does not cover its monitor (a
+// chrome-less windowed app; a transparent overlay app's main window, parked off-screen)
+// is an ordinary window and gets ps_fit_window_to_monitor.
+static bool ps_window_is_full_screen(LONG_PTR style, const RECT *wr, HMONITOR cur)
+{
+	if ((style & WS_CAPTION) == WS_CAPTION || (style & WS_THICKFRAME) != 0) return false;
+	if ((style & (WS_MAXIMIZE | WS_MINIMIZE)) != 0) return false; // left alone, as before
+	MONITORINFO cmi;
+	cmi.cbSize = sizeof(MONITORINFO);
+	if (!cur || !GetMonitorInfo(cur, &cmi)) return false;
+	return wr->left <= cmi.rcMonitor.left && wr->top <= cmi.rcMonitor.top &&
+	       wr->right >= cmi.rcMonitor.right && wr->bottom >= cmi.rcMonitor.bottom;
+}
+
+// After the move, make a full-screen window (ps_window_is_full_screen) cover the panel's
+// whole monitor: rcMonitor, not the work area, and no aspect fit. Same inside-the-pinned-
+// scope rule as ps_fit_window_to_monitor. It is what Unity does itself when it moves a
+// full-screen window to another display (Screen.MoveMainWindowTo "snaps the position to
+// the top left corner of the display and resizes it to fit"). The work-area fit would
+// make it a letterboxed borderless window that leaves the taskbar strip of the panel
+// uncovered. Leaving it alone would keep whatever WM_DPICHANGED made of it, which on a
+// higher-scale panel is a window larger than the panel (2560x1600 at 150 % becomes
+// 5120x3200 on a 300 % panel): the black-panel case above. A no-op when the player
+// already re-fitted itself to the panel.
+static void ps_cover_monitor(HWND hwnd, const MONITORINFO *mi)
+{
+	const RECT &m = mi->rcMonitor;
+	const int mw = (int)(m.right - m.left), mh = (int)(m.bottom - m.top);
+	RECT wr = {0, 0, 0, 0};
+	if (!GetWindowRect(hwnd, &wr)) return;
+	if (EqualRect(&wr, &m)) {
+		ps_log("[DisplayXR-PROV] move_window_to_display: the full-screen window covers the panel "
+		       "(%d,%d %dx%d)\n",
+		       (int)m.left, (int)m.top, mw, mh);
+		return;
+	}
+	const BOOL ok = SetWindowPos(hwnd, NULL, (int)m.left, (int)m.top, mw, mh, SWP_NOZORDER | SWP_NOACTIVATE);
+	RECT now = {0, 0, 0, 0};
+	GetWindowRect(hwnd, &now);
+	ps_log("[DisplayXR-PROV] move_window_to_display: after the move the full-screen window is %dx%d "
+	       "at (%d,%d) - covering the panel (%d,%d %dx%d) rc=%d, now %dx%d at (%d,%d)\n",
+	       (int)(wr.right - wr.left), (int)(wr.bottom - wr.top), (int)wr.left, (int)wr.top, (int)m.left,
+	       (int)m.top, mw, mh, ok ? 1 : 0, (int)(now.right - now.left), (int)(now.bottom - now.top),
+	       (int)now.left, (int)now.top);
+}
+#endif
+
 // @p at_start: DisplayXRTargetDisplay's move once the session runs, not one the app
 // asks for later. Only the native-Wayland path tells them apart (the size the window
 // keeps, see dxr_wl_move_player_to_panel_at_start); Windows and X11 move the same.
@@ -8600,6 +8715,9 @@ static int ps_move_window_to_display(int at_start)
 			ps_log("[DisplayXR-PROV] move_window_to_display: already on the 3D display\n");
 			rc = 1;
 		} else {
+			// Full-screen on the monitor it is leaving? Only answerable now.
+			const LONG_PTR style = GetWindowLongPtrW(hwnd, GWL_STYLE);
+			const bool full_screen = ps_window_is_full_screen(style, &wr, cur);
 			// Centre it, and clamp so a window LARGER than the panel still lands
 			// with its top-left on the panel rather than off the top/left edge
 			// where the title bar becomes unreachable.
@@ -8610,9 +8728,16 @@ static int ps_move_window_to_display(int at_start)
 			rc = SetWindowPos(hwnd, NULL, x, y, 0, 0,
 			                  SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE) ? 1 : 0;
 			ps_log("[DisplayXR-PROV] move_window_to_display: (%d,%d) %dx%d -> (%d,%d) on "
-			       "monitor (%d,%d %dx%d) rc=%d\n",
+			       "monitor (%d,%d %dx%d) rc=%d style=0x%08x%s\n",
 			       (int)wr.left, (int)wr.top, ww, wh, x, y,
-			       (int)mi.rcMonitor.left, (int)mi.rcMonitor.top, mw, mh, rc);
+			       (int)mi.rcMonitor.left, (int)mi.rcMonitor.top, mw, mh, rc,
+			       (unsigned)(DWORD)style, full_screen ? " full-screen" : "");
+			if (rc && !IsZoomed(hwnd) && !IsIconic(hwnd)) {
+				if (full_screen)
+					ps_cover_monitor(hwnd, &mi);
+				else
+					ps_fit_window_to_monitor(hwnd, &mi);
+			}
 		}
 	}
 
