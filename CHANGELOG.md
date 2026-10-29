@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.34.0] - 2026-10-29
+
 ### Changed
 - **Linux native Wayland: the app's window opens on the 3D panel by default (#266).** mutter opens a new window on the monitor under the pointer. With a screen-casting tool's virtual "extend" display up and the pointer on it, a DisplayXR app opened there, out of the user's sight; with the pointer on the laptop, it opened on the laptop and stayed 2D. The plug-in now moves the window onto the panel once, at the session's second frame (or when the window is first shown, within 5 s), centred, with the size it opened with. No component is needed.
   - It stands down when someone placed the window first: the app (`displayxr_set_overlay_position`, e.g. a saved position it restores, or `DisplayXRTargetDisplay`), the side-step, or the user (a drag). An app's position after it still wins. A saved position off the panel is still treated as stale (#361).
