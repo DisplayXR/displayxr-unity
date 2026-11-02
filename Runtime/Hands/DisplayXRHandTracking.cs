@@ -23,20 +23,22 @@ namespace DisplayXR.Hands
     /// <c>XRHandSkeletonDriver</c> and <c>XRHandMeshController</c> work unchanged.
     ///
     /// <b>Frame.</b> Joint poses are expressed relative to the <b>rig camera's transform</b>
-    /// (the display plane — what the provider sends the runtime as the rig pose), in the
-    /// rig's world units. Parent your hand visuals under the rig camera (or transform the
+    /// (what the provider sends the runtime as the rig pose: the display plane for a
+    /// display-centric rig, the nominal viewer for a camera-centric one), in the rig's world
+    /// units. Parent your hand visuals under the rig camera (or transform the
     /// poses by it) and they land where the real hands are in front of the panel; see the
     /// Hand Tracking doc page for why that is the right origin.
     ///
-    /// <b>Scale.</b> The runtime reports joints in metres relative to the physical panel.
-    /// A rig whose virtual display is not the physical size (display-centric
-    /// <c>virtualDisplayHeight</c>, or camera-centric FOV × convergence distance) scales
-    /// the eye positions by that ratio, and the hands must follow or a fingertip on the
-    /// glass would not touch the virtual display plane. <see cref="ResolvePoseScale"/>
-    /// derives the ratio from the active rig every update; <see cref="PoseScaleOverride"/>
-    /// pins it instead. Scale-as-zoom (a scaled rig transform) needs nothing here — it is
-    /// folded out of the tunables before they reach the runtime, and parenting under the
-    /// (scaled) rig camera applies it to the hands.
+    /// <b>Placement.</b> The runtime reports joints in metres relative to the physical panel.
+    /// <see cref="ResolveMapping"/> maps them the way the rig maps the eyes (the runtime's
+    /// <c>XR_DXR_view_rig</c> rule for hand joints): rebased onto the canvas (the window on
+    /// the panel), then for a display-centric rig scaled by the virtual-to-canvas height
+    /// ratio, and for a camera-centric rig offset so the rig camera is the nominal viewer
+    /// (the panel, and a hand in front of it, land in front of the camera). Without it a
+    /// camera-centric rig put every joint behind its camera.
+    /// <see cref="PoseScaleOverride"/> pins the scale instead. Scale-as-zoom (a scaled rig
+    /// transform) needs nothing here — it is folded out of the tunables before they reach
+    /// the runtime, and parenting under the (scaled) rig camera applies it to the hands.
     /// </summary>
     public static class DisplayXRHandTracking
     {
@@ -73,7 +75,8 @@ namespace DisplayXR.Hands
 
         /// <summary>
         /// Pin the metres→rig-units factor applied to joint positions and radii instead of
-        /// deriving it from the active rig (null = derive, the default). 1 = raw metres.
+        /// deriving it from the active rig (null = derive, the default). 1 = raw metres. The
+        /// rig's origin (canvas centre, camera-centric nominal viewer) still applies.
         /// </summary>
         public static float? PoseScaleOverride { get; set; }
 
@@ -149,25 +152,37 @@ namespace DisplayXR.Hands
         }
 
         /// <summary>
-        /// The metres→rig-units factor for this update: <see cref="PoseScaleOverride"/> if
-        /// set, else the active rig's virtual display height over the physical panel
-        /// height (display-centric: <c>virtualDisplayHeight</c>, 0 = physical;
-        /// camera-centric: the vertical FOV's span at the convergence distance,
-        /// 2·tan(vFov/2)/invConvergenceDistance). 1 when there is no rig, no display info,
-        /// or the rig converges at infinity. Called by the provider; public for HUDs.
+        /// The joint → rig mapping for this update (see <see cref="DisplayXRHandRigMath"/>):
+        /// the canvas centre is subtracted, a camera-centric rig moves the origin to the
+        /// nominal viewer (the rig camera is the viewer there, so the panel sits
+        /// <c>nominalViewerZ</c> in front of it), and the position is scaled by the rig's
+        /// metres→rig-units factor (display-centric: <c>perspectiveFactor ·
+        /// virtualDisplayHeight / canvas height</c>; camera-centric: 1, the
+        /// <c>metersToVirtual</c> the provider sends). <see cref="PoseScaleOverride"/>, if
+        /// set, replaces the scale only. Identity when there is no rig or no display info.
+        /// Called by the provider every update; public for HUDs.
         /// </summary>
-        public static float ResolvePoseScale()
+        public static DisplayXRHandRigMapping ResolveMapping()
         {
-            float scale = PoseScaleOverride ?? ComputeAutoScale();
-            if (!(scale > 0f) || float.IsInfinity(scale)) scale = 1f;
-            CurrentPoseScale = scale;
-            return scale;
+            var m = ComputeAutoMapping();
+            s_AutoScale = m.scale > 0f && !float.IsInfinity(m.scale) ? m.scale : 1f;
+            if (PoseScaleOverride.HasValue) m.scale = PoseScaleOverride.Value;
+            if (!(m.scale > 0f) || float.IsInfinity(m.scale)) m.scale = 1f;
+            CurrentPoseScale = m.scale;
+            CurrentMapping = m;
+            return m;
         }
 
-        static float ComputeAutoScale()
+        /// <summary>The scale part of <see cref="ResolveMapping"/> (kept for HUDs and older callers).</summary>
+        public static float ResolvePoseScale() => ResolveMapping().scale;
+
+        /// <summary>The mapping the last update applied (diagnostics / HUDs).</summary>
+        public static DisplayXRHandRigMapping CurrentMapping { get; private set; } = DisplayXRHandRigMapping.Identity;
+
+        static DisplayXRHandRigMapping ComputeAutoMapping()
         {
             var cam = DisplayXRRigManager.ActiveCamera;
-            if (cam == null) return 1f;
+            if (cam == null) return DisplayXRHandRigMapping.Identity;
 
             DisplayXRTunables t;
             var disp = cam.GetComponent<DisplayXRDisplay>();
@@ -175,26 +190,82 @@ namespace DisplayXR.Hands
             else
             {
                 var camRig = cam.GetComponent<DisplayXRCamera>();
-                if (camRig == null || !camRig.enabled) return 1f; // rig-less camera: metres
+                if (camRig == null || !camRig.enabled) return DisplayXRHandRigMapping.Identity; // rig-less camera: metres
                 t = camRig.GetProviderTunables();
             }
 
-            if (!DisplayXRProvider.TryGetDisplayInfo(out var di) || di.heightM <= 0f) return 1f;
+            if (!DisplayXRProvider.TryGetDisplayInfo(out var di) || di.heightM <= 0f)
+                return DisplayXRHandRigMapping.Identity;
 
-            float virtualHeight;
+            // The canvas the runtime framed this frame's views into (the window on the
+            // panel, published by the provider from the XR_DXR_view_rig raw channel); the
+            // whole panel until the first located frame or on a runtime without it.
+            var canvas = DisplayXRHandRigMath.FullPanel(di.heightM);
+            if (TryGetLiveCanvas(out int rx, out int ry, out int rw, out int rh, out float ch) &&
+                DisplayXRHandRigMath.TryCanvasFromPanelRect(rx, ry, rw, rh, ch,
+                    di.pixelWidth, di.pixelHeight, di.widthM, di.heightM, out var live))
+                canvas = live;
+
             if (t.cameraCentricMode)
+                return DisplayXRHandRigMath.CameraRig(canvas, di.nominalZ, 1f);
+
+            // The height the provider sends: the rig's field, or the physical panel when 0
+            // (ps_display_rig_vh in native).
+            float vdh = t.virtualDisplayHeight > 0f ? t.virtualDisplayHeight : di.heightM;
+            return DisplayXRHandRigMath.DisplayRig(canvas, vdh, t.perspectiveFactor);
+        }
+
+        static bool s_RigFrameMissing;
+
+        /// <summary>
+        /// True when the last locate came back in the RIG frame (runtime <c>XR_DXR_view_rig</c>
+        /// ≥ 4 with the rig chained on the joint locate): the runtime already applied the
+        /// canvas rebase, the rig scale and the camera rig's viewer offset, so the C# mapping
+        /// must not. False on older runtimes and older native binaries.
+        /// </summary>
+        public static bool JointsInRigFrame { get; private set; }
+
+        internal static bool QueryRigFrame()
+        {
+            bool rig = false;
+            if (!s_RigFrameMissing)
             {
-                // fovOverride is tan(vFov/2); the display plane sits at the convergence
-                // distance and the FOV spans it, so its height is 2·tan(vFov/2)·distance.
-                if (t.invConvergenceDistance <= 0f || t.fovOverride <= 0f) return 1f;
-                virtualHeight = 2f * t.fovOverride / t.invConvergenceDistance;
+                try { rig = DisplayXRHandNative.DisplayXR_HandTracking_IsRigFrame() != 0; }
+                catch (DllNotFoundException) { s_RigFrameMissing = true; }
+                catch (EntryPointNotFoundException) { s_RigFrameMissing = true; }
             }
-            else
+            JointsInRigFrame = rig;
+            return rig;
+        }
+
+        static float s_AutoScale = 1f;
+
+        /// <summary>
+        /// The mapping for rig-frame joints: identity, or — when
+        /// <see cref="PoseScaleOverride"/> is set — the ratio that turns the runtime's rig
+        /// scale (the same number <see cref="ResolveMapping"/> derives) into the override,
+        /// about the rig camera, so the override means the same on both paths.
+        /// </summary>
+        internal static DisplayXRHandRigMapping RigFrameMapping()
+        {
+            var m = DisplayXRHandRigMapping.Identity;
+            if (PoseScaleOverride.HasValue && PoseScaleOverride.Value > 0f && !float.IsInfinity(PoseScaleOverride.Value))
+                m.scale = PoseScaleOverride.Value / s_AutoScale;
+            return m;
+        }
+
+        static bool s_CanvasMissing;
+
+        static bool TryGetLiveCanvas(out int x, out int y, out int w, out int h, out float heightM)
+        {
+            x = y = w = h = 0; heightM = 0f;
+            if (s_CanvasMissing) return false;
+            try
             {
-                virtualHeight = t.virtualDisplayHeight; // raw field; 0 = physical height
-                if (virtualHeight <= 0f) return 1f;
+                return DisplayXRNative.displayxr_get_kooima_canvas(out x, out y, out w, out h, out _, out heightM) != 0;
             }
-            return virtualHeight / di.heightM;
+            catch (DllNotFoundException) { s_CanvasMissing = true; return false; }
+            catch (EntryPointNotFoundException) { s_CanvasMissing = true; return false; }
         }
     }
 }

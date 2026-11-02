@@ -26,13 +26,18 @@
 //
 // Frame. Joints are located in the provider's LOCAL reference space — the same
 // space the views are located in — and converted to Unity's frame (negate Z,
-// flip the quaternion's X/Y; the same mirror the eye poses take). Unlike the eye
-// poses they are NOT made rig-relative here: the located views bake the app's rig
-// pose in (XrDisplayRigDXR/XrCameraRigDXR carry it), while xrLocateHandJointsEXT
-// never sees that descriptor, so LOCAL-space joints are already expressed relative
-// to the display plane, which is exactly what the rig camera's transform represents
-// on the Unity side. Scale (virtual display height vs. the physical panel) is
-// applied in C#, where the active rig's tunables live.
+// flip the quaternion's X/Y; the same mirror the eye poses take).
+//
+// On a runtime advertising XR_DXR_view_rig >= 4 (rig-scoped hand joints, runtime
+// #2189) the view locate's rig descriptor is chained on xrLocateHandJointsEXT with
+// an IDENTITY pose, so the runtime returns each joint in the RIG frame relative to
+// the rig camera: canvas-centred, scaled like the eyes, the camera rig's nominal
+// viewer at the origin. That is the only frame that is right for every canvas
+// (a window off the panel centre) and every hand source: since runtime v2.56 an
+// UNCHAINED locate places a display-plane-relative source at the rig's image of the
+// display centre, which the C# fallback cannot undo. DisplayXR_HandTracking_IsRigFrame
+// tells C# which frame the last locate answered in; in the display-plane frame
+// (older runtime) C# applies the same rig mapping itself (DisplayXRHandRigMath).
 
 #pragma once
 
@@ -40,6 +45,7 @@
 #include "displayxr_provider_session.h" // DISPLAYXR_EXPORT
 
 #include <openxr/openxr.h>
+#include "../displayxr_extensions.h" // XrDisplayRigDXR / XrCameraRigDXR
 
 #ifdef __cplusplus
 extern "C" {
@@ -60,6 +66,15 @@ void dxr_hands_on_session_created(XrSession session, XrSpace base_space, int sys
 void dxr_hands_on_session_destroying(void);
 //! After xrBeginFrame: the predicted display time the views were located at.
 void dxr_hands_on_frame_begun(XrTime predicted_display_time);
+
+// ---- Session hooks the hands TU calls (implemented in displayxr_provider_session.cpp) ----
+
+//! Fill the rig descriptor to chain on xrLocateHandJointsEXT (identity pose, the view
+//! locate's tunables) and return the chain head, or NULL when the runtime does not
+//! advertise XR_DXR_view_rig >= 4.
+const void *dxr_prov_hand_rig_chain(XrDisplayRigDXR *display_rig, XrCameraRigDXR *camera_rig);
+//! The advertised XR_DXR_view_rig extensionVersion (0 = not advertised).
+uint32_t dxr_prov_view_rig_version(void);
 
 // ---- C# surface (Runtime/Hands/DisplayXRHandNative.cs) ----
 
@@ -86,8 +101,10 @@ DISPLAYXR_EXPORT void DisplayXR_HandTracking_Stop(void);
 //! @param time       XrTime to locate at, or 0 = the current frame's predicted
 //!                   display time (what the views were located at).
 //! @param out_poses  26 x 7 floats, UNITY frame (left-handed, +Z forward):
-//!                   [px, py, pz, qx, qy, qz, qw] per joint, in metres, relative to
-//!                   the LOCAL origin (the display plane). OpenXR joint order
+//!                   [px, py, pz, qx, qy, qz, qw] per joint: in the RIG frame (rig
+//!                   units, relative to the rig camera) when IsRigFrame() reports 1
+//!                   after the call, else in metres relative to the LOCAL origin (the
+//!                   display plane). OpenXR joint order
 //!                   (palm = 0, wrist = 1, thumb metacarpal = 2 ... little tip = 25).
 //! @param out_radii  26 floats, joint radius in metres (may be NULL).
 //! @param out_flags  26 XrSpaceLocationFlags (may be NULL): bit 0 orientation valid,
@@ -99,6 +116,12 @@ DISPLAYXR_EXPORT void DisplayXR_HandTracking_Stop(void);
 //!         filled whenever the locate itself succeeded, even for an inactive hand.
 DISPLAYXR_EXPORT int DisplayXR_HandTracking_Locate(int hand, int64_t time, float *out_poses, float *out_radii,
                                                    uint64_t *out_flags);
+
+//! 1 when the last successful Locate returned joints in the RIG frame (the view
+//! locate's rig chained, XR_DXR_view_rig >= 4): C# then applies no rig mapping.
+//! 0 = display-plane metres (older runtime), C# maps them. A DLL without this export
+//! predates rig-frame joints, so a missing entry point means 0.
+DISPLAYXR_EXPORT int DisplayXR_HandTracking_IsRigFrame(void);
 
 #ifdef __cplusplus
 }

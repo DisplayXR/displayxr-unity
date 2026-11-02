@@ -94,6 +94,11 @@ jobs:
       - name: Game view placement
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: dotnet run --project "Tests~/GameViewPlacement" -c Release
+      # Pure C#: where a tracked hand joint lands relative to the rig camera (display- and
+      # camera-centric rigs, off-centre canvas), pinned to the runtime's view-rig joint rule (#439).
+      - name: Hand rig math
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: dotnet run --project "Tests~/HandRigMath" -c Release
 
   build-windows:
     name: Windows x64

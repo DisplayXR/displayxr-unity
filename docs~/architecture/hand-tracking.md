@@ -103,28 +103,46 @@ survives the provider restarts that bit earlier pushed-before-start state (v2.9.
 
 ## Where the hands land: origin and scale
 
-The runtime locates joints in the provider's **LOCAL** reference space — the space the
-views are located in — in **metres relative to the physical display**. Unlike the eye
-poses, the joints are **not** made rig-relative in native: the located views bake the
-app's rig pose in (`XrDisplayRigDXR`/`XrCameraRigDXR` carry it, and the display provider
-subtracts it back so Unity does not apply it twice), whereas `xrLocateHandJointsEXT` never
-sees that descriptor. LOCAL-space joints are therefore *already* relative to the display
-plane — and on the Unity side the display plane **is the rig camera's transform** (the
-pose the driver sends as `dxr_prov_set_display_pose`). Hence the one rule:
+Joint poses are relative to the **rig camera's transform**, in the rig's world units, and
+map exactly as an eye at that point would — the runtime's rule for rig-scoped hand joints
+(`XR_DXR_view_rig` spec 4, runtime #2189; `docs/specs/extensions/XR_DXR_view_rig.md` §2):
 
-> **Joint poses are relative to the rig camera's transform.** Parent hand visuals under it
-> (or `TransformPoint` through it). Moving/rotating/scaling the rig carries the hands,
-> exactly as it carries the eyes.
+| Rig | The camera is | Joint in the rig frame |
+|---|---|---|
+| `DisplayXRDisplay` | the virtual display plane | minus the canvas centre, × `perspectiveFactor · virtualDisplayHeight / canvas height` |
+| `DisplayXRCamera` | the nominal viewer | minus the canvas centre, `z − nominalViewerZ` (OpenXR; Unity `z + nominalViewerZ`), × `metersToVirtual` (the provider sends 1) |
+| rig-less camera | — | display-plane metres, unchanged |
 
-**Scale.** A rig whose virtual display is not the physical size scales the eye positions
-by `virtualDisplayHeight / physicalHeight` (display-centric) or by the FOV's span at the
-convergence distance over the physical height (camera-centric: `2·tan(vFov/2) /
-invConvergenceDistance / physicalHeight`). The hands must follow, or a fingertip touching
-the glass would not reach the virtual display plane. `DisplayXRHandTracking.ResolvePoseScale`
-derives that ratio from the active rig every update (1 for a rig-less camera, a rig at
-infinity, or before display info arrives); `PoseScaleOverride` pins it. Scale-as-zoom (a
-scaled rig *transform*) needs nothing extra: the driver folds `lossyScale` out of the
-tunables, and parenting under the scaled camera applies it to the hands.
+So on a camera-centric rig the panel, and a hand in front of it, sit `nominalViewerZ`
+in front of the camera. (Before this rule the plugin scaled camera-rig joints by the
+convergence-plane framing and applied no viewer offset, which put every joint *behind*
+the camera.) The convergence distance and FOV shape the frustum; they do not move a point.
+
+**Who computes it.**
+
+- **Runtime with `XR_DXR_view_rig` ≥ 4 (v2.47.1+):** the hands TU chains the same rig
+  descriptor the primary view locate uses — with an **identity pose**, so the result is
+  rig-camera-relative — on `XrHandJointsLocateInfoEXT::next`, and the runtime returns the
+  joints in the rig frame (radii scaled alike). C# applies nothing
+  (`DisplayXR_HandTracking_IsRigFrame` = 1, `DisplayXRHandTracking.JointsInRigFrame`). This
+  is the only path that is right for a canvas off the panel centre and for every hand
+  source: since runtime v2.56 an *unchained* locate places a display-plane-relative source
+  at the rig's image of the display centre (`-m2v × canvas centre`), which app code cannot
+  undo. Gated on the advertised `extensionVersion`, because an older runtime ignores the
+  struct without an error.
+- **Older runtime:** joints come back in display-plane metres and
+  `DisplayXRHandTracking.ResolveMapping` applies the same table in C#
+  (`DisplayXRHandRigMath`, pinned by `Tests~/HandRigMath` against the shared core's eye
+  mapping), reading the canvas from the provider's published Kooima canvas.
+
+The runtime takes the canvas from the most recent `xrLocateViews`. In a multi-zone app the
+extra zones are located after the primary each frame, so the joints follow the last
+zone's canvas — a known limit.
+
+`PoseScaleOverride` pins the metres→rig-units factor on both paths (the rig origin still
+applies). Scale-as-zoom (a scaled rig *transform*) needs nothing extra: the driver folds
+`lossyScale` out of the tunables, and parenting under the scaled camera applies it to the
+hands.
 
 ## Requirements
 
@@ -149,8 +167,9 @@ tunables, and parenting under the scaled camera applies it to the hands.
 3. Native log (`%TEMP%\displayxr_prov_native.log` / Player.log), in order:
    `XR_EXT_hand_tracking: advertised …` → `XR_EXT_hand_tracking: AVAILABLE (enabled, entry
    points resolved)` → `hand tracking: AVAILABLE (extension enabled, system
-   supportsHandTracking=1, app requested=1)` → `left tracker created` / `right tracker
-   created` → `left hand first seen (wrist LOCAL x,y,z m; flags=0xf)`.
+   supportsHandTracking=1; …)` → `left tracker created` / `right tracker
+   created` → `joints in the RIG frame (XR_DXR_view_rig vN, … rig chained …)` → `left hand
+   first seen (wrist x,y,z …; flags=0xf)`.
 4. Console: `[DisplayXR] Hands: XR Hands subsystem created …`; the sample's status line
    reads `left TRACKED / right TRACKED` with your hands above the sensor; the ghost hands
    sit in front of the panel where the hands are, mirrored correctly (left is left, thumb

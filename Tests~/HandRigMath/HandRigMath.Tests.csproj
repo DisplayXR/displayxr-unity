@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Unit tests for Runtime/Hands/DisplayXRHandRigMath.cs (pure C#, no UnityEngine): where a tracked
+       hand joint lands relative to the rig camera for the display- and camera-centric rigs, pinned to
+       the runtime's XR_DXR_view_rig spec 4 joint rule. Lives under Tests~ so Unity never imports it.
+       Run: dotnet run -c Release -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <RollForward>Major</RollForward>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../Runtime/Hands/DisplayXRHandRigMath.cs" Link="DisplayXRHandRigMath.cs" />
+  </ItemGroup>
+</Project>
