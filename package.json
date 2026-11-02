@@ -24,7 +24,8 @@
   },
   "dependencies": {
     "com.unity.xr.management": "4.4.0",
-    "com.unity.inputsystem": "1.4.4"
+    "com.unity.inputsystem": "1.4.4",
+    "com.unity.ugui": "1.0.0"
   },
   "samples": [
     {
