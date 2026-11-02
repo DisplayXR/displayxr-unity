@@ -30,8 +30,11 @@ namespace DisplayXR.Samples
     /// fallback — also used automatically on HDRP, where the sample ships no shader, and on
     /// URP when the companion "Hand Tracking (URP Ghost Hand)" sample is not imported).
     /// Drop it on any GameObject. The hand models are parented under the active rig
-    /// camera (the display plane the joint poses are relative to) and scaled with
-    /// <see cref="DisplayXRHandTracking.CurrentPoseScale"/>.
+    /// camera (the frame the joint poses are relative to) and, by default, sized to the
+    /// tracked hand: the model's wrist-to-middle-knuckle bone length is matched to the
+    /// joints' wrist-to-middle-proximal distance, so the model fits its joints whatever
+    /// gain the hand source maps physical motion with (a relative mapping can make the
+    /// joints half the real hand's size) and whatever scale the rig applies.
     /// </summary>
     public class DisplayXRGhostHand : MonoBehaviour
     {
@@ -52,6 +55,12 @@ namespace DisplayXR.Samples
         [Tooltip("Also move each driven bone to its joint position (stretches the model to the tracked hand). Off (Ultraleap's default): rotations only, the model keeps its proportions.")]
         public bool setBonePositions;
 
+        [Tooltip("Size the model from the tracked joints (wrist to middle-proximal vs. the model's own bone). Off: the model is real-size, scaled only by the rig's pose scale — too big when the hand source maps hands smaller than life.")]
+        public bool matchTrackedHandSize = true;
+
+        [Tooltip("Seconds over which the measured hand size is smoothed (0 = no smoothing).")]
+        public float sizeSmoothingSeconds = 0.25f;
+
         [Tooltip("Show a status line (support, per-hand tracking, pose scale) in the top-left.")]
         public bool showStatus = true;
 
@@ -66,6 +75,7 @@ namespace DisplayXR.Samples
         }
 
         const string k_WristBone = "L_Wrist";
+        const string k_MiddleKnuckleBone = "L_middle_a"; // the MiddleProximal joint's bone
 
         static readonly BoneBinding[] s_Bindings =
         {
@@ -109,6 +119,10 @@ namespace DisplayXR.Samples
             public Transform[] bones;   // indexed like s_Bindings; null when the name was not found
             public Quaternion offset;
             public bool visible;
+            public float restLength;    // model wrist -> middle knuckle, root-local units (0 = unknown)
+            public float size;          // smoothed root scale magnitude (0 = not set yet)
+            public bool measured;       // size came from the joints at least once
+            public int sizeFrame = -1;  // the frame the smoothing last advanced (fires twice a frame)
         }
 
         HandVisual m_Left, m_Right;
@@ -214,6 +228,19 @@ namespace DisplayXR.Samples
                 Debug.LogWarning("[DisplayXR] Ghost Hand: " + missing + " bone(s) not found by name; those joints stay at rest");
 
             hv.offset = Quaternion.Euler(isRight ? k_OffsetRight : k_OffsetLeft);
+
+            // The model's own wrist -> middle-knuckle length at rest, in root-local units
+            // (the root is still unscaled here), the yardstick the joints are matched to.
+            var knuckle = FindDeep(model.transform, k_MiddleKnuckleBone);
+            if (knuckle != null)
+                hv.restLength = Vector3.Distance(hv.root.InverseTransformPoint(hv.wrist.position),
+                                                 hv.root.InverseTransformPoint(knuckle.position));
+            if (!(hv.restLength > 1e-5f))
+            {
+                hv.restLength = 0f;
+                if (matchTrackedHandSize)
+                    Debug.LogWarning("[DisplayXR] Ghost Hand: bone '" + k_MiddleKnuckleBone + "' not found; sizing the model by the pose scale only");
+            }
             hv.root.gameObject.SetActive(false);
             return hv;
         }
@@ -270,12 +297,51 @@ namespace DisplayXR.Samples
                 m_Right.root.SetParent(rig, false);
                 m_ParentedTo = rig;
             }
-            float s = DisplayXRHandTracking.CurrentPoseScale;
-            m_Left.root.localScale  = new Vector3(s, s, s);
-            m_Right.root.localScale = new Vector3(-s, s, s);
+            float poseScale = DisplayXRHandTracking.CurrentPoseScale;
+            UpdateSize(m_Left, subsystem.leftHand, poseScale);
+            UpdateSize(m_Right, subsystem.rightHand, poseScale);
 
             Apply(m_Left, subsystem.leftHand, rig);
             Apply(m_Right, subsystem.rightHand, rig);
+        }
+
+        // The joints' poses are in rig units relative to the rig camera, and the model's root
+        // lives under that camera, so root scale = (joint wrist->middle-proximal) / (model
+        // wrist->middle-knuckle) makes the model's bone exactly span the tracked one. Before
+        // a hand has been measured (and when matching is off or the bone is missing) the
+        // real-size model is scaled by the rig's pose scale, the former behaviour.
+        void UpdateSize(HandVisual hv, XRHand hand, float poseScale)
+        {
+            float target = poseScale;
+            bool fromJoints = false;
+            if (matchTrackedHandSize && hv.restLength > 0f && hand.isTracked
+             && hand.GetJoint(XRHandJointID.Wrist).TryGetPose(out Pose w)
+             && hand.GetJoint(XRHandJointID.MiddleProximal).TryGetPose(out Pose mp))
+            {
+                float measured = Vector3.Distance(w.position, mp.position) / hv.restLength;
+                // Reject a degenerate sample (joints collapsed / not yet valid).
+                if (measured > 1e-4f && !float.IsInfinity(measured))
+                {
+                    target = measured;
+                    fromJoints = true;
+                }
+                else if (hv.size > 0f)
+                    target = hv.size;
+            }
+            else if (matchTrackedHandSize && hv.size > 0f)
+            {
+                target = hv.size; // hold the last measured size while the hand is away
+            }
+
+            if (hv.size <= 0f || sizeSmoothingSeconds <= 0f || (fromJoints && !hv.measured))
+                hv.size = target; // first measurement snaps: no visible grow/shrink on acquire
+            else if (hv.sizeFrame != Time.frameCount)
+                hv.size = Mathf.Lerp(hv.size, target, 1f - Mathf.Exp(-Time.unscaledDeltaTime / sizeSmoothingSeconds));
+            hv.sizeFrame = Time.frameCount;
+            hv.measured |= fromJoints;
+
+            float s = hv.size;
+            hv.root.localScale = new Vector3(hv.isRight ? -s : s, s, s);
         }
 
         void Apply(HandVisual hv, XRHand hand, Transform rig)
