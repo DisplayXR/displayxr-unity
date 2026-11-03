@@ -1347,6 +1347,10 @@ static int ps_create_bridge_d3d11(void); // D3D11 editor bridge (#195); defined 
 static int ps_create_bridge_vk(void);
 #endif
 static void ps_publish_stereo_matrices(void); // defined after dxr_prov_begin_frame (overlay hit-test)
+// The rig the primary view locate chained (for xrLocateHandJointsEXT); defined by
+// dxr_prov_hand_rig_chain.
+static void ps_hand_rig_record(const void *rig_chain, int app_rig);
+static void ps_hand_rig_reset(void);
 
 // --- Color-space-aware swapchain format (present-path sRGB gamma fix) ---------
 // A Linear-color-space Unity project renders LINEAR values; correct display needs a final
@@ -5613,6 +5617,7 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	}
 	// Hand trackers hang off the session AND locate in this space (the views' space),
 	// so they are bound only now, after both exist.
+	ps_hand_rig_reset(); // no view located in this session yet
 	dxr_hands_on_session_created(s_ps.session, s_ps.local_space, s_ps.system_hand_tracking);
 
 	ps_enumerate_modes();
@@ -7099,6 +7104,13 @@ int dxr_prov_begin_frame(uint32_t *out_image_index, int *out_should_render)
 			if (n == 1) { s_ps.views[1] = s_ps.views[0]; n = 2; }
 			s_ps.view_count = n;
 
+			// The hands locate with exactly this rig (XR_DXR_view_rig spec 4): snapshot
+			// the descriptor these views were located with. The chain head here may be
+			// the zone; the rig is behind it.
+			if (s_ps.has_view_rig)
+				ps_hand_rig_record(s_ps.camera_centric ? (const void *)&camera_rig : (const void *)&display_rig,
+				                   s_ps.tunables_set);
+
 			// Turn this locate's advisory budget into the world-unit far offset the
 			// foreground clip adds behind each eye's display-plane distance (#318).
 			ps_resolve_rear_budget(&budget);
@@ -8477,17 +8489,74 @@ void dxr_prov_set_tunables(float ipd_factor, float parallax_factor,
 
 // XR_DXR_view_rig spec 4 (#2189): the rig descriptor to chain on xrLocateHandJointsEXT so
 // the runtime returns the joints in the RIG frame the views are in (canvas-centred, the
-// camera rig's nominal-viewer offset, the display rig's m2v; radii too). Same tunables as
-// the primary view locate, but an IDENTITY pose: the C# side wants joints relative to the
-// rig camera, which is what the rig frame is before the pose places it. Returns the chain
-// head (one of the two caller-owned structs) or NULL when the runtime cannot do it — no
-// XR_DXR_view_rig, or an advertised version below 4 (an older runtime ignores the struct
-// and answers in base space without an error, so the version is the only gate).
-// Main thread (the hands TU's locate); reads the tunables the C# driver wrote there too.
-const void *dxr_prov_hand_rig_chain(XrDisplayRigDXR *display_rig, XrCameraRigDXR *camera_rig)
+// camera rig's nominal-viewer offset, the display rig's m2v; radii too).
+//
+// The hands must use EXACTLY the rig the views were located with, so the primary view
+// locate (graphics thread, dxr_prov_begin_frame) snapshots its descriptor here and the
+// hand locate (main thread) chains a copy. Rebuilding it from the live tunables instead
+// (the #446 code) went wrong whenever the two disagreed: every session starts with
+// s_ps zeroed (camera_centric = 0) and the C# driver does not push the app rig while
+// the boot splash is up, so a camera-centric scene's first seconds were located with
+// the default DISPLAY rig and the joints came back in the display frame (z = +0.145
+// OpenXR = 0.145 m in front of the glass), which C# read as camera-relative: behind the
+// camera (#446 partner rerun, 2026-11-03).
+//
+// The pose is IDENTITY: the C# side wants joints relative to the rig camera, which is
+// what the rig frame is before the pose places it.
+namespace {
+std::mutex s_hand_rig_mx;
+int s_hand_rig_kind;          // DXR_PROV_HAND_RIG_* of the last primary view locate (0 = none yet)
+XrDisplayRigDXR s_hand_display_rig;
+XrCameraRigDXR s_hand_camera_rig;
+} // namespace
+
+static void ps_hand_rig_reset(void)
 {
+	std::lock_guard<std::mutex> lk(s_hand_rig_mx);
+	s_hand_rig_kind = DXR_PROV_HAND_RIG_NONE;
+}
+
+static void ps_hand_rig_record(const void *rig_chain, int app_rig)
+{
+	if (rig_chain == NULL) return;
+	const XrPosef identity = {{0, 0, 0, 1}, {0, 0, 0}};
+	std::lock_guard<std::mutex> lk(s_hand_rig_mx);
+	if (((const XrBaseInStructure *)rig_chain)->type == XR_TYPE_CAMERA_RIG_DXR) {
+		s_hand_camera_rig = *(const XrCameraRigDXR *)rig_chain;
+		s_hand_camera_rig.next = NULL;
+		s_hand_camera_rig.pose = identity;
+		s_hand_rig_kind = DXR_PROV_HAND_RIG_CAMERA;
+	} else {
+		s_hand_display_rig = *(const XrDisplayRigDXR *)rig_chain;
+		s_hand_display_rig.next = NULL;
+		s_hand_display_rig.pose = identity;
+		s_hand_rig_kind = app_rig ? DXR_PROV_HAND_RIG_DISPLAY : DXR_PROV_HAND_RIG_DEFAULT_DISPLAY;
+	}
+}
+
+// Returns the chain head (one of the two caller-owned structs) or NULL when the runtime
+// cannot do it — no XR_DXR_view_rig, or an advertised version below 4 (an older runtime
+// ignores the struct and answers in base space without an error, so the version is the
+// only gate). Before the session's first view locate it falls back to the live tunables
+// (the runtime then resolves the canvas for that locate). Main thread.
+const void *dxr_prov_hand_rig_chain(XrDisplayRigDXR *display_rig, XrCameraRigDXR *camera_rig, int *out_kind)
+{
+	if (out_kind) *out_kind = DXR_PROV_HAND_RIG_NONE;
 	if (!s_ps.has_view_rig || s_ps.view_rig_version < 4 || display_rig == NULL || camera_rig == NULL)
 		return NULL;
+	{
+		std::lock_guard<std::mutex> lk(s_hand_rig_mx);
+		if (s_hand_rig_kind == DXR_PROV_HAND_RIG_CAMERA) {
+			*camera_rig = s_hand_camera_rig;
+			if (out_kind) *out_kind = s_hand_rig_kind;
+			return camera_rig;
+		}
+		if (s_hand_rig_kind != DXR_PROV_HAND_RIG_NONE) {
+			*display_rig = s_hand_display_rig;
+			if (out_kind) *out_kind = s_hand_rig_kind;
+			return display_rig;
+		}
+	}
 	const XrPosef identity = {{0, 0, 0, 1}, {0, 0, 0}};
 	if (s_ps.camera_centric) {
 		*camera_rig = XrCameraRigDXR{XR_TYPE_CAMERA_RIG_DXR};
@@ -8497,6 +8566,7 @@ const void *dxr_prov_hand_rig_chain(XrDisplayRigDXR *display_rig, XrCameraRigDXR
 		camera_rig->convergenceDiopters = s_ps.inv_convergence_distance;
 		camera_rig->verticalFov = 2.0f * atanf(s_ps.fov_override);
 		camera_rig->metersToVirtual = 1.0f; // as the view locate sends
+		if (out_kind) *out_kind = DXR_PROV_HAND_RIG_CAMERA;
 		return camera_rig;
 	}
 	*display_rig = XrDisplayRigDXR{XR_TYPE_DISPLAY_RIG_DXR};
@@ -8505,6 +8575,7 @@ const void *dxr_prov_hand_rig_chain(XrDisplayRigDXR *display_rig, XrCameraRigDXR
 	display_rig->ipdFactor = s_ps.tunables_set ? s_ps.ipd_factor : 1.0f;
 	display_rig->parallaxFactor = s_ps.tunables_set ? s_ps.parallax_factor : 1.0f;
 	display_rig->perspectiveFactor = s_ps.tunables_set ? s_ps.perspective_factor : 1.0f;
+	if (out_kind) *out_kind = s_ps.tunables_set ? DXR_PROV_HAND_RIG_DISPLAY : DXR_PROV_HAND_RIG_DEFAULT_DISPLAY;
 	return display_rig;
 }
 

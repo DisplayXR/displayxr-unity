@@ -140,6 +140,43 @@ static class Program
             Check(Near(fb2.scale, 1f), "camera rig: metersToVirtual <= 0 -> 1");
         }
 
+        // --- Camera-centric scene: the joints must be in the rig the views used ------------------
+        {
+            // Partner rerun of #446 (camera-centric scene, 2026-11-03): the views were located with
+            // the provider's DEFAULT display rig while the boot splash held the app rig back, and the
+            // hand locate chained the same. A wrist 0.145 m in front of the glass then comes back in
+            // the display frame (OpenXR z = +0.145) - read as camera-relative it is BEHIND the camera.
+            var disp = DisplayXRHandRigMath.DisplayRig(panel, H, 1f); // the default rig: vH = panel height
+            Map(disp, -0.132f, -0.084f, 0.145f, out float dx, out float dy, out float dz);
+            Check(dz < 0f, $"default display rig frame read under a camera rig: behind the camera (z={dz})");
+            Check(!DisplayXRHandRigMath.JointRigFitsScene(DisplayXRHandRigKind.DefaultDisplay, DisplayXRHandRigKind.Camera),
+                  "default-display-rig joints are held back under a camera rig");
+            Check(!DisplayXRHandRigMath.JointRigFitsScene(DisplayXRHandRigKind.Display, DisplayXRHandRigKind.Camera),
+                  "display-rig joints are held back under a camera rig");
+
+            // Once the app's camera rig is the one chained, the same wrist lands in front of the camera,
+            // nominalZ - 0.145 deep, exactly as the runtime maps it.
+            Check(DisplayXRHandRigMath.JointRigFitsScene(DisplayXRHandRigKind.Camera, DisplayXRHandRigKind.Camera),
+                  "camera-rig joints fit a camera rig");
+            RuntimeEye(true, panel, 0f, 1f, 1f, N, -0.132f, -0.084f, 0.145f, out float cx, out float cy, out float cz);
+            Check(cz > 0f && Near(cz, N - 0.145f), $"camera rig frame: the wrist is in front of the camera (z={cz})");
+            var cam = DisplayXRHandRigMath.CameraRig(panel, N, 1f);
+            Map(cam, -0.132f, -0.084f, 0.145f, out float fx, out float fy, out float fz);
+            Check(Near(fx, cx) && Near(fy, cy) && Near(fz, cz), "C# fallback camera rig == runtime camera rig frame");
+
+            // The other pairings.
+            Check(DisplayXRHandRigMath.JointRigFitsScene(DisplayXRHandRigKind.Display, DisplayXRHandRigKind.Display),
+                  "display-rig joints fit a display rig");
+            Check(!DisplayXRHandRigMath.JointRigFitsScene(DisplayXRHandRigKind.Camera, DisplayXRHandRigKind.Display),
+                  "camera-rig joints are held back under a display rig");
+            Check(!DisplayXRHandRigMath.JointRigFitsScene(DisplayXRHandRigKind.DefaultDisplay, DisplayXRHandRigKind.Display),
+                  "default-rig joints are held back under the app's display rig (wrong scale)");
+            Check(DisplayXRHandRigMath.JointRigFitsScene(DisplayXRHandRigKind.DefaultDisplay, DisplayXRHandRigKind.None),
+                  "default-rig joints fit a rig-less camera");
+            Check(DisplayXRHandRigMath.JointRigFitsScene(DisplayXRHandRigKind.None, DisplayXRHandRigKind.Camera),
+                  "display-plane metres always fit (C# maps them)");
+        }
+
         // --- Identity ---------------------------------------------------------------------------
         {
             var id = DisplayXRHandRigMapping.Identity;

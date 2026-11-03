@@ -69,10 +69,18 @@ void dxr_hands_on_frame_begun(XrTime predicted_display_time);
 
 // ---- Session hooks the hands TU calls (implemented in displayxr_provider_session.cpp) ----
 
-//! Fill the rig descriptor to chain on xrLocateHandJointsEXT (identity pose, the view
-//! locate's tunables) and return the chain head, or NULL when the runtime does not
-//! advertise XR_DXR_view_rig >= 4.
-const void *dxr_prov_hand_rig_chain(XrDisplayRigDXR *display_rig, XrCameraRigDXR *camera_rig);
+//! Which rig the joints are in (DisplayXR_HandTracking_RigKind; same values).
+#define DXR_PROV_HAND_RIG_NONE 0            //!< display-plane metres: no rig chained
+#define DXR_PROV_HAND_RIG_DISPLAY 1         //!< the app's display rig (DisplayXRDisplay)
+#define DXR_PROV_HAND_RIG_CAMERA 2          //!< the app's camera rig (DisplayXRCamera)
+#define DXR_PROV_HAND_RIG_DEFAULT_DISPLAY 3 //!< the default display rig: no app rig pushed yet
+                                            //!< (session start, boot splash, rig-less scene)
+
+//! Fill the rig descriptor to chain on xrLocateHandJointsEXT — a copy of the one the
+//! latest primary xrLocateViews chained, with an identity pose — and return the chain
+//! head, or NULL when the runtime does not advertise XR_DXR_view_rig >= 4.
+//! @p out_kind (may be NULL) receives DXR_PROV_HAND_RIG_*.
+const void *dxr_prov_hand_rig_chain(XrDisplayRigDXR *display_rig, XrCameraRigDXR *camera_rig, int *out_kind);
 //! The advertised XR_DXR_view_rig extensionVersion (0 = not advertised).
 uint32_t dxr_prov_view_rig_version(void);
 
@@ -122,6 +130,14 @@ DISPLAYXR_EXPORT int DisplayXR_HandTracking_Locate(int hand, int64_t time, float
 //! 0 = display-plane metres (older runtime), C# maps them. A DLL without this export
 //! predates rig-frame joints, so a missing entry point means 0.
 DISPLAYXR_EXPORT int DisplayXR_HandTracking_IsRigFrame(void);
+
+//! Which rig the last successful Locate's joints are in: DXR_PROV_HAND_RIG_* (0 none =
+//! display-plane metres, 1 the app's display rig, 2 the app's camera rig, 3 the default
+//! display rig before the app's rig reached the provider). It is the rig the views were
+//! located with, so C# must hold the joints back when it is not the rig the scene
+//! renders with (e.g. 3 under a DisplayXRCamera while the boot splash is up). A DLL
+//! without this export: use IsRigFrame() and assume the scene's rig.
+DISPLAYXR_EXPORT int DisplayXR_HandTracking_RigKind(void);
 
 #ifdef __cplusplus
 }

@@ -32,7 +32,8 @@ int g_create_failed[2] = {0, 0};        // don't retry a failed create every fra
 int g_locate_failed_logged[2] = {0, 0}; // one log line per hand per session
 int g_first_active_logged[2] = {0, 0};  // one "hand seen" line per hand per session
 int g_rig_frame = 0;                    // last successful locate answered in the RIG frame
-int g_frame_logged = -1;                // the frame last logged (-1 = none this session)
+int g_rig_kind = 0;                     // DXR_PROV_HAND_RIG_* of the last successful locate
+int g_frame_logged = -1;                // the rig kind last logged (-1 = none this session)
 
 // Written on the graphics thread once per begun frame, read on the main thread.
 std::atomic<int64_t> g_frame_time{0};
@@ -70,6 +71,8 @@ destroy_trackers_locked()
 		g_first_active_logged[h] = 0;
 	}
 	g_frame_logged = -1;
+	g_rig_frame = 0;
+	g_rig_kind = 0;
 }
 
 bool
@@ -209,6 +212,13 @@ DisplayXR_HandTracking_IsRigFrame(void)
 }
 
 int
+DisplayXR_HandTracking_RigKind(void)
+{
+	std::lock_guard<std::mutex> lk(g_mx);
+	return g_rig_kind;
+}
+
+int
 DisplayXR_HandTracking_Locate(int hand, int64_t time, float *out_poses, float *out_radii, uint64_t *out_flags)
 {
 	if (hand < 0 || hand > 1 || out_poses == nullptr) return 0;
@@ -230,8 +240,10 @@ DisplayXR_HandTracking_Locate(int hand, int64_t time, float *out_poses, float *o
 	// XR_DXR_view_rig spec 4: joints in the rig frame the views are in (see the header).
 	XrDisplayRigDXR display_rig;
 	XrCameraRigDXR camera_rig;
-	li.next = dxr_prov_hand_rig_chain(&display_rig, &camera_rig);
+	int rig_kind = DXR_PROV_HAND_RIG_NONE;
+	li.next = dxr_prov_hand_rig_chain(&display_rig, &camera_rig, &rig_kind);
 	const int rig_frame = li.next != nullptr ? 1 : 0;
+	if (!rig_frame) rig_kind = DXR_PROV_HAND_RIG_NONE;
 
 	XrResult r = pfn_locate(g_tracker[hand], &li, &locs);
 	if (XR_FAILED(r)) {
@@ -243,12 +255,18 @@ DisplayXR_HandTracking_Locate(int hand, int64_t time, float *out_poses, float *o
 		return 0;
 	}
 	g_rig_frame = rig_frame;
-	if (g_frame_logged != rig_frame) {
-		g_frame_logged = rig_frame;
+	g_rig_kind = rig_kind;
+	// Once per session and on every change of the chained rig (the default display rig
+	// during the boot splash, then the app's rig), never per frame.
+	if (g_frame_logged != rig_kind) {
+		g_frame_logged = rig_kind;
 		if (rig_frame)
 			HANDS_LOG("[DisplayXR-PROV] hand tracking: joints in the RIG frame (XR_DXR_view_rig v%u, "
-			          "%s rig chained on xrLocateHandJointsEXT)\n",
-			          dxr_prov_view_rig_version(), li.next == (const void *)&camera_rig ? "camera" : "display");
+			          "%s chained on xrLocateHandJointsEXT - the rig the views were located with)\n",
+			          dxr_prov_view_rig_version(),
+			          rig_kind == DXR_PROV_HAND_RIG_CAMERA    ? "app camera rig"
+			          : rig_kind == DXR_PROV_HAND_RIG_DISPLAY ? "app display rig"
+			                                                  : "default display rig (no app rig pushed yet)");
 		else
 			HANDS_LOG("[DisplayXR-PROV] hand tracking: joints in display-plane metres (XR_DXR_view_rig "
 			          "v%u < 4: no rig-scoped joints) - C# maps them onto the rig\n",

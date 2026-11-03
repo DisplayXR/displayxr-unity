@@ -63,5 +63,13 @@ namespace DisplayXR.Hands
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern int DisplayXR_HandTracking_IsRigFrame();
+
+        /// <summary>
+        /// Which rig the last successful locate's joints are in — the rig the views were
+        /// located with (<see cref="DisplayXRHandRigKind"/> values). Absent in DLLs older
+        /// than this export: fall back to <see cref="DisplayXR_HandTracking_IsRigFrame"/>.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int DisplayXR_HandTracking_RigKind();
     }
 }

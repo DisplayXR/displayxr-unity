@@ -130,6 +130,17 @@ the camera.) The convergence distance and FOV shape the frustum; they do not mov
   at the rig's image of the display centre (`-m2v × canvas centre`), which app code cannot
   undo. Gated on the advertised `extensionVersion`, because an older runtime ignores the
   struct without an error.
+  The descriptor is a **snapshot of the one the latest primary view locate chained**
+  (taken in `dxr_prov_begin_frame`), not rebuilt from the live tunables, so the joints are
+  always in the rig the views were located with. That rig is not always the scene's:
+  every session starts with the provider's state zeroed, and the C# driver does not push
+  the app's rig while the boot splash is up, so the first seconds of a session are
+  located with the **default display rig**. `DisplayXR_HandTracking_RigKind` (0 none,
+  1 app display rig, 2 app camera rig, 3 default display rig) says which; C# holds the
+  joints back (hand untracked, one log line) while it does not fit the scene's rig
+  (`DisplayXRHandRigMath.JointRigFitsScene`) — default-display-rig joints read as
+  camera-relative land behind a `DisplayXRCamera` (#446 partner rerun). The native log
+  names the chained rig once per session and on every change.
 - **Older runtime:** joints come back in display-plane metres and
   `DisplayXRHandTracking.ResolveMapping` applies the same table in C#
   (`DisplayXRHandRigMath`, pinned by `Tests~/HandRigMath` against the shared core's eye

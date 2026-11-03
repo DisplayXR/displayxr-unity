@@ -177,7 +177,14 @@ namespace DisplayXR.Hands
             if (active == 0) return false;
 
             if (DisplayXRHandTracking.QueryRigFrame())
+            {
+                // Rig-frame joints are in the rig the VIEWS were located with. Until the app's
+                // rig reaches the provider (boot splash, session start) that is the default
+                // display rig, whose frame read as camera-relative puts every joint behind a
+                // DisplayXRCamera: report the hand untracked rather than misplace it.
+                if (!DisplayXRHandTracking.JointsFitScene()) return false;
                 mapping = DisplayXRHandTracking.RigFrameMapping();
+            }
 
             for (int j = 0; j < k_JointCount; j++)
             {
