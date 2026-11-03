@@ -39,8 +39,10 @@ namespace DisplayXR.Hands
         public static extern void DisplayXR_HandTracking_Stop();
 
         /// <summary>
-        /// Locate one hand's 26 joints in the UNITY frame (left-handed, +Z forward), in
-        /// metres relative to the display plane, OpenXR joint order (palm 0, wrist 1,
+        /// Locate one hand's 26 joints in the UNITY frame (left-handed, +Z forward): in the
+        /// rig frame (relative to the rig camera, rig units) when
+        /// <see cref="DisplayXR_HandTracking_IsRigFrame"/> then reports 1, else in metres
+        /// relative to the display plane. OpenXR joint order (palm 0, wrist 1,
         /// thumb metacarpal 2 … little tip 25).
         /// </summary>
         /// <param name="hand">0 = left, 1 = right.</param>
@@ -52,5 +54,14 @@ namespace DisplayXR.Hands
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern int DisplayXR_HandTracking_Locate(int hand, long time,
             [Out] float[] outPoses, [Out] float[] outRadii, [Out] ulong[] outFlags);
+
+        /// <summary>
+        /// 1 when the last successful locate answered in the RIG frame (the runtime
+        /// advertises <c>XR_DXR_view_rig</c> ≥ 4 and the view locate's rig was chained on
+        /// <c>xrLocateHandJointsEXT</c>), 0 for display-plane metres. Absent in DLLs older
+        /// than that path — treat a missing entry point as 0.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int DisplayXR_HandTracking_IsRigFrame();
     }
 }

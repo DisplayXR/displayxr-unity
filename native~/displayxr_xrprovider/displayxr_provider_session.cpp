@@ -367,6 +367,7 @@ typedef struct ProviderSession {
 	XrTime predicted_display_time;
 
 	int has_view_rig;
+	uint32_t view_rig_version; // advertised extensionVersion (>= 4: rig-scoped hand joints, #2189)
 
 	// Native-Wayland player: the runtime advertises XR_DXR_wayland_surface_binding,
 	// and this session weaves into a sub-surface of the player's own window
@@ -4846,8 +4847,10 @@ int dxr_prov_session_start(const char *runtime_json_path,
 				for (uint32_t i = 0; i < avail; i++) props[i].type = XR_TYPE_EXTENSION_PROPERTIES;
 				if (XR_SUCCEEDED(enum_ext(NULL, avail, &avail, props))) {
 					for (uint32_t i = 0; i < avail; i++) {
-						if (strcmp(props[i].extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0)
+						if (strcmp(props[i].extensionName, XR_DXR_VIEW_RIG_EXTENSION_NAME) == 0) {
 							s_ps.has_view_rig = 1;
+							s_ps.view_rig_version = props[i].extensionVersion ? props[i].extensionVersion : 1;
+						}
 						else if (strcmp(props[i].extensionName, XR_DXR_DISPLAY_ZONES_EXTENSION_NAME) == 0)
 							s_ps.has_display_zones = 1;
 						else if (strcmp(props[i].extensionName, XR_DXR_LOCAL_3D_ZONE_EXTENSION_NAME) == 0)
@@ -8471,6 +8474,41 @@ void dxr_prov_set_tunables(float ipd_factor, float parallax_factor,
 	s_ps.camera_centric = camera_centric;
 	s_ps.tunables_set = 1;
 }
+
+// XR_DXR_view_rig spec 4 (#2189): the rig descriptor to chain on xrLocateHandJointsEXT so
+// the runtime returns the joints in the RIG frame the views are in (canvas-centred, the
+// camera rig's nominal-viewer offset, the display rig's m2v; radii too). Same tunables as
+// the primary view locate, but an IDENTITY pose: the C# side wants joints relative to the
+// rig camera, which is what the rig frame is before the pose places it. Returns the chain
+// head (one of the two caller-owned structs) or NULL when the runtime cannot do it — no
+// XR_DXR_view_rig, or an advertised version below 4 (an older runtime ignores the struct
+// and answers in base space without an error, so the version is the only gate).
+// Main thread (the hands TU's locate); reads the tunables the C# driver wrote there too.
+const void *dxr_prov_hand_rig_chain(XrDisplayRigDXR *display_rig, XrCameraRigDXR *camera_rig)
+{
+	if (!s_ps.has_view_rig || s_ps.view_rig_version < 4 || display_rig == NULL || camera_rig == NULL)
+		return NULL;
+	const XrPosef identity = {{0, 0, 0, 1}, {0, 0, 0}};
+	if (s_ps.camera_centric) {
+		*camera_rig = XrCameraRigDXR{XR_TYPE_CAMERA_RIG_DXR};
+		camera_rig->pose = identity;
+		camera_rig->ipdFactor = s_ps.tunables_set ? s_ps.ipd_factor : 1.0f;
+		camera_rig->parallaxFactor = s_ps.tunables_set ? s_ps.parallax_factor : 1.0f;
+		camera_rig->convergenceDiopters = s_ps.inv_convergence_distance;
+		camera_rig->verticalFov = 2.0f * atanf(s_ps.fov_override);
+		camera_rig->metersToVirtual = 1.0f; // as the view locate sends
+		return camera_rig;
+	}
+	*display_rig = XrDisplayRigDXR{XR_TYPE_DISPLAY_RIG_DXR};
+	display_rig->pose = identity;
+	display_rig->virtualDisplayHeight = ps_display_rig_vh();
+	display_rig->ipdFactor = s_ps.tunables_set ? s_ps.ipd_factor : 1.0f;
+	display_rig->parallaxFactor = s_ps.tunables_set ? s_ps.parallax_factor : 1.0f;
+	display_rig->perspectiveFactor = s_ps.tunables_set ? s_ps.perspective_factor : 1.0f;
+	return display_rig;
+}
+
+uint32_t dxr_prov_view_rig_version(void) { return s_ps.has_view_rig ? s_ps.view_rig_version : 0; }
 
 void dxr_prov_set_display_pose(float px, float py, float pz,
                                float ox, float oy, float oz, float ow, int enabled)

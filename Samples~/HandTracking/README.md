@@ -30,7 +30,8 @@ your real hands are, with a joint-sphere debug visual as the fallback.
    line reports `left TRACKED / right TRACKED` and the joints appear in front of the
    display. The native log (`%TEMP%\displayxr_prov_native.log` / Player.log) shows
    `XR_EXT_hand_tracking: AVAILABLE`, `hand tracking: AVAILABLE (... supportsHandTracking=1 ...)`,
-   `left tracker created`, then `left hand first seen (wrist LOCAL x,y,z m)`.
+   `left tracker created`, `joints in the RIG frame (...)` (or `display-plane metres` on an
+   older runtime), then `left hand first seen (wrist x,y,z ...)`.
 
 ## The Ghost Hand
 
@@ -57,6 +58,14 @@ same way Ultraleap's SDK does. Like Ultraleap's default, only rotations are driv
 model keeps its proportions; `setBonePositions` stretches it to the tracked joints) and
 the four finger metacarpals stay at rest (`driveMetacarpals` opts in).
 
+**Size.** The model is sized to the tracked hand (`matchTrackedHandSize`, on by default):
+its wrist-to-middle-knuckle bone is scaled to the joints' wrist-to-middle-proximal
+distance, smoothed over `sizeSmoothingSeconds`. A hand source may map physical motion
+with a gain below 1 (a relative mapping that keeps the hands inside the display volume
+makes the joints about half life-size), and a real-size model would then be about twice
+too big for its joints. Turn it off to get the real-size model scaled by the rig's pose
+scale only.
+
 Materials: `Resources/DisplayXRGhostHand/Ghost Hand.mat` (Built-in, this sample) /
 `Ghost Hand URP.mat` (the URP sample); tweak the fresnel / outline / lighting toggles there,
 or assign `materialOverride`.
@@ -73,12 +82,22 @@ block skips the SubShader, so you get one warning, not an include error.
 
 ## Where the hands land — the rig camera is the origin
 
-The runtime locates joints in the same reference space it locates the eyes in: relative to
-the **display plane**, in metres. On the Unity side the display plane is the **rig camera's
-transform** (the GameObject carrying `DisplayXRDisplay` or `DisplayXRCamera` — the pose the
-provider sends the runtime). So joint poses from `XRHandSubsystem` are **relative to that
-transform**, already scaled to the rig's world units (virtual display height vs. the
-physical panel; see `DisplayXRHandTracking.ResolvePoseScale`).
+Joint poses from `XRHandSubsystem` are **relative to the rig camera's transform** (the
+GameObject carrying `DisplayXRDisplay` or `DisplayXRCamera`), in the rig's world units,
+mapped exactly the way the rig maps the eyes:
+
+- **Display-centric rig:** the camera is the display plane. Joints are taken relative to
+  the canvas (the window on the panel) and scaled by `perspectiveFactor ·
+  virtualDisplayHeight / canvas height`.
+- **Camera-centric rig:** the camera is the nominal viewer, so the panel — and a hand in
+  front of it — sits `nominalViewerZ` (about half a metre) in front of the camera,
+  unscaled. A hand held 10 cm in front of the glass lands about 0.4–0.5 m in front of the
+  camera.
+
+On a runtime that supports rig-scoped hand joints (`XR_DXR_view_rig` spec 4) the runtime
+does this mapping itself, from the same rig descriptor the views use, so it is right for
+any window position; on an older runtime `DisplayXRHandTracking.ResolveMapping` does it in
+C#. `DisplayXRHandTracking.JointsInRigFrame` says which.
 
 Both visuals therefore go through `DisplayXRRigManager.ActiveCamera` — the Ghost Hand
 roots are parented under it (so the rig's scale reaches the bone lengths and the right

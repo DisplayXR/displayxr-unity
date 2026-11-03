@@ -22,7 +22,8 @@ namespace DisplayXR.Hands
     ///
     /// Created, started and stopped by <see cref="DisplayXRHandTracking"/> alongside the
     /// display subsystem; apps do not instantiate it. Joint poses are relative to the
-    /// rig camera's transform (the display plane) — see the Hand Tracking doc page.
+    /// rig camera's transform (display-centric: the display plane; camera-centric: the
+    /// nominal viewer) — see the Hand Tracking doc page.
     /// </summary>
     public sealed class DisplayXRHandSubsystem : XRHandSubsystem
     {
@@ -142,20 +143,23 @@ namespace DisplayXR.Hands
             var flags = XRHandSubsystem.UpdateSuccessFlags.None;
             if (m_NativeMissing) return flags;
 
-            // Metres -> the rig's world units (virtual display height vs. the physical
-            // panel). Resolved once per update, on the main thread, from the active rig.
-            float scale = DisplayXRHandTracking.ResolvePoseScale();
+            // Display-plane metres -> the rig camera's frame (canvas rebase, camera-rig
+            // viewer offset, metres -> rig units). Resolved once per update, on the main
+            // thread, from the active rig. A runtime with rig-scoped joints (XR_DXR_view_rig
+            // >= 4) already answers in the rig frame; then only an explicit scale override
+            // applies (UpdateHand picks per locate, the frame is reported after it).
+            var mapping = DisplayXRHandTracking.ResolveMapping();
 
-            if (UpdateHand(Handedness.Left, 0, scale, ref leftHandRootPose, leftHandJoints))
+            if (UpdateHand(Handedness.Left, 0, mapping, ref leftHandRootPose, leftHandJoints))
                 flags |= XRHandSubsystem.UpdateSuccessFlags.LeftHandRootPose
                        | XRHandSubsystem.UpdateSuccessFlags.LeftHandJoints;
-            if (UpdateHand(Handedness.Right, 1, scale, ref rightHandRootPose, rightHandJoints))
+            if (UpdateHand(Handedness.Right, 1, mapping, ref rightHandRootPose, rightHandJoints))
                 flags |= XRHandSubsystem.UpdateSuccessFlags.RightHandRootPose
                        | XRHandSubsystem.UpdateSuccessFlags.RightHandJoints;
             return flags;
         }
 
-        bool UpdateHand(Handedness handedness, int hand, float scale,
+        bool UpdateHand(Handedness handedness, int hand, DisplayXRHandRigMapping mapping,
                         ref Pose rootPose, NativeArray<XRHandJoint> joints)
         {
             int active;
@@ -172,13 +176,18 @@ namespace DisplayXR.Hands
             // for this hand, which is what flips XRHand.isTracked to false.
             if (active == 0) return false;
 
+            if (DisplayXRHandTracking.QueryRigFrame())
+                mapping = DisplayXRHandTracking.RigFrameMapping();
+
             for (int j = 0; j < k_JointCount; j++)
             {
                 int o = j * k_Stride;
                 // Already in Unity's frame (native mirrors Z and the quaternion's X/Y, the
-                // same conversion the eye poses take); only the scale is applied here.
+                // same conversion the eye poses take); only the rig mapping is applied here.
+                float x = m_Poses[o], y = m_Poses[o + 1], z = m_Poses[o + 2];
+                mapping.Apply(ref x, ref y, ref z);
                 var pose = new Pose(
-                    new Vector3(m_Poses[o] * scale, m_Poses[o + 1] * scale, m_Poses[o + 2] * scale),
+                    new Vector3(x, y, z),
                     new Quaternion(m_Poses[o + 3], m_Poses[o + 4], m_Poses[o + 5], m_Poses[o + 6]));
 
                 ulong f = m_Flags[j];
@@ -191,7 +200,7 @@ namespace DisplayXR.Hands
                     if ((f & k_PositionTracked) != 0 && (f & k_OrientationTracked) != 0)
                         state |= XRHandJointTrackingState.HighFidelityPose;
                 }
-                float radius = m_Radii[j] * scale;
+                float radius = m_Radii[j] * mapping.scale;
                 if (radius > 0f) state |= XRHandJointTrackingState.Radius;
 
                 var id = s_OpenXRToUnity[j];
