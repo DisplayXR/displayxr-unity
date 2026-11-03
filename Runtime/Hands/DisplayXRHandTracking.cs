@@ -225,6 +225,15 @@ namespace DisplayXR.Hands
         /// </summary>
         public static bool JointsInRigFrame { get; private set; }
 
+        /// <summary>
+        /// The rig the last locate's joints are in — the rig the views were located with
+        /// (see <see cref="DisplayXRHandRigKind"/>). On a native binary without the export it
+        /// is the scene's own rig when <see cref="JointsInRigFrame"/>, else None.
+        /// </summary>
+        public static DisplayXRHandRigKind JointRig { get; private set; }
+
+        static bool s_RigKindMissing;
+
         internal static bool QueryRigFrame()
         {
             bool rig = false;
@@ -235,7 +244,59 @@ namespace DisplayXR.Hands
                 catch (EntryPointNotFoundException) { s_RigFrameMissing = true; }
             }
             JointsInRigFrame = rig;
+
+            var kind = rig ? SceneRig() : DisplayXRHandRigKind.None;
+            if (rig && !s_RigKindMissing)
+            {
+                try { kind = (DisplayXRHandRigKind)DisplayXRHandNative.DisplayXR_HandTracking_RigKind(); }
+                catch (DllNotFoundException) { s_RigKindMissing = true; }
+                catch (EntryPointNotFoundException) { s_RigKindMissing = true; }
+            }
+            JointRig = kind;
             return rig;
+        }
+
+        /// <summary>
+        /// The rig the scene renders with: the active DisplayXR camera's
+        /// <see cref="DisplayXRDisplay"/> (Display) or <see cref="DisplayXRCamera"/> (Camera),
+        /// None for no active camera or one without a DisplayXR rig. Same precedence as the
+        /// provider's tunables push.
+        /// </summary>
+        public static DisplayXRHandRigKind SceneRig()
+        {
+            var cam = DisplayXRRigManager.ActiveCamera;
+            if (cam == null) return DisplayXRHandRigKind.None;
+            var disp = cam.GetComponent<DisplayXRDisplay>();
+            if (disp != null && disp.enabled) return DisplayXRHandRigKind.Display;
+            var camRig = cam.GetComponent<DisplayXRCamera>();
+            if (camRig != null && camRig.enabled) return DisplayXRHandRigKind.Camera;
+            return DisplayXRHandRigKind.None;
+        }
+
+        static bool s_MismatchLogged;
+
+        /// <summary>
+        /// False when the last locate's joints are in a different rig than the scene renders
+        /// with (<see cref="DisplayXRHandRigMath.JointRigFitsScene"/>) — the caller then reports
+        /// the hand untracked. Logs once per mismatch episode.
+        /// </summary>
+        internal static bool JointsFitScene()
+        {
+            var scene = SceneRig();
+            bool fits = DisplayXRHandRigMath.JointRigFitsScene(JointRig, scene);
+            if (!fits && !s_MismatchLogged)
+            {
+                s_MismatchLogged = true;
+                Debug.Log($"[DisplayXR] Hands: holding the joints back - located with the {JointRig} rig " +
+                          $"while the scene renders with the {scene} rig (the views' rig; the app rig is not " +
+                          "pushed while the boot splash is up). They resume when the two agree.");
+            }
+            else if (fits && s_MismatchLogged)
+            {
+                s_MismatchLogged = false;
+                Debug.Log($"[DisplayXR] Hands: joints resumed ({JointRig} rig, matching the scene).");
+            }
+            return fits;
         }
 
         static float s_AutoScale = 1f;

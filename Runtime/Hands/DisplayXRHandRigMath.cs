@@ -32,6 +32,23 @@ namespace DisplayXR.Hands
     }
 
     /// <summary>
+    /// Which rig a locate's joints are in (native <c>DisplayXR_HandTracking_RigKind</c>, the
+    /// rig the views were located with), and which rig the scene renders with.
+    /// </summary>
+    public enum DisplayXRHandRigKind
+    {
+        /// <summary>Display-plane metres: no rig chained (older runtime) — C# maps them.</summary>
+        None = 0,
+        /// <summary>The app's display-centric rig (<c>DisplayXRDisplay</c>).</summary>
+        Display = 1,
+        /// <summary>The app's camera-centric rig (<c>DisplayXRCamera</c>).</summary>
+        Camera = 2,
+        /// <summary>The provider's default display rig: the app's rig has not reached the
+        /// provider yet (session start, the boot splash) or the scene has none.</summary>
+        DefaultDisplay = 3,
+    }
+
+    /// <summary>
     /// The joint → rig mapping of the runtime's <c>XR_DXR_view_rig</c> spec 4 ("rig-scoped hand
     /// joints", §2 of <c>docs/specs/extensions/XR_DXR_view_rig.md</c>), done app-side because the
     /// provider locates joints in LOCAL with no rig chained. A joint maps exactly as an eye at
@@ -51,6 +68,30 @@ namespace DisplayXR.Hands
     /// </summary>
     public static class DisplayXRHandRigMath
     {
+        /// <summary>
+        /// Whether rig-frame joints can be placed relative to the scene's rig camera: only when
+        /// the rig they were located with (<paramref name="jointRig"/>) is the one the scene
+        /// renders with (<paramref name="sceneRig"/>: <see cref="DisplayXRHandRigKind.Display"/>,
+        /// <see cref="DisplayXRHandRigKind.Camera"/>, or <see cref="DisplayXRHandRigKind.None"/>
+        /// for a camera with no DisplayXR rig). Display-frame joints read as camera-relative
+        /// land behind the camera, and camera-frame joints under a display rig sit a nominal
+        /// viewer distance too deep, so a mismatch is held back (hand reported untracked) — it
+        /// happens while the boot splash owns the views, before the app's rig is pushed.
+        /// <see cref="DisplayXRHandRigKind.None"/> joints are display-plane metres that C#
+        /// maps itself, so they always fit.
+        /// </summary>
+        public static bool JointRigFitsScene(DisplayXRHandRigKind jointRig, DisplayXRHandRigKind sceneRig)
+        {
+            switch (jointRig)
+            {
+                case DisplayXRHandRigKind.None: return true;
+                case DisplayXRHandRigKind.Display: return sceneRig == DisplayXRHandRigKind.Display;
+                case DisplayXRHandRigKind.Camera: return sceneRig == DisplayXRHandRigKind.Camera;
+                case DisplayXRHandRigKind.DefaultDisplay: return sceneRig == DisplayXRHandRigKind.None;
+                default: return false;
+            }
+        }
+
         /// <summary>Nominal viewer distance when display info has none (matches the gizmos).</summary>
         public const float NominalViewerZFallback = 0.5f;
 
