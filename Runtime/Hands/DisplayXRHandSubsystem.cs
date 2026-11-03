@@ -23,7 +23,7 @@ namespace DisplayXR.Hands
     /// Created, started and stopped by <see cref="DisplayXRHandTracking"/> alongside the
     /// display subsystem; apps do not instantiate it. Joint poses are relative to the
     /// rig camera's transform (display-centric: the display plane; camera-centric: the
-    /// nominal viewer) — see the Hand Tracking doc page.
+    /// camera, with the glass on its convergence plane) — see the Hand Tracking doc page.
     /// </summary>
     public sealed class DisplayXRHandSubsystem : XRHandSubsystem
     {
@@ -144,7 +144,7 @@ namespace DisplayXR.Hands
             if (m_NativeMissing) return flags;
 
             // Display-plane metres -> the rig camera's frame (canvas rebase, camera-rig
-            // viewer offset, metres -> rig units). Resolved once per update, on the main
+            // convergence-plane offset, metres -> rig units). Resolved once per update, on the main
             // thread, from the active rig. A runtime with rig-scoped joints (XR_DXR_view_rig
             // >= 4) already answers in the rig frame; then only an explicit scale override
             // applies (UpdateHand picks per locate, the frame is reported after it).
