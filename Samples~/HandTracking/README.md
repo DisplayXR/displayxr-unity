@@ -89,12 +89,14 @@ mapped exactly the way the rig maps the eyes:
 - **Display-centric rig:** the camera is the display plane. Joints are taken relative to
   the canvas (the window on the panel) and scaled by `perspectiveFactor ·
   virtualDisplayHeight / canvas height`.
-- **Camera-centric rig:** the camera is the nominal viewer, so the panel — and a hand in
-  front of it — sits `nominalViewerZ` (about half a metre) in front of the camera,
-  unscaled. A hand held 10 cm in front of the glass lands about 0.4–0.5 m in front of the
-  camera.
+- **Camera-centric rig:** the glass sits on the camera's **convergence plane**
+  (`1 / invConvergenceDistance` in front of the camera, zero parallax), scaled by the
+  camera's virtual screen height there over the canvas height. A hand touching the glass
+  shows at zero parallax over the pixels it covers; a hand 10 cm in front of the glass
+  pops out by 10 cm × that scale.
 
-On a runtime that supports rig-scoped hand joints (`XR_DXR_view_rig` spec 4) the runtime
+On a runtime that supports rig-scoped hand joints (`XR_DXR_view_rig` spec 4; spec 5 for
+the camera-centric convergence-plane placement) the runtime
 does this mapping itself, from the same rig descriptor the views use, so it is right for
 any window position; on an older runtime `DisplayXRHandTracking.ResolveMapping` does it in
 C#. `DisplayXRHandTracking.JointsInRigFrame` says which.

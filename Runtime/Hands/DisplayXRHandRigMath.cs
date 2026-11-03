@@ -49,22 +49,23 @@ namespace DisplayXR.Hands
     }
 
     /// <summary>
-    /// The joint → rig mapping of the runtime's <c>XR_DXR_view_rig</c> spec 4 ("rig-scoped hand
-    /// joints", §2 of <c>docs/specs/extensions/XR_DXR_view_rig.md</c>), done app-side because the
-    /// provider locates joints in LOCAL with no rig chained. A joint maps exactly as an eye at
-    /// that point would, with the eye-pair factors (ipd, parallax) neutral:
+    /// The joint → rig mapping of the runtime's <c>XR_DXR_view_rig</c> rig-scoped hand joints
+    /// (§2 of <c>docs/specs/extensions/XR_DXR_view_rig.md</c>; camera rigs per spec 5), done
+    /// app-side when the provider locates joints in LOCAL with no rig chained. Both rigs first
+    /// rebase onto the canvas (the window on the panel): minus the canvas centre. Then:
     /// <list type="bullet">
-    /// <item>both rigs first rebase onto the canvas (the window on the panel): minus the canvas
-    /// centre;</item>
     /// <item>display rig: × <c>perspectiveFactor · virtualDisplayHeight / canvas height</c>; the
-    /// plane sits at the rig camera;</item>
-    /// <item>camera rig: × <c>metersToVirtual</c> about the nominal viewer plane
-    /// (<c>z − nominal z</c>), so the rig camera IS the nominal viewer and the panel sits
-    /// <c>nominal z</c> in front of it. The frustum (convergence, FOV) does not move a
-    /// point.</item>
+    /// glass sits at the rig camera (the display plane);</item>
+    /// <item>camera rig: the glass sits on the CONVERGENCE plane, <c>1 / invConvergenceDistance</c>
+    /// in front of the camera (zero parallax), scaled by the camera's virtual screen height
+    /// there, <c>V = 2 · tan(vFOV/2) / invConvergenceDistance</c>, over the canvas height — so a
+    /// hand on the glass lands on the pixel it covers, exactly as under a display rig. Only at
+    /// infinite convergence (<c>invConvergenceDistance</c> 0) does it fall back to
+    /// × <c>metersToVirtual</c> about the nominal viewer plane (<c>z − nominal z</c>).</item>
     /// </list>
-    /// Keep this in step with the runtime's <c>m_view_rig_map_relation</c>; a later move to
-    /// chaining the rig on <c>xrLocateHandJointsEXT</c> must give the same numbers.
+    /// Keep this in step with the runtime's <c>m_view_rig_map_relation</c>: chaining the rig on
+    /// <c>xrLocateHandJointsEXT</c> (runtime ≥ spec 5 for a camera rig) must give the same numbers.
+    /// A spec-4 runtime still maps chained camera-rig joints about the nominal viewer.
     /// </summary>
     public static class DisplayXRHandRigMath
     {
@@ -150,10 +151,40 @@ namespace DisplayXR.Hands
         }
 
         /// <summary>
-        /// Camera-centric rig (<c>XrCameraRigDXR</c>). The provider sends
-        /// <c>metersToVirtual = 1</c>; <paramref name="nominalZ"/> is the nominal viewer's
+        /// Camera-centric rig (<c>XrCameraRigDXR</c>) at a finite convergence: the glass lands on
+        /// the convergence plane, <c>1 / invConvergenceDistance</c> in front of the camera, scaled
+        /// by <c>V / canvas height</c> with <c>V = 2 · halfTanVFov / invConvergenceDistance</c>
+        /// (the camera's virtual screen there). <paramref name="halfTanVFov"/> is
+        /// <c>tan(vFOV/2)</c> — the tunables' <c>fovOverride</c>. In Unity's frame (+z in front
+        /// of the camera) the glass is at <c>z = +1/invConvergenceDistance</c>.
+        /// <c>invConvergenceDistance</c> ≤ 0 (parallel cameras), a non-positive FOV or an unknown
+        /// canvas height fall back to <see cref="CameraRig(Canvas, float, float)"/>.
+        /// </summary>
+        public static DisplayXRHandRigMapping CameraRig(Canvas canvas, float nominalZ, float metersToVirtual,
+                                                       float invConvergenceDistance, float halfTanVFov)
+        {
+            if (!(invConvergenceDistance > 0f) || !(halfTanVFov > 0f) || !(canvas.heightM > 0f))
+                return CameraRig(canvas, nominalZ, metersToVirtual);
+            float convergence = 1f / invConvergenceDistance;
+            float virtualHeight = 2f * halfTanVFov * convergence;
+            float s = virtualHeight / canvas.heightM;
+            return new DisplayXRHandRigMapping
+            {
+                originX = canvas.centerX,
+                originY = canvas.centerY,
+                // p_rig.z = s · (0 − originZ) = convergence for a point on the glass.
+                originZ = -convergence / s,
+                scale = s,
+            };
+        }
+
+        /// <summary>
+        /// Camera-centric rig (<c>XrCameraRigDXR</c>) at INFINITE convergence (no glass plane):
+        /// × <paramref name="metersToVirtual"/> about the nominal viewer plane. The provider
+        /// sends <c>metersToVirtual = 1</c>; <paramref name="nominalZ"/> is the nominal viewer's
         /// distance from the panel (display info), ≤ 0 = <see cref="NominalViewerZFallback"/>.
         /// OpenXR <c>z − nominal z</c> (+z toward the viewer) is Unity <c>z + nominal z</c>.
+        /// (Before runtime spec 5 this was the mapping at every convergence.)
         /// </summary>
         public static DisplayXRHandRigMapping CameraRig(Canvas canvas, float nominalZ, float metersToVirtual)
         {

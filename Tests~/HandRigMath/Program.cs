@@ -5,11 +5,13 @@
 // Hand-rolled (no test framework) so it also runs from a bare `csc` + the .NET runtime that ships
 // inside the Unity editor. Exit code 0 = all passed.
 //
-// The reference is the runtime's rule for rig-scoped hand joints (XR_DXR_view_rig spec 4, §2): a
-// joint maps exactly as an eye at that point would. RuntimeEye() below re-implements the shared
-// core's eye mapping (displayxr-common dxr_view_math.c: display3d `es * p`, es = persp * vH / canvasH;
-// camera3d `m2v * (p - (0, 0, nominalZ))`) in OpenXR coordinates, independently of the code under test,
-// which works in Unity's frame (z mirrored).
+// The reference is the runtime's rule for rig-scoped hand joints (XR_DXR_view_rig §2; camera rigs
+// spec 5). RuntimeEye() below re-implements it in OpenXR coordinates, independently of the code under
+// test (which works in Unity's frame, z mirrored), from the shared core (displayxr-common
+// dxr_view_math.c): display rig = display3d `es * p`, es = persp * vH / canvasH; camera rig = the
+// core's camera -> display conversion (plane 1/invd along -Z, vH = 2 * halfTan / invd) through
+// display3d with persp 1, i.e. `(s x, s y, s z - 1/invd)`, s = vH / canvasH; camera rig at infinite
+// convergence = camera3d `m2v * (p - (0, 0, nominalZ))`.
 
 using System;
 using DisplayXR.Hands;
@@ -37,10 +39,16 @@ static class Program
 
     // Reference, in OpenXR: canvas rebase, then the core's eye mapping; mirrored to Unity at the end.
     static void RuntimeEye(bool camera, DisplayXRHandRigMath.Canvas c, float vh, float persp, float m2v,
-                           float nominalZ, float ox, float oy, float oz, out float x, out float y, out float z)
+                           float nominalZ, float ox, float oy, float oz, out float x, out float y, out float z,
+                           float invd = 0f, float halfTan = 0f)
     {
         float px = ox - c.centerX, py = oy - c.centerY, pz = oz;
-        if (camera)
+        if (camera && invd > 0f && halfTan > 0f)
+        {
+            float s = (2f * halfTan / invd) / c.heightM;
+            x = s * px; y = s * py; z = s * pz - 1f / invd;
+        }
+        else if (camera)
         {
             x = m2v * px; y = m2v * py; z = m2v * (pz - nominalZ);
         }
@@ -105,9 +113,58 @@ static class Program
             Check(Near(bad.scale, 1f), "display rig with no heights -> scale 1");
         }
 
-        // --- Camera-centric rig -----------------------------------------------------------------
+        // --- Camera-centric rig: the glass on the convergence plane (runtime spec 5) -----------
+        {
+            // The reported scene: convergence 0.5 m, ~60 deg vFOV -> a ~0.58 m virtual screen on
+            // a 0.194 m panel, so s ~ 2.98. Spec 4 put a hand in front of the glass 6-10 cm behind
+            // zero parallax at 1:1 scale.
+            const float conv = 0.5f;
+            float halfTan = (float)Math.Tan(0.5 * 60.0 * Math.PI / 180.0);
+            float V = 2f * halfTan * conv, s = V / H;
+            var m = DisplayXRHandRigMath.CameraRig(panel, N, 1f, 1f / conv, halfTan);
+            Check(Near(m.scale, s, 1e-4f), $"camera rig: scale = virtual / physical height ({m.scale} vs {s})");
+
+            // The glass centre lands on the convergence plane, in front of the camera (Unity +z).
+            Map(m, 0f, 0f, 0f, out float x, out float y, out float z);
+            Check(Near(x, 0f) && Near(y, 0f) && Near(z, conv), $"camera rig: glass centre at z = +convergence (z={z})");
+
+            // The panel's top edge is the frustum's top edge at the convergence plane.
+            Map(m, 0f, H / 2, 0f, out x, out y, out z);
+            Check(Near(y / z, halfTan, 1e-4f), "camera rig: panel top edge on the frustum's top edge");
+
+            // A hand 10 cm in front of the glass: s x 10 cm in front of the convergence plane.
+            Map(m, -0.05f, 0.02f, 0.10f, out x, out y, out z);
+            Check(Near(x, -0.05f * s, 1e-4f) && Near(y, 0.02f * s, 1e-4f) && Near(z, conv - 0.10f * s, 1e-4f),
+                  $"camera rig: a hand in front of the glass pops out by s x its distance (z={z})");
+
+            // Against the runtime rule, off-centre window, several convergences / FOVs.
+            DisplayXRHandRigMath.TryCanvasFromPanelRect(1200, 900, 1280, 720, H / 3, PW, PH, W, H, out var win);
+            foreach (float invd in new[] { 2f, 0.5f, 5f })
+            foreach (float ht in new[] { 0.3249f, 0.5774f })
+            {
+                var mw = DisplayXRHandRigMath.CameraRig(win, N, 1f, invd, ht);
+                Map(mw, 0.04f, -0.03f, 0.08f, out x, out y, out z);
+                RuntimeEye(true, win, 0f, 1f, 1f, N, 0.04f, -0.03f, 0.08f, out float rx, out float ry, out float rz, invd, ht);
+                Check(Near(x, rx, 1e-4f) && Near(y, ry, 1e-4f) && Near(z, rz, 1e-4f),
+                      $"camera rig invd={invd} halfTan={ht} matches the runtime rule");
+                Map(mw, win.centerX, win.centerY, 0f, out x, out y, out z);
+                Check(Near(x, 0f) && Near(y, 0f) && Near(z, 1f / invd, 1e-4f), "camera rig: glass at the canvas centre on the axis");
+            }
+
+            // metersToVirtual scales the eyes, not the glass.
+            var m25 = DisplayXRHandRigMath.CameraRig(panel, N, 25f, 1f / conv, halfTan);
+            Check(Near(m25.scale, m.scale) && Near(m25.originZ, m.originZ), "camera rig: metersToVirtual does not move the glass");
+
+            // Degenerate FOV / canvas -> the infinite-convergence mapping.
+            var noFov = DisplayXRHandRigMath.CameraRig(panel, N, 1f, 2f, 0f);
+            Check(Near(noFov.scale, 1f) && Near(noFov.originZ, -N), "camera rig: no FOV -> nominal-viewer fallback");
+        }
+
+        // --- Camera-centric rig at infinite convergence (no glass plane) -------------------------
         {
             var m = DisplayXRHandRigMath.CameraRig(panel, N, 1f);
+            Check(DisplayXRHandRigMath.CameraRig(panel, N, 1f, 0f, 0.5f).originZ == m.originZ,
+                  "camera rig: invConvergenceDistance 0 -> the infinite-convergence mapping");
 
             // The partner report's case: a hand 10 cm in front of the glass. It used to come back
             // BEHIND the camera (z = -0.298 with the old convergence-plane scale); it must land in
@@ -154,8 +211,8 @@ static class Program
             Check(!DisplayXRHandRigMath.JointRigFitsScene(DisplayXRHandRigKind.Display, DisplayXRHandRigKind.Camera),
                   "display-rig joints are held back under a camera rig");
 
-            // Once the app's camera rig is the one chained, the same wrist lands in front of the camera,
-            // nominalZ - 0.145 deep, exactly as the runtime maps it.
+            // Once the app's camera rig is the one chained, the same wrist lands in front of the camera
+            // (here at infinite convergence: nominalZ - 0.145 deep), exactly as the runtime maps it.
             Check(DisplayXRHandRigMath.JointRigFitsScene(DisplayXRHandRigKind.Camera, DisplayXRHandRigKind.Camera),
                   "camera-rig joints fit a camera rig");
             RuntimeEye(true, panel, 0f, 1f, 1f, N, -0.132f, -0.084f, 0.145f, out float cx, out float cy, out float cz);

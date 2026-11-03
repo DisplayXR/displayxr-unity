@@ -104,19 +104,23 @@ survives the provider restarts that bit earlier pushed-before-start state (v2.9.
 ## Where the hands land: origin and scale
 
 Joint poses are relative to the **rig camera's transform**, in the rig's world units, and
-map exactly as an eye at that point would — the runtime's rule for rig-scoped hand joints
-(`XR_DXR_view_rig` spec 4, runtime #2189; `docs/specs/extensions/XR_DXR_view_rig.md` §2):
+map the way the runtime's rule for rig-scoped hand joints says (`XR_DXR_view_rig` spec 4,
+runtime #2189; camera rigs spec 5; `docs/specs/extensions/XR_DXR_view_rig.md` §2):
 
 | Rig | The camera is | Joint in the rig frame |
 |---|---|---|
 | `DisplayXRDisplay` | the virtual display plane | minus the canvas centre, × `perspectiveFactor · virtualDisplayHeight / canvas height` |
-| `DisplayXRCamera` | the nominal viewer | minus the canvas centre, `z − nominalViewerZ` (OpenXR; Unity `z + nominalViewerZ`), × `metersToVirtual` (the provider sends 1) |
+| `DisplayXRCamera` | the camera (the nominal viewer) | minus the canvas centre, × `V / canvas height`, glass on the convergence plane: Unity `z + 1/invConvergenceDistance`. `V = 2 · tan(vFOV/2) / invConvergenceDistance` is the camera's virtual screen height there (the provider's `fovOverride` is `tan(vFOV/2)`). At `invConvergenceDistance` 0 only: `z − nominalViewerZ` (OpenXR; Unity `z + nominalViewerZ`), × `metersToVirtual` |
 | rig-less camera | — | display-plane metres, unchanged |
 
-So on a camera-centric rig the panel, and a hand in front of it, sit `nominalViewerZ`
-in front of the camera. (Before this rule the plugin scaled camera-rig joints by the
-convergence-plane framing and applied no viewer offset, which put every joint *behind*
-the camera.) The convergence distance and FOV shape the frustum; they do not move a point.
+So on a camera-centric rig the glass sits on the convergence plane — zero parallax — and
+a hand on it covers the pixels the real hand covers, exactly as under a display rig.
+History: the plugin first scaled camera-rig joints by the convergence-plane framing with
+no plane offset (every joint *behind* the camera, #439); then (spec 4) placed the glass
+`nominalViewerZ` in front of the camera at metric scale — in a scene with convergence 0.5
+and a ≈ 0.58 m virtual screen that showed a hand in front of the glass 6–10 cm *behind*
+zero parallax and about 3× too small. Spec 5 takes the plane and height from the runtime
+core's camera → display conversion, so joints and the frustum cannot disagree.
 
 **Who computes it.**
 
@@ -130,6 +134,11 @@ the camera.) The convergence distance and FOV shape the frustum; they do not mov
   at the rig's image of the display centre (`-m2v × canvas centre`), which app code cannot
   undo. Gated on the advertised `extensionVersion`, because an older runtime ignores the
   struct without an error.
+  **Camera rigs need ≥ 5 for the convergence-plane placement:** a spec-4 runtime
+  (v2.47.1 – v2.59.x) answers a chained camera rig with the old nominal-viewer placement
+  (glass `nominalViewerZ` in front of the camera, metric). The provider still chains on 4
+  — the C# fallback cannot place a display-relative source on an off-centre window under
+  those runtimes either — so on a spec-4 runtime update the runtime for camera-centric hands.
   The descriptor is a **snapshot of the one the latest primary view locate chained**
   (taken in `dxr_prov_begin_frame`), not rebuilt from the live tunables, so the joints are
   always in the rig the views were located with. That rig is not always the scene's:
