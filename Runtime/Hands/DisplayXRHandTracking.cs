@@ -24,7 +24,7 @@ namespace DisplayXR.Hands
     ///
     /// <b>Frame.</b> Joint poses are expressed relative to the <b>rig camera's transform</b>
     /// (what the provider sends the runtime as the rig pose: the display plane for a
-    /// display-centric rig, the nominal viewer for a camera-centric one), in the rig's world
+    /// display-centric rig, the camera — the nominal viewer — for a camera-centric one), in the rig's world
     /// units. Parent your hand visuals under the rig camera (or transform the
     /// poses by it) and they land where the real hands are in front of the panel; see the
     /// Hand Tracking doc page for why that is the right origin.
@@ -33,9 +33,10 @@ namespace DisplayXR.Hands
     /// <see cref="ResolveMapping"/> maps them the way the rig maps the eyes (the runtime's
     /// <c>XR_DXR_view_rig</c> rule for hand joints): rebased onto the canvas (the window on
     /// the panel), then for a display-centric rig scaled by the virtual-to-canvas height
-    /// ratio, and for a camera-centric rig offset so the rig camera is the nominal viewer
-    /// (the panel, and a hand in front of it, land in front of the camera). Without it a
-    /// camera-centric rig put every joint behind its camera.
+    /// ratio, and for a camera-centric rig placed on its convergence plane (the glass at
+    /// zero parallax, <c>1/invConvergenceDistance</c> in front of the camera) and scaled by
+    /// the camera's virtual screen height there over the canvas height — so a hand on the
+    /// glass lands on the pixels it covers.
     /// <see cref="PoseScaleOverride"/> pins the scale instead. Scale-as-zoom (a scaled rig
     /// transform) needs nothing here — it is folded out of the tunables before they reach
     /// the runtime, and parenting under the (scaled) rig camera applies it to the hands.
@@ -76,7 +77,7 @@ namespace DisplayXR.Hands
         /// <summary>
         /// Pin the metres→rig-units factor applied to joint positions and radii instead of
         /// deriving it from the active rig (null = derive, the default). 1 = raw metres. The
-        /// rig's origin (canvas centre, camera-centric nominal viewer) still applies.
+        /// rig's origin (canvas centre; camera-centric: the convergence plane) still applies.
         /// </summary>
         public static float? PoseScaleOverride { get; set; }
 
@@ -153,12 +154,12 @@ namespace DisplayXR.Hands
 
         /// <summary>
         /// The joint → rig mapping for this update (see <see cref="DisplayXRHandRigMath"/>):
-        /// the canvas centre is subtracted, a camera-centric rig moves the origin to the
-        /// nominal viewer (the rig camera is the viewer there, so the panel sits
-        /// <c>nominalViewerZ</c> in front of it), and the position is scaled by the rig's
+        /// the canvas centre is subtracted, and the position is scaled by the rig's
         /// metres→rig-units factor (display-centric: <c>perspectiveFactor ·
-        /// virtualDisplayHeight / canvas height</c>; camera-centric: 1, the
-        /// <c>metersToVirtual</c> the provider sends). <see cref="PoseScaleOverride"/>, if
+        /// virtualDisplayHeight / canvas height</c>, the glass at the rig camera;
+        /// camera-centric: the camera's virtual screen height at its convergence plane /
+        /// canvas height, the glass ON that plane, <c>1/invConvergenceDistance</c> in front
+        /// of the camera — zero parallax). <see cref="PoseScaleOverride"/>, if
         /// set, replaces the scale only. Identity when there is no rig or no display info.
         /// Called by the provider every update; public for HUDs.
         /// </summary>
@@ -207,7 +208,8 @@ namespace DisplayXR.Hands
                 canvas = live;
 
             if (t.cameraCentricMode)
-                return DisplayXRHandRigMath.CameraRig(canvas, di.nominalZ, 1f);
+                return DisplayXRHandRigMath.CameraRig(canvas, di.nominalZ, 1f,
+                    t.invConvergenceDistance, t.fovOverride);
 
             // The height the provider sends: the rig's field, or the physical panel when 0
             // (ps_display_rig_vh in native).
@@ -220,7 +222,7 @@ namespace DisplayXR.Hands
         /// <summary>
         /// True when the last locate came back in the RIG frame (runtime <c>XR_DXR_view_rig</c>
         /// ≥ 4 with the rig chained on the joint locate): the runtime already applied the
-        /// canvas rebase, the rig scale and the camera rig's viewer offset, so the C# mapping
+        /// canvas rebase, the rig scale and the camera rig's convergence-plane offset, so the C# mapping
         /// must not. False on older runtimes and older native binaries.
         /// </summary>
         public static bool JointsInRigFrame { get; private set; }
