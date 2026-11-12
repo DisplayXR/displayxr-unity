@@ -36,12 +36,25 @@ jobs:
     runs-on: ubuntu-latest
     outputs:
       docs_only: ${{ steps.filter.outputs.docs_only }}
+      repoint: ${{ steps.filter.outputs.repoint }}
     steps:
       - uses: actions/checkout@v5
         with:
           fetch-depth: 0
       - id: filter
         run: |
+          # A v* tag moved onto the upm branch's signing commit (the release
+          # signing step re-points it there, so `#vX.Y.Z` git installs get the
+          # signed DLL) is an already-published release, not a new one. Build
+          # nothing and skip the release job, which would otherwise force-push
+          # an UNSIGNED DLL over the signed upm branch and its upm/vX.Y.Z tag.
+          if [ "${{ github.ref_type }}" = "tag" ] && \
+             git log -1 --format=%s HEAD | grep -q '^Sign displayxr_unity.dll for '; then
+            echo "docs_only=true" >> "$GITHUB_OUTPUT"
+            echo "repoint=true" >> "$GITHUB_OUTPUT"
+            echo "Tag re-pointed onto the signing commit — nothing to build or release"
+            exit 0
+          fi
           # Tag pushes are releases — always build.
           if [ "${{ github.ref_type }}" = "tag" ]; then
             echo "docs_only=false" >> "$GITHUB_OUTPUT"
@@ -369,9 +382,9 @@ jobs:
   # ── Release job: runs on v* tags ──────────────────────────────────────
   release:
     name: Create GitHub Release
-    needs: [build-windows, build-macos, build-linux, build-android]
+    needs: [DetectChanges, build-windows, build-macos, build-linux, build-android]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/v')
+    if: startsWith(github.ref, 'refs/tags/v') && needs.DetectChanges.outputs.repoint != 'true'
     permissions:
       contents: write
     steps:
@@ -437,8 +450,12 @@ jobs:
 
       - name: Create UPM tarball
         run: |
-          # Build the package directory with binaries included
-          PKG_DIR="com.displayxr.unity-${{ steps.version.outputs.version }}"
+          # Build the package directory with binaries included. It MUST be
+          # named `package`: Unity's "Add package from tarball" reads
+          # package/package.json (the npm pack layout) and refuses any other
+          # top folder. Through v2.36.0 it was com.displayxr.unity-X.Y.Z/, so a
+          # tarball install failed with "package.json cannot be found".
+          PKG_DIR="package"
           mkdir "$PKG_DIR"
           # Copy package contents (everything Unity needs)
           cp -r Runtime/ "$PKG_DIR/Runtime/"
@@ -452,6 +469,11 @@ jobs:
           cp LICENSE "$PKG_DIR/"
           # Create tarball (npm pack format that UPM understands)
           tar czf "com.displayxr.unity-${{ steps.version.outputs.version }}.tgz" "$PKG_DIR"
+          tar tzf "com.displayxr.unity-${{ steps.version.outputs.version }}.tgz" | grep -qx 'package/package.json' || {
+            echo "::error::the .tgz has no package/package.json — Unity cannot install it"; exit 1; }
+          # The upm-branch step below does `git add` with explicit paths; keep the
+          # staging folder out of the working tree's way all the same.
+          rm -rf "$PKG_DIR"
           echo "Created: com.displayxr.unity-${{ steps.version.outputs.version }}.tgz"
           ls -lh *.tgz
 
