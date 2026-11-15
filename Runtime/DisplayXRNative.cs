@@ -295,13 +295,6 @@ namespace DisplayXR
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern void displayxr_local2d_clear();
 
-        /// <summary>
-        /// Get the display backing scale factor (Retina).
-        /// Returns 2.0 on macOS Retina, 1.0 on non-Retina or non-macOS.
-        /// </summary>
-        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
-        public static extern float displayxr_get_backing_scale_factor();
-
         // ====================================================================
         // Transparent overlay mode (issue #57) — Windows only
         //
