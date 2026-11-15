@@ -118,7 +118,7 @@ two ways (`displayxr_win32.c`):
 
 | Case | Source of the target rect |
 |---|---|
-| **Multi-zone** (`dxr_prov_get_zone_count() > 1`) | `dxr_prov_get_zone_rect_px(zone, …)` — stamp into each zone's rect (union). |
+| **Multi-zone** (`dxr_prov_get_zone_count() > 1`) | `dxr_prov_get_zone_rect_px(zone, …)` — stamp into each zone's rect (union). The count is a **slot bound** (1 + last live extra slot + 1), not a live-zone count: loop `0..count-1` and skip a slot whose getter returns 0, because a hidden zone can leave a dead slot below a live one (#449). |
 | **Single zone / canvas** | `displayxr_get_canvas_rect_px(…)` — the app-set canvas sub-rect, or the **full window** when unset. |
 
 **The invariant:** the rect the mask is stamped into (`cv`) must equal the rect the runtime
