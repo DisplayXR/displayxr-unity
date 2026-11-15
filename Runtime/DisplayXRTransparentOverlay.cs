@@ -228,9 +228,6 @@ namespace DisplayXR
         private RenderTexture m_HitMaskRT;
         private RenderTexture m_HitMaskDilatedRT;
         private RenderTexture m_HitMaskDilatedRT2;   // ping-pong for multi-pass dilate
-        // Mask dimensions captured at request time (the raster can resize
-        // between request and callback).
-        private int  m_HitMaskPendingW, m_HitMaskPendingH;
         private Material      m_SilhouetteMat;
         private Material      m_SilhouetteDilateMat;
         private CommandBuffer m_HitMaskCB;
@@ -238,6 +235,15 @@ namespace DisplayXR
         // AsyncGPUReadback budget is a few outstanding requests, but
         // a single one keeps memory + GPU pressure deterministic.
         private bool m_HitMaskReadbackPending;
+        // Bumped by ReleaseHitMaskResources (OnDisable). A readback issued before a
+        // disable/enable can complete after the next enable has issued its own: the
+        // callback carries the generation it was requested under, and a stale one
+        // must neither clear the new request's pending flag nor apply its bytes
+        // (#451). The callback delegate is cached per generation, so a steady-state
+        // request allocates nothing.
+        private int m_HitMaskGeneration;
+        private int m_HitMaskReadbackCbGeneration = -1;
+        private System.Action<AsyncGPUReadbackRequest> m_HitMaskReadbackCb;
         // Captured at request time so the callback (which runs on a
         // later main-thread tick) uses the overlay size that was
         // current when we issued the readback, not whatever the
@@ -1933,19 +1939,29 @@ namespace DisplayXR
 
             m_HitMaskPendingDstW = overlayW;
             m_HitMaskPendingDstH = overlayH;
-            m_HitMaskPendingW = m_HitMaskW;
-            m_HitMaskPendingH = m_HitMaskH;
             m_HitMaskReadbackPending = true;
-            AsyncGPUReadback.Request(readbackRT, 0, OnHitMaskReadback);
+            if (m_HitMaskReadbackCb == null || m_HitMaskReadbackCbGeneration != m_HitMaskGeneration)
+            {
+                int gen = m_HitMaskGeneration;
+                m_HitMaskReadbackCbGeneration = gen;
+                m_HitMaskReadbackCb = req => OnHitMaskReadback(req, gen);
+            }
+            AsyncGPUReadback.Request(readbackRT, 0, m_HitMaskReadbackCb);
         }
 
-        void OnHitMaskReadback(AsyncGPUReadbackRequest req)
+        void OnHitMaskReadback(AsyncGPUReadbackRequest req, int generation)
         {
+            // Requested before a disable/enable: the flag (and the resources) now
+            // belong to a newer request. Touch nothing.
+            if (generation != m_HitMaskGeneration) return;
             m_HitMaskReadbackPending = false;
             if (req.hasError) return;
             if (m_HitMaskRT == null) return;
 
+            // The request's own size, not fields a later request may have rewritten.
+            int maskW = req.width, maskH = req.height;
             var data = req.GetData<byte>();
+            if (maskW <= 0 || maskH <= 0 || data.Length < maskW * maskH) return;
 #if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN || (UNITY_STANDALONE_LINUX && !UNITY_EDITOR)
             unsafe
             {
@@ -1953,7 +1969,7 @@ namespace DisplayXR
                     .NativeArrayUnsafeUtility.GetUnsafeReadOnlyPtr(data);
                 DisplayXRNative.displayxr_set_overlay_hit_mask(
                     ptr,
-                    m_HitMaskPendingW, m_HitMaskPendingH,
+                    maskW, maskH,
                     m_HitMaskPendingDstW, m_HitMaskPendingDstH);
 #if UNITY_STANDALONE_WIN || UNITY_EDITOR_WIN
 
@@ -1969,13 +1985,13 @@ namespace DisplayXR
                 if (reportContentMask && DisplayXRProviderDriver.IsActive)
                 {
                     DisplayXRProviderNative.dxr_prov_set_content_mask(
-                        ptr, (uint)m_HitMaskPendingW, (uint)m_HitMaskPendingH,
-                        (uint)m_HitMaskPendingW);
+                        ptr, (uint)maskW, (uint)maskH,
+                        (uint)maskW);
                 }
 #endif
             }
             if (s_DumpHitMask && (m_HitMaskDumpCounter++ % 15) == 0)
-                DumpHitMaskPng(data, m_HitMaskPendingW, m_HitMaskPendingH);
+                DumpHitMaskPng(data, maskW, maskH);
 #endif
         }
 
@@ -2014,8 +2030,10 @@ namespace DisplayXR
         {
             // Drop the readback flag so OnHitMaskReadback (which may
             // fire after OnDisable) silently no-ops instead of
-            // dereferencing freed resources.
+            // dereferencing freed resources. The generation bump makes any
+            // readback still in flight stale (#451).
             m_HitMaskReadbackPending = false;
+            m_HitMaskGeneration++;
             if (m_HitMaskRT != null)
             {
                 m_HitMaskRT.Release();
