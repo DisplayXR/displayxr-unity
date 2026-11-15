@@ -1920,6 +1920,13 @@ namespace DisplayXR
             DisplayXRProviderNative.dxr_prov_set_gameview_rect(px, py, pw, ph);
         }
 
+        // The active camera's rig components, looked up once per ActiveCamera change
+        // instead of twice per frame (#451). Re-queried while the camera carries
+        // neither, so a rig added to the same camera later is still picked up.
+        Camera           m_TunablesCam;
+        DisplayXRDisplay m_TunablesDisp;
+        DisplayXRCamera  m_TunablesCamRig;
+
         void PushActiveRigTunables()
         {
             if (DisplayXRRigManager.SplashActive) return;
@@ -1927,10 +1934,17 @@ namespace DisplayXR
             Camera cam = DisplayXRRigManager.ActiveCamera;
             if (cam == null) return;
 
+            if (!ReferenceEquals(cam, m_TunablesCam) || (m_TunablesDisp == null && m_TunablesCamRig == null))
+            {
+                m_TunablesCam    = cam;
+                m_TunablesDisp   = cam.GetComponent<DisplayXRDisplay>();
+                m_TunablesCamRig = cam.GetComponent<DisplayXRCamera>();
+            }
+
             // Read the active rig's tunables (raw fields; no DisplayXRFeature dep).
             DisplayXRTunables t;
-            var disp = cam.GetComponent<DisplayXRDisplay>();
-            var camRig = cam.GetComponent<DisplayXRCamera>();
+            var disp = m_TunablesDisp;
+            var camRig = m_TunablesCamRig;
             if (disp != null && disp.enabled) t = disp.GetProviderTunables();
             else if (camRig != null && camRig.enabled) t = camRig.GetProviderTunables();
             else return; // active camera carries no DisplayXR rig — nothing to push
