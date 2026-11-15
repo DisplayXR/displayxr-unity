@@ -4211,7 +4211,13 @@ displayxr_set_overlay_hit_mask(const uint8_t *mask, int mask_w, int mask_h,
 	} else {
 		DWORD buf_size = sizeof(RGNDATAHEADER) + (DWORD)n * sizeof(RECT);
 		RGNDATA *data = (RGNDATA *)malloc(buf_size);
-		if (data == NULL) { free(rects); return; }
+		if (data == NULL) {
+			// The hash above was stored before the region was built: forget it, or the
+			// next identical mask would be skipped as "already applied" (#451).
+			s_hit_mask_region_hash = 0;
+			free(rects);
+			return;
+		}
 
 		data->rdh.dwSize   = sizeof(RGNDATAHEADER);
 		data->rdh.iType    = RDH_RECTANGLES;
@@ -4236,6 +4242,7 @@ displayxr_set_overlay_hit_mask(const uint8_t *mask, int mask_w, int mask_h,
 		free(data);
 
 		if (rgn == NULL) {
+			s_hit_mask_region_hash = 0; // not applied: let the next identical mask retry (#451)
 			displayxr_log("[DisplayXR] hit_mask: ExtCreateRegion failed (n=%d) err=%lu\n",
 			              n, (unsigned long)GetLastError());
 			free(rects);
