@@ -1736,11 +1736,34 @@ namespace DisplayXR
         // out of the mask → interior click-through holes over those parts (#131).
         // The silhouette shader writes solid 1 for any rasterized triangle, so
         // covering all submeshes makes the silhouette truly solid.
-        void DrawSilhouetteAllSubmeshes(Renderer r)
+        //
+        // `index` is r's slot in clickableRenderers. The MeshFilter lookup is cached
+        // per slot and refreshed only when the slot's renderer changes (the array is
+        // reassigned or an element replaced), not per draw (#451). sharedMesh is still
+        // read live, so swapping a filter's mesh needs no refresh.
+        private Renderer[]   m_SilFilterRenderers = new Renderer[0];
+        private MeshFilter[] m_SilFilters         = new MeshFilter[0];
+
+        MeshFilter SilhouetteFilterFor(int index, Renderer r)
+        {
+            if (m_SilFilters.Length != clickableRenderers.Length)
+            {
+                m_SilFilterRenderers = new Renderer[clickableRenderers.Length];
+                m_SilFilters         = new MeshFilter[clickableRenderers.Length];
+            }
+            if (!ReferenceEquals(m_SilFilterRenderers[index], r))
+            {
+                m_SilFilterRenderers[index] = r;
+                m_SilFilters[index] = r.GetComponent<MeshFilter>();
+            }
+            return m_SilFilters[index];
+        }
+
+        void DrawSilhouetteAllSubmeshes(Renderer r, int index)
         {
             Mesh mesh = null;
             if (r is SkinnedMeshRenderer smr) mesh = smr.sharedMesh;
-            else { var mf = r.GetComponent<MeshFilter>(); if (mf != null) mesh = mf.sharedMesh; }
+            else { var mf = SilhouetteFilterFor(index, r); if (mf != null) mesh = mf.sharedMesh; }
 
             int subCount = (mesh != null) ? Mathf.Max(1, mesh.subMeshCount) : 1;
             for (int s = 0; s < subCount; s++)
@@ -1895,14 +1918,14 @@ namespace DisplayXR
                 {
                     var r = clickableRenderers[i];
                     if (!IsHitTestable(r)) continue;
-                    DrawSilhouetteAllSubmeshes(r);
+                    DrawSilhouetteAllSubmeshes(r, i);
                 }
                 m_HitMaskCB.SetGlobalMatrix("_DXRViewProj", rVP);
                 for (int i = 0; i < clickableRenderers.Length; i++)
                 {
                     var r = clickableRenderers[i];
                     if (!IsHitTestable(r)) continue;
-                    DrawSilhouetteAllSubmeshes(r);
+                    DrawSilhouetteAllSubmeshes(r, i);
                 }
             }
 
