@@ -1,8 +1,12 @@
 # Controller and Stylus Input — the "DisplayXR Input" subsystem
 
-> **Status: new in the next release (branch `feat/stylus-unity-input`).** Native and
-> editor compile checks plus a fake-runtime unit test; not yet run against a live
-> stylus provider (see *Validation*).
+> **Status: new in the next release.** Native and editor compile checks plus a
+> fake-runtime unit test; not yet run against a live stylus provider (see
+> *Validation*). The stylus interaction profile and the glass-registered
+> `XRT_TRACKING_TYPE_RIG_LOCAL_PHYSICAL` frame (runtime ADR-034 Amendment 8,
+> `input-provider-discovery.md` §4b.4a) are runtime-side and ship with the runtime
+> release that adds them; against an older runtime only `khr/simple_controller` is
+> bound.
 
 ## What it is
 
@@ -232,6 +236,12 @@ Still to do on a box with a stylus provider:
   `TryGetDeviceStateAtTime`).
 - Camera rigs need a runtime with `XR_DXR_view_rig` ≥ 5 for the glass on the
   convergence plane (as for the hands).
+- By default a display-relative (`RIG_LOCAL`) controller and the same provider's
+  XR Hands joints disagree in scale under a scaled rig: the runtime gives rig-scoped
+  hand joints the rig's gain but returns `RIG_LOCAL` action spaces metric on the rig's
+  plane, and the plugin cannot tell per device which frame a provider publishes in.
+  An app whose controllers come only from display-relative providers sets
+  `DisplayXRInput.ApplyRigGain`.
 - Glass registration of a stylus needs a runtime that implements
   `XRT_TRACKING_TYPE_RIG_LOCAL_PHYSICAL` and a provider that publishes on it; the same
   runtime is the one that advertises the stylus profile.
