@@ -8579,11 +8579,11 @@ static void ps_hand_rig_record(const void *rig_chain, int app_rig)
 }
 
 // After each primary view locate (graphics thread): hand the controllers' TU the rig
-// frame those views were located in, from the descriptor actually chained. A display-
-// relative (RIG_LOCAL) action space comes back from the runtime at P o (s L) - on the
-// display plane P the rig puts in LOCAL, but METRIC (action spaces get no rig length
-// scale) - while the views are scaled; the TU re-places the pose on that plane at the
-// rig's scale, relative to the rig camera, the frame the hand joints use (spec 4/5):
+// frame those views were located in, from the descriptor actually chained. The TU
+// always re-expresses poses relative to the rig pose; plane + scale are used only by
+// its opt-in rig gain (displayxr_provider_input.h: a glass-registered stylus already
+// comes back in the rig frame). The gain, for a metric display-relative (RIG_LOCAL)
+// device at P o (s L), is the hand joints' mapping (spec 4/5):
 //   display rig: plane at the rig pose,          k = perspectiveFactor * vH / canvas h
 //   camera rig:  plane 1/conv in front (glass),  k = (2 tan(vFov/2) / conv) / canvas h
 //                conv 0: nominalViewerZ in front, k = metersToVirtual

@@ -19,7 +19,14 @@ namespace {
 std::mutex g_mx;
 
 DxrInputLogFn g_log = nullptr;
-int g_app_enabled = 1; // DisplayXR_Input_SetEnabled; outlives the instance
+// DisplayXR_Input_SetEnabled; outlives the instance. Atomic: set on the main thread,
+// read on the graphics thread at instance creation.
+std::atomic<int> g_app_enabled{1};
+// DisplayXR_Input_SetRigGain (live) / DISPLAYXR_INPUT_RIG_GAIN=1 (read at instance
+// creation): also apply the rig's metres -> rig units gain to located poses. Off by
+// default: the runtime already maps action spaces into the rig frame (see the header).
+std::atomic<int> g_rig_gain{0};
+int g_rig_gain_env = 0; // under g_mx
 
 XrInstance g_instance = XR_NULL_HANDLE;
 XrSession g_session = XR_NULL_HANDLE;
@@ -108,6 +115,13 @@ env_disabled()
 {
 	const char *v = getenv("DISPLAYXR_INPUT");
 	return v != nullptr && v[0] == '0' && v[1] == '\0';
+}
+
+bool
+env_rig_gain()
+{
+	const char *v = getenv("DISPLAYXR_INPUT_RIG_GAIN");
+	return v != nullptr && v[0] == '1' && v[1] == '\0';
 }
 
 // ---- Pose math (OpenXR frame) ----
@@ -366,7 +380,7 @@ extern "C" {
 uint32_t
 dxr_input_add_instance_extensions(const char **names, uint32_t count, int advertised_mx_ink)
 {
-	if (!g_app_enabled || env_disabled())
+	if (!g_app_enabled.load() || env_disabled())
 		return count;
 	// An interaction-profile extension: enabling it only makes its profile path
 	// legal for xrSuggestInteractionProfileBindings. Gated on the runtime
@@ -387,7 +401,8 @@ dxr_input_on_instance(XrInstance instance, PFN_xrGetInstanceProcAddr gipa, int m
 	g_mx_ink = 0;
 	g_simple = 0;
 	g_profile_dirty.store(1);
-	if (!g_app_enabled || env_disabled()) {
+	g_rig_gain_env = env_rig_gain() ? 1 : 0;
+	if (!g_app_enabled.load() || env_disabled()) {
 		INPUT_LOG(
 		    "[DisplayXR-PROV] input: disabled (DisplayXRInput.Enabled / "
 		    "DISPLAYXR_INPUT=0) - no action set\n");
@@ -588,6 +603,11 @@ dxr_input_update(int before_render)
 		std::lock_guard<std::mutex> rk(g_rig_mx);
 		rig = g_rig;
 	}
+	// Default: as located, only re-expressed relative to the rig camera (scale 1, so
+	// the plane offset cancels). The opt-in gain is for a display-relative device on
+	// a runtime that returns action spaces metric (see the header).
+	if (!(g_rig_gain.load() || g_rig_gain_env))
+		rig.scale = 1.0f;
 
 	if (!before_render) {
 		XrActiveActionSet active = {g_set, XR_NULL_PATH};
@@ -687,8 +707,13 @@ dxr_input_haptic_stop(int hand)
 void
 DisplayXR_Input_SetEnabled(int enabled)
 {
-	std::lock_guard<std::mutex> lk(g_mx);
-	g_app_enabled = enabled ? 1 : 0;
+	g_app_enabled.store(enabled ? 1 : 0);
+}
+
+void
+DisplayXR_Input_SetRigGain(int enabled)
+{
+	g_rig_gain.store(enabled ? 1 : 0);
 }
 
 int

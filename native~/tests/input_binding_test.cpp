@@ -5,7 +5,8 @@
 // against a fake runtime: the stylus profile is suggested only when its extension is
 // enabled (and never the system component), simple_controller always; the opt-out
 // creates no action set; the bound profile decides each hand's kind; action state is
-// read per hand; poses come back relative to the rig camera at the rig's scale
+// read per hand; poses come back relative to the rig camera, as located by default
+// and at the rig's scale with the opt-in gain
 // (display rig and camera rig); haptics reach xrApplyHapticFeedback clamped; teardown
 // destroys every handle. No Unity, no real runtime.
 //
@@ -368,7 +369,24 @@ test_stylus_profile_and_state()
 	F.pose_local["tip_pose|right"] = XrPosef{{0, 0, 0, 1}, {1.1f, 2.0f, 3.05f}};
 	dxr_input_on_frame_begun(1000);
 
+	// Default (no rig gain): as located, only relative to the rig camera. The
+	// runtime already put a glass-registered pen in the rig frame; scaling it
+	// here would scale it twice. rel = (0.1, 0, 0.05) -> Unity (0.1, 0, -0.05);
+	// velocity (0,0,1) -> Unity (0,0,-1).
 	CHECK(dxr_input_update(0) == 1);
+	CHECK(F.sync_calls == 1);
+	{
+		DxrInputHandState d;
+		dxr_input_get_hand_state(1, &d);
+		NEAR(d.pose[DXR_INPUT_POSE_TIP].position[0], 0.1f);
+		NEAR(d.pose[DXR_INPUT_POSE_TIP].position[1], 0.0f);
+		NEAR(d.pose[DXR_INPUT_POSE_TIP].position[2], -0.05f);
+		NEAR(d.pose[DXR_INPUT_POSE_TIP].linear_velocity[2], -1.0f);
+	}
+
+	// Opt-in rig gain: the hand-joint mapping about the plane.
+	DisplayXR_Input_SetRigGain(1);
+	CHECK(dxr_input_update(1) == 1); // before-render: relocate, no sync
 	CHECK(F.sync_calls == 1);
 	DxrInputHandState r, l;
 	CHECK(dxr_input_get_hand_state(1, &r) == DXR_INPUT_KIND_STYLUS);
@@ -418,6 +436,15 @@ test_stylus_profile_and_state()
 	NEAR(r.pose[DXR_INPUT_POSE_TIP].position[1], 0.0f);
 	NEAR(r.pose[DXR_INPUT_POSE_TIP].position[2], 2.0f);
 	NEAR(fabsf(r.pose[DXR_INPUT_POSE_TIP].rotation[3]), 1.0f);
+
+	// The same camera rig without the gain: relative to the camera, unscaled:
+	// OpenXR (0.2, 0, -2) -> Unity (0.2, 0, 2).
+	DisplayXR_Input_SetRigGain(0);
+	CHECK(dxr_input_update(1) == 1);
+	dxr_input_get_hand_state(1, &r);
+	NEAR(r.pose[DXR_INPUT_POSE_TIP].position[0], 0.2f);
+	NEAR(r.pose[DXR_INPUT_POSE_TIP].position[1], 0.0f);
+	NEAR(r.pose[DXR_INPUT_POSE_TIP].position[2], 2.0f);
 
 	// Haptics: clamped amplitude, seconds -> nanoseconds, on the right subaction
 	// path.

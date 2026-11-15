@@ -21,7 +21,8 @@
 //           click), PrimaryDoubleTap, SecondaryButton (back cluster click),
 //           SecondaryDoubleTap, Docked
 //   simple: Trigger + TriggerButton (select click, as 0/1), MenuButton (menu click)
-// Poses are relative to the rig camera in rig units (see displayxr_provider_input.h).
+// Poses are relative to the rig camera, as the runtime located them (see
+// displayxr_provider_input.h for the frame and the opt-in rig gain).
 // Haptics: InputDevice.SendHapticImpulse(0, amplitude, duration) ->
 // xrApplyHapticFeedback on the hand's /output/haptic.
 //

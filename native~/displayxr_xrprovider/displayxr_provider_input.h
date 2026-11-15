@@ -28,24 +28,30 @@
 // frame, so the poses are located at the time the current frame's views were.
 //
 // Frame. Poses are located in the provider's LOCAL reference space (the views' space)
-// and re-expressed RELATIVE TO THE RIG CAMERA in rig units: exactly the frame the
-// XR Hands joints come back in (XR_DXR_view_rig spec >= 4; see hand-tracking.md).
+// and re-expressed RELATIVE TO THE RIG CAMERA: rel = inv(rig pose) o G. By default
+// nothing is scaled: the runtime itself places action spaces in the frame of the rig
+// the latest xrLocateViews chained (runtime input-provider-discovery.md 4b.4 / 4b.4a):
+//   - a glass-registered device (XRT_TRACKING_TYPE_RIG_LOCAL_PHYSICAL, the frame a
+//     stylus provider publishes in) comes back already in rig units, on the glass:
+//     the canvas rebased and carried by the rig's glass mapping (display rig
+//     virtualDisplayHeight / canvas h about the rig pose; camera rig its virtual
+//     screen height on the convergence plane). A tip on the glass is on the pixel it
+//     touches, in a window too. Scaling it again here would scale the pen twice.
+//   - a display-relative device (RIG_LOCAL) comes back at P o (s L): on the rig's
+//     plane P, canvas-relative, METRIC (no rig length scale);
+//   - a stage-anchored device comes back as tracked.
 //
-//   For a display-relative (RIG_LOCAL) source the runtime places a pose at P o (s L)
-//   in LOCAL, where P is the display plane the session's rig puts in LOCAL (runtime
-//   input-provider-discovery.md section 4b.4) and s L is the provider's display-plane
-//   pose read on the canvas, in metres. That is METRIC: the rig's own length scale is
-//   not applied to action spaces, while the views are scaled. This TU therefore takes
-//   rel = inv(P) o G (the canvas-relative metric pose), scales its position by the
-//   rig's metres-to-rig-units factor k and re-places it on the plane, relative to the
-//   rig camera:
+// Opt-in rig gain (DisplayXR_Input_SetRigGain(1) / DISPLAYXR_INPUT_RIG_GAIN=1): for a
+// display-relative device on a runtime that does not register it to the glass, take
+// rel = inv(P) o G, scale it by the hand joints' metres-to-rig-units factor k about the
+// plane and re-place it, relative to the rig camera:
 //     display rig:           plane at the rig camera,
 //                            k = perspectiveFactor * virtualDisplayHeight / canvas h
 //     camera rig, conv > 0:  plane 1/conv in front of the camera (the glass),
 //                            k = (2 tan(vFov/2) / conv) / canvas h
 //     camera rig, conv = 0:  plane nominalViewerZ in front, k = metersToVirtual (1)
-//   This is the mapping the runtime applies to rig-scoped hand joints, so a pen tip
-//   and a fingertip on the same pixel land on the same point.
+//   This is the mapping the runtime applies to rig-scoped hand joints. Never enable
+//   it for a glass-registered stylus.
 // The rig the frame is built from is a snapshot of the one the latest primary view
 // locate chained (dxr_input_on_views_located, graphics thread), never the live
 // tunables, so the poses are in the rig the views were located with.
@@ -83,7 +89,7 @@ extern "C" {
 #define DXR_INPUT_POSE_COUNT 3
 
 //! One located pose, UNITY frame (left-handed, +Z forward), relative to the rig
-//! camera, rig units. flags = XrSpaceLocationFlags (1 orient valid, 2 pos
+//! camera (as located, or with the opt-in rig gain). flags = XrSpaceLocationFlags (1 orient valid, 2 pos
 //! valid, 4 orient tracked, 8 pos tracked); vel_flags = XrSpaceVelocityFlags (1
 //! linear, 2 angular).
 typedef struct DxrInputPose
@@ -200,6 +206,12 @@ DisplayXR_Input_GetHandKind(int hand);
 //! DXR_PROV_HAND_RIG_* of the rig frame the poses are expressed in.
 DISPLAYXR_EXPORT int
 DisplayXR_Input_RigKind(void);
+//! 1 = also apply the rig's metres -> rig units gain about the rig's display
+//! plane (the hand-joint mapping); 0 (default) = poses as located, relative to
+//! the rig camera. Live. DISPLAYXR_INPUT_RIG_GAIN=1 in the environment also turns
+//! it on (read at instance creation).
+DISPLAYXR_EXPORT void
+DisplayXR_Input_SetRigGain(int enabled);
 
 #ifdef __cplusplus
 }

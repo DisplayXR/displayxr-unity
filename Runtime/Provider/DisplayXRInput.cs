@@ -45,8 +45,10 @@ namespace DisplayXR
     /// <see cref="DisplayXRStylusUsages"/>.
     ///
     /// <b>Frame.</b> Poses are relative to the <b>rig camera's transform</b> (the active
-    /// <see cref="DisplayXRDisplay"/> / <see cref="DisplayXRCamera"/>), in rig units — the
-    /// frame the XR Hands joints use, so a pen tip and a fingertip on the same pixel agree.
+    /// <see cref="DisplayXRDisplay"/> / <see cref="DisplayXRCamera"/>), as the runtime
+    /// located them in the frame of the rig the views were located with: a stylus on a
+    /// glass-registered origin comes back in rig units, a tip touching the glass on the
+    /// pixel it touches (see <see cref="ApplyRigGain"/> for metric display-relative devices).
     /// Parent the pen visual under the rig camera, or use <see cref="TryGetWorldPose"/>.
     /// On a display-centric rig the glass is the rig camera's plane (z = 0); on a
     /// camera-centric rig the glass is the convergence plane in front of the camera.
@@ -74,6 +76,30 @@ namespace DisplayXR
         public static bool Enabled { get; set; } = true;
 
         static bool s_NativeMissing;
+        static bool s_ApplyRigGain;
+
+        /// <summary>
+        /// Off (default): poses as the runtime located them, re-expressed relative to the
+        /// rig camera. The runtime already places a glass-registered stylus in the rig
+        /// frame, glass scale included. On: also scale each pose about the rig's display
+        /// plane by the hand-joint gain (display rig <c>perspectiveFactor · virtualDisplayHeight
+        /// / canvas height</c>; camera rig the virtual screen height on the convergence plane
+        /// over the canvas height). Only for a display-relative device the runtime returns
+        /// metric; on a glass-registered stylus it scales the pen twice. Live.
+        /// <c>DISPLAYXR_INPUT_RIG_GAIN=1</c> in the environment also turns it on.
+        /// </summary>
+        public static bool ApplyRigGain
+        {
+            get => s_ApplyRigGain;
+            set
+            {
+                s_ApplyRigGain = value;
+                if (s_NativeMissing) return;
+                try { DisplayXRInputNative.DisplayXR_Input_SetRigGain(value ? 1 : 0); }
+                catch (DllNotFoundException) { s_NativeMissing = true; }
+                catch (EntryPointNotFoundException) { s_NativeMissing = true; }
+            }
+        }
 
         internal static bool IsEnabledByApp() =>
             Enabled && Environment.GetEnvironmentVariable("DISPLAYXR_INPUT") != "0";
@@ -81,7 +107,11 @@ namespace DisplayXR
         internal static void PushEnabledToNative(bool enabled)
         {
             if (s_NativeMissing) return;
-            try { DisplayXRInputNative.DisplayXR_Input_SetEnabled(enabled ? 1 : 0); }
+            try
+            {
+                DisplayXRInputNative.DisplayXR_Input_SetEnabled(enabled ? 1 : 0);
+                DisplayXRInputNative.DisplayXR_Input_SetRigGain(s_ApplyRigGain ? 1 : 0);
+            }
             catch (DllNotFoundException) { s_NativeMissing = true; }
             catch (EntryPointNotFoundException) { s_NativeMissing = true; }
         }
@@ -214,5 +244,8 @@ namespace DisplayXR
 
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern int DisplayXR_Input_RigKind();
+
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void DisplayXR_Input_SetRigGain(int enabled);
     }
 }

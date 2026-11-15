@@ -119,42 +119,43 @@ support is (`com.unity.modules.xr`, `ENABLE_VR`).
 
 ## Where the poses land: the rig-camera frame
 
-Poses are **relative to the rig camera's transform, in rig units** — the frame the XR
-Hands joints use ([hand-tracking.md](hand-tracking.md)), so a pen tip and a fingertip on
-the same pixel agree:
+Poses are **relative to the rig camera's transform**, otherwise exactly as the runtime
+located them. The plugin computes no pen math by default: the runtime places every
+action-space pose in the frame of the rig the latest primary `xrLocateViews` chained
+(runtime `input-provider-discovery.md` §4b.4 and §4b.4a), and the plugin only takes
+`inv(rig pose) ∘ G` and converts to Unity's handedness.
 
-| Active rig | Where the glass is, relative to the rig camera | Metres → rig units |
-|---|---|---|
-| `DisplayXRDisplay` | the camera's plane (z = 0) | `perspectiveFactor · virtualDisplayHeight / canvas height` |
-| `DisplayXRCamera` | the convergence plane, `1 / invConvergenceDistance` in front | `(2 · tan(vFOV/2) / invConvergenceDistance) / canvas height` |
-| `DisplayXRCamera`, `invConvergenceDistance` 0 | `nominalViewerZ` in front | 1 |
-| rig-less camera | the display plane, LOCAL | 1 |
+| Source (how the input provider publishes it) | What comes back |
+|---|---|
+| Glass-registered (`XRT_TRACKING_TYPE_RIG_LOCAL_PHYSICAL`, the frame a stylus provider uses) | already in the rig frame, rig units: the canvas rebased and carried by the rig's **glass** mapping (display rig `virtualDisplayHeight / canvas height` about the rig pose; camera rig its virtual screen height on the convergence plane). A tip touching the glass sits on the pixel it touches, at zero parallax, in a window as well as full screen. |
+| Display-relative (`RIG_LOCAL`: hands-as-controllers, emulated controllers) | on the rig's display plane, canvas-relative, **metric** (no rig length scale) |
+| Stage-anchored | as tracked |
+
+Where the glass is, relative to the rig camera: a `DisplayXRDisplay` rig's own plane
+(z = 0); a `DisplayXRCamera` rig's convergence plane, `1 / invConvergenceDistance` in
+front; a rig-less camera: the display plane in LOCAL.
 
 Parent the pen visual under the rig camera (local pose = device pose), or compose it
 yourself: `DisplayXRInput.TryGetWorldPose` = `rigCamera.TransformPoint(position)`,
 `rigCamera.rotation * rotation` (the camera's scale included, so scale-as-zoom keeps the
 pen on the content). `QueryTrackingOriginMode` reports `Device`; recentring is the app's
-(move the rig).
+(move the rig). The rig used is a snapshot of the descriptor the latest primary
+`xrLocateViews` chained, never the live tunables. `DisplayXRInput.RigKind` says which rig
+that was (`DefaultDisplay` while the boot splash holds the app's rig back - the same
+transient the hands document).
 
-**Why the plugin rescales.** For a display-relative (`RIG_LOCAL`) input source — the
-frame the runtime asks stylus and hand providers to publish in — the runtime locates an
-action space at `P ∘ (s·L)` in the session's LOCAL space: `P` is the display plane the
-session's rig puts in LOCAL (the views' frame), `s·L` the provider's display-plane pose
-read on the canvas, in **metres** (`input-provider-discovery.md` §4b.4). Action spaces
-do not get the rig's length scale; the views do. So the provider takes
-`inv(P) ∘ G` and applies the rig's scale about the plane — the same point mapping the
-runtime applies to rig-scoped hand joints (`XR_DXR_view_rig` spec 4/5). The rig used is
-a snapshot of the descriptor the latest primary `xrLocateViews` chained, never the live
-tunables, so the poses are in the rig the views were located with.
-`DisplayXRInput.RigKind` says which rig that was (`DefaultDisplay` while the boot
-splash holds the app's rig back — the same transient the hands document).
+**Opt-in rig gain.** `DisplayXRInput.ApplyRigGain = true` (live) or
+`DISPLAYXR_INPUT_RIG_GAIN=1` additionally scales each pose about the rig's display plane
+by the gain the XR Hands joints get:
 
-**Physical registration.** In a full-screen session (`canvas = display`) a pen touching
-the glass lands on the glass, on the pixel it touches. In a **window** the runtime
-reads `L` as fractions of the physical display height and applies it to the canvas
-(runtime ADR-034 Amendment 7): the pen keeps its place relative to the *scene*, at the
-window's scale, not to the physical glass under it. That is a runtime rule; this plugin
-re-expresses whatever the runtime returns and does not undo it.
+| Active rig | Plane, relative to the rig camera | Gain |
+|---|---|---|
+| `DisplayXRDisplay` | z = 0 | `perspectiveFactor · virtualDisplayHeight / canvas height` |
+| `DisplayXRCamera` | `1 / invConvergenceDistance` in front | `(2 · tan(vFOV/2) / invConvergenceDistance) / canvas height` |
+| `DisplayXRCamera`, `invConvergenceDistance` 0 | `nominalViewerZ` in front | `metersToVirtual` |
+
+Use it only for a metric display-relative device that should follow the scene like a
+hand. On a glass-registered stylus it scales the pen twice.
 
 ## Component map
 
@@ -214,7 +215,7 @@ Still to do on a box with a stylus provider:
    the marker sits on the pen tip, a stroke drawn on the glass lands at zero parallax
    under the tip; tip/middle pressure, both buttons, double taps, dock and both haptic
    pulses behave as the table says. Repeat under a `DisplayXRCamera` rig and in a
-   window (see *Physical registration* for the expected window behaviour).
+   window: the tip stays on the pixel it touches in both.
 4. Unplug / dock the pen: the device disconnects or goes untracked, no errors; replug:
    it reconnects. Dock/undock the Game view: input resumes without a Play restart.
 5. A project with `DisplayXRInput.Enabled = false`: no `input:` lines after the
@@ -231,3 +232,6 @@ Still to do on a box with a stylus provider:
   `TryGetDeviceStateAtTime`).
 - Camera rigs need a runtime with `XR_DXR_view_rig` ≥ 5 for the glass on the
   convergence plane (as for the hands).
+- Glass registration of a stylus needs a runtime that implements
+  `XRT_TRACKING_TYPE_RIG_LOCAL_PHYSICAL` and a provider that publishes on it; the same
+  runtime is the one that advertises the stylus profile.

@@ -27,8 +27,9 @@ pressure and the dock state.
 
 ## How the pose reaches the scene
 
-The device poses are relative to the **rig camera** in rig units, the same frame the
-XR Hands joints use. `DisplayXRInput.TryGetWorldPose` composes them with the active
+The device poses are relative to the **rig camera**, in the frame the runtime places
+them in for the rig the views were located with (a stylus on the glass lands on the
+pixel it touches). `DisplayXRInput.TryGetWorldPose` composes them with the active
 rig camera's transform. You can also parent a pen model under the rig camera and set
 its `localPosition` / `localRotation` straight from `devicePosition` /
 `deviceRotation` (or a `TrackedPoseDriver` with the *Rotation and Position*, *Local*

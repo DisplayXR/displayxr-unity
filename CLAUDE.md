@@ -145,8 +145,11 @@ build will tell you. One container run catches them all:
   creates one action set, suggests `khr/simple_controller` always and the stylus interaction
   profile (`XR_LOGITECH_mx_ink_stylus_interaction`) only when the runtime advertises it,
   attaches, syncs on the main thread (input `Tick`) and re-expresses each pose relative to the
-  rig camera in rig units (the hands' frame: the runtime returns `RIG_LOCAL` action spaces
-  metric on the rig's plane, the views are scaled). `displayxr_input_provider.cpp` is the
+  rig camera, otherwise **as located**: the runtime already maps action spaces into the frame
+  of the rig the views were located with (a glass-registered stylus, `RIG_LOCAL_PHYSICAL`,
+  comes back in rig units on the glass). Do not re-apply the rig's gain by default - that
+  scales the pen twice; `DisplayXRInput.ApplyRigGain` / `DISPLAYXR_INPUT_RIG_GAIN=1` is the
+  opt-in hand-joint gain for a metric display-relative device. `displayxr_input_provider.cpp` is the
   `IUnityXRInput` side: one `UnityEngine.XR.InputDevice` per bound hand, `"DisplayXR Stylus"` /
   `"DisplayXR Controller"`, haptics via `SendHapticImpulse`. C#: `DisplayXRInput`,
   `DisplayXRStylusUsages`, Input System layouts `DisplayXRStylus` / `DisplayXRController`.
