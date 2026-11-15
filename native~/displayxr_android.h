@@ -60,9 +60,18 @@ int dxr_android_surface_attach(void);
 /// The XrAndroidSurfaceBindingCreateInfoDXR to chain at xrCreateSession (its `next`
 /// set to @p next), waiting up to @p wait_ms for the surface to exist. NULL when
 /// there is none — the session then runs hosted (the runtime's own SurfaceView).
+/// The binding holds its own ANativeWindow reference until dxr_android_on_session
+/// (xrCreateSession succeeded) or dxr_android_surface_binding_release (it failed) drops
+/// it; a second call before either also drops the earlier one (#450).
 const void *dxr_android_surface_binding(const void *next, int wait_ms);
 
-/// After xrCreateSession: resolve the surface-binding entry points and, when the
+/// Drop the binding's window reference without a session: call on the
+/// xrCreateSession failure path, which never reaches dxr_android_on_session. No-op
+/// when the binding holds none.
+void dxr_android_surface_binding_release(void);
+
+/// After xrCreateSession: drop the binding's window reference (bound or not), resolve
+/// the surface-binding entry points and, when the
 /// session was created with the binding (@p bound), re-apply the current surface and
 /// geometry. From here on the UI thread forwards every change to this session.
 void dxr_android_on_session(XrSession session, PFN_xrGetInstanceProcAddr gipa, XrInstance instance,
