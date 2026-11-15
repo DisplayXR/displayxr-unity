@@ -7579,11 +7579,19 @@ int dxr_prov_get_zone_eye_clip(uint32_t zone, uint32_t eye, float *out_far,
 // render the silhouette per-zone into that zone's sub-rect and union the result.
 // Zone 0 = primary (s_ps.views / primary zone rect); zone i>=1 = extra_zones[i-1].
 // ============================================================================
+//
+// dxr_prov_get_zone_count() is a SLOT BOUND, not a count of live zones (#449): callers
+// loop zone = 0..count-1 over slot indices and the per-zone getters below return 0 for a
+// dead slot, so the bound must reach the LAST live extra slot even when a slot below it is
+// dead. (A compacted count, 1 + live extras, left the last live zone unvisited once an
+// earlier slot was hidden: hide slot 0 of two and slot 1 got no click-through mask rect.)
+// "count > 1" still means "at least one extra zone is live".
 uint32_t dxr_prov_get_zone_count(void)
 {
 	uint32_t n = 1; // primary always present
 	for (uint32_t i = 0; i < s_ps.extra_zone_count; i++)
-		if (s_ps.extra_zones[i].valid && s_ps.extra_zones[i].view_count >= 2) n++;
+		if (s_ps.extra_zones[i].valid && s_ps.extra_zones[i].view_count >= 2)
+			n = i + 2; // extra_zones[i] is zone slot i + 1; bound = slot + 1
 	return n;
 }
 

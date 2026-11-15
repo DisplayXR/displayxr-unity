@@ -306,7 +306,10 @@ void dxr_prov_build_projection(const float fov[4], float *out16);
 /// Per-zone stereo matrices + screen rect (#166 — multi-zone transparent mask).
 /// The transparent overlay renders its SetWindowRgn silhouette per-zone into each
 /// zone's rect so ALL zones stay visible (else non-primary zones clip to see-through).
-/// Zone 0 = primary; zone i>=1 = extra zone i-1. Count = 1 + active extra zones.
+/// Zone 0 = primary; zone i>=1 = extra zone i-1. Returns a SLOT BOUND, not a count:
+/// 1 + (index of the last live extra slot + 1), so callers loop 0..count-1 and skip the
+/// slots whose getters return 0 (a dead slot may sit below the bound, #449). count > 1
+/// means at least one extra zone is live.
 DISPLAYXR_EXPORT uint32_t dxr_prov_get_zone_count(void);
 /// Fill 4 column-major float[16] matrices for `zone` (cyclopean L/R view+proj).
 /// Returns 1 on success (zone has >=2 valid views), 0 otherwise. Any out ptr may be NULL.

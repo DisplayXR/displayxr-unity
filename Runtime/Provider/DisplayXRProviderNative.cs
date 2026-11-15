@@ -526,8 +526,10 @@ namespace DisplayXR
         public static extern int dxr_prov_get_zone_eye_clip(
             uint zone, uint eye, out float outFar, out float outEx, out float outEy, out float outEz);
 
-        /// <summary>Number of 3D zones (1 primary + active extra zones). Multi-zone
-        /// transparent mask (#166): the overlay unions a per-zone silhouette.</summary>
+        /// <summary>Zone SLOT bound (#449): 1 + (index of the last live extra slot + 1), so
+        /// loop 0..count-1 and skip slots whose getters return 0 (a dead slot can sit below
+        /// the bound). Greater than 1 means some extra zone is live. Multi-zone transparent
+        /// mask (#166): the overlay unions a per-zone silhouette.</summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern uint dxr_prov_get_zone_count();
 
