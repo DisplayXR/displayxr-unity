@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Controllers and styluses from any DisplayXR input provider, as Unity `InputDevice`s.** The display provider owns the OpenXR session, so until now no Unity app could see a provider's controllers. A new `IUnityXRInput` provider, `"DisplayXR Input"`, rides the display loader: the native side creates one action set on the session, suggests bindings for `/interaction_profiles/khr/simple_controller` and — only when the runtime advertises `XR_LOGITECH_mx_ink_stylus_interaction`, which it then enables — `/interaction_profiles/logitech/mx_ink_stylus_logitech`, attaches it, and syncs it every frame on the main thread. Each hand the runtime binds becomes a device named `DisplayXR Stylus` or `DisplayXR Controller` with standard usages (`devicePosition`/`deviceRotation`, `trigger` = tip force, `grip` = middle cluster force, `primaryButton` / `secondaryButton` = front / back cluster) plus `PointerPosition`/`Rotation` (aim), `TipPosition`/`Rotation`, `TipPressure`, `MiddlePressure`, `PrimaryDoubleTap`, `SecondaryDoubleTap` and `Docked` (`DisplayXRStylusUsages`). `SendHapticImpulse` drives `xrApplyHapticFeedback`. Poses are relative to the rig camera in rig units — the frame the XR Hands joints use — so the pen lines up with the rendered content; `DisplayXRInput.TryGetWorldPose` composes them with the rig camera. Input System layouts `DisplayXRStylus` / `DisplayXRController` type the generated devices. New sample **Stylus Input** (pressure-sensitive strokes, haptics). Opt out with `DisplayXRInput.Enabled = false` or `DISPLAYXR_INPUT=0`, which leaves the session exactly as before. Vendored `IUnityXRInput.h` (Unity XR SDK). See `docs~/architecture/controller-input.md`.
+
 ## [2.36.0] - 2026-11-11
 
 ### Fixed

@@ -21,9 +21,11 @@ namespace DisplayXR
     ///
     /// The native provider (registered from UnityPluginLoad) implements the
     /// subsystem; this loader creates/starts/stops it and owns the lifecycle of the
-    /// per-frame <see cref="DisplayXRProviderDriver"/>. Display-only (no input
-    /// subsystem) — by design (#166): apps render stereo 3D while using normal
-    /// Unity input. Companion subsystems that need the same lifecycle but live in a
+    /// per-frame <see cref="DisplayXRProviderDriver"/>. It also creates the
+    /// "DisplayXR Input" <see cref="XRInputSubsystem"/> next to it (controllers and
+    /// styluses from the runtime's input providers, through the session's own OpenXR
+    /// actions; <see cref="DisplayXRInput"/>), unless the app opts out. Keyboard,
+    /// mouse and touch stay ordinary Unity input. Companion subsystems that need the same lifecycle but live in a
     /// package-gated assembly (the XR Hands subsystem, <c>Runtime/Hands/</c>) attach
     /// through <see cref="DisplayXRCompanionSubsystems"/>, raised at each stage below.
     /// </summary>
@@ -53,9 +55,17 @@ namespace DisplayXR
 #endif
 
         static readonly List<XRDisplaySubsystemDescriptor> s_DisplayDescriptors = new();
+        static readonly List<XRInputSubsystemDescriptor> s_InputDescriptors = new();
 
         /// <summary>The created display subsystem (null until Initialize succeeds).</summary>
         public XRDisplaySubsystem DisplaySubsystem => GetLoadedSubsystem<XRDisplaySubsystem>();
+
+        /// <summary>
+        /// The created input subsystem ("DisplayXR Input": controllers and styluses of any
+        /// DisplayXR input provider as <c>UnityEngine.XR.InputDevice</c>s), or null when
+        /// <see cref="DisplayXRInput.Enabled"/> is off or the descriptor is missing.
+        /// </summary>
+        public XRInputSubsystem InputSubsystem => GetLoadedSubsystem<XRInputSubsystem>();
 
         /// <summary>
         /// True between a successful <see cref="Start"/> and the matching <see cref="Stop"/>
@@ -182,6 +192,17 @@ namespace DisplayXR
                     "UnitySubsystemsManifest.json shipped?");
                 return false;
             }
+            // The input subsystem rides the display one: same native library, same
+            // session (the OpenXR actions are attached to the display provider's session).
+            if (DisplayXRInput.IsEnabledByApp())
+            {
+                CreateSubsystem<XRInputSubsystemDescriptor, XRInputSubsystem>(
+                    s_InputDescriptors, DisplayXRInput.SubsystemId);
+                if (InputSubsystem == null)
+                    Debug.LogWarning("[DisplayXR] Input: '" + DisplayXRInput.SubsystemId +
+                        "' input subsystem not created (UnitySubsystemsManifest.json without an " +
+                        "\"inputs\" entry?) - controllers and styluses stay invisible to Unity");
+            }
             // Companions (XR Hands) are created only once the display subsystem exists —
             // never on the declined paths above, where there is no provider to ride.
             DisplayXRCompanionSubsystems.RaiseInitialized();
@@ -220,7 +241,11 @@ namespace DisplayXR
             // is born at the panel's native resolution (otherwise it freezes at the weave
             // window's creation default and the mirror srcRect over-samples into black).
             DisplayXRProviderDriver.TryPushInitialGameViewRect();
+            // Controllers / styluses: the native action binding reads its switch when the
+            // session's instance is created (GfxStart, after the display subsystem starts).
+            DisplayXRInput.PushEnabledToNative(InputSubsystem != null);
             StartSubsystem<XRDisplaySubsystem>();
+            if (InputSubsystem != null) StartSubsystem<XRInputSubsystem>();
             // GameView weave-to-texture (Task (a), editor + probe): the editor XR game view
             // only displays the XR mirror-blit (IMGUI/overlay UI don't composite into it), so
             // presentation goes through the mirror-blit. Select the RESERVED LeftEye mode
@@ -242,6 +267,7 @@ namespace DisplayXR
             SubsystemRunning = false;
             DisplayXRCompanionSubsystems.RaiseStopped();
             DisplayXRProviderDriver.DestroyInstance();
+            if (InputSubsystem != null) StopSubsystem<XRInputSubsystem>();
             StopSubsystem<XRDisplaySubsystem>();
             return true;
         }
@@ -249,6 +275,7 @@ namespace DisplayXR
         public override bool Deinitialize()
         {
             DisplayXRCompanionSubsystems.RaiseDeinitialized();
+            if (InputSubsystem != null) DestroySubsystem<XRInputSubsystem>();
             DestroySubsystem<XRDisplaySubsystem>();
             return base.Deinitialize();
         }
