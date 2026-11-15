@@ -372,8 +372,12 @@ dxr_android_looper_poll(void)
 //
 // LOCKING. s_surf_mx guards the window, the geometry and the session handle + entry
 // points. The UI thread holds it across its xrSet*/xrSubmit* call so the render
-// thread cannot destroy the session under it; the render thread only takes it to
-// install / clear the handle and never calls into the runtime while holding it.
+// thread cannot destroy the session under it. The render thread takes it to fetch
+// the create-time binding (waiting on s_surf_cv for the first surface), to install the
+// handle — and then, still holding it, makes the authoritative xrSetAndroidSurfaceDXR /
+// xrSetAndroidWindowGeometryDXR re-apply (dxr_android_on_session) — and to clear the
+// handle (dxr_android_on_session_end). It never holds it across xrCreateSession or
+// xrDestroySession: the handle is cleared before the session is destroyed.
 
 static pthread_mutex_t s_surf_mx = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t s_surf_cv = PTHREAD_COND_INITIALIZER;
