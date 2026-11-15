@@ -5575,6 +5575,10 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	sci.next = gfx_binding;
 	sci.systemId = s_ps.system_id;
 	if (XR_FAILED(s_ps.pfn_create_session(s_ps.instance, &sci, &s_ps.session))) {
+#if defined(__ANDROID__)
+		// dxr_android_on_session is never reached: drop the binding's window ref here (#450).
+		dxr_android_surface_binding_release();
+#endif
 		ps_log("[DisplayXR-PROV] xrCreateSession failed\n"); dxr_prov_session_stop(); return 0;
 	}
 #if defined(__ANDROID__)

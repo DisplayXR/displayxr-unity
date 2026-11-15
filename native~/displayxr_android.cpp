@@ -389,6 +389,23 @@ static PFN_xrSubmitAndroidInputEventDXR s_pfn_submit_input = nullptr;
 static int s_surf_attach_requested = 0;
 static unsigned long s_touch_events = 0;
 static XrAndroidSurfaceBindingCreateInfoDXR s_binding;
+// The reference s_binding.nativeWindow holds (#450). s_win is ours to drop whenever Java
+// says the surface died, so a binding that only copied the pointer could reach
+// xrCreateSession after jni_surface_destroyed released the last reference. The binding
+// therefore takes its own (ANativeWindow_acquire) and keeps it until the runtime has
+// taken its own inside xrCreateSession: released by dxr_android_on_session, or by
+// dxr_android_surface_binding_release on a failed xrCreateSession. One release per acquire.
+static ANativeWindow *s_binding_win = nullptr;
+
+// Caller holds s_surf_mx.
+static void
+surf_binding_release_locked(void)
+{
+	if (s_binding_win) {
+		ANativeWindow_release(s_binding_win);
+		s_binding_win = nullptr;
+	}
+}
 
 // Caller holds s_surf_mx and has checked s_surf_session / s_pfn_set_surface.
 static void
@@ -609,18 +626,23 @@ dxr_android_surface_binding(const void *next, int wait_ms)
 			if (pthread_cond_timedwait(&s_surf_cv, &s_surf_mx, &dl) == ETIMEDOUT) break;
 		}
 	}
+	// A binding fetched earlier that never reached a session (no on_session / release
+	// call in between) still holds its reference: drop it before taking a new one.
+	surf_binding_release_locked();
 	const void *out = nullptr;
 	if (s_win) {
+		ANativeWindow_acquire(s_win);
+		s_binding_win = s_win;
 		memset(&s_binding, 0, sizeof(s_binding));
 		s_binding.type = XR_TYPE_ANDROID_SURFACE_BINDING_CREATE_INFO_DXR;
 		s_binding.next = next;
-		s_binding.nativeWindow = (struct ANativeWindow *)s_win;
+		s_binding.nativeWindow = (struct ANativeWindow *)s_binding_win;
 		s_binding.screenOffsetX = s_geom_valid ? s_geom.windowRect.offset.x : 0;
 		s_binding.screenOffsetY = s_geom_valid ? s_geom.windowRect.offset.y : 0;
 		s_binding.transparentBackgroundEnabled = XR_FALSE;
 		out = &s_binding;
 		and_log("[DisplayXR-AND] binding the provider SurfaceView at xrCreateSession: window=%p %dx%d offset=%d,%d",
-		        (void *)s_win, (int)s_win_w, (int)s_win_h, s_binding.screenOffsetX, s_binding.screenOffsetY);
+		        (void *)s_binding_win, (int)s_win_w, (int)s_win_h, s_binding.screenOffsetX, s_binding.screenOffsetY);
 	} else {
 		and_log("[DisplayXR-AND] WARN: provider SurfaceView not created within %d ms — no surface binding, the "
 		        "runtime hosts its own surface",
@@ -640,6 +662,9 @@ dxr_android_on_session(XrSession session, PFN_xrGetInstanceProcAddr gipa, XrInst
 		gipa(instance, "xrSubmitAndroidInputEventDXR", &f3);
 	}
 	pthread_mutex_lock(&s_surf_mx);
+	// xrCreateSession has returned, so the runtime holds its own window reference (or
+	// was never handed one): the binding's reference is done, bound or not (#450).
+	surf_binding_release_locked();
 	s_surf_session = bound ? session : XR_NULL_HANDLE;
 	s_pfn_set_surface = (PFN_xrSetAndroidSurfaceDXR)f1;
 	s_pfn_set_geometry = (PFN_xrSetAndroidWindowGeometryDXR)f2;
@@ -654,6 +679,14 @@ dxr_android_on_session(XrSession session, PFN_xrGetInstanceProcAddr gipa, XrInst
 		if (s_pfn_set_surface) surf_publish_locked("session start");
 		if (s_pfn_set_geometry && s_geom_valid) surf_push_geometry_locked("session start");
 	}
+	pthread_mutex_unlock(&s_surf_mx);
+}
+
+extern "C" void
+dxr_android_surface_binding_release(void)
+{
+	pthread_mutex_lock(&s_surf_mx);
+	surf_binding_release_locked();
 	pthread_mutex_unlock(&s_surf_mx);
 }
 
