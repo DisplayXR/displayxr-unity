@@ -216,7 +216,9 @@ void prov_log(const char *msg)
 // Armed once the session has actually rendered for a while, so the
 // DXR_AVATAR_PRESENT_HZ cap can never interfere with the SYNCHRONIZED -> VISIBLE
 // climb (which needs continuous frame submission — see GfxPopulateNextFrameDesc).
+// Both reset in GfxStop, so every session start re-earns the arm (#451).
 static bool s_cap_armed = false;
+static unsigned s_renderable_ticks = 0;
 
 // Monotonic nanoseconds for the present cap's pacing gate. QPC on Windows for the
 // same reason the twin uses steady_clock: the gate opens a few ms before a vblank
@@ -1298,7 +1300,6 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 	// climb SYNCHRONIZED -> VISIBLE (see above), and a cap that started early would
 	// reproduce the black-tile stall as a perf knob.
 	if (!s_cap_armed) {
-		static unsigned s_renderable_ticks = 0;
 		if (++s_renderable_ticks >= 120) {
 			s_cap_armed = true;
 			prov_log("[DisplayXR-PROV] present-cap armed (session renderable)\n");
@@ -1540,6 +1541,11 @@ GfxStop(UnitySubsystemHandle handle, void *userData)
 		dxr_prov_session_stop();
 		s_session_active = false;
 	}
+	// Per-session pump state (#451): a restarted session must climb SYNCHRONIZED ->
+	// VISIBLE uncapped again, and no frame of the dead session is still in flight.
+	s_frame_in_flight = false;
+	s_cap_armed = false;
+	s_renderable_ticks = 0;
 	prov_log("[DisplayXR-PROV] GfxStop\n");
 	return kUnitySubsystemErrorCodeSuccess;
 }
