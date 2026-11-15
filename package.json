@@ -3,7 +3,7 @@
   "displayName": "DisplayXR",
   "version": "2.36.0",
   "unity": "2022.3",
-  "description": "Unity plugin for DisplayXR OpenXR runtime enabling stereo rendering on 3D light field displays. Provides display-centric and camera-centric stereo rig authoring, Kooima asymmetric frustum projection, 2D UI overlay support, and in-editor preview.",
+  "description": "Unity display provider (IUnityXRDisplay) for the DisplayXR OpenXR runtime: eye-tracked stereo rendering on 3D light field displays. Provides display-centric and camera-centric stereo rigs, runtime-owned Kooima asymmetric frustum projection, 2D/3D display zones and a 2D UI overlay, on BiRP, URP and HDRP. Play Mode runs the provider itself, identical to a built player.",
   "keywords": [
     "xr",
     "openxr",
