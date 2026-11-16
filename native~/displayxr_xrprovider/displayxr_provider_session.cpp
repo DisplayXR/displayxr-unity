@@ -16,6 +16,7 @@
 #include "displayxr_provider_mcp.h" // XR_DXR_mcp_tools: app-registered MCP tools
 #include "displayxr_provider_desktop.h" // XR_DXR_desktop_control: the app's agent operates the desktop
 #include "displayxr_provider_hands.h" // XR_EXT_hand_tracking: 26-joint hands for the XR Hands subsystem
+#include "displayxr_provider_input.h" // OpenXR actions: controllers + styluses as Unity InputDevices
 #include "../displayxr_shared_state.h" // displayxr_state_set_stereo_matrices (overlay hit-test)
 #include "../displayxr_window_space_ui.h" // DXR_WSUI_MAX_SLOTS, get_pending_slot
 #include <atomic>     // s_session_generation (#336)
@@ -368,6 +369,8 @@ typedef struct ProviderSession {
 
 	int has_view_rig;
 	uint32_t view_rig_version; // advertised extensionVersion (>= 4: rig-scoped hand joints, #2189)
+	int has_mx_ink;            // XR_LOGITECH_mx_ink_stylus_interaction advertised
+	int input_mx_ink_enabled;  // ... and enabled on the instance (the app did not opt out of input)
 
 	// Native-Wayland player: the runtime advertises XR_DXR_wayland_surface_binding,
 	// and this session weaves into a sub-surface of the player's own window
@@ -1351,6 +1354,9 @@ static void ps_publish_stereo_matrices(void); // defined after dxr_prov_begin_fr
 // dxr_prov_hand_rig_chain.
 static void ps_hand_rig_record(const void *rig_chain, int app_rig);
 static void ps_hand_rig_reset(void);
+// The rig frame the controllers' action-space poses are re-expressed in
+// (displayxr_provider_input.h); defined after ps_hand_rig_record.
+static void ps_input_publish_rig(const void *rig_chain, float canvas_h_m);
 
 // --- Color-space-aware swapchain format (present-path sRGB gamma fix) ---------
 // A Linear-color-space Unity project renders LINEAR values; correct display needs a final
@@ -4881,6 +4887,8 @@ int dxr_prov_session_start(const char *runtime_json_path,
 							s_ps.cursor_depth_version = props[i].extensionVersion;
 						else if (strcmp(props[i].extensionName, XR_EXT_HAND_TRACKING_EXTENSION_NAME) == 0)
 							s_ps.has_hand_tracking = 1;
+						else if (strcmp(props[i].extensionName, DXR_INPUT_MX_INK_EXTENSION_NAME) == 0)
+							s_ps.has_mx_ink = 1;
 					}
 				}
 				free(props);
@@ -4909,6 +4917,9 @@ int dxr_prov_session_start(const char *runtime_json_path,
 		       s_ps.cursor_depth_version,
 		       s_ps.cursor_depth_version >= 5 ? "yes" : "no",
 		       s_ps.cursor_depth_version >= 7 ? "yes" : "no");
+		ps_log("[DisplayXR-PROV] %s: %s\n", DXR_INPUT_MX_INK_EXTENSION_NAME,
+		       s_ps.has_mx_ink ? "advertised (stylus interaction profile)"
+		                       : "no (controllers bind khr/simple_controller only)");
 		ps_log("[DisplayXR-PROV] XR_EXT_hand_tracking: %s\n",
 		       s_ps.has_hand_tracking ? "advertised (system support checked at xrGetSystemProperties)"
 		                              : "no (XR Hands subsystem stays inactive)");
@@ -4949,7 +4960,7 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	}
 
 	// --- Create instance ---
-	const char *extensions[16]; // worst case today: 13 (Linux + Wayland + every optional ext)
+	const char *extensions[20]; // worst case today: 14 (Linux + Wayland + every optional ext)
 	uint32_t ext_count = 0;
 	extensions[ext_count++] = XR_DXR_DISPLAY_INFO_EXTENSION_NAME;
 #ifdef _WIN32
@@ -5029,6 +5040,13 @@ int dxr_prov_session_start(const char *runtime_json_path,
 		extensions[ext_count++] = XR_DXR_CURSOR_DEPTH_EXTENSION_NAME;
 	else
 		s_ps.cursor_depth_version = 0;
+	// Controllers / styluses (displayxr_provider_input.h): the stylus interaction profile
+	// extension, only when advertised and the app has not opted out.
+	{
+		const uint32_t before = ext_count;
+		ext_count = dxr_input_add_instance_extensions(extensions, ext_count, s_ps.has_mx_ink);
+		s_ps.input_mx_ink_enabled = ext_count > before ? 1 : 0;
+	}
 
 	PFN_xrVoidFunction fn_create = NULL;
 	s_ps.gipa(XR_NULL_HANDLE, "xrCreateInstance", &fn_create);
@@ -5054,6 +5072,7 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	dxr_mcp_on_instance(s_ps.instance, s_ps.gipa, s_ps.has_mcp_tools, ps_log);
 	dxr_desktop_on_instance(s_ps.instance, s_ps.gipa, s_ps.has_desktop_control, ps_log);
 	dxr_hands_on_instance(s_ps.instance, s_ps.gipa, s_ps.has_hand_tracking, ps_log);
+	dxr_input_on_instance(s_ps.instance, s_ps.gipa, s_ps.input_mx_ink_enabled, ps_log);
 
 	// --- System ---
 	XrSystemGetInfo sgi = {XR_TYPE_SYSTEM_GET_INFO};
@@ -5623,6 +5642,8 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	// so they are bound only now, after both exist.
 	ps_hand_rig_reset(); // no view located in this session yet
 	dxr_hands_on_session_created(s_ps.session, s_ps.local_space, s_ps.system_hand_tracking);
+	// Controllers: action spaces in the same LOCAL space, then the one-per-session attach.
+	dxr_input_on_session_created(s_ps.session, s_ps.local_space);
 
 	ps_enumerate_modes();
 
@@ -6106,6 +6127,7 @@ void dxr_prov_session_stop(void)
 	dxr_mcp_on_session_destroying();
 	dxr_desktop_on_session_destroying();
 	dxr_hands_on_session_destroying(); // destroys the trackers under its lock, before the session goes
+	dxr_input_on_session_destroying(); // action spaces + action set, under its lock, before the session goes
 	if (s_ps.session && s_ps.session_ready && s_ps.pfn_end_session) s_ps.pfn_end_session(s_ps.session);
 #if defined(__ANDROID__)
 	dxr_android_on_session_end(); // the UI thread must stop calling into this session first
@@ -6673,6 +6695,11 @@ void dxr_prov_poll_events(void)
 		if (dxr_mcp_handle_event(&ev)) { ev = {XR_TYPE_EVENT_DATA_BUFFER}; continue; }
 		// Desktop-control action results + consent changes: queued for the C# main thread.
 		if (dxr_desktop_handle_event(&ev)) { ev = {XR_TYPE_EVENT_DATA_BUFFER}; continue; }
+		if (ev.type == XR_TYPE_EVENT_DATA_INTERACTION_PROFILE_CHANGED) {
+			dxr_input_on_interaction_profile_changed(); // re-queried on the next input update
+			ev = {XR_TYPE_EVENT_DATA_BUFFER};
+			continue;
+		}
 		if (ev.type == XR_TYPE_EVENT_DATA_SESSION_STATE_CHANGED) {
 			XrEventDataSessionStateChanged *ssc = (XrEventDataSessionStateChanged *)&ev;
 			s_ps.session_state = ssc->state;
@@ -6987,6 +7014,7 @@ int dxr_prov_begin_frame(uint32_t *out_image_index, int *out_should_render)
 	s_ps.predicted_display_time = fs.predictedDisplayTime;
 	s_ps.frame_begun = 1;
 	dxr_hands_on_frame_begun(fs.predictedDisplayTime); // hands locate at the views' time
+	dxr_input_on_frame_begun(fs.predictedDisplayTime); // so do the controllers
 
 	// --- Per-frame render rect. In a 3D-zone frame the swapchain IS zone-sized, so
 	//     render == swapchain (full slice, no sub-rect). Otherwise render =
@@ -7152,6 +7180,10 @@ int dxr_prov_begin_frame(uint32_t *out_image_index, int *out_should_render)
 				               kc.size_meters_w > 0.0f && kc.size_meters_h > 0.0f) ? 1 : 0;
 				displayxr_state_set_kooima_canvas(&kc);
 			}
+			// The rig frame the controllers' poses are re-expressed in: exactly the rig
+			// these views were located with (displayxr_provider_input.h).
+			ps_input_publish_rig(s_ps.camera_centric ? (const void *)&camera_rig : (const void *)&display_rig,
+			                     s_ps.has_view_rig ? raw.canvasSizeMeters.height : 0.0f);
 		}
 	}
 
@@ -8544,6 +8576,53 @@ static void ps_hand_rig_record(const void *rig_chain, int app_rig)
 		s_hand_display_rig.pose = identity;
 		s_hand_rig_kind = app_rig ? DXR_PROV_HAND_RIG_DISPLAY : DXR_PROV_HAND_RIG_DEFAULT_DISPLAY;
 	}
+}
+
+// After each primary view locate (graphics thread): hand the controllers' TU the rig
+// frame those views were located in, from the descriptor actually chained. The TU
+// always re-expresses poses relative to the rig pose; plane + scale are used only by
+// its opt-in rig gain (displayxr_provider_input.h: a glass-registered stylus already
+// comes back in the rig frame). The gain, for a metric display-relative (RIG_LOCAL)
+// device at P o (s L), is the hand joints' mapping (spec 4/5):
+//   display rig: plane at the rig pose,          k = perspectiveFactor * vH / canvas h
+//   camera rig:  plane 1/conv in front (glass),  k = (2 tan(vFov/2) / conv) / canvas h
+//                conv 0: nominalViewerZ in front, k = metersToVirtual
+// Without XR_DXR_view_rig: identity scale at the pushed rig pose (or LOCAL).
+static void ps_input_publish_rig(const void *rig_chain, float canvas_h_m)
+{
+	DxrInputRigFrame f;
+	memset(&f, 0, sizeof(f));
+	f.rig_pose = s_ps.display_pose_set ? s_ps.display_pose : XrPosef{{0, 0, 0, 1}, {0, 0, 0}};
+	f.scale = 1.0f;
+	f.kind = DXR_PROV_HAND_RIG_NONE;
+	float canvas_h = canvas_h_m;
+	if (!(canvas_h > 0.0f) && s_ps.display_info.is_valid) canvas_h = s_ps.display_info.height_m;
+	if (s_ps.has_view_rig && rig_chain != NULL && canvas_h > 0.0f) {
+		if (((const XrBaseInStructure *)rig_chain)->type == XR_TYPE_CAMERA_RIG_DXR) {
+			const XrCameraRigDXR *c = (const XrCameraRigDXR *)rig_chain;
+			f.rig_pose = c->pose;
+			f.kind = DXR_PROV_HAND_RIG_CAMERA;
+			if (c->convergenceDiopters > 0.0f) {
+				const float d = 1.0f / c->convergenceDiopters;
+				const float v = 2.0f * tanf(0.5f * c->verticalFov) * d; // virtual screen height at the glass
+				f.plane_offset = XrVector3f{0.0f, 0.0f, -d};
+				f.scale = v / canvas_h;
+			} else {
+				const float m2v = c->metersToVirtual > 0.0f ? c->metersToVirtual : 1.0f;
+				const float nz = s_ps.display_info.is_valid ? s_ps.display_info.nominal_z : 0.0f;
+				f.plane_offset = XrVector3f{0.0f, 0.0f, -nz * m2v};
+				f.scale = m2v;
+			}
+		} else {
+			const XrDisplayRigDXR *d = (const XrDisplayRigDXR *)rig_chain;
+			f.rig_pose = d->pose;
+			f.kind = s_ps.tunables_set ? DXR_PROV_HAND_RIG_DISPLAY : DXR_PROV_HAND_RIG_DEFAULT_DISPLAY;
+			const float pf = d->perspectiveFactor > 0.0f ? d->perspectiveFactor : 1.0f;
+			f.scale = pf * d->virtualDisplayHeight / canvas_h;
+		}
+		if (!(f.scale > 0.0f) || f.scale != f.scale) f.scale = 1.0f;
+	}
+	dxr_input_on_views_located(&f);
 }
 
 // Returns the chain head (one of the two caller-owned structs) or NULL when the runtime

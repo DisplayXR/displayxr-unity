@@ -217,9 +217,9 @@ hands.
 
 - Joints only. No provider-supplied aim/pinch/grip/poke poses (`canSurfaceCommonPoseData`
   is left at its default) and no velocities; XR Hands' joint-derived helpers still work.
-- No controller input: the runtime's Ultraleap Tier 1 "hand as motion controller"
-  (grip/aim actions, pinch = select) and gamepads need an `IUnityXRInput` provider in this
-  plugin — a separate follow-up issue, deliberately out of this change.
+- Controller-style input (grip/aim actions, pinch = select, styluses) is not part of the
+  hands subsystem: it goes through the plugin's `IUnityXRInput` provider, see
+  [controller-input.md](controller-input.md). Gamepads (`/user/gamepad`) are not bound.
 - Located at the frame's predicted display time only (`time` is exposed on the C ABI but
   the subsystem passes 0 = current frame).
 - Windows-first in practice (the Ultraleap provider is Windows today). The binding compiles

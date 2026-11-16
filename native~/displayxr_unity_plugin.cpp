@@ -37,6 +37,7 @@ extern "C" void dxr_prov_file_log(const char *s); // provider session TU -> logc
 // Custom IUnityXRDisplay Display Provider registration (epic #166, M1).
 // Implemented in displayxr_xrprovider/displayxr_display_provider.cpp.
 extern "C" void displayxr_register_xr_display_provider(IUnityInterfaces *ifaces);
+extern "C" void displayxr_register_xr_input_provider(IUnityInterfaces *ifaces);
 extern "C" void displayxr_unregister_xr_display_provider(void);
 
 #ifdef __APPLE__
@@ -239,6 +240,10 @@ UnityPluginLoad(IUnityInterfaces *unityInterfaces)
 	// DisplayXR display subsystem isn't selected in XR Plug-in Management —
 	// RegisterLifecycleProvider just sits idle until Unity starts it.
 	displayxr_register_xr_display_provider(s_unity_ifaces);
+	// Its companion IUnityXRInput provider ("DisplayXR Input"): controllers and styluses
+	// of any DisplayXR input provider as UnityEngine.XR InputDevices. Idle until the
+	// loader creates + starts the input subsystem.
+	displayxr_register_xr_input_provider(s_unity_ifaces);
 }
 
 extern "C" void UNITY_INTERFACE_EXPORT UNITY_INTERFACE_API

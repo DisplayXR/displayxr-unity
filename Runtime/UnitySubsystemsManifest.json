@@ -2,6 +2,11 @@
   "name": "DisplayXR",
   "version": "1.0.0",
   "libraryName": "displayxr_unity",
+  "inputs": [
+    {
+      "id": "DisplayXR Input"
+    }
+  ],
   "displays": [
     {
       "id": "DisplayXR Display",

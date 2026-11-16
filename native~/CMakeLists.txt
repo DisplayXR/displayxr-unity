@@ -113,6 +113,10 @@ set(SOURCES
     displayxr_xrprovider/displayxr_provider_desktop.cpp
     # XR_EXT_hand_tracking binding: 26-joint hands for the XR Hands subsystem (Runtime/Hands/).
     displayxr_xrprovider/displayxr_provider_hands.cpp
+    # OpenXR actions -> UnityEngine.XR InputDevices (controllers + styluses of any
+    # DisplayXR input provider): the action binding + the IUnityXRInput provider.
+    displayxr_xrprovider/displayxr_provider_input.cpp
+    displayxr_xrprovider/displayxr_input_provider.cpp
     # XR SDK pre-init provider (#247): XRSDKPreInit export, compiled everywhere so
     # the boot.config xrsdk-pre-init-library entry never dangles; VK-only in effect.
     displayxr_xrprovider/displayxr_provider_preinit.cpp
@@ -466,4 +470,11 @@ if(DISPLAYXR_BUILD_TESTS)
     target_compile_features(desktop_test PRIVATE cxx_std_17)
     target_link_libraries(desktop_test PRIVATE Threads::Threads)
     add_test(NAME desktop_control COMMAND desktop_test)
+    # Controller / stylus action binding against a fake runtime (profiles, opt-out,
+    # per-hand state, rig-frame poses, haptics, teardown).
+    add_executable(input_binding_test tests/input_binding_test.cpp displayxr_xrprovider/displayxr_provider_input.cpp)
+    target_include_directories(input_binding_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/displayxr_xrprovider ${OPENXR_INCLUDE_DIR})
+    target_compile_features(input_binding_test PRIVATE cxx_std_17)
+    target_link_libraries(input_binding_test PRIVATE Threads::Threads)
+    add_test(NAME input_binding COMMAND input_binding_test)
 endif()

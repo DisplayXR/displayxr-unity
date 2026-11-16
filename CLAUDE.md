@@ -140,6 +140,21 @@ build will tell you. One container run catches them all:
   Depth/Physics need a rig (locate space == Unity world only via the rig pose). Gate on the
   ADVERTISED spec. Full write-up, the Auto/no-jump argument, and the Windows panel recipe:
   `docs~/architecture/cursor-depth.md`.
+- **Controllers and styluses (`"DisplayXR Input"` `IUnityXRInput` subsystem)**: the provider
+  owns the session, so it also owns the session's OpenXR actions. `displayxr_provider_input.cpp`
+  creates one action set, suggests `khr/simple_controller` always and the stylus interaction
+  profile (`XR_LOGITECH_mx_ink_stylus_interaction`) only when the runtime advertises it,
+  attaches, syncs on the main thread (input `Tick`) and re-expresses each pose relative to the
+  rig camera, otherwise **as located**: the runtime already maps action spaces into the frame
+  of the rig the views were located with (a glass-registered stylus, `RIG_LOCAL_PHYSICAL`,
+  comes back in rig units on the glass). Do not re-apply the rig's gain by default - that
+  scales the pen twice; `DisplayXRInput.ApplyRigGain` / `DISPLAYXR_INPUT_RIG_GAIN=1` is the
+  opt-in hand-joint gain for a metric display-relative device. `displayxr_input_provider.cpp` is the
+  `IUnityXRInput` side: one `UnityEngine.XR.InputDevice` per bound hand, `"DisplayXR Stylus"` /
+  `"DisplayXR Controller"`, haptics via `SendHapticImpulse`. C#: `DisplayXRInput`,
+  `DisplayXRStylusUsages`, Input System layouts `DisplayXRStylus` / `DisplayXRController`.
+  Opt out with `DisplayXRInput.Enabled = false` / `DISPLAYXR_INPUT=0`. Fake-runtime test:
+  `native~/tests/input_binding_test.cpp`. Full write-up: `docs~/architecture/controller-input.md`.
 - **App-registered MCP tools (`XR_DXR_mcp_tools`)**: `DisplayXRMcp.RegisterTool` exposes an
   app's own verbs to AI agents through the runtime's per-app MCP server. The provider pumps
   `xrPollEvent` on the graphics thread (Windows/Linux), so a tool-call event is never handled

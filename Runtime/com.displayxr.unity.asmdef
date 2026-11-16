@@ -22,6 +22,11 @@
       "name": "com.unity.modules.physics",
       "expression": "1.0.0",
       "define": "DISPLAYXR_HAS_PHYSICS"
+    },
+    {
+      "name": "com.unity.modules.xr",
+      "expression": "1.0.0",
+      "define": "DISPLAYXR_INPUT_SYSTEM_XR"
     }
   ],
   "noEngineReferences": false

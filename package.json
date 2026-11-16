@@ -79,6 +79,11 @@
       "path": "Samples~/HandTracking"
     },
     {
+      "displayName": "Stylus Input",
+      "description": "Draws with a stylus or controller from any DisplayXR input provider, read through the standard UnityEngine.XR InputDevice API: a marker on the pen tip, a ray along the aim pose, pressure-sensitive strokes when the tip touches the glass, front button clears, back button pulses the haptics, plus a status line. Shows the rig-camera pose rule (DisplayXRInput.TryGetWorldPose). A stylus appears as \"DisplayXR Stylus\" when the runtime advertises XR_LOGITECH_mx_ink_stylus_interaction; other controllers as \"DisplayXR Controller\" (khr/simple_controller).",
+      "path": "Samples~/StylusInput"
+    },
+    {
       "displayName": "Hand Tracking (URP Ghost Hand)",
       "description": "URP add-on for the Hand Tracking (XR Hands) sample: the Ghost Hand's Universal Render Pipeline shader (a hand-written HLSL port; Apache-2.0, attributed) and material. Import it NEXT TO the Hand Tracking sample in a URP project — DisplayXRGhostHand picks it up automatically. Kept separate so Built-in / HDRP projects never compile a shader whose URP includes they cannot resolve; do not import it into a non-URP project.",
       "path": "Samples~/HandTrackingURP"

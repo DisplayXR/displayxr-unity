@@ -252,6 +252,18 @@ jobs:
             -o /tmp/desktop_test
           /tmp/desktop_test
 
+      # The controller / stylus action binding against a fake runtime: the stylus
+      # profile only with its extension (never the system component), the opt-out,
+      # per-hand kind + state, rig-frame poses (display and camera rig), haptics.
+      - name: Input binding tests
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          c++ -std=c++17 -Wall -pthread -I native~/displayxr_xrprovider \
+            -I native~/build/_deps/openxr_sdk-src/include \
+            native~/tests/input_binding_test.cpp native~/displayxr_xrprovider/displayxr_provider_input.cpp \
+            -o /tmp/input_binding_test
+          /tmp/input_binding_test
+
       - name: Verify output
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |

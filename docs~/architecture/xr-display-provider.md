@@ -235,7 +235,9 @@ driver's lifecycle; `DisplayXRDisplaySettings` (`[XRConfigurationData]`) +
 `Editor/Provider/DisplayXRDisplayPackage` (`IXRPackage`) register it as a
 **Standalone** XR Plug-in Management toggle so Unity ships the loader +
 `UnitySubsystemsManifest.json` automatically — the M1 bootstrap + hand-copy hack
-is gone. Display-only (no input subsystem) by design.
+is gone. Controllers and styluses ride the same loader as a companion `IUnityXRInput`
+subsystem ("DisplayXR Input") over the session's own OpenXR actions — see
+[controller-input.md](controller-input.md).
 
 ## Play Mode runs the provider (#171)
 
