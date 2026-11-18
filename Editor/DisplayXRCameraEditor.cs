@@ -55,19 +55,35 @@ namespace DisplayXR.Editor
                 new GUIContent("Inv. Convergence Distance",
                     "1/meters. 0 = infinity (parallel projection). Higher = screen closer."));
 
-            // Show distance in parenthesis
+            // The same value as a distance (#461): what an author thinks in. Edits the SAME
+            // serialized field (1/m) - nothing new is stored. "infinity" (or an empty
+            // field) = 0 = parallel; distances below the slider's range clamp to its top.
             float invd = m_InvConvergenceDistance.floatValue;
-            EditorGUI.indentLevel++;
-            if (invd > 0.001f)
+            EditorGUI.BeginChangeCheck();
+            string typed = EditorGUILayout.DelayedTextField(
+                new GUIContent("Convergence Distance (m)",
+                    "Distance from the camera to the zero-parallax (screen) plane, in metres. " +
+                    "Type a number, or \"infinity\" for parallel projection. Stored as the " +
+                    "inverse distance above."),
+                DisplayXRAutoConvergenceMath.FormatDistance(invd));
+            if (EditorGUI.EndChangeCheck() &&
+                DisplayXRAutoConvergenceMath.TryParseDistance(typed, out float newInv, 10f))
             {
-                float dist = 1.0f / invd;
-                EditorGUILayout.LabelField(" ", $"({dist:F2} m)");
+                m_InvConvergenceDistance.floatValue = newInv;
             }
-            else
+
+            var autoConv = ((DisplayXRCamera)target).GetComponent<DisplayXRAutoConvergence>();
+            if (autoConv != null && autoConv.isActiveAndEnabled)
             {
-                EditorGUILayout.LabelField(" ", "(\u221E)");
+                EditorGUILayout.HelpBox(
+                    Application.isPlaying
+                        ? "Driven by DisplayXR Auto Convergence while it is enabled (authored value: " +
+                          DisplayXRAutoConvergenceMath.FormatDistance(autoConv.AuthoredInvConvergenceDistance) +
+                          " m). Edits here become the new authored value."
+                        : "DisplayXR Auto Convergence drives this in Play Mode; the value here is the " +
+                          "starting point and what is restored when it is disabled.",
+                    MessageType.None);
             }
-            EditorGUI.indentLevel--;
 
             EditorGUILayout.Space();
             EditorGUILayout.LabelField("Field of View", EditorStyles.boldLabel);

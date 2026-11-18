@@ -438,6 +438,13 @@ namespace DisplayXR
             Gizmos.DrawWireCube(center, size);
             Gizmos.matrix = Matrix4x4.identity;
 
+            // Comfort volume (#461): where content reaches the front / behind disparity
+            // cap either side of the convergence plane. Approximate, authoring aid only.
+            DisplayXRGizmoHelpers.GetComfortCapsDegrees(this, out float capFrontDeg, out float capBehindDeg);
+            DisplayXRGizmoHelpers.DrawCameraComfortVolume(
+                transform, fovDeg, aspect, parallel ? 0f : invConvergenceDistance, ipdFactor,
+                capFrontDeg, capBehindDeg, info, winW_m, cam != null ? cam.farClipPlane : 1000f);
+
             Vector3 cBL = transform.TransformPoint(new Vector3(-hw, -hh, convergenceDist));
             Vector3 cBR = transform.TransformPoint(new Vector3(+hw, -hh, convergenceDist));
             Vector3 cTR = transform.TransformPoint(new Vector3(+hw, +hh, convergenceDist));
