@@ -233,6 +233,63 @@ namespace DisplayXR
         /// <summary>Dock state the current session was bound for (watcher compares against this).</summary>
         public static bool LastAppliedDocked => s_lastAppliedDocked;
 
+        // --- (#459) Pixel-exact Game view: shared state ---------------------------------
+        // How long a Game-view size must hold before the glue pushes it (the #740 resize
+        // debounce); the 1:1 diagnostic and the whole-pixel experiment wait the same time.
+        internal const double GameViewSettleSeconds = 0.35;
+
+        // What the matched path of TryGetGameViewRenderRect last saw: the pane as handed to
+        // DisplayXRGameViewPlacement, Unity's target size in px (fractional for Free Aspect)
+        // and the pane's left border in points. Valid only while s_diagValid.
+        static bool  s_diagValid;
+        static DisplayXRGameViewPlacement.Pane s_diagPane;
+        static float s_diagTargetWPx, s_diagTargetHPx;
+
+        /// <summary>The Game view the glue is bound to (a UnityEditor.GameView), or null.</summary>
+        internal static object MatchedGameView => s_matchedGameView;
+
+        /// <summary>The matched pane's points-to-px as Unity uses it (1.75 at 175 %), measured
+        /// from the pane's own rects, never the global pixelsPerPoint. 0 = not known yet.</summary>
+        internal static float MatchedPaneScale =>
+            s_diagValid ? DisplayXRGameViewPlacement.SnappedScale(s_diagPane.PtToPx) : 0f;
+
+        // WHOLE-PIXEL experiment (#459, env DISPLAYXR_PROV_GV_WHOLEPIXEL=1, off by default).
+        // At 125 / 175 / 225 % a Free Aspect Game view is drawn half a pixel narrower than its
+        // render texture, so a column is dropped and the eyes swap past it. With the switch
+        // on, the editor-side DisplayXRGameViewWholePixel selects, during Play, a temporary
+        // Fixed Resolution size that is a whole number of points AND pixels and snaps the
+        // zoom to 1, and tells the driver which view carries it (WholePixelView). On that
+        // view the driver then (1) skips GVFIT — the size is drawn texel for pixel at zoom 1,
+        // and GVFIT's h / (h - 0.5) stretch would double a row — and (2) places the anchor
+        // as a letterbox with no stretch and the pane's real left border. THE EXPERIMENT
+        // WINS OVER GVFIT on that one view; every other view, and every frame the size is
+        // not selected, keeps GVFIT and the default placement exactly as they were.
+        static int s_wholePixelGate = -1;
+        internal static bool WholePixelEnabled()
+        {
+            if (!ProbeEnabled()) return false;
+            if (s_wholePixelGate < 0)
+                s_wholePixelGate = System.Environment.GetEnvironmentVariable(
+                    "DISPLAYXR_PROV_GV_WHOLEPIXEL") == "1" ? 1 : 0;
+            return s_wholePixelGate == 1;
+        }
+
+        /// <summary>The Game view currently showing the whole-pixel size, or null. Set by the
+        /// editor-side DisplayXRGameViewWholePixel, cleared when it restores the view.</summary>
+        internal static object WholePixelView
+        {
+            get => s_wholePixelView;
+            set { s_wholePixelView = value; if (value == null) s_fitSkipLogged = false; }
+        }
+        static object s_wholePixelView;
+
+        // Two references to the same live UnityEngine.Object (a destroyed one matches nothing).
+        static bool SameLiveObject(object a, object b)
+        {
+            var ua = a as UnityEngine.Object; var ub = b as UnityEngine.Object;
+            return ua != null && ub != null && ua.GetInstanceID() == ub.GetInstanceID();
+        }
+
         // Force the editor Game view to render its mirror RT at FULL (physical) resolution
         // rather than the HiDPI "Low Resolution Aspect Ratios" mode. That toggle (ON by default
         // on a scaled display) makes Unity render the Game view at LOGICAL px (panel_physical /
@@ -548,6 +605,7 @@ namespace DisplayXR
         static FieldInfo s_zoomScaleField, s_zoomTransField;
         static bool   s_zoomFieldsResolved;
         static string s_lastFitLog;
+        static bool   s_fitSkipLogged;   // (#459) "skipped on the whole-pixel view", once per activation
 
         static void ApplyGameViewFit()
         {
@@ -604,6 +662,19 @@ namespace DisplayXR
                         Debug.Log("[DisplayXR] GVFIT zoom fields: scale=" +
                                   (s_zoomScaleField != null ? s_zoomScaleField.Name : "MISSING") +
                                   " trans=" + (s_zoomTransField != null ? s_zoomTransField.Name : "MISSING"));
+                    }
+
+                    // (#459) The view showing the whole-pixel size is drawn texel for pixel at
+                    // zoom 1 (the editor side snapped it): no fit, and none of the overrides.
+                    if (SameLiveObject(w, WholePixelView))
+                    {
+                        if (!s_fitSkipLogged)
+                        {
+                            s_fitSkipLogged = true;
+                            Debug.Log("[DisplayXR] GVFIT skipped on the whole-pixel Game view " +
+                                      "(DISPLAYXR_PROV_GV_WHOLEPIXEL: zoom 1, no row stretch)");
+                        }
+                        continue;
                     }
 
                     string applied = null;
@@ -1119,6 +1190,260 @@ namespace DisplayXR
             return s_rtCentY;
         }
 
+        // (#459) PlayModeView.GetMainPlayModeView(): the Game view Unity treats as the main one.
+        // Null when the API is missing, the main view is not a Game view (e.g. the device
+        // simulator) or there is none; the caller then keeps its heuristic.
+        static MethodInfo s_mainPlayModeViewMethod;
+        static bool s_mainPlayModeViewResolved;
+        static int  s_mainViewLogState;   // 0 unseen, 1 = same as the heuristic, 2 = differs
+        static object TryGetMainPlayModeGameView()
+        {
+            if (!s_mainPlayModeViewResolved)
+            {
+                s_mainPlayModeViewResolved = true;
+                try
+                {
+                    var pmv = System.Type.GetType("UnityEditor.PlayModeView,UnityEditor");
+                    if (pmv != null)
+                        s_mainPlayModeViewMethod = pmv.GetMethod("GetMainPlayModeView",
+                            BindingFlags.Static | BindingFlags.NonPublic | BindingFlags.Public,
+                            null, System.Type.EmptyTypes, null);
+                }
+                catch { }
+                if (s_mainPlayModeViewMethod == null)
+                    Debug.LogWarning("[DisplayXR] GameView glue: PlayModeView.GetMainPlayModeView not found " +
+                                     "(editor internals changed?) - with several Game views open the glue " +
+                                     "falls back to matching by width.");
+            }
+            if (s_mainPlayModeViewMethod == null || s_gvType == null) return null;
+            try
+            {
+                var v = s_mainPlayModeViewMethod.Invoke(null, null) as UnityEngine.Object;
+                return v != null && s_gvType.IsInstanceOfType(v) ? v : null;
+            }
+            catch { return null; }
+        }
+
+        // (#459) The matched pane's left border in points: EditorWindow.position (the border
+        // REMOVED) minus HostView.screenPosition (the border INCLUDED). Both are Unity points
+        // of the same window, so the difference needs no scale and no Win32 call. 1 pt between
+        // two docked views, 0 at the editor window's left edge, maximized and floating.
+        static bool TryGetMatchedLeftBorderPt(Rect host, out float borderPt)
+        {
+            borderPt = 0f;
+            if (s_matchedGameView == null) return false;
+            try
+            {
+                if (s_posProp == null)
+                    for (var t = s_matchedGameView.GetType(); t != null && s_posProp == null; t = t.BaseType)
+                        s_posProp = t.GetProperty("position",
+                            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                if (s_posProp == null) return false;
+                var pos = (Rect)s_posProp.GetValue(s_matchedGameView, null);
+                float b = pos.x - host.x;
+                if (!(b >= -0.01f && b <= 4f)) return false;   // not a border: implausible reading
+                borderPt = Mathf.Max(0f, b);
+                return true;
+            }
+            catch { return false; }
+        }
+
+        // (#459) IS THE GAME VIEW DRAWN 1:1? One log line each time the numbers settle, and one
+        // WARN per kind of mismatch per session. Changes nothing. Three things must all hold
+        // for the woven image to reach the panel texel for pixel:
+        //   W, H    Unity draws the render texture into a rect of the texture's own size. The
+        //           rect is Unity's target size (px, fractional for Free Aspect) x the zoom
+        //           area's scale = targetInView x the pane's scale; computed from the target
+        //           and the zoom because targetInView goes through
+        //           EditorGUIUtility.pixelsPerPoint, which is only valid inside OnGUI. The raw
+        //           targetInView / viewInWindow points are logged next to it.
+        //   canvas  the size the glue drives the woven canvas to equals the texture's: the
+        //           native mirror blit stretches the canvas over the whole texture with a
+        //           LINEAR sampler, so one pixel of difference resamples every column.
+        // DrawnPx / IsOneToOne / LinesDroppedOrDoubled / BorderPx are pure
+        // (DisplayXRGameViewPlacement, unit-tested).
+        struct OneToOneKey
+        {
+            public int RtW, RtH, CanvasW, CanvasH, AnchorDx, AnchorDy;
+            public float TargetW, TargetH, ZoomX, ZoomY, Scale, BorderPt;
+            public bool WholePixel, HaveZoom;
+            public bool Same(in OneToOneKey o) =>
+                RtW == o.RtW && RtH == o.RtH && CanvasW == o.CanvasW && CanvasH == o.CanvasH
+                && AnchorDx == o.AnchorDx && AnchorDy == o.AnchorDy
+                && TargetW == o.TargetW && TargetH == o.TargetH && ZoomX == o.ZoomX && ZoomY == o.ZoomY
+                && Scale == o.Scale && BorderPt == o.BorderPt && WholePixel == o.WholePixel && HaveZoom == o.HaveZoom;
+        }
+        static OneToOneKey s_o2oPend, s_o2oLogged;
+        static bool   s_o2oHavePend, s_o2oHaveLogged;
+        static double s_o2oPendSince;
+        static bool   s_o2oWarnedW, s_o2oWarnedH, s_o2oWarnedCanvas, s_o2oWarnedDpi, s_o2oWarnedUnavailable;
+        static PropertyInfo s_targetInViewProp, s_viewInWindowProp;
+        static bool   s_o2oRectPropsResolved;
+
+        // GetDpiForWindow answers in the WINDOW's own DPI awareness context, not the calling
+        // thread's: the DPI of the monitor it is on for a per-monitor-aware window (Unity's
+        // editor windows), the system DPI for a system-aware one, 96 for an unaware one. It
+        // is a scale, not a coordinate; it is only LOGGED next to the measured pane scale as
+        // a cross-check and never enters any arithmetic with a rect.
+        [DllImport("user32.dll")] static extern uint GetDpiForWindow(System.IntPtr hWnd);
+
+        static RenderTexture FirstGameViewRt(object view)
+        {
+            if (s_rtFields == null)
+            {
+                s_rtFields = new System.Collections.Generic.List<FieldInfo>();
+                var rtFlags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+                for (var t = s_gvType; t != null; t = t.BaseType)
+                    foreach (var fi in t.GetFields(rtFlags | BindingFlags.DeclaredOnly))
+                        if (fi.FieldType == typeof(RenderTexture)) s_rtFields.Add(fi);
+            }
+            // The same pick as ApplyGameViewFit: the first live RenderTexture field.
+            foreach (var rfi in s_rtFields)
+                if (rfi.GetValue(view) is RenderTexture r && r != null) return r;
+            return null;
+        }
+
+        // canvasW/H: the size TryGetGameViewRenderRect returned (what the glue drives the
+        // woven canvas to once it settles); anchorX/Y: the anchor it returned, before the
+        // phase nudge. All physical px of the pane's monitor, like s_panePhysWin.
+        static void LogGameViewOneToOneOnChange(int anchorX, int anchorY, int canvasW, int canvasH)
+        {
+            if (!s_diagValid || s_matchedGameView == null || s_gvType == null) return;
+            try
+            {
+                var rt = FirstGameViewRt(s_matchedGameView);
+                if (rt == null || rt.width <= 1 || rt.height <= 1) return;
+                var key = new OneToOneKey
+                {
+                    RtW = rt.width, RtH = rt.height, CanvasW = canvasW, CanvasH = canvasH,
+                    AnchorDx = anchorX - s_diagPane.Left, AnchorDy = anchorY - s_diagPane.Top,
+                    TargetW = s_diagTargetWPx, TargetH = s_diagTargetHPx, ZoomX = 1f, ZoomY = 1f,
+                    Scale = DisplayXRGameViewPlacement.SnappedScale(s_diagPane.PtToPx),
+                    BorderPt = s_diagPane.HaveLeftBorder ? s_diagPane.LeftBorderPt : -1f,
+                    WholePixel = s_diagPane.WholePixelFixedSize,
+                };
+                if (s_zoomAreaField != null && s_zoomScaleField != null)
+                {
+                    var za = s_zoomAreaField.GetValue(s_matchedGameView);
+                    if (za != null)
+                    {
+                        var sc = (Vector2)s_zoomScaleField.GetValue(za);
+                        key.ZoomX = sc.x; key.ZoomY = sc.y; key.HaveZoom = true;
+                    }
+                }
+
+                // Settle: the same hold as the size push, so a splitter drag logs once.
+                double now = Time.realtimeSinceStartupAsDouble;
+                if (!s_o2oHavePend || !key.Same(s_o2oPend))
+                {
+                    s_o2oPend = key; s_o2oHavePend = true; s_o2oPendSince = now;
+                    return;
+                }
+                if (now - s_o2oPendSince < GameViewSettleSeconds) return;
+                if (s_o2oHaveLogged && key.Same(s_o2oLogged)) return;
+                s_o2oLogged = key; s_o2oHaveLogged = true;
+
+                double drawnW = DisplayXRGameViewPlacement.DrawnPx(key.TargetW, key.ZoomX);
+                double drawnH = DisplayXRGameViewPlacement.DrawnPx(key.TargetH, key.ZoomY);
+                int lostW = DisplayXRGameViewPlacement.LinesDroppedOrDoubled(drawnW, key.RtW);
+                int lostH = DisplayXRGameViewPlacement.LinesDroppedOrDoubled(drawnH, key.RtH);
+                bool canvasOk = canvasW == key.RtW && canvasH == key.RtH;
+                var inv = System.Globalization.CultureInfo.InvariantCulture;
+                string Axis(double drawn, int rtPx, int lost) =>
+                    drawn.ToString("F2", inv) + " px for a " + rtPx + " px texture (" +
+                    (lost == 0 ? "1:1" : (lost < 0 ? "up to " + (-lost) + " dropped" : "up to " + lost + " doubled")) + ")";
+
+                var sb = new System.Text.StringBuilder(384);
+                sb.Append("W drawn ").Append(Axis(drawnW, key.RtW, lostW));
+                sb.Append(", H drawn ").Append(Axis(drawnH, key.RtH, lostH));
+                sb.Append(" | target=").Append(key.TargetW.ToString("R", inv)).Append('x').Append(key.TargetH.ToString("R", inv));
+                sb.Append(" px zoom=").Append(key.HaveZoom
+                    ? "(" + key.ZoomX.ToString("R", inv) + "," + key.ZoomY.ToString("R", inv) + ")" : "? (assumed 1)");
+                sb.Append(" scale=").Append(key.Scale.ToString("R", inv));
+                uint dpi = 0;
+                if (Application.platform == RuntimePlatform.WindowsEditor && s_hwndCorrHwnd != System.IntPtr.Zero)
+                {
+                    try { dpi = GetDpiForWindow(s_hwndCorrHwnd); } catch { /* pre-1607 Windows */ }
+                }
+                if (dpi != 0) sb.Append(" (pane dpi ").Append(dpi).Append(" = ").Append((dpi / 96f).ToString("R", inv)).Append(')');
+                sb.Append(" canvas=").Append(canvasW).Append('x').Append(canvasH)
+                  .Append(canvasOk ? " (= texture)" : " (NOT the texture's size)");
+                if (key.BorderPt >= 0f)
+                    sb.Append(" | left border ").Append(key.BorderPt.ToString("0.###", inv)).Append(" pt = +")
+                      .Append(DisplayXRGameViewPlacement.BorderPx(key.BorderPt, key.Scale)).Append(" px");
+                sb.Append(" | anchor at pane +").Append(key.AnchorDx).Append(",+").Append(key.AnchorDy);
+                if (!s_o2oRectPropsResolved)
+                {
+                    s_o2oRectPropsResolved = true;
+                    var flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+                    for (var t = s_gvType; t != null; t = t.BaseType)
+                    {
+                        if (s_targetInViewProp == null) s_targetInViewProp = t.GetProperty("targetInView", flags | BindingFlags.DeclaredOnly);
+                        if (s_viewInWindowProp == null) s_viewInWindowProp = t.GetProperty("viewInWindow", flags | BindingFlags.DeclaredOnly);
+                    }
+                }
+                try
+                {
+                    if (s_targetInViewProp != null && s_targetInViewProp.GetValue(s_matchedGameView, null) is Rect tiv)
+                        sb.Append(" | targetInView=(").Append(tiv.x.ToString("F3", inv)).Append(',').Append(tiv.y.ToString("F3", inv))
+                          .Append(' ').Append(tiv.width.ToString("F3", inv)).Append('x').Append(tiv.height.ToString("F3", inv)).Append(")pt");
+                    if (s_viewInWindowProp != null && s_viewInWindowProp.GetValue(s_matchedGameView, null) is Rect viw)
+                        sb.Append(" viewInWindow=(").Append(viw.width.ToString("F3", inv)).Append('x').Append(viw.height.ToString("F3", inv)).Append(")pt");
+                }
+                catch { /* raw rects are a courtesy; the verdict above does not use them */ }
+                if (key.WholePixel) sb.Append(" [whole-pixel size]");
+                // Undocked = PRESENT mode: the runtime presents its own window over the pane, so
+                // how Unity draws the texture underneath is not what reaches the panel.
+                if (!s_lastAppliedDocked) sb.Append(" [present mode: covered by the weave window, no warning]");
+                Debug.Log("[DisplayXR] GameView 1:1: " + sb);
+                if (!s_lastAppliedDocked) return;
+
+                const string kDoc = " See docs~/architecture/editor-game-view-placement.md.";
+                string pct = (key.Scale * 100f).ToString("0.#", inv) + " %";
+                if (lostW != 0 && !s_o2oWarnedW)
+                {
+                    s_o2oWarnedW = true;
+                    Debug.LogWarning("[DisplayXR] Game view is not drawn 1:1 horizontally: its " + key.RtW +
+                        " px wide texture is drawn " + drawnW.ToString("F2", inv) + " px wide at " + pct +
+                        ", so columns will be dropped/doubled and the image past them sits a pixel off " +
+                        "(on a lenticular panel: the eyes swap there). A Windows scale of 100/150/200/250/300 % " +
+                        "avoids it; DISPLAYXR_PROV_GV_WHOLEPIXEL=1 is the experimental fix." + kDoc);
+                }
+                if (lostH != 0 && !s_o2oWarnedH)
+                {
+                    s_o2oWarnedH = true;
+                    Debug.LogWarning("[DisplayXR] Game view is not drawn 1:1 vertically: its " + key.RtH +
+                        " px high texture is drawn " + drawnH.ToString("F2", inv) + " px high at " + pct +
+                        (key.WholePixel ? "" : " (with the GVFIT row stretch, exact only for a x.5 px area)") +
+                        ", so rows will be dropped/doubled and the image past them sits a row off " +
+                        "(through a slanted lens that moves the interlace phase)." + kDoc);
+                }
+                if (!canvasOk && !s_o2oWarnedCanvas)
+                {
+                    s_o2oWarnedCanvas = true;
+                    Debug.LogWarning("[DisplayXR] Game view is not drawn 1:1: the woven canvas is driven to " +
+                        canvasW + "x" + canvasH + " but the Game view's texture is " + key.RtW + "x" + key.RtH +
+                        "; the mirror blit resamples one into the other (linear), which blurs the interlace " +
+                        "across the whole view." + kDoc);
+                }
+                if (dpi != 0 && Mathf.Abs(dpi / 96f - key.Scale) > 0.011f && !s_o2oWarnedDpi)
+                {
+                    s_o2oWarnedDpi = true;
+                    Debug.LogWarning("[DisplayXR] GameView glue: the pane's measured scale (" +
+                        key.Scale.ToString("R", inv) + ") is not its window DPI (" + dpi + " = " +
+                        (dpi / 96f).ToString("R", inv) + "); the placement uses the measured one." + kDoc);
+                }
+            }
+            catch (System.Exception e)
+            {
+                if (!s_o2oWarnedUnavailable)
+                {
+                    s_o2oWarnedUnavailable = true;
+                    Debug.LogWarning("[DisplayXR] GameView 1:1 check unavailable (editor internals changed?): " + e.Message);
+                }
+            }
+        }
+
         // Compute the visible Game view's RENDER-area rect in physical px. SIZE comes from
         // Unity's own GetMainGameViewTargetSize() (the render-target pixel size it uses to
         // allocate the main Game view — one stable value, no instance juggling). POSITION
@@ -1132,6 +1457,7 @@ namespace DisplayXR
                                              out string dbg)
         {
             px = py = pw = ph = 0; dbg = null;
+            s_diagValid = false;   // (#459) set again by the matched path below
             if (s_gvType == null)
             {
                 s_gvType = System.Type.GetType("UnityEditor.GameView,UnityEditor");
@@ -1201,6 +1527,37 @@ namespace DisplayXR
                     }
                 }
             if (!haveHost) { host = fallbackHost; haveHost = bestArea >= 0f; matchedWin = fallbackWin; }
+            // (#459) Prefer the view Unity itself calls the main play-mode view: it is the one
+            // GetMainPlayModeViewTargetSize (the size above) describes, and the one Screen and
+            // input refer to. The width heuristic above stays as the fallback (API missing, the
+            // main view is not a Game view, or it has no host yet). With a single Game view
+            // both pick that view, so the result is unchanged; with several, the heuristic
+            // compared host POINTS with a size that is px once Low Resolution is off, i.e. it
+            // picked the widest view rather than the main one.
+            if (wins != null && s_screenPosProp != null)
+            {
+                object mainView = TryGetMainPlayModeGameView();
+                if (mainView != null)
+                {
+                    try
+                    {
+                        var mpr = s_parentField.GetValue(mainView);
+                        if (mpr != null)
+                        {
+                            bool differs = !SameLiveObject(mainView, matchedWin);
+                            host = (Rect)s_screenPosProp.GetValue(mpr, null);
+                            haveHost = true; matchedWin = mainView;
+                            int state = differs ? 2 : 1;
+                            if (state != s_mainViewLogState && (differs || s_mainViewLogState == 2))
+                                Debug.Log("[DisplayXR] GameView glue: bound to the main play-mode view" +
+                                          (differs ? " (the width heuristic picked another of " + wins.Length + " Game views)"
+                                                   : " (the width heuristic agrees again)"));
+                            s_mainViewLogState = state;
+                        }
+                    }
+                    catch { /* keep the heuristic's pick */ }
+                }
+            }
             if (haveHost) s_matchedGameView = matchedWin;   // dock-state detection reads this (#740)
 
             // Compose the PHYSICAL render rect. GetMainGameViewTargetSize returns the render
@@ -1367,6 +1724,15 @@ namespace DisplayXR
                             PtToPx = ptToPx,
                             RoundsBottomEdge = SystemInfo.graphicsUVStartsAtTop,
                         };
+                        // (#459) The pane's real left border, for the 1:1 diagnostic; the
+                        // placement reads it (and drops the GVFIT stretch) only on the view
+                        // that shows the opt-in whole-pixel size.
+                        pane.HaveLeftBorder = TryGetMatchedLeftBorderPt(host, out pane.LeftBorderPt);
+                        pane.WholePixelFixedSize = SameLiveObject(s_matchedGameView, WholePixelView);
+                        s_diagPane = pane;
+                        s_diagTargetWPx = size.x * sizeScale;
+                        s_diagTargetHPx = size.y * sizeScale;
+                        s_diagValid = true;
                         bool chromeSlackOnly = DisplayXRGameViewPlacement.IsChromeSlackOnly(pane);
                         if ((chromeSlackOnly ? 1 : 0) != s_lastChromeSlackOnly)
                         {
@@ -1821,6 +2187,9 @@ namespace DisplayXR
                 Debug.Log($"[DisplayXR] GameView glue size change: {dbg}");
             }
             LogDockBorderOnChange(s_cachedPpp > 0 ? s_cachedPpp : 1f, px, py, pw, ph); // #740
+            // (#459) Is the Game view drawn texel for pixel? Log-only; before the nudge so the
+            // logged anchor is the computed one.
+            LogGameViewOneToOneOnChange(px, py, pw, ph);
             // (#740) Docked phase calibration: shift the invisible child anchor's X — phase
             // moves, content doesn't (see UpdatePhaseNudge).
             UpdatePhaseNudge();
@@ -1841,7 +2210,7 @@ namespace DisplayXR
             if (s_freezeSizeGate < 0)
                 s_freezeSizeGate = System.Environment.GetEnvironmentVariable(
                     "DISPLAYXR_PROV_FREEZE_SIZE") == "1" ? 1 : 0;
-            const double kResizeSettleSeconds = 0.35;
+            const double kResizeSettleSeconds = GameViewSettleSeconds;
             if (m_PushedW == int.MinValue)
             {
                 m_PushedW = pw; m_PushedH = ph; // first frame: adopt (session-start size)
