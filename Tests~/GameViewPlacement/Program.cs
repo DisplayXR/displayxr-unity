@@ -136,6 +136,276 @@ static class Program
         Check(pw == rtW && ph == rtH, $"{g.Name}: anchor size {pw}x{ph} == RT {rtW}x{rtH}");
     }
 
+    // ==== (#459) Is the Game view drawn 1:1, and the whole-point-and-pixel size ====
+    // NOTHING BELOW IS A HARDWARE PIN. Two kinds of check, kept apart:
+    //   WholePixelDefinitions()  unit tests of exact arithmetic (steps, sizes, line counts).
+    //   ModelConsistency()       the plug-in's MODEL of Unity checked against itself and against
+    //                            numbers reported from another plug-in's 175 % screen captures. Those
+    //                            captures give pixels on screen, not Unity's inputs, so the panes and
+    //                            targets fed in here are reconstructed with this suite's own chrome
+    //                            constants (1 pt side borders, 24 pt tab, 21 pt toolbar, 2 pt bottom
+    //                            border): agreement shows the model is self-consistent, not that it
+    //                            is right. docs~/architecture/editor-game-view-placement.md lists
+    //                            what a hardware session has to confirm.
+    // The texture size Unity allocates is its target rounded half AWAY FROM ZERO
+    // (PlayModeView.RenderView in the 6000.4 editor assembly): UnityRt() below.
+    static int UnityRt(double targetPx) => (int)Math.Round(targetPx, MidpointRounding.AwayFromZero);
+    // What the glue computes today: Mathf.RoundToInt, i.e. halves to even.
+    static int GlueRt(double targetPx) => (int)Math.Round(targetPx, MidpointRounding.ToEven);
+
+    static void WholePixelDefinitions()
+    {
+        // The step: the smallest number of points that is EXACTLY a whole number of pixels.
+        foreach (var (scale, q, px) in new[]
+        {
+            (1f, 1, 1), (1.25f, 4, 5), (1.5f, 2, 3), (1.75f, 4, 7), (2f, 1, 2), (2.25f, 4, 9), (2.5f, 2, 5), (3f, 1, 3),
+            (3.0000003f, 1, 3), (1.7499999f, 4, 7), (1.4999998f, 2, 3),   // measured scales (pane px / host pt)
+            (1.1f, 10, 11), (1.2f, 5, 6),
+            // Custom Windows scales a loose tolerance got wrong (3 pt at 133 % is 3.99 px, 7 pt at
+            // 143 % is 10.01 px, 3 pt at 167 % is 5.01 px; 199 / 201 / 299 / 301 % are not whole scales).
+            (1.33f, 100, 133), (1.43f, 100, 143), (1.67f, 100, 167),
+            (1.99f, 100, 199), (2.01f, 100, 201), (2.99f, 100, 299), (3.01f, 100, 301),
+            (1.3333f, 0, 0), (0f, 0, 0), (9f, 0, 0),                      // not a whole percent / implausible
+        })
+        {
+            int got = DisplayXRGameViewPlacement.WholePixelStepPt(scale);
+            Check(got == q, $"WholePixelStepPt({scale:R}) == {q} (got {got})");
+            if (q > 0)
+                Check(q * (int)Math.Round(scale * 100.0) == px * 100, $"{q} pt at {scale:R} is exactly {px} px");
+        }
+        // ...for every whole percent: a true whole number of pixels, and no smaller step is one.
+        {
+            int bad = 0; string first = null;
+            for (int pct = 51; pct <= 799; pct++)
+            {
+                int q = DisplayXRGameViewPlacement.WholePixelStepPt(pct / 100f);
+                bool ok = q >= 1 && q <= DisplayXRGameViewPlacement.WholePixelMaxStepPt && q * pct % 100 == 0;
+                for (int smaller = 1; ok && smaller < q; smaller++)
+                    if (smaller * pct % 100 == 0) ok = false;
+                if (!ok) { bad++; first ??= $"{pct} % -> {q}"; }
+            }
+            Check(bad == 0, $"WholePixelStepPt is the smallest exact step at every whole percent 51-799 ({bad} are not; {first})");
+        }
+
+        // The size: the largest multiple of the step that fits the view area.
+        foreach (var (scale, vw, vh, wPt, hPt, wPx, hPx) in new[]
+        {
+            (1.75f, 443.9f,    647.5f,    440, 644,  770, 1127),
+            (1.75f, 450f,      653f,      448, 652,  784, 1141),
+            (1.75f, 1099.143f, 631.4286f, 1096, 628, 1918, 1099),
+            (1.5f,  1469.333f, 719.6667f, 1468, 718, 2202, 1077),
+            (1.25f, 982f,      407.4f,    980, 404, 1225,  505),
+            (2.25f, 801.7f,    400f,      800, 400, 1800,  900),
+            (2.5f,  691.2f,    343.8f,    690, 342, 1725,  855),
+            (1.75f, 440f,      644f,      440, 644,  770, 1127),   // an exact fit keeps it all
+            (1.7499999f, 443.9f, 647.5f,  440, 644,  770, 1127),   // measured-scale noise
+            (1.1f,  1005f,     603f,      1000, 600, 1100,  660),
+            (1.33f, 1050f,     699f,      1000, 600, 1330,  798),  // 100 pt steps: a wide margin, but exact
+        })
+        {
+            bool ok = DisplayXRGameViewPlacement.WholePixelSize(vw, vh, scale, out int a, out int b, out int c, out int d);
+            Check(ok && a == wPt && b == hPt && c == wPx && d == hPx,
+                  $"WholePixelSize({vw}x{vh} pt at {scale:R}) == {wPt}x{hPt} pt = {wPx}x{hPx} px (got {ok} {a}x{b} {c}x{d})");
+        }
+        foreach (float scale in new[] { 1f, 2f, 3f, 1.3333f, 0f })
+            Check(!DisplayXRGameViewPlacement.WholePixelSize(1000f, 600f, scale, out _, out _, out int zw, out int zh) && zw == 0 && zh == 0,
+                  $"WholePixelSize at {scale:R}: nothing to select (a whole scale, or not a whole percent)");
+        Check(!DisplayXRGameViewPlacement.WholePixelSize(3f, 600f, 1.75f, out _, out _, out _, out _), "an area narrower than one step has no size");
+        Check(!DisplayXRGameViewPlacement.WholePixelSize(99f, 600f, 1.33f, out _, out _, out _, out _), "133 %: an area under 100 pt has no size");
+        // ...for every area a sweep tries: whole points, exactly whole pixels, a margin under one step.
+        {
+            int bad = 0; string first = null;
+            foreach (int pct in new[] { 110, 125, 133, 150, 175, 225, 250 })
+            {
+                float scale = pct / 100f;
+                int q = DisplayXRGameViewPlacement.WholePixelStepPt(scale);
+                for (int pw = 400; pw <= 2400; pw += 7)
+                    for (int ph = 300; ph <= 1250; ph += 13)
+                    {
+                        float vw = pw / scale - 2f, vh = ph / scale - 47f;   // a docked pane's area
+                        bool fits = vw + 0.001f * q >= q && vh + 0.001f * q >= q;
+                        bool got = DisplayXRGameViewPlacement.WholePixelSize(vw, vh, scale, out int wPt, out int hPt, out int wPx, out int hPx);
+                        if (!fits) { if (got) { bad++; first ??= $"{pct} %: a size for {vw}x{vh}"; } continue; }
+                        bool ok = got && wPt % q == 0 && hPt % q == 0 && wPt <= vw + 0.01f * q && hPt <= vh + 0.01f * q
+                                  && vw - wPt < q && vh - hPt < q
+                                  && wPt * pct == wPx * 100 && hPt * pct == hPx * 100;
+                        if (!ok) { bad++; first ??= $"{pct} %: {vw}x{vh} pt -> {wPt}x{hPt} pt = {wPx}x{hPx} px"; }
+                    }
+            }
+            Check(bad == 0, $"whole-pixel sizes at 110-250 % are whole points and exactly whole pixels within one step of the area ({bad} are not; {first})");
+        }
+
+        // Line counts.
+        Check(DisplayXRGameViewPlacement.LinesDroppedOrDoubled(878.4, 880) == -2 && DisplayXRGameViewPlacement.LinesDroppedOrDoubled(881.0, 880) == 1
+              && DisplayXRGameViewPlacement.LinesDroppedOrDoubled(879.5, 880) == -1 && DisplayXRGameViewPlacement.LinesDroppedOrDoubled(880.25, 880) == 1
+              && DisplayXRGameViewPlacement.LinesDroppedOrDoubled(880.01, 880) == 0 && DisplayXRGameViewPlacement.LinesDroppedOrDoubled(880, 0) == 0,
+              "LinesDroppedOrDoubled counts whole lines (any sub-pixel mismatch is up to one) and ignores float noise");
+        Check(DisplayXRGameViewPlacement.IsOneToOne(880.01, 880) && !DisplayXRGameViewPlacement.IsOneToOne(880.25, 880)
+              && !DisplayXRGameViewPlacement.IsOneToOne(879.5, 880) && !DisplayXRGameViewPlacement.IsOneToOne(880, 0),
+              "IsOneToOne: a quarter pixel is a mismatch, float noise is not");
+        Check(DisplayXRGameViewPlacement.LinesShown(1501.5, 879.5) == 879 && DisplayXRGameViewPlacement.LinesShown(1508.5, 770) == 770
+              && DisplayXRGameViewPlacement.LinesShown(366.0, 880.5) == 881,
+              "LinesShown: each edge on the next whole pixel at or after it");
+
+        // A pane border in px (half up; x.25 rounds DOWN here).
+        foreach (var (pt, scale, want) in new[] { (1f, 2.5f, 3), (1f, 3f, 3), (1f, 2f, 2), (1f, 1.5f, 2), (1f, 1.75f, 2), (1f, 1.25f, 1), (1f, 1f, 1), (0f, 2.5f, 0), (0f, 1.75f, 0) })
+            Check(DisplayXRGameViewPlacement.BorderPx(pt, scale) == want, $"BorderPx({pt} pt at {scale:R}) == {want}");
+    }
+
+    static void ModelConsistency()
+    {
+        // ---- F1 / F2, predicted: a docked Free Aspect pane at every scale. 2 pt of side borders, 47 pt
+        // of chrome above and below, a whole-pixel pane, the texture = UnityRt(area). ----
+        // dW: drawn - texture columns at zoom 1; dFit: drawn - texture rows under GVFIT (h / (h - 0.5));
+        // dRaw: the same at zoom 1.
+        foreach (var (scale, dW, dFit, dRaw) in new[]
+        {
+            (1f,    0.0,  0.5,  0.0),
+            (1.25f, -0.5, 0.75, 0.25),
+            (1.5f,  0.0,  0.0,  -0.5),
+            (1.75f, -0.5, 0.25, -0.25),
+            (2f,    0.0,  0.5,  0.0),
+            (2.25f, -0.5, 0.75, 0.25),
+            (2.5f,  0.0,  0.0,  -0.5),
+            (3f,    0.0,  0.5,  0.0),
+        })
+        {
+            int bad = 0, n = 0; string first = null;
+            for (int pw = 900; pw <= 2400; pw += 7)
+                for (int ph = 700; ph <= 1250; ph += 13)
+                {
+                    double tw = pw - 2.0 * scale, th = ph - 47.0 * scale;   // Unity's target = the area, px
+                    int rtW = UnityRt(tw), rtH = UnityRt(th);
+                    double w = DisplayXRGameViewPlacement.DrawnPx(tw, 1.0) - rtW;
+                    double fit = DisplayXRGameViewPlacement.DrawnPx(th, rtH / (rtH - 0.5)) - rtH;
+                    double raw = DisplayXRGameViewPlacement.DrawnPx(th, 1.0) - rtH;
+                    n++;
+                    // GVFIT's stretch is not exactly +0.5: (h + f) * h / (h - 0.5) - h, within 1e-3 here.
+                    bool ok = Math.Abs(w - dW) < 1e-9 && Math.Abs(fit - dFit) < 2e-3 && Math.Abs(raw - dRaw) < 1e-9
+                              && DisplayXRGameViewPlacement.IsOneToOne(tw, rtW) == (dW == 0.0)
+                              && DisplayXRGameViewPlacement.IsOneToOne(th * rtH / (rtH - 0.5), rtH) == (dFit == 0.0)
+                              && DisplayXRGameViewPlacement.IsOneToOne(th, rtH) == (dRaw == 0.0);
+                    if (!ok) { bad++; first ??= $"{pw}x{ph}: {w:F3} {fit:F3} {raw:F3}"; }
+                }
+            Check(bad == 0, $"MODEL {scale * 100} % docked Free Aspect: columns {dW:+0.##;-0.##;0}, rows under GVFIT {dFit:+0.##;-0.##;0}, rows at zoom 1 {dRaw:+0.##;-0.##;0} px vs the texture ({bad} of {n} panes differ; {first})");
+        }
+
+        // ---- F4, predicted: the glue's Mathf.RoundToInt (halves to even) against Unity's texture
+        // (halves away from zero). They differ exactly where the area ends on x.5 with an even floor:
+        // about every other pane height at 150 % and 250 %, never at the other scales' heights. ----
+        foreach (var (scale, want) in new[] { (1f, 0), (1.25f, 0), (1.5f, 275), (1.75f, 0), (2f, 0), (2.5f, 276), (3f, 0) })
+        {
+            int differ = 0, n = 0;
+            for (int ph = 700; ph <= 1250; ph++) { n++; double th = ph - 47.0 * scale; if (GlueRt(th) != UnityRt(th)) differ++; }
+            Check(differ == want, $"MODEL {scale * 100} %: glue rows != Unity's texture rows at {differ} of {n} pane heights (want {want})");
+        }
+        // ...and in the columns at 125 / 175 / 225 % (2 pt of borders = x.5 px).
+        foreach (var (scale, some) in new[] { (1.25f, true), (1.5f, false), (1.75f, true), (2.25f, true), (2.5f, false) })
+        {
+            int differ = 0;
+            for (int pw = 900; pw <= 2400; pw++) { double tw = pw - 2.0 * scale; if (GlueRt(tw) != UnityRt(tw)) differ++; }
+            Check((differ > 0) == some, $"MODEL {scale * 100} %: glue columns != Unity's texture columns at {differ} pane widths");
+        }
+        // The hardware-verified 250 % dev pane (#421) is not one of them: 859.5 -> 860 both ways, and
+        // drawn 1:1 on both axes with its logged zoom (1, 860 / 859.5). The diagnostic is silent there.
+        {
+            float zoomY = 860f / (860f - 0.5f);
+            double dw = DisplayXRGameViewPlacement.DrawnPx(1728f, 1f), dh = DisplayXRGameViewPlacement.DrawnPx(859.5f, zoomY);
+            Check(GlueRt(859.5) == 860 && UnityRt(859.5) == 860 && GlueRt(860.5) == 860 && UnityRt(860.5) == 861,
+                  "250 %: 859.5 rounds to 860 both ways; 860.5 is 860 for the glue, 861 for Unity");
+            Check(DisplayXRGameViewPlacement.IsOneToOne(dw, 1728) && DisplayXRGameViewPlacement.IsOneToOne(dh, 860),
+                  $"250 % dev pane: drawn {dw}x{dh} for 1728x860 is 1:1");
+        }
+
+        // ---- F3, predicted: a pane docked at the editor window's left or right edge has ONE side
+        // border. The Free Aspect anchor is pane left + CentringX(slack); the texture starts at the
+        // real left border. 250 %: slack is always 2. 300 %: always 3. ----
+        foreach (var (scale, slackWant, anchor, leftEdgeTexture, rightEdgeTexture) in new[] { (2.5f, 2, 1, 0, 3), (3f, 3, 2, 0, 3) })
+        {
+            int bad = 0;
+            for (int pw = 900; pw <= 2400; pw++)
+            {
+                int slack = pw - UnityRt(pw - 1.0 * scale);   // one 1 pt border
+                if (slack != slackWant || DisplayXRGameViewPlacement.CentringX(slack) != anchor) bad++;
+            }
+            Check(bad == 0 && DisplayXRGameViewPlacement.BorderPx(0f, scale) == leftEdgeTexture && DisplayXRGameViewPlacement.BorderPx(1f, scale) == rightEdgeTexture,
+                  $"MODEL {scale * 100} % edge-docked: anchor +{anchor}; texture at +{leftEdgeTexture} (far left: nudge {leftEdgeTexture - anchor}) or +{rightEdgeTexture} (far right: nudge +{rightEdgeTexture - anchor})");
+        }
+
+        // ---- F5: the code is inconsistent at a quarter pixel. X (BorderPx, LetterboxOffsets) rounds
+        // x.25 DOWN; Y (RtRow0Y) and LinesShown take the next pixel UP. ----
+        Check(DisplayXRGameViewPlacement.BorderPx(1f, 1.25f) == 1 && DisplayXRGameViewPlacement.LinesShown(0.0, 1.25) == 2,
+              "x.25: BorderPx rounds 1.25 px down to 1, LinesShown's edge rule takes it up to 2");
+
+        // ---- The 175 % numbers reported from another plug-in's captures, RECONSTRUCTED inputs ----
+        // Reported: an 880 px wide Free Aspect image drawn 879 px wide (column 440 missing); a 1924 px
+        // render area in a 1927 px docked pane. Reconstruction: the area is 880 - 0.5 = 879.5 px (the
+        // model's x.5 at 175 %), from edge 1501.5.
+        Check(DisplayXRGameViewPlacement.LinesDroppedOrDoubled(DisplayXRGameViewPlacement.DrawnPx(879.5, 1.0), 880) == -1
+              && DisplayXRGameViewPlacement.LinesShown(1501.5, 879.5) == 879,
+              "MODEL 175 %: an 879.5 px area for an 880 px texture -> one column dropped, 879 shown (reported: 879)");
+        Check(UnityRt(1927 - 2 * 1.75) == 1924 && !DisplayXRGameViewPlacement.IsOneToOne(1927 - 2 * 1.75, 1924),
+              "MODEL 175 %: a 1927 px pane has a 1923.5 px area and a 1924 px texture (reported: 1924 in 1927), not 1:1");
+        // Under GVFIT a whole-pixel Fixed Resolution would be stretched: why that view skips GVFIT.
+        Check(DisplayXRGameViewPlacement.LinesDroppedOrDoubled(DisplayXRGameViewPlacement.DrawnPx(1127, 1127.0 / 1126.5), 1127) == 1,
+              "MODEL 175 %: 1127 rows under the GVFIT stretch are drawn 1127.5 px high (one doubled)");
+
+        // Reported: a 770x1127 px Fixed Resolution (440x644 pt) at zoom 1 had its first column at 1509
+        // and rows 223..1349. The pane below is NOT measured: it is derived backwards from those
+        // numbers with this suite's chrome constants (1 pt border + 5 pt centring -> left 1498, 452 pt
+        // wide; 7.875 px below the image above a 2 pt border -> top 137, 700 pt high). So this checks
+        // only that Place() inverts that derivation, i.e. that the whole-pixel path uses the same
+        // rules as the rest of the model (Unity's whole-point rounding, no GVFIT stretch).
+        var wp = new DisplayXRGameViewPlacement.Pane
+        {
+            Left = 1498, Top = 137, ClientW = 791, ClientH = 1225,
+            ToolbarPx = DisplayXRGameViewPlacement.ToolbarPx(700f, 653f, 791 / 452f),
+            RtW = 770, RtH = 1127, TargetHPx = 1127f, DockedNonMaximized = true, HaveDrawRect = true,
+            HostWPt = 452f, DrawWPt = 450f, DrawHPt = 653f, HostHPt = 700f, PtToPx = 791 / 452f, RoundsBottomEdge = true,
+            WholePixelFixedSize = true, HaveLeftBorder = true, LeftBorderPt = 1f,
+        };
+        DisplayXRGameViewPlacement.Place(wp, 0, 0, out int wx, out int wy, out int ww, out int wh);
+        Check(wx == 1509 && wy == 223 && ww == 770 && wh == 1127,
+              $"MODEL 175 % whole-pixel 770x1127 (reconstructed pane): anchor ({wx},{wy} {ww}x{wh}) == (1509,223 770x1127)");
+        // The same pane with the GVFIT stretch left in the bottom-edge rounding lands two rows lower:
+        // the stretch must be out of the arithmetic when it is out of the view.
+        var wpDefault = wp; wpDefault.WholePixelFixedSize = false;
+        DisplayXRGameViewPlacement.Place(wpDefault, 0, 0, out _, out int dy, out _, out _);
+        Check(dy == 225, $"MODEL 175 % 770x1127 with the GVFIT stretch modelled: y {dy} == 225");
+
+        // A whole-pixel size within the dock's chrome slack is still a letterbox (Unity's whole-point
+        // X), never the #740 pixel centring: 1929 px pane, area 1100.29 pt -> 1100 pt = 1925 px.
+        var thinWp = new DisplayXRGameViewPlacement.Pane
+        {
+            Left = 100, Top = 137, ClientW = 1929, ClientH = 1225,
+            ToolbarPx = DisplayXRGameViewPlacement.ToolbarPx(700f, 653f, 1.75f),
+            RtW = 1925, RtH = 1141, TargetHPx = 1141f, DockedNonMaximized = true, HaveDrawRect = true,
+            HostWPt = 1929 / 1.75f, DrawWPt = 1929 / 1.75f - 2f, DrawHPt = 653f, HostHPt = 700f, PtToPx = 1.75f, RoundsBottomEdge = true,
+        };
+        Check(DisplayXRGameViewPlacement.IsChromeSlackOnly(thinWp), "MODEL a 4 px slack Fixed Resolution is chrome slack by default");
+        thinWp.WholePixelFixedSize = true; thinWp.HaveLeftBorder = true; thinWp.LeftBorderPt = 1f;
+        Check(!DisplayXRGameViewPlacement.IsChromeSlackOnly(thinWp), "MODEL ...and a letterbox as the whole-pixel view");
+        DisplayXRGameViewPlacement.Place(thinWp, 99, 99, out int tx, out _, out int tw2, out int th2);
+        Check(tx == 102 && tw2 == 1925 && th2 == 1141, $"MODEL ...at pane + 1 pt (1.75 px -> column +2): x {tx} == 102, {tw2}x{th2}");
+
+        // Whole-pixel view docked at the editor window's LEFT edge: no left border, only the right
+        // one, so host - draw = 1 pt. With the real border (0) the image starts 1 pt in (centring) =
+        // column +2; assuming two equal half-point borders puts it at +3.
+        var farLeft = new DisplayXRGameViewPlacement.Pane
+        {
+            Left = 0, Top = 137, ClientW = 790, ClientH = 1225,
+            ToolbarPx = DisplayXRGameViewPlacement.ToolbarPx(700f, 653f, 1.75f),
+            RtW = 784, RtH = 1141, TargetHPx = 1141f, DockedNonMaximized = true, HaveDrawRect = true,
+            HostWPt = 790 / 1.75f, DrawWPt = 790 / 1.75f - 1f, DrawHPt = 653f, HostHPt = 700f, PtToPx = 1.75f, RoundsBottomEdge = true,
+            WholePixelFixedSize = true, HaveLeftBorder = true, LeftBorderPt = 0f,
+        };
+        DisplayXRGameViewPlacement.Place(farLeft, 0, 0, out int flx, out _, out _, out _);
+        Check(flx == 2, $"MODEL 175 % whole-pixel far-left pane with its real border (0 pt): x {flx} == 2");
+        farLeft.HaveLeftBorder = false;
+        DisplayXRGameViewPlacement.Place(farLeft, 0, 0, out int flx2, out _, out _, out _);
+        Check(flx2 == 3, $"MODEL ...and with the border unknown (two equal borders assumed): x {flx2} == 3");
+    }
+
     static void Main()
     {
         // ---- HARDWARE 2026-10-27: DS1 3840x2160, Unity 6000.4.6f1, the pane as logged at the capture
@@ -352,6 +622,9 @@ static class Program
             if (name.StartsWith("250%")) g.T = 293;
             Pinned(g, ex, ey, rtW, rtH);
         }
+
+        WholePixelDefinitions();
+        ModelConsistency();
 
         Console.WriteLine($"GameViewPlacement: {s_pass} passed, {s_fail} failed");
         Environment.Exit(s_fail == 0 ? 0 : 1);

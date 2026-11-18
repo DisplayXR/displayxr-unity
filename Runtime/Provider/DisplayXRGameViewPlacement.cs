@@ -98,6 +98,14 @@ namespace DisplayXR
             public float HostHPt;                   // HostView.screenPosition height, points
             public float PtToPx;
             public bool RoundsBottomEdge;           // SystemInfo.graphicsUVStartsAtTop
+            // (#459) Opt-in whole-pixel experiment only; all false / 0 = the placement above,
+            // unchanged. WholePixelFixedSize: the view shows the plug-in's Fixed Resolution
+            // size at zoom 1 with GVFIT off, so it is always a letterbox (never chrome slack)
+            // and its rows are not stretched. LeftBorderPt (valid when HaveLeftBorder): the
+            // pane's real left border, EditorWindow.position.x - HostView.screenPosition.x.
+            public bool WholePixelFixedSize;
+            public bool HaveLeftBorder;
+            public float LeftBorderPt;
         }
 
         /// <summary>True when the docked anchor's Y comes from <see cref="RtRow0Y"/>: a docked,
@@ -125,7 +133,8 @@ namespace DisplayXR
             double s = SnapScale(p.PtToPx);
             double targetHPt = (p.TargetHPx > 0f ? p.TargetHPx : p.RtH) / s;
             double topPt = p.HostHPt - p.DrawHPt - DockBottomBorderPt;  // tab strip + toolbar
-            double stretch = p.RtH / (p.RtH - 0.5);                      // GVFIT scale.y
+            double stretch = p.WholePixelFixedSize ? 1.0                 // (#459) zoom 1, GVFIT off
+                                                   : p.RtH / (p.RtH - 0.5); // GVFIT scale.y
             double bottomPt = Math.Round((p.DrawHPt + targetHPt * stretch) * 0.5);
             double bottomPx = p.Top + (topPt + bottomPt) * s;
             return (int)Math.Ceiling(bottomPx - 1e-3) - p.RtH;
@@ -146,7 +155,7 @@ namespace DisplayXR
         public static bool IsChromeSlackOnly(in Pane p)
         {
             int areaH = p.ClientH - p.ToolbarPx;
-            return p.DockedNonMaximized && p.RtW > 0 && p.RtH > 0
+            return !p.WholePixelFixedSize && p.DockedNonMaximized && p.RtW > 0 && p.RtH > 0
                 && p.ClientW - p.RtW >= 0 && p.ClientW - p.RtW <= SideChromeSlackMaxPx(p.PtToPx)
                 && areaH - p.RtH >= -RoundingSlackMaxPx && areaH - p.RtH <= RoundingSlackMaxPx;
         }
@@ -190,7 +199,8 @@ namespace DisplayXR
             int offY = (h - fitH) / 2;
             if (p.HaveDrawRect && p.PtToPx > 0.5f && p.PtToPx < 8f)
                 LetterboxOffsets(p.HostWPt, p.DrawWPt, p.DrawHPt, fitW, fitH, p.PtToPx, p.RoundsBottomEdge,
-                                 ref offX, ref offY);
+                                 ref offX, ref offY,
+                                 p.WholePixelFixedSize && p.HaveLeftBorder ? p.LeftBorderPt : -1f);
             x += offX;
             y += offY;
             w = fitW;
@@ -219,9 +229,13 @@ namespace DisplayXR
         /// untouched when the inputs are implausible.
         /// </summary>
         public static void LetterboxOffsets(float hostWPt, float drawWPt, float drawHPt, int fitW, int fitH,
-                                            float ptToPx, bool roundsBottomEdge, ref int offX, ref int offY)
+                                            float ptToPx, bool roundsBottomEdge, ref int offX, ref int offY,
+                                            float leftBorderPt = -1f)
         {
-            float side = (hostWPt - drawWPt) * 0.5f;
+            // (#459) leftBorderPt >= 0: the pane's real left border (whole-pixel experiment);
+            // otherwise the two side borders are assumed equal, which a pane docked at the
+            // editor window's left or right edge is not (it has one border, not two).
+            float side = leftBorderPt >= 0f ? leftBorderPt : (hostWPt - drawWPt) * 0.5f;
             if (!(side >= 0f && side <= 4f) || !(drawHPt > 1f)) return;
             ptToPx = SnapScale(ptToPx);
             float rtWPt = fitW / ptToPx, rtHPt = fitH / ptToPx;
@@ -232,6 +246,125 @@ namespace DisplayXR
                                          : Round((drawHPt - rtHPt) * 0.5f);
             float fullPt = roundsBottomEdge ? Round(drawHPt) - drawHPt : 0f;
             offY = FloorToInt((yPt - fullPt) * ptToPx + 0.5f);
+        }
+
+        // ---- (#459) Is the Game view drawn 1:1, and the whole-point-and-pixel size ----
+        // The weave is only right if every texel of the Game view's render texture lands on
+        // exactly one panel pixel. Unity draws the texture into targetInView, whose size in
+        // px is its TARGET size (fractional for Free Aspect: the area) times the zoom area's
+        // scale, with point filtering; the texture's own size is whole px. Where the two
+        // differ, a column (row) is dropped or doubled and everything past it sits one pixel
+        // off, which on a lenticular panel is the other eye.
+        // Unity allocates the texture as its target rounded half AWAY FROM ZERO
+        // (PlayModeView.RenderView, read from the 6000.4 editor assembly), so for a docked
+        // Free Aspect view (2 pt of side borders, 47 pt of chrome above and below):
+        //   Windows scale   area W   area H   texture vs area     rows drawn under GVFIT
+        //   100 200 300 %   whole    whole    equal               h + 0.5
+        //   150 250 %       whole    x.5      H 0.5 taller        h (exact)
+        //   175 %           x.5      x.75     W 0.5, H 0.25 over  h + 0.25
+        //   125 225 %       x.5      x.25     W 0.5 over, H 0.25 under   h + 0.75
+        // GVFIT stretches Y by h / (h - 0.5): exact for the half row of 150 / 250 % and nothing
+        // else. These are arithmetic; points x scale in float can land a hair below x.5 and
+        // round the other way, which is why the driver's diagnostic reads the REAL texture.
+        // See docs~/architecture/editor-game-view-placement.md.
+
+        /// <summary>A drawn size within this of the texture size counts as equal: the smallest
+        /// real mismatch is a quarter pixel (125 %), float noise is ~1e-3.</summary>
+        public const double OneToOneTolPx = 0.05;
+
+        /// <summary>The largest step (points) <see cref="WholePixelStepPt"/> can return: at a
+        /// whole-percent scale 100 points are always a whole number of pixels.</summary>
+        public const int WholePixelMaxStepPt = 100;
+
+        /// <summary>The pane's scale as Unity uses it: the measured px / pt snapped to a whole
+        /// percent (see SnapScale).</summary>
+        public static float SnappedScale(float ptToPx) => SnapScale(ptToPx);
+
+        /// <summary>The size, in px, of the rect Unity draws the render texture into along one
+        /// axis: the target size in px (GetMainPlayModeViewTargetSize, fractional for Free
+        /// Aspect) times the zoom area's scale on that axis. Equal to targetInView's size times
+        /// the pane's scale, without depending on EditorGUIUtility.pixelsPerPoint, which is
+        /// only valid inside OnGUI.</summary>
+        public static double DrawnPx(double targetPx, double zoomScale) => targetPx * zoomScale;
+
+        /// <summary>True when a texture <paramref name="rtPx"/> wide (high) is drawn into a rect
+        /// of the same size, i.e. texel for pixel.</summary>
+        public static bool IsOneToOne(double drawnPx, int rtPx) =>
+            rtPx > 0 && Math.Abs(drawnPx - rtPx) < OneToOneTolPx;
+
+        /// <summary>How many columns (rows) the mismatch costs at most: negative = dropped (the
+        /// rect is smaller than the texture), positive = doubled, 0 = drawn 1:1. Whether a
+        /// sub-pixel mismatch really costs one depends on where the rect's edge falls
+        /// (<see cref="LinesShown"/>).</summary>
+        public static int LinesDroppedOrDoubled(double drawnPx, int rtPx)
+        {
+            double d = drawnPx - rtPx;
+            if (rtPx <= 0 || Math.Abs(d) < OneToOneTolPx) return 0;
+            int n = (int)Math.Ceiling(Math.Abs(d) - OneToOneTolPx);
+            return d < 0 ? -n : n;
+        }
+
+        /// <summary>How many device columns (rows) a drawn rect covers when it starts at the
+        /// fractional pixel <paramref name="edgePx"/>: each edge lands on the next whole pixel
+        /// at or after it (the rule a 175 % screen capture showed for the first column: edge
+        /// 1501.5 -> column 1502, 1326.75 -> 1327, and the one <see cref="RtRow0Y"/> uses for the
+        /// last row). An 879.5 px rect from 1501.5 covers 879 columns of an 880 px texture.</summary>
+        public static int LinesShown(double edgePx, double drawnPx) =>
+            (int)Math.Ceiling(edgePx + drawnPx - 1e-3) - (int)Math.Ceiling(edgePx - 1e-3);
+
+        /// <summary>A pane border of <paramref name="borderPt"/> points in whole px, with the
+        /// half-up rule of <see cref="LetterboxOffsets"/> (1 pt at 250 % = 2.5 px -> 3, the
+        /// measured #740 value). The quarter-pixel case (x.25 at 125 % / 175 %) is unmeasured,
+        /// and this rounds it DOWN while <see cref="RtRow0Y"/> and <see cref="LinesShown"/> take
+        /// the next pixel UP: X and Y disagree there by construction.</summary>
+        public static int BorderPx(float borderPt, float ptToPx) =>
+            FloorToInt(borderPt * SnapScale(ptToPx) + 0.5f);
+
+        // The pane's scale as a whole percent (175 for 1.75), or 0 when it is not one (the
+        // measured px / pt is within 0.1 % of a whole percent on any real pane) or implausible.
+        static int ScalePercent(float ptToPx)
+        {
+            double pct = (double)ptToPx * 100.0;
+            int whole = (int)Math.Round(pct);
+            if (!(pct > 50.0 && pct < 800.0) || Math.Abs(pct - whole) > 0.1) return 0;
+            return whole;
+        }
+
+        static int Gcd(int a, int b) { while (b != 0) { int t = a % b; a = b; b = t; } return a; }
+
+        /// <summary>The smallest number of points that is EXACTLY a whole number of pixels at
+        /// this scale: 100 / gcd(percent, 100). 1 at 100 / 200 / 300 %, 2 at 150 % (3 px) and
+        /// 250 % (5 px), 4 at 125 % (5 px), 175 % (7 px) and 225 % (9 px), 10 at 110 %, 100 at
+        /// a custom 133 % (3 pt would be 3.99 px: not whole). Integer arithmetic on the whole
+        /// percent, no tolerance. 0 when the scale is not a whole percent or is implausible.</summary>
+        public static int WholePixelStepPt(float ptToPx)
+        {
+            int pct = ScalePercent(ptToPx);
+            return pct == 0 ? 0 : 100 / Gcd(pct, 100);
+        }
+
+        /// <summary>
+        /// The largest Game-view size that fits a view area of <paramref name="viewWPt"/> x
+        /// <paramref name="viewHPt"/> points (GameView.viewInWindow) and is a whole number of
+        /// points AND of pixels on both axes: a multiple of <see cref="WholePixelStepPt"/>. A
+        /// Fixed Resolution of that size at zoom 1 is drawn texel for pixel (measured at 175 %:
+        /// 770x1127 px = 440x644 pt, every column on screen); it leaves a margin of less than
+        /// one step. False when the scale needs no such size (a whole scale: step 1), is not a
+        /// whole percent (step 0), or the area is smaller than one step.
+        /// </summary>
+        public static bool WholePixelSize(float viewWPt, float viewHPt, float ptToPx,
+                                          out int wPt, out int hPt, out int wPx, out int hPx)
+        {
+            wPt = hPt = wPx = hPx = 0;
+            int q = WholePixelStepPt(ptToPx);
+            if (q <= 1) return false;
+            int pct = ScalePercent(ptToPx);
+            wPt = (int)Math.Floor(viewWPt / q + 0.001) * q;
+            hPt = (int)Math.Floor(viewHPt / q + 0.001) * q;
+            if (wPt <= 0 || hPt <= 0) { wPt = hPt = 0; return false; }
+            wPx = wPt * pct / 100;   // exact: wPt is a multiple of the step
+            hPx = hPt * pct / 100;
+            return true;
         }
     }
 }
