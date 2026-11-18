@@ -424,9 +424,10 @@ namespace DisplayXR
 
             // Comfort volume (#461): where content reaches the front / behind disparity
             // cap either side of the virtual display. Approximate, authoring aid only.
-            DisplayXRGizmoHelpers.GetComfortCapsDegrees(this, out float capFrontDeg, out float capBehindDeg);
-            DisplayXRGizmoHelpers.DrawDisplayComfortVolume(
-                transform, w, h, ipdFactor, capFrontDeg, capBehindDeg, info, windowMode ? winH_m : 0f);
+            // Drawn only when the DisplayXR > Gizmos > Comfort Volume toggle (off by default) is on.
+            if (DisplayXRGizmoHelpers.GetComfortCapsDegrees(this, out float capFrontDeg, out float capBehindDeg))
+                DisplayXRGizmoHelpers.DrawDisplayComfortVolume(
+                    transform, w, h, ipdFactor, capFrontDeg, capBehindDeg, info, windowMode ? winH_m : 0f);
 
             float hw = w * 0.5f;
             float hh = h * 0.5f;

@@ -84,6 +84,9 @@ namespace DisplayXR.Editor
             if (!m_DriveStrength.boolValue)
                 EditorGUILayout.HelpBox("Drive Stereo Strength is off: the caps only shape the dead band and the " +
                                         "Scene-view comfort volume; the rig's IPD Factor is left alone.", MessageType.None);
+            else
+                EditorGUILayout.HelpBox("While this runs, the rig's IPD Factor field holds the DELIVERED value. " +
+                                        "Code that saves stereo settings should read AuthoredIpdFactor here.", MessageType.None);
 
             EditorGUILayout.Space();
             EditorGUILayout.LabelField("Sampling", EditorStyles.boldLabel);
@@ -135,16 +138,25 @@ namespace DisplayXR.Editor
                     $"{ac.FrontCapPercent:F2} % / {ac.BehindCapPercent:F2} %");
                 EditorGUILayout.LabelField("Samples",
                     $"{ac.ValidSamples} with depth of {ac.TotalSamples}, confidence {ac.Confidence:F2}");
+                if (ac.Source == DisplayXRAutoConvergence.ActiveSource.Depth)
+                    EditorGUILayout.LabelField(
+                        new GUIContent("Grid top / bottom third",
+                            "Mean depth of the top and bottom third of the depth grid. Looking at a floor, " +
+                            "the BOTTOM third must be the nearer one; if it is the top, the grid is upside " +
+                            "down on this graphics API (set DISPLAYXR_CURSOR_DEPTH_FLIPY=1 and report it)."),
+                        new GUIContent($"{Fmt(ac.GridTopThirdDepth)} m / {Fmt(ac.GridBottomThirdDepth)} m"));
             }
             if (GUILayout.Button("Reset Convergence (snap next sample)")) ac.ResetConvergence();
             Repaint(); // live readout
         }
 
-        static string Fmt(float meters) => float.IsInfinity(meters) ? "infinity" : meters.ToString("F2");
+        static string Fmt(float meters) =>
+            float.IsNaN(meters) ? "-" : float.IsInfinity(meters) ? "infinity" : meters.ToString("F2");
     }
 
     /// <summary>DisplayXR > Gizmos > Comfort Volume: show the front / behind comfort limits
-    /// with the rig gizmos (editor preference, on by default).</summary>
+    /// with EVERY rig's gizmo (editor preference, off by default). A rig that carries a
+    /// DisplayXRAutoConvergence shows them regardless.</summary>
     static class DisplayXRComfortVolumeMenu
     {
         const string kMenu = "DisplayXR/Gizmos/Comfort Volume";

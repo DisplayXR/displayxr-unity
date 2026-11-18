@@ -517,14 +517,16 @@ namespace DisplayXR
         const string kComfortVolumePref = "DisplayXR.Gizmos.ComfortVolume";
         static int s_ShowComfortVolume = -1;
 
-        /// <summary>Draw the comfort volume with the rig gizmos (editor preference;
-        /// menu DisplayXR > Gizmos > Comfort Volume).</summary>
+        /// <summary>Draw the comfort volume for EVERY rig (editor preference, OFF by default;
+        /// menu DisplayXR > Gizmos > Comfort Volume). A rig that carries a
+        /// DisplayXRAutoConvergence draws it regardless - that rig's author opted in -
+        /// so projects that do not use auto-convergence see no change in their gizmos.</summary>
         public static bool ShowComfortVolume
         {
             get
             {
                 if (s_ShowComfortVolume < 0)
-                    s_ShowComfortVolume = UnityEditor.EditorPrefs.GetBool(kComfortVolumePref, true) ? 1 : 0;
+                    s_ShowComfortVolume = UnityEditor.EditorPrefs.GetBool(kComfortVolumePref, false) ? 1 : 0;
                 return s_ShowComfortVolume != 0;
             }
             set
@@ -537,16 +539,18 @@ namespace DisplayXR
         public static readonly Color ComfortFront = new Color(1f, 0.35f, 0.3f, 0.9f);
         public static readonly Color ComfortBehind = new Color(0.3f, 0.9f, 0.5f, 0.9f);
 
-        /// <summary>The caps to draw for a rig: an auto-convergence component on the same
-        /// object supplies its own (after its depth scale), otherwise the defaults.</summary>
-        public static void GetComfortCapsDegrees(Component rig, out float frontDeg, out float behindDeg)
+        /// <summary>Whether to draw the comfort volume for a rig, and with which caps: an
+        /// auto-convergence component on the same object supplies its own (after its depth
+        /// scale) and always draws; otherwise the defaults, only when the menu toggle is on.</summary>
+        public static bool GetComfortCapsDegrees(Component rig, out float frontDeg, out float behindDeg)
         {
             frontDeg = DisplayXRAutoConvergenceMath.DefaultFrontCapDegrees;
             behindDeg = DisplayXRAutoConvergenceMath.DefaultBehindCapDegrees;
             var ac = rig != null ? rig.GetComponent<DisplayXRAutoConvergence>() : null;
-            if (ac == null) return;
+            if (ac == null) return ShowComfortVolume;
             frontDeg = ac.frontCapDegrees * ac.depthScale;
             behindDeg = ac.behindCapDegrees * ac.depthScale;
+            return true;
         }
 
         static void DrawLocalRect(Transform rig, float z, float halfW, float halfH, Color color,
@@ -576,7 +580,8 @@ namespace DisplayXR
         /// <summary>
         /// Camera-centric rig: the screen plane is at 1/invConvergenceDistance; the limits are
         /// where the estimated disparity (<see cref="DisplayXRAutoConvergenceMath.Disparity"/>)
-        /// meets the caps. With a parallel rig (inv = 0) only a front limit exists; a behind
+        /// meets the caps (physical angles, converted through <paramref name="viewWidthMeters"/>,
+        /// the physical width of the canvas). With a parallel rig (inv = 0) only a front limit exists; a behind
         /// limit past <paramref name="maxDrawDistance"/> is not drawn (everything behind the
         /// screen is inside the cap).
         /// </summary>
@@ -585,14 +590,17 @@ namespace DisplayXR
             float frontCapDeg, float behindCapDeg, DisplayXRDisplayInfo info, float viewWidthMeters,
             float maxDrawDistance)
         {
-            if (!ShowComfortVolume || rig == null) return;
+            if (rig == null) return;
             float tanV = Mathf.Tan(fovDeg * 0.5f * Mathf.Deg2Rad);
             float tanH = tanV * aspect;
             float viewDist = info.isValid ? info.nominalViewerZ : 0f;
             float width = viewWidthMeters > 0f ? viewWidthMeters : (info.isValid ? info.displayWidthMeters : 0f);
             float capF = DisplayXRAutoConvergenceMath.CapFractionFromDegrees(frontCapDeg, viewDist, width);
             float capB = DisplayXRAutoConvergenceMath.CapFractionFromDegrees(behindCapDeg, viewDist, width);
-            float k = DisplayXRAutoConvergenceMath.DisparityScale(NOMINAL_IPD_METERS, tanH);
+            // Rig units: the eye baseline is a physical distance in WORLD units whatever the
+            // rig's scale, so in the rig's own units it is ipd / scale.
+            float k = DisplayXRAutoConvergenceMath.DisparityScale(
+                DisplayXRAutoConvergenceMath.BaselineInRigUnits(NOMINAL_IPD_METERS, Mathf.Abs(rig.lossyScale.y)), tanH);
             DisplayXRAutoConvergenceMath.ComfortRangeQ(k, ipdFactor, invConvergence, capF, capB,
                                                        out float frontQ, out float behindQ);
             bool haveScreen = invConvergence > 0.001f;
@@ -630,7 +638,7 @@ namespace DisplayXR
             Transform rig, float virtualWidth, float virtualHeight, float ipdFactor,
             float frontCapDeg, float behindCapDeg, DisplayXRDisplayInfo info, float physicalHeightMeters)
         {
-            if (!ShowComfortVolume || rig == null) return;
+            if (rig == null) return;
             float e = NOMINAL_IPD_METERS * ipdFactor;
             if (e < 1e-5f || virtualHeight <= 0f) return; // no stereo: nothing to bound
             float viewDist = info.isValid && info.nominalViewerZ > 0f

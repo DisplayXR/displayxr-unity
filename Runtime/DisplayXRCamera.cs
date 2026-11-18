@@ -440,10 +440,12 @@ namespace DisplayXR
 
             // Comfort volume (#461): where content reaches the front / behind disparity
             // cap either side of the convergence plane. Approximate, authoring aid only.
-            DisplayXRGizmoHelpers.GetComfortCapsDegrees(this, out float capFrontDeg, out float capBehindDeg);
-            DisplayXRGizmoHelpers.DrawCameraComfortVolume(
-                transform, fovDeg, aspect, parallel ? 0f : invConvergenceDistance, ipdFactor,
-                capFrontDeg, capBehindDeg, info, winW_m, cam != null ? cam.farClipPlane : 1000f);
+            // Drawn only for a rig with a DisplayXRAutoConvergence, or when the
+            // DisplayXR > Gizmos > Comfort Volume toggle (off by default) is on.
+            if (DisplayXRGizmoHelpers.GetComfortCapsDegrees(this, out float capFrontDeg, out float capBehindDeg))
+                DisplayXRGizmoHelpers.DrawCameraComfortVolume(
+                    transform, fovDeg, aspect, parallel ? 0f : invConvergenceDistance, ipdFactor,
+                    capFrontDeg, capBehindDeg, info, winW_m, cam != null ? cam.farClipPlane : 1000f);
 
             Vector3 cBL = transform.TransformPoint(new Vector3(-hw, -hh, convergenceDist));
             Vector3 cBR = transform.TransformPoint(new Vector3(+hw, -hh, convergenceDist));
