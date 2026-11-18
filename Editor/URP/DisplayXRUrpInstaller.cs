@@ -21,6 +21,7 @@
 // m_RendererFeatureMap) and are wrapped so a failure never corrupts the asset.
 
 using System;
+using System.Collections.Generic;
 using System.IO;
 using UnityEditor;
 using UnityEngine;
@@ -74,8 +75,12 @@ namespace DisplayXR.Editor.URP
             }
             AssetDatabase.SaveAssets();
 
-            // 2. Renderer feature (best effort).
-            var rendererData = FindRendererData();
+            // 2. Renderer feature (best effort), on every renderer asset the project
+            // actually renders the clip rigs with - not on whichever asset a search
+            // happens to return first (#462).
+            bool guessed;
+            var targets = ResolveClipRenderers(out guessed);
+            var rendererData = targets.Count > 0 ? targets[0] : null;
             string manual =
                 "Manual wiring (3 clicks):\n" +
                 "  1. Select your URP Renderer asset (UniversalRendererData)\n" +
@@ -93,16 +98,27 @@ namespace DisplayXR.Editor.URP
                 return false;
             }
 
-            bool added;
-            try { added = TryAddFullScreenFeature(rendererData, mat); }
-            catch (Exception e)
+            bool added = true;
+            var names = new List<string>();
+            foreach (var target in targets)
             {
-                Debug.LogWarning("[DisplayXRUrp] foreground-clip wiring failed: " + e.Message);
-                added = false;
+                names.Add(target.name);
+                try { added &= TryAddFullScreenFeature(target, mat); }
+                catch (Exception e)
+                {
+                    Debug.LogWarning("[DisplayXRUrp] foreground-clip wiring failed on " + target.name + ": " + e.Message);
+                    added = false;
+                }
             }
 
+            string wiredInto = string.Join(", ", names.ToArray());
             Report(interactive, "Foreground Clip",
-                added ? "Material + Full Screen Pass feature wired into " + rendererData.name + "."
+                added ? "Material + Full Screen Pass feature wired into " + wiredInto + "." +
+                        (guessed
+                            ? "\n\nNo URP pipeline asset is assigned in Graphics or Quality settings, so " +
+                              "this is simply the first URP renderer asset found in the project. Check " +
+                              "it is the one your pipeline asset uses."
+                            : "")
                       : "Material created at " + kClipMaterialPath + ".\n\n" +
                         "Auto-wiring the renderer feature didn't complete — do it manually:\n\n" + manual,
                 error: false);
@@ -111,6 +127,10 @@ namespace DisplayXR.Editor.URP
 
         // ---- Shared renderer-asset plumbing ---------------------------------
 
+        /// <summary>
+        /// Last resort only: the first URP renderer asset a project search returns. It
+        /// says nothing about which asset is in use - see <see cref="ResolveClipRenderers"/>.
+        /// </summary>
         internal static ScriptableRendererData FindRendererData()
         {
             foreach (var guid in AssetDatabase.FindAssets("t:UniversalRendererData"))
@@ -120,6 +140,92 @@ namespace DisplayXR.Editor.URP
                 if (data != null) return data;
             }
             return null;
+        }
+
+        /// <summary>
+        /// The renderer assets the foreground clip has to be on: for every URP pipeline
+        /// asset the project can run with (the active one, the Graphics default, and each
+        /// quality level's override), the renderer each clip rig camera in the open
+        /// scenes selects - or the pipeline's default renderer when no such rig is open.
+        /// <para>
+        /// <paramref name="guessed"/> is true when no URP pipeline asset is assigned
+        /// anywhere and the result is only the first renderer asset found in the project.
+        /// </para>
+        /// </summary>
+        internal static List<ScriptableRendererData> ResolveClipRenderers(out bool guessed)
+        {
+            // -1 = "the pipeline asset's default renderer", as on the camera.
+            var rendererIndices = new List<int>();
+            foreach (var camera in DisplayXRProjectValidation.FindRigCamerasWithForegroundClip())
+            {
+                int index = -1;
+                var extra = camera.GetComponent<UniversalAdditionalCameraData>();
+                if (extra != null)
+                {
+                    var prop = new SerializedObject(extra).FindProperty("m_RendererIndex");
+                    if (prop != null) index = prop.intValue;
+                }
+                if (!rendererIndices.Contains(index)) rendererIndices.Add(index);
+            }
+            if (rendererIndices.Count == 0) rendererIndices.Add(-1);
+
+            var pipelines = new List<UniversalRenderPipelineAsset>();
+            AddPipeline(pipelines, GraphicsSettings.currentRenderPipeline);
+            AddPipeline(pipelines, GraphicsSettings.defaultRenderPipeline);
+            int levels = QualitySettings.names.Length;
+            for (int i = 0; i < levels; i++)
+                AddPipeline(pipelines, QualitySettings.GetRenderPipelineAssetAt(i));
+
+            var result = new List<ScriptableRendererData>();
+            foreach (var pipeline in pipelines)
+            {
+                var renderers = pipeline.rendererDataList;
+                if (renderers.Length == 0) continue;
+                int defaultIndex = 0;
+                var prop = new SerializedObject(pipeline).FindProperty("m_DefaultRendererIndex");
+                if (prop != null) defaultIndex = prop.intValue;
+                foreach (int wanted in rendererIndices)
+                {
+                    // URP itself falls back to the default renderer for a bad index.
+                    int index = wanted >= 0 && wanted < renderers.Length ? wanted : defaultIndex;
+                    if (index < 0 || index >= renderers.Length) index = 0;
+                    var data = renderers[index];
+                    if (data != null && !result.Contains(data)) result.Add(data);
+                }
+            }
+
+            guessed = false;
+            if (result.Count == 0)
+            {
+                var first = FindRendererData();
+                if (first != null)
+                {
+                    result.Add(first);
+                    guessed = true;
+                }
+            }
+            return result;
+        }
+
+        static void AddPipeline(List<UniversalRenderPipelineAsset> list, RenderPipelineAsset asset)
+        {
+            var urp = asset as UniversalRenderPipelineAsset;
+            if (urp != null && !list.Contains(urp)) list.Add(urp);
+        }
+
+        /// <summary>
+        /// The renderer assets from <see cref="ResolveClipRenderers"/> that do not carry
+        /// the foreground-clip pass yet. Empty = wired everywhere it is needed.
+        /// </summary>
+        internal static List<ScriptableRendererData> RenderersMissingClip(out bool guessed, out int resolved)
+        {
+            var targets = ResolveClipRenderers(out guessed);
+            resolved = targets.Count;
+            var missing = new List<ScriptableRendererData>();
+            foreach (var target in targets)
+                if (FindClipFeature(target) == null)
+                    missing.Add(target);
+            return missing;
         }
 
         /// <summary>
@@ -144,15 +250,6 @@ namespace DisplayXR.Editor.URP
             return null;
         }
 
-        /// <summary>
-        /// True when the renderer asset this installer would wire (<see cref="FindRendererData"/>)
-        /// already carries the foreground-clip pass.
-        /// </summary>
-        internal static bool IsForegroundClipInstalled()
-        {
-            return FindClipFeature(FindRendererData()) != null;
-        }
-
         static bool TryAddFullScreenFeature(ScriptableRendererData rendererData, Material mat)
         {
             var so = new SerializedObject(rendererData);
@@ -164,6 +261,15 @@ namespace DisplayXR.Editor.URP
             var installed = FindClipFeature(rendererData);
             if (installed != null)
             {
+                // A pass someone wired by hand (it runs the clip shader, but it is not
+                // the feature this installer creates): it is theirs. Leave its material,
+                // injection point and requirements exactly as they set them.
+                if (installed.name != kClipFeatureName)
+                {
+                    Debug.Log("[DisplayXRUrp] " + rendererData.name + " already has a Full Screen Pass running " +
+                              kClipShaderName + " ('" + installed.name + "') - left as it is.");
+                    return true;
+                }
                 ConfigureClipFeature(installed, mat);
                 EditorUtility.SetDirty(rendererData);
                 AssetDatabase.SaveAssets();

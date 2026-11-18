@@ -61,13 +61,15 @@ namespace DisplayXR.Editor.URP
                 Check = CheckForegroundClip,
                 Fix = c => DisplayXRUrpInstaller.InstallForegroundClip(interactive: false),
                 FixDescription = "Create Assets/DisplayXR/DXRForegroundClip.mat and add a Full Screen " +
-                                 "Pass Renderer Feature to the URP renderer asset (the same as " +
-                                 "DisplayXR > Setup URP Foreground Clip)",
+                                 "Pass Renderer Feature to each URP renderer asset in use that lacks " +
+                                 "it (the same as DisplayXR > Setup URP Foreground Clip)",
             });
         }
 
         static Result CheckPreserveAlpha(DisplayXRValidationContext c)
         {
+            Result off;
+            if (DisplayXRProjectValidation.LoaderNotEnabled(c, out off)) return off;
             if (!DisplayXRProjectValidation.IsUrpActive())
                 return Result.NotApplicable("URP is not the active render pipeline.");
             string evidence;
@@ -81,18 +83,35 @@ namespace DisplayXR.Editor.URP
 
         static Result CheckForegroundClip(DisplayXRValidationContext c)
         {
+            Result off;
+            if (DisplayXRProjectValidation.LoaderNotEnabled(c, out off)) return off;
             if (!DisplayXRProjectValidation.IsUrpActive())
                 return Result.NotApplicable("URP is not the active render pipeline.");
             string rig = DisplayXRProjectValidation.FindRigWithForegroundClip();
             if (rig == null)
                 return Result.NotApplicable("No rig in the open scenes has Foreground Only Clip ticked.");
-            if (DisplayXRUrpInstaller.IsForegroundClipInstalled())
+
+            // The renderer assets in use - the active pipeline asset's and each quality
+            // level's, at the renderer index the rig's camera selects - not the first
+            // renderer asset a project search happens to return.
+            bool guessed; int resolved;
+            var missing = DisplayXRUrpInstaller.RenderersMissingClip(out guessed, out resolved);
+            if (resolved == 0)
+                return Result.Fail("'" + rig + "' has Foreground Only Clip ticked, but the project has " +
+                                   "no URP renderer asset to carry the clip pass.", noFix: true);
+            if (missing.Count == 0)
                 return Result.Pass();
+
+            var names = new System.Collections.Generic.List<string>();
+            foreach (var data in missing) names.Add(data.name);
             return Result.Fail(
-                "'" + rig + "' has Foreground Only Clip ticked, but " +
-                (DisplayXRUrpInstaller.FindRendererData() == null
-                    ? "the project has no URP renderer asset to carry the clip pass."
-                    : "the URP renderer asset has no DisplayXR foreground clip pass."));
+                "'" + rig + "' has Foreground Only Clip ticked, but the clip pass is not on: " +
+                string.Join(", ", names.ToArray()) + "." +
+                (guessed
+                    ? " (No URP pipeline asset is assigned in Graphics or Quality settings, so this is " +
+                      "only the first URP renderer asset found in the project.)"
+                    : " These are the renderers the rig's camera uses under the active pipeline asset " +
+                      "and the quality levels' pipeline assets."));
         }
     }
 }
