@@ -43,13 +43,19 @@ namespace DisplayXR.Editor
                 Explanation =
                     "The provider is an XR Plug-in Management loader. Unless it is ticked for the " +
                     "build target, Unity never creates the display subsystem and the app renders " +
-                    "one flat view.",
-                Severity = Severity.Error,
+                    "one flat view. Leaving a target without it is a legitimate choice (a 3D app on " +
+                    "Windows that also has an Android target), so this is a warning at most and is " +
+                    "never written to the build log; every other rule is not applicable for such a " +
+                    "target.",
+                // The result sets the real severity (DisplayXRLoaderRules.NotEnabledSeverity).
+                Severity = Severity.Warning,
                 Order = 10,
                 Check = CheckLoaderEnabled,
                 Fix = FixLoaderEnabled,
                 FixDescription = "Enable the DisplayXR Display loader in XR Plug-in Management for the " +
-                                 "active build target",
+                                 "active build target. Like ticking the box, this can create assets: " +
+                                 "the loader asset under Assets/XR/Loaders/, and that target's XR " +
+                                 "settings inside the project's XR settings asset if it has none yet",
             });
 
             Add(new DisplayXRValidationRule
@@ -64,6 +70,7 @@ namespace DisplayXR.Editor
                 Order = 20,
                 Check = CheckInitOnStartup,
                 Fix = FixInitOnStartup,
+                ExcludeFromFixAll = true, // a choice for apps that start XR themselves
                 FixDescription = "Turn on Initialize XR on Startup in XR Plug-in Management for the " +
                                  "active build target",
             });
@@ -83,6 +90,7 @@ namespace DisplayXR.Editor
                 Order = 30,
                 Check = CheckOtherLoaders,
                 Fix = FixOtherLoaders,
+                ExcludeFromFixAll = true, // a project may keep a fallback loader on purpose
                 FixDescription = "Untick every XR loader other than DisplayXR Display for the active " +
                                  "build target (XR Plug-in Management)",
             });
@@ -260,11 +268,21 @@ namespace DisplayXR.Editor
             if (DisplayXRProjectValidation.IsDisplayXRLoaderEnabled(group))
                 return Result.Pass("Enabled for " + group + ".");
 
+            // Enabled for the other target group = this one was left out on purpose: a
+            // note. Enabled nowhere = the package is installed and does nothing: a warning.
+            bool elsewhere = DisplayXRProjectValidation.IsDisplayXRLoaderEnabledElsewhere(group);
+            var severity = DisplayXRLoaderRules.NotEnabledSeverity(elsewhere);
+            string tail = elsewhere
+                ? " It is enabled for another build target, so this may be intended: builds for " +
+                  group + " then render without DisplayXR, and the other rules do not apply to them."
+                : " It is not enabled for any build target, so the plug-in does nothing yet.";
+
             XRGeneralSettings general; XRManagerSettings manager;
             if (!DisplayXRProjectValidation.TryGetXRSettings(group, out general, out manager))
                 return Result.Fail("XR Plug-in Management has no settings for " + group +
-                                   " yet, so no XR loader is enabled for it.");
-            return Result.Fail("DisplayXR Display is not ticked under XR Plug-in Management > " + group + ".");
+                                   " yet, so no XR loader is enabled for it." + tail, severity);
+            return Result.Fail("DisplayXR Display is not ticked under XR Plug-in Management > " + group +
+                               "." + tail, severity);
         }
 
         static void FixLoaderEnabled(DisplayXRValidationContext c)
@@ -304,8 +322,8 @@ namespace DisplayXR.Editor
         static Result CheckInitOnStartup(DisplayXRValidationContext c)
         {
             var group = c.Group();
-            if (!DisplayXRProjectValidation.IsDisplayXRLoaderEnabled(group))
-                return Result.NotApplicable("The DisplayXR Display loader is not enabled.");
+            Result off;
+            if (DisplayXRProjectValidation.LoaderNotEnabled(c, out off)) return off;
             XRGeneralSettings general; XRManagerSettings manager;
             DisplayXRProjectValidation.TryGetXRSettings(group, out general, out manager);
             return general.InitManagerOnStart
@@ -377,6 +395,8 @@ namespace DisplayXR.Editor
 
         static Result CheckGraphicsApi(DisplayXRValidationContext c)
         {
+            Result off;
+            if (DisplayXRProjectValidation.LoaderNotEnabled(c, out off)) return off;
             var apis = GraphicsApiNames(c.Target());
             string list = string.Join(", ", apis.ToArray());
             switch (DisplayXRGraphicsApiRules.Classify(c.Platform, apis))
@@ -429,12 +449,17 @@ namespace DisplayXR.Editor
 
         static Result CheckNativePlugin(DisplayXRValidationContext c)
         {
+            Result off;
+            if (DisplayXRProjectValidation.LoaderNotEnabled(c, out off)) return off;
             if (c.Target() == BuildTarget.StandaloneWindows)
                 return Result.Fail("The build target is 32-bit Windows. The package ships a Windows " +
                                    "x64 library only - switch the architecture to x86_64.");
 
             bool sourceCheckout;
             string root = DisplayXRProjectValidation.PackageRoot(out sourceCheckout);
+            if (root == null)
+                return Result.NotApplicable("The package folder could not be located, so its " +
+                                            "libraries were not checked.");
             var missing = new List<string>();
             foreach (var relative in DisplayXRNativePluginRules.RequiredFiles(c.Platform))
             {
@@ -468,6 +493,8 @@ namespace DisplayXR.Editor
 
         static Result CheckAndroidArm64(DisplayXRValidationContext c)
         {
+            Result off;
+            if (DisplayXRProjectValidation.LoaderNotEnabled(c, out off)) return off;
             bool il2cpp = PlayerSettings.GetScriptingBackend(NamedBuildTarget.Android)
                           == ScriptingImplementation.IL2CPP;
             var verdict = DisplayXRAndroidRules.ClassifyArchitectures(
@@ -500,6 +527,8 @@ namespace DisplayXR.Editor
 
         static Result CheckAndroidMinSdk(DisplayXRValidationContext c)
         {
+            Result off;
+            if (DisplayXRProjectValidation.LoaderNotEnabled(c, out off)) return off;
             int min = (int)PlayerSettings.Android.minSdkVersion;
             return min >= DisplayXRAndroidRules.MinApiLevel
                 ? Result.Pass("Minimum API Level " + min + ".")
@@ -513,6 +542,8 @@ namespace DisplayXR.Editor
 
         static Result CheckLinuxTransparentOverlay(DisplayXRValidationContext c)
         {
+            Result off;
+            if (DisplayXRProjectValidation.LoaderNotEnabled(c, out off)) return off;
             var overlays = DisplayXRProjectValidation.FindInLoadedScenes<DisplayXRTransparentOverlay>();
             if (overlays.Length == 0)
                 return Result.NotApplicable("No DisplayXR Transparent Overlay in the open scenes.");

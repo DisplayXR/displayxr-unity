@@ -145,22 +145,40 @@ namespace DisplayXR.Editor
 
         public static bool IsIgnored(string ruleId) { return IgnoredIds.Contains(ruleId); }
 
-        /// <summary>Ignore a rule for this project, or stop ignoring it. Saved at once.</summary>
-        public static void SetIgnored(string ruleId, bool ignored)
+        /// <summary>
+        /// Read the ignore list from disk again. The window does this on every refresh, so
+        /// a change that arrived from version control (or a hand edit) is picked up
+        /// without a domain reload.
+        /// </summary>
+        public static void ReloadIgnoreList()
         {
-            var ids = (HashSet<string>)IgnoredIds;
-            bool changed = ignored ? ids.Add(ruleId) : ids.Remove(ruleId);
-            if (!changed) return;
-            try
-            {
-                DisplayXRValidationIgnoreList.Save(DisplayXRValidationIgnoreList.DefaultPath, ids);
-            }
-            catch (Exception e)
-            {
-                Debug.LogWarning("[DisplayXR] Project validation: could not write " +
-                    DisplayXRValidationIgnoreList.DefaultPath + ": " + e.Message);
-            }
+            s_Ignored = null;
             InvalidateCache();
+        }
+
+        /// <summary>
+        /// Ignore a rule for this project, or stop ignoring it. Saved at once. If the file
+        /// cannot be written (read-only under version control, for instance) nothing
+        /// changes - the in-memory list is put back - a warning is logged, and the method
+        /// returns false with the reason in <paramref name="error"/>.
+        /// </summary>
+        public static bool SetIgnored(string ruleId, bool ignored, out string error)
+        {
+            bool ok = DisplayXRValidationIgnoreList.TrySet(
+                DisplayXRValidationIgnoreList.DefaultPath, IgnoredIds, ruleId, ignored, out error);
+            if (!ok)
+                Debug.LogWarning("[DisplayXR] Project validation: the ignore list was NOT changed - could not " +
+                    "write " + DisplayXRValidationIgnoreList.DefaultPath + ": " + error +
+                    " (if the file is read-only under version control, check it out first).");
+            InvalidateCache();
+            return ok;
+        }
+
+        /// <summary><see cref="SetIgnored(string,bool,out string)"/> without the reason.</summary>
+        public static bool SetIgnored(string ruleId, bool ignored)
+        {
+            string error;
+            return SetIgnored(ruleId, ignored, out error);
         }
 
         // ---- Build hook --------------------------------------------------------
@@ -187,9 +205,13 @@ namespace DisplayXR.Editor
                 Debug.LogWarning("[DisplayXR] Project validation could not run: " + e.Message);
                 return 0;
             }
+            // The window checks the ACTIVE build target; a build can be for another one
+            // (BuildPipeline.BuildPlayer from a script). Name the target, so the line is
+            // not read against the wrong set of settings.
+            string hint = DisplayXRValidationEngine.BuildHint(
+                target.ToString(), EditorUserBuildSettings.activeBuildTarget.ToString());
             foreach (var line in lines)
-                Debug.LogWarning("[DisplayXR] Project validation: " + line +
-                    " (DisplayXR > Project Validation has the fix; ignore the rule there to silence this.)");
+                Debug.LogWarning("[DisplayXR] Project validation: " + line + " " + hint);
             return lines.Count;
         }
 
@@ -223,6 +245,43 @@ namespace DisplayXR.Editor
         public static bool IsDisplayXRLoaderEnabled(BuildTargetGroup group)
         {
             return LoaderTypeNames(group).Contains(typeof(DisplayXRDisplayLoader).FullName);
+        }
+
+        /// <summary>
+        /// The DisplayXR Display loader is enabled for a build target group OTHER than
+        /// <paramref name="group"/> (of the two the loader is registered for).
+        /// </summary>
+        public static bool IsDisplayXRLoaderEnabledElsewhere(BuildTargetGroup group)
+        {
+            foreach (var other in new[] { BuildTargetGroup.Standalone, BuildTargetGroup.Android })
+                if (other != group && IsDisplayXRLoaderEnabled(other))
+                    return true;
+            return false;
+        }
+
+        /// <summary>
+        /// The gate every rule that only matters to a DisplayXR build opens with: when the
+        /// loader is not enabled for the context's build target, the rule has nothing to
+        /// say (<paramref name="notApplicable"/>) and <c>loader-enabled</c> is the single
+        /// finding. Without it, a project that uses DisplayXR on Windows only would be
+        /// told to change its Android scripting backend, architectures and graphics APIs.
+        /// <code>
+        /// DisplayXRValidationResult off;
+        /// if (DisplayXRProjectValidation.LoaderNotEnabled(c, out off)) return off;
+        /// </code>
+        /// </summary>
+        public static bool LoaderNotEnabled(DisplayXRValidationContext context,
+                                            out DisplayXRValidationResult notApplicable)
+        {
+            var group = context.Group();
+            if (IsDisplayXRLoaderEnabled(group))
+            {
+                notApplicable = default(DisplayXRValidationResult);
+                return false;
+            }
+            notApplicable = DisplayXRValidationResult.NotApplicable(
+                "The DisplayXR Display loader is not enabled for " + group + ".");
+            return true;
         }
 
         /// <summary>Open Project Settings > XR Plug-in Management.</summary>
@@ -273,11 +332,25 @@ namespace DisplayXR.Editor
         /// </summary>
         public static string FindRigWithForegroundClip()
         {
+            var cameras = FindRigCamerasWithForegroundClip();
+            return cameras.Count > 0 ? cameras[0].name : null;
+        }
+
+        /// <summary>The cameras of every rig in a loaded scene that has Foreground Only Clip ticked.</summary>
+        public static List<Camera> FindRigCamerasWithForegroundClip()
+        {
+            var cameras = new List<Camera>();
             foreach (var rig in FindInLoadedScenes<DisplayXRCamera>())
-                if (rig.foregroundOnlyClip) return rig.name;
+                if (rig.foregroundOnlyClip) AddCamera(cameras, rig);
             foreach (var rig in FindInLoadedScenes<DisplayXRDisplay>())
-                if (rig.foregroundOnlyClip) return rig.name;
-            return null;
+                if (rig.foregroundOnlyClip) AddCamera(cameras, rig);
+            return cameras;
+        }
+
+        static void AddCamera(List<Camera> cameras, Component rig)
+        {
+            var camera = rig.GetComponent<Camera>();
+            if (camera != null && !cameras.Contains(camera)) cameras.Add(camera);
         }
 
         /// <summary>
@@ -303,31 +376,45 @@ namespace DisplayXR.Editor
         /// <summary>
         /// The package's folder on disk and whether it is a source checkout (a "file:" or
         /// embedded install) as opposed to a published copy (git URL, tarball, registry).
+        /// Returns null when the folder cannot be found - callers must then say nothing
+        /// rather than report every file in it as missing.
         /// </summary>
         public static string PackageRoot(out bool isSourceCheckout)
         {
             var info = UnityEditor.PackageManager.PackageInfo.FindForAssembly(
                 typeof(DisplayXRProjectValidation).Assembly);
-            if (info != null)
+            if (info != null && !string.IsNullOrEmpty(info.resolvedPath))
             {
                 isSourceCheckout =
                     info.source == UnityEditor.PackageManager.PackageSource.Local ||
                     info.source == UnityEditor.PackageManager.PackageSource.Embedded;
                 return info.resolvedPath;
             }
-            // Not resolved as a package (should not happen): same fallback the build
-            // processors use.
-            isSourceCheckout = false;
-            return Path.GetFullPath("Packages/com.displayxr.unity");
+
+            // Not a package: the folder was copied into Assets/. Find it from this
+            // assembly's own .asmdef, which sits in <root>/Editor/. Such a copy is a
+            // source tree as far as its binaries go.
+            isSourceCheckout = true;
+            string asmdef = UnityEditor.Compilation.CompilationPipeline
+                .GetAssemblyDefinitionFilePathFromAssemblyName(
+                    typeof(DisplayXRProjectValidation).Assembly.GetName().Name);
+            if (!string.IsNullOrEmpty(asmdef))
+            {
+                string editorDir = Path.GetDirectoryName(Path.GetFullPath(asmdef));
+                string root = editorDir != null ? Path.GetDirectoryName(editorDir) : null;
+                if (root != null && File.Exists(Path.Combine(root, "package.json")))
+                    return root;
+            }
+            return null;
         }
 
         /// <summary>The installed version of a package, or null when it is not in the project.</summary>
         public static string InstalledPackageVersion(string packageName)
         {
-            foreach (var info in UnityEditor.PackageManager.PackageInfo.GetAllRegisteredPackages())
-                if (info.name == packageName)
-                    return info.version;
-            return null;
+            // FindForAssetPath has been in UnityEditor.PackageManager since 2019 and takes
+            // the package's virtual root; it returns null for a package that is not there.
+            var info = UnityEditor.PackageManager.PackageInfo.FindForAssetPath("Packages/" + packageName);
+            return info != null ? info.version : null;
         }
     }
 }

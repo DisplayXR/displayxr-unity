@@ -64,6 +64,9 @@ namespace DisplayXR.Editor
 
         void Refresh()
         {
+            // The ignore list is a file under ProjectSettings/: a version-control update
+            // or a hand edit can change it behind the editor's back.
+            DisplayXRProjectValidation.ReloadIgnoreList();
             m_Entries = DisplayXRProjectValidation.Evaluate();
             m_EvaluatedTarget = (int)EditorUserBuildSettings.activeBuildTarget;
             DisplayXRProjectValidation.InvalidateCache();
@@ -92,7 +95,11 @@ namespace DisplayXR.Editor
                     Refresh();
                 using (new EditorGUI.DisabledScope(!canFix || plan.Count == 0))
                 {
-                    if (GUILayout.Button("Fix All (" + plan.Count + ")", EditorStyles.toolbarButton))
+                    var fixAll = new GUIContent("Fix All Errors (" + plan.Count + ")",
+                        "Runs the fixes of the open Errors, after listing them. Warnings and notes, and " +
+                        "settings that are a project's choice (other XR loaders, Initialize XR on " +
+                        "Startup), are left to their own Fix buttons.");
+                    if (GUILayout.Button(fixAll, EditorStyles.toolbarButton))
                         FixAll(plan);
                 }
                 if (GUILayout.Button("Docs", EditorStyles.toolbarButton))
@@ -189,7 +196,11 @@ namespace DisplayXR.Editor
                             EditorStyles.miniButton, GUILayout.Width(60f));
                         if (ignore != entry.Ignored)
                         {
-                            DisplayXRProjectValidation.SetIgnored(rule.Id, ignore);
+                            string error;
+                            if (!DisplayXRProjectValidation.SetIgnored(rule.Id, ignore, out error))
+                                ShowNotification(new GUIContent(
+                                    "Not saved: " + DisplayXRValidationIgnoreList.DefaultPath +
+                                    " could not be written (" + error + ")"), 6.0);
                             m_RefreshRequested = true;
                         }
                     }
@@ -230,11 +241,12 @@ namespace DisplayXR.Editor
         {
             if (plan.Count == 0) return;
             string text =
-                "This will change " + plan.Count + " project setting" + (plan.Count == 1 ? "" : "s") +
-                " for " + EditorUserBuildSettings.activeBuildTarget + ":\n\n" +
+                "This will fix " + plan.Count + " error" + (plan.Count == 1 ? "" : "s") +
+                " for " + EditorUserBuildSettings.activeBuildTarget + ", and change nothing else:\n\n" +
                 DisplayXRValidationEngine.DescribeFixAllPlan(plan) +
-                "\nEach one is an ordinary Unity setting you can change back on its usual page.";
-            if (!EditorUtility.DisplayDialog("DisplayXR - Fix All", text, "Apply", "Cancel"))
+                "\nEach one is an ordinary Unity setting you can change back on its usual page. " +
+                "Warnings and notes are not touched.";
+            if (!EditorUtility.DisplayDialog("DisplayXR - Fix All Errors", text, "Apply", "Cancel"))
                 GUIUtility.ExitGUI(); // throws: nothing is changed
             foreach (var entry in plan)
                 RunFix(entry);

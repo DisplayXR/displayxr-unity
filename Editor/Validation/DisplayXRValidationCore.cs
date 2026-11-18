@@ -149,6 +149,13 @@ namespace DisplayXR.Editor
         /// where the user makes the change. Such a fix is never part of Fix All.
         /// </summary>
         public bool FixOnlyNavigates;
+        /// <summary>
+        /// True when the fix is a matter of project policy rather than a repair (unticking
+        /// another XR loader a project may keep on purpose, turning on Initialize XR on
+        /// Startup for an app that may start XR itself). Its own Fix button stays; Fix All
+        /// never runs it, whatever the finding's severity.
+        /// </summary>
+        public bool ExcludeFromFixAll;
     }
 
     /// <summary>A rule together with what its check found.</summary>
@@ -357,16 +364,35 @@ namespace DisplayXR.Editor
         }
 
         /// <summary>
-        /// What Fix All would run: open failures whose fix changes something. Ignored
-        /// rules and navigation-only fixes are left out.
+        /// What Fix All would run: open ERRORS whose fix changes something. Deliberately
+        /// narrow - one click must not rewrite settings that are a choice rather than a
+        /// fault. Left out: warnings and notes (each keeps its own Fix button), ignored
+        /// rules, navigation-only fixes, and rules marked
+        /// <see cref="DisplayXRValidationRule.ExcludeFromFixAll"/>.
         /// </summary>
         public static List<DisplayXRValidationEntry> FixAllPlan(IEnumerable<DisplayXRValidationEntry> entries)
         {
             var plan = new List<DisplayXRValidationEntry>();
             foreach (var e in entries)
-                if (e.IsOpenIssue && e.CanFix && !e.Rule.FixOnlyNavigates)
+                if (e.IsOpenIssue && e.CanFix && e.Severity == DisplayXRValidationSeverity.Error
+                    && !e.Rule.FixOnlyNavigates && !e.Rule.ExcludeFromFixAll)
                     plan.Add(e);
             return plan;
+        }
+
+        /// <summary>
+        /// What the build hook appends to each line: which target the finding is for and
+        /// where the fix is. The window checks the ACTIVE build target, so when the build
+        /// is for another one the hint says to switch first.
+        /// </summary>
+        public static string BuildHint(string builtTarget, string activeTarget)
+        {
+            return builtTarget == activeTarget
+                ? "(Build target " + builtTarget + ". DisplayXR > Project Validation shows the fix; " +
+                  "ignore the rule there to silence this.)"
+                : "(Build target " + builtTarget + ". DisplayXR > Project Validation checks the active " +
+                  "build target, which is " + activeTarget + ": switch the active build target to " +
+                  builtTarget + " to see this finding and its fix there, or ignore the rule to silence this.)";
         }
 
         /// <summary>The text Fix All shows before it asks: one line per change.</summary>
@@ -496,6 +522,37 @@ namespace DisplayXR.Editor
             string dir = Path.GetDirectoryName(path);
             if (!string.IsNullOrEmpty(dir)) Directory.CreateDirectory(dir);
             File.WriteAllText(path, Serialize(ids), new UTF8Encoding(false));
+        }
+
+        /// <summary>
+        /// Add or remove one id and write the file. If the write fails (a read-only file
+        /// under version control, a locked folder) the set is put back as it was, so what
+        /// is in memory never claims more than what is on disk; <paramref name="error"/>
+        /// then says why. Returns true when the set and the file agree afterwards - also
+        /// when nothing needed to change.
+        /// </summary>
+        public static bool TrySet(string path, ICollection<string> ids, string id, bool ignored, out string error)
+        {
+            error = null;
+            if (!DisplayXRValidationRegistry.IsValidId(id))
+            {
+                error = "'" + id + "' is not a valid rule id";
+                return false;
+            }
+            bool had = ids.Contains(id);
+            if (had == ignored) return true;
+            if (ignored) ids.Add(id); else ids.Remove(id);
+            try
+            {
+                Save(path, ids);
+                return true;
+            }
+            catch (Exception e)
+            {
+                if (ignored) ids.Remove(id); else ids.Add(id);
+                error = e.Message;
+                return false;
+            }
         }
     }
 }

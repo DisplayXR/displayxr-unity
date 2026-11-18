@@ -189,24 +189,53 @@ static class Program
         var noFixForFinding = Rule("finding-without-fix", Severity.Error, c => Result.Fail("info", Severity.Info, noFix: true));
         noFixForFinding.Fix = c => { };
         var nullMessage = Rule("null-message", Severity.Error, c => Result.Fail(null));
+        // An Error with a fix, but no description of it: Fix All falls back to the title.
+        var errorNoDescription = Rule("error-plain", Severity.Error, c => Result.Fail("e2"));
+        errorNoDescription.Fix = c => { };
+        // Policy, not repair: an Error (another XR loader ahead of DisplayXR) that a project
+        // may still have on purpose. Its own Fix button stays; Fix All must not touch it.
+        var policy = Rule("policy", Severity.Warning, c => Result.Fail("other loader first", Severity.Error));
+        policy.Fix = c => { };
+        policy.ExcludeFromFixAll = true;
+        // A Warning-by-default rule whose finding is an Error IS a repair.
+        var escalated = Rule("escalated", Severity.Warning, c => Result.Fail("worse than usual", Severity.Error));
+        escalated.Fix = c => { };
+        escalated.FixDescription = "Repair the escalated thing";
+        // An Error-by-default rule whose finding is only a Warning is not.
+        var softened = Rule("softened", Severity.Error, c => Result.Fail("milder than usual", Severity.Warning));
+        softened.Fix = c => { };
 
         var entries = DisplayXRValidationEngine.Evaluate(
-            new[] { fixable, noDescription, navigates, noFix, ignoredRule, passing, noFixForFinding, nullMessage },
+            new[] { fixable, noDescription, navigates, noFix, ignoredRule, passing, noFixForFinding, nullMessage,
+                    errorNoDescription, policy, escalated, softened },
             Ctx(Platforms.Windows), new[] { "skipped" });
 
         var plan = DisplayXRValidationEngine.FixAllPlan(entries);
         var planIds = new List<string>();
         foreach (var e in plan) planIds.Add(e.Rule.Id);
-        Check(string.Join(",", planIds) == "fixable,no-description",
-              "Fix All = open failures with a real fix; not ignored, passing, navigation-only or NoFix (got " +
-              string.Join(",", planIds) + ")");
+        Check(string.Join(",", planIds) == "fixable,error-plain,escalated",
+              "Fix All = open ERRORS with a real fix; not warnings/notes, ignored, passing, navigation-only, " +
+              "NoFix or ExcludeFromFixAll (got " + string.Join(",", planIds) + ")");
+        foreach (var e in plan)
+            Check(e.Severity == Severity.Error && !e.Rule.ExcludeFromFixAll && !e.Ignored,
+                  "every Fix All entry is an open, non-policy Error: " + e.Rule.Id);
+        var byId = new Dictionary<string, DisplayXRValidationEntry>();
+        foreach (var e in entries) byId[e.Rule.Id] = e;
+        Check(byId["policy"].CanFix && byId["no-description"].CanFix && byId["softened"].CanFix,
+              "what Fix All leaves out keeps its own Fix button");
 
+        // The dialog lists exactly the plan: one line per entry, nothing else.
         string text = DisplayXRValidationEngine.DescribeFixAllPlan(plan);
-        Check(text == "• Enable the loader\n• Title of no-description\n",
-              "Fix All lists one line per change, falling back to the title");
+        Check(text == "• Enable the loader\n• Title of error-plain\n• Repair the escalated thing\n",
+              "Fix All lists one line per change, falling back to the title (got " + text.Replace("\n", "|") + ")");
+        Check(text.Split('\n').Length - 1 == plan.Count, "one line per planned change");
+        Check(DisplayXRValidationEngine.FixAllPlan(new List<DisplayXRValidationEntry>()).Count == 0, "empty plan");
 
         var lines = DisplayXRValidationEngine.BuildMessages(entries);
-        Check(lines.Count == 3, "the build hook reports open Errors only (got " + lines.Count + ")");
+        Check(lines.Count == 6, "the build hook reports open Errors only (got " + lines.Count + ")");
+        Check(string.Join("|", lines).Contains("[policy]"),
+              "ExcludeFromFixAll is about Fix All only: the Error is still reported at build time");
+        Check(!string.Join("|", lines).Contains("[softened]"), "a finding softened to a Warning is not reported at build time");
         Check(lines.Count > 0 && lines[0] == "Title of fixable: no loader [fixable]", "build line = title: message [id]");
         Check(lines.Count > 1 && lines[1] == "Title of no-fix: cannot be fixed here [no-fix]",
               "an Error without a fix is still reported");
@@ -215,6 +244,18 @@ static class Program
         foreach (var line in lines)
             Check(!line.Contains("skipped") && !line.Contains("no-description") && !line.Contains("finding-without-fix"),
                   "ignored rules, warnings and overridden-to-Info findings stay out of the build log");
+    }
+
+    static void TestBuildHint()
+    {
+        string same = DisplayXRValidationEngine.BuildHint("StandaloneWindows64", "StandaloneWindows64");
+        Check(same.Contains("Build target StandaloneWindows64") && !same.Contains("switch"),
+              "building the active target: the hint names it and does not ask for a switch");
+        string other = DisplayXRValidationEngine.BuildHint("Android", "StandaloneWindows64");
+        Check(other.Contains("Build target Android") && other.Contains("switch the active build target to Android")
+              && other.Contains("which is StandaloneWindows64"),
+              "building another target: the hint says the window shows the active one and to switch (got " + other + ")");
+        Check(same.Contains("ignore the rule") && other.Contains("ignore the rule"), "both hints say how to silence the line");
     }
 
     // ---- ignore list ------------------------------------------------------------
@@ -270,8 +311,80 @@ static class Program
         {
             if (Directory.Exists(dir)) Directory.Delete(dir, true);
         }
+        TestIgnoreListTrySet();
         Check(DisplayXRValidationIgnoreList.DefaultPath == "ProjectSettings/DisplayXRProjectValidation.json",
               "the ignore list is project state under ProjectSettings/");
+    }
+
+    // A failed write must leave the in-memory list as it was: what the window shows as
+    // ignored must be what is on disk.
+    static void TestIgnoreListTrySet()
+    {
+        string dir = Path.Combine(Path.GetTempPath(), "dxr-validation-" + Guid.NewGuid().ToString("N"));
+        Directory.CreateDirectory(dir);
+        try
+        {
+            string path = Path.Combine(dir, "list.json");
+            var ids = new HashSet<string>();
+            string error;
+
+            Check(DisplayXRValidationIgnoreList.TrySet(path, ids, "a", true, out error) && error == null
+                  && ids.Contains("a") && DisplayXRValidationIgnoreList.Load(path).Contains("a"),
+                  "TrySet adds and writes");
+            DateTime stamp = File.GetLastWriteTimeUtc(path);
+            Check(DisplayXRValidationIgnoreList.TrySet(path, ids, "a", true, out error) && ids.Count == 1
+                  && File.GetLastWriteTimeUtc(path) == stamp,
+                  "TrySet with nothing to change succeeds without rewriting the file");
+            Check(!DisplayXRValidationIgnoreList.TrySet(path, ids, "Not Valid", true, out error) && error != null
+                  && ids.Count == 1, "TrySet rejects a malformed id and changes nothing");
+
+            // A path that cannot be written on any OS: its parent "folder" is a file.
+            string blocker = Path.Combine(dir, "blocker");
+            File.WriteAllText(blocker, "x");
+            string unwritable = Path.Combine(blocker, "list.json");
+
+            var kept = new HashSet<string> { "kept" };
+            Check(!DisplayXRValidationIgnoreList.TrySet(unwritable, kept, "new", true, out error),
+                  "TrySet reports a failed write");
+            Check(!string.IsNullOrEmpty(error), "a failed write gives the reason");
+            Check(kept.Count == 1 && kept.Contains("kept") && !kept.Contains("new"),
+                  "a failed ADD is rolled back in memory");
+
+            // Removing: with one id left the list is still written (non-empty), so it fails too.
+            var two = new HashSet<string> { "one", "two" };
+            Check(!DisplayXRValidationIgnoreList.TrySet(unwritable, two, "one", false, out error)
+                  && two.Count == 2 && two.Contains("one"),
+                  "a failed REMOVE is rolled back in memory");
+
+            // A read-only file, the version-control case. (Skipped where the OS lets the
+            // owner write anyway, e.g. running as root.)
+            DisplayXRValidationIgnoreList.Save(path, new[] { "a" });
+            File.SetAttributes(path, FileAttributes.ReadOnly);
+            bool reallyReadOnly;
+            try { File.AppendAllText(path, ""); reallyReadOnly = false; }
+            catch (UnauthorizedAccessException) { reallyReadOnly = true; }
+            if (reallyReadOnly)
+            {
+                var ro = DisplayXRValidationIgnoreList.Load(path);
+                Check(!DisplayXRValidationIgnoreList.TrySet(path, ro, "b", true, out error)
+                      && !ro.Contains("b") && ro.Contains("a"),
+                      "read-only file: adding fails and is rolled back");
+                Check(!DisplayXRValidationIgnoreList.TrySet(path, ro, "a", false, out error)
+                      && ro.Contains("a") && File.Exists(path),
+                      "read-only file: removing the last id (a delete) fails and is rolled back");
+                var onDisk = DisplayXRValidationIgnoreList.Load(path);
+                Check(onDisk.Count == 1 && onDisk.Contains("a"), "the read-only file is unchanged");
+            }
+            else
+            {
+                Console.WriteLine("note: read-only files are writable here, skipped the read-only checks");
+            }
+            File.SetAttributes(path, FileAttributes.Normal);
+        }
+        finally
+        {
+            if (Directory.Exists(dir)) Directory.Delete(dir, true);
+        }
     }
 
     // ---- graphics APIs ----------------------------------------------------------
@@ -362,6 +475,25 @@ static class Program
         Check(DisplayXRLoaderRules.FriendlyName("Some.Vendor.FooLoader") == "FooLoader", "other loaders by class name");
         Check(DisplayXRLoaderRules.FriendlyName("NoNamespace") == "NoNamespace", "a type without a namespace");
 
+        // "Not enabled" is never an Error - an Error would reach the build log, and a
+        // target left without the loader is a choice.
+        Check(DisplayXRLoaderRules.NotEnabledSeverity(true) == Severity.Info,
+              "loader off here, on for another target: a note");
+        Check(DisplayXRLoaderRules.NotEnabledSeverity(false) == Severity.Warning,
+              "loader on nowhere: a warning");
+        foreach (var elsewhere in new[] { true, false })
+        {
+            var rule = Rule("loader-enabled", Severity.Warning,
+                            c => Result.Fail("not ticked", DisplayXRLoaderRules.NotEnabledSeverity(elsewhere)));
+            rule.Fix = c => { };
+            var found = DisplayXRValidationEngine.Evaluate(new[] { rule }, Ctx(Platforms.Android), null);
+            Check(DisplayXRValidationEngine.BuildMessages(found).Count == 0,
+                  "a loader that is not enabled is never written to the build log (elsewhere=" + elsewhere + ")");
+            Check(DisplayXRValidationEngine.FixAllPlan(found).Count == 0,
+                  "and Fix All never enables it (elsewhere=" + elsewhere + ")");
+            Check(found[0].CanFix, "its own Fix button stays (elsewhere=" + elsewhere + ")");
+        }
+
         // The constant must name the real class. The runtime source is next door.
         string root = FindRepoRoot();
         if (root != null)
@@ -371,6 +503,32 @@ static class Program
                   "DisplayXRDisplayLoader is in namespace DisplayXR");
             Check(loader.Contains("class DisplayXRDisplayLoader"), "DisplayXRDisplayLoader is still the loader's class name");
         }
+    }
+
+    // ---- menu multi-selection ---------------------------------------------------
+    // Unity calls a GameObject/ menu item once per selected object from the Hierarchy's
+    // context menu (context = that object), once without context from the menu bar.
+
+    static void TestMenuRules()
+    {
+        Check(DisplayXRMenuRules.ActsOnThisInvocation(false, -1), "menu bar: the one invocation acts");
+        Check(DisplayXRMenuRules.CoversWholeSelection(false, -1), "menu bar: over the whole selection");
+
+        // [Camera, Cube] or N non-cameras, right-clicked: N invocations, one acts.
+        foreach (int n in new[] { 1, 2, 5 })
+        {
+            int acting = 0;
+            for (int i = 0; i < n; i++)
+            {
+                if (DisplayXRMenuRules.ActsOnThisInvocation(true, i)) acting++;
+                Check(DisplayXRMenuRules.CoversWholeSelection(true, i), "a selected context covers the whole selection");
+            }
+            Check(acting == 1, "exactly one of " + n + " per-object invocations acts (got " + acting + ")");
+        }
+
+        // A context that is not in the selection: act for that object alone.
+        Check(DisplayXRMenuRules.ActsOnThisInvocation(true, -1), "context outside the selection acts");
+        Check(!DisplayXRMenuRules.CoversWholeSelection(true, -1), "context outside the selection: only that object");
     }
 
     // ---- native plug-in ---------------------------------------------------------
@@ -477,9 +635,11 @@ static class Program
         TestIds();
         TestEvaluate();
         TestFixAllAndBuildMessages();
+        TestBuildHint();
         TestIgnoreList();
         TestGraphicsApis();
         TestLoaders();
+        TestMenuRules();
         TestNativePlugin();
         TestAndroid();
         TestVersions();

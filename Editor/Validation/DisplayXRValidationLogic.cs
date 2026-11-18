@@ -154,6 +154,21 @@ namespace DisplayXR.Editor
             return index == 0 ? Verdict.OtherLoaderAfter : Verdict.OtherLoaderFirst;
         }
 
+        /// <summary>
+        /// How serious "the DisplayXR loader is not enabled for this build target" is.
+        /// Never an Error: leaving a target without the loader is a legitimate choice (a
+        /// Windows-only 3D app that also has an Android target), so it must not reach the
+        /// build log, which reports Errors only. A note when the loader is enabled for
+        /// another target - then it is clearly a choice; a Warning when it is enabled
+        /// nowhere - then the package is installed and does nothing.
+        /// </summary>
+        public static DisplayXRValidationSeverity NotEnabledSeverity(bool enabledForAnotherTarget)
+        {
+            return enabledForAnotherTarget
+                ? DisplayXRValidationSeverity.Info
+                : DisplayXRValidationSeverity.Warning;
+        }
+
         /// <summary>Every loader in the list that is not DisplayXR's, in order.</summary>
         public static List<string> Others(IList<string> loaderTypeNames)
         {
@@ -260,6 +275,37 @@ namespace DisplayXR.Editor
         {
             if ((androidArchitectureMask & ArchARM64) == 0) return ArchVerdict.NoArm64;
             return androidArchitectureMask == ArchARM64 ? ArchVerdict.Arm64Only : ArchVerdict.Arm64AndOthers;
+        }
+    }
+
+    /// <summary>
+    /// How a <c>GameObject/...</c> menu item treats a multi-selection. From the Hierarchy's
+    /// right-click menu Unity invokes the item once PER selected object, each time with
+    /// that object as the command's context; from the main menu bar it invokes it once,
+    /// with no context. An item that must act once over the whole selection therefore
+    /// has to drop all but one of those invocations.
+    /// </summary>
+    public static class DisplayXRMenuRules
+    {
+        /// <summary>
+        /// Whether this invocation is the one that does the work.
+        /// <paramref name="contextIndexInSelection"/> is the context object's index in
+        /// the selection, or -1 when it is not part of it.
+        /// </summary>
+        public static bool ActsOnThisInvocation(bool hasContext, int contextIndexInSelection)
+        {
+            // No context: the single main-menu invocation. Context outside the selection:
+            // an invocation for that one object alone. Otherwise only the first of the N.
+            return !hasContext || contextIndexInSelection <= 0;
+        }
+
+        /// <summary>
+        /// Whether the invocation covers the whole selection (true) or only the context
+        /// object (false - the context is not part of the selection).
+        /// </summary>
+        public static bool CoversWholeSelection(bool hasContext, int contextIndexInSelection)
+        {
+            return !hasContext || contextIndexInSelection >= 0;
         }
     }
 
