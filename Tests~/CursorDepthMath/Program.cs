@@ -195,6 +195,7 @@ static class Program
         TestPose();
         TestEndToEnd();
         Console.WriteLine($"cursor_depth_math (C#): {s_pass} passed, {s_fail} failed");
-        return s_fail == 0 ? 0 : 1;
+        int autoConvergenceFailed = AutoConvergenceTests.Run(); // #461, same harness
+        return s_fail == 0 && autoConvergenceFailed == 0 ? 0 : 1;
     }
 }

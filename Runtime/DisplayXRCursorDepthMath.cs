@@ -104,6 +104,25 @@ namespace DisplayXR
         }
 
         /// <summary>
+        /// Raw depth -> linear eye depth (distance along the view's forward axis, in the
+        /// projection's units), without inverting the matrix: depth along the axis depends
+        /// only on the projection's z and w rows, also for an off-axis frustum. Returns
+        /// +infinity for background (nothing drawn) and NaN for a degenerate projection.
+        /// Used by the full-frame grid (auto-convergence, #461); allocation-free.
+        /// </summary>
+        public static float LinearEyeDepth(float[] proj, float raw, bool reversedZ)
+        {
+            if (proj == null || proj.Length < 16) return float.NaN;
+            if (IsBackground(raw, reversedZ)) return float.PositiveInfinity;
+            // clip z = m10 z + m14, clip w = m11 z + m15  ->  z = (m14 - ndc m15) / (ndc m11 - m10)
+            float ndc = NdcZFromRaw(raw, reversedZ);
+            float den = ndc * proj[11] - proj[10];
+            if (!(Math.Abs(den) > 1e-12f)) return float.NaN;
+            float z = (proj[14] - ndc * proj[15]) / den;
+            return -z;
+        }
+
+        /// <summary>
         /// The z remap of <c>GL.GetGPUProjectionMatrix(proj, false)</c>: on reversed-Z, row 2
         /// becomes (row3 - row2) / 2, so z/w lands in [0, 1] with near = 1. Unchanged on OpenGL.
         /// </summary>

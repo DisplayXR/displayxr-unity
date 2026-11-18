@@ -504,6 +504,171 @@ namespace DisplayXR
         }
 
         // -----------------------------------------------------------------
+        // Comfort volume (#461)
+        //
+        // Where content reaches the front / behind comfort cap, drawn as two
+        // rectangles either side of the screen plane and joined to it. An
+        // APPROXIMATION for authoring: plain similar triangles from the
+        // nominal eye separation and the display's nominal viewing distance.
+        // It is not the runtime's projection (the runtime owns that) and it
+        // ignores the tracked head, perspectiveFactor and window offsets.
+        // -----------------------------------------------------------------
+
+        const string kComfortVolumePref = "DisplayXR.Gizmos.ComfortVolume";
+        static int s_ShowComfortVolume = -1;
+
+        /// <summary>Draw the comfort volume for EVERY rig (editor preference, OFF by default;
+        /// menu DisplayXR > Gizmos > Comfort Volume). A rig that carries a
+        /// DisplayXRAutoConvergence draws it regardless - that rig's author opted in -
+        /// so projects that do not use auto-convergence see no change in their gizmos.</summary>
+        public static bool ShowComfortVolume
+        {
+            get
+            {
+                if (s_ShowComfortVolume < 0)
+                    s_ShowComfortVolume = UnityEditor.EditorPrefs.GetBool(kComfortVolumePref, false) ? 1 : 0;
+                return s_ShowComfortVolume != 0;
+            }
+            set
+            {
+                s_ShowComfortVolume = value ? 1 : 0;
+                UnityEditor.EditorPrefs.SetBool(kComfortVolumePref, value);
+            }
+        }
+
+        public static readonly Color ComfortFront = new Color(1f, 0.35f, 0.3f, 0.9f);
+        public static readonly Color ComfortBehind = new Color(0.3f, 0.9f, 0.5f, 0.9f);
+
+        /// <summary>Whether to draw the comfort volume for a rig, and with which caps: an
+        /// auto-convergence component on the same object supplies its own (after its depth
+        /// scale) and always draws; otherwise the defaults, only when the menu toggle is on.</summary>
+        public static bool GetComfortCapsDegrees(Component rig, out float frontDeg, out float behindDeg)
+        {
+            frontDeg = DisplayXRAutoConvergenceMath.DefaultFrontCapDegrees;
+            behindDeg = DisplayXRAutoConvergenceMath.DefaultBehindCapDegrees;
+            var ac = rig != null ? rig.GetComponent<DisplayXRAutoConvergence>() : null;
+            if (ac == null) return ShowComfortVolume;
+            frontDeg = ac.frontCapDegrees * ac.depthScale;
+            behindDeg = ac.behindCapDegrees * ac.depthScale;
+            return true;
+        }
+
+        static void DrawLocalRect(Transform rig, float z, float halfW, float halfH, Color color,
+                                  out Vector3 bl, out Vector3 br, out Vector3 tr, out Vector3 tl)
+        {
+            bl = rig.TransformPoint(new Vector3(-halfW, -halfH, z));
+            br = rig.TransformPoint(new Vector3(+halfW, -halfH, z));
+            tr = rig.TransformPoint(new Vector3(+halfW, +halfH, z));
+            tl = rig.TransformPoint(new Vector3(-halfW, +halfH, z));
+            Gizmos.color = color;
+            Gizmos.DrawLine(bl, br);
+            Gizmos.DrawLine(br, tr);
+            Gizmos.DrawLine(tr, tl);
+            Gizmos.DrawLine(tl, bl);
+        }
+
+        static void JoinRects(Color color, Vector3 aBL, Vector3 aBR, Vector3 aTR, Vector3 aTL,
+                              Vector3 bBL, Vector3 bBR, Vector3 bTR, Vector3 bTL)
+        {
+            Gizmos.color = new Color(color.r, color.g, color.b, color.a * 0.45f);
+            Gizmos.DrawLine(aBL, bBL);
+            Gizmos.DrawLine(aBR, bBR);
+            Gizmos.DrawLine(aTR, bTR);
+            Gizmos.DrawLine(aTL, bTL);
+        }
+
+        /// <summary>
+        /// Camera-centric rig: the screen plane is at 1/invConvergenceDistance; the limits are
+        /// where the estimated disparity (<see cref="DisplayXRAutoConvergenceMath.Disparity"/>)
+        /// meets the caps (physical angles, converted through <paramref name="viewWidthMeters"/>,
+        /// the physical width of the canvas). With a parallel rig (inv = 0) only a front limit exists; a behind
+        /// limit past <paramref name="maxDrawDistance"/> is not drawn (everything behind the
+        /// screen is inside the cap).
+        /// </summary>
+        public static void DrawCameraComfortVolume(
+            Transform rig, float fovDeg, float aspect, float invConvergence, float ipdFactor,
+            float frontCapDeg, float behindCapDeg, DisplayXRDisplayInfo info, float viewWidthMeters,
+            float maxDrawDistance)
+        {
+            if (rig == null) return;
+            float tanV = Mathf.Tan(fovDeg * 0.5f * Mathf.Deg2Rad);
+            float tanH = tanV * aspect;
+            float viewDist = info.isValid ? info.nominalViewerZ : 0f;
+            float width = viewWidthMeters > 0f ? viewWidthMeters : (info.isValid ? info.displayWidthMeters : 0f);
+            float capF = DisplayXRAutoConvergenceMath.CapFractionFromDegrees(frontCapDeg, viewDist, width);
+            float capB = DisplayXRAutoConvergenceMath.CapFractionFromDegrees(behindCapDeg, viewDist, width);
+            // Rig units: the eye baseline is a physical distance in WORLD units whatever the
+            // rig's scale, so in the rig's own units it is ipd / scale.
+            float k = DisplayXRAutoConvergenceMath.DisparityScale(
+                DisplayXRAutoConvergenceMath.BaselineInRigUnits(NOMINAL_IPD_METERS, Mathf.Abs(rig.lossyScale.y)), tanH);
+            DisplayXRAutoConvergenceMath.ComfortRangeQ(k, ipdFactor, invConvergence, capF, capB,
+                                                       out float frontQ, out float behindQ);
+            bool haveScreen = invConvergence > 0.001f;
+            float zs = haveScreen ? 1f / invConvergence : 0f;
+            Vector3 sBL = default, sBR = default, sTR = default, sTL = default;
+            if (haveScreen)
+            {
+                sBL = rig.TransformPoint(new Vector3(-zs * tanH, -zs * tanV, zs));
+                sBR = rig.TransformPoint(new Vector3(+zs * tanH, -zs * tanV, zs));
+                sTR = rig.TransformPoint(new Vector3(+zs * tanH, +zs * tanV, zs));
+                sTL = rig.TransformPoint(new Vector3(-zs * tanH, +zs * tanV, zs));
+            }
+            if (frontQ > 0f && !float.IsInfinity(frontQ))
+            {
+                float z = 1f / frontQ;
+                DrawLocalRect(rig, z, z * tanH, z * tanV, ComfortFront, out var bl, out var br, out var tr, out var tl);
+                if (haveScreen) JoinRects(ComfortFront, sBL, sBR, sTR, sTL, bl, br, tr, tl);
+            }
+            if (behindQ > 0f && 1f / behindQ <= maxDrawDistance)
+            {
+                float z = 1f / behindQ;
+                DrawLocalRect(rig, z, z * tanH, z * tanV, ComfortBehind, out var bl, out var br, out var tr, out var tl);
+                if (haveScreen) JoinRects(ComfortBehind, sBL, sBR, sTR, sTL, bl, br, tr, tl);
+            }
+        }
+
+        /// <summary>
+        /// Display-centric rig: the screen plane is the virtual display (rig-local z = 0, the
+        /// viewer on -Z). A cap of p metres of on-glass disparity is reached at the physical
+        /// depth V p / (e + p) in front and V p / (e - p) behind (e = eye separation x IPD
+        /// factor, V = nominal viewing distance; no behind limit when p >= e), scaled into
+        /// the rig by virtual / physical display height.
+        /// </summary>
+        public static void DrawDisplayComfortVolume(
+            Transform rig, float virtualWidth, float virtualHeight, float ipdFactor,
+            float frontCapDeg, float behindCapDeg, DisplayXRDisplayInfo info, float physicalHeightMeters)
+        {
+            if (rig == null) return;
+            float e = NOMINAL_IPD_METERS * ipdFactor;
+            if (e < 1e-5f || virtualHeight <= 0f) return; // no stereo: nothing to bound
+            float viewDist = info.isValid && info.nominalViewerZ > 0f
+                ? info.nominalViewerZ : DisplayXRAutoConvergenceMath.FallbackViewingDistanceMeters;
+            float physH = physicalHeightMeters > 0f ? physicalHeightMeters
+                : (info.isValid && info.displayHeightMeters > 0f ? info.displayHeightMeters : 0.2f);
+            float toRig = virtualHeight / physH;
+            float pF = Mathf.Tan(Mathf.Min(frontCapDeg, 89f) * Mathf.Deg2Rad) * viewDist;
+            float pB = Mathf.Tan(Mathf.Min(behindCapDeg, 89f) * Mathf.Deg2Rad) * viewDist;
+            float hw = virtualWidth * 0.5f, hh = virtualHeight * 0.5f;
+            Vector3 sBL = rig.TransformPoint(new Vector3(-hw, -hh, 0f));
+            Vector3 sBR = rig.TransformPoint(new Vector3(+hw, -hh, 0f));
+            Vector3 sTR = rig.TransformPoint(new Vector3(+hw, +hh, 0f));
+            Vector3 sTL = rig.TransformPoint(new Vector3(-hw, +hh, 0f));
+
+            float front = viewDist * pF / (e + pF);              // metres in front of the glass
+            float sf = (viewDist - front) / viewDist;            // the view cone narrows toward the eye
+            DrawLocalRect(rig, -front * toRig, hw * sf, hh * sf, ComfortFront, out var bl, out var br, out var tr, out var tl);
+            JoinRects(ComfortFront, sBL, sBR, sTR, sTL, bl, br, tr, tl);
+
+            if (pB < e * 0.98f)
+            {
+                float behind = viewDist * pB / (e - pB);
+                float sb = (viewDist + behind) / viewDist;
+                DrawLocalRect(rig, behind * toRig, hw * sb, hh * sb, ComfortBehind, out bl, out br, out tr, out tl);
+                JoinRects(ComfortBehind, sBL, sBR, sTR, sTL, bl, br, tr, tl);
+            }
+        }
+
+        // -----------------------------------------------------------------
         // Eye-glyph colors
         // -----------------------------------------------------------------
 

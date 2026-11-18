@@ -422,6 +422,13 @@ namespace DisplayXR
             Gizmos.DrawWireCube(Vector3.zero, new Vector3(w, h, 0.002f));
             Gizmos.matrix = Matrix4x4.identity;
 
+            // Comfort volume (#461): where content reaches the front / behind disparity
+            // cap either side of the virtual display. Approximate, authoring aid only.
+            // Drawn only when the DisplayXR > Gizmos > Comfort Volume toggle (off by default) is on.
+            if (DisplayXRGizmoHelpers.GetComfortCapsDegrees(this, out float capFrontDeg, out float capBehindDeg))
+                DisplayXRGizmoHelpers.DrawDisplayComfortVolume(
+                    transform, w, h, ipdFactor, capFrontDeg, capBehindDeg, info, windowMode ? winH_m : 0f);
+
             float hw = w * 0.5f;
             float hh = h * 0.5f;
             Vector3 cBL = transform.TransformPoint(new Vector3(-hw, -hh, 0f));
