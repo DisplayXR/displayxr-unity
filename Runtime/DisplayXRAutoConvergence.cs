@@ -39,8 +39,10 @@ namespace DisplayXR
         public enum Mode
         {
             /// <summary>Scene depth where the render pipeline provides a depth texture, else
-            /// physics rays. (BiRP forward without a camera depth texture uses rays: a depth
-            /// pre-pass is never forced on the app.)</summary>
+            /// physics rays. This component never forces a depth pre-pass; on BiRP forward the
+            /// DisplayXR rig's own foreground-clip pass already keeps the camera depth texture
+            /// on, so Auto uses depth there too. Rays are the fallback for a custom pipeline
+            /// or when no depth grid arrives.</summary>
             Auto = 0,
             /// <summary>A low-resolution grid of the camera depth texture (asynchronous
             /// readback; never waits on the GPU).</summary>
@@ -62,7 +64,8 @@ namespace DisplayXR
         public Mode mode = Mode.Auto;
 
         [Tooltip("Also reduce the rig's IPD Factor when the scene's nearest / farthest content " +
-                 "would exceed the comfort caps. Never raises it above the authored value.")]
+                 "would exceed the comfort caps: at once when a cap is reached, back up only " +
+                 "gradually. Never raises it above the authored value.")]
         public bool driveStereoStrength = true;
 
         [Header("Convergence")]
@@ -198,7 +201,8 @@ namespace DisplayXR
         /// <summary>Depth source only: mean depth (rig metres) of the TOP and BOTTOM third of
         /// the last grid; NaN when that third had no depth. A diagnostic for the grid's
         /// vertical orientation, which the bottom-row damping depends on: look at a floor
-        /// from standing height - the bottom third must be the NEARER one. If it is the top
+        /// from standing height - the bottom third must be the NEARER one. NaN whenever the
+        /// current source is not Depth or the last grid is older than three sample periods. If it is the top
         /// third, the grid is upside down on this graphics API / pipeline (set
         /// <c>DISPLAYXR_CURSOR_DEPTH_FLIPY=1</c> and report it).</summary>
         public float GridTopThirdDepth { get; private set; } = float.NaN;
@@ -213,8 +217,7 @@ namespace DisplayXR
         /// </summary>
         public void ResetConvergence()
         {
-            m_Conv.SnapNext();
-            m_Strength.SnapNext();
+            m_Conv.SnapNext(); // (strength: a cap still bites at once, and still recovers slowly)
             m_NextSampleTime = 0f;
             m_LastClumpQ = -1f;
             m_GridNotBeforeFrame = Time.frameCount;
@@ -233,7 +236,6 @@ namespace DisplayXR
 
         const int kMaxSamples = DisplayXRCursorDepthPatch.Size * DisplayXRCursorDepthPatch.Size;
         const float kDepthFallbackSeconds = 1.0f;   // Auto: no grid for this long -> rays
-        const float kStrengthDownFactor = 0.35f;    // stereo backs off faster than it returns
 
         DisplayXRCamera m_Rig;
         Camera m_Camera;
@@ -243,9 +245,10 @@ namespace DisplayXR
         // The authored tunables, and what we last wrote (to tell our writes from anyone else's).
         float m_AuthoredInv, m_AuthoredIpd;
         float m_WrittenInv = float.NaN, m_WrittenIpd = float.NaN;
-        float m_FedAuthoredIpd; // the authored strength the strength target was last solved for
 
-        DisplayXRAutoConvergenceMath.Follower m_Conv, m_Strength;
+        DisplayXRAutoConvergenceMath.Follower m_Conv;
+        // The delivered strength: caps push it down at once, it only recovers gradually.
+        DisplayXRAutoConvergenceMath.StrengthGovernor m_Strength;
         DisplayXRAutoConvergenceMath.Workspace m_Work;
         float[] m_Q, m_U, m_V;
         float m_NextSampleTime;
@@ -253,6 +256,7 @@ namespace DisplayXR
         // The disparity model, refreshed every frame: content extremes of the last sample,
         // caps (fraction of the view width, after the depth scale), and k in rig units.
         float m_NearQ, m_FarQ;
+        bool m_HaveExtremes; // a sample has reported the content extremes
         float m_K, m_CapFront, m_CapBehind;
         bool m_NoCanvasApi;
 
@@ -293,7 +297,7 @@ namespace DisplayXR
             m_V ??= new float[kMaxSamples];
 
             m_AuthoredInv = m_Rig.invConvergenceDistance;
-            m_AuthoredIpd = m_FedAuthoredIpd = m_Rig.ipdFactor;
+            m_AuthoredIpd = m_Rig.ipdFactor;
             m_WrittenInv = m_WrittenIpd = float.NaN;
             m_Conv.Reset(m_AuthoredInv);
             m_Strength.Reset(m_AuthoredIpd);
@@ -301,6 +305,8 @@ namespace DisplayXR
             m_NextSampleTime = 0f;
             m_LastClumpQ = -1f;
             m_NearQ = m_FarQ = 0f;
+            m_HaveExtremes = false;
+            GridTopThirdDepth = GridBottomThirdDepth = float.NaN;
             m_GridSerial = DisplayXRCursorDepthPatch.GridSerial;
             m_GridFrameConsumed = -1;
             m_GridNotBeforeFrame = Time.frameCount;
@@ -362,6 +368,7 @@ namespace DisplayXR
                 m_DepthWantedSince = m_LastGridTime = -1f;
                 m_GridSerial = DisplayXRCursorDepthPatch.GridSerial;
                 m_WasGated = true;
+                GridTopThirdDepth = GridBottomThirdDepth = float.NaN;
                 return;
             }
             if (m_WasGated)
@@ -438,36 +445,46 @@ namespace DisplayXR
                 if (measured) Feed(screenQ);
             }
 
-            // ---- Follow and write ----
-            if (!m_Conv.have)
-            {
-                IsDriving = false;
-                return; // nothing confident yet: the authored values stand
-            }
-            IsDriving = true;
-            float dt = Time.unscaledDeltaTime;
-            float inv = Mathf.Clamp(m_Conv.Step(dt, timeConstant), 0f, 10f);
-            m_Rig.invConvergenceDistance = inv;
-            m_WrittenInv = inv;
+            // The grid-orientation readout describes the grid the Depth source is using NOW:
+            // not one from an earlier place, kept while rays or a target supply the samples.
+            if (Source != ActiveSource.Depth || m_LastGridTime < 0f || now - m_LastGridTime > 3f * samplePeriod)
+                GridTopThirdDepth = GridBottomThirdDepth = float.NaN;
 
-            if (driveStereoStrength && m_Strength.have)
+            // ---- Follow and write ----
+            float dt = Time.unscaledDeltaTime;
+            float inv;
+            if (m_Conv.have)
             {
-                if (m_AuthoredIpd != m_FedAuthoredIpd)
+                IsDriving = true;
+                inv = Mathf.Clamp(m_Conv.Step(dt, timeConstant), 0f, 10f);
+                m_Rig.invConvergenceDistance = inv;
+                m_WrittenInv = inv;
+            }
+            else
+            {
+                // Nothing confident yet: the authored convergence stands. The caps below
+                // still apply to it once a sample has reported what is in the frame.
+                IsDriving = false;
+                inv = Mathf.Clamp(m_AuthoredInv, 0f, 10f);
+            }
+
+            if (driveStereoStrength)
+            {
+                // ONE state for the delivered strength. The caps, evaluated at the convergence
+                // actually delivered this frame, push it down at once; it comes back only
+                // gradually, at the follower's time constant - whatever lifted the cap (the
+                // plane arriving, an intruder leaving while the convergence holds, a
+                // low-confidence sample).
+                float bound = m_HaveExtremes
+                    ? DisplayXRAutoConvergenceMath.StrengthForCaps(
+                        m_K, m_AuthoredIpd, inv, m_NearQ, m_FarQ, m_CapFront, m_CapBehind)
+                    : m_AuthoredIpd;
+                float f = m_Strength.Step(dt, timeConstant, m_AuthoredIpd, bound);
+                if (m_HaveExtremes || !float.IsNaN(m_WrittenIpd))
                 {
-                    // The ceiling moved (an app slider) between samples, possibly while
-                    // holding: re-solve the target now instead of at the next confident sample.
-                    m_FedAuthoredIpd = m_AuthoredIpd;
-                    m_Strength.Retarget(DisplayXRAutoConvergenceMath.StrengthForCaps(
-                        m_K, m_AuthoredIpd, m_Conv.target, m_NearQ, m_FarQ, m_CapFront, m_CapBehind));
+                    m_Rig.ipdFactor = f;
+                    m_WrittenIpd = f;
                 }
-                float f = m_Strength.StepAsymmetric(dt, timeConstant, timeConstant * kStrengthDownFactor);
-                // The follower heads for the strength that fits once the plane has ARRIVED.
-                // While the plane is still travelling, bound it by the caps at the convergence
-                // actually delivered this frame - at once, not through the follower.
-                f = DisplayXRAutoConvergenceMath.BoundStrength(
-                    f, m_K, m_AuthoredIpd, inv, m_NearQ, m_FarQ, m_CapFront, m_CapBehind);
-                m_Rig.ipdFactor = f;
-                m_WrittenIpd = f;
                 StereoStrength = f;
             }
             else if (!float.IsNaN(m_WrittenIpd))
@@ -480,6 +497,7 @@ namespace DisplayXR
             }
             else
             {
+                m_Strength.Reset(m_AuthoredIpd);
                 StereoStrength = m_AuthoredIpd;
             }
 
@@ -531,7 +549,8 @@ namespace DisplayXR
                 tanHalfH);
         }
 
-        // A confident measurement: clamp, hand it to the followers, size the strength.
+        // A confident measurement: clamp and hand it to the convergence follower. (The
+        // strength needs no feeding: it is bounded every frame in LateUpdate.)
         void Feed(float screenQ)
         {
             float qMin = 1f / Mathf.Max(maxConvergenceDistance, minConvergenceDistance);
@@ -541,13 +560,6 @@ namespace DisplayXR
             float kf = m_K * Mathf.Max(m_AuthoredIpd, 0.05f);
             float deadbandQ = kf > 0f ? deadBand * (m_CapFront + m_CapBehind) / kf : 0f;
             m_Conv.Measure(screenQ, deadbandQ);
-
-            // Where the strength should settle once the plane has arrived. (The per-frame
-            // bound in LateUpdate covers the journey.)
-            float strength = DisplayXRAutoConvergenceMath.StrengthForCaps(
-                m_K, m_AuthoredIpd, m_Conv.target, m_NearQ, m_FarQ, m_CapFront, m_CapBehind);
-            m_FedAuthoredIpd = m_AuthoredIpd;
-            m_Strength.Measure(strength, 0.02f * m_AuthoredIpd);
         }
 
         // ---- Depth grid ----------------------------------------------------------------
@@ -647,6 +659,7 @@ namespace DisplayXR
             {
                 m_NearQ = est.nearQ;
                 m_FarQ = est.farQ;
+                m_HaveExtremes = true;
             }
             if (!ok) return false;
             m_LastClumpQ = est.clumpQ;
@@ -698,6 +711,7 @@ namespace DisplayXR
             screenQ = scale / d;
             m_NearQ = scale / Mathf.Max(d - reach, 1e-4f);
             m_FarQ = scale / (d + reach);
+            m_HaveExtremes = true;
             Confidence = 1f;
             ValidSamples = TotalSamples = 1;
             return true;
