@@ -313,6 +313,180 @@ static class AutoConvergenceTests
         Check(float.IsNaN(DisplayXRCursorDepthMath.LinearEyeDepth(null, 0.5f, true)), "null projection is NaN");
     }
 
+    // ---- Review findings (#461): one regression test each --------------------------------
+
+    // Finding 1: the caps must hold for what is DELIVERED while the plane is still moving.
+    static void TestDeliveredDisparityWhilePlaneMoves()
+    {
+        const float dt = 1f / 60f, tau = 1.2f;
+        float k = M.DisparityScale(0.063f, (float)Math.Tan(30 * Math.PI / 180) * 16f / 9f); // vfov 60, 16:9
+        float capF = M.CapFractionFromDegrees(0.6f, 0.6f, 0.344f), capB = M.CapFractionFromDegrees(1.2f, 0.6f, 0.344f);
+
+        foreach (bool towardNear in new[] { true, false })
+        {
+            // Settled on one flat surface, then the camera turns to another: 50 m -> 0.5 m
+            // (front cap at risk) and 0.5 m -> 50 m (behind cap at risk).
+            float q0 = towardNear ? 1f / 50f : 2f, q1 = towardNear ? 2f : 1f / 50f;
+            var conv = new M.Follower(); conv.Reset(q0); conv.Measure(q0, 0f);
+            var str = new M.Follower(); str.Reset(1f); str.Measure(1f, 0f);
+            for (int i = 0; i < 120; i++) { conv.Step(dt, tau); str.StepAsymmetric(dt, tau, tau * 0.35f); }
+
+            float worstBounded = 0f, worstUnbounded = 0f, maxStrength = 0f, t = 0f, next = 0f;
+            for (int i = 0; i < 600; i++, t += dt)
+            {
+                if (t >= next)
+                {
+                    next = t + 0.15f;
+                    conv.Measure(q1, 0.001f);
+                    str.Measure(M.StrengthForCaps(k, 1f, conv.target, q1, q1, capF, capB), 0.02f);
+                }
+                float inv = conv.Step(dt, tau);
+                float followed = str.StepAsymmetric(dt, tau, tau * 0.35f);
+                float delivered = M.BoundStrength(followed, k, 1f, inv, q1, q1, capF, capB);
+                float cap = towardNear ? capF : capB;
+                float dB = Math.Abs(M.Disparity(k, delivered, inv, q1)) / cap;
+                float dU = Math.Abs(M.Disparity(k, Math.Min(followed, 1f), inv, q1)) / cap;
+                if (dB > worstBounded) worstBounded = dB;
+                if (dU > worstUnbounded) worstUnbounded = dU;
+                if (delivered > maxStrength) maxStrength = delivered;
+            }
+            string dir = towardNear ? "50 m -> 0.5 m" : "0.5 m -> 50 m";
+            Check(worstUnbounded > 1.5f, $"{dir}: without the per-frame bound the cap is exceeded ({worstUnbounded:F2}x) - the test bites");
+            Check(worstBounded <= 1.0005f, $"{dir}: delivered disparity never exceeds the cap ({worstBounded:F4}x)");
+            Check(maxStrength <= 1f + 1e-6f, $"{dir}: delivered strength never above the authored one");
+            float end = M.BoundStrength(str.x, k, 1f, conv.x, q1, q1, capF, capB);
+            Check(Near(end, 1f, 1e-3f), $"{dir}: full strength again once the plane has arrived ({end:F4})");
+        }
+        Check(M.BoundStrength(float.NaN, k, 1f, 0.5f, 0.5f, 0.5f, capF, capB) == 1f, "bound: a NaN followed value falls back to the bound");
+        Check(M.StrengthForCaps(k, 1f, 0.5f, 5f, 0f, float.NaN, float.NaN) == 0f, "a NaN cap is no stereo, not NaN");
+    }
+
+    // Finding 4: content nearer than the minimum distance must not blind the clump search.
+    static void TestNearIntruderDoesNotBlindTheClump()
+    {
+        // A room at 6 m, a centred character at 1.5 m (20 %), and something 15 cm from the
+        // lens in a corner (9 %) - nearer than the 0.3 m minimum convergence distance.
+        Func<float, float, float> scene = (u, v) =>
+            (u > 0.7f && v < 0.3f) ? 0.15f
+            : ((Math.Abs(u - 0.5f) < 0.2f && Math.Abs(v - 0.5f) < 0.25f) ? 1.5f : 6f);
+        bool ok = Run(scene, out var e);
+        Check(ok && e.valid, "near intruder: still a valid estimate (was: hold forever)");
+        Check(Near(e.clumpQ, 1f / 1.5f, 0.02f), $"near intruder: the clump is the character (q={e.clumpQ:F3})");
+        Check(1f / e.screenQ > 0.9f && 1f / e.screenQ < 3f, $"near intruder: screen near the character ({1f / e.screenQ:F2} m)");
+        Check(Near(e.nearQ, 1f / 0.15f, 1e-3f), "near intruder: its true nearness still reaches the caps");
+    }
+
+    // Finding 5g: the content extremes are reported even when the screen plane is not confident.
+    static void TestExtremesReportedWhenHolding()
+    {
+        // 25 texels of something at 0.4 m against sky: below the 3 % floor -> hold...
+        bool ok = Run((u, v) => (u < 0.16f && v > 0.84f) ? 0.4f : float.PositiveInfinity, out var e);
+        Check(!ok && !e.valid, "small intruder: the screen plane holds");
+        // ...but it is more than 2 % of the frame, so the front cap must see it.
+        Check(e.samples == N && Near(e.nearQ, 2.5f, 1e-3f), $"small intruder: nearQ still reported for the caps ({e.nearQ:F2})");
+    }
+
+    // Findings 2 and 3: which depth grids a consumer may use.
+    static void TestGridAcceptance()
+    {
+        Check(M.AcceptGrid(100, -1, 0, true), "a first grid from this camera is taken");
+        Check(!M.AcceptGrid(100, 100, 0, true), "the same grid published twice is taken once (median of three stays three samples)");
+        Check(!M.AcceptGrid(99, 100, 0, true), "an older grid arriving late is ignored");
+        Check(!M.AcceptGrid(100, 90, 101, true), "a grid drawn before ResetConvergence() is ignored");
+        Check(M.AcceptGrid(101, 90, 101, true), "a grid drawn in the reset frame (rendered after it) is taken");
+        Check(!M.AcceptGrid(100, 90, 0, false), "another rig's grid is ignored");
+
+        // The sequence the reset exists for: a pre-cut grid in flight must not take the snap.
+        var f = new M.Follower();
+        f.Reset(0.2f); f.Measure(0.2f, 0f);
+        for (int i = 0; i < 120; i++) f.Step(1f / 60f, 1.2f);
+        int notBefore = 500, consumed = 480;
+        f.SnapNext();
+        if (M.AcceptGrid(498, consumed, notBefore, true)) f.Measure(0.2f, 0f);   // pre-cut grid arrives late
+        Check(!f.fast, "pre-cut grid after a reset does not use up the fast ramp");
+        if (M.AcceptGrid(501, consumed, notBefore, true)) f.Measure(1.5f, 0f);   // first post-cut grid
+        Check(f.fast && Near(f.target, 1.5f, 1e-6f), "the first post-cut grid gets the fast ramp");
+    }
+
+    // Finding 6: rig scale. The runtime keeps the eye baseline a physical distance in WORLD
+    // units (camera rig sent with metersToVirtual = 1) while the convergence is authored in
+    // rig units (the driver sends inv / scale). Everything must agree with the world answer.
+    static void TestRigScale()
+    {
+        float tanH = 1.0264f;
+        float capF = M.CapFractionFromDegrees(0.6f, 0.6f, 0.344f), capB = M.CapFractionFromDegrees(1.2f, 0.6f, 0.344f);
+        float kWorld = M.DisparityScale(0.063f, tanH);
+        // World-space scene: screen at 4 units, content from 1 to 400 units.
+        float qsW = 1f / 4f, qnW = 1f, qfW = 1f / 400f;
+        float dWorld = M.Disparity(kWorld, 1f, qsW, qnW);
+        float fWorld = M.StrengthForCaps(kWorld, 1f, qsW, qnW, qfW, capF, capB);
+        Check(fWorld < 1f, "rig scale: the reference scene is cap-limited");
+        foreach (float scale in new[] { 0.1f, 1f, 10f })
+        {
+            // Rig units: q_rig = scale * q_world (what the component computes from depth).
+            float k = M.DisparityScale(M.BaselineInRigUnits(0.063f, scale), tanH);
+            float d = M.Disparity(k, 1f, scale * qsW, scale * qnW);
+            float f = M.StrengthForCaps(k, 1f, scale * qsW, scale * qnW, scale * qfW, capF, capB);
+            Check(Near(d, dWorld, Math.Abs(dWorld) * 1e-4f), $"rig scale {scale}: disparity equals the world-space value ({d:F5} vs {dWorld:F5})");
+            Check(Near(f, fWorld, 1e-4f), $"rig scale {scale}: strength equals the world-space value ({f:F4} vs {fWorld:F4})");
+            M.ComfortRangeQ(k, 1f, scale * qsW, capF, capB, out float fq, out _);
+            M.ComfortRangeQ(kWorld, 1f, qsW, capF, capB, out float fqW, out _);
+            Check(Near(fq / scale, fqW, fqW * 1e-4f), $"rig scale {scale}: the gizmo's front limit is the same world distance");
+        }
+        // The old model (63 mm in RIG units) was wrong by the scale factor.
+        float kOld = M.DisparityScale(0.063f, tanH);
+        float fOld = M.StrengthForCaps(kOld, 1f, 10f * qsW, 10f * qnW, 10f * qfW, capF, capB);
+        Check(fOld < 0.2f * fWorld, "rig scale 10: the unscaled baseline cut the strength ~10x too hard (regression guard)");
+        Check(M.BaselineInRigUnits(0.063f, 0f) == 0.063f && M.BaselineInRigUnits(0.063f, float.NaN) == 0.063f, "degenerate scale reads as 1");
+    }
+
+    // Finding 5d: a ceiling that moves between samples re-targets at once.
+    static void TestRetargetAndFollowerHardening()
+    {
+        var f = new M.Follower();
+        f.Reset(1f);
+        f.Retarget(2f);
+        Check(!f.have && f.target == 1f, "retarget before the first measurement is a no-op");
+        f.Measure(0.8f, 0f);
+        for (int i = 0; i < 120; i++) f.StepAsymmetric(1f / 60f, 1.2f, 0.42f);
+        f.Retarget(1.5f);
+        Check(Near(f.target, 1.5f, 1e-6f), "retarget moves the target without waiting for the median");
+        f.Measure(1.5f, 0f);
+        Check(Near(f.target, 1.5f, 1e-6f), "retarget also refills the median");
+        float x0 = f.x;
+        float x1 = f.StepAsymmetric(1f / 60f, 1.2f, 0.42f);
+        Check(x1 > x0 && x1 < x0 + 0.05f, "retarget is still followed smoothly");
+
+        // A NaN time constant must never turn into a one-frame snap.
+        var g = new M.Follower();
+        g.Reset(0.5f); g.Measure(0.5f, 0f);
+        for (int i = 0; i < 60; i++) g.Step(1f / 60f, 1.2f);
+        g.Measure(1f, 0f); g.Measure(1f, 0f);
+        float gx = g.Step(1f / 60f, float.NaN);
+        Check(gx < 0.6f && !float.IsNaN(gx), $"NaN time constant: no snap ({gx:F3})");
+        g.Step(float.NaN, 1.2f);
+        Check(!float.IsNaN(g.x), "NaN dt: ignored");
+        g.Measure(float.NaN, 0f); g.Measure(float.PositiveInfinity, 0f);
+        Check(Near(g.target, 1f, 1e-6f), "NaN / infinite measurements are ignored");
+    }
+
+    // Design choice, pinned: with exactly two surfaces - a SMALL centred object in front of a
+    // large wall - the percentile sits on the wall and the clump on the object, so the
+    // screen lands half-way between them IN NEARNESS (i.e. the disparity between the two is
+    // split evenly: the object comes out by half of it, the wall recedes by half). Once the
+    // object fills about a fifth of the weighted frame the percentile joins the clump and the
+    // screen sits on the object.
+    static void TestTwoSurfacePolicy()
+    {
+        const float wall = 8f, obj = 2f;
+        Run((u, v) => Centre(u, v, 0.11f) ? obj : wall, out var small);
+        float mid = 0.5f * (1f / wall + 1f / obj);
+        Check(Near(small.percentileQ, 1f / wall, 1e-3f) && Near(small.clumpQ, 1f / obj, 0.01f), "two surfaces, small object: percentile on the wall, clump on the object");
+        Check(Near(small.screenQ, mid, 0.01f), $"two surfaces, small object: screen half-way in nearness ({1f / small.screenQ:F2} m)");
+        Run((u, v) => Centre(u, v, 0.22f) ? obj : wall, out var large);
+        Check(Near(large.screenQ, 1f / obj, 0.01f), $"two surfaces, large object: screen on the object ({1f / large.screenQ:F2} m)");
+    }
+
     public static int Run()
     {
         TestFarPlateauAndNearSubject();
@@ -323,6 +497,13 @@ static class AutoConvergenceTests
         TestFollower();
         TestDistanceText();
         TestLinearEyeDepth();
+        TestDeliveredDisparityWhilePlaneMoves();
+        TestNearIntruderDoesNotBlindTheClump();
+        TestExtremesReportedWhenHolding();
+        TestGridAcceptance();
+        TestRigScale();
+        TestRetargetAndFollowerHardening();
+        TestTwoSurfacePolicy();
         Console.WriteLine($"auto_convergence_math (C#): {s_pass} passed, {s_fail} failed");
         return s_fail;
     }

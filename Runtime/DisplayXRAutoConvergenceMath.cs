@@ -230,7 +230,11 @@ namespace DisplayXR
             // Peaks outside the far plateau. The plateau is the far farExclude of what this
             // frame actually spans (2nd..98th percentile, sky included); a bin is excluded
             // when it lies wholly inside it, so a single flat plane is still its own subject.
-            double farLimit = est.farQ + Clamp(p.farExclude, 0f, 1f) * (double)(est.nearQ - est.farQ);
+            // The span is clamped to the histogram's range: content nearer than its top
+            // (a hand, a first-person weapon) lands in the last bin, and measured unclamped
+            // it would stretch the span until the real subject counted as "far".
+            double spanNear = Math.Min(est.nearQ, histogramMaxQ), spanFar = Math.Min(est.farQ, histogramMaxQ);
+            double farLimit = spanFar + Clamp(p.farExclude, 0f, 1f) * (spanNear - spanFar);
             double binWidth = histogramMaxQ / (double)Bins;
             int best = -1, kept = -1;
             double bestScore = -1.0, keptScore = -1.0;
@@ -374,11 +378,53 @@ namespace DisplayXR
         {
             float f = authored > 0f ? authored : 0f;
             if (!(k > 0f)) return f;
+            if (float.IsNaN(capFront)) capFront = 0f;
+            if (float.IsNaN(capBehind)) capBehind = 0f;
             float front = k * (nearQ - screenQ);   // disparity in front at strength 1
             float behind = k * (screenQ - farQ);   // disparity behind at strength 1
             if (front > 0f) f = Math.Min(f, Math.Max(capFront, 0f) / front);
             if (behind > 0f) f = Math.Min(f, Math.Max(capBehind, 0f) / behind);
             return f;
+        }
+
+        /// <summary>
+        /// The strength to DELIVER this frame: the followed value, bounded by the caps
+        /// evaluated at the convergence actually delivered (<paramref name="deliveredScreenQ"/>).
+        /// The convergence follower lags its target by its time constant; a strength solved
+        /// against the target alone leaves the caps exceeded for as long as the plane is
+        /// still travelling. This bound is applied every frame and takes effect at once.
+        /// </summary>
+        public static float BoundStrength(float followed, float k, float authored, float deliveredScreenQ,
+                                          float nearQ, float farQ, float capFront, float capBehind)
+        {
+            float bound = StrengthForCaps(k, authored, deliveredScreenQ, nearQ, farQ, capFront, capBehind);
+            if (float.IsNaN(followed)) return bound;
+            float f = followed < bound ? followed : bound;
+            return f > 0f ? f : 0f;
+        }
+
+        /// <summary>
+        /// The eye baseline in the RIG's units. The runtime places the eyes a physical
+        /// distance apart in WORLD units whatever the rig's scale (the camera rig is sent with
+        /// metersToVirtual = 1), while the convergence is authored in rig units (the driver
+        /// sends invConvergenceDistance / scale). In rig units the baseline is therefore
+        /// <c>ipd / scale</c>: a rig scaled up 10x sees a tenth of the disparity.
+        /// </summary>
+        public static float BaselineInRigUnits(float ipdMeters, float rigScale)
+        {
+            if (!(rigScale > 1e-6f) || float.IsInfinity(rigScale)) rigScale = 1f;
+            return ipdMeters / rigScale;
+        }
+
+        /// <summary>
+        /// Whether a depth grid may be consumed: it must be newer than the last one consumed
+        /// (the same grid can come back twice), drawn no earlier than
+        /// <paramref name="notBeforeFrame"/> (a reset or a rig switch makes older grids
+        /// evidence about a view that is gone), and drawn from the consumer's own camera.
+        /// </summary>
+        public static bool AcceptGrid(int gridFrame, int lastConsumedFrame, int notBeforeFrame, bool sameCamera)
+        {
+            return sameCamera && gridFrame > lastConsumedFrame && gridFrame >= notBeforeFrame;
         }
 
         /// <summary>
@@ -441,6 +487,17 @@ namespace DisplayXR
                 snapPending = true;
             }
 
+            /// <summary>Move the target now, without the median or the dead band (the
+            /// ceiling itself changed, e.g. the authored strength). No-op before the first
+            /// measurement.</summary>
+            public void Retarget(float value)
+            {
+                if (!have || float.IsNaN(value) || float.IsInfinity(value)) return;
+                target = value;
+                m0 = m1 = m2 = value;
+                nMed = 3;
+            }
+
             /// <summary>Feed one VALID measurement. (No call = hold.)</summary>
             public void Measure(float value, float deadband)
             {
@@ -493,7 +550,8 @@ namespace DisplayXR
                     if (!fast && tauUp != tauDown) v = 0f;
                 }
                 double tau = fast ? tauFast : (down ? tauDown : tauUp);
-                if (!(tau > 1e-4)) tau = 1e-4;
+                if (double.IsNaN(tau) || double.IsInfinity(tau)) tau = 1.0; // never a one-frame snap
+                if (tau < 1e-3) tau = 1e-3;
                 double w = 1.0 / tau;
                 // y = x - target; y(t) = (y0 + (v0 + w y0) t) e^(-wt).
                 double y0 = (double)x - target, v0 = v;
