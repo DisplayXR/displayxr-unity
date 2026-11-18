@@ -1,6 +1,7 @@
 // Copyright 2026, DisplayXR contributors
 // SPDX-License-Identifier: Apache-2.0
 
+using System;
 using System.Collections.Generic;
 using UnityEditor;
 using UnityEditor.SceneManagement;
@@ -11,10 +12,11 @@ namespace DisplayXR.Editor
     /// <summary>
     /// <b>GameObject &gt; DisplayXR &gt; Camera-Centric Rig / Display-Centric Rig</b> (#462).
     /// <para>
-    /// On a selected Camera the item adds the rig component to it. With no Camera
-    /// selected it creates a new GameObject holding a Camera and the rig, as a child of
-    /// the selected object if there is one. Either way it is one Undo step, and every
-    /// rig value is the component's own default - the menu sets none.
+    /// The item acts ONCE over the whole selection. If the selection holds cameras, it
+    /// adds the rig component to each of them and creates nothing. If it holds none, it
+    /// creates one new GameObject with a Camera and the rig, as a child of the selected
+    /// object if there is one. Either way it is one Undo step, and every rig value is the
+    /// component's own default - the menu sets none.
     /// </para>
     /// The same components are also under <b>Component &gt; DisplayXR</b> (their
     /// <c>AddComponentMenu</c>), which is the route when the Camera is already selected
@@ -43,13 +45,19 @@ namespace DisplayXR.Editor
         static void AddOrCreate<TRig, TOther>(MenuCommand command, string newName)
             where TRig : MonoBehaviour where TOther : MonoBehaviour
         {
-            // From the Hierarchy's right-click menu Unity calls this once per selected
-            // object, with that object as the context. From the main menu bar there is no
-            // context and the selection is ours to read.
+            // From the Hierarchy's right-click menu Unity calls this once PER selected
+            // object, each time with that object as the context; from the main menu bar it
+            // calls it once with no context. Act on the first of those calls only, and
+            // over the whole selection - otherwise [Camera, Cube] would also create a new
+            // rig under Cube, and N selected non-cameras would create N rigs.
             var context = command.context as GameObject;
-            var targets = context != null
-                ? new[] { context }
-                : Selection.gameObjects;
+            var selection = Selection.gameObjects;
+            int contextIndex = context != null ? Array.IndexOf(selection, context) : -1;
+            if (!DisplayXRMenuRules.ActsOnThisInvocation(context != null, contextIndex))
+                return;
+            var targets = DisplayXRMenuRules.CoversWholeSelection(context != null, contextIndex)
+                ? selection
+                : new[] { context };
 
             var cameras = new List<GameObject>();
             foreach (var go in targets)
@@ -74,12 +82,10 @@ namespace DisplayXR.Editor
                     }
                     Undo.AddComponent<TRig>(go);
                 }
-                if (context == null)
-                    Selection.objects = cameras.ToArray();
                 return;
             }
 
-            // No camera in the selection: make one. ObjectFactory applies the project's
+            // No camera in the selection: make ONE. ObjectFactory applies the project's
             // default presets, as Unity's own GameObject > Camera does.
             var parent = context != null ? context : Selection.activeGameObject;
             if (parent != null && EditorUtility.IsPersistent(parent))
@@ -90,15 +96,24 @@ namespace DisplayXR.Editor
             GameObjectUtility.SetParentAndAlign(rig, parent);
             GameObjectUtility.EnsureUniqueNameForSibling(rig);
 
-            // A scene's first camera is its main one and carries its audio listener;
-            // a second camera must not take either.
-            if (Camera.main == null)
-                rig.tag = "MainCamera";
-            if (DisplayXRProjectValidation.FindInLoadedScenes<AudioListener>().Length == 0)
-                ObjectFactory.AddComponent<AudioListener>(rig);
+            // A scene's first camera is its main one and carries its audio listener; a
+            // second camera must not take either. In Prefab Mode neither question can be
+            // answered: the prefab's own preview scene has no camera and no listener, but
+            // the scenes the prefab will be placed in almost certainly do - so leave both
+            // alone there and let whoever places the prefab decide.
+            if (PrefabStageUtility.GetCurrentPrefabStage() == null)
+            {
+                if (Camera.main == null)
+                    rig.tag = "MainCamera";
+                if (DisplayXRProjectValidation.FindInLoadedScenes<AudioListener>().Length == 0)
+                    ObjectFactory.AddComponent<AudioListener>(rig);
+            }
 
             Undo.RegisterCreatedObjectUndo(rig, undoName);
-            Selection.activeGameObject = rig;
+            // Select the new rig AFTER this command: the remaining per-object invocations
+            // of a multi-selection decide whether to act by looking at the selection, so
+            // it must not change under them.
+            EditorApplication.delayCall += () => { if (rig != null) Selection.activeGameObject = rig; };
         }
     }
 }
