@@ -283,6 +283,45 @@ namespace DisplayXR
         }
         static object s_wholePixelView;
 
+        // (#459) True the first time a key is seen in this EDITOR session. Statics are reset by
+        // the domain reload of every Play, so a "warn once" static alone warns once per Play;
+        // UnityEditor.SessionState (reached by reflection: the Runtime asmdef has no UnityEditor
+        // reference) lasts until the editor quits. Falls back to once per domain.
+        static MethodInfo s_sessGetBool, s_sessSetBool;
+        static bool s_sessResolved;
+        static System.Collections.Generic.HashSet<string> s_onceLocal;
+        static bool FirstTimeThisEditorSession(string key)
+        {
+            key = "DisplayXR.Once." + key;
+            if (!s_sessResolved)
+            {
+                s_sessResolved = true;
+                try
+                {
+                    var ss = System.Type.GetType("UnityEditor.SessionState,UnityEditor");
+                    if (ss != null)
+                    {
+                        var types = new[] { typeof(string), typeof(bool) };
+                        s_sessGetBool = ss.GetMethod("GetBool", BindingFlags.Static | BindingFlags.Public, null, types, null);
+                        s_sessSetBool = ss.GetMethod("SetBool", BindingFlags.Static | BindingFlags.Public, null, types, null);
+                    }
+                }
+                catch { }
+            }
+            try
+            {
+                if (s_sessGetBool != null && s_sessSetBool != null)
+                {
+                    if ((bool)s_sessGetBool.Invoke(null, new object[] { key, false })) return false;
+                    s_sessSetBool.Invoke(null, new object[] { key, true });
+                    return true;
+                }
+            }
+            catch { }
+            if (s_onceLocal == null) s_onceLocal = new System.Collections.Generic.HashSet<string>();
+            return s_onceLocal.Add(key);
+        }
+
         // Two references to the same live UnityEngine.Object (a destroyed one matches nothing).
         static bool SameLiveObject(object a, object b)
         {
@@ -1210,7 +1249,7 @@ namespace DisplayXR
                             null, System.Type.EmptyTypes, null);
                 }
                 catch { }
-                if (s_mainPlayModeViewMethod == null)
+                if (s_mainPlayModeViewMethod == null && FirstTimeThisEditorSession("NoMainPlayModeView"))
                     Debug.LogWarning("[DisplayXR] GameView glue: PlayModeView.GetMainPlayModeView not found " +
                                      "(editor internals changed?) - with several Game views open the glue " +
                                      "falls back to matching by width.");
@@ -1248,8 +1287,12 @@ namespace DisplayXR
             catch { return false; }
         }
 
-        // (#459) IS THE GAME VIEW DRAWN 1:1? One log line each time the numbers settle, and one
-        // WARN per kind of mismatch per session. Changes nothing. Three things must all hold
+        // (#459) IS THE GAME VIEW DRAWN 1:1? One log line each time the numbers settle. A
+        // warning, once per editor session, only for what is certain from values read back
+        // from Unity: a column mismatch, the glue's computed texture size or the canvas not
+        // being the real texture's, the measured scale not being the window's DPI. The ROW
+        // verdict depends on the GVFIT model and is unverified on hardware, so it stays inside
+        // the log line. Changes nothing. Three things must all hold
         // for the woven image to reach the panel texel for pixel:
         //   W, H    Unity draws the render texture into a rect of the texture's own size. The
         //           rect is Unity's target size (px, fractional for Free Aspect) x the zoom
@@ -1276,7 +1319,7 @@ namespace DisplayXR
         static OneToOneKey s_o2oPend, s_o2oLogged;
         static bool   s_o2oHavePend, s_o2oHaveLogged;
         static double s_o2oPendSince;
-        static bool   s_o2oWarnedW, s_o2oWarnedH, s_o2oWarnedCanvas, s_o2oWarnedDpi, s_o2oWarnedUnavailable;
+        static bool   s_o2oWarnedW, s_o2oWarnedGlue, s_o2oWarnedCanvas, s_o2oWarnedDpi, s_o2oWarnedUnavailable;
         static PropertyInfo s_targetInViewProp, s_viewInWindowProp;
         static bool   s_o2oRectPropsResolved;
 
@@ -1349,13 +1392,24 @@ namespace DisplayXR
                 int lostH = DisplayXRGameViewPlacement.LinesDroppedOrDoubled(drawnH, key.RtH);
                 bool canvasOk = canvasW == key.RtW && canvasH == key.RtH;
                 var inv = System.Globalization.CultureInfo.InvariantCulture;
-                string Axis(double drawn, int rtPx, int lost) =>
+                // The glue's own idea of the texture size (Mathf.RoundToInt of Unity's target,
+                // i.e. halves to even) against the texture Unity really allocated (halves away
+                // from zero, PlayModeView.RenderView): where they differ the canvas, and the
+                // RtW / RtH the placement used, are a pixel off (doc: finding F4).
+                int glueW = s_diagPane.RtW, glueH = s_diagPane.RtH;
+                bool glueOk = glueW == key.RtW && glueH == key.RtH;
+                string Axis(double drawn, int rtPx, int lost, string note) =>
                     drawn.ToString("F2", inv) + " px for a " + rtPx + " px texture (" +
-                    (lost == 0 ? "1:1" : (lost < 0 ? "up to " + (-lost) + " dropped" : "up to " + lost + " doubled")) + ")";
+                    (lost == 0 ? "1:1" : (lost < 0 ? "up to " + (-lost) + " dropped" : "up to " + lost + " doubled") + note) + ")";
 
-                var sb = new System.Text.StringBuilder(384);
-                sb.Append("W drawn ").Append(Axis(drawnW, key.RtW, lostW));
-                sb.Append(", H drawn ").Append(Axis(drawnH, key.RtH, lostH));
+                var sb = new System.Text.StringBuilder(448);
+                sb.Append("W drawn ").Append(Axis(drawnW, key.RtW, lostW, ""));
+                // The row verdict under GVFIT is a prediction from the zoom, not yet confirmed on
+                // hardware (doc: finding F1): reported here, never raised as a warning.
+                sb.Append(", H drawn ").Append(Axis(drawnH, key.RtH, lostH, key.WholePixel ? "" : " - predicted, unverified: F1"));
+                sb.Append(" | texture=").Append(key.RtW).Append('x').Append(key.RtH)
+                  .Append(" glue computed ").Append(glueW).Append('x').Append(glueH)
+                  .Append(glueOk ? " (agree)" : " (DISAGREE)");
                 sb.Append(" | target=").Append(key.TargetW.ToString("R", inv)).Append('x').Append(key.TargetH.ToString("R", inv));
                 sb.Append(" px zoom=").Append(key.HaveZoom
                     ? "(" + key.ZoomX.ToString("R", inv) + "," + key.ZoomY.ToString("R", inv) + ")" : "? (assumed 1)");
@@ -1398,30 +1452,35 @@ namespace DisplayXR
                 Debug.Log("[DisplayXR] GameView 1:1: " + sb);
                 if (!s_lastAppliedDocked) return;
 
+                // WARNINGS: only for conditions that are certain from values read back from
+                // Unity (the real texture, the target, the zoom, the window DPI), and once per
+                // EDITOR session, not per Play (the statics below do not survive the domain
+                // reload of each Play; the SessionState flag does).
                 const string kDoc = " See docs~/architecture/editor-game-view-placement.md.";
                 string pct = (key.Scale * 100f).ToString("0.#", inv) + " %";
                 if (lostW != 0 && !s_o2oWarnedW)
                 {
                     s_o2oWarnedW = true;
-                    Debug.LogWarning("[DisplayXR] Game view is not drawn 1:1 horizontally: its " + key.RtW +
+                    if (FirstTimeThisEditorSession("O2O.W")) Debug.LogWarning("[DisplayXR] Game view is not drawn 1:1 horizontally: its " + key.RtW +
                         " px wide texture is drawn " + drawnW.ToString("F2", inv) + " px wide at " + pct +
                         ", so columns will be dropped/doubled and the image past them sits a pixel off " +
                         "(on a lenticular panel: the eyes swap there). A Windows scale of 100/150/200/250/300 % " +
                         "avoids it; DISPLAYXR_PROV_GV_WHOLEPIXEL=1 is the experimental fix." + kDoc);
                 }
-                if (lostH != 0 && !s_o2oWarnedH)
+                if (!glueOk && !s_o2oWarnedGlue)
                 {
-                    s_o2oWarnedH = true;
-                    Debug.LogWarning("[DisplayXR] Game view is not drawn 1:1 vertically: its " + key.RtH +
-                        " px high texture is drawn " + drawnH.ToString("F2", inv) + " px high at " + pct +
-                        (key.WholePixel ? "" : " (with the GVFIT row stretch, exact only for a x.5 px area)") +
-                        ", so rows will be dropped/doubled and the image past them sits a row off " +
-                        "(through a slanted lens that moves the interlace phase)." + kDoc);
+                    s_o2oWarnedGlue = true;
+                    if (FirstTimeThisEditorSession("O2O.Glue")) Debug.LogWarning(
+                        "[DisplayXR] GameView glue: the Game view's texture is " + key.RtW + "x" + key.RtH +
+                        " but the glue computed " + glueW + "x" + glueH + " from Unity's target size (" +
+                        key.TargetW.ToString("R", inv) + "x" + key.TargetH.ToString("R", inv) +
+                        " px, halves rounded to even; Unity rounds them up), so the woven canvas and the " +
+                        "anchor's row are sized for a texture one pixel smaller." + kDoc);
                 }
-                if (!canvasOk && !s_o2oWarnedCanvas)
+                if (!canvasOk && glueOk && !s_o2oWarnedCanvas)   // (with !glueOk the warning above says it)
                 {
                     s_o2oWarnedCanvas = true;
-                    Debug.LogWarning("[DisplayXR] Game view is not drawn 1:1: the woven canvas is driven to " +
+                    if (FirstTimeThisEditorSession("O2O.Canvas")) Debug.LogWarning("[DisplayXR] Game view is not drawn 1:1: the woven canvas is driven to " +
                         canvasW + "x" + canvasH + " but the Game view's texture is " + key.RtW + "x" + key.RtH +
                         "; the mirror blit resamples one into the other (linear), which blurs the interlace " +
                         "across the whole view." + kDoc);
@@ -1429,7 +1488,7 @@ namespace DisplayXR
                 if (dpi != 0 && Mathf.Abs(dpi / 96f - key.Scale) > 0.011f && !s_o2oWarnedDpi)
                 {
                     s_o2oWarnedDpi = true;
-                    Debug.LogWarning("[DisplayXR] GameView glue: the pane's measured scale (" +
+                    if (FirstTimeThisEditorSession("O2O.Dpi")) Debug.LogWarning("[DisplayXR] GameView glue: the pane's measured scale (" +
                         key.Scale.ToString("R", inv) + ") is not its window DPI (" + dpi + " = " +
                         (dpi / 96f).ToString("R", inv) + "); the placement uses the measured one." + kDoc);
                 }
@@ -1439,7 +1498,7 @@ namespace DisplayXR
                 if (!s_o2oWarnedUnavailable)
                 {
                     s_o2oWarnedUnavailable = true;
-                    Debug.LogWarning("[DisplayXR] GameView 1:1 check unavailable (editor internals changed?): " + e.Message);
+                    if (FirstTimeThisEditorSession("O2O.Unavailable")) Debug.LogWarning("[DisplayXR] GameView 1:1 check unavailable (editor internals changed?): " + e.Message);
                 }
             }
         }
