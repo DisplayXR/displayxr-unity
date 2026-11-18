@@ -94,7 +94,7 @@ namespace DisplayXR.Editor
                 m_VirtualDisplayHeight.floatValue = 0f;
             }
 
-            // Runtime eye tracking info (Provider / Standalone Preview / OpenXR hook)
+            // Runtime eye tracking info (from the display provider)
             if (Application.isPlaying &&
                 DisplayXREditorStatus.TryGetEyeTracking(out bool tracked, out Vector3 leftEye,
                                                         out Vector3 rightEye, out bool hasPositions))
@@ -145,9 +145,9 @@ namespace DisplayXR.Editor
             if (!DisplayXREditorStatus.TryGetDisplayInfo(out var info, out var source))
             {
                 EditorGUILayout.HelpBox(
-                    "Display info not available. Connect a DisplayXR runtime via the " +
-                    "Display Provider (Play Mode / built app), the standalone Preview window, " +
-                    "or the OpenXR hook.",
+                    "Display info not available. It appears while a DisplayXR session is " +
+                    "running: enable DisplayXR Display in XR Plug-in Management and enter " +
+                    "Play Mode.",
                     MessageType.Info);
                 return;
             }
