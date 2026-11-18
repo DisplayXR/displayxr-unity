@@ -14,8 +14,12 @@ on the DisplayXR page of Project Settings, with a button that opens the window.
 
 ## What it does and does not do
 
-- It **never changes a setting by itself.** A fix runs when you press its button. **Fix All**
-  lists every change it is about to make and asks first.
+- It **never changes a setting by itself.** A fix runs when you press its button. **Fix All
+  Errors** lists every change it is about to make and asks first.
+- It only judges build targets that **use** DisplayXR. For a target where the DisplayXR
+  Display loader is not enabled, `loader-enabled` is the only finding, and it is a warning or
+  a note, never an error. A project that uses DisplayXR on Windows only is not told to change
+  its Android settings.
 - It **never opens by itself.** There is no first-run pop-up and nothing runs on project load.
 - Every fix writes an ordinary Unity setting (XR Plug-in Management, Player Settings, a URP
   renderer asset, the DisplayXR Manifest Settings asset). You can see it and change it back
@@ -36,9 +40,18 @@ exists, and up to three buttons.
 | **Ignore** | Stops reporting the rule for this project. Ignored rules move to their own group and can be un-ignored there. |
 | **Docs** | Opens the rule's section on this page. |
 
-**Fix All** runs the fixes of all open issues, after a confirmation that lists them. It
-leaves out ignored rules and the buttons that only open a page. **Show passed** adds the
-rules that passed or do not apply to the build target.
+**Fix All Errors** runs the fixes of the open **Errors**, after a confirmation that lists
+exactly those changes. It leaves out:
+
+- warnings and notes;
+- ignored rules;
+- buttons that only open a page;
+- rules whose fix is a project's choice, whatever their severity: `other-xr-loader` (a
+  project may keep a fallback loader on purpose) and `init-on-startup` (an app may start XR
+  itself).
+
+Everything it leaves out keeps its own **Fix** button. **Show passed** adds the rules that
+passed or do not apply to the build target.
 
 The ignore list is project state. It is stored in
 `ProjectSettings/DisplayXRProjectValidation.json`, which belongs in version control with the
@@ -56,29 +69,43 @@ rest of `ProjectSettings/`:
 The file exists only while at least one rule is ignored. Ids are sorted, one per line. A
 file that cannot be read counts as "nothing ignored".
 
+- The window reads the file again on every refresh (and it refreshes when it gets focus), so
+  a change that arrives from version control shows up without a restart.
+- If the file cannot be written (read-only until checked out, for example), **Ignore** changes
+  nothing: the row stays as it was, the window says "Not saved", and the Console has the
+  reason.
+
 ## At build time
 
 Before a build, `DisplayXRBuildProcessor.OnPreprocessBuild` evaluates the rules for the
 target being built and logs each open **Error** as a **warning**:
 
 ```
-[DisplayXR] Project validation: DisplayXR Display loader enabled: DisplayXR Display is not ticked under XR Plug-in Management > Standalone. [loader-enabled] (DisplayXR > Project Validation has the fix; ignore the rule there to silence this.)
+[DisplayXR] Project validation: Graphics API supported by the provider: The first Graphics API for StandaloneLinux64 is OpenGLCore, which the provider has no backend for (supported here: Vulkan). Current list: OpenGLCore, Vulkan. [graphics-api] (Build target StandaloneLinux64. DisplayXR > Project Validation checks the active build target, which is StandaloneWindows64: switch the active build target to StandaloneLinux64 to see this finding and its fix there, or ignore the rule to silence this.)
 ```
 
-It never fails the build and opens no window or dialog, so a batch-mode build behaves the
-same as an interactive one. Warnings and notes are not logged. Ignored rules are not logged.
-Nothing is logged for a build target the provider does not exist for (WebGL, iOS, ...).
+- It never fails the build and opens no window or dialog, so a batch-mode build behaves the
+  same as an interactive one.
+- Warnings and notes are not logged. Ignored rules are not logged.
+- Each line names the target that was built. The window checks the **active** build target,
+  so when a script builds another one the line says to switch to it.
+- Nothing is logged for a build target where the DisplayXR Display loader is not enabled:
+  that is a choice, `loader-enabled` is never an error, and no other rule applies there.
+- Nothing is logged for a build target the provider does not exist for (WebGL, iOS, ...).
 
 ## The rules
 
 Severity is the default; some findings of a rule are less (or more) serious and say so.
-"Applies to" is the build target.
+"Applies to" is the build target. Every rule down to `linux-transparent-overlay`, and the
+two URP rules, apply only when the DisplayXR Display loader is enabled for that target;
+otherwise they are "not applicable" and `loader-enabled` is the single finding. The notes
+are about the editor machine or the installed packages and do not depend on it.
 
 | Id | Severity | Applies to | Fix |
 |---|---|---|---|
-| [`loader-enabled`](#loader-enabled) | Error | all supported | yes |
-| [`init-on-startup`](#init-on-startup) | Warning | all supported | yes |
-| [`other-xr-loader`](#other-xr-loader) | Warning / Error | all supported | yes |
+| [`loader-enabled`](#loader-enabled) | Warning / note | all supported | yes (not in Fix All) |
+| [`init-on-startup`](#init-on-startup) | Warning | all supported | yes (not in Fix All) |
+| [`other-xr-loader`](#other-xr-loader) | Warning / Error | all supported | yes (not in Fix All) |
 | [`graphics-api`](#graphics-api) | Error / Warning / note | all supported | yes |
 | [`native-plugin`](#native-plugin) | Error / note | all supported | no |
 | [`android-arm64`](#android-arm64) | Error / Warning | Android | yes |
@@ -100,12 +127,21 @@ Severity is the default; some findings of a rule are less (or more) serious and 
 
 - **Why:** the provider is an XR Plug-in Management loader. If it is not enabled, Unity never
   creates the display subsystem and the app renders one flat view.
+- **Severity:** never an error, because leaving a target without the loader is a legitimate
+  choice.
+  - Enabled for the other target group (Standalone / Android): a **note**. This target was
+    most likely left out on purpose.
+  - Enabled for no target: a **warning**. The package is installed and does nothing yet.
+- **Consequences of that choice:** it is never written to the build log, Fix All never
+  enables it, and every other project rule is "not applicable" for that target.
 - **Source of truth:** `Editor/Provider/DisplayXRDisplayPackage.cs` registers the loader for
-  the Standalone and Android build target groups.
+  the Standalone and Android build target groups; `DisplayXRLoaderRules.NotEnabledSeverity`.
 - **Fix:** enables the loader with `XRPackageMetadataStore.AssignLoader`, the call the
-  XR Plug-in Management checkbox makes. If the project has XR settings but none for this
-  target yet, it creates that target's empty settings first. If the project has no XR
-  settings asset at all, it opens the XR Plug-in Management page instead, which creates one.
+  XR Plug-in Management checkbox makes. Like ticking the box, it can **create assets**: the
+  loader asset under `Assets/XR/Loaders/`, and, if the project has XR settings but none for
+  this target yet, that target's settings inside the project's XR settings asset. If the
+  project has no XR settings asset at all, it creates nothing and opens the XR Plug-in
+  Management page instead, which creates one.
 
 ### init-on-startup
 
@@ -117,7 +153,7 @@ Severity is the default; some findings of a rule are less (or more) serious and 
   Feature".
 - **When to ignore:** an app that starts XR itself. The `DisplayXRRuntime` class comment
   shows one that turns it off at run time on machines without a runtime.
-- **Fix:** turns the setting on for the build target.
+- **Fix:** turns the setting on for the build target. Not part of Fix All.
 
 ### other-xr-loader
 
@@ -136,6 +172,7 @@ Severity is the default; some findings of a rule are less (or more) serious and 
   re-sorts the list each time a loader is ticked.
 - **When to ignore:** a project that ships a second loader on purpose as the fallback.
 - **Fix:** unticks every other loader for the build target (`XRPackageMetadataStore.RemoveLoader`).
+  Not part of Fix All, even when the finding is an error.
 
 ### graphics-api
 
@@ -183,6 +220,8 @@ Severity is the default; some findings of a rule are less (or more) serious and 
     embedded install): a **note**. Those libraries are built by CI and are not committed, so
     this is expected until you build them (`native~/build-linux.sh`, `native~/build-android.sh`).
   - The build target is 32-bit Windows: **Error**. The package ships x64 only.
+  - The package folder cannot be located: not applicable. A package copied into `Assets/`
+    is found through its `Editor` assembly definition and treated as a source checkout.
 - **Source of truth:** `Runtime/Plugins/`, `.gitignore`, the install note in the README.
 - **Fix:** none.
 
@@ -297,11 +336,24 @@ Severity is the default; some findings of a rule are less (or more) serious and 
 - **Why:** on URP the rig only publishes the clip planes as shader globals. The clip is done
   by a Full Screen Pass renderer feature running `DisplayXR/ForegroundClipURP`. Without the
   pass nothing is clipped and nothing warns.
-- **Source of truth:** `DisplayXRUrpInstaller.FindClipFeature` in
-  `Editor/URP/DisplayXRUrpInstaller.cs`. The installer and this rule use the same function.
-  It looks at the first `UniversalRendererData` asset in the project, as the installer does.
+- **Which renderer assets:** the ones in use, not the first one a project search returns.
+  `DisplayXRUrpInstaller.ResolveClipRenderers` takes every URP pipeline asset the project can
+  run with (the active one, the Graphics default, and each quality level's override) and, in
+  each, the renderer the rig's camera selects (its Renderer setting; the pipeline's default
+  renderer when the camera says "default"). The finding names the renderer assets that lack
+  the pass. A quality level you never ship still counts; ignore the rule if that is the only
+  one named.
+- **Last resort:** if no URP pipeline asset is assigned anywhere, the first URP renderer
+  asset in the project is used, and the finding (and the installer) say that it is a guess.
+- **A pass wired by hand counts.** A Full Screen Pass whose material runs
+  `DisplayXR/ForegroundClipURP` is recognised under any name, and the installer leaves it
+  exactly as it is (material, injection point, requirements). It only reconfigures the
+  feature it created itself, named "DisplayXR Foreground Clip".
+- **Source of truth:** `ResolveClipRenderers` and `FindClipFeature` in
+  `Editor/URP/DisplayXRUrpInstaller.cs`. The installer and this rule use the same functions.
 - **Fix:** the same as **DisplayXR > Setup URP Foreground Clip**: creates
-  `Assets/DisplayXR/DXRForegroundClip.mat` and adds the renderer feature.
+  `Assets/DisplayXR/DXRForegroundClip.mat` and adds the renderer feature to each of those
+  renderer assets that lacks it.
 
 ## Considered and left out
 
@@ -349,6 +401,11 @@ static class MyRules
   `c.Group()`, `c.NamedTarget()`) and whether it runs from the build hook (`c.IsBuild`).
 - `Fix` is optional. Give one only when it writes an ordinary setting the user can change
   back. Set `FixOnlyNavigates` when it only opens a page; such a fix is not part of Fix All.
+- Fix All runs the fixes of Errors only. Set `ExcludeFromFixAll` on a rule whose fix is a
+  matter of project policy, so that it is left out even when its finding is an error.
+- A rule that only matters to a DisplayXR build should open with the loader gate, so that it
+  is silent for a target that does not use DisplayXR:
+  `DisplayXRValidationResult off; if (DisplayXRProjectValidation.LoaderNotEnabled(c, out off)) return off;`
 - A rule id is what the ignore list stores. Do not rename one after it has shipped.
 - A check that throws is shown as a warning naming the exception. It does not stop the
   other rules.
@@ -371,20 +428,28 @@ compiled only when URP 17 or newer is installed.
 
 The two pure C# files are compiled and tested without the editor by
 `Tests~/ProjectValidation` (`dotnet run --project "Tests~/ProjectValidation" -c Release`),
-which CI runs with the other C# tests. The tests also check the rules against the tree: every
-library a rule names has a committed `.meta`, the loader's class name, and the API level in
-`native~/build-android.sh`. Reading the facts out of a project, the fixes and the window
-need the editor and are not covered by those tests.
+which CI runs with the other C# tests. They cover the registry, evaluation, what Fix All
+takes, what the build hook logs and its hint, the ignore-list file (including a failed
+write being rolled back), and each decision above. The tests also check the rules against
+the tree: every library a rule names has a committed `.meta`, the loader's class name, and
+the API level in `native~/build-android.sh`. Reading the facts out of a project (including
+which URP renderer assets are in use), the fixes and the window need the editor and are not
+covered by those tests.
 
 ## Rig menu items
 
 Not validation, but added with it (#462): **GameObject > DisplayXR > Camera-Centric Rig** and
 **Display-Centric Rig** (`Editor/DisplayXRRigMenu.cs`).
 
-- With a Camera selected, the item adds the rig component to it.
-- With no Camera selected, it creates a GameObject with a Camera and the rig, as a child of
-  the selected object if there is one. It is tagged `MainCamera` only when there is no main
-  camera yet, and given an Audio Listener only when the open scenes have none.
+- The item acts once over the whole selection, from the menu bar and from the Hierarchy's
+  right-click menu alike.
+- If the selection has cameras, it adds the rig component to each of them and creates
+  nothing, whatever else is selected.
+- If the selection has no camera, it creates one GameObject with a Camera and the rig, as a
+  child of the selected object if there is one. It is tagged `MainCamera` only when there is
+  no main camera yet, and given an Audio Listener only when the open scenes have none.
+- In Prefab Mode the new camera gets neither the tag nor an Audio Listener: the prefab's
+  preview scene has none, but the scenes the prefab goes into usually do.
 - It is one Undo step. Every rig value is the component's own default.
 - A camera takes one rig. The item skips a camera that already has the other kind and logs
   a warning.
