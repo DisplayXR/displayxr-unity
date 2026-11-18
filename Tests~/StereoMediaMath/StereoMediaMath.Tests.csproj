@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Unit tests for Runtime/DisplayXRStereoMediaMath.cs (pure C#, no UnityEngine): which part of a
+       stereo picture each eye samples for every layout, the fit modes, the depth shift, flipped
+       textures and the colour conversion. Lives under Tests~ so Unity never imports it.
+       Run: dotnet run -c Release -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <RollForward>Major</RollForward>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../Runtime/DisplayXRStereoMediaMath.cs" Link="DisplayXRStereoMediaMath.cs" />
+  </ItemGroup>
+</Project>
