@@ -122,6 +122,39 @@ namespace DisplayXR
         internal static bool ResultHasContent { get; private set; }
         internal static Vector3 ResultPoint { get; private set; }
 
+        // ---- Full-frame grid (auto-convergence, #461) ---------------------------------
+        //
+        // The same target, hooks and readback, pointed at the WHOLE view for one frame: on a
+        // grid frame the patch rect is (0, 0, 1, 1) instead of the square under the cursor,
+        // and the readback is published as Size x Size linear depths instead of a cursor
+        // point. Nothing in the pipeline hooks changes. A consumer asks a few times a
+        // second, so the cursor (when it also uses depth) skips one frame in every several
+        // - well inside its own freshness window.
+
+        /// <summary>Keep the depth source switched on (call every frame while a consumer is
+        /// enabled), so the pipeline does not reallocate its depth texture between samples.</summary>
+        internal static void KeepGridAlive() => s_GridKeepAliveFrame = Time.frameCount;
+
+        /// <summary>Ask for one full-frame grid; it is drawn on the next <see cref="Tick"/>.</summary>
+        internal static void RequestGrid()
+        {
+            s_GridKeepAliveFrame = Time.frameCount;
+            s_GridRequested = true;
+        }
+
+        /// <summary>Incremented each time a grid result is published.</summary>
+        internal static int GridSerial { get; private set; }
+        /// <summary>Samples in the latest grid (texels the draw actually wrote).</summary>
+        internal static int GridCount { get; private set; }
+        /// <summary>Sample position over the view, bottom-left UV.</summary>
+        internal static readonly float[] GridU = new float[Size * Size], GridV = new float[Size * Size];
+        /// <summary>World-unit depth along the camera's forward axis, measured from the
+        /// camera; +infinity = nothing drawn there (sky / cleared).</summary>
+        internal static readonly float[] GridDepth = new float[Size * Size];
+        /// <summary>A hook reported that this pipeline has no scene depth to read (or the
+        /// patch shader / target format is missing).</summary>
+        internal static bool DepthUnavailable => s_Disabled || !string.IsNullOrEmpty(s_Unavailable);
+
         // ---- Implementation ------------------------------------------------------------
 
         struct Snapshot
@@ -130,6 +163,8 @@ namespace DisplayXR
             public bool valid;
             public float[] pos, quat, proj;
             public bool reversedZ;
+            public bool grid;        // a full-frame grid frame, not a cursor patch
+            public float camOffset;  // grid: eye position along the camera's forward axis
         }
 
         static readonly Snapshot[] s_Ring = new Snapshot[kRing];
@@ -147,6 +182,9 @@ namespace DisplayXR
         static bool s_ProbeLogged;
         static bool s_EverResult;
         static int s_ActiveFrames;
+        static int s_GridKeepAliveFrame = -100;
+        static bool s_GridRequested;
+        static int s_GridJitter;
 
         // BiRP
         static CommandBuffer s_BirpCmd;
@@ -205,7 +243,10 @@ namespace DisplayXR
         /// </summary>
         internal static void Tick(bool use)
         {
-            Active = use && EnsureResources();
+            bool gridUser = Time.frameCount - s_GridKeepAliveFrame <= 1;
+            bool gridFrame = s_GridRequested;
+            s_GridRequested = false;
+            Active = (use || gridUser) && EnsureResources();
             DrawThisFrame = false;
             Camera cam = DisplayXRRigManager.ActiveCamera != null ? DisplayXRRigManager.ActiveCamera : Camera.main;
             TargetCamera = Active ? cam : null;
@@ -227,7 +268,9 @@ namespace DisplayXR
             }
 
             // This frame's patch.
-            if (DisplayXRProviderNative.dxr_prov_cursor_get_canvas_uv(out float cu, out float cv) == 0 ||
+            // (A grid frame needs no pointer; a cursor frame needs the cursor to use depth.)
+            float cu = 0f, cv = 0f;
+            if ((!gridFrame && (!use || DisplayXRProviderNative.dxr_prov_cursor_get_canvas_uv(out cu, out cv) == 0)) ||
                 DisplayXRProviderNative.dxr_prov_cursor_get_eye(out var eye) == 0)
             {
                 DetachBiRPIfNot(pipeline);
@@ -250,9 +293,23 @@ namespace DisplayXR
             snap.frame = Time.frameCount;
             snap.valid = true;
 
-            float aspect = proj[0] != 0f ? proj[5] / proj[0] : 1f; // (r-l)/(t-b) of the frustum
-            DisplayXRCursorDepthMath.PatchRect(cu, cv, aspect, out float px, out float py, out float pw, out float ph);
-            PatchRect = new Vector4(px, py, pw, ph);
+            snap.grid = gridFrame;
+            if (gridFrame)
+            {
+                // The whole view, shifted by a quarter texel in a 4-frame rotation so
+                // successive grids do not sample the same pixels. Depth is published
+                // relative to the CAMERA (the rig's convergence origin), not the eye.
+                var eyeWorld = new Vector3(snap.pos[0], snap.pos[1], -snap.pos[2]); // locate space -> Unity world
+                snap.camOffset = Vector3.Dot(eyeWorld - cam.transform.position, cam.transform.forward);
+                int j = s_GridJitter++ & 3;
+                PatchRect = new Vector4(((j & 1) != 0 ? 0.25f : -0.25f) / Size, ((j & 2) != 0 ? 0.25f : -0.25f) / Size, 1f, 1f);
+            }
+            else
+            {
+                float aspect = proj[0] != 0f ? proj[5] / proj[0] : 1f; // (r-l)/(t-b) of the frustum
+                DisplayXRCursorDepthMath.PatchRect(cu, cv, aspect, out float px, out float py, out float pw, out float ph);
+                PatchRect = new Vector4(px, py, pw, ph);
+            }
             Stamp = Time.frameCount % (1 << 20);
             FlipY = s_FlipYOverride;
             DrawThisFrame = true;
@@ -367,6 +424,11 @@ namespace DisplayXR
             if (newest <= 0) return;
             Snapshot snap = s_Ring[newest % kRing];
             if (!snap.valid || snap.frame % (1 << 20) != newest) return;
+            if (snap.grid)
+            {
+                PublishGrid(data, n, newest, snap);
+                return;
+            }
 
             int m = 0;
             for (int i = 0; i < n; i++)
@@ -394,6 +456,24 @@ namespace DisplayXR
             s_ResultArrivalFrame = Time.frameCount;
             s_ResultStampFrame = snap.frame;
             s_EverResult = true;
+        }
+
+        // A grid frame came back: linear depth per texel, from the camera. The cursor's own
+        // results are left exactly as they were.
+        static void PublishGrid(NativeArray<float> data, int n, int stamp, Snapshot snap)
+        {
+            int m = 0;
+            for (int i = 0; i < n; i++)
+            {
+                if ((int)data[i * 4 + 3] != stamp) continue;
+                float d = DisplayXRCursorDepthMath.LinearEyeDepth(snap.proj, data[i * 4 + 0], snap.reversedZ);
+                GridDepth[m] = d + snap.camOffset; // +infinity (background) stays +infinity
+                GridU[m] = data[i * 4 + 1];
+                GridV[m] = data[i * 4 + 2];
+                m++;
+            }
+            GridCount = m;
+            GridSerial++;
         }
 
         // ---- shouldFillOutDepth probe (answers the native-route question for free) ------
@@ -444,6 +524,8 @@ namespace DisplayXR
             s_ActiveFrames = 0;
             s_EverResult = false;
             s_Unavailable = "";
+            s_GridRequested = false;
+            GridCount = 0;
             for (int i = 0; i < kRing; i++) s_Ring[i].valid = false;
         }
     }
