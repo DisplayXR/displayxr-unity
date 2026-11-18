@@ -69,6 +69,11 @@
       "path": "Samples~/WindowSpaceUI"
     },
     {
+      "displayName": "Stereo Picking (Pointer Events)",
+      "description": "Makes 3D objects and world-space uGUI canvases clickable where the viewer sees them (#460). Unity's own pointer path builds its ray with Camera.ScreenPointToRay, which knows nothing about the off-axis views DisplayXR renders with, so it misses everywhere but at the centre of the screen. DisplayXRPointerEvents casts DisplayXRPicking's stereo-correct ray against colliders and world-space canvas graphics and sends enter/exit/down/up/click/drag/scroll to IPointer*Handlers, Buttons, Sliders and UnityEvents. Works with the Input System and the legacy Input Manager, mouse and touch. Input policy is app-owned, so fork it freely — the plugin's part is the DisplayXRPicking API.",
+      "path": "Samples~/StereoPicking"
+    },
+    {
       "displayName": "Minimal Transparent",
       "description": "Smallest working alpha-native transparent overlay scene (~60 lines). Teaching sample — README walks through the three-mechanism pipeline, the OpenXR extensions in use, and the layer ownership map. Windows + macOS standalone.",
       "path": "Samples~/MinimalTransparent"

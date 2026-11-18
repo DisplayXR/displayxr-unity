@@ -7689,6 +7689,27 @@ int dxr_prov_get_active_zone_rect_px(int *x, int *y, int *w, int *h)
 	return 1;
 }
 
+// The rect the located views FRAME when that is an app-authored 3D zone, as the app
+// authored it (client px, top-left origin); 0 when the views frame the whole screen. The
+// same predicate, and the same rect, ps_cursor_chain maps the pointer with: an app zone
+// that is live. 0 for no zone, a cleared one, the provider's own Game-view zone, or a
+// runtime that ignores zones. C# picking (DisplayXRPicking, #460) reads it instead of
+// keeping its own copy of the app's intent, which cannot follow what happens to the zone
+// here (a clear does not forget the app's rect; a session restart re-applies it).
+//
+// ps_zone_active() spelled out on the CACHED caps answer, like the getter above: the real
+// one makes the lazy xrGetDisplayZoneCapabilitiesDXR call while the answer is unknown, and
+// this runs on Unity's main thread. Until the session's first zone frame has asked, the
+// answer is "no zone" here - a frame or two at session start.
+int dxr_prov_get_app_zone_rect_px(int *x, int *y, int *w, int *h)
+{
+	if (!s_app_zone_valid || !s_ps.zone_valid || s_ps.zone_caps_ok <= 0) return 0;
+	if (s_app_zone_w <= 0 || s_app_zone_h <= 0) return 0;
+	if (x) *x = s_app_zone_x; if (y) *y = s_app_zone_y;
+	if (w) *w = s_app_zone_w; if (h) *h = s_app_zone_h;
+	return 1;
+}
+
 // DIAGNOSTIC (DISPLAYXR_PROV_SLICE_COLORS=1): record clears of the acquired swapchain image's
 // array slice 0 = solid BLUE and slice 1 = solid RED onto the own command list (caller has
 // already Reset it and will Close + execute). Used to test whether the runtime's texture-mode

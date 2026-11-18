@@ -124,6 +124,24 @@ namespace DisplayXR
         public static Vector3 RigPlaneForward { get; internal set; } = Vector3.forward;
         public static bool    RigPlaneValid   { get; internal set; }
 
+        /// <summary>The rotation sent with <see cref="RigPlanePos"/>.
+        /// <see cref="DisplayXRPicking"/> needs the whole pose to place the located views.</summary>
+        internal static Quaternion RigPlaneRotation { get; set; } = Quaternion.identity;
+
+        // The rig pose describes what one session was last sent. Forget it when that session
+        // stops (the next one starts with no display pose until a rig pushes again) and at
+        // the start of every Play: with Enter Play Mode Options (no domain reload) the
+        // statics would otherwise carry the previous Play's pose into a scene that may have
+        // no rig at all.
+        [RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]
+        static void ResetRigPlane()
+        {
+            RigPlaneValid = false;
+            RigPlanePos = Vector3.zero;
+            RigPlaneForward = Vector3.forward;
+            RigPlaneRotation = Quaternion.identity;
+        }
+
         static DisplayXRProviderNative.ModeInfo[] s_modes = Array.Empty<DisplayXRProviderNative.ModeInfo>();
 
         /// <summary>The enumerated rendering modes (refreshed at session start + on mode change).</summary>
@@ -368,6 +386,7 @@ namespace DisplayXR
         {
             IsSessionReady = false;
             IsEyeTracked = false;
+            ResetRigPlane();
             SessionStopped?.Invoke();
         }
 

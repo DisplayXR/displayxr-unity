@@ -455,6 +455,7 @@ For detailed architecture and design decisions, see `docs~/`:
   [`docs/architecture/rear-depth-budget.md`](https://github.com/DisplayXR/displayxr-runtime/blob/main/docs/architecture/rear-depth-budget.md)
   (plain-language) and [`docs/specs/extensions/XR_DXR_depth_budget.md`](https://github.com/DisplayXR/displayxr-runtime/blob/main/docs/specs/extensions/XR_DXR_depth_budget.md)
   (the contract). Plugin side: `DisplayXRContentBounds` / `DisplayXRDepthBudget`.
+- Click a 3D object or a world-space canvas accurately (`DisplayXRPicking`; why `Camera.ScreenPointToRay` misses, cyclopean vs per-eye, pixel-space rules) → `docs~/architecture/stereo-picking.md`
 - Build a 2D scene / menu (a rig-less camera STILL renders stereo) → `docs~/architecture/two-dimensional-scenes.md`
 - Window-space 2D UI + why its buttons are dead without a router → `docs~/architecture/window-space-ui.md`
 - Transparent-overlay click-through mask (mask/weave rect-alignment invariant + debugging pitfalls) → `docs~/architecture/click-through-mask.md`

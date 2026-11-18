@@ -2408,6 +2408,7 @@ namespace DisplayXR
             // origin/normal) rather than re-reading the transform independently (#166).
             DisplayXRProvider.RigPlanePos     = p;
             DisplayXRProvider.RigPlaneForward = cam.transform.forward;
+            DisplayXRProvider.RigPlaneRotation = q;
             DisplayXRProvider.RigPlaneValid   = true;
             DisplayXRProviderNative.dxr_prov_set_display_pose(p.x, p.y, p.z, q.x, q.y, q.z, q.w, 1);
         }
