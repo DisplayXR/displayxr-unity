@@ -326,7 +326,7 @@ namespace DisplayXR
         static bool SameLiveObject(object a, object b)
         {
             var ua = a as UnityEngine.Object; var ub = b as UnityEngine.Object;
-            return ua != null && ub != null && ua.GetInstanceID() == ub.GetInstanceID();
+            return ua != null && ub != null && ua == ub;
         }
 
         // Force the editor Game view to render its mirror RT at FULL (physical) resolution
