@@ -27,6 +27,11 @@
       "name": "com.unity.modules.xr",
       "expression": "1.0.0",
       "define": "DISPLAYXR_INPUT_SYSTEM_XR"
+    },
+    {
+      "name": "com.unity.modules.video",
+      "expression": "1.0.0",
+      "define": "DISPLAYXR_HAS_VIDEO"
     }
   ],
   "noEngineReferences": false
