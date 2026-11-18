@@ -36,6 +36,11 @@ namespace DisplayXR.Editor
             EditorGUILayout.LabelField("DisplayXR Settings", EditorStyles.boldLabel);
             EditorGUILayout.Space();
 
+            // Project validation summary (#462)
+            DrawValidationSummary();
+
+            EditorGUILayout.Space();
+
             // Runtime status
             DrawRuntimeStatus();
 
@@ -53,6 +58,29 @@ namespace DisplayXR.Editor
 
             // App manifest sidecar
             DrawManifestSection();
+        }
+
+        /// <summary>
+        /// One line of project validation plus the way into the window. Read-only: the
+        /// fixes are in the window, behind their own buttons.
+        /// </summary>
+        private void DrawValidationSummary()
+        {
+            EditorGUILayout.BeginVertical(EditorStyles.helpBox);
+            EditorGUILayout.LabelField("Project Validation", EditorStyles.boldLabel);
+
+            // Cached for a couple of seconds: this page repaints often and some checks
+            // search the asset database.
+            var summary = DisplayXRValidationEngine.Summarize(DisplayXRProjectValidation.EvaluateCached());
+            MessageType type = summary.Errors > 0 ? MessageType.Error
+                             : summary.Warnings > 0 ? MessageType.Warning
+                             : MessageType.Info;
+            EditorGUILayout.HelpBox(
+                summary + " for " + EditorUserBuildSettings.activeBuildTarget + ".", type);
+            if (GUILayout.Button("Open Project Validation"))
+                DisplayXRProjectValidationWindow.Open();
+
+            EditorGUILayout.EndVertical();
         }
 
         private void DrawRuntimeStatus()

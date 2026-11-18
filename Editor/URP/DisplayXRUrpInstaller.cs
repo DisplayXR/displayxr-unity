@@ -122,6 +122,37 @@ namespace DisplayXR.Editor.URP
             return null;
         }
 
+        /// <summary>
+        /// The foreground-clip Full Screen Pass feature on a renderer asset, or null. It is
+        /// the one this installer adds (found by its name) or one wired by hand (found by
+        /// its material's shader). The single definition of "is the clip pass wired" -
+        /// the installer's own idempotence check and the project-validation rule both ask
+        /// here.
+        /// </summary>
+        internal static FullScreenPassRendererFeature FindClipFeature(ScriptableRendererData rendererData)
+        {
+            if (rendererData == null) return null;
+            foreach (var feature in rendererData.rendererFeatures)
+            {
+                var pass = feature as FullScreenPassRendererFeature;
+                if (pass == null) continue;
+                if (pass.name == kClipFeatureName) return pass;
+                if (pass.passMaterial != null && pass.passMaterial.shader != null &&
+                    pass.passMaterial.shader.name == kClipShaderName)
+                    return pass;
+            }
+            return null;
+        }
+
+        /// <summary>
+        /// True when the renderer asset this installer would wire (<see cref="FindRendererData"/>)
+        /// already carries the foreground-clip pass.
+        /// </summary>
+        internal static bool IsForegroundClipInstalled()
+        {
+            return FindClipFeature(FindRendererData()) != null;
+        }
+
         static bool TryAddFullScreenFeature(ScriptableRendererData rendererData, Material mat)
         {
             var so = new SerializedObject(rendererData);
@@ -130,16 +161,13 @@ namespace DisplayXR.Editor.URP
             if (features == null || map == null) return false;
 
             // Already installed? (idempotent)
-            for (int i = 0; i < features.arraySize; i++)
+            var installed = FindClipFeature(rendererData);
+            if (installed != null)
             {
-                var existing = features.GetArrayElementAtIndex(i).objectReferenceValue;
-                if (existing is FullScreenPassRendererFeature f && f.name == kClipFeatureName)
-                {
-                    ConfigureClipFeature(f, mat);
-                    EditorUtility.SetDirty(rendererData);
-                    AssetDatabase.SaveAssets();
-                    return true;
-                }
+                ConfigureClipFeature(installed, mat);
+                EditorUtility.SetDirty(rendererData);
+                AssetDatabase.SaveAssets();
+                return true;
             }
 
             var feature = ScriptableObject.CreateInstance<FullScreenPassRendererFeature>();
