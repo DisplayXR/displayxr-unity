@@ -90,10 +90,11 @@ where the viewer sees it. A cursor drawn on the panel sits at zero disparity, an
 ray is the one that passes from the midpoint of the eyes through that cursor.
 
 The cyclopean matrices are the left view with its translation averaged with the right one's,
-and the element-wise mean of the two projections. For two eyes at the same distance from the
-display that is exactly the midpoint eye's off-axis frustum (`TestCyclopeanIsTheMidpointEye`).
-When the head is turned so that one eye is nearer the panel than the other, it is an
-approximation of it.
+and the element-wise mean of the two projections. That is exactly the midpoint eye's own
+off-axis frustum, for any two eye positions, a turned or tilted head included. Every term of a
+projection that frames one fixed rectangle is linear in the eye position, so the mean of the two
+projections is the projection of the mean position (`TestCyclopeanIsTheMidpointEye`,
+`TestCyclopeanWithATurnedHead`).
 
 Use a **per-eye** ray or screen point when the question is about one eye's image:
 
@@ -117,7 +118,7 @@ the 3D picture is shown in.
 | Built player, opaque window (all platforms) | `Screen.width` x `Screen.height` | Unity's mouse |
 | Editor, docked or floating Game view (default) | the Game view (`Screen.*` in Play Mode) | Unity's mouse |
 | macOS / Linux transparent overlay | `Screen.*`: Unity's window is the visible one | Unity's mouse |
-| Android | `Screen.*` | touch, in the same pixels |
+| Android | `Screen.*` | none from `TryGetPointerPosition` unless a mouse is attached (it reads the mouse, not touches). Read the touch yourself: its position is in the same pixels |
 | **Windows transparent overlay** (`DisplayXRTransparentOverlay`, overlay mode) | the **provider's overlay window** | the cursor over that window |
 | **Windows editor with `DISPLAYXR_PROV_EXTERNAL_WINDOW=1`** | the provider's output window | the cursor over that window |
 
@@ -131,10 +132,12 @@ Unity's mouse position does not follow the cursor. Code that uses `TryGetPointer
 also in the picking space there, although `Screen.*` is not its size.
 
 No Win32 geometry call was added for this. The overlay window's size and pointer come from the
-existing native exports (`displayxr_get_overlay_size`, `displayxr_get_overlay_pointer`), which
-run on the per-monitor-DPI-aware native side. Only a point divided by a size from the same
-source ever reaches managed code, so there is no DPI space to mix up (see the DPI rules in
-`CLAUDE.md`).
+existing native exports (`displayxr_get_overlay_size`, `displayxr_get_overlay_pointer`). Those
+are not DPI-pinned: they call `GetClientRect` and `GetCursorPos` + `ScreenToClient` on the
+calling (managed) thread, so they answer in Unity's DPI awareness. That is safe here for one
+reason only: both numbers come from the same thread and the same window, and the only thing done
+with them is to divide one by the other. Do not combine either with a number from the pinned
+native side (see the DPI rules in `CLAUDE.md`).
 
 ### Zones
 
@@ -142,16 +145,27 @@ When the app sets a 3D zone (`DisplayXRProvider.SetZoneRect`), the located views
 **zone**, not the window. A screen point is then mapped into the zone rect before it is
 unprojected. A point outside the zone still maps to a ray, through the extension of the frustum,
 although nothing is drawn there. This is the rule the depth-aware cursor applies natively
-(`dxr_cursor::screen_to_canvas_uv`): an app-authored zone frames its rect, and anything else,
-including the zone the provider makes for the editor Game view, frames the whole screen.
+(`dxr_cursor::screen_to_canvas_uv`): an app-authored zone that is live frames its rect, and
+anything else frames the whole screen. "Anything else" is no zone, a cleared zone, the zone the
+provider makes for the editor Game view, and a runtime without `XR_DXR_display_zones`.
+
+Whether that holds, and for which rect, is the provider's answer, not a managed copy of what the
+app asked for: `dxr_prov_get_app_zone_rect_px` returns the app's rect only while an app zone is
+live. A managed copy cannot follow the native state. `ClearZone` clears the live zone but the
+provider keeps the app's rect and re-applies it when the session restarts.
 
 The zone rect is in client pixels with a top-left origin. On a scaled native-Wayland output
 Unity's screen and pointer are logical pixels while the rect is device pixels, and the mapping
 scales by `displayxr_linux_ui_scale` as the overlay does. Elsewhere the two units are the same.
 
-An app that sets the zone through the native export directly, without `SetZoneRect`, is covered
-when it also publishes the rect with `displayxr_set_canvas_rect`, the rect the overlay's own
-hit-test uses.
+The export is new with this API. A native library built before it (a platform binary that has
+not been rebuilt yet) lacks it. The managed side then treats that as "the provider cannot say",
+keeps working, and uses the rect an app publishes with `displayxr_set_canvas_rect`, the one the
+overlay's own hit-test maps the cursor into. Each optional native entry point has its own
+"missing" latch, so a missing one never disables the primary views or the overlay's hit-test.
+
+A camera's own `Camera.rect` sub-viewport is not applied. The mapping is always against the
+whole picking screen, or the zone.
 
 In a multi-zone app each zone has its own views and its own rect. Pass the zone index (0 =
 primary, i >= 1 = the zone set with `DisplayXRProvider.SetZone(i, ...)`) to the `zone`
@@ -159,16 +173,27 @@ overloads, for the zone the point lies in.
 
 ## Cameras and rigs
 
-The views are located by the runtime with the active rig's pose chained in, so for the camera
-whose `DisplayXRDisplay` / `DisplayXRCamera` rig is active they are already in Unity world
-space. That is the default, and the case `DisplayXRTransparentOverlay` has always used.
-
-Unity renders every camera with the same located views, composed as
+The views are located by the runtime with the rig pose the provider last sent chained in. Unity
+renders every camera with those same views, composed as
 `camera.transform * (rigPose^-1 * view)` (see `set_eye_pose_rig_relative` in the native
-provider). So for a camera other than the active rig's, and for a camera without a rig (where
-the rig pose is the identity), the `camera` overloads place the views at
-`camera.transform * rigPose^-1` before answering. With no rig and no camera to place them by,
-the methods return `false`.
+provider). So the views sit at `camera.transform * rigPose^-1`, and the API places them there
+before answering (`DisplayXRPickingMath.FrameFromPoses`, `TestFrameFromPoses`):
+
+- for the active rig camera, standing where it was when its rig pushed, that is the identity.
+  This is the default, and the case `DisplayXRTransparentOverlay` has always used;
+- for any other camera, it is that camera's pose relative to the rig's;
+- for a camera without a rig, the rig pose is the identity and the views sit at the camera;
+- for a rig camera that moved after its rig stopped pushing (the component was disabled, or the
+  splash is up), the runtime still has the last pose it was sent, and the views move with the
+  camera. This is why there is no "it is the rig camera, so identity" shortcut.
+
+The rig pose is forgotten when the session stops and at the start of every Play, so it never
+leaks from one Play into the next with domain reload disabled. With no camera to place the views
+by, the methods return `false`.
+
+Unity's side of this, that the device anchor it composes the eye poses with is the camera's own
+world transform, is taken from the native provider's comments and has not been measured for a
+second camera (see [Checking it by hand](#checking-it-by-hand)).
 
 ## What it consumes
 
@@ -208,11 +233,10 @@ overlay works in its own window's client pixels and knows its canvas sub-rect.
 - **Workspace (shell) tile.** Unity's window is minimised and the runtime composites the app
   into a tile. The pixel mapping above does not cover that case. Pointer input there comes from
   the shell.
-- **A zone the runtime ignores.** The zone rect is the one the app set. Against a runtime
-  without `XR_DXR_display_zones` the views frame the whole window while the mapping still uses
-  the rect.
+- **`Camera.rect`.** A camera rendering into a sub-viewport is mapped against the whole screen.
 - **More than two views.** The first two views of a multi-view mode are what is published.
-- **Turned head.** See [Cyclopean or per-eye](#cyclopean-or-per-eye).
+- **First frames of a session.** The provider learns whether the runtime supports zones on its
+  first zone frame. Until then a zoned app is mapped against the whole screen.
 
 ## Checking it by hand
 
@@ -231,3 +255,12 @@ On the simulated display (no 3D panel needed, the runtime falls back to it):
 4. Draw `Debug.DrawRay` from both `TryScreenPointToRay(..., Left, ...)` and `(..., Right, ...)`.
    In the Scene view they start next to the two eye positions (on each eye's near plane) and
    cross on the display plane under the cursor.
+5. The per-camera overload. Add a second camera with no rig, parented under a moved, rotated and
+   scaled object. Compare `secondCamera.GetStereoViewMatrix(Left)` with the view the frame
+   implies: the eye position from `TryScreenPointToRay(p, secondCamera, Left, out ray)` (the
+   point all its rays converge on) must be the translation of the inverse of that matrix. This
+   is the one assumption about Unity that nothing here has measured. Parent scale is the case
+   most likely to differ: the frame is rigid and ignores it.
+6. Zones. Call `SetZoneRect`, pick inside the zone, then `ClearZone` and pick again. Restart the
+   session (dock and undock the Game view) and pick once more. The ray must follow what is drawn
+   each time.
