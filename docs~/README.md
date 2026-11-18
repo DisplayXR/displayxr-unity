@@ -5,6 +5,7 @@
 Start here:
 - [README](../README.md) — Features, requirements, installation, scene setup, building
 - [Quick Start Guide](quick-start-guide.md) — Hands-on walkthrough
+- [Project Validation](project-validation.md) — **DisplayXR > Project Validation**: every rule, why it exists, what its Fix changes, the build-time check, the ignore list, and how to add a rule
 - [Render Path](../README.md#render-path) — which pipeline renders single-pass or multi-pass, per graphics API
 - [Runtime Compatibility](../README.md#runtime-compatibility) — which plugin feature needs which runtime version or extension
 - [What Happens When Things Are Missing](../README.md#what-happens-when-things-are-missing) — no runtime, no 3D panel, eye tracking lost, session stopped, and the API that detects each
