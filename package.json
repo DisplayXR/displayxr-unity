@@ -92,6 +92,11 @@
       "displayName": "Hand Tracking (URP Ghost Hand)",
       "description": "URP add-on for the Hand Tracking (XR Hands) sample: the Ghost Hand's Universal Render Pipeline shader (a hand-written HLSL port; Apache-2.0, attributed) and material. Import it NEXT TO the Hand Tracking sample in a URP project — DisplayXRGhostHand picks it up automatically. Kept separate so Built-in / HDRP projects never compile a shader whose URP includes they cannot resolve; do not import it into a non-URP project.",
       "path": "Samples~/HandTrackingURP"
+    },
+    {
+      "displayName": "Stereo Media",
+      "description": "Side-by-side / top-bottom stereo pictures and video with the DisplayXRStereoMedia component: each eye sees its own half, as a quad on the rig's zero-parallax plane or full screen with no added parallax. Ships no media file - the red \"L\" / blue \"R\" test picture with shapes at three depths is generated in code - and the README shows how to point it at your own video. DisplayXR > Samples > Create Stereo Media Scene builds the scene. BiRP, URP and HDRP.",
+      "path": "Samples~/StereoMedia"
     }
   ]
 }

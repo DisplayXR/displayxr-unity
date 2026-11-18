@@ -122,6 +122,11 @@ jobs:
       - name: Project validation
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: dotnet run --project "Tests~/ProjectValidation" -c Release
+      # Pure C#: which part of a side-by-side / top-bottom picture each eye samples, the fit
+      # modes, the depth shift, flipped textures and the colour conversion (#463).
+      - name: Stereo media math
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: dotnet run --project "Tests~/StereoMediaMath" -c Release
 
   build-windows:
     name: Windows x64

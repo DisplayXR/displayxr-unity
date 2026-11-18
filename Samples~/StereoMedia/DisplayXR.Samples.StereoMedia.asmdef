@@ -1,0 +1,22 @@
+{
+    "name": "DisplayXR.Samples.StereoMedia",
+    "rootNamespace": "DisplayXR.Samples",
+    "references": [
+        "com.displayxr.unity"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [
+        {
+            "name": "com.unity.modules.video",
+            "expression": "1.0.0",
+            "define": "DISPLAYXR_SAMPLE_HAS_VIDEO"
+        }
+    ],
+    "noEngineReferences": false
+}
