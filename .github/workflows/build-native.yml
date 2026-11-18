@@ -117,6 +117,11 @@ jobs:
       - name: Picking math
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: dotnet run --project "Tests~/PickingMath" -c Release
+      # Pure C#: project validation's rule registry, evaluation, ignore-list file format and
+      # the decisions behind the built-in rules (graphics APIs, XR loaders, native binaries) (#462).
+      - name: Project validation
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: dotnet run --project "Tests~/ProjectValidation" -c Release
 
   build-windows:
     name: Windows x64

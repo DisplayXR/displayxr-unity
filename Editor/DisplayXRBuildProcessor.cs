@@ -20,10 +20,26 @@ namespace DisplayXR.Editor
     /// registered-mode manifest to %LOCALAPPDATA%\DisplayXR\apps\ so any
     /// compliant workspace controller can find this build without it
     /// living under Program Files.
+    /// <para>
+    /// Before the build it also runs project validation (#462) and logs each open
+    /// Error-severity finding as a warning - see <see cref="OnPreprocessBuild"/>.
+    /// </para>
     /// </summary>
-    public class DisplayXRBuildProcessor : IPostprocessBuildWithReport
+    public class DisplayXRBuildProcessor : IPreprocessBuildWithReport, IPostprocessBuildWithReport
     {
         public int callbackOrder => 100;
+
+        /// <summary>
+        /// Project validation at build time (#462): the Error-severity rules, for the
+        /// target being built, each logged as a WARNING. It never fails the build and
+        /// shows no window or dialog, so a batch-mode / CI build behaves exactly like an
+        /// interactive one. Rules the project ignores (DisplayXR > Project Validation)
+        /// are not logged.
+        /// </summary>
+        public void OnPreprocessBuild(BuildReport report)
+        {
+            DisplayXRProjectValidation.LogBuildIssues(report.summary.platform);
+        }
 
         public void OnPostprocessBuild(BuildReport report)
         {
