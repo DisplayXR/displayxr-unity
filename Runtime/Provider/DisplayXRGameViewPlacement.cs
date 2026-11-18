@@ -255,19 +255,26 @@ namespace DisplayXR
         // scale, with point filtering; the texture's own size is whole px. Where the two
         // differ, a column (row) is dropped or doubled and everything past it sits one pixel
         // off, which on a lenticular panel is the other eye.
-        //   Windows scale   2 pt side borders   47 pt docked chrome   drawn vs texture
-        //   100 200 300 %   whole px            whole px              W equal, H equal *
-        //   150 250 %       whole px (3, 5)     x.5 px (70.5, 117.5)  W equal, H 0.5 short
-        //   125 175 225 %   x.5 px              x.25 / x.75 px        W 0.5 short, H 0.25 / 0.75
-        // (* before GVFIT. GVFIT stretches Y by h / (h - 0.5), which is exact for the 0.5 row
-        // of 150 / 250 % and nothing else: see docs~/architecture/editor-game-view-placement.md.)
+        // Unity allocates the texture as its target rounded half AWAY FROM ZERO
+        // (PlayModeView.RenderView, read from the 6000.4 editor assembly), so for a docked
+        // Free Aspect view (2 pt of side borders, 47 pt of chrome above and below):
+        //   Windows scale   area W   area H   texture vs area     rows drawn under GVFIT
+        //   100 200 300 %   whole    whole    equal               h + 0.5
+        //   150 250 %       whole    x.5      H 0.5 taller        h (exact)
+        //   175 %           x.5      x.75     W 0.5, H 0.25 over  h + 0.25
+        //   125 225 %       x.5      x.25     W 0.5 over, H 0.25 under   h + 0.75
+        // GVFIT stretches Y by h / (h - 0.5): exact for the half row of 150 / 250 % and nothing
+        // else. These are arithmetic; points x scale in float can land a hair below x.5 and
+        // round the other way, which is why the driver's diagnostic reads the REAL texture.
+        // See docs~/architecture/editor-game-view-placement.md.
 
         /// <summary>A drawn size within this of the texture size counts as equal: the smallest
         /// real mismatch is a quarter pixel (125 %), float noise is ~1e-3.</summary>
         public const double OneToOneTolPx = 0.05;
 
-        /// <summary>The largest step (points) <see cref="WholePixelStepPt"/> looks for.</summary>
-        public const int WholePixelMaxStepPt = 8;
+        /// <summary>The largest step (points) <see cref="WholePixelStepPt"/> can return: at a
+        /// whole-percent scale 100 points are always a whole number of pixels.</summary>
+        public const int WholePixelMaxStepPt = 100;
 
         /// <summary>The pane's scale as Unity uses it: the measured px / pt snapped to a whole
         /// percent (see SnapScale).</summary>
@@ -307,24 +314,33 @@ namespace DisplayXR
 
         /// <summary>A pane border of <paramref name="borderPt"/> points in whole px, with the
         /// half-up rule of <see cref="LetterboxOffsets"/> (1 pt at 250 % = 2.5 px -> 3, the
-        /// measured #740 value). The quarter-pixel case (x.25 at 125 % / 175 %) is unmeasured.</summary>
+        /// measured #740 value). The quarter-pixel case (x.25 at 125 % / 175 %) is unmeasured,
+        /// and this rounds it DOWN while <see cref="RtRow0Y"/> and <see cref="LinesShown"/> take
+        /// the next pixel UP: X and Y disagree there by construction.</summary>
         public static int BorderPx(float borderPt, float ptToPx) =>
             FloorToInt(borderPt * SnapScale(ptToPx) + 0.5f);
 
-        /// <summary>The smallest number of points that is a whole number of pixels at this
-        /// scale: 1 at 100 / 200 / 300 %, 2 at 150 % (3 px) and 250 % (5 px), 4 at 125 % (5 px),
-        /// 175 % (7 px) and 225 % (9 px). 0 when there is none up to
-        /// <see cref="WholePixelMaxStepPt"/> (e.g. a custom 110 %) or the scale is implausible.</summary>
+        // The pane's scale as a whole percent (175 for 1.75), or 0 when it is not one (the
+        // measured px / pt is within 0.1 % of a whole percent on any real pane) or implausible.
+        static int ScalePercent(float ptToPx)
+        {
+            double pct = (double)ptToPx * 100.0;
+            int whole = (int)Math.Round(pct);
+            if (!(pct > 50.0 && pct < 800.0) || Math.Abs(pct - whole) > 0.1) return 0;
+            return whole;
+        }
+
+        static int Gcd(int a, int b) { while (b != 0) { int t = a % b; a = b; b = t; } return a; }
+
+        /// <summary>The smallest number of points that is EXACTLY a whole number of pixels at
+        /// this scale: 100 / gcd(percent, 100). 1 at 100 / 200 / 300 %, 2 at 150 % (3 px) and
+        /// 250 % (5 px), 4 at 125 % (5 px), 175 % (7 px) and 225 % (9 px), 10 at 110 %, 100 at
+        /// a custom 133 % (3 pt would be 3.99 px: not whole). Integer arithmetic on the whole
+        /// percent, no tolerance. 0 when the scale is not a whole percent or is implausible.</summary>
         public static int WholePixelStepPt(float ptToPx)
         {
-            double s = SnapScale(ptToPx);
-            if (!(s > 0.5 && s < 8.0)) return 0;
-            for (int q = 1; q <= WholePixelMaxStepPt; q++)
-            {
-                double px = q * s;
-                if (Math.Abs(px - Math.Round(px)) < 0.01) return q;
-            }
-            return 0;
+            int pct = ScalePercent(ptToPx);
+            return pct == 0 ? 0 : 100 / Gcd(pct, 100);
         }
 
         /// <summary>
@@ -333,8 +349,8 @@ namespace DisplayXR
         /// points AND of pixels on both axes: a multiple of <see cref="WholePixelStepPt"/>. A
         /// Fixed Resolution of that size at zoom 1 is drawn texel for pixel (measured at 175 %:
         /// 770x1127 px = 440x644 pt, every column on screen); it leaves a margin of less than
-        /// one step. False when the scale needs no such size (a whole scale: step 1), has none
-        /// (step 0), or the area is smaller than one step.
+        /// one step. False when the scale needs no such size (a whole scale: step 1), is not a
+        /// whole percent (step 0), or the area is smaller than one step.
         /// </summary>
         public static bool WholePixelSize(float viewWPt, float viewHPt, float ptToPx,
                                           out int wPt, out int hPt, out int wPx, out int hPx)
@@ -342,12 +358,12 @@ namespace DisplayXR
             wPt = hPt = wPx = hPx = 0;
             int q = WholePixelStepPt(ptToPx);
             if (q <= 1) return false;
-            double s = SnapScale(ptToPx);
+            int pct = ScalePercent(ptToPx);
             wPt = (int)Math.Floor(viewWPt / q + 0.001) * q;
             hPt = (int)Math.Floor(viewHPt / q + 0.001) * q;
             if (wPt <= 0 || hPt <= 0) { wPt = hPt = 0; return false; }
-            wPx = (int)Math.Round(wPt * s);
-            hPx = (int)Math.Round(hPt * s);
+            wPx = wPt * pct / 100;   // exact: wPt is a multiple of the step
+            hPx = hPt * pct / 100;
             return true;
         }
     }
