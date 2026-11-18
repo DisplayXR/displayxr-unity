@@ -205,7 +205,7 @@ namespace DisplayXR.Editor
                 Type kind = EditorType("UnityEditor.GameViewSizeType");
                 entry = Activator.CreateInstance(sizeType, kAny, null,
                     new object[] { Enum.Parse(kind, "FixedResolution"), wPx, hPx, SizeName }, null);
-                Method(groupType, "AddCustomSize").Invoke(group, new[] { entry });
+                Method(groupType, "AddCustomSize", sizeType).Invoke(group, new[] { entry });
                 // Found again by name: whether the group stores the instance or a copy, and what
                 // its IndexOf returns for a custom size, has varied between editor versions.
                 index = FindEntry(group, groupType, out entry);
