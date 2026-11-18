@@ -283,6 +283,18 @@ namespace DisplayXR
         /// <summary>The renderer currently under the pointer, or null if none.</summary>
         public Renderer HoverRenderer => m_HoverRenderer;
 
+        /// <summary>True while an overlay has hidden Unity's own window behind the
+        /// provider's (Windows overlay mode): <c>Screen.*</c> and Unity's mouse position
+        /// then describe a window nobody sees, so <see cref="DisplayXRPicking"/> measures
+        /// screen points against the overlay window instead. Never true in simple-window
+        /// mode, in the editor, or off Windows, where Unity's window is the visible one.</summary>
+#if UNITY_STANDALONE_WIN
+        internal static bool OverlayWindowActive => s_OverlayWindowCount > 0;
+        private static int s_OverlayWindowCount;
+#else
+        internal static bool OverlayWindowActive => false;
+#endif
+
         /// <summary>
         /// Request the runtime's transparent-background mode for the next
         /// OpenXR session. MUST be called BEFORE the OpenXR session is
@@ -489,6 +501,7 @@ namespace DisplayXR
             {
                 DisplayXRNative.displayxr_set_transparent_overlay(
                     1, alwaysOnTop ? 1 : 0);
+                s_OverlayWindowCount++;
             }
             // Default hit rect = whole window until LateUpdate refines it.
             DisplayXRNative.displayxr_set_overlay_hit_rect(
@@ -507,7 +520,10 @@ namespace DisplayXR
             if (m_SimpleWindow)
                 DisplayXRNative.displayxr_set_simple_window(0, 0);
             else
+            {
                 DisplayXRNative.displayxr_set_transparent_overlay(0, 0);
+                if (s_OverlayWindowCount > 0) s_OverlayWindowCount--;
+            }
             DisplayXRNative.displayxr_set_overlay_hit_active(0);
         }
 #endif
@@ -1455,37 +1471,14 @@ namespace DisplayXR
             }
         }
 
-        private readonly float[] m_SmLV = new float[16], m_SmLP = new float[16],
-                                 m_SmRV = new float[16], m_SmRP = new float[16];
-
+        // The per-eye view + projection the provider renders with. Shared with the public
+        // picking API (DisplayXRPicking): one implementation of the matrices and the math.
         private bool TryGetStereoMatrices(out Matrix4x4 leftView, out Matrix4x4 leftProj,
                                            out Matrix4x4 rightView, out Matrix4x4 rightProj)
-        {
-            leftView = leftProj = rightView = rightProj = Matrix4x4.identity;
-
-            // The provider publishes the per-eye matrices to the shared state each
-            // frame — read them directly via the native getter so the cyclopean
-            // hit-test (LMB drag on the silhouette) works.
-            DisplayXRNative.displayxr_get_stereo_matrices(
-                m_SmLV, m_SmLP, m_SmRV, m_SmRP, out int pvalid);
-            if (pvalid == 0) return false;
-            leftView = FloatsToMatrix(m_SmLV); leftProj = FloatsToMatrix(m_SmLP);
-            rightView = FloatsToMatrix(m_SmRV); rightProj = FloatsToMatrix(m_SmRP);
-            return true;
-        }
+            => DisplayXRPicking.TryGetStereoMatrices(out leftView, out leftProj, out rightView, out rightProj);
 
         // Column-major float[16] → Unity Matrix4x4.
-        private static Matrix4x4 FloatsToMatrix(float[] m)
-        {
-            var mat = new Matrix4x4();
-            mat.m00 = m[0];  mat.m10 = m[1];  mat.m20 = m[2];  mat.m30 = m[3];
-            mat.m01 = m[4];  mat.m11 = m[5];  mat.m21 = m[6];  mat.m31 = m[7];
-            mat.m02 = m[8];  mat.m12 = m[9];  mat.m22 = m[10]; mat.m32 = m[11];
-            mat.m03 = m[12]; mat.m13 = m[13]; mat.m23 = m[14]; mat.m33 = m[15];
-            return mat;
-        }
-
-
+        private static Matrix4x4 FloatsToMatrix(float[] m) => DisplayXRPicking.ToMatrix(m);
 
         // The stereo viewport (overlay client px) the Kooima projection from
         // displayxr_get_stereo_matrices is computed for. Defaults to the full
@@ -1509,96 +1502,39 @@ namespace DisplayXR
         }
 
         // Unproject a window-pixel cursor through one eye's view + projection
-        // into a Unity-world-space Ray. Inverse path of ProjectThroughEye:
-        // viewport px → NDC → inverse projection (eye-space, OpenXR convention)
-        // → inverse view (Unity world). Origin = ray's near-plane point;
-        // direction = far-near. Returns false if the projection is degenerate.
+        // into a Unity-world-space Ray: viewport px → NDC → inverse projection
+        // (eye-space, OpenXR convention) → inverse view (Unity world). Origin =
+        // ray's near-plane point; direction = far-near. Returns false if the
+        // projection is degenerate.
+        //
+        // The cursor maps to NDC over the stereo VIEWPORT — the region the
+        // Kooima projection is computed for. Normally that's the full overlay
+        // client area, but when a 3D canvas sub-rect is active (#131) the
+        // projection is built for that (smaller, offset) sub-rect, so cursor →
+        // NDC must use it too; otherwise the ray lands at the content's
+        // full-window position and misses the shrunk-into-the-sub-rect
+        // collider. (overlayW/H is passed as the viewport when no sub-rect is
+        // set.) The math is DisplayXRPickingMath, shared with DisplayXRPicking.
         private static bool TryBuildEyeRay(int clientX, int clientY,
                                             int vpX, int vpY, int vpW, int vpH,
                                             Matrix4x4 viewOpenXR, Matrix4x4 projOpenXR,
                                             out Ray ray)
-        {
-            ray = new Ray(Vector3.zero, Vector3.forward);
-            // Map the cursor to NDC over the stereo VIEWPORT — the region the
-            // Kooima projection is computed for. Normally that's the full
-            // overlay client area, but when a 3D canvas sub-rect is active
-            // (#131) the projection is built for that (smaller, offset)
-            // sub-rect, so cursor → NDC must use it too; otherwise the ray
-            // lands at the content's full-window position and misses the
-            // shrunk-into-the-sub-rect collider. (overlayW/H is passed as the
-            // viewport when no sub-rect is set.)
-            float sw = Mathf.Max(1, vpW);
-            float sh = Mathf.Max(1, vpH);
-            // Viewport pixel (top-left origin) → NDC ([-1,1] with +Y up)
-            float ndcX = 2f * (clientX - vpX) / sw - 1f;
-            float ndcY = 1f - 2f * (clientY - vpY) / sh;
-
-            Matrix4x4 projInv = projOpenXR.inverse;
-            Vector4 nearClip = new Vector4(ndcX, ndcY, -1f, 1f);
-            Vector4 farClip  = new Vector4(ndcX, ndcY,  1f, 1f);
-            Vector4 nearEye = projInv * nearClip;
-            Vector4 farEye  = projInv * farClip;
-            if (Mathf.Abs(nearEye.w) < 1e-6f || Mathf.Abs(farEye.w) < 1e-6f)
-                return false;
-            Vector3 nearEye3 = new Vector3(nearEye.x / nearEye.w,
-                                            nearEye.y / nearEye.w,
-                                            nearEye.z / nearEye.w);
-            Vector3 farEye3 = new Vector3(farEye.x / farEye.w,
-                                           farEye.y / farEye.w,
-                                           farEye.z / farEye.w);
-
-            // viewUnity = FlipViewZ(viewOpenXR) maps Unity-world → OpenXR-eye-space.
-            // Its inverse maps OpenXR-eye-space back to Unity-world.
-            Matrix4x4 viewUnity = viewOpenXR;
-            viewUnity.m02 = -viewUnity.m02;
-            viewUnity.m12 = -viewUnity.m12;
-            viewUnity.m22 = -viewUnity.m22;
-            viewUnity.m32 = -viewUnity.m32;
-            Matrix4x4 viewInv = viewUnity.inverse;
-            Vector3 nearWorld = viewInv.MultiplyPoint(nearEye3);
-            Vector3 farWorld  = viewInv.MultiplyPoint(farEye3);
-            Vector3 dir = (farWorld - nearWorld);
-            float len = dir.magnitude;
-            if (len < 1e-4f)
-                return false;
-            ray = new Ray(nearWorld, dir / len);
-            return true;
-        }
+            => DisplayXRPicking.TryClientPixelToRay(clientX, clientY, vpX, vpY, vpW, vpH,
+                                                    viewOpenXR, projOpenXR, out ray);
 
         // Project a single world-space point through one eye's view + projection
         // into top-left-origin window pixels. Returns false if the point is
         // behind the eye or outside the depth clip range.
         //
         // The view matrix from the runtime is OpenXR convention (right-hand,
-        // -Z forward); Unity world is +Z forward. FlipViewZ negates the
-        // matrix's Z column, which is equivalent to negating the world Z
-        // input — so the result equals applying the unflipped matrix to
-        // (x, y, -z). We do that here so callers pass plain Unity-world
-        // positions.
+        // -Z forward); Unity world is +Z forward. The shared math negates Z on
+        // the way in, so callers pass plain Unity-world positions.
         private static bool ProjectThroughEye(Vector3 worldUnity,
                                                Matrix4x4 viewOpenXR, Matrix4x4 projOpenXR,
                                                float screenW, float screenH,
                                                out Vector2 windowPx)
-        {
-            windowPx = Vector2.zero;
-            Matrix4x4 viewUnity = viewOpenXR;
-            viewUnity.m02 = -viewUnity.m02;
-            viewUnity.m12 = -viewUnity.m12;
-            viewUnity.m22 = -viewUnity.m22;
-            viewUnity.m32 = -viewUnity.m32;
-            Vector4 worldH = new Vector4(worldUnity.x, worldUnity.y, worldUnity.z, 1f);
-            Vector4 eye = viewUnity * worldH;
-            Vector4 clip = projOpenXR * eye;
-            if (clip.w <= 0.0001f) return false;
-            float ndcX = clip.x / clip.w;
-            float ndcY = clip.y / clip.w;
-            float ndcZ = clip.z / clip.w;
-            if (ndcZ < -1f || ndcZ > 1f) return false;
-            // NDC ([-1,1] with +Y up) → window pixels (top-left origin, +Y down).
-            windowPx.x = (ndcX + 1f) * 0.5f * screenW;
-            windowPx.y = (1f - ndcY) * 0.5f * screenH;
-            return true;
-        }
+            => DisplayXRPicking.TryWorldToClientPixel(worldUnity, viewOpenXR, projOpenXR,
+                                                      screenW, screenH, out windowPx);
 
         // Convert an OpenXR-convention view matrix (right-handed
         // world, -Z forward) to a Unity-convention view matrix that
@@ -1639,18 +1575,8 @@ namespace DisplayXR
                                             Matrix4x4 rightView, Matrix4x4 rightProj,
                                             out Matrix4x4 cyclopeanView,
                                             out Matrix4x4 cyclopeanProj)
-        {
-            cyclopeanView = leftView;
-            cyclopeanView.m03 = (leftView.m03 + rightView.m03) * 0.5f;
-            cyclopeanView.m13 = (leftView.m13 + rightView.m13) * 0.5f;
-            cyclopeanView.m23 = (leftView.m23 + rightView.m23) * 0.5f;
-
-            cyclopeanProj = new Matrix4x4();
-            for (int row = 0; row < 4; row++)
-                for (int col = 0; col < 4; col++)
-                    cyclopeanProj[row, col] =
-                        (leftProj[row, col] + rightProj[row, col]) * 0.5f;
-        }
+            => DisplayXRPicking.BuildCyclopean(leftView, leftProj, rightView, rightProj,
+                                               out cyclopeanView, out cyclopeanProj);
 
         // Project a renderer's world-space AABB to a window-pixel rect via
         // cyclopean Kooima projection. 8 corners → take min/max.

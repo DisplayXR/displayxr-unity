@@ -124,6 +124,12 @@ namespace DisplayXR
         public static Vector3 RigPlaneForward { get; internal set; } = Vector3.forward;
         public static bool    RigPlaneValid   { get; internal set; }
 
+        /// <summary>The rotation sent with <see cref="RigPlanePos"/>, and the camera whose rig
+        /// sent it. <see cref="DisplayXRPicking"/> needs both to place the located views for a
+        /// camera other than that one.</summary>
+        internal static Quaternion RigPlaneRotation { get; set; } = Quaternion.identity;
+        internal static Camera     RigPlaneCamera   { get; set; }
+
         static DisplayXRProviderNative.ModeInfo[] s_modes = Array.Empty<DisplayXRProviderNative.ModeInfo>();
 
         /// <summary>The enumerated rendering modes (refreshed at session start + on mode change).</summary>
@@ -304,11 +310,39 @@ namespace DisplayXR
         /// swapchain is born zone-sized.
         /// width&lt;=0||height&lt;=0 clears. Safe to call whether or not the provider is active.
         /// </summary>
-        public static void SetZoneRect(int x, int y, int width, int height) =>
+        public static void SetZoneRect(int x, int y, int width, int height)
+        {
+            RecordAppZone(x, y, width, height);
             DisplayXRProviderNative.dxr_prov_set_3d_zone_rect(x, y, width, height);
+        }
 
         /// <summary>Clear the 3D-zone rect (revert to full-window framing).</summary>
-        public static void ClearZone() => DisplayXRProviderNative.dxr_prov_clear_3d_zone();
+        public static void ClearZone()
+        {
+            s_AppZoneValid = false;
+            DisplayXRProviderNative.dxr_prov_clear_3d_zone();
+        }
+
+        // The primary 3D zone as the APP authored it (client-window pixels, top-left origin).
+        // The views frame this rect, so DisplayXRPicking maps a screen point into it. Kept
+        // here rather than read back from native because the live native zone can also be one
+        // the provider made for itself (the editor Game-view zone), which frames the whole
+        // screen as far as Unity's pixels are concerned - the same distinction the native
+        // cursor code draws with s_app_zone_valid.
+        static bool s_AppZoneValid;
+        static int s_AppZoneX, s_AppZoneY, s_AppZoneW, s_AppZoneH;
+
+        static void RecordAppZone(int x, int y, int width, int height)
+        {
+            s_AppZoneValid = width > 0 && height > 0;
+            s_AppZoneX = x; s_AppZoneY = y; s_AppZoneW = width; s_AppZoneH = height;
+        }
+
+        internal static bool TryGetAppZoneRect(out int x, out int y, out int width, out int height)
+        {
+            x = s_AppZoneX; y = s_AppZoneY; width = s_AppZoneW; height = s_AppZoneH;
+            return s_AppZoneValid;
+        }
 
         /// <summary>
         /// Set the total number of 3D zones (#166 Phase B2): 1 primary + extras (max 4,
@@ -323,8 +357,11 @@ namespace DisplayXR
         /// the primary zone (equivalent to <see cref="SetZoneRect"/>); index &gt;= 1 are the
         /// extra zones. Each 3D zone weaves into its own window-pixel rect.
         /// </summary>
-        public static void SetZone(int index, int zoneId, int x, int y, int width, int height) =>
+        public static void SetZone(int index, int zoneId, int x, int y, int width, int height)
+        {
+            if (index == 0) RecordAppZone(x, y, width, height);
             DisplayXRProviderNative.dxr_prov_set_zone((uint)index, (uint)zoneId, x, y, width, height);
+        }
 
         /// <summary>
         /// Set 3D zone <paramref name="index"/>'s cosmetic edge feather radius in
