@@ -23,8 +23,20 @@ media.layout = DisplayXRStereoLayout.SideBySide;
 media.presentation = DisplayXRStereoMedia.PresentationMode.FullScreen;
 ```
 
-The component draws through a hidden child object it owns, so it never moves or scales the
-GameObject it sits on, and it allocates nothing per frame.
+The component submits the picture each frame with `Graphics.RenderMesh`. It adds no
+renderer and no child object, never moves or scales the GameObject it sits on, and
+allocates nothing per frame. Disabling the component or deactivating its GameObject simply
+stops the draw.
+
+### Importing a stereo photo
+
+Two texture import defaults hurt a stereo picture, and the inspector warns about both:
+
+- **Non-Power of 2** other than *None* resizes the image: 3840×1080 becomes 4096×1024, which
+  changes the picture's shape (and resamples it). Set it to *None*. If you cannot, state
+  the true size in **Source Size** — only the shape is used.
+- **Generate Mip Maps**: see *The seam* below. Turn it off for a picture shown at or near
+  its own size.
 
 ## Layouts
 
@@ -40,7 +52,7 @@ GameObject it sits on, and it allocates nothing per frame.
 packing axis so the frame keeps a normal shape: half-width side-by-side (two 16:9 pictures
 in 1920×1080) or half-height top-bottom. Each eye is then shown at the aspect of the whole
 texture. With it off, each eye picture is taken at its stored shape (3840×1080 holds two
-16:9 pictures). The inspector warns when the texture's shape does not look like the
+16:9 pictures). The inspector warns when the picture's shape does not look like the
 setting; it is a hint, since a 4:3 or portrait source can trip it legitimately.
 
 **Pixel Aspect** is the width / height of one stored pixel. `0` takes it from the Video
@@ -78,12 +90,17 @@ data is read; the projection is the runtime's (`XR_DXR_view_rig`), and the plug-
 none of it. `DisplayXRStereoMedia.TryGetZeroParallaxPlane` exposes the same plane for your
 own objects.
 
+The component runs at execution order 9999, just before the provider driver (10000)
+samples the rig pose it sends the runtime, so the quad is placed from the pose that is
+rendered this frame rather than the previous one.
+
 A camera-centric rig that converges at infinity (`invConvergenceDistance = 0`) has no such
 plane; the component then logs once and falls back to its own transform and **Quad Size**,
 as **Placement = Manual** does.
 
-The quad is still a scene object: other objects can be in front of or behind it, and it
-shifts against them as the viewer's head moves. That is the difference from full screen.
+The quad is still a scene object: it is drawn for every camera, other objects can be in
+front of or behind it, and it shifts against them as the viewer's head moves. That is the
+difference from full screen.
 
 ### Full screen
 
@@ -96,8 +113,12 @@ nothing moves with the head. **Order** decides when it is drawn:
   over it.
 - `Foreground` — after transparents, ignoring depth.
 
-It is drawn for Game cameras only (never the Scene view, previews or reflection probes),
-and only for **Rig Camera** when one is assigned.
+Clip-space geometry would cover any camera that drew it, so it is drawn for exactly **one**
+camera: **Rig Camera**, or the active rig camera (`DisplayXRRigManager.ActiveCamera`) when
+that is empty. The camera is a parameter of the draw (`RenderParams.camera`), so the Scene
+view, previews, reflection probes and a second Game camera rendering into a texture never
+get it, and nothing is toggled between cameras. With no rig camera at all, nothing is
+drawn.
 
 ### Fit
 
@@ -117,6 +138,7 @@ One shader serves all three pipelines. That is deliberate, and rests on these fa
    `Runtime/Resources/` (which puts it in every build) without breaking a project that has
    no URP or HDRP. A shader that includes URP or HDRP libraries must never be there — see
    `CLAUDE.md`, the #130 revert. `DisplayXRCursorDepthPatch.shader` follows the same rule.
+   The shader has exactly one pass.
 2. **It is drawn by every pipeline.** A pass with no `LightMode` tag is `SRPDefaultUnlit`.
    URP draws it in its opaque and transparent passes; HDRP lists it in its forward pass
    names as "a fall back to legacy unlit rendering". `Sprites/Default`, which the boot
@@ -128,9 +150,10 @@ One shader serves all three pipelines. That is deliberate, and rests on these fa
    `XRBuiltinShaderConstants` for exactly this purpose, and both set `STEREO_INSTANCING_ON`,
    which `#pragma multi_compile_instancing` declares.
 
-So both presentations use the same mechanism on every pipeline: a mesh renderer with this
-material, drawn in the pipeline's normal scene pass. No `OnRenderImage`, renderer feature
-or custom pass is involved, and nothing has to be set up in the project.
+So both presentations use the same mechanism on every pipeline: one mesh submitted with
+`Graphics.RenderMesh`, drawn in the pipeline's normal scene pass like any renderer. No
+`OnRenderImage`, renderer feature or custom pass is involved, and nothing has to be set up
+in the project.
 
 | | Quad | Full screen |
 |---|---|---|
@@ -138,20 +161,67 @@ or custom pass is involved, and nothing has to be set up in the project.
 | **URP** (single-pass instanced) | yes | yes |
 | **HDRP** (single-pass instanced) | yes, but see the HDRP limits below | yes, but see the HDRP limits below |
 
+### Render queue: never the opaque queue
+
+Even an opaque quad is drawn at queue **2900** (`Transparent − 100`), with depth write on.
+The reason is URP's depth priming (Depth Priming Mode *Forced*, or *Auto* when a prepass
+is needed, for instance SSAO with depth-normals and no MSAA): `DrawObjectsPass` then draws
+the opaque queue with `DepthState(false, CompareFunction.Equal)` against the depth
+prepass. A shader with no `DepthOnly` pass is not in that prepass, so every one of its
+fragments fails the test and an opaque-queue quad **is not drawn at all**.
+
+Two ways out were considered:
+
+- **Add `DepthOnly` / `DepthNormalsOnly` passes.** They would have to be written without
+  URP's library, and `DepthNormalsOnly` has to match what URP expects in its normals
+  target — world normals, octahedral-packed under a keyword in the deferred path, plus a
+  second target when rendering layers are written. HDRP also has a `DepthOnly` pass name,
+  with its own stencil and normal-buffer conventions, so the same pass would be picked up
+  there with outputs HDRP does not expect. That is a lot of pipeline contract to reproduce
+  blind in a shader that cannot be compiled or looked at here.
+- **Stay out of the primed queue.** URP applies the `Equal` state only to its opaque pass
+  (`m_IsOpaque`); its transparent pass draws `SRPDefaultUnlit` with the shader's own depth
+  state. BiRP and HDRP likewise draw this queue with the shader's state. This is what the
+  component does.
+
+The queue numbers are chosen against all three pipelines: at or below 2500 is URP's opaque
+(primed) range; 2501–2649 is HDRP's after-post-process opaque range; 2900–3100 is HDRP's
+plain transparent range, which URP and BiRP also draw as transparents.
+
+| What | Queue | Depth |
+|---|---|---|
+| Opaque quad | 2900 | test `LEqual`, write on |
+| Quad with alpha | 3000 | test `LEqual`, write off |
+| Full screen, Background | 2900 | far plane, test `LEqual`, write off |
+| Full screen, Foreground | 3100 | test `Always`, write off |
+
+What this costs is listed under Limits (*Not in the depth prepass*).
+
 ### Where the eye index comes from
 
-The shader reads `unity_StereoEyeIndex` in the **vertex** stage, where it is defined on
-every path, and passes the chosen eye's UV mapping to the fragment stage as interpolants.
-The fragment stage needs no eye index at all.
+The shader decides the eye in the **vertex** stage and passes that eye's UV mapping to the
+fragment stage as interpolants. The fragment stage needs no eye index at all.
 
-- **Single-pass instanced (URP, HDRP; D3D11, D3D12, Metal, Vulkan).** The engine doubles
-  the instance count; `UNITY_SETUP_INSTANCE_ID` sets `unity_StereoEyeIndex = instanceID & 1`,
-  and `UNITY_INITIALIZE_VERTEX_OUTPUT_STEREO` routes the instance to array slice 0 or 1.
-- **Multi-pass (BiRP).** `unity_StereoEyeIndex` is a per-camera constant the engine sets
-  for each eye's pass.
-- **No stereo.** The same constant is 0: the left picture.
+| Path | Source of the eye |
+|---|---|
+| **Single-pass instanced** (URP, HDRP; D3D11, D3D12, Metal, Vulkan) | The engine doubles the instance count; `UNITY_SETUP_INSTANCE_ID` sets `unity_StereoEyeIndex = instanceID & 1`, and `UNITY_INITIALIZE_VERTEX_OUTPUT_STEREO` routes the instance to array slice 0 or 1. |
+| **Multi-pass** (BiRP) | Either of two, OR-ed: the engine's per-camera `unity_StereoEyeIndex`, and `_DXRMediaScriptEye`, a global the component sets from `Camera.onPreRender` to 1 while `Camera.stereoActiveEye` is `Right`. |
+| **No stereo** | Both are 0: the left picture. |
 
-A view index above 1 (a future mode with more than two views) gets the right picture.
+The second BiRP source exists because whether the engine sets `unity_StereoEyeIndex` to 1
+for the right-eye pass *under this provider* (which issues one render pass per eye) could
+not be settled from source. `Camera.stereoActiveEye` is the signal the BiRP per-eye
+foreground clip (`DisplayXRForegroundClipBiRP`) already relies on under this provider — it
+reads it in `OnRenderImage`; here it is read in `onPreRender`, before the eye's draws,
+because the value has to be in place when the mesh is drawn. OR-ing them is safe: neither
+can be 1 during a left-eye or non-stereo pass (a camera that does not render stereo
+reports `Mono`, which sets 0), so if either mechanism works the right eye gets the right
+picture. The subscription is made only when the Built-in pipeline is active; under URP and
+HDRP the global is never set and stays 0. **This is still the first thing to verify on
+hardware** — see Verification.
+
+An odd index is the right eye, an even one the left, so an extra pair (another 3D zone, a
+mode with more than two views) alternates.
 
 ### Picture orientation
 
@@ -175,8 +245,27 @@ answer from the sign of the Y scale of the projection matrix of the pass it is d
 (`UNITY_MATRIX_P[1][1]`), which Unity negates exactly when it flips — the same matrix the
 scene's own geometry is drawn with, so the two cannot disagree.
 
-Sampling is clamped half a texel inside the eye's own half, so bilinear filtering never
-blends the two pictures at the seam.
+### The seam
+
+A linear filter tap reaches half a texel to either side, so sampling right at the edge of
+an eye's half would blend in the other eye's edge column. Half a texel **of the mip level
+in use**: a texel of mip *n* is 2ⁿ base texels wide, so the tap reaches 0.5 · 2ⁿ base
+texels. A fixed half-base-texel guard is therefore only enough at mip 0; at mip *n* it
+leaves the other eye's texel a weight of (2ⁿ − 1) / 2ⁿ⁺¹ — a quarter at mip 1, three
+eighths at mip 2 — which shows as a column of the wrong eye along the inner edge of a
+minified picture.
+
+The shader computes the mip level per pixel from the UV derivatives (clamped to the
+texture's last level), rounds it up — trilinear filtering blends two levels and the
+coarser decides — and keeps each eye 0.5 · 2^level base texels inside its own half
+(`DisplayXRStereoMediaMath.SeamInsetTexels`, tested for levels 0–3). It samples with the
+derivatives of the unclamped coordinate, so the mip level does not drop at the clamp.
+
+The price is that the picture's own edge texels are repeated across that inset, about half
+a displayed pixel wide. A texture without mipmaps is always sampled at level 0 and pays the
+minimum, half a texel. Anisotropic filtering spreads its taps along the long axis of the
+footprint; the inset is derived from that long axis, so it covers them, but this has not
+been looked at on hardware.
 
 ## Colour
 
@@ -194,8 +283,10 @@ it is):
 The second row is the one that bites: a non-sRGB `RenderTexture` that a Video Player
 decodes into, in a Linear project, holds encoded bytes the GPU will not decode, and looks
 washed out with an ordinary unlit shader. The component decodes it in the shader instead.
-The decision is `DisplayXRStereoMediaMath.ColorTransform`, from `Texture.isDataSRGB` and
-`QualitySettings.activeColorSpace`; the conversions use the exact piecewise sRGB curve.
+The decision is `DisplayXRStereoMediaMath.ColorTransform`, from the texture's format
+(`GraphicsFormatUtility.IsSRGBFormat(texture.graphicsFormat)` — the format itself, since
+that is what decides whether the sampler decodes) and `QualitySettings.activeColorSpace`;
+the conversions use the exact piecewise sRGB curve.
 
 **Alpha.** `Opaque` (default) ignores the texture's alpha and writes 1. `Premultiplied`
 and `Straight` say what the alpha channel means; the picture is then blended
@@ -224,11 +315,34 @@ Physics module).
 
 ## Limits
 
-- **HDRP colour.** The picture is drawn in HDRP's scene pass, before post-processing, so
+- **Not in the depth prepass** (all pipelines, a consequence of the queue choice above).
+  The quad is not in URP's camera depth texture or HDRP's depth buffer when effects that
+  read them run, so: SSAO, depth of field and other depth-based effects treat it as not
+  there; the depth-aware cursor's Depth source sees what is behind it; a transparent
+  object in a queue *below* 2900 that is in front of the quad is drawn over by it. It
+  still depth-tests against the scene and writes depth itself, so ordinary opaque and
+  transparent (queue 3000) objects sort correctly against it.
+- **HDRP: temporal anti-aliasing.** The shader has no depth-prepass and no motion-vector
+  pass, so TAA (and anything else that reprojects) treats the picture's pixels as the
+  background behind them. Under a head-tracked camera that can smear the picture. Use a
+  non-temporal anti-aliasing mode on that camera.
+- **HDRP: fog.** The picture is drawn after HDRP's opaque fog pass and the shader does not
+  evaluate fog itself, so fog between the viewer and the picture is not applied to it
+  (in the opaque queue it would instead have been fogged at the depth of whatever is
+  behind it, since it is not in the depth buffer). Expect it to look unfogged in a foggy
+  scene.
+- **HDRP: colour.** The picture is drawn in HDRP's scene pass, before post-processing, so
   tonemapping and any other post effect apply to it, and its values are taken as already
   exposed. For faithful colour use a volume without tonemapping on that camera. An
   after-post-process custom pass would avoid this; it is not shipped, because it could not
   be verified on hardware when this was written.
+- **HDRP without a session: full-screen orientation unknown.** With a session, HDRP's
+  built-in stereo projection is published with "render into texture" set, which matches
+  HDRP's own matrices. Without one (the non-XR path) the shader reads `unity_MatrixVP`'s
+  projection as the engine set it for the camera, and whether its Y sign matches the
+  target HDRP is then rendering into could not be determined from source. If a full-screen
+  picture is upside down on HDRP with no session, that is the cause. Quad presentation is
+  not affected (it uses the same matrix as every other built-in-shader object).
 - **Post-processing in general.** The same applies to URP post-processing and to the rig's
   FXAA (**Post-Process AA**), which softens the picture slightly; turn it off for a
   pixel-exact viewer.
@@ -238,21 +352,30 @@ Physics module).
 - **Forced multi-pass on URP / HDRP** (`DISPLAYXR_FORCE_MULTIPASS=1`, a development
   override) is not supported. Nothing in either pipeline's source sets a per-eye index
   for built-in shaders on that path, so expect the left picture in both eyes. Untested.
+- **`Graphics.RenderMesh` under single-pass instancing.** It queues an ordinary renderer
+  for the frame, and stereo instancing is applied by the engine when the pipeline draws
+  renderers, so it is expected to behave exactly as the boot splash's mesh renderers do.
+  That happens in engine code, not in C# that could be read, so it is on the verification
+  list rather than proven.
+- **Edit-mode preview.** Outside Play the draw is submitted once per camera render (from
+  `Camera.onPreCull` on BiRP, `RenderPipelineManager.beginCameraRendering` on URP / HDRP)
+  so it survives repaints. It is a convenience and has not been checked on HDRP; Play Mode
+  submits from `LateUpdate` and does not depend on it.
 - **Windowed display-centric rigs with `virtualDisplayHeight = 0`.** The plane height is
   taken as the physical display height, which is right for a full-screen window. In a
   smaller window set `virtualDisplayHeight`, or use **Placement = Manual**.
 - **A scaled rig.** The plane follows the rig's gizmo: defined in the rig's local units
   and scaled by its transform. Only scale 1 has been reasoned through end to end.
-- **Display zones** (`XR_DXR_display_zones`). Full screen fills every 3D zone's view.
-- **More than two views.** Only two pictures exist; views after the first get the right
-  one.
+- **Display zones** (`XR_DXR_display_zones`). Full screen fills every 3D zone's view. On
+  BiRP, which eye an extra zone's passes report is not known.
+- **More than two views.** Only two pictures exist; odd views get the right one.
 - **Batching.** The shader is not SRP Batcher compatible (it is one draw).
 
 ## Verification
 
 The math is covered by `Tests~/StereoMediaMath` (`dotnet run --project Tests~/StereoMediaMath -c Release`,
 run in CI): every layout × eye, the swapped variants, half resolution, the fit modes, the
-depth shift, flipped textures, the seam clamp and the colour decision.
+depth shift, flipped textures, the seam inset per mip level and the colour decision.
 
 The shader cannot be tested in CI. Check these by eye with the **Stereo Media** sample on
 the runtime's simulated side-by-side display (`SIM_DISPLAY_OUTPUT=sbs`, no 3D panel), where
@@ -260,32 +383,52 @@ the window shows the left eye's view in its left half and the right eye's in its
 half. The sample's left picture is red with an **L**, its right picture blue with an **R**.
 Repeat on BiRP, URP and HDRP, and per graphics API in use.
 
-1. **Eye separation.** Left half of the window: the red **L** picture, whole. Right half:
+1. **BiRP multi-pass eye index — the open question.** On a Built-in pipeline project: the
+   right half of the window must show the blue **R** picture. If both halves show the red
+   **L** picture, neither eye source works under this provider (`unity_StereoEyeIndex` is
+   not 1 in the right-eye pass *and* `Camera.onPreRender` does not report
+   `stereoActiveEye == Right` per eye). To tell the two apart, log
+   `Camera.stereoActiveEye` from a `Camera.onPreRender` handler: `Left` then `Right` each
+   frame means the script source works. If the project uses extra 3D zones, check each
+   zone's two halves as well.
+2. **Eye separation.** Left half of the window: the red **L** picture, whole. Right half:
    the blue **R** picture, whole. A half that shows both a red and a blue part means the
-   eye index is not reaching the shader.
-2. **Not swapped.** Red **L** left, blue **R** right — not the other way round.
-3. **Upright.** The letters are at the top left and read correctly; the white frame runs
+   eye index is not reaching the shader. On URP and HDRP this also proves that
+   `Graphics.RenderMesh` is drawn into both array slices.
+3. **Not swapped.** Red **L** left, blue **R** right — not the other way round.
+4. **Upright.** The letters are at the top left and read correctly; the white frame runs
    round all four edges. Check Quad and Full Screen separately (full screen has its own
-   up/down rule).
-4. **Top-bottom.** Set the sample's **Pattern Layout** to `TopBottom`: same result as 1–3.
-5. **Swapped layouts.** `SideBySideSwapped` / `TopBottomSwapped` patterns still give red
+   up/down rule), and on HDRP also with no session running.
+5. **URP depth priming.** In the URP renderer set **Depth Priming Mode** to *Forced*: the
+   opaque quad is still drawn. Then *Auto* with SSAO (Depth Normals) enabled: still drawn.
+6. **Top-bottom.** Set the sample's **Pattern Layout** to `TopBottom`: same result as 2–4.
+7. **Swapped layouts.** `SideBySideSwapped` / `TopBottomSwapped` patterns still give red
    **L** to the left eye (the generator swaps the packing, the component swaps it back).
-6. **Depth.** In both halves the square, the letter and the grid are at the same place.
+8. **Depth.** In both halves the square, the letter and the grid are at the same place.
    The yellow circle is further right in the right half; the green triangle further left.
-7. **Mono fallback.** **Force Mono**: both halves show the red **L** picture. Same when
+9. **Mono fallback.** **Force Mono**: both halves show the red **L** picture. Same when
    the session switches to a 2D rendering mode (`DisplayXRSceneMode` set to 2D).
-8. **Zero parallax, quad.** With **Depth Shift** 0 the white frame is at the same place in
-   both halves, and stays so as the simulated head moves.
-9. **Full screen.** The picture covers the view (`Fit`: with bars), and does not move at
-   all as the head moves, while the orange cube does. `Background`: the cube is drawn over
-   the picture. `Foreground`: the picture hides the cube.
-10. **Fit.** `Fit` shows the whole frame with bars, `Fill` crops, `Stretch` distorts; the
+10. **Zero parallax, quad.** With **Depth Shift** 0 the white frame is at the same place in
+    both halves, and stays so as the simulated head moves — including while the rig itself
+    is moved by a script every frame (no one-frame lag between the frame and the view).
+11. **Full screen.** The picture covers the view (`Fit`: with bars), and does not move at
+    all as the head moves, while the orange cube does. `Background`: the cube is drawn over
+    the picture. `Foreground`: the picture hides the cube.
+12. **One camera only.** In Full Screen the Scene view is not covered by the picture, and
+    neither is a second Game camera rendering into a `RenderTexture`.
+13. **Show / hide.** Call `SetActive(false)` then `SetActive(true)` on the GameObject: the
+    picture disappears and comes back, with no error in the console and no stray object in
+    the hierarchy.
+14. **Fit.** `Fit` shows the whole frame with bars, `Fill` crops, `Stretch` distorts; the
     shapes stay round / square in `Fit` and `Fill`.
-11. **Seam.** No blue line on the right edge of the red picture, no red line on the left
-    edge of the blue one.
-12. **Colour.** In a Linear and in a Gamma project the red and blue look the same, and
-    match the PNG that **Create Scene Content** writes, viewed in an image viewer. Then
-    play a video into a non-sRGB render texture in a Linear project: not washed out.
-13. **Scene view.** In Full Screen the Scene view is not covered by the picture.
-14. **HDRP.** Expect the tonemapping difference described under Limits; everything else as
-    above.
+15. **Seam.** No blue line on the right edge of the red picture, no red line on the left
+    edge of the blue one. Repeat with **Create Scene Content**'s PNG re-imported with
+    **Generate Mip Maps** on and the quad made small (**Placement = Manual**, a quad a
+    quarter of the view): still no line.
+16. **Non-power-of-two import.** Re-import that PNG with **Non-Power of 2** = *ToNearest*:
+    the inspector warns, and **Set Source Size** restores round circles.
+17. **Colour.** In a Linear and in a Gamma project the red and blue look the same, and
+    match the PNG viewed in an image viewer. Then play a video into a non-sRGB render
+    texture in a Linear project: not washed out.
+18. **HDRP.** Expect the tonemapping, TAA and fog differences described under Limits;
+    everything else as above.
