@@ -153,10 +153,9 @@ namespace DisplayXR
 
             // Pick the stereo render mode BEFORE creating/starting the subsystem so
             // the native GfxStart (which reads it) sees the right value (#166 task #8).
-            // SPI is correct only on URP+Windows+D3D12; on BiRP it renders opaque
-            // geometry wrong (skybox-only), so gate to MultiPass there. Mirrors the
-            // hook path's DisplayXRFeature.IsUrpWindowsD3D12 (the provider can't use
-            // OpenXRRuntime.name — Unity's OpenXR loader isn't active in provider mode).
+            // URP and HDRP render Single-Pass-Instanced on every supported platform/API;
+            // BiRP renders opaque geometry wrong under SPI (skybox-only), so it gets
+            // MultiPass. The full policy table is in IsSinglePassEligible().
             bool spi = IsSinglePassEligible();
             DisplayXRProviderNative.dxr_prov_set_single_pass(spi ? 1 : 0);
             Debug.Log("[DisplayXR] Provider render mode: " + (spi ? "Single-Pass-Instanced" : "MultiPass")

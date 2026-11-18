@@ -97,7 +97,8 @@ The plugin and the runtime are released separately. The provider checks which ex
 
 | Plugin feature | Needs from the runtime | Runtime version |
 |----------------|------------------------|-----------------|
-| Stereo rendering (desktop baseline) | `XR_DXR_view_rig`. Without it the provider log says `XR_DXR_view_rig: not found (no stereo)` and raw views pass through. | v2.17.1 or newer (stated for plugin 2.19.4: against an older runtime a 2D→3D switch can fail at `xrEndFrame`) |
+| Stereo rendering | `XR_DXR_view_rig`. Without it the provider log says `XR_DXR_view_rig: not found (no stereo)` and raw views pass through. | The release that introduced `XR_DXR_view_rig` is not stated in this repository; see runtime release notes |
+| Desktop baseline: 2D↔3D switching without errors | The runtime's mode-switch grace at `xrEndFrame` | v2.17.1 or newer. This is the newest general minimum the changelog states (plugin 2.19.4): against an older runtime a 2D→3D switch can fail with `XR_ERROR_VALIDATION_FAILURE`. It is not the version that added `XR_DXR_view_rig` |
 | Android player | Runtime APK, `XR_DXR_android_surface_binding` | v2.47.0 or newer; tested on v2.53.0 |
 | Android: touch copy to the runtime | `XR_DXR_android_surface_binding` spec 3 | v2.47.1 or newer |
 | Linux native Wayland (the `<name>.sh` launcher) | GNOME Wayland session + the DisplayXR GNOME Shell extension | v2.28.0 or newer; otherwise the launcher uses X11 |
@@ -105,8 +106,9 @@ The plugin and the runtime are released separately. The provider checks which ex
 | Correct colour for Gamma projects, window-space UI and Local2D | Nothing new; the plugin adapts to the runtime's version | The runtime reads swapchain formats literally from v2.21.0 (D3D11), v2.21.1 (D3D12), v2.21.7 (Vulkan); Local2D from v2.26.0 |
 | Depth-aware cursor, sources `Depth` / `Physics` / `Auto` | `XR_DXR_cursor_depth` spec 5 | v2.36.0 or newer |
 | Depth-aware cursor, source `Measured` (and the `Auto` fallback to it) | `XR_DXR_cursor_depth` spec 7 | v2.39.0 or newer |
-| Hand joints placed by the runtime in the rig's frame | `XR_EXT_hand_tracking` + `XR_DXR_view_rig` spec 4 | v2.47.1 or newer |
-| `DisplayXRProvider.MoveWindowToDisplay`, `TryGetDisplayDesktopOrigin` | `XR_DXR_display_info` spec 16 | see runtime release notes |
+| Hand joints placed by the runtime in the rig's frame, display-centric rig (`DisplayXRDisplay`) | `XR_EXT_hand_tracking` + `XR_DXR_view_rig` spec 4 | v2.47.1 or newer |
+| The same, camera-centric rig (`DisplayXRCamera`) | `XR_EXT_hand_tracking` + `XR_DXR_view_rig` spec 5 | Newer than v2.59.x. A spec-4 runtime (v2.47.1 – v2.59.x) places the hand wrongly under a camera-centric rig; update the runtime. See [`docs~/architecture/hand-tracking.md`](docs~/architecture/hand-tracking.md) |
+| `DisplayXRProvider.MoveWindowToDisplay`, `TryGetDisplayDesktopOrigin` | `XR_DXR_display_info` spec 16. `MoveWindowToDisplay` works on Windows and Linux only; it returns `false` on macOS | see runtime release notes |
 | Rear depth budget for transparent overlays (`DisplayXRDepthBudget`) | `XR_DXR_depth_budget`; spec 2 for `DisplayXRContentBounds`, spec 3 for the silhouette mask | see runtime release notes |
 | 3D display zones, `DisplayXRLocal2D` | `XR_DXR_display_zones` | see runtime release notes |
 | Window-space UI (`DisplayXRWindowSpaceUI`) | The window-space composition layer (`XrCompositionLayerWindowSpaceDXR`) | see runtime release notes |
@@ -443,7 +445,7 @@ set XR_RUNTIME_JSON=C:\path\to\openxr_displayxr-dev.json
 
 Set before launching the app:
 ```bash
-export XR_RUNTIME_JSON=/path/to/DisplayXR-macOS/share/openxr/1/openxr_displayxr.json
+export XR_RUNTIME_JSON=/path/to/DisplayXR-macOS/openxr_displayxr.json
 ```
 
 #### Unsigned builds and the runtime symlink
@@ -496,7 +498,9 @@ The device needs the **DisplayXR runtime APK**: v2.47.0 or newer. v2.53.0 is the
 | **Session stopped** (session loss, the provider stopping, the editor's dock/undock restart, an Android pause and resume) | Everything the app pushed into the session is gone with it: display mode, rendering mode, eye-tracking mode. Requests made while no session is running return `false` and are dropped. | `DisplayXRProvider.SessionStopped` fires once and `IsSessionReady` goes `false`. After a restart `SessionStarted` fires again: re-apply your requests there (`DisplayXRProvider.WhenRunning` is a one-shot and does not re-run). |
 | **The runtime asks the app to exit** (session state `EXITING` or `LOSS_PENDING`, for example the shell closing the app) | The plugin logs `[DisplayXR] runtime requested session exit → Application.Quit()` and calls `Application.Quit()`. | Unity's own quit callbacks (`Application.quitting`). |
 
-The `DisplayXRProvider` events fire only while the provider session is running (`SessionStarted` / `SessionStopped` bracket that window). They are raised each frame from the provider's driver, on the main thread.
+The `DisplayXRProvider` events fire only while the provider session is running (`SessionStarted` / `SessionStopped` bracket that window). They are dispatched from the provider driver's per-frame update, on the main thread.
+
+---
 
 ## Testing Without Hardware
 
@@ -524,7 +528,7 @@ This lets you develop and test the full stereo pipeline on any machine.
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| Console: `[DisplayXR] No DisplayXR runtime found on this machine` (the DisplayXR settings page says "No OpenXR runtime found") | No runtime installed, or `XR_RUNTIME_JSON` is set and points to a missing file (when set, it wins and the installed runtime is not looked up) | Install the DisplayXR runtime, or set `XR_RUNTIME_JSON` to an existing runtime JSON before launching Unity |
+| Console: `[DisplayXR] No DisplayXR runtime found on this machine` | No runtime installed (the DisplayXR settings page says "No OpenXR runtime found"), or `XR_RUNTIME_JSON` is set and points to a missing file (the settings page shows the path with "File Exists: No"; when the variable is set, it wins and the installed runtime is not looked up) | Install the DisplayXR runtime, or set `XR_RUNTIME_JSON` to an existing runtime JSON before launching Unity |
 | Black screen | DisplayXR not enabled | Check **Project Settings > XR Plug-in Management > Standalone > DisplayXR Display**, and **Initialize XR on Startup**. |
 | Scene renders 2D side-by-side on Leia hardware (no depth) | Leia plug-in not installed/registered | Install `DisplayXRLeiaSRSetup-*.exe` from [displayxr-leia-plugin](https://github.com/DisplayXR/displayxr-leia-plugin/releases). Verify `HKLM\Software\DisplayXR\DisplayProcessors\leia-sr` exists. Without the plug-in, the runtime falls back to `sim_display` (SBS output) on any hardware. |
 | No stereo (flat image) | Eye tracking not running | Verify the DisplayXR runtime is configured with a display that supports eye tracking, or use sim_display for testing |
@@ -542,7 +546,7 @@ This lets you develop and test the full stereo pipeline on any machine.
 
 | Log | Where | What is in it |
 |-----|-------|---------------|
-| Unity Console / `Player.log` | Windows player: `%USERPROFILE%\AppData\LocalLow\<Company>\<Product>\Player.log`. macOS player: `~/Library/Logs/<Company>/<Product>/Player.log` | The plugin's C# messages, prefixed `[DisplayXR]` |
+| Unity Console / `Player.log` | Windows player: `%USERPROFILE%\AppData\LocalLow\<Company>\<Product>\Player.log`. macOS player: `~/Library/Logs/<Company>/<Product>/Player.log`. Linux player: `~/.config/unity3d/<Company>/<Product>/Player.log` | The plugin's C# messages, prefixed `[DisplayXR]` |
 | Provider (native plugin) log | Windows: `%TEMP%\displayxr_prov_native.log`. macOS / Linux: `$TMPDIR/displayxr_prov_native.log` (`/tmp/` when `TMPDIR` is unset). Android: logcat, `adb logcat -s DisplayXRUnity` | Lines prefixed `[DisplayXR-PROV]`: session start, which extensions the runtime advertises, session state changes. The file is appended to on every run |
 | Runtime log | Windows: `%LOCALAPPDATA%\DisplayXR\DisplayXR_<exe>.<pid>_<timestamp>.log`. Other platforms: see the runtime's documentation | The runtime's own messages, including why it refused a request |
 

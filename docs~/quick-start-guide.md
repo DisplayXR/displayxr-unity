@@ -120,7 +120,7 @@ Open Terminal **before** launching Unity (environment variables must be set in t
 
 ```bash
 # Point to your DisplayXR runtime build
-export XR_RUNTIME_JSON=/path/to/DisplayXR-macOS/share/openxr/1/openxr_displayxr.json
+export XR_RUNTIME_JSON=/path/to/DisplayXR-macOS/openxr_displayxr.json
 
 # With no 3D panel present, the runtime uses sim_display automatically.
 # Optionally pick the sim output format (default: sbs):
@@ -292,8 +292,10 @@ Unity input, physics, and game logic run alongside.
 
 1. Verify the runtime is found: the **DisplayXR** settings page (Project
    Settings > XR Plug-in Management > OpenXR > DisplayXR) shows the runtime JSON it
-   resolved under **Runtime Status**. The display info on that page stays "Not
-   connected" until you are in Play Mode.
+   resolved under **Runtime Status**. If nothing resolves it says "No OpenXR runtime
+   found"; if `XR_RUNTIME_JSON` points to a missing file it shows the path with "File
+   Exists: No". The display info on that page stays "Not connected" until you are in
+   Play Mode.
 
 2. Open one of the demo scenes and press **Play**.
 
@@ -360,7 +362,7 @@ The output is a standard `.exe` — no installer is needed for testing. For dist
    ```
    YourApp.app/
      Contents/
-       Plugins/
+       PlugIns/
          displayxr_unity.bundle       ← native plugin (auto-included)
        MacOS/
          YourApp                     ← main executable
@@ -411,7 +413,7 @@ YourApp.exe
 
 Open Terminal:
 ```bash
-export XR_RUNTIME_JSON=/path/to/DisplayXR-macOS/share/openxr/1/openxr_displayxr.json
+export XR_RUNTIME_JSON=/path/to/DisplayXR-macOS/openxr_displayxr.json
 
 # Without a 3D panel the runtime uses sim_display automatically.
 # Optionally pick the sim output format (default: sbs):
