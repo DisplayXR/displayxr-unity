@@ -34,7 +34,7 @@ Step-by-step walkthrough: install the plugin, build two demo scenes, test both s
 |-------------|---------|
 | **Unity** | 2022.3 LTS or later (including Unity 6). Install via [Unity Hub](https://unity.com/download). |
 | **Build Support Modules** | In Unity Hub, add modules for your target platform(s): **Windows Build Support (Mono)** and/or **macOS Build Support (Mono)**. |
-| **DisplayXR Runtime** | Either a hardware-connected runtime from [openxr-3d-display](https://github.com/dfattal/openxr-3d-display), or the sim_display driver for testing without hardware. |
+| **DisplayXR Runtime** | Install it from the [displayxr-runtime releases](https://github.com/DisplayXR/displayxr-runtime/releases/latest). It drives a 3D display when one is connected and falls back to its simulated display (sim_display) when none is. Minimum versions: [Runtime Compatibility](../README.md#runtime-compatibility). |
 
 You do **not** need a 3D display to complete this guide — the sim_display driver provides a software display for development.
 
@@ -60,8 +60,9 @@ The simplest method — no cloning or building required. Pre-built native binari
    ```
    Or for a pinned version:
    ```
-   https://github.com/DisplayXR/displayxr-unity.git#upm/v0.1.0
+   https://github.com/DisplayXR/displayxr-unity.git#upm/vX.Y.Z
    ```
+   Replace `vX.Y.Z` with a version from the [releases page](https://github.com/DisplayXR/displayxr-unity/releases). Use the `upm/` form: a plain `#vX.Y.Z` is the source tag and has no Linux or Android binaries.
 
 5. The package appears as **DisplayXR** in the Package Manager list — ready to use.
 
@@ -101,9 +102,11 @@ This step is the same on both platforms:
 
 1. Go to **Edit > Project Settings > XR Plug-in Management**.
 
-2. Under the **Standalone** tab (desktop icon), check **DisplayXR** — the custom `IUnityXRDisplay` provider (subsystem id `DisplayXR Display`). It drives the DisplayXR runtime directly, so you do **not** enable Unity's OpenXR plugin.
+2. Under the **Standalone** tab (desktop icon), check **DisplayXR Display** — the custom `IUnityXRDisplay` provider. It drives the DisplayXR runtime directly, so you do **not** need Unity's OpenXR plugin; if the project has it, leave **OpenXR** unchecked on the same tab.
 
-3. That's the whole setup — the provider is a single toggle. The plugin's post-build processor auto-deploys the native library + `UnitySubsystemsManifest.json` into player builds, so no manual copying is needed.
+3. Check **Initialize XR on Startup**, so the provider comes up in Play Mode and in built apps.
+
+4. That's the whole setup. The plugin's post-build processor auto-deploys the native library + `UnitySubsystemsManifest.json` into player builds, so no manual copying is needed.
 
 ---
 
@@ -117,7 +120,7 @@ Open Terminal **before** launching Unity (environment variables must be set in t
 
 ```bash
 # Point to your DisplayXR runtime build
-export XR_RUNTIME_JSON=/path/to/SRDisplayXR-macOS/share/openxr/1/openxr_displayxr.json
+export XR_RUNTIME_JSON=/path/to/DisplayXR-macOS/share/openxr/1/openxr_displayxr.json
 
 # With no 3D panel present, the runtime uses sim_display automatically.
 # Optionally pick the sim output format (default: sbs):
@@ -287,9 +290,10 @@ composited stereo output to a dedicated window on the DisplayXR display — Play
 `DisplayXRDisplay` / `DisplayXRCamera` rigs drive the stereo projection, and normal
 Unity input, physics, and game logic run alongside.
 
-1. Verify the runtime is configured: the **DisplayXR** status panel (Project
-   Settings > XR Plug-in Management > DisplayXR) should show a connected display or
-   the sim_display info.
+1. Verify the runtime is found: the **DisplayXR** settings page (Project
+   Settings > XR Plug-in Management > OpenXR > DisplayXR) shows the runtime JSON it
+   resolved under **Runtime Status**. The display info on that page stays "Not
+   connected" until you are in Play Mode.
 
 2. Open one of the demo scenes and press **Play**.
 
@@ -301,6 +305,12 @@ Unity input, physics, and game logic run alongside.
    ```
    [DisplayXR] Eyes: L=(0.032, 0.001, 0.504), R=(-0.031, 0.001, 0.504), tracked=True
    ```
+
+> **Play Mode does not run the provider in two cases** (it declines and logs a
+> `[DisplayXR]` warning; Unity renders normally, without stereo): the **macOS editor**
+> (off pending a Unity editor Metal fix, #204) and **any editor set to Vulkan**. On
+> macOS and Linux, build a player (Step 7) to see stereo; on Windows, switch the
+> editor to D3D12 or D3D11.
 
 > Displays advertising more than 8 views (many-view light fields, e.g. Looking
 > Glass) are not yet supported — the provider caps at 8 views and logs a one-shot
@@ -351,7 +361,7 @@ The output is a standard `.exe` — no installer is needed for testing. For dist
    YourApp.app/
      Contents/
        Plugins/
-         libdisplayxr_unity.dylib     ← native plugin (auto-included)
+         displayxr_unity.bundle       ← native plugin (auto-included)
        MacOS/
          YourApp                     ← main executable
        ...
@@ -401,7 +411,7 @@ YourApp.exe
 
 Open Terminal:
 ```bash
-export XR_RUNTIME_JSON=/path/to/SRDisplayXR-macOS/share/openxr/1/openxr_displayxr.json
+export XR_RUNTIME_JSON=/path/to/DisplayXR-macOS/share/openxr/1/openxr_displayxr.json
 
 # Without a 3D panel the runtime uses sim_display automatically.
 # Optionally pick the sim output format (default: sbs):
@@ -422,7 +432,7 @@ Once the app is running, verify each stage:
 
 | Check | What to look for |
 |-------|-----------------|
-| **Runtime connects** | No "No OpenXR runtime found" error in the Player.log |
+| **Runtime connects** | No `[DisplayXR] No DisplayXR runtime found on this machine` warning in the Player.log |
 | **Stereo renders** | With `SIM_DISPLAY_OUTPUT=sbs`, you see a side-by-side stereo pair |
 | **Depth is correct** | Near objects appear shifted between left/right eyes; far objects are nearly identical |
 | **Camera-centric mode** | Scene parallax shifts as (simulated) head moves |
@@ -432,22 +442,36 @@ Once the app is running, verify each stage:
 
 ### Reading the Log
 
-Search the Player.log for these key lines:
+The plugin's C# messages go to the Player.log. Look for:
 
 ```
-[DisplayXR-PROV] provider registered, subsystem 'DisplayXR Display' started
-[DisplayXR] Display info: 1920x1080, 27.0x15.2 cm, viewer at 500 mm
-[DisplayXR] Eye tracking active
+[DisplayXR] Provider render mode: MultiPass (pipeline=Built-in, gfx=Direct3D11)
 ```
 
-If you see `[DisplayXR] Feature not active` or no DisplayXR lines at all, the feature is not enabled in XR settings — go back to Step 2.
+The native provider writes its own log: `%TEMP%\displayxr_prov_native.log` on Windows,
+`$TMPDIR/displayxr_prov_native.log` on macOS and Linux (`/tmp/` when `TMPDIR` is unset).
+Look for:
+
+```
+[DisplayXR-PROV] Lifecycle Initialize: providers registered
+[DisplayXR-PROV] XR_DXR_view_rig: AVAILABLE
+[DisplayXR-PROV] GfxStart OK
+```
+
+- `[DisplayXR] No DisplayXR runtime found on this machine` in the Player.log: no runtime
+  is installed, or `XR_RUNTIME_JSON` points to a missing file. The app runs as a normal
+  2D application.
+- `XR_DXR_view_rig: not found (no stereo)` in the provider log: the runtime is too old
+  for this plugin. See [Runtime Compatibility](../README.md#runtime-compatibility).
+- No DisplayXR lines at all: the provider is not enabled in XR settings — go back to
+  Step 2.
 
 ---
 
 ## What to Look For
 
 ### Camera-centric demo
-- **Stereo depth gradient:** In the preview window, the red near cube should appear to float in front of the screen. The green mid cube sits at the screen plane. The blue far cube is behind the screen.
+- **Stereo depth gradient:** In Play Mode or the built app, the red near cube should appear to float in front of the screen. The green mid cube sits at the screen plane. The blue far cube is behind the screen.
 - **Motion parallax:** When the viewer moves their head (or the sim_display keyboard controls move the simulated eye position), the scene shifts naturally — near objects move more than far objects.
 - **Inv. convergence distance:** Adjusting this value moves where the "screen plane" sits in depth. Higher values (e.g. 3.0 = 0.33 m) make content pop out more; lower values (e.g. 1.0 = 1.0 m) push most content behind the screen.
 
@@ -465,4 +489,6 @@ If you see `[DisplayXR] Feature not active` or no DisplayXR lines at all, the fe
 - **Add a 2D UI overlay** — see [2D UI Overlay](../README.md#2d-ui-overlay) for routing a Canvas to a compositor layer.
 - **Preview in the editor** — just press Play; the provider weaves to a dedicated window on the DisplayXR display (there is no separate preview window).
 - **Deploy to end users** — see [Deploying to End Users](../README.md#deploying-to-end-users) for runtime installation on target machines.
-- **Build for both platforms** — the plugin includes both Windows and macOS binaries. Unity selects the correct one per build target.
+- **Build for other platforms** — the `upm` package carries Windows, macOS, Linux and Android binaries, and Unity selects the right one per build target. See [Building Your App](../README.md#building-your-app) for Linux and Android.
+- **Handle missing hardware or a missing runtime** — see [What Happens When Things Are Missing](../README.md#what-happens-when-things-are-missing).
+- **Make window-space UI clickable, build a 2D menu scene, add a depth-aware cursor, hands or a stylus** — see the app-developer guides in the [documentation index](README.md).
