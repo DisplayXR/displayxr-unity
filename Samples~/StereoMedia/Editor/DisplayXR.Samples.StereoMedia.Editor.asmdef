@@ -1,0 +1,19 @@
+{
+    "name": "DisplayXR.Samples.StereoMedia.Editor",
+    "rootNamespace": "DisplayXR.Samples.Editor",
+    "references": [
+        "com.displayxr.unity",
+        "DisplayXR.Samples.StereoMedia"
+    ],
+    "includePlatforms": [
+        "Editor"
+    ],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}
