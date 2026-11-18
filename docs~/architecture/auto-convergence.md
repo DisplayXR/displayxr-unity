@@ -53,8 +53,8 @@ the scene swimming into place.
   restart (dock / undock, Android resume).
 - The **authored** values are remembered and restored when the component is disabled. A value
   somebody else writes into the rig while it runs (the inspector, an app slider) becomes the new
-  authored value: for the IPD Factor that is the ceiling (it takes effect at once, also while
-  the convergence is holding), for the convergence it is what gets restored.
+  authored value: for the IPD Factor that is the ceiling (followed at once while no cap is
+  biting, also while the convergence is holding), for the convergence it is what gets restored.
 - **While it runs, `rig.ipdFactor` and `rig.invConvergenceDistance` hold the delivered values,
   not the authored ones.** An app that saves its stereo settings (or shows them in a settings
   menu) must read `AuthoredIpdFactor` / `AuthoredInvConvergenceDistance` from the component;
@@ -84,11 +84,16 @@ The statistic works in **nearness** `q = 1 / depth` (1/m), metric, in the rig's 
    (floors and props at the feet are near but rarely the subject). The 80th percentile means
    roughly a fifth of the weighted frame is in front of the screen.
 2. **The dominant clump.** A 64-bin histogram of nearness, smoothed (sigma 1.5 bins); the
-   highest peak that is not in the far 15 % of what the frame spans (the span is clamped to
-   the histogram's range, so something held 15 cm from the lens does not stretch it until the
-   real subject counts as "far"). Sky / far-plane samples are left out of this search
-   altogether. A clump already being followed is kept unless
-   another one scores 1.5x higher, so two comparable surfaces do not trade places.
+   highest peak that is not in the far 15 % of the range. The histogram spans **this frame's
+   own content range** - the 2nd to 98th percentile of the samples that have depth - so the
+   far 15 % is "the back of what is in view" at any absolute distance. (A fixed metric range
+   was the first implementation and failed in a player: a subject at 6 m in front of a wall
+   at 40 m are only 0.14 1/m apart, fell into neighbouring bins, and the wall was not
+   excluded.) Sky / far-plane samples are left out of the search and of the range: with sky
+   as the far end, a wall behind the subject would sit mid-range and stop being the plateau.
+   The range is also clamped at 1 / Min Distance, so something held 15 cm from the lens does
+   not stretch it until the real subject counts as "far". A clump already being followed is
+   kept unless another one scores 1.5x higher, so two comparable surfaces do not trade places.
 3. **Screen plane = 0.5 x percentile + 0.5 x clump.** If only the far plateau has a peak, the
    percentile alone is used.
 
@@ -102,16 +107,17 @@ clump is the foreground-chasing behaviour that was tuned away); it is pinned by 
 Lower Blend to favour the clump, or use Target mode, when a small object IS the subject.
 
 Why nearness and not depth: on-screen disparity is linear in `q`
-(`d = k * ipdFactor * (q_screen - q)`), so a fixed histogram over `q` has uniform resolution in
-exactly what the eye sees. Two depths that fall in the same bin differ by a fraction of a
-percent of disparity - stereoscopically they are the same depth.
+(`d = k * ipdFactor * (q_screen - q)`), so percentiles and blends of `q` are percentiles and
+blends of exactly what the eye sees.
 
-Nothing is re-normalised per frame. The histogram range is fixed (0 to 1 / Min Distance) and
-every value is metric. Per-frame normalisation makes the same scene read differently when
-something enters the frame (false cuts) and makes a depth budget impossible.
+Every value that comes out is **metric** - the screen plane, the clump (a weighted mean of the
+samples around the peak), the near / far extremes. Only the *binning* of the clump search is
+relative to the frame. Normalising the output per frame makes the same scene read differently
+when something enters it (false cuts) and makes a depth budget impossible.
 
 A sample is rejected - and the last target **held** - when fewer than 3 % of the samples have
-real depth (a frame of sky), or the clump holds less than 6 % of the weighted mass.
+real depth (a frame of sky), or the clump (within an eighth of the range around its peak)
+holds less than 6 % of the weighted mass.
 
 ### Stereo strength
 
@@ -128,15 +134,20 @@ strength = min(authored, capFront / front, capBehind / behind)
 
 Strength is only ever reduced, never raised above the authored IPD Factor.
 
-Two things happen with that formula:
+The delivered strength is **one state with one rule**:
 
-- **A follower** heads for the strength that fits once the screen plane has *arrived* at its
-  target (median of three, backing off about three times faster than it returns).
-- **A per-frame bound** evaluates the same formula at the convergence *actually delivered this
-  frame* and is applied at once, not through the follower. The plane lags its target by the
-  time constant; without this bound a camera turning from a far scene to a near object left
-  the front cap exceeded several times over for seconds. With it, strength dips while the
-  plane travels and comes back as it arrives.
+- **Down at once.** Every frame the formula is evaluated at the convergence *actually
+  delivered this frame* (not at the follower's target - the plane lags its target by the time
+  constant, and a camera turning from a far scene to a near object would otherwise leave the
+  front cap exceeded several times over for seconds). If the result is below the current
+  strength, the strength drops to it in that frame.
+- **Up only gradually.** Whatever lifts the cap - the plane arriving, a near intruder leaving
+  while the convergence is holding, a low-confidence sample - the strength comes back through
+  a critically damped spring with the Time Constant, from rest. It never pops back.
+
+The one thing that is followed directly is the authored IPD Factor itself while no cap is
+biting (an app's stereo slider should respond immediately); while a cap is biting or the
+strength is still recovering, a raised authored value is approached gradually too.
 
 What that guarantees: the estimated disparity of the *last sampled* near / far content, at the
 delivered settings, is inside the caps on every frame. What it does not: content that appears
@@ -171,8 +182,8 @@ The plug-in does not consume the runtime's `XR_DXR_stereo_comfort` bounds yet (s
 
 - Sampled every 0.15 s (about 7 Hz). The follower is far slower, so the one or two frames of
   readback latency do not matter.
-- Median of the last three samples (each depth grid is published and consumed exactly once,
-  although its readback can come back twice), then a dead band (2 % of the comfort budget, expressed in
+- Convergence: median of the last three samples (each depth grid is published and consumed
+  exactly once, although its readback can come back twice), then a dead band (2 % of the comfort budget, expressed in
   nearness), then a critically damped spring with the Time Constant - no overshoot from rest.
 - The first sample, and the one after `ResetConvergence()`, are followed with a 0.06 s time
   constant for at most 0.4 s. When that fast phase ends its velocity is dropped: carried into
@@ -185,7 +196,7 @@ The plug-in does not consume the runtime's `XR_DXR_stereo_comfort` bounds yet (s
 | **Depth** | A 32 x 32 grid of the camera depth texture | Asynchronous GPU readback; never waits. Reads whatever wrote depth |
 | **Raycast** | A grid of physics rays (9 x 7) through the rig's authored frustum | Needs colliders and the physics module. Honors Raycast Layers. A miss is sky |
 | **Target** | A Transform; its Renderer bounds; or its `DisplayXRContentBounds` | The centre goes on the screen, the near / far faces size the strength |
-| **Auto** | Depth where the pipeline provides it, else Raycast | Falls to rays when the depth hook reports it has no depth, or no grid arrives for 1 s; goes back when grids arrive |
+| **Auto** | Depth where the pipeline provides it, else Raycast | In practice Depth on URP, HDRP and BiRP (see below). Falls to rays when the depth hook reports it has no depth, or no grid arrives for 1 s; goes back when grids arrive |
 
 **Depth, per pipeline.** The grid reuses the depth-aware cursor's readback
 ([cursor-depth.md](cursor-depth.md)) - the same 32 x 32 target, the same three pipeline hooks,
@@ -197,8 +208,14 @@ cursor. So it behaves exactly as the cursor's depth source does:
 | URP (17+) | Yes. The camera's Depth Texture is switched on while the component is enabled (restored afterwards) |
 | HDRP (17+) | Yes. Not with an MSAA depth buffer |
 | BiRP deferred | Yes (the depth is a by-product of the G-buffer) |
-| BiRP forward | Only if the camera already renders a depth texture. **A depth pre-pass is never forced on the app** - Auto uses rays instead |
+| BiRP forward | Yes **with a DisplayXR rig**: the rig's own BiRP foreground-clip pass (`DisplayXRForegroundClipBiRP`) already switches the camera depth texture on for every BiRP rig camera, so the depth is there and Auto uses it. This component never forces a depth pre-pass itself |
 | Custom SRP | No - Auto uses rays |
+
+**When Auto actually uses rays.** Only when the depth hook reports that there is no depth to
+read, or no grid arrives for a second: a custom render pipeline; HDRP with an MSAA depth
+buffer; URP in its deprecated compatibility (non render-graph) mode; a BiRP forward camera
+whose depth texture something has switched off again; or a missing patch shader / float
+render-target support. On URP, HDRP and BiRP with a DisplayXR rig the source is Depth.
 
 Each grid is offset by a quarter texel in a four-sample rotation, so consecutive samples do not
 read the same pixels. If the depth-aware cursor is also using scene depth, it skips the one
@@ -232,6 +249,9 @@ after `DisplayXRRigManager.CycleNext()` never starts from the other one's view.
 
 - **Scene pumps / breathes** - raise Time Constant (1.5), or raise the dead band.
 - **Subject sits too far out of the screen** - lower Percentile (70) or lower Front Cap.
+- **Strength dips when something passes close to the lens and takes a second or two to come
+  back** - by design (down at once, up gradually). Mask the object with Ignore Nearer Than or
+  the Raycast layers if it should not count.
 - **Scene looks flat** - a cap is biting: check Stereo Strength in the readout; raise the caps
   or the User Depth Scale, or check that a near prop is not dominating (Ignore Nearer Than).
 - **Screen plane sticks to a first-person weapon** - Raycast: take its layer out. Depth: set
@@ -272,12 +292,14 @@ after `DisplayXRRigManager.CycleNext()` never starts from the other one's view.
 
 ## Verifying
 
-- **Grid orientation.** Depth source, camera at standing height looking at a floor with nothing
+- **Grid orientation** (verified in D3D12 players on URP and BiRP: floor in view, bottom third
+  4.2 m, top third 25 m; other graphics APIs are not verified). Depth source, camera at standing height looking at a floor with nothing
   else in view: the inspector's *Grid top / bottom third* (or the component's context menu
   *Log Grid Orientation*, or `GridTopThirdDepth` / `GridBottomThirdDepth`) must show the
   **bottom** third nearer than the top. If it is the other way round the grid is upside down on
   that graphics API: set `DISPLAYXR_CURSOR_DEPTH_FLIPY=1` to confirm, and report the API and
-  pipeline.
+  pipeline. The readout is blank ("-", NaN from code) whenever the current source is not Depth
+  or the last grid is older than three sample periods, so it never shows an earlier place.
 - **Caps while moving.** Settle on a far scene, then turn to an object half a metre away: in
   the readout, *Disparity near* must stay within *Caps front* throughout, with Stereo Strength
   dipping and recovering.
