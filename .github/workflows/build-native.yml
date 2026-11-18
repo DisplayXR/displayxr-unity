@@ -112,6 +112,11 @@ jobs:
       - name: Hand rig math
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: dotnet run --project "Tests~/HandRigMath" -c Release
+      # Pure C#: stereo-correct picking (#460) - screen point <-> ray / world point through the
+      # per-eye and cyclopean views, off-axis frusta, zone and logical-pixel mapping.
+      - name: Picking math
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: dotnet run --project "Tests~/PickingMath" -c Release
 
   build-windows:
     name: Windows x64
