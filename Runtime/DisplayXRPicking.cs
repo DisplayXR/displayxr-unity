@@ -17,9 +17,10 @@ namespace DisplayXR
     /// <b>Why not <c>Camera.ScreenPointToRay</c>.</b> Under DisplayXR the picture is drawn with
     /// two off-axis frusta the runtime computes from the tracked eye positions.
     /// <c>Camera.projectionMatrix</c> and the camera transform know neither: a ray built from
-    /// them starts at the wrong point and misses what the viewer sees, by more the further the
-    /// object is from the display plane and the further the head is from the centre. These
-    /// methods use the per-eye view and projection the provider renders with.
+    /// them starts at the wrong point (with a display-centric rig, at the display itself,
+    /// where the camera sits) and misses what the viewer sees everywhere but at the centre of
+    /// the screen, content on the display plane included. These methods use the per-eye view
+    /// and projection the provider renders with.
     /// </para>
     /// <para>
     /// <b>Which eye.</b> The default is the <b>cyclopean</b> view (the point midway between

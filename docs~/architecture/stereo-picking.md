@@ -25,7 +25,25 @@ resulting eye poses and full projection matrices.
 
 `Camera.ScreenPointToRay` uses neither. It uses `Camera.projectionMatrix`, a symmetric frustum
 built from the camera's field of view, and the camera transform. That is one fixed apex, and it
-is not where the viewer's eyes are.
+is not where the viewer's eyes are. It is not the cyclopean view either: the midpoint eye's
+frustum is also off-axis and also moves with the head.
+
+With a display-centric rig the mismatch is as large as it can be. The rig camera's transform
+**is the display plane** (the provider sends `camera.transform` to the runtime as the display
+pose, and `DisplayXRDisplay` ignores the camera's field of view). So the stock ray starts at the
+centre of the display, not at the viewer, and fans out at the camera's own field of view. It
+agrees with the true ray only along the camera's forward axis, that is, at the centre of the
+screen. Everywhere else it is wrong, **including for content that lies on the display plane**:
+those points are at zero distance in front of the stock camera, which cannot place them at all.
+
+Measured in built players (URP and BiRP, D3D12): the stock `Camera.ScreenPointToRay` misses
+off-centre points on the display plane by 0.34 to 0.47 world units, and
+`Camera.WorldToScreenPoint` is off by 24 to several thousand pixels. `DisplayXRPicking` in the
+same players: world -> screen -> ray misses by less than 5e-6, and the drawn position of a
+sphere matches `TryWorldToScreenPoint` per eye within 0.22 pixel.
+
+The rest of this section is about the correct views, and why even a ray built from the right
+kind of projection needs the eye positions.
 
 Take a display plane at distance `d` from the viewer and a point `z` behind it (`z < 0`: in front
 of it). Seen from an eye at lateral position `e`, a point at lateral position `x` appears on the
@@ -37,9 +55,10 @@ x_panel = e + (x - e) * d / (d + z)
 
 Three things follow.
 
-- **On the display plane (`z = 0`) every eye agrees**: `x_panel = x`. A ray built from any
-  projection that frames the display hits the right spot there. This is why picking can look
-  correct in a scene whose content sits on the plane.
+- **On the display plane (`z = 0`) every eye agrees**: `x_panel = x`. The left, right and
+  cyclopean views put an on-plane point on the same pixel, wherever the head is. This is a
+  statement about views whose frustum passes through the display's edges. It says nothing for
+  the stock camera, whose frustum does not (see above).
 - **Off the plane, the image moves with the eye** by `z / (d + z)` of the eye's movement. With
   the viewer 60 cm from the panel and an object 30 cm behind it, a head 15 cm off-centre moves
   the object's image 5 cm across the panel. A ray that does not know where the head is misses by
@@ -250,8 +269,12 @@ On the simulated display (no 3D panel needed, the runtime falls back to it):
    drawn silhouette for all three cubes, measured against the midpoint of the two eye images
    where they are drawn apart.
 3. For comparison, raycast `Camera.main.ScreenPointToRay(Input.mousePosition)` in a debug
-   script and log what it hits. The on-plane cube still switches at its edge. The other two
-   switch away from their silhouettes, by more the further they are from the plane.
+   script and log what it hits. It is wrong for all three cubes, the on-plane one included:
+   it agrees with the stereo ray only at the centre of the screen. In built URP and BiRP D3D12
+   players it missed off-centre on-plane points by 0.34 to 0.47 world units. Do not use "the
+   stock ray is right on the plane" as a sanity check. To check the plane property itself,
+   compare the `Left`, `Right` and `Mono` results of `TryWorldToScreenPoint` for the on-plane
+   cube: they must be the same pixel.
 4. Draw `Debug.DrawRay` from both `TryScreenPointToRay(..., Left, ...)` and `(..., Right, ...)`.
    In the Scene view they start next to the two eye positions (on each eye's near plane) and
    cross on the display plane under the cursor.

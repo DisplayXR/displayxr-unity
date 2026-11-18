@@ -9,8 +9,10 @@ Unity's pointer path (`PhysicsRaycaster`, a `GraphicRaycaster` on a world-space 
 drawn with two off-axis frusta that the runtime computes from the tracked eye positions. The
 camera's own projection and transform know nothing about them, so that ray misses what the
 viewer sees: a button floating behind the display highlights when the cursor is beside it, and
-the error changes as the head moves. On the display plane the error is zero, which is why a
-scene can look fine until something is placed in depth.
+the error changes as the head moves. It is wrong on the display plane too: with a
+display-centric rig the camera sits on that plane, so its ray starts at the display, not at the
+viewer, and agrees with what is drawn only at the centre of the screen. Measured in built
+players, it missed off-centre points on the plane by 0.34 to 0.47 world units.
 
 `DisplayXRPicking` (in the plugin) gives the ray through the views that are actually rendered.
 `DisplayXRPointerEvents` (this sample) uses it to deliver ordinary pointer events.
