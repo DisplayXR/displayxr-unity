@@ -16,7 +16,7 @@ namespace DisplayXR.Editor
     [CanEditMultipleObjects]
     public class DisplayXRStereoMediaEditor : UnityEditor.Editor
     {
-        SerializedProperty m_Texture, m_VideoPlayer, m_PrepareVideo, m_Encoding, m_FlipVertical;
+        SerializedProperty m_Texture, m_VideoPlayer, m_PrepareVideo, m_Encoding, m_FlipVertical, m_SourceSize;
         SerializedProperty m_Layout, m_HalfResolution, m_PixelAspect, m_DepthShift, m_ForceMono;
         SerializedProperty m_Presentation, m_Fit, m_AlphaMode, m_Tint;
         SerializedProperty m_Placement, m_RigCamera, m_QuadSize;
@@ -35,6 +35,7 @@ namespace DisplayXR.Editor
             m_PrepareVideo = serializedObject.FindProperty("prepareVideo");
             m_Encoding = serializedObject.FindProperty("encoding");
             m_FlipVertical = serializedObject.FindProperty("flipVertical");
+            m_SourceSize = serializedObject.FindProperty("sourceSize");
             m_Layout = serializedObject.FindProperty("layout");
             m_HalfResolution = serializedObject.FindProperty("halfResolution");
             m_PixelAspect = serializedObject.FindProperty("pixelAspect");
@@ -78,6 +79,9 @@ namespace DisplayXR.Editor
             }
             EditorGUILayout.PropertyField(m_Encoding);
             EditorGUILayout.PropertyField(m_FlipVertical);
+            EditorGUILayout.PropertyField(m_SourceSize);
+            if (!serializedObject.isEditingMultipleObjects)
+                DrawImportWarnings(PreviewTexture(media));
 
             EditorGUILayout.PropertyField(m_Layout);
             bool mono = !m_Layout.hasMultipleDifferentValues &&
@@ -121,8 +125,8 @@ namespace DisplayXR.Editor
                 if (!mixed)
                     EditorGUILayout.HelpBox(
                         "Each eye's half goes straight to that eye's render target: no added parallax, nothing moves " +
-                        "with the head. Drawn for Game cameras only" +
-                        (m_RigCamera.objectReferenceValue != null ? " (the Rig Camera assigned under Quad)." : "."),
+                        "with the head. Drawn for one camera only: " +
+                        (m_RigCamera.objectReferenceValue != null ? "the Rig Camera assigned under Quad." : "the active rig camera."),
                         MessageType.None);
             }
 
@@ -155,8 +159,12 @@ namespace DisplayXR.Editor
             var layout = (DisplayXRStereoLayout)m_Layout.enumValueIndex;
             bool half = m_HalfResolution.boolValue;
             bool flip = m_FlipVertical.boolValue;
+            // The picture's shape comes from the stated source size when there is one.
+            Vector2Int stated = m_SourceSize.vector2IntValue;
+            int shapeW = stated.x > 0 && stated.y > 0 ? stated.x : tex.width;
+            int shapeH = stated.x > 0 && stated.y > 0 ? stated.y : tex.height;
 
-            DrawHint(tex, layout, half);
+            DrawHint(shapeW, shapeH, layout, half);
 
             s_Caption ??= new GUIStyle(EditorStyles.miniLabel) { alignment = TextAnchor.MiddleCenter };
 
@@ -182,9 +190,9 @@ namespace DisplayXR.Editor
 
             // --- what each eye gets, at its displayed aspect ---
             float pixelAspect = m_PixelAspect.floatValue;
-            float eyeAspect = DisplayXRStereoMediaMath.EyeAspect(tex.width, tex.height, layout, half, pixelAspect);
+            float eyeAspect = DisplayXRStereoMediaMath.EyeAspect(shapeW, shapeH, layout, half, pixelAspect);
             if (eyeAspect <= 0f) return;
-            var sol = DisplayXRStereoMediaMath.Solve(tex.width, tex.height, layout, half, pixelAspect,
+            var sol = DisplayXRStereoMediaMath.Solve(shapeW, shapeH, layout, half, pixelAspect,
                 DisplayXRStereoFit.Stretch, 0f, m_DepthShift.floatValue * 0.01f, flip, !m_ForceMono.boolValue);
 
             float gap = 8f;
@@ -209,7 +217,7 @@ namespace DisplayXR.Editor
                       s_Caption);
 
             EditorGUILayout.LabelField(" ",
-                $"{tex.width} x {tex.height} texture, {eyeAspect:F2}:1 per eye" +
+                $"{shapeW} x {shapeH} picture, {eyeAspect:F2}:1 per eye" +
                 (Application.isPlaying ? "" : "  (in Play, mono is also used when the session is not stereo)"),
                 EditorStyles.miniLabel);
         }
@@ -221,33 +229,77 @@ namespace DisplayXR.Editor
             return m_Texture.objectReferenceValue as Texture;
         }
 
-        void DrawHint(Texture tex, DisplayXRStereoLayout layout, bool half)
+        void DrawHint(int width, int height, DisplayXRStereoLayout layout, bool half)
         {
             string axis = layout == DisplayXRStereoLayout.TopBottom || layout == DisplayXRStereoLayout.TopBottomSwapped
                 ? "height" : "width";
-            float eye = DisplayXRStereoMediaMath.EyeAspect(tex.width, tex.height, layout, half, 1f);
+            float eye = DisplayXRStereoMediaMath.EyeAspect(width, height, layout, half, 1f);
             string message = null;
-            switch (DisplayXRStereoMediaMath.DiagnoseLayout(tex.width, tex.height, layout, half))
+            switch (DisplayXRStereoMediaMath.DiagnoseLayout(width, height, layout, half))
             {
                 case DisplayXRStereoLayoutHint.LooksHalfResolution:
-                    message = $"A {tex.width} x {tex.height} texture gives each eye a {eye:F2}:1 picture with this layout. " +
+                    message = $"A {width} x {height} picture gives each eye a {eye:F2}:1 picture with this layout. " +
                               $"It looks like half-{axis} (squeezed) media: turn on Half Resolution.";
                     break;
                 case DisplayXRStereoLayoutHint.LooksFullResolution:
-                    message = $"A {tex.width} x {tex.height} texture gives each eye a {eye:F2}:1 picture with Half Resolution on. " +
+                    message = $"A {width} x {height} picture gives each eye a {eye:F2}:1 picture with Half Resolution on. " +
                               $"It looks like full-{axis} media: turn Half Resolution off.";
                     break;
                 case DisplayXRStereoLayoutHint.LooksSideBySide:
-                    message = $"A {tex.width} x {tex.height} texture is very wide for one picture. It looks like a " +
+                    message = $"A {width} x {height} picture is very wide for one picture. It looks like a " +
                               "side-by-side pair: set Layout to Side By Side.";
                     break;
                 case DisplayXRStereoLayoutHint.LooksTopBottom:
-                    message = $"A {tex.width} x {tex.height} texture has the shape of two 16:9 pictures stacked. " +
+                    message = $"A {width} x {height} picture has the shape of two 16:9 pictures stacked. " +
                               "If it is a top-bottom pair, set Layout to Top Bottom.";
                     break;
             }
             if (message != null)
                 EditorGUILayout.HelpBox(message, MessageType.Warning);
+        }
+
+        // Two import settings that are on by default and hurt a stereo picture.
+        void DrawImportWarnings(Texture tex)
+        {
+            if (tex == null) return;
+
+            // Non-Power of 2: Unity resizes the image, which changes its shape - and the
+            // component can only see the resized texture.
+            string path = AssetDatabase.GetAssetPath(tex);
+            if (!string.IsNullOrEmpty(path) && AssetImporter.GetAtPath(path) is TextureImporter importer &&
+                importer.npotScale != TextureImporterNPOTScale.None)
+            {
+                importer.GetSourceTextureWidthAndHeight(out int sw, out int sh);
+                Vector2Int stated = m_SourceSize.vector2IntValue;
+                bool resized = sw > 0 && sh > 0 && (sw != tex.width || sh != tex.height);
+                bool statedRight = stated.x == sw && stated.y == sh;
+                if (resized && !statedRight)
+                {
+                    EditorGUILayout.HelpBox(
+                        $"This {sw} x {sh} image is imported as {tex.width} x {tex.height} (Non-Power of 2: " +
+                        $"{importer.npotScale}), so the picture's shape is wrong and it is resampled. Set " +
+                        "Non-Power of 2 to None in the texture's import settings, or state the true size in " +
+                        "Source Size.", MessageType.Warning);
+                    using (new EditorGUILayout.HorizontalScope())
+                    {
+                        if (GUILayout.Button("Fix Import (Non-Power of 2: None)"))
+                        {
+                            importer.npotScale = TextureImporterNPOTScale.None;
+                            importer.SaveAndReimport();
+                        }
+                        if (GUILayout.Button($"Set Source Size to {sw} x {sh}"))
+                            m_SourceSize.vector2IntValue = new Vector2Int(sw, sh);
+                    }
+                }
+            }
+
+            if (tex.mipmapCount > 1)
+                EditorGUILayout.HelpBox(
+                    "This texture has mipmaps. Shown smaller than its own size it is sampled from a coarser mip, " +
+                    "where a filter tap is wider: the shader then keeps each eye further from the seam between the " +
+                    "two pictures (half a texel of the mip in use), which repeats the picture's inner edge over " +
+                    "about half a displayed pixel. For a picture shown at or near its own size, turn Generate Mip " +
+                    "Maps off.", MessageType.Warning);
         }
 
         // An EyeMapping as the texCoords rect IMGUI takes (a negative height mirrors).

@@ -2,6 +2,7 @@
 // SPDX-License-Identifier: Apache-2.0
 
 using UnityEngine;
+using UnityEngine.Experimental.Rendering;
 using UnityEngine.Rendering;
 #if DISPLAYXR_HAS_VIDEO
 using UnityEngine.Video;
@@ -34,13 +35,18 @@ namespace DisplayXR
     /// per-pipeline notes and limits.
     /// </para>
     /// <para>
-    /// The quad is a hidden child object the component owns, so the component never moves
-    /// or scales the GameObject it sits on. Nothing is allocated per frame.
+    /// The picture is submitted each frame with <c>Graphics.RenderMesh</c>: the component
+    /// adds no renderer and no child object, and never moves or scales the GameObject it
+    /// sits on. Nothing is allocated per frame.
     /// </para>
     /// </summary>
     [AddComponentMenu("DisplayXR/Stereo Media")]
     [DisallowMultipleComponent]
     [ExecuteAlways]
+    // Just before the provider driver (10000), which samples the rig pose it sends the
+    // runtime: by then every app script has moved the rig, so the quad is placed on the
+    // plane of the pose that is actually rendered - not last frame's.
+    [DefaultExecutionOrder(9999)]
     public class DisplayXRStereoMedia : MonoBehaviour
     {
         /// <summary>How the media is put in front of the viewer.</summary>
@@ -107,6 +113,11 @@ namespace DisplayXR
         [Tooltip("The texture is stored upside down (some native / external textures).")]
         public bool flipVertical;
 
+        [Tooltip("The picture's true size in pixels, when the texture is not that size - most often an imported " +
+                 "image that Unity resized to a power of two (Non-Power of 2 other than None turns 3840x1080 into " +
+                 "4096x1024). Only the shape is used. 0 x 0 = the texture's own size.")]
+        public Vector2Int sourceSize;
+
         [Header("Layout")]
 
         [Tooltip("How the two eye pictures are packed. Top-Bottom has the left eye on top.")]
@@ -149,8 +160,8 @@ namespace DisplayXR
 
         public QuadPlacement placement = QuadPlacement.ZeroParallaxPlane;
 
-        [Tooltip("The rig camera whose zero-parallax plane is used. Empty = the active rig camera " +
-                 "(DisplayXRRigManager.ActiveCamera).")]
+        [Tooltip("The rig camera: its zero-parallax plane carries the quad, and it is the one camera a full-screen " +
+                 "picture is drawn for. Empty = the active rig camera (DisplayXRRigManager.ActiveCamera).")]
         public Camera rigCamera;
 
         [Tooltip("Size of the frame the picture is fitted into, in this object's local units (Manual placement, and " +
@@ -190,6 +201,8 @@ namespace DisplayXR
         static readonly int s_FullScreenId = Shader.PropertyToID("_DXRMediaFullScreen");
         static readonly int s_ColorXformId = Shader.PropertyToID("_DXRMediaColor");
         static readonly int s_AlphaId = Shader.PropertyToID("_DXRMediaAlpha");
+        static readonly int s_MaxLodId = Shader.PropertyToID("_DXRMediaMaxLod");
+        static readonly int s_ScriptEyeId = Shader.PropertyToID("_DXRMediaScriptEye");
         static readonly int s_SrcBlendId = Shader.PropertyToID("_SrcBlend");
         static readonly int s_DstBlendId = Shader.PropertyToID("_DstBlend");
         static readonly int s_ZWriteId = Shader.PropertyToID("_ZWrite");
@@ -197,20 +210,30 @@ namespace DisplayXR
 
         // Full-screen geometry never leaves the view; bounds this large keep CPU culling
         // (which uses the camera transform, not the per-eye projection) from dropping it.
-        static readonly Bounds k_HugeBounds = new Bounds(Vector3.zero, Vector3.one * 1e5f);
+        const float k_HugeExtent = 1e5f;
 
-        // After the opaque queue and the skybox, before ordinary transparents.
-        const int k_BackgroundQueue = (int)RenderQueue.Transparent - 100;
+        // Every queue used is OUTSIDE the opaque range, on purpose - see the queue notes in
+        // docs~/architecture/stereo-media.md. In short: with depth priming URP draws its
+        // opaque queue (<= 2500) with ZTest Equal against a depth prepass, and this shader
+        // has no depth pass, so an opaque-queue quad would not be drawn at all. 2501-2649
+        // is HDRP's after-post-process opaque range. From 2900 (HDRP's first plain
+        // transparent queue) to 3100 (its last) every pipeline draws the pass with the
+        // shader's own depth state.
+        //
+        // After the opaque queue and the skybox, before ordinary transparents: the opaque
+        // quad (which writes depth) and the full-screen background.
+        const int k_EarlyQueue = (int)RenderQueue.Transparent - 100;
         // The last queue every pipeline still draws with its transparents.
-        const int k_ForegroundQueue = (int)RenderQueue.Transparent + 100;
-        const string k_QuadName = "DisplayXR Stereo Media Quad";
+        const int k_LateQueue = (int)RenderQueue.Transparent + 100;
 
-        // Everything the material and the quad depend on. Compared field by field each
-        // frame; the material is only touched when something differs.
+        // Everything the material depends on. Compared field by field each frame; the
+        // material is only touched when something differs.
         struct State
         {
             public Texture texture;
-            public int width, height;
+            public int width, height;        // the texture as it is on the GPU
+            public int aspectWidth, aspectHeight; // the size the picture's shape is taken from
+            public int mipCount;
             public bool formatIsSRGB;
             public DisplayXRStereoLayout layout;
             public bool halfResolution;
@@ -224,13 +247,14 @@ namespace DisplayXR
             public AlphaMode alphaMode;
             public Color tint;
             public FullScreenOrder order;
-            public Vector2 frame;      // Quad: frame size in the quad object's units. Full screen: unused.
+            public Vector2 frame;      // Quad: frame size in the quad's own units. Full screen: unused.
             public float frameAspect;
             public bool valid;
 
             public bool Same(in State o) =>
                 valid && o.valid &&
                 ReferenceEquals(texture, o.texture) && width == o.width && height == o.height &&
+                aspectWidth == o.aspectWidth && aspectHeight == o.aspectHeight && mipCount == o.mipCount &&
                 formatIsSRGB == o.formatIsSRGB && layout == o.layout && halfResolution == o.halfResolution &&
                 pixelAspect == o.pixelAspect && depthShift == o.depthShift && flipVertical == o.flipVertical &&
                 stereo == o.stereo && encoding == o.encoding && presentation == o.presentation && fit == o.fit &&
@@ -241,13 +265,10 @@ namespace DisplayXR
         State m_State;
         float m_PictureAspect;
         bool m_Visible;
+        Vector2 m_Drawn;            // Quad: drawn size in the quad's units. Full screen: fraction of the view.
+        Matrix4x4 m_QuadMatrix = Matrix4x4.identity;
         bool m_UsingSRP;
-        Camera.CameraCallback m_OnPreCull;
-        System.Action<ScriptableRenderContext, Camera> m_OnBeginCamera;
 
-        GameObject m_QuadObject;
-        Transform m_QuadTransform;
-        MeshRenderer m_Renderer;
         Mesh m_Mesh;
         Material m_Material;
         bool m_WarnedShader;
@@ -271,6 +292,25 @@ namespace DisplayXR
         VideoPlayer.EventHandler m_OnVideoPrepared;
 #endif
 
+#if UNITY_EDITOR
+        Camera.CameraCallback m_OnEditCamera;
+        System.Action<ScriptableRenderContext, Camera> m_OnEditCameraSRP;
+#endif
+
+        // Built-in pipeline, multi-pass: which eye the pass about to render is for, as a
+        // shader global. One subscription shared by all instances.
+        static int s_ScriptEyeUsers;
+        static Camera.CameraCallback s_OnPreRenderEye;
+
+        static void PublishScriptEye(Camera cam)
+        {
+            // Camera.stereoActiveEye is Left / Right inside an eye's render callbacks and
+            // Mono for a camera that is not rendering stereo - the same signal the BiRP
+            // foreground clip reads (in OnRenderImage) to pick its eye.
+            Shader.SetGlobalFloat(s_ScriptEyeId,
+                cam != null && cam.stereoActiveEye == Camera.MonoOrStereoscopicEye.Right ? 1f : 0f);
+        }
+
         void OnEnable()
         {
             m_State = default;
@@ -284,40 +324,25 @@ namespace DisplayXR
             DisplayXRProvider.RenderingModeChanged += m_OnModeChanged;
             DisplayXRProvider.HardwareDisplayStateChanged += m_OnHardwareChanged;
 
-            // Full screen draws in clip space, so it would cover every camera that renders
-            // this layer - the Scene view, previews, reflection probes. Gate it per camera.
             m_UsingSRP = GraphicsSettings.currentRenderPipeline != null;
-            m_OnPreCull ??= GateForCamera;
-            m_OnBeginCamera ??= OnBeginCameraRendering;
-            if (m_UsingSRP) RenderPipelineManager.beginCameraRendering += m_OnBeginCamera;
-            else Camera.onPreCull += m_OnPreCull;
-
-            DestroyStrayQuads();
-            EnsureQuad();
-            Refresh();
-        }
-
-        // A duplicated GameObject carries a copy of the hidden quad that no component owns.
-        void DestroyStrayQuads()
-        {
-            for (int i = transform.childCount - 1; i >= 0; i--)
+            if (!m_UsingSRP)
             {
-                Transform c = transform.GetChild(i);
-                if (c.name == k_QuadName && (c.hideFlags & HideFlags.DontSave) != 0)
-                    DestroyOwned(c.gameObject);
+                s_OnPreRenderEye ??= PublishScriptEye;
+                if (s_ScriptEyeUsers++ == 0) Camera.onPreRender += s_OnPreRenderEye;
             }
-        }
 
-        void OnBeginCameraRendering(ScriptableRenderContext context, Camera cam) => GateForCamera(cam);
+#if UNITY_EDITOR
+            // Outside Play, LateUpdate runs only when something changes while every view
+            // repaints on its own, so a draw submitted from LateUpdate would come and go.
+            // Submit once per camera render instead.
+            m_OnEditCamera ??= DrawForEditCamera;
+            m_OnEditCameraSRP ??= DrawForEditCameraSRP;
+            if (m_UsingSRP) RenderPipelineManager.beginCameraRendering += m_OnEditCameraSRP;
+            else Camera.onPreCull += m_OnEditCamera;
+#endif
 
-        // Runs before each camera culls. Quad presentation is an ordinary scene object and
-        // is left alone.
-        void GateForCamera(Camera cam)
-        {
-            if (m_Renderer == null || m_State.presentation != PresentationMode.FullScreen) return;
-            bool show = m_Visible && cam != null && cam.cameraType == CameraType.Game &&
-                        (rigCamera == null || ReferenceEquals(cam, rigCamera));
-            if (m_Renderer.enabled != show) m_Renderer.enabled = show;
+            EnsureResources();
+            Refresh();
         }
 
         void OnDisable()
@@ -326,17 +351,21 @@ namespace DisplayXR
             DisplayXRProvider.SessionStopped -= m_OnSessionEdge;
             DisplayXRProvider.RenderingModeChanged -= m_OnModeChanged;
             DisplayXRProvider.HardwareDisplayStateChanged -= m_OnHardwareChanged;
-            if (m_UsingSRP) RenderPipelineManager.beginCameraRendering -= m_OnBeginCamera;
-            else Camera.onPreCull -= m_OnPreCull;
+            if (!m_UsingSRP && --s_ScriptEyeUsers <= 0)
+            {
+                s_ScriptEyeUsers = 0;
+                Camera.onPreRender -= s_OnPreRenderEye;
+                Shader.SetGlobalFloat(s_ScriptEyeId, 0f);
+            }
+#if UNITY_EDITOR
+            if (m_UsingSRP) RenderPipelineManager.beginCameraRendering -= m_OnEditCameraSRP;
+            else Camera.onPreCull -= m_OnEditCamera;
+#endif
 #if DISPLAYXR_HAS_VIDEO
             HookVideo(null);
 #endif
-            DestroyOwned(m_QuadObject);
             DestroyOwned(m_Mesh);
             DestroyOwned(m_Material);
-            m_QuadObject = null;
-            m_QuadTransform = null;
-            m_Renderer = null;
             m_Mesh = null;
             m_Material = null;
             m_State = default;
@@ -359,15 +388,21 @@ namespace DisplayXR
         // display with no switchable hardware can report 2D while it renders two views.
         void OnHardwareChanged(bool is3D) => m_ModeDirty = true;
 
-        void LateUpdate() => Refresh();
+        // Late (see the DefaultExecutionOrder above): the rig has been moved by then.
+        void LateUpdate()
+        {
+            Refresh();
+            if (Application.isPlaying) Draw(null);
+        }
 
         /// <summary>
         /// Re-evaluate the source, the layout and the placement now. Runs every frame in
-        /// LateUpdate; call it yourself only to see a change before the next frame.
+        /// LateUpdate; call it yourself only to have <see cref="CurrentTexture"/>,
+        /// <see cref="IsStereo"/> or <see cref="PictureAspect"/> reflect a change before then.
         /// </summary>
         public void Refresh()
         {
-            if (m_QuadObject == null || m_Material == null) return;
+            if (m_Material == null || m_Mesh == null) return;
 
             State s = default;
             s.texture = ResolveTexture(out float sourcePixelAspect);
@@ -375,8 +410,14 @@ namespace DisplayXR
             {
                 s.width = s.texture.width;
                 s.height = s.texture.height;
-                s.formatIsSRGB = s.texture.isDataSRGB;
+                s.mipCount = s.texture.mipmapCount;
+                // The FORMAT, not a colour-space guess: it is what decides whether the
+                // sampler decodes (see DisplayXRStereoMediaMath.ColorTransform).
+                s.formatIsSRGB = GraphicsFormatUtility.IsSRGBFormat(s.texture.graphicsFormat);
             }
+            bool stated = sourceSize.x > 0 && sourceSize.y > 0;
+            s.aspectWidth = stated ? sourceSize.x : s.width;
+            s.aspectHeight = stated ? sourceSize.y : s.height;
             s.layout = layout;
             s.halfResolution = halfResolution;
             s.pixelAspect = pixelAspect > 0f ? pixelAspect : sourcePixelAspect;
@@ -393,17 +434,15 @@ namespace DisplayXR
 
             if (presentation == PresentationMode.FullScreen)
             {
-                PlaceQuadLocal();
+                m_QuadMatrix = Matrix4x4.identity;
                 s.frame = Vector2.one;
-                s.frameAspect = ResolveViewAspect();
+                s.frameAspect = ResolveViewAspect(ResolveRigCamera());
             }
             else
             {
-                s.frame = PlaceQuad();
+                s.frame = PlaceQuad(out m_QuadMatrix);
                 s.frameAspect = s.frame.y > 1e-6f ? s.frame.x / s.frame.y : 0f;
             }
-
-            if (m_QuadObject.layer != gameObject.layer) m_QuadObject.layer = gameObject.layer;
 
             if (s.Same(m_State)) return;
             m_State = s;
@@ -502,15 +541,8 @@ namespace DisplayXR
 
         // ---- placement ---------------------------------------------------------
 
-        void PlaceQuadLocal()
-        {
-            m_QuadTransform.localPosition = Vector3.zero;
-            m_QuadTransform.localRotation = Quaternion.identity;
-            m_QuadTransform.localScale = Vector3.one;
-        }
-
-        // Positions the quad object and returns the frame size in its local units.
-        Vector2 PlaceQuad()
+        // Returns the frame size in the quad's own units, and the quad's object-to-world.
+        Vector2 PlaceQuad(out Matrix4x4 matrix)
         {
             if (placement == QuadPlacement.ZeroParallaxPlane)
             {
@@ -518,11 +550,8 @@ namespace DisplayXR
                 if (TryGetPlane(cam, out Vector3 center, out Quaternion rotation, out Vector2 size, out Vector3 rigScale))
                 {
                     m_WarnedNoPlane = false;
-                    Vector3 parent = transform.lossyScale;
-                    m_QuadTransform.SetPositionAndRotation(center, rotation);
                     // The plane is defined in the rig's local units; give the quad the rig's scale.
-                    m_QuadTransform.localScale = new Vector3(
-                        SafeDivide(rigScale.x, parent.x), SafeDivide(rigScale.y, parent.y), SafeDivide(rigScale.z, parent.z));
+                    matrix = Matrix4x4.TRS(center, rotation, rigScale);
                     return size;
                 }
                 if (!m_WarnedNoPlane && Application.isPlaying)
@@ -535,11 +564,9 @@ namespace DisplayXR
                                      ". Using this object's transform and Quad Size instead.", this);
                 }
             }
-            PlaceQuadLocal();
+            matrix = transform.localToWorldMatrix;
             return new Vector2(Mathf.Max(0f, quadSize.x), Mathf.Max(0f, quadSize.y));
         }
-
-        static float SafeDivide(float a, float b) => Mathf.Abs(b) > 1e-6f ? a / b : a;
 
         bool TryGetPlane(Camera cam, out Vector3 center, out Quaternion rotation, out Vector2 size, out Vector3 rigScale)
         {
@@ -622,16 +649,13 @@ namespace DisplayXR
             return true;
         }
 
-        float ResolveViewAspect()
-        {
-            return ResolveViewAspect(ResolveRigCamera());
-        }
-
+        // The camera whose plane the quad sits on, and the ONE camera a full-screen picture
+        // is drawn for.
         Camera ResolveRigCamera()
         {
             if (rigCamera != null) return rigCamera;
             Camera cam = DisplayXRRigManager.ActiveCamera;
-            // Rigs register only in Play; in edit mode use the main camera so the quad
+            // Rigs register only in Play; in edit mode use the main camera so the picture
             // previews where it will be.
             if (cam == null && !Application.isPlaying) cam = Camera.main;
             return cam;
@@ -651,7 +675,7 @@ namespace DisplayXR
 
         // ---- drawing -----------------------------------------------------------
 
-        void EnsureQuad()
+        void EnsureResources()
         {
             if (m_Material == null)
             {
@@ -685,24 +709,6 @@ namespace DisplayXR
                 };
                 m_Mesh.triangles = new[] { 0, 2, 1, 0, 3, 2 };
             }
-
-            if (m_QuadObject == null)
-            {
-                m_QuadObject = new GameObject(k_QuadName) { hideFlags = HideFlags.HideAndDontSave };
-                m_QuadObject.layer = gameObject.layer;
-                m_QuadTransform = m_QuadObject.transform;
-                m_QuadTransform.SetParent(transform, false);
-                m_QuadObject.AddComponent<MeshFilter>().sharedMesh = m_Mesh;
-                m_Renderer = m_QuadObject.AddComponent<MeshRenderer>();
-                m_Renderer.sharedMaterial = m_Material;
-                m_Renderer.shadowCastingMode = ShadowCastingMode.Off;
-                m_Renderer.receiveShadows = false;
-                m_Renderer.lightProbeUsage = LightProbeUsage.Off;
-                m_Renderer.reflectionProbeUsage = ReflectionProbeUsage.Off;
-                m_Renderer.motionVectorGenerationMode = MotionVectorGenerationMode.ForceNoMotion;
-                m_Renderer.allowOcclusionWhenDynamic = false;
-                m_Renderer.enabled = false;
-            }
         }
 
         void Apply(in State s)
@@ -710,19 +716,18 @@ namespace DisplayXR
             if (s.texture == null || s.width <= 0 || s.height <= 0)
             {
                 m_Visible = false;
-                m_Renderer.enabled = false;
                 m_PictureAspect = 0f;
                 return;
             }
 
             var sol = DisplayXRStereoMediaMath.Solve(
-                s.width, s.height, s.layout, s.halfResolution, s.pixelAspect, s.fit, s.frameAspect,
+                s.aspectWidth, s.aspectHeight, s.layout, s.halfResolution, s.pixelAspect, s.fit, s.frameAspect,
                 s.depthShift, s.flipVertical, s.stereo);
             m_PictureAspect = sol.pictureAspect;
 
             bool fullScreen = s.presentation == PresentationMode.FullScreen;
             bool opaque = s.alphaMode == AlphaMode.Opaque;
-            Vector2 drawn = new Vector2(s.frame.x * sol.frameX, s.frame.y * sol.frameY);
+            m_Drawn = new Vector2(s.frame.x * sol.frameX, s.frame.y * sol.frameY);
 
             var m = m_Material;
             m.SetTexture(s_MainTexId, s.texture);
@@ -731,11 +736,12 @@ namespace DisplayXR
             m.SetVector(s_STRId, new Vector4(sol.right.scaleX, sol.right.scaleY, sol.right.offsetX, sol.right.offsetY));
             m.SetVector(s_ClampLId, new Vector4(sol.left.clampMinX, sol.left.clampMinY, sol.left.clampMaxX, sol.left.clampMaxY));
             m.SetVector(s_ClampRId, new Vector4(sol.right.clampMinX, sol.right.clampMinY, sol.right.clampMaxX, sol.right.clampMaxY));
-            m.SetVector(s_FrameId, new Vector4(drawn.x, drawn.y, 0f, 0f));
+            m.SetVector(s_FrameId, new Vector4(m_Drawn.x, m_Drawn.y, 0f, 0f));
             m.SetFloat(s_FullScreenId, fullScreen ? 1f : 0f);
             m.SetFloat(s_ColorXformId, DisplayXRStereoMediaMath.ColorTransform(
                 QualitySettings.activeColorSpace == ColorSpace.Linear, s.formatIsSRGB, s.encoding));
             m.SetFloat(s_AlphaId, (float)s.alphaMode);
+            m.SetFloat(s_MaxLodId, Mathf.Max(0, s.mipCount - 1));
             m.SetFloat(s_SrcBlendId, (float)BlendMode.One);
             m.SetFloat(s_DstBlendId, (float)(opaque ? BlendMode.Zero : BlendMode.OneMinusSrcAlpha));
 
@@ -744,19 +750,85 @@ namespace DisplayXR
                 bool background = s.order == FullScreenOrder.Background;
                 m.SetFloat(s_ZWriteId, 0f);
                 m.SetFloat(s_ZTestId, (float)(background ? CompareFunction.LessEqual : CompareFunction.Always));
-                m.renderQueue = background ? k_BackgroundQueue : k_ForegroundQueue;
-                m_Mesh.bounds = k_HugeBounds;
+                m.renderQueue = background ? k_EarlyQueue : k_LateQueue;
             }
             else
             {
                 m.SetFloat(s_ZWriteId, opaque ? 1f : 0f);
                 m.SetFloat(s_ZTestId, (float)CompareFunction.LessEqual);
-                m.renderQueue = (int)(opaque ? RenderQueue.Geometry : RenderQueue.Transparent);
-                m_Mesh.bounds = new Bounds(Vector3.zero, new Vector3(drawn.x, drawn.y, 0f));
+                m.renderQueue = opaque ? k_EarlyQueue : (int)RenderQueue.Transparent;
             }
 
-            m_Visible = drawn.x > 0f && drawn.y > 0f;
-            m_Renderer.enabled = m_Visible;
+            m_Visible = m_Drawn.x > 0f && m_Drawn.y > 0f;
         }
+
+        // Submits the picture for this frame. onlyCamera = null: the cameras the
+        // presentation calls for (Play). Otherwise: that one camera, if it qualifies
+        // (edit mode, once per camera render).
+        //
+        // Graphics.RenderMesh rather than a renderer on a child object: nothing is created,
+        // parented or toggled, so there is no object to orphan when this GameObject is
+        // activated or deactivated, and "which camera" is a parameter of the draw
+        // (RenderParams.camera) instead of shared state changed between cameras.
+        void Draw(Camera onlyCamera)
+        {
+            if (!m_Visible || m_Material == null || m_Mesh == null) return;
+
+            bool fullScreen = m_State.presentation == PresentationMode.FullScreen;
+            Camera target = onlyCamera;
+            Bounds bounds;
+            if (fullScreen)
+            {
+                // Clip-space geometry covers whatever camera renders it, so it is drawn for
+                // exactly one: the rig camera. Never the Scene view, a preview, a
+                // reflection probe or a second Game camera rendering into a texture.
+                Camera rig = ResolveRigCamera();
+                if (rig == null || (onlyCamera != null && !ReferenceEquals(onlyCamera, rig))) return;
+                target = rig;
+                bounds = new Bounds(rig.transform.position, Vector3.one * k_HugeExtent);
+            }
+            else
+            {
+                bounds = QuadWorldBounds();
+            }
+
+            var rp = new RenderParams(m_Material)
+            {
+                camera = target, // null = every camera: the quad is an ordinary scene object
+                layer = gameObject.layer,
+                worldBounds = bounds,
+                shadowCastingMode = ShadowCastingMode.Off,
+                receiveShadows = false,
+                lightProbeUsage = LightProbeUsage.Off,
+                reflectionProbeUsage = ReflectionProbeUsage.Off,
+                motionVectorMode = MotionVectorGenerationMode.ForceNoMotion,
+            };
+            Graphics.RenderMesh(rp, m_Mesh, 0, m_QuadMatrix);
+        }
+
+        // The quad is a unit square scaled by m_Drawn in the shader, in the XY plane of
+        // m_QuadMatrix.
+        Bounds QuadWorldBounds()
+        {
+            Matrix4x4 q = m_QuadMatrix;
+            float hx = m_Drawn.x * 0.5f, hy = m_Drawn.y * 0.5f;
+            var extents = new Vector3(
+                Mathf.Abs(q.m00) * hx + Mathf.Abs(q.m01) * hy,
+                Mathf.Abs(q.m10) * hx + Mathf.Abs(q.m11) * hy,
+                Mathf.Abs(q.m20) * hx + Mathf.Abs(q.m21) * hy);
+            return new Bounds(new Vector3(q.m03, q.m13, q.m23), extents * 2f);
+        }
+
+#if UNITY_EDITOR
+        void DrawForEditCameraSRP(ScriptableRenderContext context, Camera cam) => DrawForEditCamera(cam);
+
+        void DrawForEditCamera(Camera cam)
+        {
+            if (Application.isPlaying || cam == null) return;
+            if (cam.cameraType != CameraType.Game && cam.cameraType != CameraType.SceneView) return;
+            Refresh();
+            Draw(cam);
+        }
+#endif
     }
 }
