@@ -320,6 +320,10 @@ DISPLAYXR_EXPORT int dxr_prov_get_zone_rect_px(uint32_t zone, int *x, int *y, in
 /// Zone 0's rect only while a 3D zone is active (returns 0 otherwise). Cached state only:
 /// never queries the window, so it is safe from Unity's main thread (#332).
 DISPLAYXR_EXPORT int dxr_prov_get_active_zone_rect_px(int *x, int *y, int *w, int *h);
+/// The app-authored 3D zone rect (client px, top-left origin) while the located views frame
+/// it: an app zone that is live (the predicate the depth-aware cursor maps the pointer
+/// with). 0 when the views frame the whole screen. Cached state only; any thread (#460).
+DISPLAYXR_EXPORT int dxr_prov_get_app_zone_rect_px(int *x, int *y, int *w, int *h);
 
 /// The live size in pixels of the window (or workspace tile) the runtime composites this
 /// app into — the size the eye swapchain is derived from — as last measured by the provider.

@@ -144,9 +144,11 @@ namespace DisplayXR
         /// The view between the two eyes: where the viewer perceives a fused point, which is
         /// what a pointer is aimed with. The left view with its translation averaged with the
         /// right one's (both eyes of a DisplayXR view pair share an orientation), and the
-        /// element-wise mean of the two projections: the two off-axis frusta frame the same
-        /// rectangle from eyes at the same distance, so their mean is the frustum of the
-        /// midpoint eye. Writes into the caller's arrays (which may not alias the inputs).
+        /// element-wise mean of the two projections. That is exactly the midpoint eye's own
+        /// frustum, for any two eye positions (a turned or tilted head included): every term
+        /// of an off-axis projection that frames one fixed rectangle is linear in the eye
+        /// position, so the mean of two projections is the projection of the mean position.
+        /// Writes into the caller's arrays (which may not alias the inputs).
         /// </summary>
         public static void Cyclopean(float[] leftView, float[] leftProj, float[] rightView, float[] rightProj,
                                      float[] outView, float[] outProj)
@@ -159,6 +161,43 @@ namespace DisplayXR
             outView[12] = (leftView[12] + rightView[12]) * 0.5f;
             outView[13] = (leftView[13] + rightView[13]) * 0.5f;
             outView[14] = (leftView[14] + rightView[14]) * 0.5f;
+        }
+
+        // ---- Where the views sit --------------------------------------------------------------
+
+        /// <summary>
+        /// The rigid frame the located views sit in for a camera, from that camera's pose and
+        /// the rig pose the provider last sent the runtime (identity when none was sent):
+        /// camera * rig^-1, i.e. rotation = Rc * Rr^-1 and position = pc - rotation * pr. The
+        /// views come back with the rig pose baked in and Unity re-applies the camera's own
+        /// transform to them rig-relative, so this is what turns a point of the located space
+        /// into the world that camera draws. It is the identity when the two poses are equal.
+        /// Quaternions are (x, y, z, w), unit; any consistent coordinate convention.
+        /// </summary>
+        public static void FrameFromPoses(
+            float cpx, float cpy, float cpz, float cqx, float cqy, float cqz, float cqw,
+            float rpx, float rpy, float rpz, float rqx, float rqy, float rqz, float rqw,
+            out float px, out float py, out float pz,
+            out float qx, out float qy, out float qz, out float qw)
+        {
+            // q = qc * conj(qr)
+            double ax = cqx, ay = cqy, az = cqz, aw = cqw;
+            double bx = -rqx, by = -rqy, bz = -rqz, bw = rqw;
+            double x = aw * bx + ax * bw + ay * bz - az * by;
+            double y = aw * by - ax * bz + ay * bw + az * bx;
+            double z = aw * bz + ax * by - ay * bx + az * bw;
+            double w = aw * bw - ax * bx - ay * by - az * bz;
+            double n = Math.Sqrt(x * x + y * y + z * z + w * w);
+            if (n > 1e-12) { x /= n; y /= n; z /= n; w /= n; }
+            else { x = y = z = 0.0; w = 1.0; }
+            // p = pc - q * pr
+            double tx = 2.0 * (y * rpz - z * rpy);
+            double ty = 2.0 * (z * rpx - x * rpz);
+            double tz = 2.0 * (x * rpy - y * rpx);
+            px = (float)(cpx - (rpx + w * tx + (y * tz - z * ty)));
+            py = (float)(cpy - (rpy + w * ty + (z * tx - x * tz)));
+            pz = (float)(cpz - (rpz + w * tz + (x * ty - y * tx)));
+            qx = (float)x; qy = (float)y; qz = (float)z; qw = (float)w;
         }
 
         // ---- Screen -> world --------------------------------------------------------------

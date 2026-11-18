@@ -39,6 +39,8 @@ namespace DisplayXR
     /// <see cref="TryGetPointerPosition"/> and sizes from <see cref="TryGetScreenSize"/> and
     /// the same code is right in both cases. A 3D zone (<see cref="DisplayXRProvider.SetZoneRect"/>)
     /// is accounted for: the views frame the zone, so the point is mapped into its rect.
+    /// The mapping is always against that whole screen (or zone): a camera's own
+    /// <c>Camera.rect</c> sub-viewport is not applied.
     /// </para>
     /// <para>
     /// Every method returns false, without logging or throwing, while there is nothing to
@@ -105,14 +107,8 @@ namespace DisplayXR
             if (!DisplayXRPickingMath.TryUnprojectRay(view, proj, nx, ny, out float ox, out float oy, out float oz,
                                                       out float dx, out float dy, out float dz))
                 return false;
-            var origin = new Vector3(ox, oy, oz);
-            var dir = new Vector3(dx, dy, dz);
-            if (!frame.identity)
-            {
-                origin = frame.position + frame.rotation * origin;
-                dir = frame.rotation * dir;
-            }
-            ray = new Ray(origin, dir);
+            ray = new Ray(frame.position + frame.rotation * new Vector3(ox, oy, oz),
+                          frame.rotation * new Vector3(dx, dy, dz));
             return true;
         }
 
@@ -156,7 +152,7 @@ namespace DisplayXR
             if (!TrySelectView(eye, zone, out float[] view, out float[] proj)) return false;
             if (!TryGetFrame(camera, out Frame frame)) return false;
             if (!TryGetMapping(zone, out Mapping m)) return false;
-            if (!frame.identity) world = Quaternion.Inverse(frame.rotation) * (world - frame.position);
+            world = Quaternion.Inverse(frame.rotation) * (world - frame.position);
             bool inFront = DisplayXRPickingMath.TryProject(view, proj, world.x, world.y, world.z,
                                                            out float nx, out float ny, out float _, out float depth);
             screenPoint.z = depth;
@@ -203,8 +199,7 @@ namespace DisplayXR
             if (!TryScreenToNdc(screenPoint, zone, out float nx, out float ny)) return false;
             if (!DisplayXRPickingMath.TryUnprojectPoint(view, proj, nx, ny, distance, out float x, out float y, out float z))
                 return false;
-            world = new Vector3(x, y, z);
-            if (!frame.identity) world = frame.position + frame.rotation * world;
+            world = frame.position + frame.rotation * new Vector3(x, y, z);
             return true;
         }
 
@@ -231,7 +226,9 @@ namespace DisplayXR
         /// bottom-left): the mouse through whichever input backend the project has enabled,
         /// or the cursor over the provider's window where Unity's own window is hidden and
         /// its mouse position does not follow the cursor. The position may lie outside the
-        /// screen. Returns false when there is no pointer to read.
+        /// screen. Returns false when there is no pointer to read. It reads the mouse, not
+        /// touches: on a touch-only device (Android without a mouse) it returns false, and a
+        /// touch position read from Unity is already in this pixel space.
         /// </summary>
         public static bool TryGetPointerPosition(out Vector2 screenPoint)
         {
@@ -361,39 +358,49 @@ namespace DisplayXR
         static readonly float[] s_A = new float[16], s_B = new float[16], s_C = new float[16];
         static readonly float[] s_D = new float[16], s_E = new float[16], s_F = new float[16];
 
-        /// <summary>Latched once the native plug-in turns out to be absent or too old, so a
-        /// per-frame caller does not throw (and catch) on every call.</summary>
-        static bool s_NativeMissing;
+        // One latch per entry point, so a native library that lacks an OPTIONAL export (an
+        // older binary next to newer managed code) loses that feature only: it must never
+        // take the primary views - and with them the overlay's hit-test - down with it. Each
+        // stops a per-frame caller from throwing (and catching) on every call.
+        static bool s_ViewsMissing, s_SessionMissing, s_ZoneViewsMissing;
 
         // The primary zone's pair into s_LV..s_RP, straight from the shared state the provider
         // publishes each frame. No session check: the overlay reads it this way, and the valid
         // flag only ever goes up once a pair has been located.
         static bool TryFetchPrimaryViews()
         {
-            if (s_NativeMissing) return false;
+            if (s_ViewsMissing) return false;
             try
             {
                 DisplayXRNative.displayxr_get_stereo_matrices(s_LV, s_LP, s_RV, s_RP, out int valid);
                 return valid != 0;
             }
-            catch (DllNotFoundException) { s_NativeMissing = true; return false; }
-            catch (EntryPointNotFoundException) { s_NativeMissing = true; return false; }
+            catch (DllNotFoundException) { s_ViewsMissing = true; return false; }
+            catch (EntryPointNotFoundException) { s_ViewsMissing = true; return false; }
         }
 
-        // Zone `zone`'s pair into s_LV..s_RP, only while the session runs (the shared state
+        static bool IsSessionRunning()
+        {
+            if (s_SessionMissing) return false;
+            try { return DisplayXRProvider.IsRunning; }
+            catch (DllNotFoundException) { s_SessionMissing = true; return false; }
+            catch (EntryPointNotFoundException) { s_SessionMissing = true; return false; }
+        }
+
+        // The pair of one zone into s_LV..s_RP, only while the session runs (the shared state
         // keeps the last session's matrices after it stops).
         static bool TryFetchViews(int zone)
         {
-            if (s_NativeMissing || zone < 0) return false;
+            if (zone < 0 || !IsSessionRunning()) return false;
+            if (zone == 0) return TryFetchPrimaryViews();
+            if (s_ZoneViewsMissing) return false;
             try
             {
-                if (!DisplayXRProvider.IsRunning) return false;
-                if (zone == 0) return TryFetchPrimaryViews();
                 return DisplayXRProviderNative.dxr_prov_get_zone_stereo_matrices(
                            (uint)zone, s_LV, s_LP, s_RV, s_RP) != 0;
             }
-            catch (DllNotFoundException) { s_NativeMissing = true; return false; }
-            catch (EntryPointNotFoundException) { s_NativeMissing = true; return false; }
+            catch (DllNotFoundException) { s_ZoneViewsMissing = true; return false; }
+            catch (EntryPointNotFoundException) { s_ZoneViewsMissing = true; return false; }
         }
 
         static bool TrySelectView(Camera.MonoOrStereoscopicEye eye, int zone, out float[] view, out float[] proj)
@@ -414,16 +421,18 @@ namespace DisplayXR
 
         // ---- Where the located views sit in the world -------------------------------------
         //
-        // The views are located in the runtime's space with the rig pose chained in, so for
-        // the rig camera that pushed that pose they are already in Unity world space (with Z
-        // negated, which the math applies). Unity composes every camera's eye poses as
+        // The views are located in the runtime's space with the last pushed rig pose chained
+        // in, and Unity composes every camera's eye poses as
         // camera.transform * (rigPose^-1 * view) - see set_eye_pose_rig_relative in the native
-        // provider - so for any OTHER camera, and for a camera with no rig at all (rig pose =
-        // identity), the views sit at camera.transform * rigPose^-1.
+        // provider. So the views sit at camera.transform * rigPose^-1: the identity (up to
+        // rounding) for a rig camera standing where it was when its rig pushed, and something
+        // else for any other camera, for a camera with no rig at all (rig pose = identity),
+        // and for a rig camera that moved after its rig stopped pushing (component disabled,
+        // splash up) - the runtime keeps the pose it was last sent. There is deliberately no
+        // "this is the rig camera, so identity" shortcut: it is wrong in that last case.
 
         struct Frame
         {
-            public bool identity;
             public Vector3 position;
             public Quaternion rotation;
         }
@@ -431,32 +440,32 @@ namespace DisplayXR
         static bool TryGetFrame(Camera camera, out Frame frame)
         {
             frame = default(Frame);
-            frame.identity = true;
             frame.rotation = Quaternion.identity;
 
-            bool rig = DisplayXRProvider.RigPlaneValid;
-            Camera rigCamera = DisplayXRProvider.RigPlaneCamera;
             if (camera == null)
             {
                 camera = DisplayXRRigManager.ActiveCamera;
-                if (camera == null) camera = rig ? rigCamera : Camera.main;
+                if (camera == null) camera = Camera.main;
+                if (camera == null) return false; // no camera: nowhere to put the views
             }
-            if (rig && (camera == null || ReferenceEquals(camera, rigCamera)))
-                return true; // the views are in world space as they are
-            if (camera == null) return false; // no rig and no camera: nowhere to put the views
 
             Transform t = camera.transform;
-            frame.identity = false;
-            if (rig)
+            Vector3 cp = t.position;
+            Quaternion cq = t.rotation;
+            Vector3 rp = Vector3.zero;
+            Quaternion rq = Quaternion.identity;
+            if (DisplayXRProvider.RigPlaneValid)
             {
-                frame.rotation = t.rotation * Quaternion.Inverse(DisplayXRProvider.RigPlaneRotation);
-                frame.position = t.position - frame.rotation * DisplayXRProvider.RigPlanePos;
+                rp = DisplayXRProvider.RigPlanePos;
+                rq = DisplayXRProvider.RigPlaneRotation;
             }
-            else
-            {
-                frame.rotation = t.rotation;
-                frame.position = t.position;
-            }
+            DisplayXRPickingMath.FrameFromPoses(
+                cp.x, cp.y, cp.z, cq.x, cq.y, cq.z, cq.w,
+                rp.x, rp.y, rp.z, rq.x, rq.y, rq.z, rq.w,
+                out float px, out float py, out float pz,
+                out float qx, out float qy, out float qz, out float qw);
+            frame.position = new Vector3(px, py, pz);
+            frame.rotation = new Quaternion(qx, qy, qz, qw);
             return true;
         }
 
@@ -495,6 +504,7 @@ namespace DisplayXR
             if (zone > 0)
             {
                 // Extra zones are always app-authored.
+                if (s_ZoneRectMissing) return false;
                 try
                 {
                     if (DisplayXRProviderNative.dxr_prov_get_zone_rect_px(
@@ -504,18 +514,33 @@ namespace DisplayXR
                     m.zoneX = ex; m.zoneY = ey; m.zoneW = ew; m.zoneH = eh;
                     return true;
                 }
-                catch (EntryPointNotFoundException) { return false; }
-                catch (DllNotFoundException) { return false; }
+                catch (EntryPointNotFoundException) { s_ZoneRectMissing = true; return false; }
+                catch (DllNotFoundException) { s_ZoneRectMissing = true; return false; }
             }
 
-            if (DisplayXRProvider.TryGetAppZoneRect(out int zx, out int zy, out int zw, out int zh))
+            // The provider's own answer to "do the views frame an app zone, and which rect":
+            // an app-authored zone that is live. Not a managed copy of what the app asked
+            // for - that cannot follow a clear (native keeps the app's rect and re-applies it
+            // on a session restart), nor a runtime that ignores zones.
+            if (!s_AppZoneMissing)
             {
-                m.zoneValid = true;
-                m.zoneX = zx; m.zoneY = zy; m.zoneW = zw; m.zoneH = zh;
-                return true;
+                try
+                {
+                    if (DisplayXRProviderNative.dxr_prov_get_app_zone_rect_px(
+                            out int zx, out int zy, out int zw, out int zh) != 0 && zw > 0 && zh > 0)
+                    {
+                        m.zoneValid = true;
+                        m.zoneX = zx; m.zoneY = zy; m.zoneW = zw; m.zoneH = zh;
+                    }
+                    return true;
+                }
+                // A native library built before #460 (the export is new): the provider cannot
+                // say. Fall through to the rect the overlay's own hit-test uses.
+                catch (EntryPointNotFoundException) { s_AppZoneMissing = true; }
+                catch (DllNotFoundException) { s_AppZoneMissing = true; }
             }
-            // An app that drives the natives itself publishes its 3D sub-rect here: the rect
-            // the transparent overlay's own hit-test maps the cursor into.
+            // Older native only. An app that zones its 3D publishes the same sub-rect here
+            // for the click-through mask; the transparent overlay maps its cursor into it.
             if (!s_CanvasRectMissing)
             {
                 try
@@ -533,7 +558,7 @@ namespace DisplayXR
             return true;
         }
 
-        static bool s_CanvasRectMissing;
+        static bool s_AppZoneMissing, s_CanvasRectMissing, s_ZoneRectMissing;
 
         static bool TryGetScreenSize(out float w, out float h)
         {

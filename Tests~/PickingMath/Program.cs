@@ -255,6 +255,101 @@ static class Program
         Check(same, "cyclopean view + projection == the midpoint eye's");
     }
 
+    static void TestCyclopeanWithATurnedHead()
+    {
+        // Eyes at DIFFERENT distances from the display (a head turned and tilted): the
+        // averaged matrices are still exactly the midpoint eye's, because every term of an
+        // off-axis projection that frames one fixed rectangle is linear in the eye position.
+        var rig = MakeRig(0.4f, -0.1f, 1.2f, 25f, -10f, 0.52f, 0.29f);
+        float[] l = { 0.04f, -0.05f, 0.48f }, r = { 0.09f, -0.02f, 0.63f };
+        float[] m = { (l[0] + r[0]) / 2, (l[1] + r[1]) / 2, (l[2] + r[2]) / 2 };
+        EyeMatrices(rig, l[0], l[1], l[2], out float[] lv, out float[] lp);
+        EyeMatrices(rig, r[0], r[1], r[2], out float[] rv, out float[] rp);
+        EyeMatrices(rig, m[0], m[1], m[2], out float[] mv, out float[] mp);
+        var cv = new float[16]; var cp = new float[16];
+        DisplayXRPickingMath.Cyclopean(lv, lp, rv, rp, cv, cp);
+        bool same = true;
+        for (int i = 0; i < 16; i++) same &= Near(cv[i], mv[i], 1e-5f) && Near(cp[i], mp[i], 1e-5f);
+        Check(same, "eyes at unequal depth: cyclopean view + projection == the midpoint eye's");
+
+        // ... so the cyclopean ray through a screen point starts at the midpoint of the eyes
+        // (extended back from the near plane) and passes through that point of the panel.
+        DisplayXRPickingMath.TryUnprojectRay(cv, cp, 0.3f, -0.4f, out float ox, out float oy, out float oz,
+                                             out float dx, out float dy, out float dz);
+        RigToUnity(rig, m[0], m[1], m[2], out float ex, out float ey, out float ez);
+        RigToUnity(rig, 0.3f * rig.w / 2, -0.4f * rig.h / 2, 0f, out float sx, out float sy, out float sz);
+        Check(DistToRay(ox, oy, oz, dx, dy, dz, ex, ey, ez, out float te) < 1e-4f && te < 0f,
+              "the cyclopean ray comes from the midpoint between the eyes");
+        Check(DistToRay(ox, oy, oz, dx, dy, dz, sx, sy, sz, out float ts) < 1e-4f && ts > 0f,
+              "... through the panel point under the cursor");
+    }
+
+    // A rigid pose applied to a point: rotate, then translate.
+    static void Apply(float[] pos, float[] quat, float x, float y, float z, out float ox, out float oy, out float oz)
+    {
+        DisplayXRCursorDepthMath.Rotate(quat, x, y, z, out ox, out oy, out oz);
+        ox += pos[0]; oy += pos[1]; oz += pos[2];
+    }
+
+    static void TestFrameFromPoses()
+    {
+        // The frame the located views sit in for a camera is camera * rig^-1. Checked the
+        // way it is used: a point the RIG pose puts somewhere must land where the CAMERA
+        // pose puts it, i.e. frame(rig(x)) == camera(x) for every x.
+        var cams = new[] { MakeRig(1.5f, -0.4f, 2.0f, 30f, -12f, 0, 0), MakeRig(-300f, 12f, 80f, -140f, 35f, 0, 0),
+                           MakeRig(0, 0, 0, 0, 0, 0, 0) };
+        var rigs = new[] { MakeRig(0.2f, 0.1f, -1f, 20f, 5f, 0, 0), MakeRig(40f, -7f, 15f, 95f, -60f, 0, 0),
+                           MakeRig(0, 0, 0, 0, 0, 0, 0) };
+        float[][] pts = { new[] { 0f, 0f, 0f }, new[] { 0.3f, -0.2f, 1.5f }, new[] { -4f, 2f, -9f } };
+        foreach (var c in cams)
+        foreach (var r in rigs)
+        {
+            DisplayXRPickingMath.FrameFromPoses(
+                c.pos[0], c.pos[1], c.pos[2], c.quat[0], c.quat[1], c.quat[2], c.quat[3],
+                r.pos[0], r.pos[1], r.pos[2], r.quat[0], r.quat[1], r.quat[2], r.quat[3],
+                out float px, out float py, out float pz, out float qx, out float qy, out float qz, out float qw);
+            float[] fp = { px, py, pz }, fq = { qx, qy, qz, qw };
+            Check(Near(qx * qx + qy * qy + qz * qz + qw * qw, 1f, 1e-5f), "the frame rotation is a unit quaternion");
+            foreach (var x in pts)
+            {
+                Apply(r.pos, r.quat, x[0], x[1], x[2], out float rx, out float ry, out float rz);
+                Apply(fp, fq, rx, ry, rz, out float gx, out float gy, out float gz);
+                Apply(c.pos, c.quat, x[0], x[1], x[2], out float wx, out float wy, out float wz);
+                float tol = 1e-4f * Math.Max(1f, Math.Abs(wx) + Math.Abs(wy) + Math.Abs(wz));
+                Check(Near(gx, wx, tol) && Near(gy, wy, tol) && Near(gz, wz, tol),
+                      $"frame(rig(x)) == camera(x): got ({gx}, {gy}, {gz}), want ({wx}, {wy}, {wz})");
+            }
+        }
+
+        // The camera standing where its rig pushed: the identity, also far from the origin.
+        var far = MakeRig(-300f, 12f, 80f, -140f, 35f, 0, 0);
+        DisplayXRPickingMath.FrameFromPoses(
+            far.pos[0], far.pos[1], far.pos[2], far.quat[0], far.quat[1], far.quat[2], far.quat[3],
+            far.pos[0], far.pos[1], far.pos[2], far.quat[0], far.quat[1], far.quat[2], far.quat[3],
+            out float ix, out float iy, out float iz, out float jx, out float jy, out float jz, out float jw);
+        Check(Near(ix, 0f, 1e-4f) && Near(iy, 0f, 1e-4f) && Near(iz, 0f, 1e-4f) &&
+              Near(jx, 0f, 1e-6f) && Near(jy, 0f, 1e-6f) && Near(jz, 0f, 1e-6f) && Near(Math.Abs(jw), 1f, 1e-6f),
+              $"camera pose == rig pose -> the identity frame (got pos ({ix}, {iy}, {iz}))");
+
+        // No rig pose sent (identity): the frame is the camera's own pose.
+        var cam = MakeRig(1.5f, -0.4f, 2.0f, 30f, -12f, 0, 0);
+        DisplayXRPickingMath.FrameFromPoses(
+            cam.pos[0], cam.pos[1], cam.pos[2], cam.quat[0], cam.quat[1], cam.quat[2], cam.quat[3],
+            0f, 0f, 0f, 0f, 0f, 0f, 1f,
+            out ix, out iy, out iz, out jx, out jy, out jz, out jw);
+        Check(Near(ix, cam.pos[0]) && Near(iy, cam.pos[1]) && Near(iz, cam.pos[2]) && Near(jx, cam.quat[0], 1e-6f) &&
+              Near(jy, cam.quat[1], 1e-6f) && Near(jz, cam.quat[2], 1e-6f) && Near(jw, cam.quat[3], 1e-6f),
+              "no rig pose -> the frame is the camera pose");
+
+        // The rig camera moved 0.5 along x AFTER its rig stopped pushing: the views move with it.
+        DisplayXRPickingMath.FrameFromPoses(
+            cam.pos[0] + 0.5f, cam.pos[1], cam.pos[2], cam.quat[0], cam.quat[1], cam.quat[2], cam.quat[3],
+            cam.pos[0], cam.pos[1], cam.pos[2], cam.quat[0], cam.quat[1], cam.quat[2], cam.quat[3],
+            out ix, out iy, out iz, out jx, out jy, out jz, out jw);
+        Check(Near(ix, 0.5f, 1e-5f) && Near(iy, 0f, 1e-5f) && Near(iz, 0f, 1e-5f) && Near(Math.Abs(jw), 1f, 1e-6f),
+              $"a camera that moved after the last push shifts the views by the same amount (got {ix}, {iy}, {iz})");
+    }
+
     static void TestBehindTheEye()
     {
         var rig = MakeRig(0, 0, 0, 0, 0, 0.4f, 0.3f);
@@ -407,6 +502,8 @@ static class Program
         TestRoundTrip();
         TestDisplayPlaneAndDisparity();
         TestCyclopeanIsTheMidpointEye();
+        TestCyclopeanWithATurnedHead();
+        TestFrameFromPoses();
         TestBehindTheEye();
         TestDegenerate();
         TestGraphicsApiIndependent();

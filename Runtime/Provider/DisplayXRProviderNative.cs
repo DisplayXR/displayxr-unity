@@ -546,6 +546,16 @@ namespace DisplayXR
         public static extern int dxr_prov_get_zone_rect_px(
             uint zone, out int x, out int y, out int w, out int h);
 
+        /// <summary>The app-authored 3D zone rect (window-client pixels, top-left origin)
+        /// while the located views frame it: an app zone that is live, the predicate the
+        /// depth-aware cursor maps the pointer with. Returns 0 when the views frame the
+        /// whole screen (no zone, a cleared one, the provider's own Game-view zone, a
+        /// runtime without display zones). Absent from native libraries older than #460:
+        /// callers catch <c>EntryPointNotFoundException</c> and treat it as 0.</summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int dxr_prov_get_app_zone_rect_px(
+            out int x, out int y, out int w, out int h);
+
         /// <summary>
         /// Push the stereo rig tunables to the provider (minus the clipAtDisplayPlane
         /// flag the rig descriptor doesn't carry). Scale-as-zoom
