@@ -10,5 +10,7 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="../../Runtime/DisplayXRCursorDepthMath.cs" Link="DisplayXRCursorDepthMath.cs" />
+    <!-- Auto-convergence statistic / caps / follower (#461): AutoConvergenceTests.cs -->
+    <Compile Include="../../Runtime/DisplayXRAutoConvergenceMath.cs" Link="DisplayXRAutoConvergenceMath.cs" />
   </ItemGroup>
 </Project>
