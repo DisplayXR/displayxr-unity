@@ -144,6 +144,11 @@ namespace DisplayXR
 
         /// <summary>Incremented each time a grid result is published.</summary>
         internal static int GridSerial { get; private set; }
+        /// <summary>The frame the latest grid was DRAWN in (not the frame it arrived), and
+        /// the camera it was drawn from: a consumer uses them to reject a grid from before
+        /// its own reset or from another rig.</summary>
+        internal static int GridFrame { get; private set; } = -1;
+        internal static Camera GridCamera { get; private set; }
         /// <summary>Samples in the latest grid (texels the draw actually wrote).</summary>
         internal static int GridCount { get; private set; }
         /// <summary>Sample position over the view, bottom-left UV.</summary>
@@ -165,6 +170,7 @@ namespace DisplayXR
             public bool reversedZ;
             public bool grid;        // a full-frame grid frame, not a cursor patch
             public float camOffset;  // grid: eye position along the camera's forward axis
+            public Camera cam;       // grid: the camera it is drawn from
         }
 
         static readonly Snapshot[] s_Ring = new Snapshot[kRing];
@@ -185,6 +191,8 @@ namespace DisplayXR
         static int s_GridKeepAliveFrame = -100;
         static bool s_GridRequested;
         static int s_GridJitter;
+        static int s_GridDrawFrame = -100;      // last frame a grid was drawn
+        static int s_GridPublishedFrame = -1;   // draw frame of the last grid published
 
         // BiRP
         static CommandBuffer s_BirpCmd;
@@ -244,8 +252,12 @@ namespace DisplayXR
         internal static void Tick(bool use)
         {
             bool gridUser = Time.frameCount - s_GridKeepAliveFrame <= 1;
-            bool gridFrame = s_GridRequested;
-            s_GridRequested = false;
+            // Never two grid frames in a row: at a frame time above the consumer's sample
+            // period every frame would otherwise be a grid frame and the cursor would never
+            // get its patch. The request stays pending for the next frame.
+            bool gridFrame = s_GridRequested && Time.frameCount - s_GridDrawFrame > 1;
+            if (gridFrame || !gridUser) s_GridRequested = false; // a request dies with its consumer
+            if (!gridUser) gridFrame = false;
             Active = (use || gridUser) && EnsureResources();
             DrawThisFrame = false;
             Camera cam = DisplayXRRigManager.ActiveCamera != null ? DisplayXRRigManager.ActiveCamera : Camera.main;
@@ -301,6 +313,8 @@ namespace DisplayXR
                 // relative to the CAMERA (the rig's convergence origin), not the eye.
                 var eyeWorld = new Vector3(snap.pos[0], snap.pos[1], -snap.pos[2]); // locate space -> Unity world
                 snap.camOffset = Vector3.Dot(eyeWorld - cam.transform.position, cam.transform.forward);
+                snap.cam = cam;
+                s_GridDrawFrame = Time.frameCount;
                 int j = s_GridJitter++ & 3;
                 PatchRect = new Vector4(((j & 1) != 0 ? 0.25f : -0.25f) / Size, ((j & 2) != 0 ? 0.25f : -0.25f) / Size, 1f, 1f);
             }
@@ -426,6 +440,12 @@ namespace DisplayXR
             if (!snap.valid || snap.frame % (1 << 20) != newest) return;
             if (snap.grid)
             {
+                // The readback is requested on each of the two frames after a draw, and
+                // nothing overwrites the target between grid frames unless the cursor draws
+                // (on BiRP the attached command buffer even redraws the old stamp): the same
+                // grid comes back more than once. Publish it once.
+                if (snap.frame == s_GridPublishedFrame) return;
+                s_GridPublishedFrame = snap.frame;
                 PublishGrid(data, n, newest, snap);
                 return;
             }
@@ -473,6 +493,8 @@ namespace DisplayXR
                 m++;
             }
             GridCount = m;
+            GridFrame = snap.frame;
+            GridCamera = snap.cam;
             GridSerial++;
         }
 
@@ -525,7 +547,10 @@ namespace DisplayXR
             s_EverResult = false;
             s_Unavailable = "";
             s_GridRequested = false;
+            s_GridPublishedFrame = -1;
             GridCount = 0;
+            GridFrame = -1;
+            GridCamera = null;
             for (int i = 0; i < kRing; i++) s_Ring[i].valid = false;
         }
     }

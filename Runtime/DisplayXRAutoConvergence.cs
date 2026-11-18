@@ -76,7 +76,7 @@ namespace DisplayXR
         public float maxConvergenceDistance = 100f;
 
         [Tooltip("Time constant of the follower, seconds. 1.0-1.5 reads as a slow drift; " +
-                 "below ~0.8 the depth visibly pumps.")]
+                 "0.6 visibly pumped on a panel.")]
         [Range(0.2f, 5f)]
         public float timeConstant = 1.2f;
 
@@ -162,7 +162,10 @@ namespace DisplayXR
         /// <summary>Convergence distance the follower is heading for, rig metres.</summary>
         public float TargetConvergenceDistance => DisplayXRAutoConvergenceMath.DistanceFromInverse(m_Conv.target);
 
-        /// <summary>IPD factor being delivered (== the authored one unless a cap bites).</summary>
+        /// <summary>IPD factor being delivered (== the authored one unless a cap bites).
+        /// While the component runs, <c>rig.ipdFactor</c> holds THIS value, not the
+        /// authored one: an app that saves its stereo settings must read
+        /// <see cref="AuthoredIpdFactor"/> (and <see cref="AuthoredInvConvergenceDistance"/>).</summary>
         public float StereoStrength { get; private set; } = 1f;
 
         /// <summary>The rig's authored tunables: what is restored on disable, and the ceiling
@@ -179,7 +182,8 @@ namespace DisplayXR
         public float FarDisparityPercent { get; private set; }
 
         /// <summary>The caps in the same unit (percent of the view width), after
-        /// <see cref="depthScale"/>.</summary>
+        /// <see cref="depthScale"/>. They are physical angles converted through the nominal
+        /// viewing distance and the physical width of the app's canvas (its window).</summary>
         public float FrontCapPercent { get; private set; }
         /// <inheritdoc cref="FrontCapPercent"/>
         public float BehindCapPercent { get; private set; }
@@ -191,9 +195,21 @@ namespace DisplayXR
         /// <inheritdoc cref="Confidence"/>
         public int TotalSamples { get; private set; }
 
+        /// <summary>Depth source only: mean depth (rig metres) of the TOP and BOTTOM third of
+        /// the last grid; NaN when that third had no depth. A diagnostic for the grid's
+        /// vertical orientation, which the bottom-row damping depends on: look at a floor
+        /// from standing height - the bottom third must be the NEARER one. If it is the top
+        /// third, the grid is upside down on this graphics API / pipeline (set
+        /// <c>DISPLAYXR_CURSOR_DEPTH_FLIPY=1</c> and report it).</summary>
+        public float GridTopThirdDepth { get; private set; } = float.NaN;
+        /// <inheritdoc cref="GridTopThirdDepth"/>
+        public float GridBottomThirdDepth { get; private set; } = float.NaN;
+
         /// <summary>
         /// Follow the next sample fast (a ramp of a few frames, never a one-frame snap) and
         /// take it as soon as possible. Call after a camera teleport, a cut, or a scene load.
+        /// Depth samples drawn before this call are discarded, including one already on its
+        /// way back from the GPU.
         /// </summary>
         public void ResetConvergence()
         {
@@ -201,6 +217,16 @@ namespace DisplayXR
             m_Strength.SnapNext();
             m_NextSampleTime = 0f;
             m_LastClumpQ = -1f;
+            m_GridNotBeforeFrame = Time.frameCount;
+        }
+
+        /// <summary>Log the grid-orientation diagnostic once (see <see cref="GridTopThirdDepth"/>).</summary>
+        [ContextMenu("Log Grid Orientation")]
+        public void LogGridOrientation()
+        {
+            Debug.Log($"[DisplayXR] Auto-convergence grid orientation: top third {GridTopThirdDepth:F2} m, " +
+                      $"bottom third {GridBottomThirdDepth:F2} m (source {Source}, {SystemInfo.graphicsDeviceType}). " +
+                      "Looking at a floor, the bottom third must be the nearer one.", this);
         }
 
         // -----------------------------------------------------------------------------------
@@ -212,59 +238,78 @@ namespace DisplayXR
         DisplayXRCamera m_Rig;
         Camera m_Camera;
         bool m_WarnedNoRig;
+        float m_NextBindTime;
 
         // The authored tunables, and what we last wrote (to tell our writes from anyone else's).
         float m_AuthoredInv, m_AuthoredIpd;
         float m_WrittenInv = float.NaN, m_WrittenIpd = float.NaN;
+        float m_FedAuthoredIpd; // the authored strength the strength target was last solved for
 
         DisplayXRAutoConvergenceMath.Follower m_Conv, m_Strength;
         DisplayXRAutoConvergenceMath.Workspace m_Work;
         float[] m_Q, m_U, m_V;
         float m_NextSampleTime;
         float m_LastClumpQ = -1f;
+        // The disparity model, refreshed every frame: content extremes of the last sample,
+        // caps (fraction of the view width, after the depth scale), and k in rig units.
         float m_NearQ, m_FarQ;
-        float m_K;
+        float m_K, m_CapFront, m_CapBehind;
+        bool m_NoCanvasApi;
 
+        // Depth grid bookkeeping: which grids are ours to consume.
         int m_GridSerial;
+        int m_GridFrameConsumed = -1, m_GridNotBeforeFrame;
         float m_DepthWantedSince = -1f, m_LastGridTime = -1f;
+        bool m_WasGated = true;
 
         Transform m_TargetCached;
-        Renderer m_TargetRenderer;
+        Renderer[] m_TargetRenderers;
         DisplayXRContentBounds m_TargetBounds;
 
         void OnEnable()
         {
             m_Camera = GetComponent<Camera>();
-            m_Rig = GetComponent<DisplayXRCamera>();
-            if (m_Rig == null)
+            m_Rig = null;
+            m_NextBindTime = 0f;
+            if (!TryBind() && !m_WarnedNoRig)
             {
-                if (!m_WarnedNoRig)
-                {
-                    m_WarnedNoRig = true;
-                    Debug.LogWarning("[DisplayXR] DisplayXRAutoConvergence on '" + name + "' has no " +
-                        "DisplayXRCamera next to it and does nothing. It drives the camera-centric rig " +
-                        "only; a display-centric rig's screen plane is the authored display.", this);
-                }
-                return;
+                m_WarnedNoRig = true;
+                Debug.LogWarning("[DisplayXR] DisplayXRAutoConvergence on '" + name + "' has no " +
+                    "DisplayXRCamera next to it and does nothing until one is added. It drives the " +
+                    "camera-centric rig only; a display-centric rig's screen plane is the authored display.", this);
             }
+        }
+
+        // Find the rig and start from its authored values. Also called (once a second) from
+        // LateUpdate while there is no rig, so a rig added later is picked up.
+        bool TryBind()
+        {
+            m_Rig = GetComponent<DisplayXRCamera>();
+            if (m_Rig == null) return false;
+            if (m_Camera == null) m_Camera = GetComponent<Camera>();
             m_Work ??= new DisplayXRAutoConvergenceMath.Workspace(kMaxSamples);
             m_Q ??= new float[kMaxSamples];
             m_U ??= new float[kMaxSamples];
             m_V ??= new float[kMaxSamples];
 
             m_AuthoredInv = m_Rig.invConvergenceDistance;
-            m_AuthoredIpd = m_Rig.ipdFactor;
+            m_AuthoredIpd = m_FedAuthoredIpd = m_Rig.ipdFactor;
             m_WrittenInv = m_WrittenIpd = float.NaN;
             m_Conv.Reset(m_AuthoredInv);
             m_Strength.Reset(m_AuthoredIpd);
             StereoStrength = m_AuthoredIpd;
             m_NextSampleTime = 0f;
             m_LastClumpQ = -1f;
+            m_NearQ = m_FarQ = 0f;
             m_GridSerial = DisplayXRCursorDepthPatch.GridSerial;
+            m_GridFrameConsumed = -1;
+            m_GridNotBeforeFrame = Time.frameCount;
             m_DepthWantedSince = m_LastGridTime = -1f;
+            m_WasGated = true;
             m_TargetCached = null;
             Source = ActiveSource.None;
             IsDriving = IsHolding = false;
+            return true;
         }
 
         void OnDisable()
@@ -290,7 +335,13 @@ namespace DisplayXR
 
         void LateUpdate()
         {
-            if (m_Rig == null) return;
+            float now = Time.unscaledTime;
+            if (m_Rig == null)
+            {
+                if (now < m_NextBindTime) return;
+                m_NextBindTime = now + 1f;
+                if (!TryBind()) return;
+            }
 
             // A value in the rig's field that is not the one we wrote was set by someone else
             // (the inspector, an app slider): it is the new authored value.
@@ -305,13 +356,26 @@ namespace DisplayXR
                 !DisplayXRProvider.IsRunning)
             {
                 IsDriving = false;
-                m_DepthWantedSince = -1f;
+                // Nothing that arrives while gated is ours: forget the depth clock (or Auto
+                // would take one raycast sample on return, mixed in with depth) and stay in
+                // step with the grid counter.
+                m_DepthWantedSince = m_LastGridTime = -1f;
+                m_GridSerial = DisplayXRCursorDepthPatch.GridSerial;
+                m_WasGated = true;
                 return;
             }
+            if (m_WasGated)
+            {
+                // (Re)activated: a grid drawn before now shows another rig's view, or this
+                // one's before the gap.
+                m_WasGated = false;
+                m_GridNotBeforeFrame = Time.frameCount;
+                m_NextSampleTime = 0f;
+            }
 
-            float now = Time.unscaledTime;
             float scale = transform.lossyScale.y;
             if (scale < 1e-4f) scale = 1e-4f;
+            RefreshModel(scale);
 
             // ---- Source ----
             Mode m = mode;
@@ -335,12 +399,20 @@ namespace DisplayXR
             if (wantDepth && DisplayXRCursorDepthPatch.GridSerial != m_GridSerial)
             {
                 // A grid arrived (asynchronously, a frame or two after it was asked for).
+                // Take it only if it is new, drawn since the last reset / activation, and
+                // drawn from this camera.
                 m_GridSerial = DisplayXRCursorDepthPatch.GridSerial;
-                m_LastGridTime = now;
-                depthWorks = !DisplayXRCursorDepthPatch.DepthUnavailable;
-                tried = true;
-                measured = MeasureGrid(scale, out screenQ);
-                Source = ActiveSource.Depth;
+                int gridFrame = DisplayXRCursorDepthPatch.GridFrame;
+                if (DisplayXRAutoConvergenceMath.AcceptGrid(gridFrame, m_GridFrameConsumed, m_GridNotBeforeFrame,
+                        ReferenceEquals(DisplayXRCursorDepthPatch.GridCamera, m_Camera)))
+                {
+                    m_GridFrameConsumed = gridFrame;
+                    m_LastGridTime = now;
+                    depthWorks = !DisplayXRCursorDepthPatch.DepthUnavailable;
+                    tried = true;
+                    measured = MeasureGrid(scale, out screenQ);
+                    Source = ActiveSource.Depth;
+                }
             }
             if (now >= m_NextSampleTime)
             {
@@ -380,8 +452,20 @@ namespace DisplayXR
 
             if (driveStereoStrength && m_Strength.have)
             {
+                if (m_AuthoredIpd != m_FedAuthoredIpd)
+                {
+                    // The ceiling moved (an app slider) between samples, possibly while
+                    // holding: re-solve the target now instead of at the next confident sample.
+                    m_FedAuthoredIpd = m_AuthoredIpd;
+                    m_Strength.Retarget(DisplayXRAutoConvergenceMath.StrengthForCaps(
+                        m_K, m_AuthoredIpd, m_Conv.target, m_NearQ, m_FarQ, m_CapFront, m_CapBehind));
+                }
                 float f = m_Strength.StepAsymmetric(dt, timeConstant, timeConstant * kStrengthDownFactor);
-                f = Mathf.Clamp(f, 0f, m_AuthoredIpd); // never amplify
+                // The follower heads for the strength that fits once the plane has ARRIVED.
+                // While the plane is still travelling, bound it by the caps at the convergence
+                // actually delivered this frame - at once, not through the follower.
+                f = DisplayXRAutoConvergenceMath.BoundStrength(
+                    f, m_K, m_AuthoredIpd, inv, m_NearQ, m_FarQ, m_CapFront, m_CapBehind);
                 m_Rig.ipdFactor = f;
                 m_WrittenIpd = f;
                 StereoStrength = f;
@@ -403,6 +487,50 @@ namespace DisplayXR
             FarDisparityPercent = 100f * DisplayXRAutoConvergenceMath.Disparity(m_K, StereoStrength, inv, m_FarQ);
         }
 
+        // The disparity model for this frame: the caps and k.
+        //
+        // Caps are PHYSICAL angles at the viewer, so they become a fraction of the view through
+        // the physical width of what the view is shown on: the app's canvas (its window on the
+        // panel), not the whole display - the same fraction of a small window is fewer
+        // millimetres on the glass. The viewing distance is the display's NOMINAL one (a cap
+        // that follows the live head makes the picture breathe).
+        //
+        // k is in rig units: the runtime keeps the eye baseline a physical distance in WORLD
+        // units whatever the rig's scale, so in rig units it is ipd / scale.
+        void RefreshModel(float scale)
+        {
+            float viewDist = 0f, viewWidth = 0f;
+            if (DisplayXRProvider.TryGetDisplayInfo(out var di))
+            {
+                viewDist = di.nominalZ;
+                viewWidth = di.widthM;
+            }
+            if (!m_NoCanvasApi)
+            {
+                try
+                {
+                    if (DisplayXRNative.displayxr_get_kooima_canvas(out _, out _, out int cw, out int ch,
+                                                                    out float canvasW, out float canvasH) != 0 &&
+                        cw > 0 && ch > 0 && canvasW > 0f && canvasH > 0f)
+                        viewWidth = canvasW;
+                }
+                catch (System.Exception e) when (e is System.DllNotFoundException || e is System.EntryPointNotFoundException)
+                {
+                    m_NoCanvasApi = true; // older native binary: the display width stands in
+                }
+            }
+            m_CapFront = depthScale * DisplayXRAutoConvergenceMath.CapFractionFromDegrees(frontCapDegrees, viewDist, viewWidth);
+            m_CapBehind = depthScale * DisplayXRAutoConvergenceMath.CapFractionFromDegrees(behindCapDegrees, viewDist, viewWidth);
+            FrontCapPercent = 100f * m_CapFront;
+            BehindCapPercent = 100f * m_CapBehind;
+
+            float aspect = m_Camera != null && m_Camera.aspect > 0.01f ? m_Camera.aspect : 16f / 9f;
+            float tanHalfH = Mathf.Tan(m_Rig.AuthoredFieldOfView * 0.5f * Mathf.Deg2Rad) * aspect;
+            m_K = DisplayXRAutoConvergenceMath.DisparityScale(
+                DisplayXRAutoConvergenceMath.BaselineInRigUnits(DisplayXRAutoConvergenceMath.NominalIpdMeters, scale),
+                tanHalfH);
+        }
+
         // A confident measurement: clamp, hand it to the followers, size the strength.
         void Feed(float screenQ)
         {
@@ -410,29 +538,15 @@ namespace DisplayXR
             float qMax = 1f / Mathf.Max(minConvergenceDistance, 0.1f);
             screenQ = Mathf.Clamp(screenQ, qMin, qMax);
 
-            // Caps as a fraction of the view width, from the display's NOMINAL viewing
-            // distance (a cap that follows the live head makes the picture breathe).
-            float viewDist = 0f, viewWidth = 0f;
-            if (DisplayXRProvider.TryGetDisplayInfo(out var di))
-            {
-                viewDist = di.nominalZ;
-                viewWidth = di.widthM;
-            }
-            float capFront = depthScale * DisplayXRAutoConvergenceMath.CapFractionFromDegrees(frontCapDegrees, viewDist, viewWidth);
-            float capBehind = depthScale * DisplayXRAutoConvergenceMath.CapFractionFromDegrees(behindCapDegrees, viewDist, viewWidth);
-            FrontCapPercent = 100f * capFront;
-            BehindCapPercent = 100f * capBehind;
-
-            float aspect = m_Camera != null && m_Camera.aspect > 0.01f ? m_Camera.aspect : 16f / 9f;
-            float tanHalfH = Mathf.Tan(m_Rig.AuthoredFieldOfView * 0.5f * Mathf.Deg2Rad) * aspect;
-            m_K = DisplayXRAutoConvergenceMath.DisparityScale(DisplayXRAutoConvergenceMath.NominalIpdMeters, tanHalfH);
-
             float kf = m_K * Mathf.Max(m_AuthoredIpd, 0.05f);
-            float deadbandQ = kf > 0f ? deadBand * (capFront + capBehind) / kf : 0f;
+            float deadbandQ = kf > 0f ? deadBand * (m_CapFront + m_CapBehind) / kf : 0f;
             m_Conv.Measure(screenQ, deadbandQ);
 
+            // Where the strength should settle once the plane has arrived. (The per-frame
+            // bound in LateUpdate covers the journey.)
             float strength = DisplayXRAutoConvergenceMath.StrengthForCaps(
-                m_K, m_AuthoredIpd, m_Conv.target, m_NearQ, m_FarQ, capFront, capBehind);
+                m_K, m_AuthoredIpd, m_Conv.target, m_NearQ, m_FarQ, m_CapFront, m_CapBehind);
+            m_FedAuthoredIpd = m_AuthoredIpd;
             m_Strength.Measure(strength, 0.02f * m_AuthoredIpd);
         }
 
@@ -446,17 +560,27 @@ namespace DisplayXR
             float[] depth = DisplayXRCursorDepthPatch.GridDepth;
             float[] gu = DisplayXRCursorDepthPatch.GridU, gv = DisplayXRCursorDepthPatch.GridV;
             float nearLimit = ignoreNearerThan * scale; // rig metres -> world units
+            float topSum = 0f, bottomSum = 0f;
+            int topN = 0, bottomN = 0;
             for (int i = 0; i < n; i++)
             {
                 float d = depth[i];
                 float q;
                 if (float.IsPositiveInfinity(d)) q = 0f;                       // sky
                 else if (float.IsNaN(d) || d <= 1e-6f || d < nearLimit) q = float.NaN; // masked
-                else q = scale / d;
+                else
+                {
+                    q = scale / d;
+                    // Orientation diagnostic (GridTopThirdDepth / GridBottomThirdDepth).
+                    if (gv[i] > 2f / 3f) { topSum += d; topN++; }
+                    else if (gv[i] < 1f / 3f) { bottomSum += d; bottomN++; }
+                }
                 m_Q[i] = q;
                 m_U[i] = gu[i];
                 m_V[i] = gv[i];
             }
+            GridTopThirdDepth = topN > 0 ? topSum / topN / scale : float.NaN;
+            GridBottomThirdDepth = bottomN > 0 ? bottomSum / bottomN / scale : float.NaN;
             return Estimate(n, out screenQ);
         }
 
@@ -516,10 +640,16 @@ namespace DisplayXR
             ValidSamples = est.validSamples;
             TotalSamples = est.samples;
             screenQ = est.screenQ;
+            // The content extremes are known whenever there were samples at all - also when
+            // the screen plane is not confident enough to move. The caps must see a small
+            // near intruder even while the convergence holds.
+            if (est.samples > 0)
+            {
+                m_NearQ = est.nearQ;
+                m_FarQ = est.farQ;
+            }
             if (!ok) return false;
             m_LastClumpQ = est.clumpQ;
-            m_NearQ = est.nearQ;
-            m_FarQ = est.farQ;
             return true;
         }
 
@@ -533,7 +663,7 @@ namespace DisplayXR
             {
                 m_TargetCached = target;
                 m_TargetBounds = target.GetComponent<DisplayXRContentBounds>();
-                m_TargetRenderer = target.GetComponentInChildren<Renderer>();
+                m_TargetRenderers = target.GetComponentsInChildren<Renderer>(); // once per target
             }
             Transform t = transform;
             Vector3 fwd = t.forward;
@@ -546,10 +676,16 @@ namespace DisplayXR
                 b = m_TargetBounds.LastReportedBounds;
                 haveBounds = true;
             }
-            else if (m_TargetRenderer != null)
+            else if (m_TargetRenderers != null)
             {
-                b = m_TargetRenderer.bounds;
-                haveBounds = true;
+                // The union of every enabled renderer under the target (a character is many).
+                for (int i = 0; i < m_TargetRenderers.Length; i++)
+                {
+                    Renderer r = m_TargetRenderers[i];
+                    if (r == null || !r.enabled || !r.gameObject.activeInHierarchy) continue;
+                    if (!haveBounds) { b = r.bounds; haveBounds = true; }
+                    else b.Encapsulate(r.bounds);
+                }
             }
             if (haveBounds)
             {
