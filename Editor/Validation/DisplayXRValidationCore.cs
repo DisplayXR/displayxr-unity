@@ -516,7 +516,16 @@ namespace DisplayXR.Editor
         {
             if (ids == null || ids.Count == 0)
             {
-                if (File.Exists(path)) File.Delete(path);
+                if (File.Exists(path))
+                {
+                    // A read-only file (checked in under version control) must be refused the
+                    // same way on every OS. Windows refuses the delete itself; POSIX would
+                    // allow it, because deleting depends on the folder, not the file.
+                    if ((File.GetAttributes(path) & FileAttributes.ReadOnly) != 0)
+                        throw new UnauthorizedAccessException(
+                            "The file is read-only: " + path);
+                    File.Delete(path);
+                }
                 return;
             }
             string dir = Path.GetDirectoryName(path);
