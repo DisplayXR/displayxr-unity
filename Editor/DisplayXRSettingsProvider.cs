@@ -157,10 +157,9 @@ namespace DisplayXR.Editor
             {
                 EditorGUILayout.LabelField("Status", "Not connected");
                 EditorGUILayout.HelpBox(
-                    "Connect a DisplayXR runtime to see live display info:\n" +
-                    "• Enter Play Mode with the DisplayXR Display provider (or the OpenXR " +
-                    "hook feature) enabled in XR Plug-in Management, or\n" +
-                    "• open Window > DisplayXR > Preview and click Start.",
+                    "Live display info appears while a DisplayXR session is running: " +
+                    "enable DisplayXR Display in XR Plug-in Management and enter Play Mode. " +
+                    "Play Mode runs the provider itself; there is no separate preview window.",
                     MessageType.Info);
             }
 

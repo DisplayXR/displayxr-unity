@@ -9,6 +9,8 @@ Unity plugin for rendering on eye-tracked 3D light field displays via the Displa
 
 - [Overview](#overview)
 - [Requirements](#requirements)
+  - [Render Path](#render-path)
+  - [Runtime Compatibility](#runtime-compatibility)
 - [Installing the Plugin](#installing-the-plugin)
 - [Enabling the Feature](#enabling-the-feature)
 - [Scene Setup](#scene-setup)
@@ -19,11 +21,12 @@ Unity plugin for rendering on eye-tracked 3D light field displays via the Displa
 - [Preview (Play Mode)](#preview-play-mode)
 - [Building Your App](#building-your-app)
   - [Windows Standalone](#windows-standalone)
-  - [macOS Standalone](#macOS-standalone)
+  - [macOS Standalone](#macos-standalone)
   - [Linux Standalone](#linux-standalone)
   - [Android (arm64, Vulkan)](#android-arm64-vulkan)
   - [Cross-Compiling (macOS Editor to Windows Build)](#cross-compiling-macos-editor-to-windows-build)
 - [Deploying to End Users](#deploying-to-end-users)
+- [What Happens When Things Are Missing](#what-happens-when-things-are-missing)
 - [Testing Without Hardware](#testing-without-hardware)
 - [Troubleshooting](#troubleshooting)
 - [Architecture](#architecture)
@@ -41,8 +44,9 @@ DisplayXR ships as a custom **Unity display provider** (`IUnityXRDisplay`, the s
 - **Eye-tracked stereo rendering** — runtime-owned Kooima asymmetric frustum projection from real-time eye positions (`XR_DXR_view_rig`)
 - **Two stereo rig modes** — Camera-centric (add to existing camera) or display-centric (place a virtual display in the scene)
 - **2D/3D display zones + 2D UI overlay** — frame 3D content to window-pixel zones and route any Canvas to a window-space composition layer with stereo disparity
-- **BiRP, URP, and HDRP** — off-axis projection on all three pipelines (the provider hands Unity a full per-eye projection matrix, so no per-pipeline fix is needed), plus Single-Pass-Instanced (SPI) on URP+Windows+D3D12 and Multi-Pass elsewhere
+- **BiRP, URP, and HDRP** — off-axis projection on all three pipelines (the provider hands Unity a full per-eye projection matrix, so no per-pipeline fix is needed). URP and HDRP render Single-Pass-Instanced, the Built-in pipeline Multi-Pass; see [Render Path](#render-path)
 - **Hand tracking (XR Hands)** — the runtime's `XR_EXT_hand_tracking` (Ultraleap input provider) as a standard `com.unity.xr.hands` subsystem, compiled in only when that package is installed; see [`docs~/architecture/hand-tracking.md`](docs~/architecture/hand-tracking.md)
+- **Agent APIs that do nothing until the app calls them** — `DisplayXRMcp` (the app's own tools for AI agents, `XR_DXR_mcp_tools`) and `DisplayXRDesktop` (the app's agent reads and operates other windows, `XR_DXR_desktop_control`). The plugin registers no tool and asks for no desktop consent on its own: no app tool exists until the app calls `DisplayXRMcp.RegisterTool`, and no desktop operation is allowed until the app calls `DisplayXRDesktop.Request` and the user grants it. (Separately, the runtime hosts its own MCP server in each app process when MCP is enabled on the machine; it answers questions about the display and the window. That is a machine setting, not something the plugin switches.)
 - **In-editor Play Mode preview** — pressing Play runs the provider itself, giving full parity with built apps (#171). Play Mode *is* the preview — there is no separate edit-mode preview window.
 
 **How it works:** the provider registers a `DisplayXR Display` display subsystem, binds an OpenXR session to Unity's graphics device, chains the runtime's `XR_DXR_view_rig` descriptor onto `xrLocateViews`, and submits Unity's rendered eye textures back to the runtime compositor via `xrEndFrame`. Enable it under **XR Plug-in Management > Standalone > DisplayXR Display** (see [Enabling the Feature](#enabling-the-feature)). See [`docs~/architecture/xr-display-provider.md`](docs~/architecture/xr-display-provider.md) for the full provider design.
@@ -54,9 +58,10 @@ DisplayXR ships as a custom **Unity display provider** (`IUnityXRDisplay`, the s
 | Requirement | Details |
 |-------------|---------|
 | **Unity** | 2022.3 LTS or later (including Unity 6) |
-| **OpenXR Plugin** | `com.unity.xr.openxr` 1.9.1+ (installed via Package Manager) |
-| **XR Plugin Management** | `com.unity.xr.management` 4.4.0+ (auto-installed with OpenXR) |
-| **DisplayXR Runtime** | [`DisplayXRSetup-*.exe`](https://github.com/DisplayXR/displayxr-runtime/releases/latest) (v1.4.0+) — required on every target machine. See [Deploying to End Users](#deploying-to-end-users). |
+| **XR Plugin Management** | `com.unity.xr.management` 4.4.0+. A package dependency: Package Manager installs it with this package. |
+| **Input System, uGUI** | `com.unity.inputsystem` 1.4.4+ and `com.unity.ugui` 1.0.0+. Also package dependencies, installed automatically. |
+| **Unity's OpenXR Plugin** | **Not needed.** The package does not depend on `com.unity.xr.openxr`; the provider loads the DisplayXR runtime itself. If the project has it for another reason, leave **OpenXR** unchecked next to **DisplayXR Display** (see [Enabling the Feature](#enabling-the-feature)). |
+| **DisplayXR Runtime** | [`DisplayXRSetup-*.exe`](https://github.com/DisplayXR/displayxr-runtime/releases/latest) — required on every target machine. Minimum versions: [Runtime Compatibility](#runtime-compatibility). See [Deploying to End Users](#deploying-to-end-users). |
 | **Vendor display plug-in** (Leia hardware only) | [`DisplayXRLeiaSRSetup-*.exe`](https://github.com/DisplayXR/displayxr-leia-plugin/releases/latest) — required for Leia SR hardware. Not needed for sim_display testing or non-Leia displays. Install **after** the runtime. |
 
 ### Platform Support
@@ -64,10 +69,52 @@ DisplayXR ships as a custom **Unity display provider** (`IUnityXRDisplay`, the s
 | Editor Platform | Build Target | Native Plugin | Status |
 |----------------|--------------|---------------|--------|
 | Windows | Windows x64 | `displayxr_unity.dll` | Supported |
-| macOS | macOS | `libdisplayxr_unity.dylib` | Supported |
+| macOS | macOS | `displayxr_unity.bundle` (Universal) | Supported in built players. Editor Play Mode is off on macOS (see [Preview (Play Mode)](#preview-play-mode)) |
 | macOS | Windows x64 | `displayxr_unity.dll` | Supported (cross-compile) |
 | Linux | Linux x86_64 (Vulkan) | `libdisplayxr_unity.so` (+ `libdisplayxr_unity_wayland.so`) | Supported: X11/XWayland and native Wayland |
 | Windows / macOS / Linux | Android arm64 (Vulkan) | `libdisplayxr_unity.so` (+ `libopenxr_loader.so`, `libVkLayer_DXR_queue_lock.so`) | Supported: tested on a Nubia Pad 2 (Android 13) |
+
+### Render Path
+
+The provider picks Single-Pass-Instanced (SPI) or Multi-Pass from the render pipeline, before the session starts. The graphics API does not change the choice:
+
+| Pipeline | Windows D3D11 | Windows D3D12 | macOS Metal | Linux Vulkan | Android Vulkan |
+|----------|---------------|---------------|-------------|--------------|----------------|
+| **URP** | SPI | SPI | SPI | SPI | SPI |
+| **HDRP** | SPI | SPI | SPI | SPI | SPI |
+| **Built-in (BiRP)** | Multi-Pass | Multi-Pass | Multi-Pass | Multi-Pass | Multi-Pass |
+
+- **Windows + Vulkan:** a player whose project is set to Vulkan runs on **D3D12**, with stereo. This is a deliberate fallback (Unity's XR pre-init adapter query cannot be answered on Windows; see [`docs~/unity-bug-report-vk-xr-preinit.md`](docs~/unity-bug-report-vk-xr-preinit.md)). The column that applies is then the D3D12 one.
+- **Any other platform / API pair** (for example OpenGL) is not supported: the provider does not start.
+- **Editor Play Mode on Vulkan** is not supported on any OS (the provider declines and logs why). On Windows, switch the editor to D3D12 or D3D11; on Linux, build a player.
+- `DISPLAYXR_FORCE_SPI=1` / `DISPLAYXR_FORCE_MULTIPASS=1` override the table (development only).
+
+The plugin logs its choice at start-up: `[DisplayXR] Provider render mode: Single-Pass-Instanced (pipeline=…, gfx=…)` or `MultiPass`.
+
+### Runtime Compatibility
+
+The plugin and the runtime are released separately. The provider checks which extensions the runtime advertises and leaves a feature off when its extension is missing or too old. The numbers below are the ones this repository states (changelog, docs, source comments); where it states none, check the [runtime release notes](https://github.com/DisplayXR/displayxr-runtime/releases).
+
+| Plugin feature | Needs from the runtime | Runtime version |
+|----------------|------------------------|-----------------|
+| Stereo rendering | `XR_DXR_view_rig`. Without it the provider log says `XR_DXR_view_rig: not found (no stereo)` and raw views pass through. | The release that introduced `XR_DXR_view_rig` is not stated in this repository; see runtime release notes |
+| Desktop baseline: 2D↔3D switching without errors | The runtime's mode-switch grace at `xrEndFrame` | v2.17.1 or newer. This is the newest general minimum the changelog states (plugin 2.19.4): against an older runtime a 2D→3D switch can fail with `XR_ERROR_VALIDATION_FAILURE`. It is not the version that added `XR_DXR_view_rig` |
+| Android player | Runtime APK, `XR_DXR_android_surface_binding` | v2.47.0 or newer; tested on v2.53.0 |
+| Android: touch copy to the runtime | `XR_DXR_android_surface_binding` spec 3 | v2.47.1 or newer |
+| Linux native Wayland (the `<name>.sh` launcher) | GNOME Wayland session + the DisplayXR GNOME Shell extension | v2.28.0 or newer; otherwise the launcher uses X11 |
+| GPU selection on hybrid laptops (`DisplayXRGpuPreference`) | The runtime's `DXR_D3D_FORCE_GPU` switch | v2.2.4 or newer |
+| Correct colour for Gamma projects, window-space UI and Local2D | Nothing new; the plugin adapts to the runtime's version | The runtime reads swapchain formats literally from v2.21.0 (D3D11), v2.21.1 (D3D12), v2.21.7 (Vulkan); Local2D from v2.26.0 |
+| Depth-aware cursor, sources `Depth` / `Physics` / `Auto` | `XR_DXR_cursor_depth` spec 5 | v2.36.0 or newer |
+| Depth-aware cursor, source `Measured` (and the `Auto` fallback to it) | `XR_DXR_cursor_depth` spec 7 | v2.39.0 or newer |
+| Hand joints placed by the runtime in the rig's frame, display-centric rig (`DisplayXRDisplay`) | `XR_EXT_hand_tracking` + `XR_DXR_view_rig` spec 4 | v2.47.1 or newer |
+| The same, camera-centric rig (`DisplayXRCamera`) | `XR_EXT_hand_tracking` + `XR_DXR_view_rig` spec 5 | Newer than v2.59.x. A spec-4 runtime (v2.47.1 – v2.59.x) places the hand wrongly under a camera-centric rig; update the runtime. See [`docs~/architecture/hand-tracking.md`](docs~/architecture/hand-tracking.md) |
+| `DisplayXRProvider.MoveWindowToDisplay`, `TryGetDisplayDesktopOrigin` | `XR_DXR_display_info` spec 16. `MoveWindowToDisplay` works on Windows and Linux only; it returns `false` on macOS | see runtime release notes |
+| Rear depth budget for transparent overlays (`DisplayXRDepthBudget`) | `XR_DXR_depth_budget`; spec 2 for `DisplayXRContentBounds`, spec 3 for the silhouette mask | see runtime release notes |
+| 3D display zones, `DisplayXRLocal2D` | `XR_DXR_display_zones` | see runtime release notes |
+| Window-space UI (`DisplayXRWindowSpaceUI`) | The window-space composition layer (`XrCompositionLayerWindowSpaceDXR`) | see runtime release notes |
+| App MCP tools (`DisplayXRMcp`) | `XR_DXR_mcp_tools`, and MCP enabled on the machine | v1.13 or newer |
+| Desktop control (`DisplayXRDesktop`) | `XR_DXR_desktop_control`; spec 2 for screen capture, spec 3 for held keys, modifiers and clipboard text | see runtime release notes |
+| Controllers and styluses (`DisplayXRInput`) | An input provider in the runtime; a stylus needs `XR_LOGITECH_mx_ink_stylus_interaction` | see runtime release notes |
 
 ---
 
@@ -99,8 +146,9 @@ In Unity: **Window > Package Manager > + > Add package from disk...** → select
 
    **Pinned to a specific version (recommended for production):**
    ```
-   https://github.com/DisplayXR/displayxr-unity.git#upm/v1.0.0
+   https://github.com/DisplayXR/displayxr-unity.git#upm/vX.Y.Z
    ```
+   Replace `vX.Y.Z` with a version from the [releases page](https://github.com/DisplayXR/displayxr-unity/releases).
 
    **Always latest release:**
    ```
@@ -111,7 +159,7 @@ Both URLs install from the `upm` branch, which includes pre-built native binarie
 
 > **Pin `#upm/vX.Y.Z`, not `#vX.Y.Z`.** The plain `vX.Y.Z` tags are the *source* tags: the Linux and Android `.so` files are built by CI and are not committed there, so a `#vX.Y.Z` install has only their `.meta` files (`Runtime/Plugins/Linux/x86_64/`, `Runtime/Plugins/Android/arm64-v8a/`) and a Linux or Android build has no plugin binary. Only the `upm/…` refs carry every platform's binaries.
 
-To **update** to a newer version later: change the URL fragment (e.g., `#upm/v1.0.1`) in `Packages/manifest.json` and use **Package Manager → Refresh**, or re-add the package with the new URL.
+To **update** to a newer version later: change the URL fragment to the new `#upm/vX.Y.Z` in `Packages/manifest.json` and use **Package Manager → Refresh**, or re-add the package with the new URL.
 
 ### Option C: From Release Tarball
 
@@ -148,9 +196,9 @@ This is the simplest setup. Your existing Main Camera stays in place and becomes
 **Step 2:** Add Component > **DisplayXRCamera** (found under DisplayXR category).
 
 That's it. The component:
-- Reads eye tracking data from the runtime each frame
-- Computes Kooima asymmetric frustums around the camera position
-- Pushes modified FOVs into the OpenXR pipeline before Unity renders
+- Sends its tunables and the camera pose to the runtime each frame
+- The runtime computes the Kooima asymmetric frustums from the tracked eye positions
+- The provider hands Unity the resulting per-eye pose and projection matrix
 
 ```
 Hierarchy:
@@ -212,7 +260,7 @@ Hierarchy:
 
 ## Stereo Tunables Reference
 
-Both modes share a common tunable interface that maps to the native plugin's Kooima computation. Here's what each parameter does physically:
+Both modes share a common set of tunables that the provider sends to the runtime's Kooima computation (`XR_DXR_view_rig`). Here's what each parameter does physically:
 
 ### IPD Factor (both modes)
 Scales the horizontal distance between left and right eye positions.
@@ -271,11 +319,17 @@ Route a Canvas to a window-space composition layer that the DisplayXR compositor
 
 The overlay is submitted as `XrCompositionLayerWindowSpaceDXR` and composited by DisplayXR before display processing. This means 2D UI text stays sharp and is not interlaced — ideal for HUDs, menus, and status displays.
 
+> **Buttons and sliders do not respond out of the box.** The layer carries pixels, not input: the component renders your Canvas with a hidden offscreen camera, so Unity's `GraphicRaycaster` never hits it. Import the **Window Space UI Mouse Router** sample and put the router on the same GameObject. See [`docs~/architecture/window-space-ui.md`](docs~/architecture/window-space-ui.md).
+
 ---
 
 ## Preview (Play Mode)
 
 **Press Play — Play Mode is the preview.** With the **DisplayXR Display** provider active (the shipping path), Play Mode runs the provider itself: the same backend as a built app, weaving to the display in a dedicated editor window (#171). This gives true parity with built apps — provider behavior and bugs surface directly in the editor — with no separate preview session or Play/Stop-free workflow to manage.
+
+Where Play Mode does not run the provider (it declines and logs a warning; Unity then renders normally, without stereo):
+- **macOS editor:** off pending a Unity editor Metal fix (#204). Build and run a macOS player to see stereo.
+- **Any editor set to Vulkan:** not supported. On Windows, switch the editor to D3D12 or D3D11; on Linux, build a player.
 
 Rendering modes are enumerated dynamically from the runtime and depend on the connected display hardware; mode switching is app policy (see `DisplayXRModeSwitch`). The runtime status (resolution, physical dimensions, eye-tracking state, current mode) is visible in the DisplayXR rig inspectors and settings panel.
 
@@ -300,7 +354,7 @@ The build output includes `displayxr_unity.dll` in the `Plugins/` folder alongsi
 3. Verify **DisplayXR Display** is enabled in Standalone XR settings
 4. Click **Build**
 
-The `.app` bundle includes `libdisplayxr_unity.dylib` in the plugins folder.
+The `.app` bundle includes `displayxr_unity.bundle` in its plugins folder.
 
 ### Linux Standalone
 
@@ -326,7 +380,7 @@ Next to the player, the build writes **`<name>.sh`**, a launcher: start the app 
 3. **Player Settings > XR Plug-in Management > Android:** enable **DisplayXR Display**
 4. Click **Build** or **Build And Run**
 
-Render path: URP/HDRP default to single-pass instanced, the Built-in pipeline to multi-pass (the same as Linux Vulkan). The package adds what the player needs on its own:
+Render path: see the [Render Path](#render-path) table. The package adds what the player needs on its own:
 - the runtime-discovery manifest entries (`Runtime/Plugins/Android/DisplayXR.androidlib`);
 - the Khronos OpenXR loader for Android (1.1.63);
 - the runtime's `VK_LAYER_DXR_queue_lock` layer (needed for full frame rate);
@@ -352,7 +406,7 @@ Logs: `adb logcat -s DisplayXRUnity`. Switches that need no rebuild: `adb shell 
 3. Set **Target Platform** to **Windows**
 4. Build as normal
 
-The plugin includes both platform binaries (`displayxr_unity.dll` for Windows, `libdisplayxr_unity.dylib` for macOS). Unity automatically selects the correct one based on the build target.
+The plugin includes both platform binaries (`displayxr_unity.dll` for Windows, `displayxr_unity.bundle` for macOS). Unity automatically selects the correct one based on the build target.
 
 **Important:** The built Windows `.exe` still requires the DisplayXR runtime installed on the **target Windows machine** — see [Deploying to End Users](#deploying-to-end-users). You cannot run the Windows build on macOS.
 
@@ -391,7 +445,7 @@ set XR_RUNTIME_JSON=C:\path\to\openxr_displayxr-dev.json
 
 Set before launching the app:
 ```bash
-export XR_RUNTIME_JSON=/path/to/DisplayXR-macOS/share/openxr/1/openxr_displayxr.json
+export XR_RUNTIME_JSON=/path/to/DisplayXR-macOS/openxr_displayxr.json
 ```
 
 #### Unsigned builds and the runtime symlink
@@ -425,19 +479,28 @@ xcrun notarytool submit MyApp.app --apple-id you@example.com --team-id TEAMID --
 xcrun stapler staple MyApp.app
 ```
 
-### What Happens Without the Runtime
-
-If the DisplayXR runtime is not installed, the provider fails to bind an OpenXR session and logs:
-```
-[OpenXR] No OpenXR runtime found
-```
-The plugin logs a warning but doesn't crash — your app runs in mono (non-stereo) mode. Query the DisplayXR runtime status (via the rig components / `DisplayXRProvider`) to detect this and show a user-facing message.
-
----
-
 ### Android Deployment
 
 The device needs the **DisplayXR runtime APK**: v2.47.0 or newer. v2.53.0 is the tested version. On v2.47.0 everything works except the touch copy to the runtime, which needs `xrSubmitAndroidInputEventDXR` (first shipped in v2.47.1); the provider logs that once and carries on. On a device whose display needs a vendor plug-in, use the runtime APK variant that bundles it (ADR-038), installed per the runtime's [Android guide](https://github.com/DisplayXR/displayxr-runtime/blob/main/docs/getting-started/android-build-guide.md). Launch the runtime app once after installing it so its broker is registered. The Unity APK finds the runtime through the Khronos loader. Nothing else needs installing.
+
+---
+
+## What Happens When Things Are Missing
+
+| Situation | What the plugin does | How an app detects it |
+|-----------|----------------------|-----------------------|
+| **No runtime installed** (Windows, macOS, Linux) | The XR loader declines before creating anything and logs `[DisplayXR] No DisplayXR runtime found on this machine — XR disabled, running as a standard 2D application.` Unity renders normally into its own window. | `DisplayXRRuntime.IsInstalled` is `false`. It needs no session and is safe to read from a `[RuntimeInitializeOnLoadMethod(RuntimeInitializeLoadType.SubsystemRegistration)]` method, which is early enough to choose 2D content or skip XR init. `DisplayXRProvider.IsRunning` stays `false` and `SessionStarted` never fires. |
+| **No runtime installed** (Android) | There is no pre-session check on Android, so the loader does not decline; the failure is an `xrCreateInstance` error in logcat (`adb logcat -s DisplayXRUnity`). What the user sees is not yet documented. | `DisplayXRRuntime.IsInstalled` is always `false` on Android and says nothing there; do not use it. `DisplayXRProvider.IsRunning` stays `false`. |
+| **Another vendor's OpenXR runtime is the active one** | `IsInstalled` cannot tell (it only resolves a runtime manifest file), so the loader goes ahead and the session then fails to start. What the user sees is not yet documented. | `DisplayXRRuntime.IsInstalled` is `true`; `DisplayXRRuntime.ResolvedManifestPath` shows which manifest was found. `DisplayXRProvider.IsRunning` stays `false` and `SessionStarted` never fires. |
+| **Runtime installed, no 3D panel** | Nothing changes in the plugin. The runtime falls back to its simulated display (`sim_display`: side-by-side, anaglyph or blend output in a regular window; see [Testing Without Hardware](#testing-without-hardware)), and the session runs as usual. | The session is up (`SessionStarted`, `IsRunning`). `DisplayXRProvider.TryGetDisplayInfo` returns the display geometry the runtime reports. A way to tell a simulated display from a real panel is not yet documented. |
+| **The panel switches between 2D and 3D** | The session keeps running. | `DisplayXRProvider.HardwareDisplayStateChanged` (`bool`) fires when the physical 2D/3D state flips. `RenderingModeChanged` (previous, current mode index) fires when the active rendering mode changes. |
+| **Eye tracking lost or regained** | The session keeps running. What the runtime renders while no viewer is tracked is the runtime's behaviour and is not yet documented here. | `DisplayXRProvider.EyeTrackingStateChanged` (`isTracking`, `activeMode`: 0 = managed, 1 = manual) fires on every change; `DisplayXRProvider.IsEyeTracked` holds the latest value. |
+| **Session stopped** (session loss, the provider stopping, the editor's dock/undock restart, an Android pause and resume) | Everything the app pushed into the session is gone with it: display mode, rendering mode, eye-tracking mode. Requests made while no session is running return `false` and are dropped. | `DisplayXRProvider.SessionStopped` fires once and `IsSessionReady` goes `false`. After a restart `SessionStarted` fires again: re-apply your requests there (`DisplayXRProvider.WhenRunning` is a one-shot and does not re-run). |
+| **The runtime asks the app to exit** (session state `EXITING` or `LOSS_PENDING`, for example the shell closing the app) | The plugin logs `[DisplayXR] runtime requested session exit → Application.Quit()` and calls `Application.Quit()`. | Unity's own quit callbacks (`Application.quitting`). |
+
+The `DisplayXRProvider` events fire only while the provider session is running (`SessionStarted` / `SessionStopped` bracket that window). They are dispatched from the provider driver's per-frame update, on the main thread.
+
+---
 
 ## Testing Without Hardware
 
@@ -465,19 +528,27 @@ This lets you develop and test the full stereo pipeline on any machine.
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| "No OpenXR runtime found" | `XR_RUNTIME_JSON` not set or points to missing file | Set the env var to the DisplayXR runtime JSON path |
+| Console: `[DisplayXR] No DisplayXR runtime found on this machine` | No runtime installed (the DisplayXR settings page says "No OpenXR runtime found"), or `XR_RUNTIME_JSON` is set and points to a missing file (the settings page shows the path with "File Exists: No"; when the variable is set, it wins and the installed runtime is not looked up) | Install the DisplayXR runtime, or set `XR_RUNTIME_JSON` to an existing runtime JSON before launching Unity |
 | Black screen | DisplayXR not enabled | Check **Project Settings > XR Plug-in Management > Standalone > DisplayXR Display**, and **Initialize XR on Startup**. |
 | Scene renders 2D side-by-side on Leia hardware (no depth) | Leia plug-in not installed/registered | Install `DisplayXRLeiaSRSetup-*.exe` from [displayxr-leia-plugin](https://github.com/DisplayXR/displayxr-leia-plugin/releases). Verify `HKLM\Software\DisplayXR\DisplayProcessors\leia-sr` exists. Without the plug-in, the runtime falls back to `sim_display` (SBS output) on any hardware. |
 | No stereo (flat image) | Eye tracking not running | Verify the DisplayXR runtime is configured with a display that supports eye tracking, or use sim_display for testing |
-| Stereo looks wrong | Tunables misconfigured | Reset to defaults (IPD=1, Parallax=1, Scale=1) |
+| Stereo looks wrong | Tunables misconfigured | Click **Reset to Defaults** in the rig inspector. Defaults: IPD Factor 1, Parallax Factor 1; display-centric adds Perspective Factor 1 and Virtual Display Height 0; camera-centric adds Inv. Convergence Distance 0 |
 | UPM "cannot add package from git URL" (Windows) | Git not installed or not in PATH | Install [Git for Windows](https://gitforwindows.org/), restart Unity. Verify with `git --version` in a terminal. |
 | UPM "cannot add package from git URL" (macOS) | GUI apps can't find Homebrew Git | Run `xcode-select --install` to set up `/usr/bin/git`, or launch Unity from terminal (`open -a Unity`). Check `~/Library/Logs/Unity/upm.log` for details. |
-| `DllNotFoundException: displayxr_unity` | Native plugin not found by Unity | Ensure the plugin binaries are in `Runtime/Plugins/Windows/x64/` or `Runtime/Plugins/macOS/` |
+| `DllNotFoundException: displayxr_unity` | Native plugin not found by Unity | Ensure the plugin binaries are in `Runtime/Plugins/Windows/x64/` or `Runtime/Plugins/macOS/`. On a Linux or Android build, a missing binary usually means the package was installed from a `#vX.Y.Z` source tag instead of `#upm/vX.Y.Z` (see [Installing the Plugin](#installing-the-plugin)) |
 | macOS: `XR_ERROR_RUNTIME_UNAVAILABLE` in built `.app` despite the symlink working in editor | Unsigned `.app` bundles can't read `~/Library/Application Support/openxr/` due to macOS sandbox protections | Either set `XR_RUNTIME_JSON` when launching, or ad-hoc sign with `codesign --deep --force --sign - MyApp.app`. See [macOS Deployment](#macos-deployment). |
 | HDRP stereo artifacts | Single-pass instanced issue | Verify both eye views have correct FOVs in Frame Debugger |
-| Play Mode shows "Not Connected" | `XR_RUNTIME_JSON` not set or runtime not running | Set the env var before launching Unity; verify the runtime process is active |
-| Play Mode shows black | Runtime connected but no output | Check runtime logs; verify sim_display or hardware is configured |
+| DisplayXR settings page says "Not connected" | No session is running: display info only appears in Play Mode with **DisplayXR Display** enabled | Enter Play Mode. If it still says "Not connected", look in the Console for a `[DisplayXR]` warning (no runtime found, macOS editor, Vulkan editor), then in the [log files](#log-files) |
+| Play Mode shows black | Runtime connected but no output | Read the provider log and the runtime log (paths under [Log Files](#log-files)); verify sim_display or hardware is configured. If Unity and the runtime are on different GPUs (hybrid laptops), the provider log says so and how to align them |
 | `VK_ERROR_EXTENSION_NOT_PRESENT` on macOS | MoltenVK limitation | Known issue — use sim_display for testing |
+
+### Log Files
+
+| Log | Where | What is in it |
+|-----|-------|---------------|
+| Unity Console / `Player.log` | Windows player: `%USERPROFILE%\AppData\LocalLow\<Company>\<Product>\Player.log`. macOS player: `~/Library/Logs/<Company>/<Product>/Player.log`. Linux player: `~/.config/unity3d/<Company>/<Product>/Player.log` | The plugin's C# messages, prefixed `[DisplayXR]` |
+| Provider (native plugin) log | Windows: `%TEMP%\displayxr_prov_native.log`. macOS / Linux: `$TMPDIR/displayxr_prov_native.log` (`/tmp/` when `TMPDIR` is unset). Android: logcat, `adb logcat -s DisplayXRUnity` | Lines prefixed `[DisplayXR-PROV]`: session start, which extensions the runtime advertises, session state changes. The file is appended to on every run |
+| Runtime log | Windows: `%LOCALAPPDATA%\DisplayXR\DisplayXR_<exe>.<pid>_<timestamp>.log`. Other platforms: see the runtime's documentation | The runtime's own messages, including why it refused a request |
 
 ### Debug Logging
 
@@ -516,7 +587,7 @@ Unity Editor / Player
 │                                                          │
 │  DisplayXRWindowSpaceUI / DisplayXRLocal2D  (2D layers)   │
 └──────────────────────────────────────────────────────────┘
-        │ P/Invoke (displayxr_unity.dll / .dylib)
+        │ P/Invoke (displayxr_unity.dll / .bundle / .so)
         ▼
 ┌──────────────────────────────────────────────────────────┐
 │  Native Plugin (C/C++)                                   │
@@ -544,11 +615,11 @@ Eye Tracker → raw positions in DISPLAY space
     ↓
 Scene Transform (parent camera pose, zoom)
     ↓
-Tunables (IPD factor, parallax, perspective, scale)
+Tunables (IPD factor, parallax, perspective, virtual display height / inv. convergence distance)
     ↓
-Kooima Asymmetric Frustum → XrFovf angles
+Kooima Asymmetric Frustum, computed by the runtime → per-eye XrView {pose, fov}
     ↓
-Unity builds projection matrices → renders stereo
+Provider builds the per-eye projection matrix → Unity renders stereo
 ```
 
 ---
@@ -566,7 +637,7 @@ Unity builds projection matrices → renders stereo
 | `Runtime/DisplayXRWindowSpaceUI.cs` | 2D UI overlay routing |
 | `Runtime/DisplayXRNative.cs` | P/Invoke bindings to native plugin |
 | `Runtime/Plugins/Windows/x64/` | Windows native plugin (DLL) |
-| `Runtime/Plugins/macOS/` | macOS native plugin (dylib) |
+| `Runtime/Plugins/macOS/` | macOS native plugin (`displayxr_unity.bundle`, Universal) |
 | `Editor/DisplayXRDisplayEditor.cs` | Custom inspector for display-centric mode |
 | `Editor/DisplayXRCameraEditor.cs` | Custom inspector for camera-centric mode |
 | `Editor/DisplayXRSettingsProvider.cs` | Project Settings page |

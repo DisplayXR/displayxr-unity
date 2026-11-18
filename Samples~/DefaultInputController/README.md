@@ -37,10 +37,10 @@ You're now editing the input handler as project code, free to reshape or fork it
 
 The plugin's Runtime should expose mechanisms (cursor polling on cloaked HWND, rig manager, mode setter); the policy (which key → which action, gesture priorities, target gating) belongs to the app. As of v1.5.9 this controller is shipped as opt-in sample code that apps can take ownership of, fork, or replace with their own.
 
-Previous releases (≤ v1.5.8) bundled it under `Runtime/`. v1.5.9 left a deprecated shim there that logs a one-shot warning; the next minor release removes the shim entirely.
+Releases up to v1.5.8 bundled it under `Runtime/`. That copy is gone: the package's `Runtime/` no longer contains a `DisplayXRInputController`, so this sample is the only source of it.
 
 ## Cross-references
 
 - `DisplayXRRigManager` (plugin Runtime) — registry of active rigs, `CycleNext()`
-- `DisplayXRFeature.Instance.RequestDisplayMode(bool)` (plugin Runtime) — 2D/3D mode
+- `DisplayXRProvider.RequestDisplayMode(bool)` (plugin Runtime) — 2D/3D mode. A request made before the session is running returns false and is dropped; see `DisplayXRProvider.WhenRunning` / `SessionStarted`.
 - `DisplayXRTransparentOverlay.PointerPosition / PointerDelta / IsLeftPressed` (plugin Runtime) — cursor state on transparent-overlay builds (Win32 native poll + Mac Mouse.current poll)
