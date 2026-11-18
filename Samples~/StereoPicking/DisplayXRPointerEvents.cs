@@ -37,6 +37,7 @@ using System.Collections.Generic;
 using UnityEngine;
 using UnityEngine.Events;
 using UnityEngine.EventSystems;
+using UnityEngine.SceneManagement;
 using UnityEngine.UI;
 #if ENABLE_INPUT_SYSTEM
 using UnityEngine.InputSystem;
@@ -58,6 +59,13 @@ namespace DisplayXR.Samples
                  "platform) fall back to Camera.ScreenPointToRay so the scene stays usable.")]
         public bool fallBackToCameraRay = true;
 
+        [Tooltip("Do not pick while the EventSystem reports the pointer over one of ITS objects " +
+                 "(EventSystem.IsPointerOverGameObject): a screen-space canvas on top of the 3D " +
+                 "scene then blocks the pick, as it blocks Unity's own. Needs an input module " +
+                 "on the EventSystem; turn it off if that module also raycasts the scene " +
+                 "(a PhysicsRaycaster, or takeOverCanvasRaycasters off).")]
+        public bool blockedByScreenSpaceUI = true;
+
         [Header("3D colliders")]
         public bool raycastPhysics = true;
         public LayerMask physicsLayers = Physics.DefaultRaycastLayers;
@@ -67,9 +75,9 @@ namespace DisplayXR.Samples
         [Header("World-space canvases")]
         public bool raycastWorldCanvases = true;
 
-        [Tooltip("The canvases to drive. Empty = every world-space canvas in the scene, " +
-                 "found on enable and then once a second (call RefreshCanvases after " +
-                 "spawning one to pick it up at once).")]
+        [Tooltip("The canvases to drive. Empty = every world-space canvas in the loaded scenes " +
+                 "(inactive ones included), collected on enable and whenever a scene loads. " +
+                 "Call RefreshCanvases() after instantiating one at runtime.")]
         public Canvas[] worldCanvases;
 
         [Tooltip("Disable the GraphicRaycaster of each driven canvas while this component is " +
@@ -111,13 +119,21 @@ namespace DisplayXR.Samples
         struct CanvasEntry
         {
             public Canvas canvas;
+            public Canvas root;
             public GraphicRaycaster raycaster; // on the ROOT canvas: supplies the event camera
+            public bool warnedNoCamera;
         }
 
         readonly List<CanvasEntry> m_Canvases = new List<CanvasEntry>();
-        // The GraphicRaycasters switched off by takeOverCanvasRaycasters, to switch back on.
+        // GraphicRaycasters that were there and that takeOverCanvasRaycasters switched off:
+        // switched back on when this component is disabled.
         readonly List<GraphicRaycaster> m_TakenOver = new List<GraphicRaycaster>();
-        float m_NextDiscovery;
+        // GraphicRaycasters this component ADDED to a canvas that had none (uGUI controls
+        // find their camera through one): kept disabled, and destroyed on disable, so the
+        // canvas ends as it started.
+        readonly List<GraphicRaycaster> m_Added = new List<GraphicRaycaster>();
+        readonly List<GameObject> m_Roots = new List<GameObject>();
+        readonly List<Canvas> m_Found = new List<Canvas>();
 
         EventSystem m_EventSystem;
         PointerEventData m_Data;
@@ -135,6 +151,7 @@ namespace DisplayXR.Samples
             public Vector3 point, normal;
             public Vector2 screenPosition; // what PointerEventData.position must be for this hit
             public GraphicRaycaster module;
+            public Camera eventCamera;
             public int sortingOrder, depth;
             public bool isGraphic;
         }
@@ -152,37 +169,65 @@ namespace DisplayXR.Samples
                 m_EventSystem = es.GetComponent<EventSystem>();
             }
             m_Data = new PointerEventData(m_EventSystem);
+            SceneManager.sceneLoaded += OnSceneLoaded;
             RefreshCanvases();
         }
 
         void OnDisable()
         {
+            SceneManager.sceneLoaded -= OnSceneLoaded;
             SetHovered(null);
             Release(null);
             HasRay = HasHit = false;
+            // Canvases may have been destroyed first: every entry is checked.
             for (int i = 0; i < m_TakenOver.Count; i++)
                 if (m_TakenOver[i] != null) m_TakenOver[i].enabled = true;
             m_TakenOver.Clear();
+            for (int i = 0; i < m_Added.Count; i++)
+                if (m_Added[i] != null) Destroy(m_Added[i]);
+            m_Added.Clear();
             m_Canvases.Clear();
         }
 
-        /// <summary>Re-collect the world-space canvases to drive (after spawning or destroying one).</summary>
+        void OnSceneLoaded(Scene scene, LoadSceneMode mode) { RefreshCanvases(); }
+
+        /// <summary>
+        /// Re-collect the world-space canvases to drive. Runs on enable and after every scene
+        /// load; call it yourself after instantiating (or destroying) a canvas at runtime.
+        /// Canvases under DontDestroyOnLoad are not found by the automatic search: list them
+        /// in <see cref="worldCanvases"/>.
+        /// </summary>
         public void RefreshCanvases()
         {
-            m_NextDiscovery = Time.unscaledTime + 1f;
+            for (int i = m_Canvases.Count - 1; i >= 0; i--)
+                if (m_Canvases[i].canvas == null) m_Canvases.RemoveAt(i);
             if (!raycastWorldCanvases) return;
 
-            // Resources.FindObjectsOfTypeAll is the one "find them all" call that is neither
-            // missing on 2022.3 nor deprecated on Unity 6; it also returns prefab assets and
-            // inactive objects, which the scene test below drops.
-            Canvas[] found = worldCanvases != null && worldCanvases.Length > 0
-                ? worldCanvases
-                : Resources.FindObjectsOfTypeAll<Canvas>();
-            for (int i = 0; i < found.Length; i++)
+            m_Found.Clear();
+            if (worldCanvases != null && worldCanvases.Length > 0)
             {
-                Canvas c = found[i];
+                // Each listed canvas and the canvases nested under it.
+                for (int i = 0; i < worldCanvases.Length; i++)
+                    if (worldCanvases[i] != null) AppendCanvasesUnder(worldCanvases[i].gameObject);
+            }
+            else
+            {
+                // The loaded scenes' own hierarchies: no "find every object" call, so no
+                // walk over assets and nothing that differs between Unity versions.
+                for (int sc = 0; sc < SceneManager.sceneCount; sc++)
+                {
+                    Scene scene = SceneManager.GetSceneAt(sc);
+                    if (!scene.isLoaded) continue;
+                    scene.GetRootGameObjects(m_Roots);
+                    for (int i = 0; i < m_Roots.Count; i++) AppendCanvasesUnder(m_Roots[i]);
+                }
+                m_Roots.Clear();
+            }
+
+            for (int i = 0; i < m_Found.Count; i++)
+            {
+                Canvas c = m_Found[i];
                 if (c == null || IndexOf(c) >= 0) continue;
-                if (!c.gameObject.scene.IsValid() || !c.gameObject.activeInHierarchy) continue;
                 Canvas root = c.rootCanvas;
                 if (root == null || root.renderMode != RenderMode.WorldSpace) continue;
                 // Canvases the plugin renders offscreen for a 2D layer are world-space only as
@@ -191,12 +236,19 @@ namespace DisplayXR.Samples
                     root.GetComponent<DisplayXRLocal2D>() != null)
                     continue;
 
-                var entry = new CanvasEntry { canvas = c };
+                var entry = new CanvasEntry { canvas = c, root = root };
                 // uGUI consumers (Slider.OnDrag, ...) find their camera through the event's
                 // raycast module, so the root needs a GraphicRaycaster even though it is not
-                // the one doing the hit-test.
+                // the one doing the hit-test. One added here never existed as far as the
+                // EventSystem is concerned: it stays disabled whatever takeOver says (enabled,
+                // it would be a second pointer the canvas never had) and is removed on disable.
                 entry.raycaster = root.GetComponent<GraphicRaycaster>();
-                if (entry.raycaster == null) entry.raycaster = root.gameObject.AddComponent<GraphicRaycaster>();
+                if (entry.raycaster == null)
+                {
+                    entry.raycaster = root.gameObject.AddComponent<GraphicRaycaster>();
+                    entry.raycaster.enabled = false;
+                    m_Added.Add(entry.raycaster);
+                }
                 if (takeOverCanvasRaycasters)
                 {
                     // Every canvas with a raycaster, nested ones included, is a second pointer.
@@ -205,10 +257,19 @@ namespace DisplayXR.Samples
                 }
                 m_Canvases.Add(entry);
             }
-            // Forget destroyed canvases.
-            for (int i = m_Canvases.Count - 1; i >= 0; i--)
-                if (m_Canvases[i].canvas == null) m_Canvases.RemoveAt(i);
+            m_Found.Clear();
         }
+
+        void AppendCanvasesUnder(GameObject go)
+        {
+            // GetComponentsInChildren(list) replaces the list's content, so collect per root.
+            // Inactive canvases included: a panel shown later is then already known.
+            go.GetComponentsInChildren(true, m_Scratch);
+            for (int i = 0; i < m_Scratch.Count; i++) m_Found.Add(m_Scratch[i]);
+            m_Scratch.Clear();
+        }
+
+        readonly List<Canvas> m_Scratch = new List<Canvas>();
 
         void TakeOver(GraphicRaycaster raycaster)
         {
@@ -226,20 +287,25 @@ namespace DisplayXR.Samples
 
         void Update()
         {
-            bool autoDiscover = worldCanvases == null || worldCanvases.Length == 0;
-            if (raycastWorldCanvases && autoDiscover && Time.unscaledTime >= m_NextDiscovery)
-                RefreshCanvases();
-
             // ---- 1. Pointer ---------------------------------------------------------------
-            bool havePointer = TryGetPointer(out Vector2 pointer, out bool down, out Vector2 scroll);
+            bool havePointer = TryGetPointer(out Vector2 pointer, out bool down, out Vector2 scroll, out bool fromTouch);
 
-            // A 2D HUD (window-space UI) under the cursor owns the pointer: do not also poke
-            // the 3D scene behind it.
-            if (DisplayXRWindowSpaceUI.IsCursorOverInteractive && !m_WasDown) havePointer = false;
-            // Outside the window there is nothing to point at (a drag in progress carries on).
-            if (havePointer && !m_WasDown && DisplayXRPicking.TryGetScreenSize(out Vector2 screen) &&
-                (pointer.x < 0f || pointer.y < 0f || pointer.x >= screen.x || pointer.y >= screen.y))
-                havePointer = false;
+            if (havePointer && !m_WasDown)
+            {
+                // A 2D HUD (window-space UI) under the cursor owns the pointer: do not also
+                // poke the 3D scene behind it. Likewise a screen-space canvas, which the
+                // EventSystem's own input module handles (and handles correctly: it is 2D).
+                if (DisplayXRWindowSpaceUI.IsCursorOverInteractive) havePointer = false;
+                else if (blockedByScreenSpaceUI && m_EventSystem != null && m_EventSystem.IsPointerOverGameObject())
+                    havePointer = false;
+                // Outside the window there is nothing to point at (a drag in progress carries
+                // on). Only for the pointer DisplayXRPicking reported: its position and this
+                // size are the same pixel space. A touch is on the screen by construction, and
+                // in a Windows overlay app its pixels are not the overlay window's.
+                else if (!fromTouch && DisplayXRPicking.TryGetScreenSize(out Vector2 screen) &&
+                         (pointer.x < 0f || pointer.y < 0f || pointer.x >= screen.x || pointer.y >= screen.y))
+                    havePointer = false;
+            }
 
             // ---- 2. Ray -------------------------------------------------------------------
             Camera cam = ResolveCamera();
@@ -326,10 +392,27 @@ namespace DisplayXR.Samples
             {
                 CanvasEntry e = m_Canvases[i];
                 if (e.canvas == null || !e.canvas.isActiveAndEnabled) continue;
-                // The camera uGUI will use for this canvas: the hit is reported to uGUI as the
-                // screen position at which THAT camera sees the hit point.
-                Camera eventCam = e.raycaster != null ? e.raycaster.eventCamera : cam;
-                if (eventCam == null) continue;
+                // The camera uGUI will use for this canvas (its Event Camera, else the
+                // MainCamera-tagged one): the hit is reported to uGUI as the screen position
+                // at which THAT camera sees the hit point.
+                Camera eventCam = e.raycaster != null ? e.raycaster.eventCamera : null;
+                if (eventCam == null)
+                {
+                    // No Event Camera and no MainCamera: hover and click still work through
+                    // the picking camera, but a control that maps the pointer back into its
+                    // rect (Slider, ScrollRect, text caret) has no camera to do it with.
+                    eventCam = cam;
+                    if (!e.warnedNoCamera)
+                    {
+                        e.warnedNoCamera = true;
+                        m_Canvases[i] = e;
+                        Debug.LogWarning("[DisplayXRPointerEvents] World-space canvas '" + e.root.name +
+                            "' has no Event Camera and no camera is tagged MainCamera. Picking it " +
+                            "through the picking camera; assign Canvas > Event Camera so sliders " +
+                            "and scroll views can follow a drag.", e.root);
+                    }
+                    if (eventCam == null) continue;
+                }
 
                 IList<Graphic> graphics = GraphicRegistry.GetRaycastableGraphicsForCanvas(e.canvas);
                 for (int g = 0; g < graphics.Count; g++)
@@ -359,6 +442,7 @@ namespace DisplayXR.Samples
                     best.normal = -rt.forward;
                     best.screenPosition = sp2;
                     best.module = e.raycaster;
+                    best.eventCamera = eventCam;
                     best.sortingOrder = order;
                     best.depth = graphic.depth;
                     best.isGraphic = true;
@@ -409,23 +493,66 @@ namespace DisplayXR.Samples
             };
         }
 
-        // ---- Event dispatch (the StandaloneInputModule sequence, one left button) ---------
+        // ---- Event dispatch (the sequence of Unity's own input modules, one left button) ---
 
-        void SetHovered(GameObject hovered)
+        // Enter / exit the way BaseInputModule.HandlePointerExitAndEnter does it: every
+        // object from the hit up to the root is "entered", and moving between two children
+        // of one handler exits and enters only the part of the chain that changed, so a
+        // Button with a Text and an Image under it does not flicker as the pointer crosses
+        // from one to the other.
+        void SetHovered(GameObject target)
         {
-            if (ReferenceEquals(m_Hovered, hovered)) return;
-            if (m_Hovered != null)
+            if (m_Data == null) return;
+            GameObject previous = m_Hovered;
+            if (ReferenceEquals(previous, target) && (target != null || m_Data.hovered.Count == 0)) return;
+
+            // The previous object may have been destroyed: then everything still alive in
+            // the entered chain is exited.
+            if (target == null || m_Data.pointerEnter == null)
             {
-                ExecuteEvents.ExecuteHierarchy(m_Hovered, m_Data, ExecuteEvents.pointerExitHandler);
-                onExit.Invoke(m_Hovered);
+                for (int i = 0; i < m_Data.hovered.Count; i++)
+                    if (m_Data.hovered[i] != null)
+                        ExecuteEvents.Execute(m_Data.hovered[i], m_Data, ExecuteEvents.pointerExitHandler);
+                m_Data.hovered.Clear();
+                if (target == null)
+                {
+                    m_Data.pointerEnter = null;
+                    m_Hovered = null;
+                    if (previous != null) onExit.Invoke(previous);
+                    return;
+                }
             }
-            m_Hovered = hovered;
-            m_Data.pointerEnter = hovered;
-            if (hovered != null)
+
+            Transform commonRoot = FindCommonRoot(m_Data.pointerEnter, target);
+            if (m_Data.pointerEnter != null)
             {
-                ExecuteEvents.ExecuteHierarchy(hovered, m_Data, ExecuteEvents.pointerEnterHandler);
-                onEnter.Invoke(hovered);
+                for (Transform t = m_Data.pointerEnter.transform; t != null && t != commonRoot; t = t.parent)
+                {
+                    ExecuteEvents.Execute(t.gameObject, m_Data, ExecuteEvents.pointerExitHandler);
+                    m_Data.hovered.Remove(t.gameObject);
+                }
             }
+            m_Data.pointerEnter = target;
+            for (Transform t = target.transform; t != null && t != commonRoot; t = t.parent)
+            {
+                ExecuteEvents.Execute(t.gameObject, m_Data, ExecuteEvents.pointerEnterHandler);
+                m_Data.hovered.Add(t.gameObject);
+            }
+
+            m_Hovered = target;
+            if (previous != null) onExit.Invoke(previous);
+            onEnter.Invoke(target);
+        }
+
+        // The deepest transform that is `a` or one of its ancestors and also `b` or one of
+        // its ancestors; null when there is none.
+        static Transform FindCommonRoot(GameObject a, GameObject b)
+        {
+            if (a == null || b == null) return null;
+            for (Transform ta = a.transform; ta != null; ta = ta.parent)
+                for (Transform tb = b.transform; tb != null; tb = tb.parent)
+                    if (ta == tb) return ta;
+            return null;
         }
 
         void Press(GameObject hovered, Hit hit, bool haveHit)
@@ -445,15 +572,19 @@ namespace DisplayXR.Samples
                 m_EventSystem.SetSelectedGameObject(select, m_Data);
 
             if (hovered == null) return;
-            if (haveHit && hit.isGraphic && hit.module != null)
+            if (haveHit && hit.isGraphic)
             {
                 m_PressPlane = hovered.transform;
-                m_PressCamera = hit.module.eventCamera;
+                m_PressCamera = hit.eventCamera;
             }
 
+            // Unity 2021+: the click target is fixed at press time, from the object under the
+            // pointer, and compared again at release.
             GameObject pressed = ExecuteEvents.ExecuteHierarchy(hovered, m_Data, ExecuteEvents.pointerDownHandler);
-            if (pressed == null) pressed = ExecuteEvents.GetEventHandler<IPointerClickHandler>(hovered);
+            GameObject click = ExecuteEvents.GetEventHandler<IPointerClickHandler>(hovered);
+            if (pressed == null) pressed = click;
             m_Data.pointerPress = pressed;
+            m_Data.pointerClick = click;
             m_Data.rawPointerPress = hovered;
             m_Data.clickCount = 1;
             m_Data.clickTime = Time.unscaledTime;
@@ -493,17 +624,20 @@ namespace DisplayXR.Samples
             GameObject raw = m_Data.rawPointerPress;
             if (m_Data.pointerPress != null)
                 ExecuteEvents.Execute(m_Data.pointerPress, m_Data, ExecuteEvents.pointerUpHandler);
+
+            // Click: the click handler under the release is the one that was under the press.
             GameObject clickHandler = hovered != null
                 ? ExecuteEvents.GetEventHandler<IPointerClickHandler>(hovered) : null;
-            bool clicked = m_Data.pointerPress != null && m_Data.eligibleForClick &&
-                           ReferenceEquals(m_Data.pointerPress, clickHandler);
-            if (clicked)
-                ExecuteEvents.Execute(m_Data.pointerPress, m_Data, ExecuteEvents.pointerClickHandler);
-            else if (m_Data.pointerDrag != null && m_Data.dragging && hovered != null)
-                ExecuteEvents.ExecuteHierarchy(hovered, m_Data, ExecuteEvents.dropHandler);
+            if (m_Data.pointerClick != null && ReferenceEquals(m_Data.pointerClick, clickHandler) &&
+                m_Data.eligibleForClick)
+                ExecuteEvents.Execute(m_Data.pointerClick, m_Data, ExecuteEvents.pointerClickHandler);
 
             if (m_Data.pointerDrag != null && m_Data.dragging)
+            {
+                if (hovered != null)
+                    ExecuteEvents.ExecuteHierarchy(hovered, m_Data, ExecuteEvents.dropHandler);
                 ExecuteEvents.Execute(m_Data.pointerDrag, m_Data, ExecuteEvents.endDragHandler);
+            }
 
             if (m_WasDown && raw != null) onUp.Invoke(raw);
             // The UnityEvent click needs no handler on the object: released over what was pressed.
@@ -512,6 +646,7 @@ namespace DisplayXR.Samples
 
             m_Data.eligibleForClick = false;
             m_Data.pointerPress = null;
+            m_Data.pointerClick = null;
             m_Data.rawPointerPress = null;
             m_Data.dragging = false;
             m_Data.pointerDrag = null;
@@ -525,24 +660,28 @@ namespace DisplayXR.Samples
         // Position: DisplayXRPicking.TryGetPointerPosition reads the mouse through whichever
         // backend the project enabled, and the cursor over the provider's own window where
         // Unity's is hidden (a Windows transparent-overlay app). The first touch replaces it
-        // while a finger is down (Android): touch positions are Unity screen pixels too.
-        // Button and wheel: the Input System when it is enabled, else the legacy Input Manager.
-        // Scroll is returned in uGUI's units (about 1 per notch).
+        // only while a finger is down or was lifted this frame: touch positions are Unity
+        // screen pixels too. Button and wheel: the Input System when it is enabled, else the
+        // legacy Input Manager. Scroll is returned in uGUI's units (about 1 per notch).
 
-        static bool TryGetPointer(out Vector2 position, out bool down, out Vector2 scroll)
+        static bool TryGetPointer(out Vector2 position, out bool down, out Vector2 scroll, out bool fromTouch)
         {
-            position = Vector2.zero; down = false; scroll = Vector2.zero;
+            position = Vector2.zero; down = false; scroll = Vector2.zero; fromTouch = false;
 #if ENABLE_INPUT_SYSTEM
             var ts = Touchscreen.current;
             if (ts != null)
             {
                 var touch = ts.primaryTouch;
-                if (touch.phase.ReadValue() != UnityEngine.InputSystem.TouchPhase.None)
+                // Not the touch PHASE: after the first touch it can rest at Ended for as long
+                // as nobody touches the screen, and on a touchscreen laptop that would shut
+                // the mouse out for good. A finger that lifted this frame still reports its
+                // last position, with the press released, so the release lands where the
+                // press was.
+                if (touch.press.isPressed || touch.press.wasReleasedThisFrame)
                 {
-                    // A finger that lifted this frame still reports its last position, with
-                    // the press released, so the release lands where the press was.
                     position = touch.position.ReadValue();
                     down = touch.press.isPressed;
+                    fromTouch = true;
                     return true;
                 }
             }
@@ -561,6 +700,7 @@ namespace DisplayXR.Samples
                 Touch touch = Input.GetTouch(0);
                 position = touch.position;
                 down = touch.phase != UnityEngine.TouchPhase.Ended && touch.phase != UnityEngine.TouchPhase.Canceled;
+                fromTouch = true;
                 return true;
             }
             if (!DisplayXRPicking.TryGetPointerPosition(out position)) return false;

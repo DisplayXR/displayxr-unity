@@ -45,9 +45,10 @@ Router** sample. While that HUD has the pointer, this component stays out of the
 |---|---|---|
 | `pickingCamera` | empty | The camera being pointed at. Empty = `DisplayXRRigManager.ActiveCamera`, else `Camera.main`. |
 | `fallBackToCameraRay` | on | With no DisplayXR session, use `Camera.ScreenPointToRay` so the scene still responds. `RayIsStereoCorrect` reports which ray was used. |
+| `blockedByScreenSpaceUI` | on | Do not pick while `EventSystem.IsPointerOverGameObject()` is true, so a screen-space canvas on top of the scene blocks the pick. See "Next to Unity's input module". |
 | `raycastPhysics`, `physicsLayers`, `maxDistance`, `triggerInteraction` | on, default layers, 1000, ignore | The `Physics.Raycast` parameters. |
 | `raycastWorldCanvases` | on | Hit-test world-space canvas graphics. |
-| `worldCanvases` | empty | The canvases to drive. Empty = all of them, found on enable and then once a second. Call `RefreshCanvases()` after spawning one to pick it up at once. |
+| `worldCanvases` | empty | The canvases to drive. Empty = every world-space canvas in the loaded scenes, inactive ones included, collected on enable and on every scene load. Call `RefreshCanvases()` after instantiating one at runtime. Canvases under `DontDestroyOnLoad` are not found automatically: list them here. |
 | `takeOverCanvasRaycasters` | on | Disable each driven canvas's `GraphicRaycaster` while the component is enabled (re-enabled on disable). Leave on: see below. |
 | `ignoreReversedGraphics` | on | Skip graphics seen from behind. |
 
@@ -67,6 +68,35 @@ position and Unity's ray: a second pointer, in the wrong place. The component sw
 raycaster off and keeps it only as the event's raycast module, which is where uGUI controls look
 up their camera.
 
+A canvas with no `GraphicRaycaster` gets one for that purpose. It is added disabled, stays
+disabled whatever `takeOverCanvasRaycasters` says, and is removed again when the component is
+disabled, so every canvas ends as it started.
+
+Set the canvas's **Event Camera**. Without one (and without a `MainCamera`-tagged camera) hover
+and click still work through the picking camera, and a warning is logged once, but a `Slider` or
+`ScrollRect` has no camera to follow a drag with.
+
+Hover follows Unity's rule: every object from the hit up to the root is entered, and moving
+between two children of one handler does not exit and re-enter it. A click goes to the click
+handler that was under the press if it is also the one under the release.
+
+## Next to Unity's input module
+
+The component does not replace a `StandaloneInputModule` or `InputSystemUIInputModule`. Screen-
+space canvases stay theirs. Two things follow from running both.
+
+- **Screen-space UI on top of the scene.** With `blockedByScreenSpaceUI` on, the component does
+  not pick while the EventSystem reports the pointer over one of its objects, so a HUD button
+  does not also click the 3D object behind it. This needs an input module on the EventSystem.
+  Turn the option off if that module also raycasts the 3D scene (a `PhysicsRaycaster`, or
+  `takeOverCanvasRaycasters` off), or the scene blocks itself. With it off, 3D picks are not
+  blocked by screen-space UI.
+- **Selection.** Unity's module sees a press on a world-space control as a press on nothing (it
+  cannot hit that canvas any more) and deselects. This component then selects the control. A
+  focused world-space `InputField` therefore gets `OnDeselect` followed by `OnSelect` on each
+  click on itself. It keeps the focus, but code that reacts to `OnDeselect` (end-edit handlers)
+  runs.
+
 Step 2 assumes that the event camera's `WorldToScreenPoint` and `ScreenPointToRay` are inverses
 of each other, which they are for any one camera.
 
@@ -84,8 +114,14 @@ of each other, which they are for any one camera.
 
 - Planar graphics only: a graphic is hit on its own rect plane. A bent or curved UI mesh is not
   followed.
-- In a Windows transparent-overlay app that uses only the legacy Input Manager, the position is
-  right but the button is not seen (Unity's window is hidden, so legacy input is dead). Use the
-  Input System there, or `DisplayXRTransparentOverlay`'s own pointer events.
+- In a Windows transparent-overlay app (Unity's window hidden behind the overlay):
+  - with only the legacy Input Manager, the position is right but the button is not seen (legacy
+    input is dead there). Use the Input System, or `DisplayXRTransparentOverlay`'s own pointer
+    events;
+  - the scroll wheel never arrives: the mouse state the overlay injects into the Input System
+    carries position and buttons, not scroll. Use `DisplayXRTransparentOverlay.ConsumeWheelDelta`;
+  - touch is not supported: a touch position is in the hidden window's pixels, not the overlay
+    window's, so the ray is wrong.
+- `Camera.rect` sub-viewports are not applied (see the picking doc).
 - One zone: the ray is taken through the primary 3D zone. A multi-zone app picks the zone
   itself and calls the `DisplayXRPicking` overloads that take a zone index.
