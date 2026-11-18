@@ -48,6 +48,12 @@ the default.
 
 Each hook logs once when scene depth becomes available or unavailable, and why.
 
+The same target, hooks and readback also serve `DisplayXRAutoConvergence` (#461): on the few
+frames per second it asks for a sample, the patch rect is the whole view instead of the square
+under the cursor, and the cursor skips that frame. The log lines above keep the cursor's name
+even when only auto-convergence is using the readback. See
+[auto-convergence.md](auto-convergence.md).
+
 The fully native alternative is not built. It would read the XR eye texture's own depth
 through `QueryTextureDesc` or a provider-allocated depth texture. URP and HDRP fill that depth
 (and keep it from being discarded) only when `XRRenderPass.shouldFillOutDepth` is true, and it
