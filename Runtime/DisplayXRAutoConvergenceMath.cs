@@ -17,10 +17,10 @@ namespace DisplayXR
     /// <item><b>Nearness</b> <c>q = 1 / depth</c> in 1/m, METRIC, in the rig's own units (the
     /// unit of <c>DisplayXRCamera.invConvergenceDistance</c>). Depth is measured along the
     /// camera's forward axis. <c>q = 0</c> is the far plane / sky; <c>NaN</c> is "not a
-    /// sample" (masked out). Nothing here re-normalises per frame: on-screen disparity is
-    /// linear in q, so a fixed metric histogram has uniform resolution in exactly the
-    /// quantity the eye sees, and two depths it cannot tell apart are stereoscopically
-    /// the same depth.</item>
+    /// sample" (masked out). Every value this class returns is metric - the screen plane, the
+    /// clump, the near / far extremes are never normalised to the frame. Only the BINNING of
+    /// the clump search uses the frame's own robust range, so that its resolution does not
+    /// collapse when everything is far.</item>
     /// <item><b>Disparity</b> is a fraction of the view width, positive BEHIND the screen
     /// plane, negative in front: <c>d = k * ipdFactor * (screenQ - q)</c> with
     /// <c>k = baseline / (2 tan(hfov/2))</c> (<see cref="DisparityScale"/>). This is the
@@ -62,8 +62,9 @@ namespace DisplayXR
             public float bottomDamp;
             /// <summary>Gaussian sigma of the histogram smoothing, in bins.</summary>
             public float histSmoothBins;
-            /// <summary>Clumps in the far fraction of the frame's 2nd..98th percentile range
-            /// are never the subject (the far plateau: scenery, a back wall).</summary>
+            /// <summary>Clumps in the far fraction of the 2nd..98th percentile range of the
+            /// frame's content (samples with depth; sky excluded) are never the subject (the far plateau: scenery, a back wall). The histogram
+            /// spans that same range, so this holds at any absolute distance.</summary>
             public float farExclude;
             /// <summary>Centre-weighted percentile of nearness the screen plane tracks (0..100).</summary>
             public float percentile;
@@ -71,14 +72,15 @@ namespace DisplayXR
             public float blend;
             /// <summary>A peak must hold this fraction of the highest smoothed bin.</summary>
             public float peakFloor;
-            /// <summary>Weighted mass within +-2 bins of the clump, fraction of the total.</summary>
+            /// <summary>Weighted mass within +-4 bins of the clump (an eighth of the frame's
+            /// nearness range), fraction of the total.</summary>
             public float minConfidence;
             /// <summary>Samples with real depth (not sky, not masked) needed, fraction of all samples.</summary>
             public float minValidFraction;
             /// <summary>Samples with real depth needed, absolute.</summary>
             public int minValidSamples;
             /// <summary>Subject hysteresis: the clump q currently followed (&lt; 0 = none). A peak
-            /// within <see cref="preferWindow"/> (fraction of the histogram range) of it is kept
+            /// within <see cref="preferWindow"/> (fraction of the frame's range) of it is kept
             /// unless another scores <see cref="switchRatio"/> times higher.</summary>
             public float preferQ, preferWindow, switchRatio;
 
@@ -143,9 +145,9 @@ namespace DisplayXR
         /// <param name="u">Sample position, 0 = left, 1 = right.</param>
         /// <param name="vUp">Sample position, 0 = bottom, 1 = top.</param>
         /// <param name="count">Samples to read (clamped to the arrays and the workspace).</param>
-        /// <param name="histogramMaxQ">Top of the fixed histogram range (1/m), normally
-        /// 1 / the minimum convergence distance. Nearer samples land in the last bin for the
-        /// clump search; the percentiles use their true value.</param>
+        /// <param name="histogramMaxQ">Nearest nearness the clump search distinguishes (1/m),
+        /// normally 1 / the minimum convergence distance. Nearer samples land in the last bin
+        /// for the clump search; the percentiles use their true value.</param>
         /// <returns><c>est.valid</c>.</returns>
         public static bool EstimateScreenPlane(float[] q, float[] u, float[] vUp, int count, float histogramMaxQ,
                                     in Params p, Workspace ws, out Estimate est)
@@ -162,11 +164,9 @@ namespace DisplayXR
             float sigma = p.centerSigma > 0f ? p.centerSigma : 0.35f;
             float damp = Clamp(p.bottomDamp, 0f, 1f);
             double[] counts = ws.counts, sumQ = ws.sumQ, sm = ws.smooth;
-            for (int b = 0; b < Bins; b++) { counts[b] = 0.0; sumQ[b] = 0.0; }
 
             int n = 0, nValid = 0;
-            double wsum = 0.0;
-            float binScale = Bins / histogramMaxQ;
+            double wsum = 0.0, validW = 0.0, validWQ = 0.0;
             for (int i = 0; i < count; i++)
             {
                 float qi = q[i];
@@ -183,14 +183,9 @@ namespace DisplayXR
                 wsum += wi;
                 if (qi > 0f)
                 {
-                    // Sky is kept out of the clump search (it is never the subject) but stays
-                    // in the percentiles, so "20 % of the frame in front" and the behind cap
-                    // both still see it.
                     nValid++;
-                    float fb = qi * binScale;
-                    int b = fb >= Bins ? Bins - 1 : (int)fb;
-                    counts[b] += wi;
-                    sumQ[b] += (double)wi * Math.Min(qi, histogramMaxQ);
+                    validW += wi;
+                    validWQ += (double)wi * Math.Min(qi, histogramMaxQ);
                 }
             }
             est.samples = n;
@@ -206,6 +201,45 @@ namespace DisplayXR
             if (need < 1) need = 1;
             if (nValid < need) return false;
 
+            float blend = Clamp(p.blend, 0f, 1f);
+
+            // The clump search works on a histogram of THIS FRAME's robust nearness range:
+            // the 2nd..98th percentile of the samples that HAVE depth (sky is not content: with
+            // sky as the far end, a wall behind the subject would sit mid-range and stop being
+            // the far plateau), clamped to histogramMaxQ so that something held against the
+            // lens does not stretch it. A fixed metric range
+            // has no resolution left when everything is far: a subject at 6 m and a wall at
+            // 40 m are 0.14 1/m apart and fell into neighbouring bins, where the smoothing
+            // merged them and the "far plateau" could not be told from the subject. Only the
+            // BINNING is relative to the frame; every value that leaves this function is
+            // metric nearness, taken from the samples themselves.
+            int nSky = n - nValid; // sorted ascending: the sky samples (q = 0) come first
+            double lo = Math.Min(ws.q[nSky + (int)Math.Floor(0.02 * (nValid - 1))], histogramMaxQ);
+            double hi = Math.Min(ws.q[nSky + (int)Math.Ceiling(0.98 * (nValid - 1))], histogramMaxQ);
+            double span = hi - lo;
+            if (!(span > 1e-3 * hi) || !(hi > 0.0))
+            {
+                // One surface (no depth range to speak of): it is its own subject.
+                if (!(validW > 0.0)) return false;
+                est.clumpQ = (float)(validWQ / validW);
+                est.screenQ = blend * est.percentileQ + (1f - blend) * est.clumpQ;
+                est.confidence = (float)(validW / wsum);
+                est.valid = est.confidence >= p.minConfidence;
+                return est.valid;
+            }
+
+            for (int b = 0; b < Bins; b++) { counts[b] = 0.0; sumQ[b] = 0.0; }
+            double binScale = Bins / span, binWidth = span / Bins;
+            for (int i = 0; i < n; i++)
+            {
+                float qi = ws.q[i];
+                if (!(qi > 0f)) continue; // sky is never the subject; it stays in the percentiles
+                double fb = (qi - lo) * binScale;
+                int b = fb >= Bins ? Bins - 1 : (fb <= 0.0 ? 0 : (int)fb);
+                counts[b] += ws.w[i];
+                sumQ[b] += (double)ws.w[i] * Math.Min(qi, histogramMaxQ);
+            }
+
             // Gaussian-smoothed histogram.
             double sig = p.histSmoothBins > 0f ? p.histSmoothBins : 1.5;
             int rad = (int)Math.Ceiling(3.0 * sig);
@@ -213,9 +247,9 @@ namespace DisplayXR
             for (int j = -rad; j <= rad; j++) norm += Math.Exp(-(double)(j * j) / (2.0 * sig * sig));
             for (int b = 0; b < Bins; b++)
             {
-                // Normalised by the FULL kernel, also at the ends of the range: in metric
-                // nearness the far plateau always sits in the first bins, and renormalising
-                // a truncated kernel there would inflate it against every other peak.
+                // Normalised by the FULL kernel, also at the ends of the range: the far
+                // plateau sits in the first bins, and renormalising a truncated kernel there
+                // would inflate it against every other peak.
                 double acc = 0.0;
                 for (int j = -rad; j <= rad; j++)
                 {
@@ -227,26 +261,21 @@ namespace DisplayXR
                 if (sm[b] > smax) smax = sm[b];
             }
 
-            // Peaks outside the far plateau. The plateau is the far farExclude of what this
-            // frame actually spans (2nd..98th percentile, sky included); a bin is excluded
-            // when it lies wholly inside it, so a single flat plane is still its own subject.
-            // The span is clamped to the histogram's range: content nearer than its top
-            // (a hand, a first-person weapon) lands in the last bin, and measured unclamped
-            // it would stretch the span until the real subject counted as "far".
-            double spanNear = Math.Min(est.nearQ, histogramMaxQ), spanFar = Math.Min(est.farQ, histogramMaxQ);
-            double farLimit = spanFar + Clamp(p.farExclude, 0f, 1f) * (spanNear - spanFar);
-            double binWidth = histogramMaxQ / (double)Bins;
+            // Peaks outside the far plateau: the far farExclude of the range. A bin is
+            // excluded when it lies wholly inside it. Because the range is the frame's own,
+            // this holds at any absolute distance.
+            double farBins = Clamp(p.farExclude, 0f, 1f) * Bins;
             int best = -1, kept = -1;
             double bestScore = -1.0, keptScore = -1.0;
             bool prefer = p.preferQ >= 0f;
-            double preferWindow = p.preferWindow * (double)histogramMaxQ;
+            double preferWindow = p.preferWindow * span;
             for (int b = 0; b < Bins; b++)
             {
                 double l = b > 0 ? sm[b - 1] : -1.0;
                 double r = b < Bins - 1 ? sm[b + 1] : -1.0;
                 if (!(sm[b] >= l && sm[b] >= r && sm[b] > p.peakFloor * smax && sm[b] > 0.0)) continue;
-                if ((b + 1) * binWidth <= farLimit) continue;
-                double c = (b + 0.5) * binWidth;
+                if (b + 1 <= farBins) continue;
+                double c = lo + (b + 0.5) * binWidth;
                 double score = sm[b];
                 if (score > bestScore) { bestScore = score; best = b; }
                 if (prefer && Math.Abs(c - p.preferQ) <= preferWindow && score > keptScore)
@@ -256,7 +285,6 @@ namespace DisplayXR
                 }
             }
 
-            float blend = Clamp(p.blend, 0f, 1f);
             if (best < 0)
             {
                 // Only the far plateau has a peak: the percentile alone still places the
@@ -271,17 +299,18 @@ namespace DisplayXR
             // trade places from one sample to the next.
             if (kept >= 0 && kept != best && bestScore < p.switchRatio * keptScore) best = kept;
 
-            // The clump's own depth: weighted mean of the samples around the peak (exact
-            // for a flat surface, where a bin centre would be off by up to half a bin).
+            // The clump's own depth: weighted mean of the samples around the peak (metric,
+            // from the samples - a bin centre would be off by up to half a bin). Confidence:
+            // the weighted mass within +-4 bins (an eighth of the range), over everything.
             double cw = 0.0, cq = 0.0, nearMass = 0.0;
-            for (int j = -2; j <= 2; j++)
+            for (int j = -4; j <= 4; j++)
             {
                 int bb = best + j;
                 if (bb < 0 || bb >= Bins) continue;
                 nearMass += counts[bb];
                 if (j >= -1 && j <= 1) { cw += counts[bb]; cq += sumQ[bb]; }
             }
-            est.clumpQ = cw > 0.0 ? (float)(cq / cw) : (float)((best + 0.5) * binWidth);
+            est.clumpQ = cw > 0.0 ? (float)(cq / cw) : (float)(lo + (best + 0.5) * binWidth);
             est.screenQ = blend * est.percentileQ + (1f - blend) * est.clumpQ;
             est.confidence = (float)(nearMass / wsum);
             est.valid = est.confidence >= p.minConfidence;
@@ -401,6 +430,71 @@ namespace DisplayXR
             if (float.IsNaN(followed)) return bound;
             float f = followed < bound ? followed : bound;
             return f > 0f ? f : 0f;
+        }
+
+        /// <summary>
+        /// The DELIVERED stereo strength, as one state with one rule: a cap may push it
+        /// DOWN at once, and it only ever comes back UP gradually (a critically damped
+        /// spring with the follower's time constant, from rest) - in every state, including
+        /// while the convergence is holding and after low-confidence samples. It never
+        /// exceeds the authored value or the bound it is given.
+        ///
+        /// <para>One exception, which is not a recovery: while no cap is biting (the state is
+        /// riding the authored value) a change of the authored value itself - an app's
+        /// stereo slider - is followed directly.</para>
+        /// </summary>
+        public struct StrengthGovernor
+        {
+            /// <summary>Delivered strength, and its rate (1/s).</summary>
+            public float x, v;
+            float lastAuthored;
+
+            /// <summary>Start at the authored strength.</summary>
+            public void Reset(float authored)
+            {
+                this = default;
+                x = lastAuthored = authored > 0f ? authored : 0f;
+            }
+
+            /// <summary>
+            /// Advance one frame. <paramref name="bound"/> is the largest strength the caps
+            /// allow at the convergence delivered this frame (<see cref="StrengthForCaps"/>;
+            /// NaN or anything above <paramref name="authored"/> = no cap biting).
+            /// </summary>
+            public float Step(float dt, float tau, float authored, float bound)
+            {
+                if (!(authored > 0f)) authored = 0f;
+                float limit = (float.IsNaN(bound) || bound > authored) ? authored : (bound > 0f ? bound : 0f);
+                bool wasFree = x >= lastAuthored - 1e-5f; // riding the authored value
+                lastAuthored = authored;
+                if (limit <= x)
+                {
+                    x = limit; // down: at once
+                    v = 0f;
+                    return x;
+                }
+                if (wasFree && limit >= authored)
+                {
+                    x = authored; // no cap in play: the authored value itself moved up
+                    v = 0f;
+                    return x;
+                }
+                if (!(dt > 0f)) return x;
+                if (dt > 0.5f) dt = 0.5f;
+                double t = tau;
+                if (double.IsNaN(t) || double.IsInfinity(t)) t = 1.0;
+                if (t < 1e-3) t = 1e-3;
+                double w = 1.0 / t;
+                double y0 = (double)x - limit, v0 = v > 0f ? v : 0f;
+                double kk = v0 + w * y0;
+                double e = Math.Exp(-w * dt);
+                float nx = (float)(limit + (y0 + kk * dt) * e);
+                v = (float)((v0 - w * kk * dt) * e);
+                if (nx < x) nx = x;             // a recovery never goes down
+                if (nx >= limit) { nx = limit; v = 0f; }
+                x = nx;
+                return x;
+            }
         }
 
         /// <summary>

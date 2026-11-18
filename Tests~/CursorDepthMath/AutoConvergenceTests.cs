@@ -487,6 +487,115 @@ static class AutoConvergenceTests
         Check(Near(large.screenQ, 1f / obj, 0.01f), $"two surfaces, large object: screen on the object ({1f / large.screenQ:F2} m)");
     }
 
+    // ---- Integration findings (#461) ------------------------------------------------------
+
+    // The delivered strength is one state: a cap pushes it down at once, it comes back only
+    // gradually - also when the cap lifts while the convergence is HOLDING (the player run
+    // popped 0.745 -> 1.0 in one frame when a low-confidence near intruder left).
+    static void TestStrengthNeverPopsBack()
+    {
+        const float dt = 1f / 60f, tau = 1.2f, period = 0.15f;
+        float k = M.DisparityScale(0.063f, (float)Math.Tan(30 * Math.PI / 180) * 16f / 9f);
+        float capF = M.CapFractionFromDegrees(0.6f, 0.6f, 0.344f), capB = M.CapFractionFromDegrees(1.2f, 0.6f, 0.344f);
+
+        // The scene: a wall at 4 m. The intruder: 25 texels at 0.25 m in a corner against it
+        // - more than 2 % of the frame (the caps see it), too little to move the plane.
+        Func<float, float, float> settled = (u, v) => 4f;
+        Func<float, float, float> intruder = (u, v) => (u < 0.16f && v > 0.84f) ? 0.25f : 4f;
+
+        var conv = new M.Follower(); conv.Reset(0f);
+        var gov = new M.StrengthGovernor(); gov.Reset(1f);
+        float nearQ = 0f, farQ = 0f, prefer = -1f;
+        bool holdingSeen = false;
+        float t = 0f, next = 0f, prev = 1f, minStrength = 1f, largestRise = 0f, dropFrames = 0f, worstCap = 0f;
+        float strengthWhenLeft = 0f, tHalf = -1f;
+        // 0-3 s settle, 3-6 s intruder present (20 samples), 6-16 s gone.
+        for (int i = 0; i < 16 * 60; i++, t += dt)
+        {
+            bool present = t >= 3f && t < 6f;
+            if (t >= next)
+            {
+                next = t + period;
+                bool ok = Run(present ? intruder : settled, out var e, prefer);
+                if (e.samples > 0) { nearQ = e.nearQ; farQ = e.farQ; }   // extremes: every sample
+                if (ok) { prefer = e.clumpQ; conv.Measure(e.screenQ, 0.01f); }
+                if (present) holdingSeen |= Near(conv.target, 0.25f, 0.02f); // plane did not chase it
+            }
+            float inv = conv.Step(dt, tau);
+            float bound = M.StrengthForCaps(k, 1f, inv, nearQ, farQ, capF, capB);
+            float f = gov.Step(dt, tau, 1f, bound);
+            if (f > bound + 1e-6f || f > 1f + 1e-6f) worstCap = Math.Max(worstCap, f - Math.Min(bound, 1f));
+            if (f - prev > largestRise) largestRise = f - prev;
+            if (present && f < prev - 0.05f) dropFrames++;
+            if (f < minStrength) minStrength = f;
+            if (Math.Abs(t - 6f) < dt * 0.5f) strengthWhenLeft = prev;
+            if (t > 6f && tHalf < 0f && f >= 0.5f * (1f + minStrength)) tHalf = t - 6f;
+            prev = f;
+        }
+        float gap = 1f - minStrength;
+        Check(holdingSeen, "intruder: the plane stays on the wall (it does not chase the intruder)");
+        Check(minStrength < 0.9f, $"intruder: the front cap bites while the convergence holds (min strength {minStrength:F3})");
+        Check(dropFrames == 1f, "intruder: the reduction is applied in ONE frame");
+        Check(worstCap == 0f, "intruder: delivered strength never above the bound or the authored value");
+        Check(largestRise <= gap * dt / tau, $"intruder left: largest one-frame rise {largestRise:F5} <= follower rate {gap * dt / tau:F5} (was {gap:F3} in one frame)");
+        Check(tHalf > 0.5f, $"intruder left: half-way back only after {tHalf:F2} s");
+        Check(Near(prev, 1f, 2e-3f), $"intruder left: full strength again in the end ({prev:F4})");
+
+        // The same rule at the governor alone, with a bound that toggles every frame.
+        var g = new M.StrengthGovernor(); g.Reset(1f);
+        float gp = 1f, rise = 0f;
+        bool under = true;
+        for (int i = 0; i < 600; i++)
+        {
+            float b = (i % 2 == 0) ? 0.6f : 5f;
+            float x = g.Step(dt, tau, 1f, b);
+            if (x - gp > rise) rise = x - gp;
+            if (x > Math.Min(1f, b) + 1e-6f) under = false;
+            gp = x;
+        }
+        Check(under, "a bound toggling every frame: never above the bound");
+        Check(rise <= 0.4f * dt / tau, $"a bound toggling every frame never lets the strength pop ({rise:F5})");
+
+        // The authored value itself: followed directly while no cap bites, never while one does.
+        var a = new M.StrengthGovernor(); a.Reset(1f);
+        Check(a.Step(dt, tau, 1.5f, float.NaN) == 1.5f, "authored raised with no cap biting: followed at once (an app slider)");
+        Check(a.Step(dt, tau, 0.8f, 9f) == 0.8f, "authored lowered: at once");
+        a.Step(dt, tau, 1f, 0.5f);
+        float up = a.Step(dt, tau, 2f, 9f);
+        Check(up < 0.51f, $"authored raised while recovering from a cap: still gradual ({up:F4})");
+        Check(a.Step(float.NaN, tau, 2f, 9f) == up && !float.IsNaN(a.Step(dt, float.NaN, 2f, 9f)), "NaN dt / tau are harmless");
+        Check(a.Step(dt, tau, float.NaN, 9f) == 0f, "NaN authored: no stereo");
+    }
+
+    // A centred subject covering about a fifth of the frame gets the screen at ANY distance.
+    // (Player run: subject 6 m / wall 40 m settled at 10.4 m - with a fixed metric histogram
+    // both fell into neighbouring bins and the far plateau was not excluded.)
+    static void TestSubjectAtAnyDistance()
+    {
+        float[][] pairs = { new[] { 1.5f, 6f }, new[] { 3f, 25f }, new[] { 6f, 40f }, new[] { 20f, 200f }, new[] { 60f, 900f } };
+        foreach (var pr in pairs)
+        {
+            float subj = pr[0], wall = pr[1];
+            bool ok = Run((u, v) => Centre(u, v, 0.24f) ? subj : wall, out var e);   // 23 % of the samples
+            float dist = 1f / e.screenQ;
+            Check(ok && Near(dist, subj, subj * 0.03f), $"subject {subj} m / wall {wall} m: screen on the subject ({dist:F2} m)");
+            Check(Near(e.clumpQ, 1f / subj, 0.02f / subj), $"subject {subj} m / wall {wall} m: the clump is the subject, not the wall");
+            // With relief on the subject (+-4 %) and a receding wall.
+            ok = Run((u, v) => Centre(u, v, 0.24f) ? subj * (1f + 0.04f * (float)Math.Sin(40 * u + 23 * v))
+                                                    : wall * (1f + 0.5f * u), out e);
+            dist = 1f / e.screenQ;
+            Check(ok && dist > subj * 0.9f && dist < subj * 1.15f, $"subject {subj} m / wall {wall} m, with relief: screen on the subject ({dist:F2} m)");
+            // And with sky above the wall.
+            ok = Run((u, v) => Centre(u, v, 0.24f) ? subj : (v > 0.8f ? float.PositiveInfinity : wall), out e);
+            dist = 1f / e.screenQ;
+            Check(ok && Near(dist, subj, subj * 0.03f), $"subject {subj} m / wall {wall} m / sky: screen on the subject ({dist:F2} m)");
+        }
+        // A continuous depth ramp (a floor to the horizon) is still a confident estimate.
+        bool okRamp = Run((u, v) => 1f + 30f * v, out var ramp);
+        Check(okRamp && ramp.valid, $"depth ramp: valid (confidence {ramp.confidence:F2})");
+        Check(1f / ramp.screenQ > 1f && 1f / ramp.screenQ < 12f, $"depth ramp: screen in the near part ({1f / ramp.screenQ:F2} m)");
+    }
+
     public static int Run()
     {
         TestFarPlateauAndNearSubject();
@@ -504,6 +613,8 @@ static class AutoConvergenceTests
         TestRigScale();
         TestRetargetAndFollowerHardening();
         TestTwoSurfacePolicy();
+        TestStrengthNeverPopsBack();
+        TestSubjectAtAnyDistance();
         Console.WriteLine($"auto_convergence_math (C#): {s_pass} passed, {s_fail} failed");
         return s_fail;
     }
