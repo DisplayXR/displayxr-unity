@@ -2,7 +2,9 @@
 
 `DisplayXRAutoConvergence` (#461) keeps the zero-parallax "screen" plane of a
 [`DisplayXRCamera`](kooima-pipeline.md) rig on the subject while the camera moves, and can
-back the stereo strength off so the scene stays inside a comfort budget. With a free camera a
+back the stereo strength off so that the scene it last sampled fits a comfort budget (an
+estimate from depth, refreshed a few times a second - see [Stereo strength](#stereo-strength)
+for exactly what is and is not guaranteed). With a free camera a
 fixed `invConvergenceDistance` is wrong most of the time: too near and the whole scene sinks
 behind the glass and goes flat, too far and everything pops out and strains.
 
@@ -19,9 +21,9 @@ all; the defaults are the tuned ones.
 | Mode | Auto | Where depth samples come from - see [Sources](#sources) |
 | Drive Stereo Strength | on | Also lower the rig's IPD Factor when the caps would be exceeded. Never raises it |
 | Min / Max Distance | 0.3 / 100 m | Limits of the screen plane, in rig units |
-| Time Constant | 1.2 s | The slow follower. 1.0-1.5 reads as a drift; 0.6 visibly pumps |
+| Time Constant | 1.2 s | The slow follower. 1.0-1.5 reads as a drift; 0.6 visibly pumped on a panel |
 | User Depth Scale | 1 | (0, 1]: scales both caps - a per-user "less depth" preference |
-| Front / Behind Cap | 0.6 / 1.2 deg | Largest disparity in front of / behind the screen, as an angle seen from the display's nominal viewing distance |
+| Front / Behind Cap | 0.6 / 1.2 deg | Largest on-glass disparity in front of / behind the screen, as a physical angle seen from the display's nominal viewing distance |
 | Raycast Layers | all but Ignore Raycast, UI | Raycast source only |
 | Ignore Nearer Than | 0 (off) | Leave samples nearer than this out (first-person weapon, hands) |
 | Advanced | | Sample period (0.15 s), percentile (80), blend (0.5), dead band (2 % of the budget), ray grid (9 x 7) |
@@ -33,11 +35,15 @@ var ac = camera.GetComponent<DisplayXRAutoConvergence>();
 ac.ResetConvergence();   // after a teleport, a cut, a scene load
 float d = ac.ConvergenceDistance;   // also: TargetConvergenceDistance, StereoStrength,
                                     // NearDisparityPercent, FarDisparityPercent, IsHolding, Source
+settings.ipd = ac.AuthoredIpdFactor;   // NOT rig.ipdFactor - see below
 ```
 
-**Cuts are not auto-detected.** `ResetConvergence()` makes the next sample count immediately
-and be followed over a few frames (a ramp, never a one-frame snap). Without it a teleport is
-followed over the slow time constant, which looks like the scene swimming into place.
+**Cuts are not auto-detected.** After `ResetConvergence()` the first sample *taken after the
+call* is followed over a few frames (a ramp, never a one-frame snap). Depth samples drawn
+before the call are discarded, including one already on its way back from the GPU - otherwise
+the stale pre-cut sample would take the fast ramp and the real one would then be followed
+slowly. Without the call a teleport is followed over the slow time constant, which looks like
+the scene swimming into place.
 
 ### What it writes, and what it leaves alone
 
@@ -47,8 +53,13 @@ followed over the slow time constant, which looks like the scene swimming into p
   restart (dock / undock, Android resume).
 - The **authored** values are remembered and restored when the component is disabled. A value
   somebody else writes into the rig while it runs (the inspector, an app slider) becomes the new
-  authored value: for the IPD Factor that is the ceiling, for the convergence it is what gets
-  restored.
+  authored value: for the IPD Factor that is the ceiling (it takes effect at once, also while
+  the convergence is holding), for the convergence it is what gets restored.
+- **While it runs, `rig.ipdFactor` and `rig.invConvergenceDistance` hold the delivered values,
+  not the authored ones.** An app that saves its stereo settings (or shows them in a settings
+  menu) must read `AuthoredIpdFactor` / `AuthoredInvConvergenceDistance` from the component;
+  saving `rig.ipdFactor` would persist a momentarily reduced strength as the user's choice.
+- A rig added to the camera after the component was enabled is picked up within a second.
 - It only acts while its camera is `DisplayXRRigManager.ActiveCamera`, the provider session is
   running and the boot splash is over. Otherwise it holds.
 - The runtime still owns the projection (`XR_DXR_view_rig`). The rear depth budget
@@ -73,11 +84,22 @@ The statistic works in **nearness** `q = 1 / depth` (1/m), metric, in the rig's 
    (floors and props at the feet are near but rarely the subject). The 80th percentile means
    roughly a fifth of the weighted frame is in front of the screen.
 2. **The dominant clump.** A 64-bin histogram of nearness, smoothed (sigma 1.5 bins); the
-   highest peak that is not in the far 15 % of what the frame spans. Sky / far-plane samples
-   are left out of this search altogether. A clump already being followed is kept unless
+   highest peak that is not in the far 15 % of what the frame spans (the span is clamped to
+   the histogram's range, so something held 15 cm from the lens does not stretch it until the
+   real subject counts as "far"). Sky / far-plane samples are left out of this search
+   altogether. A clump already being followed is kept unless
    another one scores 1.5x higher, so two comparable surfaces do not trade places.
 3. **Screen plane = 0.5 x percentile + 0.5 x clump.** If only the far plateau has a peak, the
    percentile alone is used.
+
+**Two surfaces: a deliberate in-between.** With a *small* centred object in front of a large
+wall, the percentile is on the wall and the clump on the object, so the screen lands half-way
+between them in nearness: the disparity between the two is split evenly, the object comes out
+by half of it and the wall recedes by half. Once the object fills about a fifth of the weighted
+frame the percentile joins the clump and the screen is on the object. This is kept on purpose
+(the 0.5 blend is the panel-tuned value, and a plane that jumps fully onto any small confident
+clump is the foreground-chasing behaviour that was tuned away); it is pinned by a unit test.
+Lower Blend to favour the clump, or use Target mode, when a small object IS the subject.
 
 Why nearness and not depth: on-screen disparity is linear in `q`
 (`d = k * ipdFactor * (q_screen - q)`), so a fixed histogram over `q` has uniform resolution in
@@ -98,19 +120,47 @@ it is rendered. The 98th / 2nd percentile of nearness (unweighted - a comfort vi
 anywhere in the frame; sky counts as the far end) are held against the caps:
 
 ```
-k        = 0.063 m / (2 tan(hfov / 2))                 view widths per (1/m)
+k        = (0.063 m / rig scale) / (2 tan(hfov / 2))   view widths per (1/m), rig units
 front    = k * (q_near - q_screen)                     at strength 1
 behind   = k * (q_screen - q_far)
 strength = min(authored, capFront / front, capBehind / behind)
 ```
 
-Strength is only ever reduced, never raised above the authored IPD Factor. It backs off about
-three times faster than it returns.
+Strength is only ever reduced, never raised above the authored IPD Factor.
+
+Two things happen with that formula:
+
+- **A follower** heads for the strength that fits once the screen plane has *arrived* at its
+  target (median of three, backing off about three times faster than it returns).
+- **A per-frame bound** evaluates the same formula at the convergence *actually delivered this
+  frame* and is applied at once, not through the follower. The plane lags its target by the
+  time constant; without this bound a camera turning from a far scene to a near object left
+  the front cap exceeded several times over for seconds. With it, strength dips while the
+  plane travels and comes back as it arrives.
+
+What that guarantees: the estimated disparity of the *last sampled* near / far content, at the
+delivered settings, is inside the caps on every frame. What it does not: content that appears
+between two samples (up to one sample period plus the readback, about 0.2 s) is not known yet,
+and the whole thing is an estimate from depth, not a measurement of the rendered views.
+
+The near / far extremes are taken from every sample that had any depth at all, including the
+ones too weak to move the screen plane - a small near intruder must reach the caps even while
+the convergence holds.
+
+**Rig scale.** The runtime places the eyes a physical distance apart in *world* units whatever
+the rig's `lossyScale` (the provider sends the camera rig with `metersToVirtual = 1`), while
+the convergence is authored in rig units (the driver sends `invConvergenceDistance / scale`).
+In rig units the baseline is therefore `0.063 / scale`: a rig scaled up 10x shows a tenth of
+the disparity. The component and the gizmo both use that.
 
 The caps are **asymmetric** - more is tolerated behind the screen than in front; the defaults
-split the budget 1/3 front, 2/3 behind. They are angles so that they mean the same on any
-display; they become a fraction of the view width through the display's **nominal** viewing
-distance and physical width (`XR_DXR_display_info`), with a 0.6 m / 0.344 m fallback. The live
+split the budget 1/3 front, 2/3 behind. They are **physical angles at the viewer** (on-glass
+disparity over viewing distance), because that - not a percentage of the picture - is what
+comfort depends on. They become a fraction of the view width through the display's **nominal**
+viewing distance and the physical width of the app's **canvas** (its window on the panel;
+the whole display when the canvas is not known), with a 0.6 m / 0.344 m fallback. So the same
+caps allow a larger fraction in a small window, where that fraction is fewer millimetres on
+the glass. The component and the gizmo use the same width. The live
 head position is deliberately not used: a budget that follows the head makes the picture
 breathe as the viewer leans.
 
@@ -121,7 +171,8 @@ The plug-in does not consume the runtime's `XR_DXR_stereo_comfort` bounds yet (s
 
 - Sampled every 0.15 s (about 7 Hz). The follower is far slower, so the one or two frames of
   readback latency do not matter.
-- Median of the last three samples, then a dead band (2 % of the comfort budget, expressed in
+- Median of the last three samples (each depth grid is published and consumed exactly once,
+  although its readback can come back twice), then a dead band (2 % of the comfort budget, expressed in
   nearness), then a critically damped spring with the Time Constant - no overshoot from rest.
 - The first sample, and the one after `ResetConvergence()`, are followed with a 0.06 s time
   constant for at most 0.4 s. When that fast phase ends its velocity is dropped: carried into
@@ -152,20 +203,30 @@ cursor. So it behaves exactly as the cursor's depth source does:
 Each grid is offset by a quarter texel in a four-sample rotation, so consecutive samples do not
 read the same pixels. If the depth-aware cursor is also using scene depth, it skips the one
 frame in which a grid is drawn (one in about nine at 60 fps), well inside its own freshness
-window.
+window; two grid frames are never drawn in a row, so at very low frame rates the cursor still
+gets every other frame.
+
+Every grid carries the frame it was drawn in and the camera it was drawn from. A component
+ignores grids drawn before its last `ResetConvergence()` or before it (re)became the active
+rig, and grids drawn from another camera - with two rigs in a scene, the rig that takes over
+after `DisplayXRRigManager.CycleNext()` never starts from the other one's view.
 
 ## Editor
 
 - **Convergence as a distance.** The `DisplayXRCamera` inspector shows the convergence as
   metres as well, editable; type `infinity` (or clear the field) for parallel. It edits the same
   serialized inverse-distance field.
-- **Comfort volume gizmo.** Both rigs draw the front (red) and behind (green) comfort limits
-  either side of the screen plane, from the same caps (the defaults when there is no
-  auto-convergence component). Toggle with **DisplayXR > Gizmos > Comfort Volume**. It is an
+- **Comfort volume gizmo.** The front (red) and behind (green) comfort limits either side of
+  the screen plane, from the same caps and the same canvas width. A rig that carries an
+  Auto Convergence component draws it; for every other rig (display-centric ones included, with
+  the default caps) it is **off** until **DisplayXR > Gizmos > Comfort Volume** is ticked, so
+  projects that do not use this feature see no change in their gizmos. It is an
   authoring approximation - similar triangles from a 63 mm eye separation and the nominal
   viewing distance - not the runtime's projection.
 - The component's inspector shows a live readout in Play Mode: source, delivered and target
-  distance, strength, near / far disparity against the caps, sample counts.
+  distance, strength, near / far disparity against the caps, sample counts, and - for the
+  Depth source - the mean depth of the grid's top and bottom third (see
+  [Verifying](#verifying)).
 
 ## Tuning
 
@@ -192,6 +253,9 @@ window.
   recommendation; the cursor's 32 x 32 target is shared so that no pipeline hook had to change).
   A subject thinner than a thirtieth of the frame can be missed in one sample; the jitter and
   the median cover that.
+- **The grid's vertical orientation is not verified on every graphics API.** The bottom-row
+  damping assumes v = 0 is the bottom of the view. Check it once per API / pipeline with the
+  readout described under [Verifying](#verifying).
 - **Depth is taken from the left eye**, corrected for the eye's offset along the camera axis.
 - **Disparity is an estimate** (parallel-axis similar triangles, nominal 63 mm eye separation).
   It sizes the caps; it is not a measurement of the rendered views.
@@ -205,6 +269,20 @@ window.
   take `frontDisparityMeters / behindDisparityMeters` over the canvas width in place of its own
   caps, and `userDepthScale` in place of User Depth Scale. Use the nominal-distance figure, not
   the tracked one, for the reason above.
+
+## Verifying
+
+- **Grid orientation.** Depth source, camera at standing height looking at a floor with nothing
+  else in view: the inspector's *Grid top / bottom third* (or the component's context menu
+  *Log Grid Orientation*, or `GridTopThirdDepth` / `GridBottomThirdDepth`) must show the
+  **bottom** third nearer than the top. If it is the other way round the grid is upside down on
+  that graphics API: set `DISPLAYXR_CURSOR_DEPTH_FLIPY=1` to confirm, and report the API and
+  pipeline.
+- **Caps while moving.** Settle on a far scene, then turn to an object half a metre away: in
+  the readout, *Disparity near* must stay within *Caps front* throughout, with Stereo Strength
+  dipping and recovering.
+- **Reset.** Teleport and call `ResetConvergence()`: Convergence reaches the new distance in
+  about a third of a second, and does not first head for the old one.
 
 ## Files
 
