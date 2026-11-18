@@ -89,8 +89,10 @@ namespace DisplayXR
         }
 
         /// <summary>
-        /// One eye's sampling: uv_texture = uv_quad * scale + offset, then clamped to
-        /// [clampMin, clampMax] so bilinear filtering never reads the other eye's half.
+        /// One eye's sampling: uv_texture = uv_quad * scale + offset, then kept inside
+        /// [clampMin, clampMax] - the eye's own half of the texture, edge to edge. The
+        /// shader pulls that rectangle in by <see cref="SeamInsetTexels"/> for the mip level
+        /// it samples, so filtering never reads the other eye's half.
         /// </summary>
         public struct EyeMapping
         {
@@ -173,6 +175,10 @@ namespace DisplayXR
         /// its half. Ignored when <paramref name="stereo"/> is false.</param>
         /// <param name="flipVertical">The texture is stored upside down.</param>
         /// <param name="stereo">False = mono fallback: both eyes get the LEFT image.</param>
+        /// <param name="textureWidth">Width of the picture in pixels. Only the shape matters
+        /// (it gives the aspect), so pass the SOURCE size where the texture was resized on
+        /// import.</param>
+        /// <param name="textureHeight">Height of the picture in pixels; see above.</param>
         public static Solution Solve(int textureWidth, int textureHeight, DisplayXRStereoLayout layout,
                                      bool halfResolution, float pixelAspect, DisplayXRStereoFit fit,
                                      float frameAspect, float depthShift, bool flipVertical, bool stereo)
@@ -204,14 +210,13 @@ namespace DisplayXR
             r.frameX = frameX;
             r.frameY = frameY;
             r.pictureAspect = picture;
-            r.left = MapEye(layout, false, s, a, visibleX, visibleY, flipVertical, textureWidth, textureHeight);
-            r.right = MapEye(layout, twoImages, s, a, visibleX, visibleY, flipVertical, textureWidth, textureHeight);
+            r.left = MapEye(layout, false, s, a, visibleX, visibleY, flipVertical);
+            r.right = MapEye(layout, twoImages, s, a, visibleX, visibleY, flipVertical);
             return r;
         }
 
         static EyeMapping MapEye(DisplayXRStereoLayout layout, bool rightEye, float s, float a,
-                                 float visibleX, float visibleY, bool flipVertical,
-                                 int textureWidth, int textureHeight)
+                                 float visibleX, float visibleY, bool flipVertical)
         {
             UVRect eye = EyeRect(layout, rightEye);
 
@@ -249,14 +254,32 @@ namespace DisplayXR
                 m.offsetY = y;
             }
 
-            // Half a texel inside the eye's own half: the bilinear footprint stays in it.
-            float insetX = textureWidth > 0 ? 0.5f / textureWidth : 0f;
-            float insetY = textureHeight > 0 ? 0.5f / textureHeight : 0f;
-            m.clampMinX = eye.x + insetX;
-            m.clampMaxX = eye.x + eye.width - insetX;
-            m.clampMinY = yLo + insetY;
-            m.clampMaxY = yHi - insetY;
+            // The eye's own half, edge to edge. The seam inset depends on the mip level
+            // being sampled, which only the shader knows (SeamInsetTexels).
+            m.clampMinX = eye.x;
+            m.clampMaxX = eye.x + eye.width;
+            m.clampMinY = yLo;
+            m.clampMaxY = yHi;
             return m;
+        }
+
+        /// <summary>
+        /// How far inside its own half an eye's sampling must stay, in texels of mip 0, so
+        /// that linear filtering at <paramref name="mipLevel"/> gives the other eye's
+        /// texels zero weight.
+        /// <para>
+        /// A texel of mip n is 2^n base texels wide, and a bilinear tap reaches half of one
+        /// to either side: the inset is 0.5 * 2^n. A constant half base texel is only right
+        /// for mip 0 - at mip n it leaves the texel across the seam a weight of
+        /// (2^n - 1) / 2^(n+1), a visible column of the other eye on a minified picture.
+        /// Trilinear filtering blends mips floor(l) and ceil(l), so a fractional level is
+        /// rounded UP. The shader computes the same value per pixel.
+        /// </para>
+        /// </summary>
+        public static float SeamInsetTexels(float mipLevel)
+        {
+            if (!(mipLevel > 0f)) return 0.5f;
+            return 0.5f * (float)Math.Pow(2.0, Math.Ceiling(mipLevel));
         }
 
         /// <summary>The shader does nothing to the sampled colour.</summary>

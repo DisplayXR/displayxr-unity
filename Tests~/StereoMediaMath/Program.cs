@@ -136,8 +136,8 @@ static class Program
         Map(s.left, 0f, 1f, out _, out float vTop);
         Map(s.left, 0f, 0f, out _, out float vBottom);
         Check(Near(vTop, 0f) && Near(vBottom, 0.5f), "TB flipped: left eye top row = texture v 0, bottom row = v 0.5");
-        Check(Near(s.left.clampMinY, 0f + 0.5f / 1080) && Near(s.left.clampMaxY, 0.5f - 0.5f / 1080), "TB flipped: left clamp follows the flipped half");
-        Check(Near(s.right.clampMinY, 0.5f + 0.5f / 1080) && Near(s.right.clampMaxY, 1f - 0.5f / 1080), "TB flipped: right clamp follows the flipped half");
+        Check(Near(s.left.clampMinY, 0f) && Near(s.left.clampMaxY, 0.5f), "TB flipped: left clamp follows the flipped half");
+        Check(Near(s.right.clampMinY, 0.5f) && Near(s.right.clampMaxY, 1f), "TB flipped: right clamp follows the flipped half");
 
         s = Plain(DisplayXRStereoLayout.TopBottomSwapped, flip: true);
         Check(Covers(s.left, 0f, 0.5f, 1f, 1f), "TB swapped flipped: left eye (picture bottom) samples texture v 0.5..1");
@@ -280,20 +280,65 @@ static class Program
 
     static void TestClamp()
     {
+        // The clamp rectangle is the eye's own half, edge to edge; the shader insets it by
+        // SeamInsetTexels for the mip level it samples.
         var s = Plain(DisplayXRStereoLayout.SideBySide);
-        float hx = 0.5f / 3840, hy = 0.5f / 1080;
-        Check(Near(s.left.clampMinX, hx, 1e-7f) && Near(s.left.clampMaxX, 0.5f - hx, 1e-7f), "SBS left clamp = left half inset by half a texel");
-        Check(Near(s.right.clampMinX, 0.5f + hx, 1e-7f) && Near(s.right.clampMaxX, 1f - hx, 1e-7f), "SBS right clamp = right half inset by half a texel");
-        Check(Near(s.left.clampMinY, hy, 1e-7f) && Near(s.left.clampMaxY, 1f - hy, 1e-7f), "SBS clamp covers the full height");
-        Check(s.left.clampMaxX < 0.5f && s.right.clampMinX > 0.5f, "the seam column is never blended across");
+        Check(Near(s.left.clampMinX, 0f, 1e-7f) && Near(s.left.clampMaxX, 0.5f, 1e-7f), "SBS left clamp = left half");
+        Check(Near(s.right.clampMinX, 0.5f, 1e-7f) && Near(s.right.clampMaxX, 1f, 1e-7f), "SBS right clamp = right half");
+        Check(Near(s.left.clampMinY, 0f, 1e-7f) && Near(s.left.clampMaxY, 1f, 1e-7f), "SBS clamp covers the full height");
 
         s = Plain(DisplayXRStereoLayout.TopBottom);
-        Check(Near(s.left.clampMinY, 0.5f + hy, 1e-7f) && Near(s.left.clampMaxY, 1f - hy, 1e-7f), "TB left clamp = top half inset");
-        Check(Near(s.right.clampMinY, hy, 1e-7f) && Near(s.right.clampMaxY, 0.5f - hy, 1e-7f), "TB right clamp = bottom half inset");
+        Check(Near(s.left.clampMinY, 0.5f, 1e-7f) && Near(s.left.clampMaxY, 1f, 1e-7f), "TB left clamp = top half");
+        Check(Near(s.right.clampMinY, 0f, 1e-7f) && Near(s.right.clampMaxY, 0.5f, 1e-7f), "TB right clamp = bottom half");
 
         // A crop (Fill, depth shift) does not shrink the clamp: it only has to keep the eye in its half.
         s = M.Solve(3840, 1080, DisplayXRStereoLayout.SideBySide, false, 1f, DisplayXRStereoFit.Fill, 1f, 0.1f, false, true);
-        Check(Near(s.left.clampMinX, hx, 1e-7f) && Near(s.left.clampMaxX, 0.5f - hx, 1e-7f), "clamp is the eye's half, not the visible window");
+        Check(Near(s.left.clampMinX, 0f, 1e-7f) && Near(s.left.clampMaxX, 0.5f, 1e-7f), "clamp is the eye's half, not the visible window");
+
+        // The clamp does not depend on the stated size (which may be the source size of a
+        // texture resized on import): only the aspect does.
+        var a = M.Solve(3840, 1080, DisplayXRStereoLayout.SideBySide, false, 1f, DisplayXRStereoFit.Fit, 2f, 0f, false, true);
+        var b = M.Solve(4096, 1024, DisplayXRStereoLayout.SideBySide, false, 1f, DisplayXRStereoFit.Fit, 2f, 0f, false, true);
+        Check(Near(a.left.clampMaxX, b.left.clampMaxX) && Near(a.right.clampMinX, b.right.clampMinX), "clamp is independent of the stated size");
+        Check(Near(a.pictureAspect, 16f / 9f) && Near(b.pictureAspect, 2f), "3840x1080 resized to 4096x1024 on import: aspect 1.78 becomes 2.0 unless the source size is stated");
+    }
+
+    // Linear (bilinear) filtering at mip level n, one dimension. Position and inset are in
+    // texels of mip 0, measured from the seam into the eye's own half. A texel of mip n is
+    // 2^n wide; the texel just across the seam has its centre at -2^n / 2. Returns the
+    // weight that texel gets - what leaks in from the other eye.
+    static float OtherEyeWeight(float distanceFromSeam, int mip)
+    {
+        float size = (float)Math.Pow(2, mip);
+        float w = 1f - (distanceFromSeam + 0.5f * size) / size;
+        return w > 0f ? w : 0f;
+    }
+
+    static void TestSeamInset()
+    {
+        for (int mip = 0; mip <= 3; mip++)
+        {
+            float inset = M.SeamInsetTexels(mip);
+            Check(Near(inset, 0.5f * (float)Math.Pow(2, mip)), $"mip {mip}: inset = half a texel of that mip ({inset} base texels)");
+            Check(OtherEyeWeight(inset, mip) == 0f, $"mip {mip}: at the inset the other eye's texel has zero weight");
+            // What a constant half base texel leaves: (2^n - 1) / 2^(n+1).
+            float leak = OtherEyeWeight(0.5f, mip);
+            float expected = ((float)Math.Pow(2, mip) - 1f) / (float)Math.Pow(2, mip + 1);
+            Check(Near(leak, expected), $"mip {mip}: a fixed half-texel inset leaks {expected:F4} of the other eye (got {leak:F4})");
+            Check(mip == 0 ? leak == 0f : leak > 0f, $"mip {mip}: the fixed inset is only enough at mip 0");
+        }
+        // Trilinear blends the two neighbouring mips: the coarser one decides.
+        Check(Near(M.SeamInsetTexels(1.3f), 2f), "mip 1.3 rounds up to mip 2");
+        Check(Near(M.SeamInsetTexels(2f), 2f), "an exact level is not rounded further");
+        Check(Near(M.SeamInsetTexels(0.01f), 1f), "any minification takes mip 1's inset");
+        Check(Near(M.SeamInsetTexels(-2f), 0.5f) && Near(M.SeamInsetTexels(0f), 0.5f), "magnification: half a base texel");
+        Check(Near(M.SeamInsetTexels(float.NaN), 0.5f), "NaN level: half a base texel");
+        for (float l = 0f; l <= 3f; l += 0.25f)
+        {
+            float inset = M.SeamInsetTexels(l);
+            Check(OtherEyeWeight(inset, (int)Math.Floor(l)) == 0f && OtherEyeWeight(inset, (int)Math.Ceiling(l)) == 0f,
+                  $"level {l:F2}: no leak in either mip trilinear filtering blends");
+        }
     }
 
     static void TestColor()
@@ -347,6 +392,7 @@ static class Program
         TestFit();
         TestDepthShift();
         TestClamp();
+        TestSeamInset();
         TestColor();
         TestDiagnose();
         TestFrustumPlane();
