@@ -85,7 +85,14 @@ real texture and the real zoom, so its line is to be trusted where this table is
   the re-host watcher restarts the display subsystem. GVFIT and the Low Resolution switch still
   apply to every Game view.
 - **Which scale:** the pane's own points-to-pixels, measured as (pane width in physical px, read
-  under per-monitor-v2 awareness) / (Unity's host width in points) and snapped to a whole percent.
+  under per-monitor-v2 awareness) / (Unity's host width in points) and snapped to a whole percent
+  (`DisplayXRGameViewPlacement.PaneScale`). The px width is a whole number, so the bare quotient
+  is off by up to a pixel's worth: 961 px / 549.7142 pt = 1.7482 at 175 %. A fixed 0.001 snap
+  rejected that, the scale read "not a whole percent" on a pane narrower than about 1000 px, and
+  a held whole-pixel size was given up for a whole resize step (harness pass, 175 %). The snap
+  now accepts the multiple of 25 %, else the whole percent, that predicts the pane's px width
+  to within one pixel; and a scale that does not read as a whole percent while a whole-pixel
+  size is held keeps the size.
   The global `EditorGUIUtility.pixelsPerPoint` is only valid inside `OnGUI`; the glue latches its
   first value above 1.1 and uses it only to find the pane and before a pane is matched.
   `GetDpiForWindow(pane)` is logged next to the measured scale as a cross-check and is not used

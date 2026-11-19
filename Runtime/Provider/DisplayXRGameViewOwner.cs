@@ -130,7 +130,13 @@ namespace DisplayXR
                                                                   out int rwPt, out int rhPt, out int rwPx, out int rhPx))
                         return new Step { Kind = Act.WholePixel, WPx = rwPx, HPx = rhPx, WPt = rwPt, HPt = rhPt,
                                           Refit = true, Why = "the view became smaller than the whole-pixel size" };
-                    return Do(Act.FreeAspect, "the view area is smaller than one whole-pixel step");
+                    // No size could be computed. If that is because the SCALE reads as "not a
+                    // whole percent" (it was one when the size was selected: a reading taken
+                    // while the layout moves), hold the size and look again; giving it up put
+                    // the view on Free Aspect, not 1:1, until the next resize.
+                    if (DisplayXRGameViewPlacement.WholePixelStepPt(o.Scale) == 0) return Do(Act.None, null);
+                    return Do(Act.FreeAspect, DisplayXRGameViewPlacement.WholePixelStepPt(o.Scale) == 1
+                        ? "the pane is at a whole display scale" : "the view area is smaller than one whole-pixel step");
                 }
                 if (!o.TakeoverOn) return Do(Act.None, null);
                 if (_zoomTries >= MaxZoomTries)
@@ -146,9 +152,11 @@ namespace DisplayXR
             // 3. Zoom 1: the whole-pixel size, where it is wanted and the scale needs one.
             if (!o.WholePixelOn) return Do(Act.None, null);
             int step = DisplayXRGameViewPlacement.WholePixelStepPt(o.Scale);
+            // step 0: the scale does not read as a whole percent. Nothing is selected then; a
+            // size that is HELD is kept (the scale was a whole percent when it was selected).
             if (step <= 1)
-                return Held == Holds.WholePixel
-                    ? Do(Act.FreeAspect, step == 1 ? "the pane is at a whole display scale" : "the pane's scale is not a whole percent")
+                return Held == Holds.WholePixel && step == 1
+                    ? Do(Act.FreeAspect, "the pane is at a whole display scale")
                     : Do(Act.None, null);
 
             if (_pendSince < 0.0 || o.AreaWPt != _pendW || o.AreaHPt != _pendH || o.Scale != _pendScale)

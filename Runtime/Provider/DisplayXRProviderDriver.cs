@@ -1999,8 +1999,10 @@ namespace DisplayXR
                 if (pcw > 64 && pch > 64)
                 {
                     // Points -> physical for THIS pane, measured from its own two rects.
+                    // (#459) PaneScale: the px width is whole, so the bare quotient is off by
+                    // up to a pixel's worth and read 1.748 for 175 % on a narrow pane.
                     float ptToPx = (host.width > 1f)
-                        ? (s_panePhysWin.right - s_panePhysWin.left) / host.width
+                        ? DisplayXRGameViewPlacement.PaneScale(s_panePhysWin.right - s_panePhysWin.left, host.width)
                         : ppp;
 
                     // (#263) THE TOOLBAR, taken from Unity's own draw rect — and ONLY

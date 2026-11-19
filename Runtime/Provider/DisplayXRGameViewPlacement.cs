@@ -68,6 +68,31 @@ namespace DisplayXR
             return Math.Abs(snapped - ptToPx) < 1e-3f ? snapped : ptToPx;
         }
 
+        /// <summary>
+        /// (#459) The pane's points-to-px from its own two widths: physical px (the pane
+        /// window, read under per-monitor-v2 awareness) over Unity points (the host view).
+        /// The px width is a WHOLE number while points x scale is not, so the quotient is off
+        /// by up to one pixel's worth: 961 px / 549.7142 pt = 1.74818 at 175 % (549.7142 x
+        /// 1.75 = 961.99997, which Unity made 961). That is 0.0018 from 1.75, outside the fixed
+        /// 0.001 the snap below allows, so on a pane narrower than about 1000 px the scale read
+        /// "not a whole percent": no whole-pixel step, and a held whole-pixel size was given up
+        /// (harness, 175 %: the view sat on Free Aspect, not 1:1, for a whole resize step).
+        /// So: a scale that predicts the pane's px width to within one pixel IS the scale -
+        /// the nearest multiple of 25 % first (what Windows offers; on a pane under about
+        /// 200 pt one pixel is more than half a percent, and the nearest whole percent can be
+        /// the wrong neighbour), then the nearest whole percent. Otherwise (a custom scale such
+        /// as 133.33 %) the quotient is returned.
+        /// </summary>
+        public static float PaneScale(int panePx, float hostPt)
+        {
+            if (panePx <= 0 || !(hostPt > 1f)) return 0f;
+            float measured = panePx / hostPt;
+            float quarter = Round(measured * 4f) / 4f;
+            if (quarter > 0f && Math.Abs(quarter * hostPt - panePx) <= 1.0001f) return quarter;
+            float percent = Round(measured * 100f) / 100f;
+            return Math.Abs(percent * hostPt - panePx) <= 1.0001f ? percent : measured;
+        }
+
         /// <summary>The #740 Y term: the anchor moves UP by the dock's bottom margin. Negative.
         /// Since #420 only the fallback (no draw rect, or a GL device) still uses it.</summary>
         public static int BottomMarginPx(float ptToPx) => -RoundToInt(RtBottomMarginPt * ptToPx);

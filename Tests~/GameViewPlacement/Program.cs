@@ -553,6 +553,52 @@ static class Program
             Check(v.Selected == 0 && v.OursIndex() < 0, "H: Play end removes the entry");
         }
 
+        // ---- J. The harness pass "rzfree" (175 %, from Free Aspect): at the third resize the
+        //         pane was 961 px for a 549.7142 pt host. 961 / 549.7142 = 1.748181, which did
+        //         not snap to 1.75, so the scale read "not a whole percent": the held size was
+        //         given up for Free Aspect and nothing was selected again for the whole step.
+        {
+            float raw = 961 / 549.7142f;
+            Check(DisplayXRGameViewPlacement.WholePixelStepPt(raw) == 0, $"J: the bare quotient {raw:R} is not a whole percent (the cause)");
+            Check(DisplayXRGameViewPlacement.PaneScale(961, 549.7142f) == 1.75f, "J: PaneScale(961 px, 549.7142 pt) == 1.75 (one pixel of rounding)");
+            Check(DisplayXRGameViewPlacement.PaneScale(962, 549.7142f) == 1.75f && DisplayXRGameViewPlacement.PaneScale(1242, 709.7142f) == 1.75f
+                  && DisplayXRGameViewPlacement.PaneScale(2213, 737.6666f) == 3f && DisplayXRGameViewPlacement.PaneScale(1733, 693.2f) == 2.5f
+                  && DisplayXRGameViewPlacement.PaneScale(1476, 984f) == 1.5f && DisplayXRGameViewPlacement.PaneScale(400, 229f) == 1.75f,
+                  "J: PaneScale on logged panes at 175 / 300 / 250 / 150 %");
+            float custom = DisplayXRGameViewPlacement.PaneScale(1333, 1000f);
+            Check(Math.Abs(custom - 1.333f) < 1e-6 && DisplayXRGameViewPlacement.WholePixelStepPt(custom) == 0
+                  && DisplayXRGameViewPlacement.PaneScale(0, 500f) == 0f && DisplayXRGameViewPlacement.PaneScale(500, 0f) == 0f,
+                  "J: a custom scale (133.3 %) is not forced onto a whole percent; bad inputs give 0");
+            int wrong = 0;
+            foreach (float sc in new[] { 1.25f, 1.5f, 1.75f, 2f, 2.25f, 2.5f, 3f })
+                for (float host = 160f; host < 1400f; host += 0.5714285f)
+                    foreach (int px in new[] { (int)Math.Floor(host * sc), (int)Math.Round(host * sc), (int)Math.Ceiling(host * sc) })
+                        if (DisplayXRGameViewPlacement.PaneScale(px, host) != sc) wrong++;
+            Check(wrong == 0, $"J: PaneScale recovers the scale for every pane width from 160 to 1400 pt, px floored / rounded / ceiled ({wrong} wrong)");
+
+            // The owner, fed what the harness pass saw.
+            var v = new FakeView { Scale = 1.75f };
+            v.Resize(684.857f, 343.857f);
+            var owner = new DisplayXRGameViewOwner();
+            double now = 0;
+            Run(owner, v, ref now, 1.0, wholePixelOn: true);
+            v.Resize(739.714f, 343.857f); Run(owner, v, ref now, 1.0, wholePixelOn: true);
+            v.Resize(616.857f, 343.857f); Run(owner, v, ref now, 1.0, wholePixelOn: true);
+            Check(owner.AppliedWPx == 1078 && owner.AppliedHPx == 595, $"J: steps 1-2 as in the pass: {owner.AppliedWPx}x{owner.AppliedHPx} (1078x595)");
+            // Step 3 with the scale as it read before the fix.
+            v.Scale = raw; v.Resize(547.7142f, 343.857f);
+            var bad = Run(owner, v, ref now, 1.0, wholePixelOn: true);
+            Check(Count(bad, FreeAspect) == 0 && Count(bad, StandDown) == 0 && v.Selected == v.OursIndex() && owner.Held == DisplayXRGameViewOwner.Holds.WholePixel,
+                  "J: a scale that reads 'not a whole percent' while a size is held does not give the size up (it did: Free Aspect for the whole step)");
+            // ...and with the scale as PaneScale reads it: re-fitted at once.
+            v.Scale = DisplayXRGameViewPlacement.PaneScale(961, 549.7142f);
+            var good = Run(owner, v, ref now, 0.1, wholePixelOn: true);
+            Check(good.Count == 1 && good[0].Kind == WholePixel && good[0].Refit && good[0].WPx == 952 && good[0].HPx == 595 && v.Zoom == 1f,
+                  $"J: step 3 (x0.8, 547.71 pt): re-fitted to 952x595 at once (the 4K-start pass did: 952x595); got {(good.Count > 0 ? good[0].WPx + "x" + good[0].HPx : "nothing")}");
+            v.EndPlay(owner);
+            Check(v.Selected == 0 && v.Zoom == 1f && v.OursIndex() < 0, "J: Play end: Free Aspect at 1x");
+        }
+
         // ---- I. Settle: a growing drag costs one size change, not one per poll.
         {
             var v = new FakeView { Scale = 1.75f };
