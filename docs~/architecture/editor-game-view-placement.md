@@ -179,7 +179,14 @@ the size, calls `GameView.UpdateZoomAreaAndParent`, sets zoom and scroll through
 and scroll back every 0.1 s: three agreeing reads in a row end it with
 `Game view: restored the previous size and zoom ... - leaving Play: read back size index 6 "4K UHD (3840x2160)", zoom 0.2786x, scroll (x,y)`;
 a read that differs is re-applied; after 30 reads one warning states what the view really
-shows. The line reports values read from the view, not the intended ones. Before a domain
+shows. The line reports values read from the view, not the intended ones. **The scroll is checked
+only while the view area is the size it was recorded in**
+(`DisplayXRGameViewPlacement.ScrollIsComparable`, 0.05 pt): `GameView.EnforceZoomAreaConstraints`
+re-centres content smaller than the area on every OnGUI (a translation of half the area) and
+clamps the rest, so after a splitter drag during Play the recorded value is not one Unity will
+hold - on hardware that was a false `could not be put back ... scroll (359,171.36) instead of
+(342.43,171.93) after 28 re-applications`, 359 being half of the new 718 pt area. With a
+different area the size and zoom are restored, Unity places the scroll, and the one line says so. Before a domain
 reload or a quit nothing can run later, so there is one application and no read-back.
 
 **GVFIT and a texture that is not the view's yet.** Right after a size change the view still

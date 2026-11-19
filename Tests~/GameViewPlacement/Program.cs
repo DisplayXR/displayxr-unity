@@ -599,6 +599,29 @@ static class Program
             Check(v.Selected == 0 && v.Zoom == 1f && v.OursIndex() < 0, "J: Play end: Free Aspect at 1x");
         }
 
+        // ---- K. The scroll after Play: checked exactly while the view area is the size it was
+        //         recorded in; not at all once the pane was resized during Play (hardware:
+        //         "scroll (359,171.36) instead of (342.43,171.93) after 28 re-applications" -
+        //         Unity re-centres it to half the NEW area on every OnGUI).
+        {
+            Check(DisplayXRGameViewPlacement.ScrollIsComparable(684.857f, 343.857f, 684.857f, 343.857f),
+                  "K: same view area: the recorded scroll is checked exactly");
+            Check(DisplayXRGameViewPlacement.ScrollIsComparable(684.857f, 343.857f, 684.86f, 343.86f),
+                  "K: the same area to float noise is the same area");
+            Check(!DisplayXRGameViewPlacement.ScrollIsComparable(684.857f, 343.857f, 718f, 342.714f),
+                  "K: hardware pass 1 (684.86 pt area at capture, 718 pt at restore): the scroll is not checked");
+            Check(!DisplayXRGameViewPlacement.ScrollIsComparable(718f, 342.714f, 723.714f, 342.714f)
+                  && !DisplayXRGameViewPlacement.ScrollIsComparable(718f, 342.714f, 718f, 343.857f),
+                  "K: hardware pass 2 (718 -> 723.71 pt), and a change of height alone: not checked");
+            Check(!DisplayXRGameViewPlacement.ScrollIsComparable(684.857f, 343.857f, 685.4286f, 343.857f),
+                  "K: half a point is a different area (the harness main-window round trip)");
+            Check(DisplayXRGameViewPlacement.ScrollIsComparable(0f, 0f, 718f, 342.714f) && DisplayXRGameViewPlacement.ScrollIsComparable(684f, 0f, 1f, 1f),
+                  "K: a record without an area (an older build) keeps the exact check");
+            // The numbers behind it: a centred view scroll is half its area.
+            Check(Math.Abs(684.857 / 2 - 342.43) < 0.01 && Math.Abs(718.0 / 2 - 359.0) < 0.01 && Math.Abs(723.714 / 2 - 361.86) < 0.01,
+                  "K: the logged scrolls 342.43 / 359 / 361.86 are half of 684.86 / 718 / 723.71 pt");
+        }
+
         // ---- I. Settle: a growing drag costs one size change, not one per poll.
         {
             var v = new FakeView { Scale = 1.75f };

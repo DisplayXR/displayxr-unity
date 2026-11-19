@@ -333,6 +333,27 @@ namespace DisplayXR
             y += (areaH - h) / 2;
         }
 
+        /// <summary>The view area counts as the same size within this many points.</summary>
+        public const float SameAreaTolPt = 0.05f;
+
+        /// <summary>
+        /// (#459) Can the Game view's scroll (ZoomableArea.m_Translation) recorded before Play
+        /// be expected back after it? Only when the view AREA is the size it was then. The
+        /// scroll is not free: on every OnGUI GameView.EnforceZoomAreaConstraints re-centres
+        /// content that is smaller than the area (shownArea.x = -shownArea.width / 2, i.e. a
+        /// translation of HALF THE AREA: 342.43 pt for a 684.86 pt area) and clamps the rest
+        /// to the content. After a splitter drag during Play the recorded value is therefore
+        /// no longer one Unity will hold (hardware: "scroll (359,171.36) instead of
+        /// (342.43,171.93) after 28 re-applications" - 359 is half of the new 718 pt area).
+        /// Then the size and zoom are restored and Unity places the scroll. A record without
+        /// an area (written by an older build) keeps the exact check.
+        /// </summary>
+        public static bool ScrollIsComparable(float recordedWPt, float recordedHPt, float nowWPt, float nowHPt)
+        {
+            if (!(recordedWPt > 0f) || !(recordedHPt > 0f)) return true;
+            return Math.Abs(nowWPt - recordedWPt) <= SameAreaTolPt && Math.Abs(nowHPt - recordedHPt) <= SameAreaTolPt;
+        }
+
         /// <summary>How far outside the pane an anchor may sit before it is called wrong: the
         /// zoom-1 placement legitimately leaves the render area by a rounding pixel or two.</summary>
         public const int PaneSlackPx = 8;

@@ -476,6 +476,7 @@ namespace DisplayXR.Editor
                     Zoom = recHere ? rec.PrevZoom : 0f,
                     HaveScroll = recHere && rec.HaveScroll,
                     Scroll = recHere ? new Vector2(rec.ScrollX, rec.ScrollY) : Vector2.zero,
+                    Area = recHere ? new Vector2(rec.AreaW, rec.AreaH) : Vector2.zero,
                 };
                 foreach (EditorWindow v in restore)
                 {
@@ -515,6 +516,7 @@ namespace DisplayXR.Editor
             public int Index; public string Name;
             public float Zoom;              // 0 = leave the zoom alone
             public bool HaveScroll; public Vector2 Scroll;   // ZoomableArea.m_Translation
+            public Vector2 Area;            // the view area the scroll was recorded in, points (zero = unknown)
         }
 
         sealed class Pending
@@ -527,6 +529,16 @@ namespace DisplayXR.Editor
         const int kVerifyMax = 30;      // then give up and say what the view really shows
         const float kScrollTolPt = 0.51f;
 
+        // The recorded scroll is only one Unity will hold while the view area is the size it
+        // was recorded in (DisplayXRGameViewPlacement.ScrollIsComparable): after a splitter
+        // drag during Play, Unity re-centres / clamps it for the new area on every OnGUI.
+        static bool ScrollApplies(EditorWindow v, in ViewState want)
+        {
+            if (!want.HaveScroll) return false;
+            Vector2 now = ViewAreaPoints(v);
+            return DisplayXRGameViewPlacement.ScrollIsComparable(want.Area.x, want.Area.y, now.x, now.y);
+        }
+
         // Size, then the zoom area re-fitted to THAT size, then zoom and scroll. The order
         // matters: see "THE RESTORE IS VERIFIED" at the top.
         static void ApplyViewState(EditorWindow v, in ViewState want)
@@ -538,7 +550,7 @@ namespace DisplayXR.Editor
             if (want.Zoom > 0f)
             {
                 bool set = false;
-                if (want.HaveScroll)
+                if (ScrollApplies(v, want))
                     set = DisplayXRProviderDriver.SetGameViewZoomState(v, want.Zoom, want.Scroll);
                 if (!set) { try { SnapZoom(v, want.Zoom); } catch (Exception) { } }
             }
@@ -557,7 +569,7 @@ namespace DisplayXR.Editor
                 float tol = 1e-4f * Mathf.Max(1f, want.Zoom);
                 if (Mathf.Abs(zoom.x - want.Zoom) > tol || Mathf.Abs(zoom.y - want.Zoom) > tol)
                 { why = "zoom (" + zoom.x.ToString("0.####", Inv) + "," + zoom.y.ToString("0.####", Inv) + ") instead of " + want.Zoom.ToString("0.####", Inv); return false; }
-                if (want.HaveScroll && (Mathf.Abs(scroll.x - want.Scroll.x) > kScrollTolPt || Mathf.Abs(scroll.y - want.Scroll.y) > kScrollTolPt))
+                if (ScrollApplies(v, want) && (Mathf.Abs(scroll.x - want.Scroll.x) > kScrollTolPt || Mathf.Abs(scroll.y - want.Scroll.y) > kScrollTolPt))
                 { why = "scroll (" + scroll.x.ToString("0.##", Inv) + "," + scroll.y.ToString("0.##", Inv) + ") instead of (" +
                         want.Scroll.x.ToString("0.##", Inv) + "," + want.Scroll.y.ToString("0.##", Inv) + ")"; return false; }
             }
@@ -597,7 +609,14 @@ namespace DisplayXR.Editor
                         Debug.Log("[DisplayXR] Game view: restored the previous size and zoom" +
                                   (p.Removed ? " and removed \"" + SizeName + "\"" : "") + " - " + p.Reason +
                                   ": read back " + Describe(p.View) +
-                                  (p.Reapplied > 0 ? " (it held after " + p.Reapplied + " re-application(s))" : ""));
+                                  (p.Reapplied > 0 ? " (it held after " + p.Reapplied + " re-application(s))" : "") +
+                                  (p.Want.HaveScroll && !ScrollApplies(p.View, p.Want)
+                                      ? " - the view area is " + ViewAreaPoints(p.View).x.ToString("0.##", Inv) + "x" +
+                                        ViewAreaPoints(p.View).y.ToString("0.##", Inv) + " pt, it was " +
+                                        p.Want.Area.x.ToString("0.##", Inv) + "x" + p.Want.Area.y.ToString("0.##", Inv) +
+                                        " pt before Play, so the scroll from then (" + p.Want.Scroll.x.ToString("0.##", Inv) + "," +
+                                        p.Want.Scroll.y.ToString("0.##", Inv) + ") does not apply and Unity placed it"
+                                      : ""));
                         s_verify.RemoveAt(i);
                         continue;
                     }
@@ -608,7 +627,7 @@ namespace DisplayXR.Editor
                                          "): " + why + " after " + p.Reapplied + " re-applications. The view now shows " + Describe(p.View) +
                                          "; wanted size index " + p.Want.Index + " \"" + p.Want.Name + "\", zoom " +
                                          p.Want.Zoom.ToString("0.####", Inv) + "x" +
-                                         (p.Want.HaveScroll ? ", scroll (" + p.Want.Scroll.x.ToString("0.##", Inv) + "," + p.Want.Scroll.y.ToString("0.##", Inv) + ")" : "") +
+                                         (ScrollApplies(p.View, p.Want) ? ", scroll (" + p.Want.Scroll.x.ToString("0.##", Inv) + "," + p.Want.Scroll.y.ToString("0.##", Inv) + ")" : "") +
                                          ". Set it in the Game view's toolbar.");
                         s_verify.RemoveAt(i);
                         continue;
@@ -646,6 +665,7 @@ namespace DisplayXR.Editor
             public int    OursIndex = -1;     // total index our custom size was selected at (-1 = never)
             public bool   HaveScroll;         // ScrollX / ScrollY are valid
             public float  ScrollX, ScrollY;   // the user's scroll (ZoomableArea.m_Translation, points)
+            public float  AreaW, AreaH;       // the view area it was read in, points (0 = unknown)
         }
         static Record s_rec;
         static bool   s_recLoaded;
@@ -677,6 +697,14 @@ namespace DisplayXR.Editor
                     case "group":      int.TryParse(val, System.Globalization.NumberStyles.Integer, Inv, out r.Group); break;
                     case "freeAspect": r.FreeAspect = val == "1"; break;
                     case "oursIndex":  int.TryParse(val, System.Globalization.NumberStyles.Integer, Inv, out r.OursIndex); break;
+                    case "area":
+                    {
+                        string[] wh = val.Split(',');
+                        if (wh.Length != 2 || !float.TryParse(wh[0], System.Globalization.NumberStyles.Float, Inv, out r.AreaW)
+                                           || !float.TryParse(wh[1], System.Globalization.NumberStyles.Float, Inv, out r.AreaH))
+                            r.AreaW = r.AreaH = 0f;
+                        break;
+                    }
                     case "scroll":
                     {
                         string[] xy = val.Split(',');
@@ -706,7 +734,8 @@ namespace DisplayXR.Editor
                 "group=" + r.Group.ToString(Inv) + "\n" +
                 "freeAspect=" + (r.FreeAspect ? "1" : "0") + "\n" +
                 "oursIndex=" + r.OursIndex.ToString(Inv) + "\n" +
-                (r.HaveScroll ? "scroll=" + r.ScrollX.ToString("R", Inv) + "," + r.ScrollY.ToString("R", Inv) + "\n" : ""));
+                (r.HaveScroll ? "scroll=" + r.ScrollX.ToString("R", Inv) + "," + r.ScrollY.ToString("R", Inv) + "\n" : "") +
+                (r.AreaW > 0f && r.AreaH > 0f ? "area=" + r.AreaW.ToString("R", Inv) + "," + r.AreaH.ToString("R", Inv) + "\n" : ""));
             s_rec = r; s_recLoaded = true;
         }
 
@@ -733,7 +762,11 @@ namespace DisplayXR.Editor
             };
             // The scroll is part of what the user sees (a zoomed-in view shows one corner).
             if (DisplayXRProviderDriver.TryGetGameViewZoomState(view, out _, out Vector2 scroll))
-            { rec.HaveScroll = true; rec.ScrollX = scroll.x; rec.ScrollY = scroll.y; }
+            {
+                rec.HaveScroll = true; rec.ScrollX = scroll.x; rec.ScrollY = scroll.y;
+                Vector2 area = ViewAreaPoints(view);
+                rec.AreaW = area.x; rec.AreaH = area.y;
+            }
             SaveRecord(rec);
             return rec;
         }
