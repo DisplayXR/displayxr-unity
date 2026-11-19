@@ -285,6 +285,18 @@ jobs:
             -o /tmp/input_binding_test
           /tmp/input_binding_test
 
+      # The win32_window_binding v9 texture target binding (#471) against a fake
+      # runtime: chained only when advertised + supported + eligible, never without
+      # a valid reference window, one resolve per frame, state compare, restart.
+      - name: Texture target binding tests
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          c++ -std=c++17 -Wall -pthread -I native~/displayxr_xrprovider \
+            -I native~/build/_deps/openxr_sdk-src/include \
+            native~/tests/texture_target_test.cpp native~/displayxr_xrprovider/displayxr_provider_texture_target.cpp \
+            -o /tmp/texture_target_test
+          /tmp/texture_target_test
+
       - name: Verify output
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: |
