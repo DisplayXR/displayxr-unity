@@ -256,6 +256,35 @@ namespace DisplayXR
         public static extern int displayxr_host_drag_active();
 
         /// <summary>
+        /// (#459) Game-view calibration marker: 1 = for the next <paramref name="maxMs"/> ms the
+        /// native mirror blit draws the position-coded marker
+        /// (<see cref="DisplayXRGameViewCalibration"/>) into the Game view's texture instead of
+        /// the woven image; 0 = back to the woven image now. The time limit is enforced
+        /// natively, so a marker can never outlive a domain reload. Windows editor, D3D12
+        /// native mirror blit only (the export exists on Windows only).
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void dxr_prov_set_gv_calib_marker(int enable, int maxMs);
+
+        /// <summary>
+        /// (#459) How many frames the marker has been drawn since it was last switched on, with
+        /// the size of the texture it was drawn into and its row-coded bands (texels).
+        /// 0 = not drawn (yet, or not on this graphics API). Windows only.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int dxr_prov_get_gv_calib_marker(out int w, out int h, out int band0, out int band1, out int bandW);
+
+        /// <summary>
+        /// (#459) Read a 1-px strip of the SCREEN: <paramref name="len"/> pixels from (x, y),
+        /// going right (vertical = 0) or down (1), in PHYSICAL virtual-desktop px (native reads
+        /// inside a per-monitor-v2 scope; negative coordinates are valid). <paramref name="rgb"/>
+        /// receives 0xFFRRGGBB per pixel read and 0 for pixels outside the desktop. Returns the
+        /// number of pixels read, 0 on failure. Windows only.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int displayxr_read_screen_strip(int x, int y, int len, int vertical, [Out] uint[] rgb);
+
+        /// <summary>
         /// GameView weave-to-texture presentation (Task (a), editor + texture probe): the
         /// runtime-woven shared texture opened on Unity's D3D device. C# wraps it as an
         /// external Texture2D and draws it into the Game view (DisplayXRGameViewPresenter).

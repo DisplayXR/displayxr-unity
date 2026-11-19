@@ -10,10 +10,12 @@ using DisplayXR;
 namespace DisplayXR.Editor
 {
     /// <summary>
-    /// (#459) WHOLE-PIXEL Game view size — an opt-in experiment
-    /// (env <c>DISPLAYXR_PROV_GV_WHOLEPIXEL=1</c>, read by
-    /// <see cref="DisplayXRProviderDriver.WholePixelEnabled"/>; off by default, and the
-    /// default placement is untouched).
+    /// (#459) WHOLE-PIXEL Game view size. Gated by
+    /// <see cref="DisplayXRProviderDriver.WholePixelEnabled"/>: automatic by default (it
+    /// turns on, for the rest of the editor session, once the on-screen calibration
+    /// MEASURES an image that is not drawn 1:1 at a fractional scale);
+    /// <c>DISPLAYXR_PROV_GV_WHOLEPIXEL=1</c> turns it on from the start, <c>=0</c> keeps it
+    /// off. While it is off nothing here runs and the default placement is untouched.
     ///
     /// At a fractional Windows scale a point is not a whole number of pixels. A Free Aspect
     /// Game view's target is its area, which at 125 / 175 / 225 % is a fraction of a pixel

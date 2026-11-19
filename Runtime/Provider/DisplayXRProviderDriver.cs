@@ -71,6 +71,9 @@ namespace DisplayXR
                 m_SessionStarted = false;
                 DisplayXRProvider.OnSessionStopped();
             }
+            // (#459) Take a calibration marker down with the glue (no-op unless one is up).
+            DisplayXRGameViewCalibrator.Abort();
+            s_calLastValid = false; s_imgRectFrame = -1;
             DisplayXRDepthBudget.Reset();
             DisplayXRCursorDepth.Reset();
             // No pump will run again: complete every pending desktop action as failed.
@@ -253,10 +256,15 @@ namespace DisplayXR
         internal static float MatchedPaneScale =>
             s_diagValid ? DisplayXRGameViewPlacement.SnappedScale(s_diagPane.PtToPx) : 0f;
 
-        // WHOLE-PIXEL experiment (#459, env DISPLAYXR_PROV_GV_WHOLEPIXEL=1, off by default).
-        // At 125 / 175 / 225 % a Free Aspect Game view is drawn half a pixel narrower than its
-        // render texture, so a column is dropped and the eyes swap past it. With the switch
-        // on, the editor-side DisplayXRGameViewWholePixel selects, during Play, a temporary
+        // WHOLE-PIXEL size (#459). At 125 / 175 / 225 % a Free Aspect Game view is drawn half
+        // a pixel narrower than its render texture, so a column is dropped and the eyes swap
+        // past it. Three states, from env DISPLAYXR_PROV_GV_WHOLEPIXEL:
+        //   unset  AUTO: off until the on-screen calibration (DisplayXRGameViewCalibrator)
+        //          MEASURES an image that is not drawn 1:1 at a fractional scale; then on for
+        //          the rest of the editor session (RequestWholePixelAuto).
+        //   "1"    on from the start, at every fractional scale (the former opt-in).
+        //   "0"    never.
+        // When on, the editor-side DisplayXRGameViewWholePixel selects, during Play, a temporary
         // Fixed Resolution size that is a whole number of points AND pixels and snaps the
         // zoom to 1, and tells the driver which view carries it (WholePixelView). On that
         // view the driver then (1) skips GVFIT — the size is drawn texel for pixel at zoom 1,
@@ -264,14 +272,40 @@ namespace DisplayXR
         // as a letterbox with no stretch and the pane's real left border. THE EXPERIMENT
         // WINS OVER GVFIT on that one view; every other view, and every frame the size is
         // not selected, keeps GVFIT and the default placement exactly as they were.
-        static int s_wholePixelGate = -1;
+        static int s_wholePixelGate = -1;   // -1 unresolved, 0 = "0" never, 1 = "1" always, 2 = auto
+        static bool s_wholePixelAuto;       // auto: a calibration asked for it (this editor session)
+        const string kSessWholePixelAuto = "DisplayXR.GameViewWholePixel.Auto";
         internal static bool WholePixelEnabled()
         {
             if (!ProbeEnabled()) return false;
             if (s_wholePixelGate < 0)
-                s_wholePixelGate = System.Environment.GetEnvironmentVariable(
-                    "DISPLAYXR_PROV_GV_WHOLEPIXEL") == "1" ? 1 : 0;
-            return s_wholePixelGate == 1;
+            {
+                string e = System.Environment.GetEnvironmentVariable("DISPLAYXR_PROV_GV_WHOLEPIXEL");
+                s_wholePixelGate = e == "1" ? 1 : e == "0" ? 0 : 2;
+                // Kept for the editor session, so the next Play starts with the size selected
+                // instead of measuring the same broken draw (and flashing the marker) again.
+                if (s_wholePixelGate == 2) s_wholePixelAuto = SessionGetBool(kSessWholePixelAuto);
+            }
+            return s_wholePixelGate == 1 || (s_wholePixelGate == 2 && s_wholePixelAuto);
+        }
+
+        /// <summary>(#459) The calibration measured an image that is not drawn texel for pixel
+        /// at a fractional scale: turn the whole-pixel size on for the rest of the editor
+        /// session, unless DISPLAYXR_PROV_GV_WHOLEPIXEL=0.</summary>
+        internal static void RequestWholePixelAuto(string why)
+        {
+            WholePixelEnabled();   // resolve the gate
+            if (s_wholePixelGate == 0)
+            {
+                Debug.Log("[DisplayXR] whole-pixel Game view: " + why +
+                          ", but DISPLAYXR_PROV_GV_WHOLEPIXEL=0 keeps the whole-pixel size off");
+                return;
+            }
+            if (s_wholePixelGate != 2 || s_wholePixelAuto) return;
+            s_wholePixelAuto = true;
+            SessionSetBool(kSessWholePixelAuto, true);
+            Debug.Log("[DisplayXR] whole-pixel Game view: " + why + " - selecting the whole-pixel size " +
+                      "(on until the editor quits; DISPLAYXR_PROV_GV_WHOLEPIXEL=0 opts out)");
         }
 
         /// <summary>The Game view currently showing the whole-pixel size, or null. Set by the
@@ -290,24 +324,43 @@ namespace DisplayXR
         static MethodInfo s_sessGetBool, s_sessSetBool;
         static bool s_sessResolved;
         static System.Collections.Generic.HashSet<string> s_onceLocal;
+        static void ResolveSessionState()
+        {
+            if (s_sessResolved) return;
+            s_sessResolved = true;
+            try
+            {
+                var ss = System.Type.GetType("UnityEditor.SessionState,UnityEditor");
+                if (ss != null)
+                {
+                    var types = new[] { typeof(string), typeof(bool) };
+                    s_sessGetBool = ss.GetMethod("GetBool", BindingFlags.Static | BindingFlags.Public, null, types, null);
+                    s_sessSetBool = ss.GetMethod("SetBool", BindingFlags.Static | BindingFlags.Public, null, types, null);
+                }
+            }
+            catch { }
+        }
+
+        // A bool kept until the editor quits (false where SessionState is not reachable).
+        static bool SessionGetBool(string key)
+        {
+            ResolveSessionState();
+            try { if (s_sessGetBool != null) return (bool)s_sessGetBool.Invoke(null, new object[] { key, false }); }
+            catch { }
+            return false;
+        }
+
+        static void SessionSetBool(string key, bool value)
+        {
+            ResolveSessionState();
+            try { if (s_sessSetBool != null) s_sessSetBool.Invoke(null, new object[] { key, value }); }
+            catch { }
+        }
+
         static bool FirstTimeThisEditorSession(string key)
         {
             key = "DisplayXR.Once." + key;
-            if (!s_sessResolved)
-            {
-                s_sessResolved = true;
-                try
-                {
-                    var ss = System.Type.GetType("UnityEditor.SessionState,UnityEditor");
-                    if (ss != null)
-                    {
-                        var types = new[] { typeof(string), typeof(bool) };
-                        s_sessGetBool = ss.GetMethod("GetBool", BindingFlags.Static | BindingFlags.Public, null, types, null);
-                        s_sessSetBool = ss.GetMethod("SetBool", BindingFlags.Static | BindingFlags.Public, null, types, null);
-                    }
-                }
-                catch { }
-            }
+            ResolveSessionState();
             try
             {
                 if (s_sessGetBool != null && s_sessSetBool != null)
@@ -711,7 +764,7 @@ namespace DisplayXR
                         {
                             s_fitSkipLogged = true;
                             Debug.Log("[DisplayXR] GVFIT skipped on the whole-pixel Game view " +
-                                      "(DISPLAYXR_PROV_GV_WHOLEPIXEL: zoom 1, no row stretch)");
+                                      "(zoom 1, no row stretch)");
                         }
                         continue;
                     }
@@ -1465,7 +1518,8 @@ namespace DisplayXR
                         " px wide texture is drawn " + drawnW.ToString("F2", inv) + " px wide at " + pct +
                         ", so columns will be dropped/doubled and the image past them sits a pixel off " +
                         "(on a lenticular panel: the eyes swap there). A Windows scale of 100/150/200/250/300 % " +
-                        "avoids it; DISPLAYXR_PROV_GV_WHOLEPIXEL=1 is the experimental fix." + kDoc);
+                        "avoids it; the whole-pixel size fixes it and is selected automatically once the " +
+                        "on-screen calibration measures it (DISPLAYXR_PROV_GV_WHOLEPIXEL=1 selects it from the start)." + kDoc);
                 }
                 if (!glueOk && !s_o2oWarnedGlue)
                 {
@@ -2216,6 +2270,90 @@ namespace DisplayXR
             s_phaseNudgeY = ReadNudge("dxr_phase_nudge_y.txt", s_phaseNudgeY, "Y");
         }
 
+        // ---- (#459) Measured Game-view image position ---------------------------------
+        // The computed anchor (TryGetGameViewRenderRect) is right at 250 % and one pixel off
+        // at 175 % (the image is centred in a 1122.5 px area and Unity snaps it; +1 measured,
+        // +2 computed: inverted 3D). DisplayXRGameViewCalibrator measures it on screen instead
+        // and this applies the result. Windows editor, docked texture mode, matched pane only.
+        static bool s_calLastValid;          // last frame: computed rect in -> anchor out
+        static int  s_calLastInX, s_calLastInY, s_calLastW, s_calLastH, s_calLastOutX, s_calLastOutY;
+        static int  s_imgRectFrame = -1;     // Time.frameCount the image rect below is from
+        static int  s_imgX, s_imgY, s_imgW, s_imgH;   // in the pane's client area, physical px
+        static bool s_imgMeasured;
+
+        static void ApplyGameViewCalibration(ref int px, ref int py, int pw, int ph)
+        {
+            bool can = Application.platform == RuntimePlatform.WindowsEditor && s_lastAppliedDocked
+                       && s_panePhysValid && s_hwndCorrValid && s_hwndCorrHwnd != System.IntPtr.Zero
+                       && !BindPaneEnabled() && !ZoneGlueEnabled();
+            if (!can)
+            {
+                s_calLastValid = false;
+                DisplayXRGameViewCalibrator.Abort();
+                return;
+            }
+            if (!s_diagValid)
+            {
+                // A transient reading: the glue handed back its last good rect. Keep the
+                // anchor that rect had, so a measured anchor does not jump for one frame.
+                if (s_calLastValid && px == s_calLastInX && py == s_calLastInY && pw == s_calLastW && ph == s_calLastH)
+                { px = s_calLastOutX; py = s_calLastOutY; }
+                return;
+            }
+            var layout = new DisplayXRGameViewCalibrator.Layout
+            {
+                Pane = s_hwndCorrHwnd,
+                Monitor = MonitorFromWindow(s_hwndCorrHwnd, 2 /* MONITOR_DEFAULTTONEAREST */),
+                PaneLeft = s_panePhysWin.left, PaneTop = s_panePhysWin.top,
+                PaneW = s_panePhysClient.right - s_panePhysClient.left,
+                PaneH = s_panePhysClient.bottom - s_panePhysClient.top,
+                X = px, Y = py, W = pw, H = ph,
+                Maximized = !s_diagPane.DockedNonMaximized,
+                WholePixel = s_diagPane.WholePixelFixedSize,
+                Scale = DisplayXRGameViewPlacement.SnappedScale(s_diagPane.PtToPx),
+            };
+            s_calLastInX = px; s_calLastInY = py; s_calLastW = pw; s_calLastH = ph;
+            try { DisplayXRGameViewCalibrator.Tick(layout, ref px, ref py); }
+            catch (System.Exception e)
+            {
+                // A missing native export (an older plug-in binary): computed placement only.
+                if (FirstTimeThisEditorSession("GvCalib.Unavailable"))
+                    Debug.LogWarning("[DisplayXR] GameView calibration unavailable, using the computed position: " + e.Message);
+                px = s_calLastInX; py = s_calLastInY;
+            }
+            s_calLastOutX = px; s_calLastOutY = py; s_calLastValid = true;
+
+            bool measured = DisplayXRGameViewCalibrator.AppliedMeasured;
+            s_imgX = px - layout.PaneLeft; s_imgY = py - layout.PaneTop;
+            s_imgW = measured ? DisplayXRGameViewCalibrator.MeasuredW : pw;
+            s_imgH = measured ? DisplayXRGameViewCalibrator.MeasuredH : ph;
+            s_imgMeasured = measured;
+            s_imgRectFrame = Time.frameCount;
+        }
+
+        /// <summary>
+        /// (#459) Where the docked editor Game view's image is, for code that binds to it
+        /// (#471). <paramref name="clientX"/> / <paramref name="clientY"/>: the image's
+        /// top-left in the matched pane window's CLIENT area, in PHYSICAL px of the pane's
+        /// monitor (the pane is a borderless child, so its client origin is its window
+        /// origin); <paramref name="width"/> / <paramref name="height"/>: its size in px;
+        /// <paramref name="measured"/>: true when the position was read off the screen by the
+        /// calibration, false when it is the computed one. Without the phase nudge. False
+        /// (all zero) unless the glue placed the image this frame or the last: outside the
+        /// Windows editor, outside Play, with a floating Game view (present mode), or before
+        /// a pane is matched.
+        /// </summary>
+        internal static bool TryGetGameViewImageRect(out int clientX, out int clientY,
+                                                     out int width, out int height, out bool measured)
+        {
+            clientX = clientY = width = height = 0; measured = false;
+            if (!IsActive || s_imgRectFrame < 0 || Time.frameCount - s_imgRectFrame > 1) return false;
+            clientX = s_imgX; clientY = s_imgY;
+            width = s_imgW; height = s_imgH;
+            measured = s_imgMeasured;
+            return true;
+        }
+
         void PushGameViewRectEditorProbe()
         {
             if (!ProbeEnabled()) return;
@@ -2249,6 +2387,10 @@ namespace DisplayXR
             // (#459) Is the Game view drawn texel for pixel? Log-only; before the nudge so the
             // logged anchor is the computed one.
             LogGameViewOneToOneOnChange(px, py, pw, ph);
+            // (#459) Where the image really is: once the layout has settled a marker is read
+            // back from the screen and the anchor goes to the MEASURED origin; the computed
+            // one above stays as the fallback. The nudge below still applies on top.
+            ApplyGameViewCalibration(ref px, ref py, pw, ph);
             // (#740) Docked phase calibration: shift the invisible child anchor's X — phase
             // moves, content doesn't (see UpdatePhaseNudge).
             UpdatePhaseNudge();
