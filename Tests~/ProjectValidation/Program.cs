@@ -608,6 +608,61 @@ static class Program
         }
     }
 
+    // ---- fullscreen mode --------------------------------------------------------
+
+    static void TestFullscreenMode()
+    {
+        const string exclusive = DisplayXRFullscreenRules.ExclusiveFullScreen;
+        var ok = DisplayXRFullscreenRules.Verdict.Ok;
+        var unknown = DisplayXRFullscreenRules.Verdict.Unknown;
+
+        Check(DisplayXRFullscreenRules.Classify(Platforms.Windows, exclusive)
+              == DisplayXRFullscreenRules.Verdict.ExclusiveNotSupported, "Windows: exclusive full screen is flagged");
+        foreach (var mode in new[] { "FullScreenWindow", "MaximizedWindow", "Windowed" })
+            Check(DisplayXRFullscreenRules.Classify(Platforms.Windows, mode) == ok, "Windows: " + mode + " is fine");
+
+        // Only Windows has an exclusive mode; the setting is one value for every desktop
+        // target, so a macOS / Linux build of the same project must not be told to change it.
+        foreach (var p in new[] { Platforms.MacOS, Platforms.Linux, Platforms.Android, Platforms.Other })
+            Check(DisplayXRFullscreenRules.Classify(p, exclusive) == unknown, p + ": not judged");
+        Check(DisplayXRFullscreenRules.Classify(Platforms.Windows, null) == unknown, "no mode name is not judged");
+        Check(DisplayXRFullscreenRules.Classify(Platforms.Windows, "") == unknown, "an empty mode name is not judged");
+        Check(DisplayXRFullscreenRules.Classify(Platforms.Windows, "exclusivefullscreen") == ok,
+              "names are compared as FullScreenMode.ToString() writes them");
+
+        // What the Fix writes, and that it then passes.
+        Check(DisplayXRFullscreenRules.Recommend(Platforms.Windows, exclusive) == "FullScreenWindow",
+              "the fix keeps the app full screen: Fullscreen Window");
+        foreach (var mode in new[] { "FullScreenWindow", "MaximizedWindow", "Windowed" })
+            Check(DisplayXRFullscreenRules.Recommend(Platforms.Windows, mode) == mode, "a supported mode is left alone: " + mode);
+        Check(DisplayXRFullscreenRules.Recommend(Platforms.MacOS, exclusive) == exclusive, "no change off Windows");
+        Check(DisplayXRFullscreenRules.Classify(Platforms.Windows,
+                  DisplayXRFullscreenRules.Recommend(Platforms.Windows, exclusive)) == ok, "the fix's mode passes the check");
+
+        // The names are UnityEngine.FullScreenMode's (the rule compares ToString()).
+        Check(DisplayXRFullscreenRules.ExclusiveFullScreen == "ExclusiveFullScreen"
+              && DisplayXRFullscreenRules.FullScreenWindow == "FullScreenWindow"
+              && DisplayXRFullscreenRules.MaximizedWindow == "MaximizedWindow"
+              && DisplayXRFullscreenRules.Windowed == "Windowed", "mode names match UnityEngine.FullScreenMode");
+
+        // The rule restates what the code does: check that code is still there.
+        string root = FindRepoRoot();
+        if (root != null)
+        {
+            string target = File.ReadAllText(Path.Combine(root, "Runtime", "DisplayXRTargetDisplay.cs"));
+            Check(target.Contains("Screen.fullScreenMode == FullScreenMode.ExclusiveFullScreen"),
+                  "DisplayXRTargetDisplay still refuses to move an ExclusiveFullScreen window");
+            string session = File.ReadAllText(Path.Combine(root, "native~", "displayxr_xrprovider",
+                                                           "displayxr_provider_session.cpp"));
+            foreach (var fn in new[] { "ps_window_is_full_screen", "ps_cover_monitor", "ps_fit_window_to_monitor" })
+                Check(session.Contains("static") && session.Contains(fn + "("),
+                      "the native move still has " + fn + " (the window shapes the rule names)");
+            string win32 = File.ReadAllText(Path.Combine(root, "native~", "displayxr_win32.c"));
+            Check(win32.Contains("parent_subclass_proc(HWND hwnd") && win32.Contains("WS_EX_NOREDIRECTIONBITMAP"),
+                  "the provider still presents in its own window that follows Unity's");
+        }
+    }
+
     // ---- versions ---------------------------------------------------------------
 
     static void TestVersions()
@@ -642,6 +697,7 @@ static class Program
         TestMenuRules();
         TestNativePlugin();
         TestAndroid();
+        TestFullscreenMode();
         TestVersions();
         Console.WriteLine($"project_validation (C#): {s_pass} passed, {s_fail} failed");
         return s_fail == 0 ? 0 : 1;

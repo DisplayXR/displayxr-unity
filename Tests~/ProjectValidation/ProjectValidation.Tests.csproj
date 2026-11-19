@@ -2,7 +2,7 @@
   <!-- Unit tests for the pure C# half of project validation (#462): Editor/Validation/
        DisplayXRValidationCore.cs (rule registry, evaluation, summary, Fix All plan, build-hook
        messages, the ignore-list file format) and DisplayXRValidationLogic.cs (graphics-API,
-       XR-loader, native-plugin, Android and package-version decisions). Neither file references
+       XR-loader, native-plugin, fullscreen-mode, Android and package-version decisions). Neither file references
        UnityEngine / UnityEditor, so they compile here unchanged. Lives under Tests~ so Unity
        never imports it. Run: dotnet run -c Release -->
   <PropertyGroup>
