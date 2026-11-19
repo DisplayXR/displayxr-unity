@@ -12,5 +12,6 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="../../Runtime/Provider/DisplayXRGameViewPlacement.cs" Link="DisplayXRGameViewPlacement.cs" />
+    <Compile Include="../../Runtime/Provider/DisplayXRGameViewOwner.cs" Link="DisplayXRGameViewOwner.cs" />
   </ItemGroup>
 </Project>

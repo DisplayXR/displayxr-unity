@@ -68,6 +68,31 @@ namespace DisplayXR
             return Math.Abs(snapped - ptToPx) < 1e-3f ? snapped : ptToPx;
         }
 
+        /// <summary>
+        /// (#459) The pane's points-to-px from its own two widths: physical px (the pane
+        /// window, read under per-monitor-v2 awareness) over Unity points (the host view).
+        /// The px width is a WHOLE number while points x scale is not, so the quotient is off
+        /// by up to one pixel's worth: 961 px / 549.7142 pt = 1.74818 at 175 % (549.7142 x
+        /// 1.75 = 961.99997, which Unity made 961). That is 0.0018 from 1.75, outside the fixed
+        /// 0.001 the snap below allows, so on a pane narrower than about 1000 px the scale read
+        /// "not a whole percent": no whole-pixel step, and a held whole-pixel size was given up
+        /// (harness, 175 %: the view sat on Free Aspect, not 1:1, for a whole resize step).
+        /// So: a scale that predicts the pane's px width to within one pixel IS the scale -
+        /// the nearest multiple of 25 % first (what Windows offers; on a pane under about
+        /// 200 pt one pixel is more than half a percent, and the nearest whole percent can be
+        /// the wrong neighbour), then the nearest whole percent. Otherwise (a custom scale such
+        /// as 133.33 %) the quotient is returned.
+        /// </summary>
+        public static float PaneScale(int panePx, float hostPt)
+        {
+            if (panePx <= 0 || !(hostPt > 1f)) return 0f;
+            float measured = panePx / hostPt;
+            float quarter = Round(measured * 4f) / 4f;
+            if (quarter > 0f && Math.Abs(quarter * hostPt - panePx) <= 1.0001f) return quarter;
+            float percent = Round(measured * 100f) / 100f;
+            return Math.Abs(percent * hostPt - panePx) <= 1.0001f ? percent : measured;
+        }
+
         /// <summary>The #740 Y term: the anchor moves UP by the dock's bottom margin. Negative.
         /// Since #420 only the fallback (no draw rect, or a GL device) still uses it.</summary>
         public static int BottomMarginPx(float ptToPx) => -RoundToInt(RtBottomMarginPt * ptToPx);
@@ -106,6 +131,9 @@ namespace DisplayXR
             public bool WholePixelFixedSize;
             public bool HaveLeftBorder;
             public float LeftBorderPt;
+            // (#459) The view's zoom (GameView.m_ZoomArea.m_Scale.x), 0 = not known (treated
+            // as 1). Anything but 1 means Unity draws the texture SCALED: see PlaceScaled.
+            public float ZoomX;
         }
 
         /// <summary>True when the docked anchor's Y comes from <see cref="RtRow0Y"/>: a docked,
@@ -173,6 +201,7 @@ namespace DisplayXR
             w = p.ClientW;
             h = p.ClientH - p.ToolbarPx;
             if (p.RtW <= 0 || p.RtH <= 0 || w <= 0 || h <= 0) return;
+            if (IsScaledView(p.ZoomX)) { PlaceScaled(p, out x, out y, out w, out h); return; }
             bool row0 = UsesRtRow0(p);
 
             if (IsChromeSlackOnly(p))
@@ -246,6 +275,124 @@ namespace DisplayXR
                                          : Round((drawHPt - rtHPt) * 0.5f);
             float fullPt = roundsBottomEdge ? Round(drawHPt) - drawHPt : 0f;
             offY = FloorToInt((yPt - fullPt) * ptToPx + 0.5f);
+        }
+
+        // ---- (#459) A zoomed Game view, and what GVFIT may write ---------------------------
+        // Everything above assumes the view's zoom is 1: the texture is drawn at its own
+        // size. A Fixed Resolution larger than the view area (Unity fits it: zoom below 1) or
+        // a Scale slider off 1x draws it SCALED. Then no texel lands on one panel pixel, the
+        // weave cannot be right wherever the anchor goes, and the zoom-1 arithmetic is not
+        // merely imprecise but wrong: RtRow0Y centres the UNSCALED target, which for a
+        // 3840x2160 texture fitted at 0.279 into a 1122x602 px area put the anchor 700 px
+        // ABOVE the pane (hardware session, 175 %), and the weave went black.
+
+        /// <summary>A zoom this close to 1 is 1 (Unity writes exactly 1; GVFIT's own row
+        /// stretch is 1 + 0.5 / rows, on Y only, and never read through here).</summary>
+        public const float ZoomOneTol = 1e-4f;
+
+        /// <summary>True when the view's zoom on X is 1: the texture is drawn unscaled. This is
+        /// the only state in which the image can be texel for pixel, GVFIT's row fit is valid
+        /// and the on-screen marker can be decoded.</summary>
+        public static bool IsZoomOne(float zoomX) => Math.Abs(zoomX - 1f) <= ZoomOneTol;
+
+        /// <summary>True when the zoom is KNOWN (above 0) and is not 1.</summary>
+        public static bool IsScaledView(float zoomX) => zoomX > 0f && !IsZoomOne(zoomX);
+
+        /// <summary>
+        /// The value GVFIT keeps in the zoom area's <c>m_Scale.y</c>. Unity's own zoom is
+        /// uniform (y == x). At zoom 1 with a texture of <paramref name="rtRows"/> rows the
+        /// row fit applies: rows / (rows - 0.5). At ANY other zoom the fit is not valid and
+        /// the answer is <paramref name="zoomX"/>: Unity's uniform zoom, untouched - which
+        /// also puts back a stretch written earlier (the view was zoomed after the fit went
+        /// on, or an older plug-in left it in the saved layout). Writing the fit regardless
+        /// of x made the zoom anisotropic: (0.279, 1.0002) drew a 4K picture 3.6x too tall.
+        /// </summary>
+        public static float FitZoomY(float zoomX, int rtRows) =>
+            IsZoomOne(zoomX) && rtRows > 1 ? rtRows / (rtRows - 0.5f) : zoomX;
+
+        /// <summary>What GVFIT leaves behind when it stops (Play ends, a domain reload, dock /
+        /// undock, the editor quits, or the fit is switched off): Unity's uniform zoom.</summary>
+        public static float RestoredZoomY(float zoomX) => zoomX;
+
+        /// <summary>
+        /// The anchor rect for a view whose zoom is not 1. The picture cannot be 1:1, so this
+        /// only has to be SAFE and roughly where Unity draws: the texture x the zoom, centred
+        /// in the render area and cut to it (a zoom above 1 shows a centred crop that fills
+        /// the area). Always inside the render area, never above or left of the pane.
+        /// </summary>
+        public static void PlaceScaled(in Pane p, out int x, out int y, out int w, out int h)
+        {
+            int areaW = p.ClientW, areaH = p.ClientH - p.ToolbarPx;
+            x = p.Left; y = p.Top + p.ToolbarPx; w = areaW; h = areaH;
+            if (areaW <= 0 || areaH <= 0 || p.RtW <= 0 || p.RtH <= 0 || !(p.ZoomX > 0f)) return;
+            int drawnW = Math.Max(1, (int)Math.Round((double)p.RtW * p.ZoomX));
+            int drawnH = Math.Max(1, (int)Math.Round((double)p.RtH * p.ZoomX));
+            w = Math.Min(areaW, drawnW);
+            h = Math.Min(areaH, drawnH);
+            x += (areaW - w) / 2;
+            y += (areaH - h) / 2;
+        }
+
+        /// <summary>The view area counts as the same size within this many points.</summary>
+        public const float SameAreaTolPt = 0.05f;
+
+        /// <summary>
+        /// (#459) Can the Game view's scroll (ZoomableArea.m_Translation) recorded before Play
+        /// be expected back after it? Only when the view AREA is the size it was then. The
+        /// scroll is not free: on every OnGUI GameView.EnforceZoomAreaConstraints re-centres
+        /// content that is smaller than the area (shownArea.x = -shownArea.width / 2, i.e. a
+        /// translation of HALF THE AREA: 342.43 pt for a 684.86 pt area) and clamps the rest
+        /// to the content. After a splitter drag during Play the recorded value is therefore
+        /// no longer one Unity will hold (hardware: "scroll (359,171.36) instead of
+        /// (342.43,171.93) after 28 re-applications" - 359 is half of the new 718 pt area).
+        /// Then the size and zoom are restored and Unity places the scroll. A record without
+        /// an area (written by an older build) keeps the exact check.
+        /// </summary>
+        public static bool ScrollIsComparable(float recordedWPt, float recordedHPt, float nowWPt, float nowHPt)
+        {
+            if (!(recordedWPt > 0f) || !(recordedHPt > 0f)) return true;
+            return Math.Abs(nowWPt - recordedWPt) <= SameAreaTolPt && Math.Abs(nowHPt - recordedHPt) <= SameAreaTolPt;
+        }
+
+        /// <summary>How far outside the pane an anchor may sit before it is called wrong: the
+        /// zoom-1 placement legitimately leaves the render area by a rounding pixel or two.</summary>
+        public const int PaneSlackPx = 8;
+
+        /// <summary>
+        /// True when the anchor rect lies in the pane (within <see cref="PaneSlackPx"/>).
+        /// Otherwise it is replaced by the pane's render area: an anchor off the pane is
+        /// never right, and on hardware it showed a black Game view instead of a picture.
+        /// </summary>
+        public static bool KeepInsidePane(in Pane p, ref int x, ref int y, ref int w, ref int h)
+        {
+            int s = PaneSlackPx;
+            bool inside = x >= p.Left - s && y >= p.Top - s
+                       && x + w <= p.Left + p.ClientW + s && y + h <= p.Top + p.ClientH + s;
+            if (inside) return true;
+            x = p.Left; y = p.Top + p.ToolbarPx;
+            w = p.ClientW; h = p.ClientH - p.ToolbarPx;
+            return false;
+        }
+
+        /// <summary>What a Game view that cannot be 1:1 needs done to it during Play.</summary>
+        public enum Takeover
+        {
+            None,           // zoom 1: nothing
+            SnapZoom,       // the selected size fits the view at 1x: set the zoom to 1
+            FreeAspect,     // it does not (Unity's smallest zoom for it is below 1): Free Aspect, zoom 1
+        }
+
+        /// <summary>
+        /// (#459) Decide what to do with a Game view whose zoom is not 1. <paramref name="zoomX"/>:
+        /// its zoom; <paramref name="fitScale"/>: the largest zoom at which the selected size
+        /// still fits the view area (area / target on the tighter axis; 1 or more for Free
+        /// Aspect and for a size that fits, below 1 for a fixed size larger than the area -
+        /// Unity will not let that one be shown at 1x).
+        /// </summary>
+        public static Takeover TakeoverFor(float zoomX, float fitScale)
+        {
+            if (!IsScaledView(zoomX)) return Takeover.None;
+            return fitScale >= 1f - ZoomOneTol ? Takeover.SnapZoom : Takeover.FreeAspect;
         }
 
         // ---- (#459) Is the Game view drawn 1:1, and the whole-point-and-pixel size ----

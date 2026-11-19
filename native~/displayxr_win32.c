@@ -2125,6 +2125,78 @@ void displayxr_set_pane_follow(void *pane_hwnd, int off_x, int off_y, int w, int
 	}
 }
 
+// (#459) Read a 1-px strip of the SCREEN for the editor Game-view calibration: `len` pixels
+// from (x, y) going right (vertical == 0) or down, as 0xFFRRGGBB; pixels outside the virtual
+// desktop stay 0. Returns the number of pixels read (0 = nothing).
+//
+// DPI: the whole call runs inside a PER_MONITOR_AWARE_V2 scope, so x / y are TRUE physical
+// virtual-desktop px, the space the weave anchor lives in and the one the caller's pane rect
+// was read in (TryGetPhysicalRects). The virtual desktop is signed and (0,0) is a valid
+// pixel: absence is signalled by the return value and the zero alpha byte, never by a
+// coordinate. The screen DC is taken INSIDE the scope, so its coordinates are physical too.
+//
+// What is on screen there in docked texture mode: Unity's own Game view, which shows the
+// mirror RT. The plug-in's anchor is an invisible layered child (alpha 0) and nothing of ours
+// presents, so nothing of ours can cover the strip; a foreign window can, and then the
+// marker does not decode and the caller keeps the computed position. Plain SRCCOPY.
+// Measured on a 4K desktop: ~15 ms per strip, whatever its length (the cost is the
+// desktop read-back, not the pixels), so callers read as few strips as they can.
+int displayxr_read_screen_strip(int x, int y, int len, int vertical, uint32_t *out_rgb)
+{
+	if (out_rgb == NULL || len <= 0 || len > 32768) return 0;
+	memset(out_rgb, 0, (size_t)len * sizeof(uint32_t));
+	int valid = 0;
+	DPI_AWARENESS_CONTEXT prev = SetThreadDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+
+	// Clip to the virtual desktop (long long: x + len must not wrap near INT_MAX).
+	long long vx = GetSystemMetrics(SM_XVIRTUALSCREEN), vy = GetSystemMetrics(SM_YVIRTUALSCREEN);
+	long long vw = GetSystemMetrics(SM_CXVIRTUALSCREEN), vh = GetSystemMetrics(SM_CYVIRTUALSCREEN);
+	long long x0 = x, y0 = y;
+	long long x1 = x0 + (vertical ? 1 : len), y1 = y0 + (vertical ? len : 1);
+	if (x0 < vx) x0 = vx;
+	if (y0 < vy) y0 = vy;
+	if (x1 > vx + vw) x1 = vx + vw;
+	if (y1 > vy + vh) y1 = vy + vh;
+
+	if (x1 > x0 && y1 > y0) {
+		int w = (int)(x1 - x0), h = (int)(y1 - y0);
+		HDC screen = GetDC(NULL);
+		HDC mem = screen != NULL ? CreateCompatibleDC(screen) : NULL;
+		if (mem != NULL) {
+			BITMAPINFO bi;
+			memset(&bi, 0, sizeof(bi));
+			bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+			bi.bmiHeader.biWidth = w;
+			bi.bmiHeader.biHeight = -h; // top-down: row 0 first
+			bi.bmiHeader.biPlanes = 1;
+			bi.bmiHeader.biBitCount = 32;
+			bi.bmiHeader.biCompression = BI_RGB;
+			void *bits = NULL;
+			HBITMAP dib = CreateDIBSection(mem, &bi, DIB_RGB_COLORS, &bits, NULL, 0);
+			if (dib != NULL && bits != NULL) {
+				HGDIOBJ old = SelectObject(mem, dib);
+				if (BitBlt(mem, 0, 0, w, h, screen, (int)x0, (int)y0, SRCCOPY)) {
+					GdiFlush();
+					// 32-bpp rows are 4 bytes per pixel with no padding, so a 1-wide
+					// column is one DWORD per row and a 1-high row is n DWORDs.
+					const uint32_t *src = (const uint32_t *)bits;
+					int n = vertical ? h : w;
+					int off = vertical ? (int)(y0 - y) : (int)(x0 - x);
+					for (int i = 0; i < n; i++)
+						out_rgb[off + i] = (src[i] & 0x00FFFFFFu) | 0xFF000000u;
+					valid = n;
+				}
+				SelectObject(mem, old);
+			}
+			if (dib != NULL) DeleteObject(dib);
+			DeleteDC(mem);
+		}
+		if (screen != NULL) ReleaseDC(NULL, screen);
+	}
+	if (prev != NULL) SetThreadDpiAwarenessContext(prev);
+	return valid;
+}
+
 // (#740) The dedicated window's container parent's client origin in screen px (child-glue
 // coord base). Returns 1 + fills *ox,*oy when child-glue is active and the parent resolves.
 int displayxr_dedicated_parent_client_origin(int *ox, int *oy)

@@ -107,6 +107,12 @@ jobs:
       - name: Game view placement
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: dotnet run --project "Tests~/GameViewPlacement" -c Release
+      # Pure C#: the position-coded marker of the editor Game-view calibration and the decoding
+      # of 1-px screen strips into the image's origin and its 1:1 verdict (#459), on synthetic
+      # screens (1:1, dropped / doubled lines, covered, filtered, colour-shifted captures).
+      - name: Game view calibration
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: dotnet run --project "Tests~/GameViewCalibration" -c Release
       # Pure C#: where a tracked hand joint lands relative to the rig camera (display- and
       # camera-centric rigs, off-centre canvas), pinned to the runtime's view-rig joint rule (#439).
       - name: Hand rig math
