@@ -77,6 +77,25 @@ namespace DisplayXR
         static int  s_attempts;
         static double s_retryAt;
 
+        // FALLBACK WITH A REMEMBERED OFFSET. Where the image lands inside its pane is Unity's
+        // rounding of a centred rect: a function of the display scale, of the margins around
+        // the image (pane minus image, per axis), of where the computed rect sits in the pane,
+        // and of the kind of size (whole-pixel / maximized). It does not depend on the image's
+        // absolute size or on where the pane is. So "measured minus computed" from an earlier
+        // successful calibration with exactly those inputs is the same error the computed
+        // position has now, and when the marker cannot be read (a window over the Game view
+        // after a resize) it is applied to the computed position instead of leaving the
+        // computed position bare. Any difference in those inputs: no offset, computed as is.
+        // Kept for the domain (a dock / undock does not invalidate arithmetic).
+        static readonly System.Collections.Generic.Dictionary<string, Vector2Int> s_offsets =
+            new System.Collections.Generic.Dictionary<string, Vector2Int>();
+        static bool s_fallbackOffset;        // the layout in s_key uses a remembered offset
+        static int  s_fbDx, s_fbDy;          // anchor relative to the pane, with that offset
+
+        static string OffsetKey(in Key k) =>
+            k.Scale.ToString("R", System.Globalization.CultureInfo.InvariantCulture) + "|" + (k.WholePixel ? 1 : 0) + "|" +
+            (k.Maximized ? 1 : 0) + "|" + (k.PaneW - k.W) + "|" + (k.PaneH - k.H) + "|" + k.Dx + "|" + k.Dy;
+
         // A layout that differs from the calibrated one, waiting to settle.
         static bool s_pendHave;
         static Key  s_pend;
@@ -102,7 +121,7 @@ namespace DisplayXR
         internal static void Disable()
         {
             s_gate = 0;
-            s_showing = false; s_have = false; s_measured = false; s_pendHave = false;
+            s_showing = false; s_have = false; s_measured = false; s_pendHave = false; s_fallbackOffset = false;
             AppliedMeasured = false;
         }
 
@@ -118,7 +137,7 @@ namespace DisplayXR
         internal static void Abort()
         {
             AppliedMeasured = false;
-            s_pendHave = false; s_have = false; s_measured = false;
+            s_pendHave = false; s_have = false; s_measured = false; s_fallbackOffset = false;
             if (!s_showing) return;
             s_showing = false;
             try { DisplayXRProviderNative.dxr_prov_set_gv_calib_marker(0, 0); } catch { }
@@ -173,6 +192,13 @@ namespace DisplayXR
                 x = l.PaneLeft + s_dx;
                 y = l.PaneTop + s_dy;
                 AppliedMeasured = true;
+            }
+            else if (s_have && !s_measured && s_fallbackOffset && key.Same(s_key))
+            {
+                // Not measured: the computed position plus the offset measured earlier for
+                // the same scale, margins and kind of size.
+                x = l.PaneLeft + s_fbDx;
+                y = l.PaneTop + s_fbDy;
             }
         }
 
@@ -297,8 +323,14 @@ namespace DisplayXR
             if (!ok)
             {
                 s_retryAt = now + kRetrySeconds;
+                s_fallbackOffset = s_offsets.TryGetValue(OffsetKey(s_showKey), out Vector2Int off);
+                if (s_fallbackOffset) { s_fbDx = cdx + off.x; s_fbDy = cdy + off.y; }
                 Debug.Log("[DisplayXR] GameView calibration: fell back to the computed origin (pane +" +
-                          cdx + ",+" + cdy + ") - " + (s_why ?? "the marker could not be read") +
+                          cdx + ",+" + cdy + ")" +
+                          (s_fallbackOffset ? " corrected by the offset measured earlier for the same scale, margins and kind of size (" +
+                                              off.x.ToString("+0;-0;0") + "," + off.y.ToString("+0;-0;0") + " px): anchor at pane +" + s_fbDx + ",+" + s_fbDy
+                                            : "") +
+                          " - " + (s_why ?? "the marker could not be read") +
                           " [attempt " + s_attempts + " of " + kMaxAttempts +
                           (s_attempts < kMaxAttempts ? ", retrying in " + kRetrySeconds.ToString("0") + " s]" : "]"));
                 return;
@@ -306,6 +338,8 @@ namespace DisplayXR
 
             s_dx = ax.Origin - l.PaneLeft; s_dy = ay.Origin - l.PaneTop;
             s_imgW = mw; s_imgH = mh;
+            s_fallbackOffset = false;
+            s_offsets[OffsetKey(s_showKey)] = new Vector2Int(s_dx - cdx, s_dy - cdy);
             bool oneX = ax.Status == Cal.Status.OneToOne, oneY = ay.Status == Cal.Status.OneToOne;
             int ddx = s_dx - cdx, ddy = s_dy - cdy;
             Debug.Log("[DisplayXR] GameView calibration: measured image origin pane +" + s_dx + ",+" + s_dy +

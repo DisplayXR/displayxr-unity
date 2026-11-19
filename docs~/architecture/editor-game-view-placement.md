@@ -122,9 +122,9 @@ runtime's own window and is not affected.
    the view at 1x; otherwise **Free Aspect at 1x**. One log line says so:
    `Game view: "4K UHD (3840x2160)" was shown at 0.28x, which cannot be 1:1 on the panel (no 3D) - switched to Free Aspect at Scale 1x for this Play session; your size and zoom come back when Play ends`.
    From there the normal path runs (calibration, the whole-pixel size where it applies). The
-   user's size and zoom are put back when Play ends, before a domain reload, on quit, and when
-   the main Game view changes. A size or zoom changed by hand afterwards wins until the next
-   Play. `DISPLAYXR_PROV_GV_TAKEOVER=0` opts out.
+   user's size, zoom and scroll are put back when Play ends, before a domain reload, on quit,
+   and when the main Game view changes - never during Play. `DISPLAYXR_PROV_GV_TAKEOVER=0`
+   opts out.
 3. **If it is not taken over** (opted out, changed by hand, editor internals not reachable) the
    glue **degrades visibly instead of going black**: the anchor is the scaled picture's rect,
    centred in the render area (`PlaceScaled`), never off the pane; the picture is shown as
@@ -137,6 +137,48 @@ runtime's own window and is not affected.
    (`KeepInsidePane`, 8 px of slack): the render area is, with the same warning naming the
    computed position.
 
+**One owner of the size and zoom during Play** (`DisplayXRGameViewOwner`, pure C#, tested in
+`Tests~/GameViewPlacement`). The takeover and the whole-pixel size used to be two mechanisms
+that each read the view's selection. On hardware (175 %): with the whole-pixel size 1239x595
+selected, a splitter drag made the pane narrower than the size; Unity fitted the size (zoom
+below 1); the takeover saw "a fixed size that does not fit" and selected Free Aspect; the
+whole-pixel side saw a selection that was not its own, logged `another Game view size was
+picked`, switched itself off and put the pre-Play 4K size back in the middle of Play. Random
+phase from then on. Now:
+
+| Situation during Play | What happens |
+|---|---|
+| the selection is the one the plug-in made (Free Aspect, its own entry, or the user's size with the zoom set to 1) | it is the plug-in's; never read as a user pick |
+| the held whole-pixel size stops fitting (the pane shrank) | re-fitted to the area **at once**, at every poll while the pane keeps shrinking (`... re-fitted without waiting`) |
+| the pane grows, or changes without the size ceasing to fit | re-fitted once the area has held 0.35 s |
+| the pane lands on a whole display scale, or the area is smaller than one step | the held size is given up for **Free Aspect** (1:1 there), not for the pre-Play size |
+| the selection differs from what the plug-in holds, or its entry was deleted | a **user pick**: the view is left exactly as it is until Play ends (`... the plug-in leaves the Game view alone until Play ends`) |
+| the zoom is not 1 on a size that fits | set back to 1, twice; the third time it is the user's |
+| Play ends (also: domain reload, quit, the main view changes) | the pre-Play size, zoom and scroll come back, **whatever happened in between** |
+
+After every size change the layout key of the calibration changes, so the marker is shown
+and the anchor measured again once the layout has held 0.35 s. A resize therefore ends as:
+follow, settle, re-fit, re-measure, re-anchor.
+
+**The restore is verified.** Selecting a size and setting a zoom in one call does not stick
+(read from the 6000.4.0f1 `GameView` / `ZoomableArea`): `SizeSelectionCallback` does nothing
+when the index is already the selected one, which it is after our entry (the last) is removed
+and Unity clamps the index to the new last entry; and the zoom area's limits (`hScaleMin` /
+`vScaleMin`) are recomputed for the new size only in `ConfigureZoomArea`, so a zoom set before
+that is held to the **old** size's minimum - 1x for the whole-pixel size. On hardware the log
+said `restored ... zoom 0.279x` while the view showed 4K UHD at 1x. The restore now selects
+the size, calls `GameView.UpdateZoomAreaAndParent`, sets zoom and scroll through
+`ZoomableArea.SetTransform` (then the fields, if the read-back differs), and reads size, zoom
+and scroll back every 0.1 s: three agreeing reads in a row end it with
+`Game view: restored the previous size and zoom ... - leaving Play: read back size index 6 "4K UHD (3840x2160)", zoom 0.2786x, scroll (x,y)`;
+a read that differs is re-applied; after 30 reads one warning states what the view really
+shows. The line reports values read from the view, not the intended ones. Before a domain
+reload or a quit nothing can run later, so there is one application and no read-back.
+
+**GVFIT and a texture that is not the view's yet.** Right after a size change the view still
+holds the old texture for a frame. GVFIT fits only a texture whose height is the view's
+target height (`GameView.targetRenderSize`) within a pixel; until then the zoom stays uniform.
+
 **Why take over rather than only warn.** A scaled view cannot show 3D at all, so leaving it
 means every Play starts broken until the user finds the size menu. Taking over is safe because
 of what it selects: **Free Aspect at zoom 1 is Unity's own default and always index 0**, so
@@ -145,15 +187,15 @@ built-in state, never on a foreign size. And what is to be restored is on disk b
 change (below), so the next editor start puts it back.
 
 **Crash safety: the record.** `Library/DisplayXR.GameViewTakeover.txt` (per project) holds the
-user's size index, its name, the zoom, and what was selected instead. It is written **before**
+user's size index, its name, the zoom, the scroll, and what was selected instead. It is written **before**
 the first change and deleted after the restore. Every editor load (and domain reload) heals:
 
 | Found at load | Done |
 |---|---|
 | a zoom with `y != x` (a row stretch saved with the layout) | `y = x` |
 | a selected size index past the end of the list | Free Aspect |
-| a record, and a Game view on our entry / on the last entry where ours used to be / (single Game view) on the Free Aspect we selected | the recorded size, if the index still carries the recorded name, else Free Aspect; the recorded zoom |
-| a record, several Game views on Free Aspect | left on Free Aspect (which of them was ours is not known) |
+| a record, and a single Game view | the recorded size (if the index still carries the recorded name, else Free Aspect), zoom and scroll |
+| a record, several Game views | a view on our entry, or on the last entry where ours used to be: as above; the others are left as they are (which of them was ours is not known) |
 | a size named "DisplayXR whole-pixel" with no record | views on it go to Free Aspect; the entry is removed |
 
 **The persistence bug this replaces.** The previous selection was kept in `SessionState`,
@@ -205,6 +247,15 @@ is measured.
    The phase nudge (`dxr_phase_nudge.txt`) still applies on top.
 5. If nothing decodes within 0.3 s the marker comes down, the **computed position stays**, one
    line says why, and the same layout is tried again after 2 s, three times in all.
+   The computed position is corrected by a **remembered offset** when there is one: where the
+   image lands in its pane is Unity's rounding of a centred rect, a function of the scale, the
+   margins around the image (pane minus image, per axis), where the computed rect sits in the
+   pane, and the kind of size (whole-pixel, maximized) - not of the image's absolute size or
+   the pane's position. So `measured - computed` of an earlier successful calibration with
+   exactly those inputs is applied (`... corrected by the offset measured earlier for the same
+   scale, margins and kind of size (+2,-1 px)`). Any difference in them: the bare computed
+   position. The image is 1:1 either way where the whole-pixel size is selected; only the
+   anchor is at stake. *Arithmetic argument, not verified on hardware.*
 
 The marker cannot stay up: native code takes it down by itself 0.5 s after it was requested,
 whatever the managed side does (a domain reload, a stopped session).
@@ -321,10 +372,10 @@ When it is on (the variable is read once, when the editor starts), during Play, 
 3. On that view the driver **skips GVFIT** and computes the anchor as an unstretched letterbox
    with the pane's real left border (the calibration then replaces that with the measured
    origin). The whole-pixel size wins there; other Game views and the default path are untouched.
-4. The previous size and zoom are put back and the custom size removed when Play ends, before a
-   domain reload (it comes back afterwards if Play continues), on quit, when the pane lands on a
-   whole scale, when the main view changes, and when applying it fails part-way. Picking another
-   size by hand turns the experiment off until the next Play. What is to be put back is kept in
+4. The pre-Play size, zoom and scroll are put back and the custom size removed when Play ends,
+   before a domain reload (it comes back afterwards if Play continues), on quit, when the main
+   view changes, and when applying it fails part-way - not during Play. Picking another size
+   by hand during Play leaves the view on that pick until Play ends. What is to be put back is kept in
    `Library/DisplayXR.GameViewTakeover.txt`, written before the size is selected, so an editor
    that is killed or closed in Play is healed at its next load (see
    [A fixed-size or zoomed Game view](#a-fixed-size-or-zoomed-game-view): the record, and the
@@ -335,7 +386,8 @@ When it is on (the variable is read once, when the editor starts), during Play, 
    project.
 
 Log lines: `whole-pixel Game view: selected WxH px (... pt, steps of q pt = p px) at S % ...`,
-`... resized to ...`, `Game view: restored the previous size (index n, "name") and zoom ... and removed "DisplayXR whole-pixel" - reason`,
+`... resized to ...` (`... re-fitted without waiting` when the pane shrank under it),
+`Game view: restored the previous size and zoom and removed "DisplayXR whole-pixel" - reason: read back size index n "name", zoom z, scroll (x,y)`,
 `GVFIT skipped on the whole-pixel Game view`.
 
 ## Findings
@@ -485,15 +537,22 @@ No switch. Press Play with the Game view docked.
 1. Free Aspect, drag the Scale slider to 2x, press Play. Expect, within a second:
    `Game view: "Free Aspect" was shown at 2x ... set Scale to 1x for this Play session`, the
    slider back at 1x, **one** marker flash, a normal `GameView calibration:` line, correct 3D.
-   Stop Play: `Game view: restored the previous size (index 0, "Free Aspect") and zoom 2x ...`,
-   the slider back at 2x, and the picture **not stretched** (zoom label and picture agree).
+   Stop Play: `Game view: restored the previous size and zoom ... read back size index 0 "Free Aspect", zoom 2x, scroll (...)`,
+   the slider back at 2x, the same part of the picture in view, **not stretched**.
 2. Select 4K UHD (3840x2160) in a docked pane (it shows scaled, about 0.28x), press Play.
    Expect `... "4K UHD (3840x2160)" was shown at 0.28x ... switched to Free Aspect at Scale 1x`,
-   then as above. Stop Play: back on 4K UHD at the fitted zoom, picture not stretched.
-3. In Play, after the takeover, drag the Scale slider to 2x: it is set back to 1x once; do it
-   again: `its zoom is 2x again ... leaving it alone until the next Play`, the picture stays
-   visible (scaled, no 3D, **not black**), no marker flashes, and one warning
-   `Game view cannot be shown 1:1: ...` appears about a second later.
+   then as above. Stop Play: back on 4K UHD at the fitted zoom (the view looks exactly as it
+   did before Play), `... read back size index 6 "4K UHD (3840x2160)", zoom 0.2786x ...`.
+3. In Play, after the takeover, drag the Scale slider to 2x: it is set back to 1x; again: set
+   back; a third time: `the zoom was changed again ... the plug-in leaves the Game view alone
+   until Play ends`, the picture stays visible (scaled, no 3D, **not black**), no marker
+   flashes, and one warning `Game view cannot be shown 1:1: ...` appears about a second later.
+   Stop Play: the pre-Play size and zoom are back.
+3b. Resizes (at 175 % / 125 %, whole-pixel size selected). Drag a splitter wider, release;
+   narrower, release; several times, also the height, also in one long drag. After **each**:
+   `whole-pixel Game view: resized to ...`, one marker flash, a `GameView calibration: measured ...
+   W 1:1, H 1:1` line, correct 3D. Never `another Game view size was picked`, never
+   `restored the previous size` before Play ends.
 4. `DISPLAYXR_PROV_GV_TAKEOVER=0`, 4K UHD selected, Play: no takeover line; the scaled picture
    is visible; no marker flash; the one warning; `GameView 1:1:` ends
    `[zoom is not 1: cannot be 1:1 - picture shown scaled, no calibration]` with
@@ -502,7 +561,7 @@ No switch. Press Play with the Game view docked.
    size selected), end the editor process from Task Manager. Check that
    `Library/DisplayXR.GameViewTakeover.txt` exists. Start the editor: the Game view is on 4K UHD
    at its fitted zoom, the size menu has no "DisplayXR whole-pixel", the file is gone, and the
-   log has `Game view: restored the previous size (index 6, "4K UHD (3840x2160)") ... - left over from an earlier session`.
+   log has `Game view: restored the previous size and zoom ... - left over from an earlier session: read back size index 6 "4K UHD (3840x2160)" ...`.
    Repeat closing the editor normally while in Play.
 
 ### Pass A - default behaviour (no switch)

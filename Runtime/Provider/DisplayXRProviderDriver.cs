@@ -826,6 +826,84 @@ namespace DisplayXR
             catch { return false; }
         }
 
+        /// <summary>(#459) The view's zoom and scroll: ZoomableArea.m_Scale and m_Translation
+        /// (points; where the content's origin sits in the view area).</summary>
+        internal static bool TryGetGameViewZoomState(object view, out Vector2 zoom, out Vector2 scroll)
+        {
+            zoom = default; scroll = default;
+            try
+            {
+                if (s_gvType == null) s_gvType = System.Type.GetType("UnityEditor.GameView,UnityEditor");
+                var za = ZoomAreaOf(view);
+                if (za == null || s_zoomScaleField == null || s_zoomTransField == null) return false;
+                zoom = (Vector2)s_zoomScaleField.GetValue(za);
+                scroll = (Vector2)s_zoomTransField.GetValue(za);
+                return zoom.x > 0f && zoom.y > 0f;
+            }
+            catch { return false; }
+        }
+
+        /// <summary>
+        /// (#459) Set a uniform zoom and the scroll on a Game view: through
+        /// ZoomableArea.SetTransform(Vector2 translation, Vector2 scale) (Unity's own setter,
+        /// which keeps the area's bookkeeping consistent and enforces its limits), then, if
+        /// what is read back differs, by writing m_Scale / m_Translation themselves. The
+        /// caller must have re-fitted the zoom area to the selected size first
+        /// (GameView.UpdateZoomAreaAndParent): the limits SetTransform enforces are the ones
+        /// last configured. False when the fields are not found.
+        /// </summary>
+        internal static bool SetGameViewZoomState(object view, float zoom, Vector2 scroll)
+        {
+            try
+            {
+                if (s_gvType == null) s_gvType = System.Type.GetType("UnityEditor.GameView,UnityEditor");
+                var za = ZoomAreaOf(view);
+                if (za == null || s_zoomScaleField == null || s_zoomTransField == null || !(zoom > 0f)) return false;
+                var want = new Vector2(zoom, zoom);
+                try
+                {
+                    MethodInfo setTransform = null;
+                    for (var t = za.GetType(); t != null && setTransform == null; t = t.BaseType)
+                        setTransform = t.GetMethod("SetTransform",
+                            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly,
+                            null, new[] { typeof(Vector2), typeof(Vector2) }, null);
+                    if (setTransform != null) setTransform.Invoke(za, new object[] { scroll, want });
+                }
+                catch { /* the direct write below still applies */ }
+                var sc = (Vector2)s_zoomScaleField.GetValue(za);
+                var tr = (Vector2)s_zoomTransField.GetValue(za);
+                if (Mathf.Abs(sc.x - zoom) > 1e-6f || Mathf.Abs(sc.y - zoom) > 1e-6f) s_zoomScaleField.SetValue(za, want);
+                if (Mathf.Abs(tr.x - scroll.x) > 1e-3f || Mathf.Abs(tr.y - scroll.y) > 1e-3f) s_zoomTransField.SetValue(za, scroll);
+                return true;
+            }
+            catch { return false; }
+        }
+
+        // GameView.targetRenderSize (internal Vector2, px): the size the view WANTS its texture
+        // to be for the size selected now. False when the property is not found.
+        static PropertyInfo s_targetRenderSizeProp;
+        static bool s_targetRenderSizeResolved;
+        static bool TryGetTargetRenderSize(object view, out Vector2 size)
+        {
+            size = default;
+            try
+            {
+                if (!s_targetRenderSizeResolved)
+                {
+                    s_targetRenderSizeResolved = true;
+                    for (var t = s_gvType; t != null && s_targetRenderSizeProp == null; t = t.BaseType)
+                        s_targetRenderSizeProp = t.GetProperty("targetRenderSize",
+                            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
+                    if (s_targetRenderSizeProp != null && s_targetRenderSizeProp.PropertyType != typeof(Vector2))
+                        s_targetRenderSizeProp = null;
+                }
+                if (s_targetRenderSizeProp == null) return false;
+                size = (Vector2)s_targetRenderSizeProp.GetValue(view, null);
+                return size.x > 1f && size.y > 1f;
+            }
+            catch { return false; }
+        }
+
         /// <summary>
         /// (#459) Undo everything GVFIT wrote, on every Game view: scale.y back to scale.x
         /// (Unity's zoom is uniform), a "nudge:" translation back to what it was. Writes
@@ -930,6 +1008,17 @@ namespace DisplayXR
                         RenderTexture rt = FirstGameViewRt(w);
                         // At zoom 1 without a texture (a realloc transient): leave it as it is.
                         if (zoomOne && (rt == null || rt.height <= 1)) continue;
+                        // (#459) A texture that is not yet the size the view wants (the size
+                        // selection changed this frame; the old texture lives until the next
+                        // repaint): its row count is not the one to fit. On hardware the fit for
+                        // a stale 3840x2160 texture was written for a frame right after the
+                        // switch to Free Aspect. Wait for the new texture; meanwhile uniform.
+                        if (zoomOne && TryGetTargetRenderSize(w, out Vector2 wantPx) &&
+                            Mathf.Abs(rt.height - wantPx.y) > 1.01f)
+                        {
+                            if (Mathf.Abs(sc.y - sc.x) > 1e-6f) { sc.y = sc.x; s_zoomScaleField.SetValue(za, sc); }
+                            continue;
+                        }
                         // (#459) Valid at zoom 1 only; at any other zoom this is scale.x.
                         float target = DisplayXRGameViewPlacement.FitZoomY(sc.x, rt != null ? rt.height : 0);
                         if (Mathf.Abs(sc.y - target) > 1e-6f)

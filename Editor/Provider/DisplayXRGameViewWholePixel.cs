@@ -30,20 +30,28 @@ namespace DisplayXR.Editor
     /// area, as a temporary custom size named <see cref="SizeName"/>, and snaps the zoom to 1.
     /// Whole scales (100 / 200 / 300 %) need nothing and keep the user's size.
     ///
-    /// What it restores, and when: the previous selection and zoom are put back and the custom
-    /// size removed on leaving Play, before a domain reload (it is re-applied afterwards if Play
-    /// continues), on quitting, when the pane moves to a whole scale, and when the main view
-    /// changes. A size left behind by a crash is removed at the next editor load. If the user
-    /// picks another size while it is on, that choice wins and the experiment stays off until
-    /// the next Play. A failed apply is rolled back the same way. Unity keeps custom sizes in a
-    /// per-user list shared by all projects and writes it only from its own size menu, so
-    /// after removing ours the list is saved (best-effort): otherwise a save the user
-    /// triggered while the experiment was on would keep our entry for every project.
+    /// What it restores, and when: the pre-Play size, zoom and scroll are put back and the
+    /// custom size removed on leaving Play, before a domain reload (it is re-applied afterwards
+    /// if Play continues), on quitting and when the main view changes - and at no other time:
+    /// never in the middle of Play. If the user picks another size (or zooms, twice) during
+    /// Play, that choice is left alone until Play ends; then the pre-Play state comes back
+    /// all the same. A failed apply is rolled back. Unity keeps custom sizes in a per-user
+    /// list shared by all projects and writes it only from its own size menu, so after
+    /// removing ours the list is saved (best-effort): otherwise a save the user triggered
+    /// while the size was on would keep our entry for every project.
+    ///
+    /// ONE OWNER. What is held on the view and what happens next is decided by
+    /// <see cref="DisplayXRGameViewOwner"/> (pure C#, unit-tested): every selection made
+    /// here is recorded there, so only a selection that differs from it is a user pick, and
+    /// a held whole-pixel size that stops fitting (the pane shrank) is re-fitted at once.
+    /// This class observes the view, carries the steps out and owns the restore.
     ///
     /// The 0.35 s resize debounce: the size follows the view AREA, which a splitter drag
     /// changes every frame; a new size is applied only once the area has held for
-    /// <see cref="DisplayXRProviderDriver.GameViewSettleSeconds"/>, so a drag costs one
-    /// Game-view size change, which the driver's own debounce then pushes once.
+    /// <see cref="DisplayXRProviderDriver.GameViewSettleSeconds"/>, so a growing drag costs one
+    /// Game-view size change, which the driver's own debounce then pushes once. A SHRINKING
+    /// drag is followed at every poll: the held size no longer fits, Unity would show it
+    /// scaled, and a scaled view has no 3D.
     ///
     /// GVFIT: the driver skips its row stretch on the view that carries this size and places
     /// the anchor as an unstretched letterbox with the pane's real left border (see
@@ -54,10 +62,19 @@ namespace DisplayXR.Editor
     /// which Unity shrinks to fit; or the Scale slider) resamples every texel, so 3D cannot
     /// be right and the calibration marker cannot be read. During Play such a view is taken
     /// over: zoom snapped to 1 when its size fits the view at 1x, otherwise Free Aspect at
-    /// zoom 1 (<see cref="DisplayXRGameViewPlacement.TakeoverFor"/>). The user's size and
-    /// zoom come back with the same Restore as above. <c>DISPLAYXR_PROV_GV_TAKEOVER=0</c>
-    /// opts out; the driver then shows the scaled picture and warns once. A size or zoom
-    /// changed by hand afterwards wins until the next Play.
+    /// zoom 1 (<see cref="DisplayXRGameViewPlacement.TakeoverFor"/>). The user's size, zoom
+    /// and scroll come back with the same Restore as above. <c>DISPLAYXR_PROV_GV_TAKEOVER=0</c>
+    /// opts out; the driver then shows the scaled picture and warns once.
+    ///
+    /// THE RESTORE IS VERIFIED. Setting a size and a zoom in one call does not stick by
+    /// itself: GameView.SizeSelectionCallback does nothing when the index is already the
+    /// (clamped) selected one, and the zoom area's limits (ZoomableArea.hScaleMin / vScaleMin)
+    /// are only recomputed for the new size in GameView.ConfigureZoomArea, so a zoom set
+    /// before that is clamped to the OLD size's minimum - 1x for the whole-pixel size, which
+    /// showed a restored 4K UHD at 1x instead of 0.28x. So the restore selects the size, calls
+    /// GameView.UpdateZoomAreaAndParent, sets zoom and scroll through ZoomableArea, and then
+    /// reads all three back over the following editor frames, re-applying until they hold
+    /// (or warning with the values actually read).
     ///
     /// CRASH SAFETY. What is to be put back (the user's size index, its name, the zoom) is
     /// written to <c>Library/DisplayXR.GameViewTakeover.txt</c> BEFORE the first change and
@@ -74,8 +91,8 @@ namespace DisplayXR.Editor
     /// and always index 0, so even an unhealed crash cannot leave a wrong or foreign size.
     ///
     /// Everything here reaches into UnityEditor internals (GameViewSizes, GameViewSizeGroup,
-    /// GameView.selectedSizeIndex / SizeSelectionCallback / SnapZoom / viewInWindow /
-    /// m_ZoomArea / m_SelectedSizes) by reflection,
+    /// GameView.selectedSizeIndex / SizeSelectionCallback / SnapZoom / UpdateZoomAreaAndParent /
+    /// viewInWindow / m_ZoomArea / m_SelectedSizes, ZoomableArea.SetTransform) by reflection,
     /// best-effort: the first failure logs one warning (once per editor session) and turns the
     /// experiment off until the next domain reload.
     /// No Win32 call is made here; the scale is the driver's measured pane scale.
@@ -94,18 +111,13 @@ namespace DisplayXR.Editor
         const BindingFlags kAny = BindingFlags.Instance | BindingFlags.Static |
                                   BindingFlags.Public | BindingFlags.NonPublic;
 
-        static bool         s_active;          // our size is selected on s_view
-        static bool         s_took;            // s_view was taken over (zoom 1 / Free Aspect) this Play
-        static int          s_takeCount;       // takeovers this Play (a second one = it did not hold)
+        static readonly DisplayXRGameViewOwner s_owner = new DisplayXRGameViewOwner
+            { SettleSeconds = DisplayXRProviderDriver.GameViewSettleSeconds };
+        static EditorWindow s_view;            // the view the owner holds (null = none)
         static int          s_takeoverGate = -1;
         static int          s_healTries;
-        static EditorWindow s_view;
-        static int          s_appliedWPx, s_appliedHPx;
-        static float        s_pendW, s_pendH, s_pendScale;   // candidate area awaiting settle
-        static double       s_pendSince = -1.0;
         static double       s_nextPoll;
         static bool         s_exitingPlay;
-        static bool         s_userOverride;    // the user picked another size: off until the next Play
         static bool         s_disabled;        // reflection failed: off for the session
         static float        s_loggedIdleScale; // "nothing to do at this scale", once per scale
 
@@ -120,29 +132,30 @@ namespace DisplayXR.Editor
             EditorApplication.delayCall += HealOnLoad;
         }
 
+        static bool Live => s_view != null || s_owner.Changed;
+
         static void OnPlayModeChanged(PlayModeStateChange change)
         {
             switch (change)
             {
             case PlayModeStateChange.ExitingPlayMode:
                 s_exitingPlay = true;
-                Restore("leaving Play", quiet: !(s_active || s_took));
+                Restore("leaving Play", quiet: !Live);
                 break;
             case PlayModeStateChange.EnteredEditMode:
                 s_exitingPlay = false;
-                s_userOverride = false;
-                s_takeCount = 0;
                 Restore("left Play", quiet: true);   // backstop
+                break;
+            case PlayModeStateChange.ExitingEditMode:
+                s_verify.Clear();                    // a new Play: the view is about to change again
                 break;
             case PlayModeStateChange.EnteredPlayMode:
                 s_exitingPlay = false;
-                s_userOverride = false;
-                s_takeCount = 0;
                 break;
             }
         }
 
-        static void OnBeforeAssemblyReload() { Restore("domain reload", quiet: !(s_active || s_took)); }
+        static void OnBeforeAssemblyReload() { Restore("domain reload", quiet: !Live); }
         static void OnQuitting() { Restore("editor quitting", quiet: true); }
 
         /// <summary>False with <c>DISPLAYXR_PROV_GV_TAKEOVER=0</c>: a zoomed Game view is
@@ -157,7 +170,7 @@ namespace DisplayXR.Editor
         // Once per editor load (and per domain reload): undo what an earlier session left.
         static void HealOnLoad()
         {
-            if (s_active || s_took) return;
+            if (Live) return;
             // 1. A zoom GVFIT stretched, saved with the layout (older plug-ins did not put it
             //    back, and a killed editor cannot).
             int fixedZoom = RestoreFit();
@@ -170,15 +183,11 @@ namespace DisplayXR.Editor
             {
                 object group = CurrentGroup(out Type groupType);
                 int total = (int)Method(groupType, "GetTotalCount").Invoke(group, null);
-                Type sizesType = EditorType("UnityEditor.GameViewSizes");
-                int groupIndex = Convert.ToInt32(Property(sizesType, "currentGroupType")
-                    .GetValue(Property(sizesType, "instance").GetValue(null, null), null));
+                int groupIndex = CurrentGroupIndex();
                 foreach (EditorWindow v in GameViews())
                 {
-                    FieldInfo raw = Field(v.GetType(), "m_SelectedSizes");
-                    if (raw == null || !(raw.GetValue(v) is int[] sel)) continue;
-                    if (groupIndex < 0 || groupIndex >= sel.Length || sel[groupIndex] < total) continue;
-                    int was = sel[groupIndex];
+                    int was = RawSelectedIndex(v, groupIndex);
+                    if (was < total) continue;
                     SelectSize(v, 0);
                     v.Repaint();
                     Debug.Log("[DisplayXR] Game view: its selected size index (" + was + ") was past the end of the " +
@@ -196,12 +205,13 @@ namespace DisplayXR.Editor
             if (now < s_nextPoll) return;
             s_nextPoll = now + kPollGap;
 
+            VerifyTick();
             if (!EditorApplication.isPlaying || s_exitingPlay)
             {
-                if (s_active || s_took) Restore("not playing");
+                if (Live) Restore("not playing");
                 return;
             }
-            if (s_disabled || s_userOverride) return;
+            if (s_disabled) return;
             // The subsystem is restarting (dock change, re-host): hold what is selected.
             if (!DisplayXRProviderDriver.IsActive) return;
             var view = DisplayXRProviderDriver.MatchedGameView as EditorWindow;
@@ -210,182 +220,169 @@ namespace DisplayXR.Editor
 
             try
             {
-                if ((s_active || s_took) && s_view != view) Restore("the main Game view changed");
-                // A view that cannot be 1:1 is put right first; the whole-pixel size (if it is
-                // on) follows on a later poll, from a view at zoom 1.
-                if (TakeoverEnabled() && TakeoverTick(view, scale)) return;
-                if (DisplayXRProviderDriver.WholePixelEnabled()) Tick(view, scale, now);
+                if (s_view != null && s_view != view) Restore("the main Game view changed");
+                Tick(view, scale, now);
             }
             catch (Exception e)
             {
                 s_disabled = true;
                 WarnOnce("could not set the Game view's size or zoom (editor internals changed?), " +
                          "so it is left alone for this session: " + Unwrap(e).Message);
-                // Unconditionally: Apply sets s_active last, so a throw after AddCustomSize or
-                // after the selection write (e.g. SnapZoom missing) leaves our size behind, and
-                // selected, with GVFIT still stretching it.
+                // Whatever was changed before the failure (an entry added, a selection
+                // written) is rolled back from the record.
                 Restore("reflection failure", quiet: true);
             }
         }
 
-        // (#459) A docked Game view whose zoom is not 1 cannot show 3D: take it over for the
-        // Play session. True when something was changed (the caller waits for the next poll).
-        static bool TakeoverTick(EditorWindow view, float scale)
-        {
-            // Floating = present mode: the runtime's own window covers the view; nothing to do.
-            if (!DisplayXRProviderDriver.LastAppliedDocked) return false;
-            if (!DisplayXRProviderDriver.TryGetGameViewZoom(view, out Vector2 zoom)) return false;
-            if (DisplayXRGameViewPlacement.IsZoomOne(zoom.x)) return false;
-
-            if (s_takeCount >= 2)
-            {
-                // It did not hold, or the user zoomed again: their choice wins until the next
-                // Play (the driver shows the scaled picture and warns).
-                s_userOverride = true;
-                Debug.Log("[DisplayXR] Game view: its zoom is " + zoom.x.ToString("0.##", Inv) +
-                          "x again after it was set to 1x - leaving it alone until the next Play (no 3D while it is scaled)");
-                return true;
-            }
-
-            int current = GetSelectedIndex(view);
-            string name = SizeText(current, out float fit, view, scale);
-            var what = DisplayXRGameViewPlacement.TakeoverFor(zoom.x, fit);
-            if (what == DisplayXRGameViewPlacement.Takeover.None) return false;
-
-            // Marked first, so that a failure part-way is rolled back on this view.
-            s_took = true; s_view = view; s_takeCount++;
-            Record rec = EnsureRecord(view, current, zoom.x, name);   // on disk BEFORE any change
-            DisplayXRProviderDriver.RestoreGameViewFit();             // uniform zoom first
-            if (what == DisplayXRGameViewPlacement.Takeover.FreeAspect && current != 0)
-            {
-                rec.FreeAspect = true;
-                SaveRecord(rec);
-                SelectSize(view, 0);
-            }
-            SnapZoom(view, 1f);
-            view.Repaint();
-            if (s_takeCount == 1)
-                Debug.Log("[DisplayXR] Game view: \"" + name + "\" was shown at " + zoom.x.ToString("0.##", Inv) +
-                          "x, which cannot be 1:1 on the panel (no 3D) - " +
-                          (what == DisplayXRGameViewPlacement.Takeover.FreeAspect
-                              ? "switched to Free Aspect at Scale 1x for this Play session"
-                              : "set Scale to 1x for this Play session") +
-                          "; your size and zoom come back when Play ends (DISPLAYXR_PROV_GV_TAKEOVER=0 opts out)");
-            return true;
-        }
-
+        // One look at the view, one step of the owner, carried out.
         static void Tick(EditorWindow view, float scale, double now)
         {
-            int step = DisplayXRGameViewPlacement.WholePixelStepPt(scale);
-            if (step <= 1)
+            object group = CurrentGroup(out Type groupType);
+            int selected = GetSelectedIndex(view);
+            Vector2 area = ViewAreaPoints(view);
+            bool haveZoom = DisplayXRProviderDriver.TryGetGameViewZoom(view, out Vector2 zoom);
+            string name = SizeText(selected, out float fit, view, scale);
+            bool wholePixelOn = DisplayXRProviderDriver.WholePixelEnabled();
+            var obs = new DisplayXRGameViewOwner.Obs
             {
-                if (s_active) Restore(step == 1 ? "the pane is at a whole display scale" : "the pane's scale is not a whole percent");
-                if (scale != s_loggedIdleScale)
+                Selected = selected,
+                OursIndex = FindEntry(group, groupType, out _),
+                ZoomX = haveZoom ? zoom.x : 0f,
+                FitScale = fit,
+                Scale = scale,
+                AreaWPt = area.x, AreaHPt = area.y,
+                WholePixelOn = wholePixelOn,
+                // Floating = present mode: the runtime's own window covers the view, so a
+                // zoomed view needs nothing there.
+                TakeoverOn = TakeoverEnabled() && DisplayXRProviderDriver.LastAppliedDocked,
+                Now = now,
+            };
+            DisplayXRGameViewOwner.Holds heldBefore = s_owner.Held;
+            DisplayXRGameViewOwner.Step step = s_owner.Next(obs);
+
+            if (step.Kind == DisplayXRGameViewOwner.Act.None)
+            {
+                if (wholePixelOn && s_owner.Held == DisplayXRGameViewOwner.Holds.Nothing && !s_owner.UserPicked &&
+                    DisplayXRGameViewPlacement.WholePixelStepPt(scale) <= 1 && scale != s_loggedIdleScale)
                 {
                     s_loggedIdleScale = scale;
+                    int q = DisplayXRGameViewPlacement.WholePixelStepPt(scale);
                     Debug.Log("[DisplayXR] whole-pixel Game view: nothing to do at " + Percent(scale) +
-                              (step == 1 ? " (a point is a whole number of pixels; the selected size is kept)"
-                                         : " (the measured scale is not a whole percent)"));
+                              (q == 1 ? " (a point is a whole number of pixels; the selected size is kept)"
+                                      : " (the measured scale is not a whole percent)"));
                 }
                 return;
             }
 
-            if (s_active)
+            if (step.Kind == DisplayXRGameViewOwner.Act.StandDown)
             {
-                // The user's own pick wins: if our size is no longer the selected one (or was
-                // deleted in the size menu), stand down until the next Play.
-                object group = CurrentGroup(out Type groupType);
-                int ours = FindEntry(group, groupType, out _);
-                if (ours < 0 || GetSelectedIndex(view) != ours)
+                // The user's choice: leave the view exactly as it is. The pre-Play size is NOT
+                // put back now (it may be one that cannot be woven); it comes back when Play ends.
+                DisplayXRProviderDriver.WholePixelView = null;
+                Debug.Log("[DisplayXR] Game view: " + step.Why + " during Play - the plug-in leaves the Game view alone " +
+                          "until Play ends (now \"" + name + "\" at " + (haveZoom ? zoom.x.ToString("0.###", Inv) + "x" : "?") +
+                          "); the size, zoom and scroll from before Play come back then");
+                return;
+            }
+
+            // A change: what is to come back is on disk BEFORE it, and the view is ours from
+            // here on, so that a failure part-way is rolled back on this view.
+            s_view = view;
+            Record rec = EnsureRecord(view, selected, haveZoom ? zoom.x : 0f, name);
+            DisplayXRProviderDriver.RestoreGameViewFit();   // Unity's uniform zoom first
+
+            switch (step.Kind)
+            {
+            case DisplayXRGameViewOwner.Act.ZoomOne:
+                RefreshZoomArea(view);
+                SnapZoom(view, 1f);
+                break;
+
+            case DisplayXRGameViewOwner.Act.FreeAspect:
+                if (!rec.FreeAspect) { rec.FreeAspect = true; SaveRecord(rec); }
+                DisplayXRProviderDriver.WholePixelView = null;
+                SelectSize(view, 0);
+                RefreshZoomArea(view);
+                SnapZoom(view, 1f);
+                break;
+
+            case DisplayXRGameViewOwner.Act.WholePixel:
+            {
+                int index = FindEntry(group, groupType, out object entry);
+                Type sizeType = EditorType("UnityEditor.GameViewSize");
+                if (entry == null)
                 {
-                    s_userOverride = true;
-                    Restore("another Game view size was picked - off until the next Play");
-                    return;
+                    Type kind = EditorType("UnityEditor.GameViewSizeType");
+                    entry = Activator.CreateInstance(sizeType, kAny, null,
+                        new object[] { Enum.Parse(kind, "FixedResolution"), step.WPx, step.HPx, SizeName }, null);
+                    Method(groupType, "AddCustomSize", sizeType).Invoke(group, new[] { entry });
+                    // Found again by name: whether the group stores the instance or a copy, and what
+                    // its IndexOf returns for a custom size, has varied between editor versions.
+                    index = FindEntry(group, groupType, out entry);
+                    if (index < 0) throw new InvalidOperationException("the custom size did not appear in the size group");
                 }
+                else
+                {
+                    PropertyInfo w = Property(sizeType, "width"), h = Property(sizeType, "height");
+                    if ((int)w.GetValue(entry, null) != step.WPx) w.SetValue(entry, step.WPx, null);
+                    if ((int)h.GetValue(entry, null) != step.HPx) h.SetValue(entry, step.HPx, null);
+                }
+                if (rec.OursIndex != index) { rec.OursIndex = index; SaveRecord(rec); }
+                if (GetSelectedIndex(view) != index) Property(view.GetType(), "selectedSizeIndex").SetValue(view, index, null);
+                // Zoom 1 on both axes, with the zoom limits of the size as it is NOW (it also
+                // clears GVFIT's row stretch, which the driver does not apply to this view).
+                RefreshZoomArea(view);
+                SnapZoom(view, 1f);
+                DisplayXRProviderDriver.WholePixelView = view;
+                break;
             }
-
-            Vector2 area = ViewAreaPoints(view);
-            if (s_pendSince < 0.0 || area.x != s_pendW || area.y != s_pendH || scale != s_pendScale)
-            {
-                s_pendW = area.x; s_pendH = area.y; s_pendScale = scale; s_pendSince = now;
-                return;   // (re)start the settle clock
             }
-            if (now - s_pendSince < DisplayXRProviderDriver.GameViewSettleSeconds) return;
-
-            if (!DisplayXRGameViewPlacement.WholePixelSize(area.x, area.y, scale,
-                                                           out int wPt, out int hPt, out int wPx, out int hPx))
-            {
-                if (s_active) Restore("the view area is smaller than one step");
-                return;
-            }
-            if (s_active && wPx == s_appliedWPx && hPx == s_appliedHPx) return;
-            Apply(view, wPx, hPx, wPt, hPt, step, scale, area);
-        }
-
-        static void Apply(EditorWindow view, int wPx, int hPx, int wPt, int hPt, int step, float scale, Vector2 area)
-        {
-            object group = CurrentGroup(out Type groupType);
-            int index = FindEntry(group, groupType, out object entry);
-            Type sizeType = EditorType("UnityEditor.GameViewSize");
-            if (entry == null)
-            {
-                Type kind = EditorType("UnityEditor.GameViewSizeType");
-                entry = Activator.CreateInstance(sizeType, kAny, null,
-                    new object[] { Enum.Parse(kind, "FixedResolution"), wPx, hPx, SizeName }, null);
-                Method(groupType, "AddCustomSize", sizeType).Invoke(group, new[] { entry });
-                // Found again by name: whether the group stores the instance or a copy, and what
-                // its IndexOf returns for a custom size, has varied between editor versions.
-                index = FindEntry(group, groupType, out entry);
-                if (index < 0) throw new InvalidOperationException("the custom size did not appear in the size group");
-            }
-            else
-            {
-                PropertyInfo w = Property(sizeType, "width"), h = Property(sizeType, "height");
-                if ((int)w.GetValue(entry, null) != wPx) w.SetValue(entry, wPx, null);
-                if ((int)h.GetValue(entry, null) != hPx) h.SetValue(entry, hPx, null);
-            }
-
-            int current = GetSelectedIndex(view);
-            if (!s_active && current != index)
-            {
-                // What to put back (the user's size and zoom; x: GVFIT only ever writes y),
-                // on disk before the selection changes. A record that already exists (the
-                // view was taken over from a zoomed size first) keeps the user's original.
-                Record rec = EnsureRecord(view, current,
-                    DisplayXRProviderDriver.TryGetGameViewZoom(view, out Vector2 zoom) ? zoom.x : 0f,
-                    SizeText(current, out _, view, scale));
-                rec.OursIndex = index;
-                SaveRecord(rec);
-            }
-            if (current != index) Property(view.GetType(), "selectedSizeIndex").SetValue(view, index, null);
-            // Zoom 1 on both axes (it also clears GVFIT's row stretch, which the driver stops
-            // re-applying to this view from now on).
-            SnapZoom(view, 1f);
             view.Repaint();
+            int selectedAfter = GetSelectedIndex(view);
+            s_owner.Applied(step, selectedAfter);
 
-            bool first = !s_active;
-            s_active = true; s_view = view; s_appliedWPx = wPx; s_appliedHPx = hPx;
-            DisplayXRProviderDriver.WholePixelView = view;
-            var inv = System.Globalization.CultureInfo.InvariantCulture;
-            Debug.Log("[DisplayXR] whole-pixel Game view: " + (first ? "selected " : "resized to ") +
-                      wPx + "x" + hPx + " px (" + wPt + "x" + hPt + " pt, steps of " + step + " pt = " +
-                      Mathf.RoundToInt(step * scale) + " px) at " + Percent(scale) + " for a " +
-                      area.x.ToString("0.###", inv) + "x" + area.y.ToString("0.###", inv) + " pt area; zoom 1" +
-                      (first ? "; previous size index " + current : ""));
+            switch (step.Kind)
+            {
+            case DisplayXRGameViewOwner.Act.WholePixel:
+                Debug.Log("[DisplayXR] whole-pixel Game view: " +
+                          (heldBefore == DisplayXRGameViewOwner.Holds.WholePixel ? "resized to " : "selected ") +
+                          step.WPx + "x" + step.HPx + " px (" + step.WPt + "x" + step.HPt + " pt, steps of " +
+                          DisplayXRGameViewPlacement.WholePixelStepPt(scale) + " pt = " +
+                          Mathf.RoundToInt(DisplayXRGameViewPlacement.WholePixelStepPt(scale) * scale) + " px) at " + Percent(scale) +
+                          " for a " + area.x.ToString("0.###", Inv) + "x" + area.y.ToString("0.###", Inv) + " pt area; zoom 1" +
+                          (step.Refit ? "; " + step.Why + " (re-fitted without waiting)" : "") +
+                          (heldBefore == DisplayXRGameViewOwner.Holds.WholePixel ? "" : "; previous size index " + selected));
+                break;
+            case DisplayXRGameViewOwner.Act.FreeAspect:
+                Debug.Log("[DisplayXR] Game view: \"" + name + "\"" +
+                          (haveZoom && !DisplayXRGameViewPlacement.IsZoomOne(zoom.x)
+                              ? " was shown at " + zoom.x.ToString("0.##", Inv) + "x, which cannot be 1:1 on the panel (no 3D)" : "") +
+                          " - switched to Free Aspect at Scale 1x for this Play session (" + step.Why +
+                          "); your size, zoom and scroll come back when Play ends" +
+                          (heldBefore == DisplayXRGameViewOwner.Holds.Nothing ? " (DISPLAYXR_PROV_GV_TAKEOVER=0 opts out)" : ""));
+                break;
+            case DisplayXRGameViewOwner.Act.ZoomOne:
+                Debug.Log("[DisplayXR] Game view: \"" + name + "\" was shown at " + (haveZoom ? zoom.x.ToString("0.##", Inv) : "?") +
+                          "x, which cannot be 1:1 on the panel (no 3D) - set Scale to 1x for this Play session; " +
+                          "your zoom and scroll come back when Play ends" +
+                          (heldBefore == DisplayXRGameViewOwner.Holds.Nothing ? " (DISPLAYXR_PROV_GV_TAKEOVER=0 opts out)" : ""));
+                break;
+            }
         }
 
-        /// <summary>Put the user's size and zoom back on every Game view this class changed,
-        /// undo GVFIT's row stretch, remove our size and delete the record. Safe to call when
-        /// nothing of ours exists. <paramref name="heal"/>: called at editor load, with no
-        /// live state - the record on disk and the size list are all there is to go on.</summary>
+        /// <summary>Put the pre-Play size, zoom and scroll back on the Game view this class
+        /// changed, undo GVFIT's row stretch, remove our size and delete the record. Safe to
+        /// call when nothing of ours exists. <paramref name="heal"/>: called at editor load,
+        /// with no live state - the record on disk and the size list are all there is to go
+        /// on. The result is read back over the next editor frames (VerifyTick).</summary>
         static void Restore(string reason, bool quiet = false, bool heal = false)
         {
             EditorWindow taken = s_view;
-            s_active = false; s_took = false; s_view = null; s_appliedWPx = s_appliedHPx = 0; s_pendSince = -1.0;
+            s_owner.Reset(); s_view = null;
             DisplayXRProviderDriver.WholePixelView = null;   // GVFIT and the default placement resume
             try
             {
-                RestoreFit();   // Unity's uniform zoom first: SnapZoom below starts from it
+                RestoreFit();   // Unity's uniform zoom first
                 Record rec = LoadRecord();
                 object group = CurrentGroup(out Type groupType);
                 int index = FindEntry(group, groupType, out _);
@@ -394,7 +391,7 @@ namespace DisplayXR.Editor
                 int total = (int)Method(groupType, "GetTotalCount").Invoke(group, null);
                 Type sizesType = EditorType("UnityEditor.GameViewSizes");
                 object sizes = Property(sizesType, "instance").GetValue(null, null);
-                int groupIndex = Convert.ToInt32(Property(sizesType, "currentGroupType").GetValue(sizes, null));
+                int groupIndex = CurrentGroupIndex();
                 // The record is about one size group (the build target's); in another one its
                 // index means nothing, so only our own entry is dealt with.
                 bool recHere = rec != null && rec.Group == groupIndex;
@@ -408,14 +405,14 @@ namespace DisplayXR.Editor
                     if (string.IsNullOrEmpty(rec.PrevName) || nameNow == rec.PrevName)
                         prev = rec.PrevIndex > index && index >= 0 ? rec.PrevIndex - 1 : rec.PrevIndex;
                 }
-                float prevZoom = recHere ? rec.PrevZoom : 0f;
 
-                // Which views get it back. In a live session: the view that was taken over.
-                // At editor load there is no such view: a view on our entry, or on the last
-                // entry when ours (which was last) is gone and Unity clamped the index, is
-                // certain; "Free Aspect because we selected it" is only certain when there is
-                // a single Game view - with several, they stay on Free Aspect (Unity's
-                // default: never a wrong or foreign size).
+                // Which views get it back. In a live session: the view that was changed,
+                // whatever is selected on it now (a size the user picked during Play gives
+                // way to the pre-Play one when Play ends). At editor load there is no such
+                // view: a single Game view is it; with several, a view on our entry, or on the
+                // last entry when ours (which was last) is gone and Unity clamped the index,
+                // is certain, and the others are left as they are (Free Aspect, if we
+                // selected it: Unity's default, never a wrong or foreign size).
                 var views = GameViews();
                 if (heal && views.Count == 0 && rec != null)
                 {
@@ -423,8 +420,7 @@ namespace DisplayXR.Editor
                     if (s_healTries++ < 50) EditorApplication.delayCall += HealOnLoad;
                     return;
                 }
-                var restoreSize = new System.Collections.Generic.List<EditorWindow>();
-                var restoreZoom = new System.Collections.Generic.List<EditorWindow>();
+                var restore = new System.Collections.Generic.List<EditorWindow>();
                 var shiftDown = new System.Collections.Generic.List<EditorWindow>();
                 foreach (EditorWindow v in views)
                 {
@@ -432,10 +428,7 @@ namespace DisplayXR.Editor
                     bool mine = taken != null ? v == taken : views.Count == 1;
                     bool ours = index >= 0 && sel == index;
                     bool clamped = heal && recHere && index < 0 && rec.OursIndex >= total && sel == total - 1;
-                    bool freed = recHere && rec.FreeAspect && sel == 0 && mine;
-                    bool zoomOnly = recHere && !rec.FreeAspect && rec.OursIndex < 0 && sel == rec.PrevIndex && mine;
-                    if (ours || clamped || freed) restoreSize.Add(v);
-                    else if (zoomOnly) restoreZoom.Add(v);
+                    if ((recHere && mine) || ours || clamped) restore.Add(v);
                     else if (index >= 0 && sel > index) shiftDown.Add(v);
                 }
 
@@ -476,18 +469,23 @@ namespace DisplayXR.Editor
                     if (sel > 0) Property(v.GetType(), "selectedSizeIndex").SetValue(v, sel - 1, null);
                     v.Repaint();
                 }
-                foreach (EditorWindow v in restoreSize)
+                var want = new ViewState
                 {
-                    SelectSize(v, prev);
-                    // The zoom the view had before (uniform; at zoom 1 GVFIT re-applies its
-                    // row stretch on the next Play frame). Best-effort: the size matters more.
-                    if (prevZoom > 0f) { try { SnapZoom(v, prevZoom); } catch (Exception) { } }
-                    v.Repaint();
-                }
-                foreach (EditorWindow v in restoreZoom)
+                    Index = prev,
+                    Name = recHere ? rec.PrevName : "",
+                    Zoom = recHere ? rec.PrevZoom : 0f,
+                    HaveScroll = recHere && rec.HaveScroll,
+                    Scroll = recHere ? new Vector2(rec.ScrollX, rec.ScrollY) : Vector2.zero,
+                };
+                foreach (EditorWindow v in restore)
                 {
-                    if (prevZoom > 0f) { try { SnapZoom(v, prevZoom); } catch (Exception) { } }
-                    v.Repaint();
+                    ApplyViewState(v, want);
+                    // Read back over the next frames; not when the domain or the editor is
+                    // about to go (nothing would run), where this one application has to do.
+                    if (reason != "domain reload" && reason != "editor quitting")
+                        s_verify.Add(new Pending { View = v, Want = want, Reason = reason, Removed = removed });
+                    else if (!quiet)
+                        Debug.Log("[DisplayXR] Game view: restored the previous size and zoom - " + reason + ": now " + Describe(v));
                 }
                 DeleteRecord();
 
@@ -498,20 +496,127 @@ namespace DisplayXR.Editor
                 {
                     try { Method(sizesType, "SaveToHDD").Invoke(sizes, null); }
                     catch (Exception) { /* best-effort: the entry is gone from this editor either way */ }
+                    if (restore.Count == 0 && (!quiet || heal))
+                        Debug.Log("[DisplayXR] Game view: removed \"" + SizeName + "\" - " + reason);
                 }
-                bool did = removed || restoreSize.Count > 0 || restoreZoom.Count > 0;
-                if (did && (!quiet || heal))
-                    Debug.Log("[DisplayXR] Game view: restored the previous size (index " + prev +
-                              (recHere && !string.IsNullOrEmpty(rec.PrevName) ? ", \"" + rec.PrevName + "\"" : "") + ")" +
-                              (prevZoom > 0f ? " and zoom " + prevZoom.ToString("0.###", Inv) + "x" : "") +
-                              " on " + (restoreSize.Count + restoreZoom.Count) + " Game view(s)" +
-                              (removed ? " and removed \"" + SizeName + "\"" : "") + " - " + reason);
             }
             catch (Exception e)
             {
                 if (!quiet || heal)
                     WarnOnce("could not put the Game view's size back (" + reason + "); select Free Aspect in the " +
                              "Game view's size menu and delete \"" + SizeName + "\" there if it is listed: " + Unwrap(e).Message);
+            }
+        }
+
+        // ---- applying a view state, and checking that it held ----
+
+        struct ViewState
+        {
+            public int Index; public string Name;
+            public float Zoom;              // 0 = leave the zoom alone
+            public bool HaveScroll; public Vector2 Scroll;   // ZoomableArea.m_Translation
+        }
+
+        sealed class Pending
+        {
+            public EditorWindow View; public ViewState Want; public string Reason; public bool Removed;
+            public int Checks, Good, Reapplied;
+        }
+        static readonly System.Collections.Generic.List<Pending> s_verify = new System.Collections.Generic.List<Pending>();
+        const int kVerifyGood = 3;      // consecutive checks (0.1 s apart, a repaint between) that must agree
+        const int kVerifyMax = 30;      // then give up and say what the view really shows
+        const float kScrollTolPt = 0.51f;
+
+        // Size, then the zoom area re-fitted to THAT size, then zoom and scroll. The order
+        // matters: see "THE RESTORE IS VERIFIED" at the top.
+        static void ApplyViewState(EditorWindow v, in ViewState want)
+        {
+            SelectSize(v, want.Index);
+            if (GetSelectedIndex(v) != want.Index)
+                Property(v.GetType(), "selectedSizeIndex").SetValue(v, want.Index, null);
+            RefreshZoomArea(v);
+            if (want.Zoom > 0f)
+            {
+                bool set = false;
+                if (want.HaveScroll)
+                    set = DisplayXRProviderDriver.SetGameViewZoomState(v, want.Zoom, want.Scroll);
+                if (!set) { try { SnapZoom(v, want.Zoom); } catch (Exception) { } }
+            }
+            v.Repaint();
+        }
+
+        static bool Matches(EditorWindow v, in ViewState want, out string why)
+        {
+            why = null;
+            int sel = GetSelectedIndex(v);
+            if (sel != want.Index) { why = "size index " + sel + " instead of " + want.Index; return false; }
+            if (want.Zoom > 0f)
+            {
+                if (!DisplayXRProviderDriver.TryGetGameViewZoomState(v, out Vector2 zoom, out Vector2 scroll))
+                { why = "the zoom cannot be read"; return false; }
+                float tol = 1e-4f * Mathf.Max(1f, want.Zoom);
+                if (Mathf.Abs(zoom.x - want.Zoom) > tol || Mathf.Abs(zoom.y - want.Zoom) > tol)
+                { why = "zoom (" + zoom.x.ToString("0.####", Inv) + "," + zoom.y.ToString("0.####", Inv) + ") instead of " + want.Zoom.ToString("0.####", Inv); return false; }
+                if (want.HaveScroll && (Mathf.Abs(scroll.x - want.Scroll.x) > kScrollTolPt || Mathf.Abs(scroll.y - want.Scroll.y) > kScrollTolPt))
+                { why = "scroll (" + scroll.x.ToString("0.##", Inv) + "," + scroll.y.ToString("0.##", Inv) + ") instead of (" +
+                        want.Scroll.x.ToString("0.##", Inv) + "," + want.Scroll.y.ToString("0.##", Inv) + ")"; return false; }
+            }
+            return true;
+        }
+
+        // "size index 6 "4K UHD (3840x2160)", zoom 0.2786x, scroll (12.5,-3)": what the view
+        // shows NOW, read back from it.
+        static string Describe(EditorWindow v)
+        {
+            try
+            {
+                int sel = GetSelectedIndex(v);
+                string t = "size index " + sel + " \"" + SizeText(sel, out _, null, 0f) + "\"";
+                if (DisplayXRProviderDriver.TryGetGameViewZoomState(v, out Vector2 zoom, out Vector2 scroll))
+                    t += ", zoom " + zoom.x.ToString("0.####", Inv) + "x" +
+                         (Mathf.Abs(zoom.y - zoom.x) > 1e-5f ? " (y " + zoom.y.ToString("0.####", Inv) + ")" : "") +
+                         ", scroll (" + scroll.x.ToString("0.##", Inv) + "," + scroll.y.ToString("0.##", Inv) + ")";
+                return t;
+            }
+            catch (Exception e) { return "unreadable (" + Unwrap(e).Message + ")"; }
+        }
+
+        // Every poll (0.1 s): read each restored view back; re-apply what did not hold.
+        static void VerifyTick()
+        {
+            for (int i = s_verify.Count - 1; i >= 0; i--)
+            {
+                Pending p = s_verify[i];
+                if (p.View == null) { s_verify.RemoveAt(i); continue; }
+                try
+                {
+                    p.Checks++;
+                    if (Matches(p.View, p.Want, out string why))
+                    {
+                        if (++p.Good < kVerifyGood) { p.View.Repaint(); continue; }
+                        Debug.Log("[DisplayXR] Game view: restored the previous size and zoom" +
+                                  (p.Removed ? " and removed \"" + SizeName + "\"" : "") + " - " + p.Reason +
+                                  ": read back " + Describe(p.View) +
+                                  (p.Reapplied > 0 ? " (it held after " + p.Reapplied + " re-application(s))" : ""));
+                        s_verify.RemoveAt(i);
+                        continue;
+                    }
+                    p.Good = 0;
+                    if (p.Checks >= kVerifyMax)
+                    {
+                        Debug.LogWarning("[DisplayXR] Game view: the size / zoom from before Play could not be put back (" + p.Reason +
+                                         "): " + why + " after " + p.Reapplied + " re-applications. The view now shows " + Describe(p.View) +
+                                         "; wanted size index " + p.Want.Index + " \"" + p.Want.Name + "\", zoom " +
+                                         p.Want.Zoom.ToString("0.####", Inv) + "x" +
+                                         (p.Want.HaveScroll ? ", scroll (" + p.Want.Scroll.x.ToString("0.##", Inv) + "," + p.Want.Scroll.y.ToString("0.##", Inv) + ")" : "") +
+                                         ". Set it in the Game view's toolbar.");
+                        s_verify.RemoveAt(i);
+                        continue;
+                    }
+                    ApplyViewState(p.View, p.Want);
+                    p.Reapplied++;
+                }
+                catch (Exception) { s_verify.RemoveAt(i); }
             }
         }
 
@@ -539,6 +644,8 @@ namespace DisplayXR.Editor
             public int    Group;              // GameViewSizeGroupType it belongs to
             public bool   FreeAspect;         // we selected Free Aspect on the view
             public int    OursIndex = -1;     // total index our custom size was selected at (-1 = never)
+            public bool   HaveScroll;         // ScrollX / ScrollY are valid
+            public float  ScrollX, ScrollY;   // the user's scroll (ZoomableArea.m_Translation, points)
         }
         static Record s_rec;
         static bool   s_recLoaded;
@@ -570,6 +677,14 @@ namespace DisplayXR.Editor
                     case "group":      int.TryParse(val, System.Globalization.NumberStyles.Integer, Inv, out r.Group); break;
                     case "freeAspect": r.FreeAspect = val == "1"; break;
                     case "oursIndex":  int.TryParse(val, System.Globalization.NumberStyles.Integer, Inv, out r.OursIndex); break;
+                    case "scroll":
+                    {
+                        string[] xy = val.Split(',');
+                        r.HaveScroll = xy.Length == 2
+                            && float.TryParse(xy[0], System.Globalization.NumberStyles.Float, Inv, out r.ScrollX)
+                            && float.TryParse(xy[1], System.Globalization.NumberStyles.Float, Inv, out r.ScrollY);
+                        break;
+                    }
                     }
                 }
                 if (any) s_rec = r;
@@ -590,7 +705,8 @@ namespace DisplayXR.Editor
                 "prevZoom=" + r.PrevZoom.ToString("R", Inv) + "\n" +
                 "group=" + r.Group.ToString(Inv) + "\n" +
                 "freeAspect=" + (r.FreeAspect ? "1" : "0") + "\n" +
-                "oursIndex=" + r.OursIndex.ToString(Inv) + "\n");
+                "oursIndex=" + r.OursIndex.ToString(Inv) + "\n" +
+                (r.HaveScroll ? "scroll=" + r.ScrollX.ToString("R", Inv) + "," + r.ScrollY.ToString("R", Inv) + "\n" : ""));
             s_rec = r; s_recLoaded = true;
         }
 
@@ -611,13 +727,13 @@ namespace DisplayXR.Editor
         {
             Record rec = LoadRecord();
             if (rec != null) return rec;
-            Type sizesType = EditorType("UnityEditor.GameViewSizes");
-            object sizes = Property(sizesType, "instance").GetValue(null, null);
             rec = new Record
             {
-                PrevIndex = currentIndex, PrevName = name ?? "", PrevZoom = zoomX,
-                Group = Convert.ToInt32(Property(sizesType, "currentGroupType").GetValue(sizes, null)),
+                PrevIndex = currentIndex, PrevName = name ?? "", PrevZoom = zoomX, Group = CurrentGroupIndex(),
             };
+            // The scroll is part of what the user sees (a zoomed-in view shows one corner).
+            if (DisplayXRProviderDriver.TryGetGameViewZoomState(view, out _, out Vector2 scroll))
+            { rec.HaveScroll = true; rec.ScrollX = scroll.x; rec.ScrollY = scroll.y; }
             SaveRecord(rec);
             return rec;
         }
@@ -689,6 +805,29 @@ namespace DisplayXR.Editor
                                  new[] { typeof(int), typeof(object) }, null);
             if (cb != null) cb.Invoke(view, new object[] { index, null });
             else Property(view.GetType(), "selectedSizeIndex").SetValue(view, index, null);
+        }
+
+        // GameViewSizes.instance.currentGroupType as an int (the index into m_SelectedSizes).
+        static int CurrentGroupIndex()
+        {
+            Type sizesType = EditorType("UnityEditor.GameViewSizes");
+            object sizes = Property(sizesType, "instance").GetValue(null, null);
+            return Convert.ToInt32(Property(sizesType, "currentGroupType").GetValue(sizes, null));
+        }
+
+        // GameView.UpdateZoomAreaAndParent(): re-fits the zoom area to the size selected NOW
+        // (ConfigureZoomArea: the area's rect, the content range and the min / max zoom) and
+        // moves a zoom that sat on the old default to the new one. Without it the limits are
+        // those of the size selected before, until the view's next OnGUI.
+        static void RefreshZoomArea(EditorWindow view)
+        {
+            MethodInfo m = null;
+            for (Type t = view.GetType(); t != null && m == null; t = t.BaseType)
+                m = t.GetMethod("UpdateZoomAreaAndParent", kAny | BindingFlags.DeclaredOnly, null, Type.EmptyTypes, null);
+            if (m == null)
+                for (Type t = view.GetType(); t != null && m == null; t = t.BaseType)
+                    m = t.GetMethod("ConfigureZoomArea", kAny | BindingFlags.DeclaredOnly, null, Type.EmptyTypes, null);
+            if (m != null) m.Invoke(view, null);
         }
 
         // GameView.SnapZoom(float): a uniform zoom, as the Scale slider sets it.

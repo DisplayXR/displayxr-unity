@@ -249,6 +249,326 @@ static class Program
               "takeover: Free Aspect at 2x, or a fixed size that fits -> zoom 1, the size is kept");
     }
 
+    // ---- (#459) The owner of the Game view's size and zoom during Play ----------------------
+    // A model of the Game view as far as the owner is concerned: a size list (built-in sizes,
+    // then custom ones), a selected index, a uniform zoom and a scroll; Unity's rule that a
+    // Fixed Resolution larger than the area is fitted (zoom below 1) while the zoom sits on
+    // its default. The steps the owner asks for are applied to it the way the editor side
+    // does, and at the end of Play the recorded pre-Play state is put back.
+    sealed class FakeView
+    {
+        public struct Size { public string Name; public int W, H; }   // W == 0: Free Aspect / an aspect ratio
+        public readonly System.Collections.Generic.List<Size> Sizes = new System.Collections.Generic.List<Size>
+        {
+            new Size { Name = "Free Aspect" }, new Size { Name = "16:9" }, new Size { Name = "16:10" },
+            new Size { Name = "Full HD", W = 1920, H = 1080 }, new Size { Name = "WXGA", W = 1366, H = 768 },
+            new Size { Name = "QHD", W = 2560, H = 1440 }, new Size { Name = "4K UHD", W = 3840, H = 2160 },
+        };
+        public const string Ours = "DisplayXR whole-pixel";
+        public int Selected; public float Zoom = 1f; public float ScrollX, ScrollY;
+        public float AreaWPt, AreaHPt, Scale;
+        // The pre-Play record (what the editor side writes to Library/ before its first change).
+        public bool HaveRecord; public int RecIndex; public float RecZoom, RecScrollX, RecScrollY; public string RecName;
+        public int MidPlayRestores;   // must stay 0: the pre-Play size never comes back during Play
+
+        public int OursIndex() => Sizes.FindIndex(z => z.Name == Ours);
+        public float Fit()
+        {
+            Size z = Sizes[Selected];
+            return z.W <= 0 ? 1f : Math.Min(AreaWPt * Scale / z.W, AreaHPt * Scale / z.H);
+        }
+        // Unity: a size that does not fit is shown at its fit; it cannot be shown larger.
+        public void UnityRefit() { float f = Fit(); if (f < 1f) Zoom = f; }
+        public void Resize(float wPt, float hPt) { AreaWPt = wPt; AreaHPt = hPt; UnityRefit(); }
+        public void UserPicks(int index) { Selected = index; float f = Fit(); Zoom = f < 1f ? f : 1f; }
+
+        public DisplayXRGameViewOwner.Obs Look(double now, bool wholePixelOn, bool takeoverOn = true) => new DisplayXRGameViewOwner.Obs
+        {
+            Selected = Selected, OursIndex = OursIndex(), ZoomX = Zoom, FitScale = Fit(), Scale = Scale,
+            AreaWPt = AreaWPt, AreaHPt = AreaHPt, WholePixelOn = wholePixelOn, TakeoverOn = takeoverOn, Now = now,
+        };
+
+        void Record()
+        {
+            if (HaveRecord) return;
+            HaveRecord = true; RecIndex = Selected; RecZoom = Zoom; RecScrollX = ScrollX; RecScrollY = ScrollY; RecName = Sizes[Selected].Name;
+        }
+
+        public void Carry(DisplayXRGameViewOwner owner, DisplayXRGameViewOwner.Step st)
+        {
+            switch (st.Kind)
+            {
+            case DisplayXRGameViewOwner.Act.None: return;
+            case DisplayXRGameViewOwner.Act.StandDown: break;
+            case DisplayXRGameViewOwner.Act.ZoomOne: Record(); Zoom = 1f; ScrollX = ScrollY = 0f; break;
+            case DisplayXRGameViewOwner.Act.FreeAspect: Record(); Selected = 0; Zoom = 1f; ScrollX = ScrollY = 0f; break;
+            case DisplayXRGameViewOwner.Act.WholePixel:
+                Record();
+                int i = OursIndex();
+                if (i < 0) { Sizes.Add(new Size { Name = Ours, W = st.WPx, H = st.HPx }); i = Sizes.Count - 1; }
+                else Sizes[i] = new Size { Name = Ours, W = st.WPx, H = st.HPx };
+                Selected = i; Zoom = 1f; ScrollX = ScrollY = 0f;
+                break;
+            }
+            owner.Applied(st, Selected);
+        }
+
+        // Play ends: the pre-Play state back, whatever happened in between; our entry removed.
+        public void EndPlay(DisplayXRGameViewOwner owner)
+        {
+            int i = OursIndex();
+            if (HaveRecord) { Selected = RecIndex; Zoom = RecZoom; ScrollX = RecScrollX; ScrollY = RecScrollY; }
+            else if (i >= 0 && Selected == i) Selected = 0;
+            if (i >= 0) Sizes.RemoveAt(i);
+            HaveRecord = false;
+            owner.Reset();
+        }
+    }
+
+    // Run the owner on the view for `seconds`, polling every 0.1 s as the editor side does.
+    // Returns the steps that did something; counts stand-downs and re-fits.
+    static System.Collections.Generic.List<DisplayXRGameViewOwner.Step> Run(DisplayXRGameViewOwner owner, FakeView v, ref double now,
+                                                                             double seconds, bool wholePixelOn, bool takeoverOn = true)
+    {
+        var done = new System.Collections.Generic.List<DisplayXRGameViewOwner.Step>();
+        for (double end = now + seconds; now < end; now += 0.1)
+        {
+            var st = owner.Next(v.Look(now, wholePixelOn, takeoverOn));
+            if (st.Kind == DisplayXRGameViewOwner.Act.None) continue;
+            // The invariant behind the hardware bug: no step of the owner ever puts the
+            // pre-Play size back during Play (a non-zero recorded index selected again).
+            bool hadRecord = v.HaveRecord; int before = v.Selected;
+            v.Carry(owner, st);
+            if (hadRecord && v.RecIndex != 0 && v.Selected == v.RecIndex && before != v.RecIndex) v.MidPlayRestores++;
+            done.Add(st);
+        }
+        return done;
+    }
+
+    static int Count(System.Collections.Generic.List<DisplayXRGameViewOwner.Step> steps, DisplayXRGameViewOwner.Act kind)
+    {
+        int n = 0;
+        foreach (var st in steps) if (st.Kind == kind) n++;
+        return n;
+    }
+
+    static void OwnerStateMachine()
+    {
+        const DisplayXRGameViewOwner.Act ZoomOne = DisplayXRGameViewOwner.Act.ZoomOne,
+              FreeAspect = DisplayXRGameViewOwner.Act.FreeAspect, WholePixel = DisplayXRGameViewOwner.Act.WholePixel,
+              StandDown = DisplayXRGameViewOwner.Act.StandDown;
+
+        // ---- A. The hardware session of 2026-11-18, 175 %: Play from "4K UHD" at its fit,
+        //         takeover, whole-pixel, then splitter drags in both directions.
+        {
+            var v = new FakeView { Scale = 1.75f, Selected = 6, ScrollX = 3f, ScrollY = -7f };
+            v.Resize(641.429f, 343.857f);
+            float fit0 = v.Zoom;
+            Check(Math.Abs(fit0 - 0.2786f) < 1e-3, $"A: the model shows 4K UHD at its fit ({fit0:F4}; hardware 0.2786)");
+            var owner = new DisplayXRGameViewOwner();
+            double now = 0;
+
+            var s1 = Run(owner, v, ref now, 0.3, wholePixelOn: false);
+            Check(s1.Count == 1 && s1[0].Kind == FreeAspect && v.Selected == 0 && v.Zoom == 1f && owner.Held == DisplayXRGameViewOwner.Holds.FreeAspect,
+                  "A: a 4K view that cannot be shown at 1x is taken over: Free Aspect, zoom 1");
+            Check(v.HaveRecord && v.RecIndex == 6 && v.RecZoom == fit0 && v.RecScrollX == 3f && v.RecScrollY == -7f,
+                  "A: the pre-Play size, zoom and scroll were recorded before the first change");
+            Check(Run(owner, v, ref now, 2.0, wholePixelOn: false).Count == 0, "A: the plug-in's own Free Aspect is not a user pick; nothing more to do");
+
+            // The calibration measured a view that is not 1:1 at 175 %: the whole-pixel size is wanted.
+            var s2 = Run(owner, v, ref now, 1.0, wholePixelOn: true);
+            Check(s2.Count == 1 && s2[0].Kind == WholePixel && s2[0].WPx == 1120 && s2[0].HPx == 595 && !s2[0].Refit,
+                  $"A: whole-pixel 1120x595 selected once the area settled (hardware: 1120x595); got {(s2.Count > 0 ? s2[0].WPx + "x" + s2[0].HPx : "nothing")}");
+            Check(v.Selected == v.OursIndex() && v.Zoom == 1f && owner.Held == DisplayXRGameViewOwner.Holds.WholePixel, "A: the view is on the plug-in's entry at zoom 1");
+            Check(Run(owner, v, ref now, 2.0, wholePixelOn: true).Count == 0, "A: its own entry is not a user pick");
+
+            // First drag: the pane grows (hardware: 709.429 pt -> 1239x595).
+            v.Resize(709.429f, 343.857f);
+            var s3 = Run(owner, v, ref now, 1.0, wholePixelOn: true);
+            Check(s3.Count == 1 && s3[0].Kind == WholePixel && s3[0].WPx == 1239 && s3[0].HPx == 595,
+                  "A: first drag (wider): resized to 1239x595 after the settle time (hardware: 1239x595)");
+
+            // Second drag: the pane SHRINKS under the held size, in steps, as a splitter drag
+            // does (hardware host widths 698.29, 685.14, 664.57, 656.57 pt; the area is 2 pt less).
+            int standDowns = 0, freeAspects = 0, refits = 0;
+            foreach (float hostW in new[] { 698.2857f, 685.1428f, 664.5715f, 656.5714f, 649.7143f })
+            {
+                v.Resize(hostW - 2f, 343.857f);
+                bool scaledBefore = v.Zoom < 1f;
+                var st = Run(owner, v, ref now, 0.1, wholePixelOn: true);
+                standDowns += Count(st, StandDown); freeAspects += Count(st, FreeAspect);
+                foreach (var x in st) if (x.Kind == WholePixel && x.Refit) refits++;
+                Check(v.Selected == v.OursIndex() && v.Zoom == 1f && v.Fit() >= 1f,
+                      $"A: second drag, host {hostW} pt: still on the plug-in's entry, zoom 1, fits (it was {(scaledBefore ? "scaled" : "fitting")} for one poll at most)");
+            }
+            Check(standDowns == 0 && freeAspects == 0, $"A: the shrinking drag never selects Free Aspect ({freeAspects}) and is never read as a user pick ({standDowns}) - the hardware bug");
+            Check(refits >= 4, $"A: a held size that stops fitting is re-fitted at once ({refits} re-fits over 5 widths)");
+            var s4 = Run(owner, v, ref now, 1.0, wholePixelOn: true);
+            Check(Count(s4, StandDown) == 0 && v.Selected == v.OursIndex(), "A: after the drag settles the view is still on the plug-in's entry");
+            int wantW = (int)Math.Floor(647.7143 / 4 + 0.001) * 4 * 175 / 100;
+            Check(owner.AppliedWPx == wantW && owner.AppliedHPx == 595, $"A: settled on {owner.AppliedWPx}x{owner.AppliedHPx} (want {wantW}x595)");
+
+            // N more resizes in a row, both directions, height too.
+            int n = 0;
+            foreach (var (w, h) in new[] { (700f, 343.857f), (520f, 343.857f), (900f, 500f), (901f, 500f), (300f, 200f), (641.429f, 343.857f), (640f, 100f), (1200f, 620f) })
+            {
+                v.Resize(w, h);
+                var st = Run(owner, v, ref now, 1.0, wholePixelOn: true);
+                DisplayXRGameViewPlacement.WholePixelSize(w, h, 1.75f, out _, out _, out int ew, out int eh);
+                Check(Count(st, StandDown) == 0 && Count(st, FreeAspect) == 0 && v.Selected == v.OursIndex() && v.Zoom == 1f
+                      && owner.AppliedWPx == ew && owner.AppliedHPx == eh,
+                      $"A: resize {++n} to {w}x{h} pt: whole-pixel {owner.AppliedWPx}x{owner.AppliedHPx} (want {ew}x{eh}), zoom 1, no stand-down");
+            }
+            Check(v.MidPlayRestores == 0 && !owner.UserPicked, "A: the pre-Play size never came back during Play");
+
+            v.EndPlay(owner);
+            Check(v.Selected == 6 && v.Zoom == fit0 && v.ScrollX == 3f && v.ScrollY == -7f && v.OursIndex() < 0 && v.Sizes.Count == 7,
+                  "A: Play end restores exactly the pre-Play state (4K UHD, its zoom, its scroll) and removes the entry");
+            Check(owner.Held == DisplayXRGameViewOwner.Holds.Nothing && !owner.Changed && !owner.UserPicked, "A: the owner is reset");
+        }
+
+        // ---- B. From Free Aspect at zoom 1 (the common case), 175 %.
+        {
+            var v = new FakeView { Scale = 1.75f };
+            v.Resize(641.429f, 343.857f);
+            var owner = new DisplayXRGameViewOwner();
+            double now = 0;
+            Check(Run(owner, v, ref now, 2.0, wholePixelOn: false).Count == 0 && !v.HaveRecord && !owner.Changed,
+                  "B: Free Aspect at zoom 1 without the whole-pixel size: untouched, nothing recorded");
+            var st = Run(owner, v, ref now, 1.0, wholePixelOn: true);
+            Check(st.Count == 1 && st[0].Kind == WholePixel && v.RecIndex == 0 && v.RecZoom == 1f, "B: whole-pixel selected; pre-Play = Free Aspect at 1x");
+            for (int i = 0; i < 6; i++)
+            {
+                v.Resize(500f + 37f * i * (i % 2 == 0 ? 1 : -1) + 200f, 343.857f - 11f * i);
+                var r = Run(owner, v, ref now, 1.0, wholePixelOn: true);
+                Check(Count(r, StandDown) == 0 && Count(r, FreeAspect) == 0 && v.Selected == v.OursIndex() && v.Zoom == 1f,
+                      $"B: resize {i + 1}: on the plug-in's entry {owner.AppliedWPx}x{owner.AppliedHPx}, zoom 1");
+            }
+            v.EndPlay(owner);
+            Check(v.Selected == 0 && v.Zoom == 1f && v.OursIndex() < 0, "B: Play end: Free Aspect at 1x, entry removed");
+        }
+
+        // ---- C. Free Aspect with the Scale slider at 2x: zoom only, the size is kept.
+        {
+            var v = new FakeView { Scale = 2.5f, Zoom = 2f, ScrollX = -120f, ScrollY = 44f };
+            v.AreaWPt = 691.2f; v.AreaHPt = 343.8f;
+            var owner = new DisplayXRGameViewOwner();
+            double now = 0;
+            var st = Run(owner, v, ref now, 0.3, wholePixelOn: false);
+            Check(st.Count == 1 && st[0].Kind == ZoomOne && v.Selected == 0 && v.Zoom == 1f && owner.Held == DisplayXRGameViewOwner.Holds.Zoom,
+                  "C: zoom 2x on Free Aspect: zoom set to 1, size kept");
+            v.EndPlay(owner);
+            Check(v.Selected == 0 && v.Zoom == 2f && v.ScrollX == -120f && v.ScrollY == 44f, "C: Play end: zoom 2x and the scroll are back");
+        }
+
+        // ---- D. A real user pick during Play, from each held state.
+        foreach (string held in new[] { "FreeAspect", "WholePixel" })
+        {
+            var v = new FakeView { Scale = 1.75f, Selected = 6 };
+            v.Resize(641.429f, 343.857f);
+            float fit0 = v.Zoom;
+            var owner = new DisplayXRGameViewOwner();
+            double now = 0;
+            Run(owner, v, ref now, 1.0, wholePixelOn: held == "WholePixel");
+            Run(owner, v, ref now, 1.0, wholePixelOn: held == "WholePixel");
+            Check(owner.Held.ToString() == held, $"D/{held}: set-up holds {owner.Held}");
+            v.UserPicks(3);   // Full HD: does not fit either, Unity shows it scaled
+            var st = Run(owner, v, ref now, 2.0, wholePixelOn: held == "WholePixel");
+            Check(st.Count == 1 && st[0].Kind == StandDown && owner.UserPicked, $"D/{held}: a user pick switches the feature off, once ({st.Count} steps)");
+            Check(v.Selected == 3 && v.MidPlayRestores == 0, $"D/{held}: the user's pick is left alone; the pre-Play size does NOT come back during Play");
+            v.Resize(700f, 343.857f);
+            v.UserPicks(0);
+            Check(Run(owner, v, ref now, 2.0, wholePixelOn: true).Count == 0 && v.Selected == 0, $"D/{held}: nothing more happens until Play ends, whatever the user does");
+            v.EndPlay(owner);
+            Check(v.Selected == 6 && v.Zoom == fit0 && v.OursIndex() < 0, $"D/{held}: Play end still restores the pre-Play 4K UHD and its zoom");
+        }
+
+        // ---- E. The user deletes the plug-in's entry from the size menu.
+        {
+            var v = new FakeView { Scale = 1.75f };
+            v.Resize(641.429f, 343.857f);
+            var owner = new DisplayXRGameViewOwner();
+            double now = 0;
+            Run(owner, v, ref now, 1.0, wholePixelOn: true);
+            v.Sizes.RemoveAt(v.OursIndex()); v.Selected = 6; v.UnityRefit();   // Unity clamps to the last entry
+            var st = Run(owner, v, ref now, 1.0, wholePixelOn: true);
+            Check(st.Count == 1 && st[0].Kind == StandDown, "E: a deleted entry is a user action: stand down, do not re-create it");
+            v.EndPlay(owner);
+            Check(v.Selected == 0 && v.Zoom == 1f, "E: Play end: Free Aspect at 1x");
+        }
+
+        // ---- F. The user zooms during Play: put right twice, then theirs.
+        {
+            var v = new FakeView { Scale = 1.75f };
+            v.Resize(641.429f, 343.857f);
+            var owner = new DisplayXRGameViewOwner();
+            double now = 0;
+            Run(owner, v, ref now, 1.0, wholePixelOn: true);
+            int idx = v.Selected;
+            v.Zoom = 2f;
+            var a = Run(owner, v, ref now, 0.3, wholePixelOn: true);
+            Check(a.Count == 1 && a[0].Kind == ZoomOne && v.Zoom == 1f && v.Selected == idx, "F: a zoom on the held whole-pixel size is set back to 1 (the size is kept)");
+            v.Zoom = 3f;
+            Run(owner, v, ref now, 0.3, wholePixelOn: true);
+            v.Zoom = 2f;
+            var c = Run(owner, v, ref now, 1.0, wholePixelOn: true);
+            Check(c.Count == 1 && c[0].Kind == StandDown && v.Zoom == 2f && v.Selected == idx, "F: the third time it is the user's: stand down, size and zoom left alone");
+            v.EndPlay(owner);
+            Check(v.Selected == 0 && v.Zoom == 1f && v.OursIndex() < 0, "F: Play end restores Free Aspect at 1x");
+        }
+
+        // ---- G. Opted out of the takeover: a zoomed view is left alone; a held whole-pixel
+        //         size is still re-fitted (that is the plug-in's own size, not a takeover).
+        {
+            var v = new FakeView { Scale = 1.75f, Selected = 6 };
+            v.Resize(641.429f, 343.857f);
+            var owner = new DisplayXRGameViewOwner();
+            double now = 0;
+            Check(Run(owner, v, ref now, 3.0, wholePixelOn: true, takeoverOn: false).Count == 0 && v.Selected == 6 && !v.HaveRecord,
+                  "G: takeover off: a scaled 4K view is not touched (no whole-pixel either: the view is not at zoom 1)");
+            v.UserPicks(0);
+            var st = Run(owner, v, ref now, 1.0, wholePixelOn: true, takeoverOn: false);
+            Check(st.Count == 1 && st[0].Kind == WholePixel, "G: at zoom 1 the whole-pixel size is selected as usual");
+            v.Resize(500f, 343.857f);
+            var rf = Run(owner, v, ref now, 0.1, wholePixelOn: true, takeoverOn: false);
+            Check(rf.Count == 1 && rf[0].Kind == WholePixel && rf[0].Refit && v.Zoom == 1f, "G: takeover off: a shrinking pane still re-fits the held size");
+            v.EndPlay(owner);
+        }
+
+        // ---- H. Whole display scale: nothing to select; a held size is given up for Free Aspect.
+        {
+            var v = new FakeView { Scale = 1.75f };
+            v.Resize(641.429f, 343.857f);
+            var owner = new DisplayXRGameViewOwner();
+            double now = 0;
+            Run(owner, v, ref now, 1.0, wholePixelOn: true);
+            v.Scale = 2f; v.Resize(560f, 300f);   // the editor moved to a 200 % monitor
+            var st = Run(owner, v, ref now, 1.0, wholePixelOn: true);
+            Check(Count(st, StandDown) == 0 && v.Selected == 0 && v.Zoom == 1f && owner.Held == DisplayXRGameViewOwner.Holds.FreeAspect,
+                  "H: at a whole scale the held whole-pixel size is given up for Free Aspect (1:1 there), not for the pre-Play size");
+            var v2 = new FakeView { Scale = 2f }; v2.Resize(560f, 300f);
+            var o2 = new DisplayXRGameViewOwner(); double n2 = 0;
+            Check(Run(o2, v2, ref n2, 2.0, wholePixelOn: true).Count == 0 && !v2.HaveRecord, "H: at a whole scale an untouched view stays untouched");
+            v.EndPlay(owner);
+            Check(v.Selected == 0 && v.OursIndex() < 0, "H: Play end removes the entry");
+        }
+
+        // ---- I. Settle: a growing drag costs one size change, not one per poll.
+        {
+            var v = new FakeView { Scale = 1.75f };
+            v.Resize(641.429f, 343.857f);
+            var owner = new DisplayXRGameViewOwner();
+            double now = 0;
+            Run(owner, v, ref now, 1.0, wholePixelOn: true);
+            int changes = 0;
+            for (int i = 1; i <= 20; i++) { v.Resize(641.429f + 9f * i, 343.857f); changes += Run(owner, v, ref now, 0.1, wholePixelOn: true).Count; }
+            Check(changes == 0, $"I: 20 polls of a growing drag: no size change while it moves ({changes})");
+            Check(Run(owner, v, ref now, 1.0, wholePixelOn: true).Count == 1, "I: one size change when it settles");
+            Check(Run(owner, v, ref now, 3.0, wholePixelOn: true).Count == 0, "I: none after that");
+            v.EndPlay(owner);
+        }
+    }
+
     static void WholePixelDefinitions()
     {
         // The step: the smallest number of points that is EXACTLY a whole number of pixels.
@@ -720,6 +1040,7 @@ static class Program
         }
 
         ZoomedView();
+        OwnerStateMachine();
         WholePixelDefinitions();
         ModelConsistency();
 
