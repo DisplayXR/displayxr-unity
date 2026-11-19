@@ -1,0 +1,18 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Unit tests for Runtime/Provider/DisplayXRRenderScaleMath.cs (pure C#, no UnityEngine):
+       the render scale's range, the app-vs-settings precedence, and the file a build writes
+       for a built player (#475). Lives under Tests~ so Unity never imports it.
+       Run: dotnet run -c Release -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <!-- The package targets Unity 2022.3 (C# 9): newer syntax must not pass here. -->
+    <LangVersion>9.0</LangVersion>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <RollForward>Major</RollForward>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../Runtime/Provider/DisplayXRRenderScaleMath.cs" Link="DisplayXRRenderScaleMath.cs" />
+  </ItemGroup>
+</Project>

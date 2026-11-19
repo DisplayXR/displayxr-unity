@@ -298,6 +298,16 @@ Inverse convergence distance in 1/meters. Controls where the virtual screen plan
 
 > **Note:** Camera-centric FOV is inherited automatically from the Camera component. There is no separate FOV tunable.
 
+### Render Scale (project-wide)
+
+The resolution each 3D view is rendered at, as a multiple of the default (window pixels x the display mode's view scale). Range 0.25 to 2.
+
+- Below `1.0` renders fewer pixels per view, for frame rate.
+- Above `1.0` supersamples, for cleaner edges. The cost grows with the square: `1.5` is 2.25x the pixels.
+- The picture on the display keeps its size. Window-space UI and Local2D layers are not affected.
+
+Set it with `DisplayXRProvider.RenderScale` from code, with **Override Render Scale** in the manifest settings asset (`Window > DisplayXR > Manifest Settings`), or with Unity's own knob (`XRSettings.eyeTextureResolutionScale`, or the URP asset's Render Scale). The first of those that is set wins. Changing it reallocates the view textures, so a change is applied once the value has held still for a quarter of a second. See [Render scale](docs~/architecture/xr-display-provider.md#render-scale-475).
+
 ---
 
 ## 2D UI Overlay

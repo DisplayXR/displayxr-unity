@@ -316,6 +316,139 @@ namespace DisplayXR
         /// <see cref="DisplayXRTransparentOverlay.RequestTransparentSession"/>.</summary>
         internal static bool s_TransparentBackgroundRequested;
 
+        // ---- Render scale (#475) ----------------------------------------------
+
+        // What the app set from code (0 = nothing) and what the settings asset says
+        // (0 = nothing). The native provider is pushed the first one that is set; it
+        // stores the number itself, so a session restart (editor dock / undock) needs
+        // no re-push.
+        static float s_appRenderScale;
+        static float s_settingsRenderScale;
+
+        /// <summary>
+        /// The resolution the 3D views are rendered at, as a multiple of the default
+        /// (window pixels x the display mode's view scale): 0.5 renders a quarter of the
+        /// pixels for frame rate, 1.5 supersamples for edge quality. The woven picture
+        /// keeps its size - the runtime scales each view into place - so this trades
+        /// sharpness for speed and nothing else. Range 0.25 to 2; a value the runtime's
+        /// maximum image size cannot hold is reduced, and the log says so.
+        ///
+        /// <para><b>Reading</b> gives the scale in effect: this property's value when it
+        /// was set, else the DisplayXR settings asset's Render Scale, else Unity's own
+        /// knob (<c>XRSettings.eyeTextureResolutionScale</c>, or the URP asset's Render
+        /// Scale, which URP writes over the former every frame), else 1. The
+        /// <c>DISPLAYXR_RENDER_SCALE</c> environment variable overrides all of them.</para>
+        ///
+        /// <para><b>Setting</b> takes precedence over the settings asset and over Unity's
+        /// knob, on every render pipeline. Set 0 (or call <see cref="ClearRenderScale"/>)
+        /// to hand the decision back. It may be set at any time, before the session
+        /// exists included. A change reallocates the eye textures, so it is applied once
+        /// the value has held still for a quarter of a second: animate it freely, but do
+        /// not expect each intermediate value to be rendered.</para>
+        ///
+        /// <para>Window-space UI, Local2D layers, zone rectangles, picking and the
+        /// click-through mask are in window pixels and do not change.</para>
+        /// </summary>
+        public static float RenderScale
+        {
+            get
+            {
+                if (TryGetRenderScaleState(out var s) && s.requested > 0f) return s.requested;
+                float o = DisplayXRRenderScaleMath.ResolveOverride(s_appRenderScale, s_settingsRenderScale);
+                return o > 0f ? o : 1f;
+            }
+            set
+            {
+                s_appRenderScale = DisplayXRRenderScaleMath.Sanitize(value);
+                PushRenderScale();
+            }
+        }
+
+        /// <summary>
+        /// Forget the value set through <see cref="RenderScale"/>: the settings asset's
+        /// Render Scale applies again, or Unity's own knob when that is unset too.
+        /// </summary>
+        public static void ClearRenderScale()
+        {
+            s_appRenderScale = DisplayXRRenderScaleMath.Unset;
+            PushRenderScale();
+        }
+
+        /// <summary>
+        /// The render scale in detail: what was asked and by whom, what the eye textures
+        /// were actually allocated at (<c>applied</c>, <c>width</c> x <c>height</c> from
+        /// <c>baseWidth</c> x <c>baseHeight</c>), and whether a limit reduced it. False
+        /// only when the native plug-in is not loaded. Sizes are 0 until a session has
+        /// allocated its eye textures.
+        /// </summary>
+        public static bool TryGetRenderScaleState(out DisplayXRProviderNative.DxrRenderScaleState state)
+        {
+            state = default;
+            try { return DisplayXRProviderNative.dxr_prov_get_render_scale_state(out state) != 0; }
+            catch (DllNotFoundException) { return false; }
+            catch (EntryPointNotFoundException) { return false; }
+        }
+
+        /// <summary>
+        /// The settings asset's Render Scale (0 = not set). Called by the display loader
+        /// with the value a build stored (players) and by the editor with the asset's
+        /// current value (Play Mode); a value set from code keeps winning.
+        /// </summary>
+        internal static void SetSettingsRenderScale(float value)
+        {
+            s_settingsRenderScale = DisplayXRRenderScaleMath.Sanitize(value);
+            PushRenderScale();
+        }
+
+        /// <summary>
+        /// Display loader, before the subsystem starts: establish the native value for
+        /// this run. It is pushed even when nothing is set - the native library outlives a
+        /// Play session in the editor, and a value left by the previous run must not leak
+        /// into this one.
+        /// </summary>
+        internal static void InitRenderScale()
+        {
+            if (!Application.isEditor)
+            {
+                // The editor pushes the asset's value itself (it can read the asset). A
+                // player reads what the build wrote next to its data.
+                if (TryReadPlayerSettingsRenderScale(out float v)) s_settingsRenderScale = v;
+            }
+            PushRenderScale();
+            float o = DisplayXRRenderScaleMath.ResolveOverride(s_appRenderScale, s_settingsRenderScale);
+            if (o > 0f)
+                Debug.Log("[DisplayXR] Render scale: " + o.ToString("0.##", System.Globalization.CultureInfo.InvariantCulture)
+                          + (s_appRenderScale > 0f ? " (DisplayXRProvider.RenderScale)" : " (DisplayXR settings)"));
+        }
+
+        static void PushRenderScale()
+        {
+            float o = DisplayXRRenderScaleMath.ResolveOverride(s_appRenderScale, s_settingsRenderScale);
+            try { DisplayXRProviderNative.dxr_prov_set_render_scale(o); }
+            catch (DllNotFoundException) { }
+            catch (EntryPointNotFoundException) { }
+        }
+
+        static bool TryReadPlayerSettingsRenderScale(out float value)
+        {
+            value = DisplayXRRenderScaleMath.Unset;
+            try
+            {
+                // Application.dataPath is <name>_Data on Windows / Linux and
+                // <name>.app/Contents on macOS, where the engine data sits one level down.
+                string root = Application.dataPath;
+                if (Application.platform == RuntimePlatform.OSXPlayer)
+                    root = System.IO.Path.Combine(root, "Resources", "Data");
+                string path = System.IO.Path.Combine(root, DisplayXRRenderScaleMath.PlayerSettingsFile);
+                if (!System.IO.File.Exists(path)) return false;
+                return DisplayXRRenderScaleMath.TryParsePlayerSettingsJson(System.IO.File.ReadAllText(path), out value);
+            }
+            catch (Exception)
+            {
+                return false; // no file system access here (e.g. inside an APK): nothing stored
+            }
+        }
+
         /// <summary>
         /// Set the single 3D-zone rect (client-window pixels) the runtime frames the
         /// Kooima 3D into (#166 Phase B). Seed early (SubsystemRegistration) so the

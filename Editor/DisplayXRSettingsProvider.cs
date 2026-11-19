@@ -211,6 +211,9 @@ namespace DisplayXR.Editor
                 EditorGUILayout.LabelField("App Name", settings.EffectiveName);
                 EditorGUILayout.LabelField("Category", settings.category.ToString());
                 EditorGUILayout.LabelField("Target GPU", settings.targetGpu.ToString());
+                EditorGUILayout.LabelField("Render Scale", DisplayXRRenderScaleMath.IsSet(settings.renderScale)
+                    ? DisplayXRRenderScaleMath.Sanitize(settings.renderScale).ToString("0.##", System.Globalization.CultureInfo.InvariantCulture)
+                    : "not set (Unity's eye texture resolution scale decides)");
                 if (GUILayout.Button("Select Manifest Settings"))
                     Selection.activeObject = settings;
             }

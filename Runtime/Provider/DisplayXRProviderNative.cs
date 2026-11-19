@@ -301,6 +301,61 @@ namespace DisplayXR
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern int dxr_prov_get_texture_target_state(out DxrTextureTargetState state);
 
+        // ---- Render scale (#475) ----------------------------------------------
+
+        /// <summary><see cref="DxrRenderScaleState.source"/>: nobody asked (1.0).</summary>
+        public const int RenderScaleSourceDefault = 0;
+        /// <summary>Unity's hint: <c>XRSettings.eyeTextureResolutionScale</c> / the URP asset's Render Scale.</summary>
+        public const int RenderScaleSourceUnity = 1;
+        /// <summary><see cref="DisplayXRProvider.RenderScale"/> or the settings asset.</summary>
+        public const int RenderScaleSourceApp = 2;
+        /// <summary>The <c>DISPLAYXR_RENDER_SCALE</c> environment variable.</summary>
+        public const int RenderScaleSourceEnv = 3;
+
+        /// <summary><see cref="DxrRenderScaleState.flags"/>: the request was outside 0.25..2.</summary>
+        public const uint RenderScaleFlagRangeClamped = 0x1;
+        /// <summary>The allocated size was reduced to the runtime's maximum image size.</summary>
+        public const uint RenderScaleFlagLimitClamped = 0x2;
+
+        /// <summary>Mirror of the native <c>DxrRenderScaleState</c> (12 x 4 bytes, field for field).</summary>
+        [StructLayout(LayoutKind.Sequential)]
+        public struct DxrRenderScaleState
+        {
+            /// <summary>The request after precedence (environment, app, Unity's hint), range clamp and rounding.</summary>
+            public float requested;
+            /// <summary>The settled request the eye textures are (being) sized to.</summary>
+            public float target;
+            /// <summary>Allocated / base size of the eye texture; 0 before the first allocation.</summary>
+            public float applied;
+            /// <summary>One of the <c>RenderScaleSource*</c> constants.</summary>
+            public int source;
+            /// <summary>Unscaled per-eye size at the last allocation.</summary>
+            public uint baseWidth, baseHeight;
+            /// <summary>Allocated per-eye size.</summary>
+            public uint width, height;
+            /// <summary>The runtime's maximum image size; 0 = not reported.</summary>
+            public uint maxWidth, maxHeight;
+            /// <summary>Eye texture allocations this session (1 = created, never reallocated).</summary>
+            public uint allocCount;
+            /// <summary><c>RenderScaleFlag*</c> bits.</summary>
+            public uint flags;
+        }
+
+        /// <summary>
+        /// (#475) The app's render scale. &lt;= 0 clears it (Unity's hint decides again).
+        /// Stored natively, so it survives a session restart; safe before the session exists.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void dxr_prov_set_render_scale(float scale);
+
+        /// <summary>(#475) What <see cref="dxr_prov_set_render_scale"/> last stored; 0 = nothing.</summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern float dxr_prov_get_render_scale_override();
+
+        /// <summary>(#475) The effective render scale state. Always returns 1.</summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int dxr_prov_get_render_scale_state(out DxrRenderScaleState state);
+
         /// <summary>
         /// (#459) Game-view calibration marker: 1 = for the next <paramref name="maxMs"/> ms the
         /// native mirror blit draws the position-coded marker

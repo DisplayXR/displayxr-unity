@@ -38,9 +38,11 @@ namespace DisplayXR.Editor
         private SerializedProperty registerWithDisplayXR;
         private SerializedProperty disableBootSplash;
         private SerializedProperty transparentOverlay;
+        private SerializedProperty renderScale;
 
         private void OnEnable()
         {
+            renderScale = serializedObject.FindProperty("renderScale");
             appName = serializedObject.FindProperty("appName");
             appId = serializedObject.FindProperty("appId");
             category = serializedObject.FindProperty("category");
@@ -139,6 +141,32 @@ namespace DisplayXR.Editor
                 "A transparent overlay app (asks for a transparent background). On Linux native " +
                 "Wayland the player's window is then presented with alpha; leave off for an " +
                 "ordinary app, whose window stays opaque."));
+
+            EditorGUILayout.Space();
+
+            // --- Rendering (#475) ---
+            EditorGUILayout.LabelField("Rendering", EditorStyles.boldLabel);
+            {
+                bool wasSet = DisplayXRRenderScaleMath.IsSet(renderScale.floatValue);
+                bool set = EditorGUILayout.Toggle(new GUIContent("Override Render Scale",
+                    "Off: Unity's own knob decides the resolution of the 3D views " +
+                    "(XRSettings.eyeTextureResolutionScale, or the URP asset's Render Scale). " +
+                    "On: the value below does, on every render pipeline."), wasSet);
+                if (set != wasSet)
+                    renderScale.floatValue = set ? 1f : DisplayXRRenderScaleMath.Unset;
+                if (set)
+                {
+                    EditorGUI.indentLevel++;
+                    float v = EditorGUILayout.Slider(new GUIContent("Render Scale",
+                        "Resolution of the 3D views as a multiple of the default. Below 1 renders " +
+                        "fewer pixels for frame rate, above 1 supersamples. The woven picture keeps " +
+                        "its size. DisplayXRProvider.RenderScale set from code takes precedence."),
+                        DisplayXRRenderScaleMath.Sanitize(renderScale.floatValue),
+                        DisplayXRRenderScaleMath.Min, DisplayXRRenderScaleMath.Max);
+                    renderScale.floatValue = DisplayXRRenderScaleMath.Sanitize(v);
+                    EditorGUI.indentLevel--;
+                }
+            }
 
             EditorGUILayout.Space();
 

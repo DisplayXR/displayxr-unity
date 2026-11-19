@@ -49,6 +49,7 @@ extern "C" uint32_t dxr_prov_get_extra_zone_acquired_index(uint32_t ei);
 #include "../unity_pluginapi/IUnityXRDisplay.h"
 
 #include "displayxr_provider_session.h"
+#include "displayxr_provider_render_scale.h" // Unity's textureResolutionScale hint (#475)
 #if defined(__ANDROID__)
 #include "../displayxr_android.h" // session-thread ALooper pump (#418 D4)
 #endif
@@ -1088,15 +1089,48 @@ GfxStart(UnitySubsystemHandle handle, void *userData, UnityXRRenderingCapabiliti
 	return kUnitySubsystemErrorCodeSuccess;
 }
 
+// Whether the provider's own viewportRect covered the whole eye texture last frame
+// (it is a sub-rect only transiently, while a window resize awaits its realloc).
+static bool s_prov_viewport_full = true;
+
 UnitySubsystemErrorCode UNITY_INTERFACE_API
 GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
                          const UnityXRFrameSetupHints *hints, UnityXRNextFrameDesc *next)
 {
-	(void)userData; (void)hints;
+	(void)userData;
 	s_handle = handle;
 	memset(next, 0, sizeof(*next));
 	next->renderPassesCount = 0;
 	next->mirrorBlitMode = kUnityXRMirrorBlitNone;
+
+	// Render scale (#475). Unity's hint is what XRSettings.eyeTextureResolutionScale and
+	// the URP asset's Render Scale feed; the render-scale TU ranks it below an app /
+	// environment override, settles a changing value, and the size reconcile further
+	// down reallocates the eye textures to match (the same live path as a window
+	// resize, #172). Read every frame rather than on the changed-flag alone: the flag
+	// is an edge, and a session restart must not depend on having seen it.
+	if (hints) {
+		dxr_rs_set_unity_hint(hints->appSetup.textureResolutionScale);
+		// XRSettings.renderViewportScale (a sub-rect of the same texture, no realloc) is
+		// NOT honoured: the provider owns viewportRect, and whether Unity's viewport
+		// origin and the submitted imageRect origin agree was the open question of
+		// #143. Say so once instead of silently ignoring it.
+		const UnityXRRectf &rv = hints->appSetup.renderViewport;
+		// Only while the provider itself asked for the full texture: its own transient
+		// sub-rect during a window resize must not be reported as the app's doing.
+		static bool s_viewport_hint_logged = false;
+		if (!s_viewport_hint_logged && s_prov_viewport_full && rv.width > 0.0f && rv.height > 0.0f &&
+		    (rv.width < 0.999f || rv.height < 0.999f)) {
+			s_viewport_hint_logged = true;
+			char m[256];
+			snprintf(m, sizeof(m),
+			         "[DisplayXR-PROV] render scale: XRSettings.renderViewportScale (%.3f x %.3f) is "
+			         "not honoured - use the render scale instead (#475, #143)\n",
+			         (double)rv.width, (double)rv.height);
+			prov_log(m);
+		}
+	}
+	dxr_rs_tick(prov_monotonic_ns());
 
 	if (!s_session_active) return kUnitySubsystemErrorCodeSuccess;
 
@@ -1315,6 +1349,7 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 	float vpH = (scH > 0 && rH > 0) ? (float)rH / (float)scH : 1.0f;
 	if (vpW > 1.0f) vpW = 1.0f;
 	if (vpH > 1.0f) vpH = 1.0f;
+	s_prov_viewport_full = (vpW >= 1.0f && vpH >= 1.0f);
 
 	if (dxr_prov_get_single_pass()) {
 		// Single-Pass-Instanced: 1 render pass, 2 render params over the 2-slice

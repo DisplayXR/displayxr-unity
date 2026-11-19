@@ -151,6 +151,11 @@ namespace DisplayXR
             // the ordinary discrete path.
             DisplayXRGpuPreference.Apply();
 
+            // Render scale (#475): hand the native provider this run's value before the
+            // session exists, so the eye textures are born at the right size instead of
+            // being reallocated a moment later.
+            DisplayXRProvider.InitRenderScale();
+
             // Pick the stereo render mode BEFORE creating/starting the subsystem so
             // the native GfxStart (which reads it) sees the right value (#166 task #8).
             // URP and HDRP render Single-Pass-Instanced on every supported platform/API;

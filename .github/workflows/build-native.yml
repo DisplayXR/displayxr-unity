@@ -123,6 +123,11 @@ jobs:
       - name: Picking math
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: dotnet run --project "Tests~/PickingMath" -c Release
+      # Pure C#: the render scale's range, the app-vs-settings precedence and the file a
+      # build writes for a built player, read back under a decimal-comma culture (#475).
+      - name: Render scale
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: dotnet run --project "Tests~/RenderScale" -c Release
       # Pure C#: project validation's rule registry, evaluation, ignore-list file format and
       # the decisions behind the built-in rules (graphics APIs, XR loaders, native binaries) (#462).
       - name: Project validation
@@ -296,6 +301,18 @@ jobs:
             native~/tests/texture_target_test.cpp native~/displayxr_xrprovider/displayxr_provider_texture_target.cpp \
             -o /tmp/texture_target_test
           /tmp/texture_target_test
+
+      # Render scale (#475) against a fake runtime: the size a swapchain is created at
+      # for a hint / app value / environment override, the runtime's size limits, no
+      # reallocation while a scale animates, and the scaled size after a restart.
+      - name: Render scale tests
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          c++ -std=c++17 -Wall -pthread -I native~/displayxr_xrprovider \
+            -I native~/build/_deps/openxr_sdk-src/include \
+            native~/tests/render_scale_test.cpp native~/displayxr_xrprovider/displayxr_provider_render_scale.cpp \
+            -o /tmp/render_scale_test
+          /tmp/render_scale_test
 
       - name: Verify output
         if: needs.DetectChanges.outputs.docs_only != 'true'

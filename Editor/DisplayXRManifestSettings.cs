@@ -77,6 +77,17 @@ namespace DisplayXR.Editor
                  "opaque, which is what keeps it visible when no 3D weave covers it.")]
         public bool transparentOverlay = false;
 
+        [Tooltip("Resolution of the 3D views, as a multiple of the default (window pixels x " +
+                 "the display mode's view scale) (#475).\n\n" +
+                 "0 = not set: Unity's own knob decides (XRSettings.eyeTextureResolutionScale, " +
+                 "or the URP asset's Render Scale), which is 1 unless the project changed it.\n\n" +
+                 "Below 1 renders fewer pixels for frame rate; above 1 supersamples for edge " +
+                 "quality. Range 0.25 to 2. The woven picture keeps its size either way. " +
+                 "DisplayXRProvider.RenderScale set from code takes precedence. Applied in " +
+                 "Play Mode and stored next to a built Windows / macOS / Linux player.")]
+        [Range(0f, 2f)]
+        public float renderScale = 0f;
+
         /// <summary>Effective app name: explicit setting or fallback to product name.</summary>
         public string EffectiveName =>
             string.IsNullOrWhiteSpace(appName) ? Application.productName : appName;
