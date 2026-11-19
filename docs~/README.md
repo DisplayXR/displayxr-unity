@@ -24,7 +24,7 @@ Feature guides. These live under `architecture/` and also explain how each featu
 - [Side-Step](architecture/side-step.md) — Linux native Wayland: the app's own window steps aside for the window the user works in and goes back when its place is free; only while the app's desktop control is granted (the #389 gate, checked before every poll); other windows are read inside the plug-in only
 - [File Drops and the Clipboard](architecture/linux-file-drop-clipboard.md) — Linux native Wayland: files dragged onto the window (#395), what that does to Unity's clipboard and the plug-in clipboard that replaces it (#398), and the input fields that copy and paste through it and get IME text (`DisplayXRClipboardInputField`, `DisplayXRClipboardLegacyInputField`, #415)
 
-Sample READMEs (each sample in Package Manager > DisplayXR > Samples has one) cover the input controller, the window-space UI mouse router, transparent overlays, the splash screen, hand tracking and stylus input.
+Sample READMEs (each sample in Package Manager > DisplayXR > Samples has one) cover the input controller, window modes (F11 fullscreen on the 3D panel, the remembered window), the window-space UI mouse router, transparent overlays, the splash screen, hand tracking and stylus input.
 
 ## For contributors
 

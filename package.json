@@ -30,7 +30,7 @@
   "samples": [
     {
       "displayName": "Default Input Controller",
-      "description": "WASD + mouse-look + Tab cycle + V mode-toggle + Space reset + F11 fullscreen + I screenshot + ESC quit. Attach to your rig camera GameObject(s). Was a plugin Runtime/ component up to v1.5.8; moved here so apps can own / fork / replace input policy. See README for the `mouseLookEnabled` opt-out and other inspector fields.",
+      "description": "WASD + mouse-look + Tab cycle + V mode-toggle + Space reset + I screenshot + ESC quit (F11 fullscreen is the Window Mode sample's). Attach to your rig camera GameObject(s). Was a plugin Runtime/ component up to v1.5.8; moved here so apps can own / fork / replace input policy. See README for the `mouseLookEnabled` opt-out and other inspector fields.",
       "path": "Samples~/DefaultInputController"
     },
     {
@@ -97,6 +97,11 @@
       "displayName": "Stereo Media",
       "description": "Side-by-side / top-bottom stereo pictures and video with the DisplayXRStereoMedia component: each eye sees its own half, as a quad on the rig's zero-parallax plane or full screen with no added parallax. Ships no media file - the red \"L\" / blue \"R\" test picture with shapes at three depths is generated in code - and the README shows how to point it at your own video. DisplayXR > Samples > Create Stereo Media Scene builds the scene. BiRP, URP and HDRP.",
       "path": "Samples~/StereoMedia"
+    },
+    {
+      "displayName": "Window Mode",
+      "description": "F11 toggle between full screen on the 3D panel and a window, with an optional fade to black across the change and a windowed size and position that are remembered (PlayerPrefs) and put back on leaving full screen and at the next launch. One MonoBehaviour (DisplayXRWindowModeSample) built on the plugin's primitives - DisplayXRProvider.MoveWindowToDisplay, DisplayXRWindowSpaceUI.TryGetWindowPixelSize, DisplayXRModeSwitch - and Unity's Screen API. Input System and legacy Input Manager. Window policy is app-owned, so fork it freely. Standalone players only; not for transparent overlay apps. See the README for what is and is not verified on hardware.",
+      "path": "Samples~/WindowMode"
     }
   ]
 }

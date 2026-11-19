@@ -133,6 +133,11 @@ jobs:
       - name: Stereo media math
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: dotnet run --project "Tests~/StereoMediaMath" -c Release
+      # Pure C#: the Window Mode sample's remembered window - its PlayerPrefs string, which
+      # sizes and positions are safe to apply, which display a position belongs to (#477).
+      - name: Window mode rules
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: dotnet run --project "Tests~/WindowModeRules" -c Release
 
   build-windows:
     name: Windows x64
