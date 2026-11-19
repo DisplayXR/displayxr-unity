@@ -775,7 +775,7 @@ namespace DisplayXR
         // A stretched scale.y also stops Unity following its own default zoom
         // (GameView.UpdateZoomAreaAndParent compares scale.y with the default), so leaving
         // it behind is not cosmetic.
-        static System.Collections.Generic.Dictionary<int, float> s_fitNudgeOrig;   // view id -> translation.y before "nudge:"
+        static System.Collections.Generic.Dictionary<UnityEngine.Object, float> s_fitNudgeOrig;   // view -> translation.y before "nudge:"
 
         // GameView.m_ZoomArea (a ZoomableArea) of one view, with its m_Scale / m_Translation
         // fields resolved. Null when the editor internals are not found.
@@ -855,7 +855,7 @@ namespace DisplayXR
                             { sc.y = y; s_zoomScaleField.SetValue(za, sc); changed++; }
                         }
                         if (s_fitNudgeOrig != null && s_zoomTransField != null &&
-                            s_fitNudgeOrig.TryGetValue(w.GetInstanceID(), out float origY))
+                            s_fitNudgeOrig.TryGetValue(w, out float origY))
                         {
                             var tr = (Vector2)s_zoomTransField.GetValue(za);
                             tr.y = origY; s_zoomTransField.SetValue(za, tr); changed++;
@@ -946,9 +946,8 @@ namespace DisplayXR
                         if (Mathf.Abs(tr.y - pt) > 1e-6f)
                         {
                             // Remember what Unity had, for RestoreGameViewFit.
-                            if (s_fitNudgeOrig == null) s_fitNudgeOrig = new System.Collections.Generic.Dictionary<int, float>();
-                            int id = w.GetInstanceID();
-                            if (!s_fitNudgeOrig.ContainsKey(id)) s_fitNudgeOrig[id] = tr.y;
+                            if (s_fitNudgeOrig == null) s_fitNudgeOrig = new System.Collections.Generic.Dictionary<UnityEngine.Object, float>();
+                            if (!s_fitNudgeOrig.ContainsKey(w)) s_fitNudgeOrig[w] = tr.y;
                             tr.y = pt; s_zoomTransField.SetValue(za, tr);
                         }
                         applied = $"trans.y={pt:F3}pt";
