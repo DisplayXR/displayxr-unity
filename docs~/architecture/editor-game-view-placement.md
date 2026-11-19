@@ -5,16 +5,22 @@ the default since v2.8.0). A lenticular weave is phase-sensitive: the image must
 texel for pixel, on the columns and rows the weaver assumed. One pixel of horizontal error is the
 other eye.
 
-This page says what has to hold, what the plug-in does about it, how to read the numeric
-diagnostic it logs, what the opt-in whole-pixel experiment changes, what the arithmetic predicts
-is still wrong, and how to test all of it at the panel (issues #420, #459).
+This page says what has to hold, what the plug-in does about it, how the image's position is
+**measured on screen** instead of computed, how to read the numeric diagnostics it logs, what the
+whole-pixel size changes, what the arithmetic predicts is still wrong, and how to test all of it
+at the panel (issues #420, #459).
 
 Code: `Runtime/Provider/DisplayXRProviderDriver.cs` (the glue: reflection into the Game view,
-Win32 rects, latches, logging), `Runtime/Provider/DisplayXRGameViewPlacement.cs` (all the
-arithmetic, pure C#), `Editor/Provider/DisplayXRGameViewWholePixel.cs` (the experiment),
-`Tests~/GameViewPlacement` (CI runs `dotnet run --project "Tests~/GameViewPlacement" -c Release`).
-In that suite the #420 checks are pinned to hardware measurements; the #459 checks are unit tests
-of the arithmetic and model-consistency checks, **not** hardware pins, and say so.
+Win32 rects, latches, logging), `Runtime/Provider/DisplayXRGameViewPlacement.cs` (the computed
+placement, pure C#), `Runtime/Provider/DisplayXRGameViewCalibration.cs` (the calibration marker
+and its decoding, pure C#), `Runtime/Provider/DisplayXRGameViewCalibrator.cs` (when to calibrate,
+the screen read-back, the log line), `Editor/Provider/DisplayXRGameViewWholePixel.cs` (the
+whole-pixel size), `native~/displayxr_xrprovider/displayxr_display_provider.cpp` (the marker, in
+the native mirror blit) and `native~/displayxr_win32.c` (`displayxr_read_screen_strip`).
+Tests: `Tests~/GameViewPlacement` and `Tests~/GameViewCalibration` (CI runs both with
+`dotnet run --project ... -c Release`). In the placement suite the #420 checks are pinned to
+hardware measurements; the #459 checks are unit tests of the arithmetic and model-consistency
+checks, **not** hardware pins, and say so. The calibration suite decodes synthetic screens only.
 
 ## What has to hold
 
@@ -60,7 +66,9 @@ real texture and the real zoom, so its line is to be trusted where this table is
 - **Columns (condition 1): nothing.** Exact wherever the borders are whole pixels (F2).
 - **Canvas size (condition 3):** the glue drives the canvas to `Mathf.RoundToInt` of Unity's main
   target size - halves to **even** - not to the texture's own size (F4).
-- **Anchor (condition 4):** `DisplayXRGameViewPlacement.Place`. Docked Free Aspect: X = pane left +
+- **Anchor (condition 4): measured, with the computed position as the fallback.** See
+  [On-screen calibration](#on-screen-calibration-condition-4-measured). The computed position:
+  `DisplayXRGameViewPlacement.Place`. Docked Free Aspect: X = pane left +
   half the pane-minus-texture slack (odd pixel to the left); Y = the row Unity's own rule puts the
   texture's row 0 on (`RtRow0Y`). Letterboxed: Unity's whole-point rounding of the centred rect.
   The 250 % reference (pane 1733x977 at (1017,293), texture 1728x860) gives **(1020,406)**,
@@ -79,6 +87,88 @@ real texture and the real zoom, so its line is to be trusted where this table is
   `GetDpiForWindow(pane)` is logged next to the measured scale as a cross-check and is not used
   in any arithmetic (it answers in the window's own DPI awareness, not the caller's).
 - **Resizes:** a changed size is pushed to the runtime only after it has held 0.35 s.
+
+## On-screen calibration (condition 4, measured)
+
+Computing where Unity draws the image does not survive a change of display scale. Measured on
+hardware: at 175 % with the whole-pixel size selected (texture 1120x595, drawn 1:1) Unity centres
+the image in a 1122.5 px area, which leaves 1.25 px on each side, and snaps it to **pane +1 px**;
+the computed anchor was pane +2 px, and the 3D was inverted. Moving the anchor one pixel fixed
+it. At 250 % the computed position was right. Each rounding rule held at one scale and broke at
+the next, because Unity rounds fractional points differently by scale and layout. So the position
+is measured.
+
+**What happens.** In the Windows editor, with the Game view docked (texture mode):
+
+1. The layout is watched: the matched pane and its monitor, the pane's size, the computed image
+   rect inside the pane, the texture size, maximized or not, whole-pixel size or not, the scale.
+   Where the pane sits on its monitor is not part of it (the image does not move inside its pane
+   when the editor window moves).
+2. When that has differed from the calibrated layout and held for 0.35 s (the same settle clock
+   as the size push), the native mirror blit draws a **position-coded marker** instead of the
+   woven image, into the same texture, through the same draw. It reaches the screen exactly
+   where the weave does.
+3. Once the marker has been drawn for two frames and 50 ms have passed, native code reads
+   **1-px strips of the screen** (GDI `BitBlt` from the screen DC, inside a per-monitor-v2
+   scope, physical px): a horizontal one a third (or two thirds) of the way down the image, then
+   a vertical one at the column the horizontal strip just located. Each read costs about 15 ms
+   (measured), so a clean strip ends the read; the second strip of each pair is only read when
+   the first is not clean.
+4. The strips are decoded. On success the marker comes down at once (typically well under
+   0.2 s after it went up), the anchor moves to the measured origin, and one line is logged.
+   The phase nudge (`dxr_phase_nudge.txt`) still applies on top.
+5. If nothing decodes within 0.3 s the marker comes down, the **computed position stays**, one
+   line says why, and the same layout is tried again after 2 s, three times in all.
+
+The marker cannot stay up: native code takes it down by itself 0.5 s after it was requested,
+whatever the managed side does (a domain reload, a stopped session).
+
+**The marker.** Every texel is one of six saturated colours (each channel fully on or off: red,
+green, blue, yellow, cyan, magenta), so a Gamma / Linear difference on the way to the screen
+cannot turn one into another; a capture that arrives with red and blue exchanged is decoded too
+and reported. A texel's colour is the code of its **column**, except inside two vertical bands
+24 texels wide (near one third and two thirds of the width), where it is the code of its **row**.
+The code comes in blocks of six texels: a magenta sync texel, then the block's index as five
+base-5 digits. A block read off the screen therefore names its own texel, and
+`screen position - texel` is the screen position of texel 0. Every block in the strip votes.
+
+**The verdict, per axis.**
+
+| Result | Meaning | What happens |
+|---|---|---|
+| `1:1` | all blocks agree and every pixel of the strip shows the colour its texel should have, over the whole width (height); the pixel beyond each end does not repeat the end texel | origin used |
+| `NOT 1:1` | the marker is there, but a line is dropped or doubled: part of the image is at another origin within 4 px, or an end line is missing or doubled | majority origin used; at a fractional scale the whole-pixel size is selected (below) |
+| unreadable | more than 4 px show neither the marker nor a shifted copy of it: another window is over the Game view, or the image is filtered (zoom below 1) | computed position, retry |
+| no marker | fewer than 3 blocks: the marker is not on screen | computed position, retry |
+
+A clean `1:1` read cannot be produced by something covering the strip, so when the two strips of
+a pair disagree the clean one wins.
+
+**The log line** (one per calibration):
+
+```
+[DisplayXR] GameView calibration: measured image origin pane +1,+110 (screen 1501,1327), computed pane +2,+110
+  (measured - computed = -1,0 px) | W 1:1, H 1:1 | texture 1120x595 | 3 marker frames, 84 ms | the anchor now uses the measured origin
+[DisplayXR] GameView calibration: fell back to the computed origin (pane +3,+113) - the horizontal strips are partly
+  covered or filtered (212 px show neither the marker nor a shifted copy of it; another window over the Game view?) [attempt 1 of 3, retrying in 2 s]
+```
+
+A not-1:1 axis reads `W NOT 1:1 (from column 561 the image is -1 px off, 448 px differ)`.
+
+**Where it does not run.** The marker is drawn by the D3D12 native mirror blit, so with D3D11,
+or with `DISPLAYXR_PROV_NATIVE_MIRROR=0`, no marker appears, the line says
+`the marker was not drawn`, and the computed position is used, as before. A floating Game view
+(present mode) is not calibrated: the runtime presents its own window there. A Game view that
+is not repainting (Play paused) shows no marker and falls back too (expected, not verified). `DISPLAYXR_PROV_GV_CALIBRATE=0` turns calibration off.
+
+**What is on screen while the strips are read.** In docked texture mode the plug-in's anchor
+window is an invisible layered child (alpha 0) and nothing of the plug-in presents, so the
+screen shows Unity's own Game view. Overlays Unity draws over the image (the Stats panel, gizmo
+labels) cover part of a strip; that is why each axis has two strips in different places.
+
+**For other code.** `DisplayXRProviderDriver.TryGetGameViewImageRect(out clientX, out clientY,
+out width, out height, out measured)` (internal) returns the image's top-left in the pane
+window's client area and its size, in physical px, and whether that was measured or computed.
 
 ## The 1:1 diagnostic (always on in the editor, changes nothing pushed to the runtime)
 
@@ -118,9 +208,19 @@ so it does not repeat on every Play), and never in present mode:
 
 `DISPLAYXR_PROV_GVGEOM=1` adds the older, much longer `GVGEOM` geometry dump.
 
-## The whole-pixel experiment (`DISPLAYXR_PROV_GV_WHOLEPIXEL=1`)
+## The whole-pixel size (`DISPLAYXR_PROV_GV_WHOLEPIXEL`)
 
-Off by default. With it set (before the editor starts), during Play, on the main Game view:
+| `DISPLAYXR_PROV_GV_WHOLEPIXEL` | Behaviour |
+|---|---|
+| unset | **automatic**: off until a calibration *measures* an image that is not drawn 1:1 at a fractional scale; then on until the editor quits (so the next Play starts with it). Logged: `whole-pixel Game view: the measured image is not drawn 1:1 horizontally at 175 % - selecting the whole-pixel size ...` |
+| `1` | on from the start at every fractional scale, measured or not (the former opt-in) |
+| `0` | never; a not-1:1 measurement is only logged |
+
+Selecting the size changes the layout, so a second calibration follows and measures the new
+image. With calibration off (`DISPLAYXR_PROV_GV_CALIBRATE=0`, or where the marker is not drawn)
+the automatic mode never turns on: use `=1`.
+
+When it is on (the variable is read once, when the editor starts), during Play, on the main Game view:
 
 1. The step `q` is the smallest number of points that is **exactly** a whole number of pixels:
    `100 / gcd(percent, 100)`. 4 pt = 5 px at 125 %, 2 pt = 3 px at 150 %, 4 pt = 7 px at 175 %,
@@ -130,9 +230,9 @@ Off by default. With it set (before the editor starts), during Play, on the main
    **"DisplayXR whole-pixel"** is created (or resized) to `floor(area / q) * q` points on each
    axis, selected, and the zoom snapped to 1. The image is at most one step smaller than the area
    and centred, with a grey margin.
-3. On that view the driver **skips GVFIT** and places the anchor as an unstretched letterbox with
-   the pane's real left border. The experiment wins there; other Game views and the default path
-   are untouched.
+3. On that view the driver **skips GVFIT** and computes the anchor as an unstretched letterbox
+   with the pane's real left border (the calibration then replaces that with the measured
+   origin). The whole-pixel size wins there; other Game views and the default path are untouched.
 4. The previous size and zoom are put back and the custom size removed when Play ends, before a
    domain reload (it comes back afterwards if Play continues), on quit, when the pane lands on a
    whole scale, when the main view changes, and when applying it fails part-way. Picking another
@@ -148,8 +248,11 @@ Log lines: `whole-pixel Game view: selected WxH px (... pt, steps of q pt = p px
 
 ## Findings
 
-Each is an **arithmetic prediction, unverified on hardware**. None is changed in code in this
-branch; the default placement is exactly what it was.
+Each is an **arithmetic prediction, unverified on hardware**. The computed placement they
+describe is unchanged; since the calibration it is the fallback, and F3 and F5 (anchor errors)
+are corrected by the measurement wherever it succeeds, F2 by the whole-pixel size it selects. A
+calibration line is now direct evidence for or against each: `measured - computed` is the
+anchor's error (F3, F5), `W NOT 1:1` / `H NOT 1:1` are F2 / F1.
 
 **F1. GVFIT's 0.5 is the 250 % panel's half row.** *Arithmetic prediction, unverified on hardware.*
 With a texture of `h` rows GVFIT draws `target x h / (h - 0.5)`:
@@ -261,7 +364,33 @@ Remove-Item $env:TEMP\dxr_phase_nudge*.txt      # when done - it persists across
 The log confirms each change: `docked phase nudge X = 1 px`. The value that makes a uniformly
 wrong view right **is** the anchor's error in that layout; write it down. Start every layout at 0.
 
+### Pass 0 - the calibration (do this first)
+
+No switch. Press Play with the Game view docked.
+
+1. About half a second after Play the Game view flashes a pattern of thin coloured stripes for a
+   fraction of a second, then the image returns. The log has one `GameView calibration:` line.
+2. `measured image origin ... computed ...`: note `measured - computed`. At 250 % in the
+   reference layout expect `(agree)`. At 175 % expect `-1,0` or similar.
+3. Look at the panel: correct depth with `dxr_phase_nudge.txt` at 0 (or absent). **A layout
+   that needed a nudge before must not need one now.** If it still does, record the nudge next
+   to the calibration line: that is an error of the measurement itself.
+4. At 175 % / 125 % without the whole-pixel size: `W NOT 1:1 ...`, then
+   `whole-pixel Game view: the measured image is not drawn 1:1 ... - selecting the whole-pixel size`,
+   a second flash, and a second line with `W 1:1, H 1:1`.
+5. Drag a splitter, release: one flash and one line about half a second later. Move the editor
+   window: no flash. Maximize (Shift+Space) and restore: a flash each. Drag the editor to a
+   monitor at another scale: a flash.
+6. Put another window over part of the Game view and resize a splitter under it: the line
+   reads `fell back to the computed origin ... partly covered ...`, up to three times 2 s
+   apart; take the window away before the third and it measures.
+7. Opt-outs: `DISPLAYXR_PROV_GV_CALIBRATE=0` (no flash, no line, computed anchor),
+   `DISPLAYXR_PROV_GV_WHOLEPIXEL=0` (at 175 %: `... keeps the whole-pixel size off`).
+8. With D3D11 as the editor's graphics API: `fell back ... the marker was not drawn`.
+
 ### Pass A - default behaviour (no switch)
+
+Run this pass with `DISPLAYXR_PROV_GV_CALIBRATE=0` to see the computed placement on its own.
 
 For each scale, press Play and go through the layouts. In each, wait a second, read the newest
 `GameView 1:1:` line and the newest `GameView glue size change:` line, look at the panel.
@@ -304,9 +433,10 @@ a uniform swap.
 the info line and **no warning**. Look for a horizontal line with ghosting on one side: seeing it
 confirms F1, not seeing it refutes it. F3 at 300 %: far left nudge **-2**, far right **+1**.
 
-### Pass B - the whole-pixel experiment
+### Pass B - the whole-pixel size, forced
 
-Close the editor, `set DISPLAYXR_PROV_GV_WHOLEPIXEL=1`, start it, same layouts.
+Close the editor, `set DISPLAYXR_PROV_GV_WHOLEPIXEL=1` (and `DISPLAYXR_PROV_GV_CALIBRATE=0` to
+judge the computed anchor), start it, same layouts.
 
 - At 175 % / 125 %, about half a second after Play: `whole-pixel Game view: selected ...`, then a
   `1:1` line with `(1:1)` twice, `(agree)`, `[whole-pixel size]`, and `GVFIT skipped ...`. The Game
@@ -327,7 +457,7 @@ Close the editor, `set DISPLAYXR_PROV_GV_WHOLEPIXEL=1`, start it, same layouts.
 
 ### What to send back
 
-For every scale x layout x pass: the `GameView 1:1:` line, `GameView glue size change:`,
+For every scale x layout x pass: the `GameView calibration:` line(s), the `GameView 1:1:` line, `GameView glue size change:`,
 `GameView glue matched pane:`, `#740 dock-border:`, any warning, what was seen, and the nudge.
 With those numbers F1-F5 can each be confirmed or dropped without another session.
 
@@ -335,6 +465,17 @@ With those numbers F1-F5 can each be confirmed or dropped without another sessio
 
 Everything in the recipe and every finding. In particular: that the whole-pixel size removes the
 175 % seam in this plug-in's texture path (it was reported from another plug-in's editor weave on
-the same Unity Game view); the experiment's reflection on Unity 2022.3 (member names, the texture
+the same Unity Game view); the whole-pixel reflection on Unity 2022.3 (member names, the texture
 rounding rule and `RemoveCustomSize`'s index meaning were read from the Unity 6000.4.0f1 editor
 assemblies only).
+
+The calibration, as of the change that added it:
+
+| | Status |
+|---|---|
+| Marker definition and decoding (origin, 1:1, dropped / doubled lines, covered, filtered, colour shifts) | unit-tested on synthetic screens (`Tests~/GameViewCalibration`) |
+| `displayxr_read_screen_strip`: pixel order, orientation, physical coordinates from a DPI-unaware thread, clipping at the desktop edge | checked once on a development machine against a plain test window painted with the marker (1:1 and one dropped column both decoded at the window's true origin); not in CI |
+| The HLSL of the marker | compiles (`fxc`, ps_5_0); **that it draws the same pattern as the C# definition is not verified** |
+| The marker reaching the screen through Unity's Game view; timing; the measured origin being the right anchor on a panel | **not verified** - Pass 0 |
+| A screen read while the Game view is on an HDR or colour-managed desktop | not verified (the classifier is relative to the brightest channel to allow for it) |
+| D3D11 editor, Vulkan | falls back by design; the fallback line is not verified |
