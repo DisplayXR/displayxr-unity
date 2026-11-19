@@ -572,5 +572,20 @@ namespace DisplayXR
             else if (flags != 0) s += " | nothing woven yet";
             return s;
         }
+
+        /// <summary>
+        /// Where the target rect pushed to the runtime came from, as appended to the
+        /// <c>GameView 1:1:</c> line after the phase source: 2 = the on-screen calibration
+        /// measured it (#459), 1 = the computed placement, 0 = no rect pushed.
+        /// </summary>
+        public static string TargetRectSourceText(int source)
+        {
+            switch (source)
+            {
+                case 2: return " | target rect: measured";
+                case 1: return " | target rect: computed";
+                default: return " | target rect: none pushed";
+            }
+        }
     }
 }

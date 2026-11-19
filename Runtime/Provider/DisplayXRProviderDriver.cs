@@ -1597,8 +1597,9 @@ namespace DisplayXR
             public float TargetW, TargetH, ZoomX, ZoomY, Scale, BorderPt;
             public bool WholePixel, HaveZoom, Degraded;
             // (#471) The texture target's phase source: chained / why not / runtime flags /
-            // mismatch, packed - a change of it logs a new line. Not the woven origin (it
-            // moves with the editor window).
+            // mismatch / where the pushed rect came from (measured or computed), packed - a
+            // change of it logs a new line. Not the woven origin (it moves with the editor
+            // window).
             public long Phase;
             public bool Same(in OneToOneKey o) =>
                 Phase == o.Phase &&
@@ -1669,7 +1670,8 @@ namespace DisplayXR
                     {
                         DisplayXRProviderNative.dxr_prov_get_texture_target_state(out tts);
                         haveTts = true;
-                        key.Phase = ((long)(tts.chained != 0 ? 1 : 0) << 60) | ((long)(tts.whyNot & 0xF) << 52)
+                        key.Phase = ((long)(tts.chained != 0 ? 1 : 0) << 60) | ((long)(s_ttRectSource & 0x3) << 56)
+                                  | ((long)(tts.whyNot & 0xF) << 52)
                                   | ((long)(tts.reported != 0 ? 1 : 0) << 48) | ((long)(tts.mismatch & 0xF) << 40)
                                   | (tts.flags & 0xFFFFFFFFL);
                     }
@@ -1753,7 +1755,8 @@ namespace DisplayXR
                 if (haveTts)
                     sb.Append(" | phase source: ").Append(DisplayXRGameViewPlacement.PhaseSourceText(
                         tts.chained != 0, tts.whyNot, tts.flags, tts.reported != 0, tts.matched != 0,
-                        tts.mismatch, tts.wovenX, tts.wovenY, tts.requestedX, tts.requestedY));
+                        tts.mismatch, tts.wovenX, tts.wovenY, tts.requestedX, tts.requestedY))
+                      .Append(DisplayXRGameViewPlacement.TargetRectSourceText(s_ttRectSource));
                 if (key.WholePixel) sb.Append(" [whole-pixel size]");
                 if (key.Degraded)
                     sb.Append(s_gvScaled ? " [zoom is not 1: cannot be 1:1 - picture shown scaled, no calibration]"
@@ -2507,36 +2510,40 @@ namespace DisplayXR
                 }
                 DisplayXRProviderNative.dxr_prov_set_initial_gameview_rect(px, py, pw, ph);
                 // (#471) The texture target binding is chained at session create and needs
-                // its first rect by then.
-                PushTextureTargetRect(px, py, pw, ph);
+                // its first rect by then. No calibration has run yet (it needs a playing,
+                // docked view), so this one is the computed placement: the same rect the
+                // anchor window is born at.
+                PushTextureTargetRect(px - s_hwndCorrX, py - s_hwndCorrY, pw, ph, false);
                 if (!s_loggedInitOnce) { s_loggedInitOnce = true; Debug.Log($"[DisplayXR] GameView initial rect: {dbg}"); }
             }
         }
 
         // (#471) Texture target (runtime ADR-060, XR_DXR_win32_window_binding spec 9): tell
-        // native where the woven texture's texel (0,0) is drawn and at what size. x,y are the
-        // SAME numbers the anchor window is placed with (the computed placement, the docked
-        // phase nudge included), expressed relative to the matched pane window - the same
-        // offset displayxr_set_pane_follow takes (the pane is a borderless child window, so
-        // its window origin is its client origin). It is a difference of two rects read in
-        // one space, so it is physical px whatever this process's DPI awareness; native adds
-        // the pane's and the top-level window's positions itself, under per-monitor-v2. No
-        // desktop coordinate crosses the boundary. (0,0) is a valid offset: absence is the
-        // missing Valid flag (ClearTextureTargetRect).
+        // native where the woven texture's texel (0,0) is drawn and at what size. offX,offY
+        // are the offset inside the matched pane window (a borderless child window, so its
+        // window origin is its client origin), physical px; native adds the pane's and the
+        // top-level window's positions itself, under per-monitor-v2. No desktop coordinate
+        // crosses the boundary. (0,0) is a valid offset: absence is the missing Valid flag
+        // (ClearTextureTargetRect).
+        // The per-frame caller hands in the numbers of ResolveImagePlacement: the SAME ones
+        // it gives displayxr_set_pane_follow for the anchor window, so the two cannot disagree.
         // Window-glue arrangement only: zone-glue and BINDPANE carry the pane offset in the
         // zone rect, and under the binding zone rects are target-local.
-        // An on-screen measurement of where the image really lands (#459) can feed the same
-        // setter later, with TextureTargetRectMeasured.
-        static void PushTextureTargetRect(int px, int py, int pw, int ph)
+        static int s_ttRectSource;   // what was last pushed: 0 none, 1 computed, 2 measured (#459)
+        static void PushTextureTargetRect(int offX, int offY, int pw, int ph, bool measured)
         {
             if (Application.platform != RuntimePlatform.WindowsEditor) return;
             try
             {
                 if (s_hwndCorrValid && s_hwndCorrHwnd != System.IntPtr.Zero && pw > 0 && ph > 0
                     && !BindPaneEnabled() && !ZoneGlueEnabled())
+                {
                     DisplayXRProviderNative.dxr_prov_set_texture_target_rect(
-                        s_hwndCorrHwnd, px - s_hwndCorrX, py - s_hwndCorrY, pw, ph,
-                        DisplayXRProviderNative.TextureTargetRectValid);
+                        s_hwndCorrHwnd, offX, offY, pw, ph,
+                        DisplayXRProviderNative.TextureTargetRectValid |
+                        (measured ? DisplayXRProviderNative.TextureTargetRectMeasured : 0u));
+                    s_ttRectSource = measured ? 2 : 1;
+                }
                 // No pane matched this frame: keep the last rect. Native re-checks the pane's
                 // window every frame and sends nothing while it is gone.
             }
@@ -2546,8 +2553,32 @@ namespace DisplayXR
         static void ClearTextureTargetRect()
         {
             if (Application.platform != RuntimePlatform.WindowsEditor) return;
+            s_ttRectSource = 0;
             try { DisplayXRProviderNative.dxr_prov_set_texture_target_rect(System.IntPtr.Zero, 0, 0, 0, 0, 0); }
             catch (System.EntryPointNotFoundException) { /* older native binary */ }
+        }
+
+        // (#459 + #471) THE placement of the woven image inside the matched pane for this
+        // frame: one pair of numbers, handed to both the anchor window (pane-follow) and the
+        // texture target rect.
+        //   px,py       where the anchor is placed this frame (screen), phase nudge included;
+        //   calX,calY   the same before the nudge (what ApplyGameViewCalibration returned).
+        // When the calibration measured the image (TryGetGameViewImageRect says so, and its
+        // rect is the one the anchor is placed with this frame) the offset is the measured
+        // one, nudge on top; otherwise it is the computed placement, as before #459. The
+        // size is the glue's canvas size in both cases - the anchor's client area - because
+        // under the binding the target rect is the canvas that zones are laid out in.
+        static void ResolveImagePlacement(int px, int py, int calX, int calY,
+                                          out int offX, out int offY, out bool measured)
+        {
+            offX = px - s_hwndCorrX; offY = py - s_hwndCorrY; measured = false;
+            if (TryGetGameViewImageRect(out int cx, out int cy, out _, out _, out bool m) && m
+                && s_panePhysValid
+                && s_panePhysWin.left + cx == calX && s_panePhysWin.top + cy == calY)
+            {
+                offX = cx + (px - calX); offY = cy + (py - calY);
+                measured = true;
+            }
         }
 
         int m_LastGlueX = int.MinValue, m_LastGlueY, m_LastGlueW, m_LastGlueH;
@@ -2734,6 +2765,7 @@ namespace DisplayXR
             // back from the screen and the anchor goes to the MEASURED origin; the computed
             // one above stays as the fallback. The nudge below still applies on top.
             ApplyGameViewCalibration(ref px, ref py, pw, ph);
+            int calX = px, calY = py;   // measured or computed, before the nudge
             // (#740) Docked phase calibration: shift the invisible child anchor's X — phase
             // moves, content doesn't (see UpdatePhaseNudge).
             UpdatePhaseNudge();
@@ -2786,11 +2818,13 @@ namespace DisplayXR
             // glue arrangements; harmless when the window doesn't track (no-op).
             if (s_hwndCorrValid && s_hwndCorrHwnd != System.IntPtr.Zero)
             {
-                DisplayXRProviderNative.displayxr_set_pane_follow(
-                    s_hwndCorrHwnd, px - s_hwndCorrX, py - s_hwndCorrY, pw, ph);
-                // (#471) The same numbers, every frame, for the texture target binding
-                // (nudge included: it moves the phase, never the picture - as with the anchor).
-                PushTextureTargetRect(px, py, pw, ph);
+                // (#459 + #471) One placement per frame for the anchor window and the texture
+                // target rect: the measured image origin when the calibration has one, else
+                // the computed one; the nudge on top of either (it moves the phase, never the
+                // picture).
+                ResolveImagePlacement(px, py, calX, calY, out int offX, out int offY, out bool imgMeasured);
+                DisplayXRProviderNative.displayxr_set_pane_follow(s_hwndCorrHwnd, offX, offY, pw, ph);
+                PushTextureTargetRect(offX, offY, pw, ph, imgMeasured);
                 // (#740) New pane matched (layout reset replaced the GameView): drop the
                 // window-glue debounce so the next dxr_prov_set_gameview_rect push fires
                 // even if the new pane landed at the identical rect (the native side also

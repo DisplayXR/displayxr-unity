@@ -90,6 +90,7 @@ struct Session
 	bool have_state = false;
 	uint64_t state_flags = 0;
 	bool reported = false;
+	bool state_measured = false; // the rect source the last state line was logged with
 	XrWin32TextureTargetStateDXR last = {};
 	bool matched = false;
 	int32_t requested_x = 0, requested_y = 0;
@@ -186,6 +187,13 @@ phase_source(uint64_t flags)
 	return "NOT BOUND by the runtime (the anchor window, as before spec 9)";
 }
 
+//! Where the pushed rect came from: the on-screen calibration or the computed placement.
+const char *
+rect_source(uint32_t rect_flags)
+{
+	return (rect_flags & DXR_TT_RECT_MEASURED) ? "measured" : "computed";
+}
+
 } // namespace
 
 extern "C" {
@@ -197,10 +205,15 @@ dxr_prov_set_texture_target_rect(void *pane_hwnd, int32_t x, int32_t y, int32_t 
 	const bool valid = (flags & DXR_TT_RECT_VALID) != 0 && w > 0 && h > 0;
 	if (valid != s_rect.valid || (valid && pane_hwnd != s_rect.pane)) {
 		if (valid)
-			s.log("[DisplayXR-PROV] texture target: rect pushed - pane %p (%d,%d %dx%d)%s\n", pane_hwnd, (int)x,
-			      (int)y, (int)w, (int)h, (flags & DXR_TT_RECT_MEASURED) ? " [measured]" : " [computed]");
+			s.log("[DisplayXR-PROV] texture target: rect pushed - pane %p (%d,%d %dx%d) [%s]\n", pane_hwnd, (int)x,
+			      (int)y, (int)w, (int)h, rect_source(flags));
 		else
 			s.log("[DisplayXR-PROV] texture target: rect cleared\n");
+	} else if (valid && ((flags ^ s_rect.flags) & DXR_TT_RECT_MEASURED) != 0) {
+		// The same pane, another source: the calibration took over, or was dropped.
+		s.log("[DisplayXR-PROV] texture target: rect now %s - pane %p (%d,%d %dx%d), was (%d,%d %dx%d) [%s]\n",
+		      rect_source(flags), pane_hwnd, (int)x, (int)y, (int)w, (int)h, (int)s_rect.x, (int)s_rect.y,
+		      (int)s_rect.w, (int)s_rect.h, rect_source(s_rect.flags));
 	}
 	s_rect.valid = valid;
 	s_rect.pane = valid ? pane_hwnd : nullptr;
@@ -341,10 +354,10 @@ dxr_tt_bind_session(XrWin32WindowBindingCreateInfoDXR *wb, int eligible)
 	s.chained = true;
 	s.why_not = DXR_TT_WHY_CHAINED;
 	s.log("[DisplayXR-PROV] texture target: binding CHAINED - reference window %p, initial rect (%d,%d %dx%d) "
-	      "in its client px = desktop (%d,%d); pane %p +(%d,%d)%s; anchor window %p kept as the fallback\n",
+	      "in its client px = desktop (%d,%d); pane %p +(%d,%d) [%s]; anchor window %p kept as the fallback\n",
 	      f.reference, (int)f.rect.offset.x, (int)f.rect.offset.y, (int)f.rect.extent.width,
 	      (int)f.rect.extent.height, (int)f.screen_x, (int)f.screen_y, s_rect.pane, (int)s_rect.x, (int)s_rect.y,
-	      (s_rect.flags & DXR_TT_RECT_MEASURED) ? " [measured]" : " [computed]", wb->windowHandle);
+	      rect_source(s_rect.flags), wb->windowHandle);
 	return 1;
 }
 
@@ -435,8 +448,13 @@ dxr_tt_on_frame_state(const XrWin32TextureTargetStateDXR *st)
 	std::lock_guard<std::mutex> lk(s_mx);
 	if (!s.chained || st == nullptr) return;
 	const bool reported = st->wovenTargetRect.extent.width > 0 && st->wovenTargetRect.extent.height > 0;
-	const bool changed = !s.have_state || st->flags != s.state_flags || reported != s.reported;
+	// The rect source (measured / computed) is part of the logged state: a calibration
+	// that takes over mid-session logs the line again, with the origin it moved to.
+	const bool measured = (s_rect.flags & DXR_TT_RECT_MEASURED) != 0;
+	const bool changed =
+	    !s.have_state || st->flags != s.state_flags || reported != s.reported || measured != s.state_measured;
 	s.have_state = true;
+	s.state_measured = measured;
 	s.state_flags = st->flags;
 	s.reported = reported;
 	s.last = *st;
@@ -464,11 +482,12 @@ dxr_tt_on_frame_state(const XrWin32TextureTargetStateDXR *st)
 	}
 
 	if (changed) {
-		char extra[96];
-		snprintf(extra, sizeof(extra), "%s%s%s",
+		char extra[128];
+		snprintf(extra, sizeof(extra), "%s%s%s, target rect %s",
 		         (st->flags & XR_WIN32_TEXTURE_TARGET_STATE_SEGMENTED_BIT_DXR) ? " SEGMENTED" : "",
 		         (st->flags & XR_WIN32_TEXTURE_TARGET_STATE_FLAT_SEGMENT_BIT_DXR) ? " FLAT_SEGMENT" : "",
-		         (st->flags & XR_WIN32_TEXTURE_TARGET_STATE_CLAMPED_BIT_DXR) ? " CLAMPED" : "");
+		         (st->flags & XR_WIN32_TEXTURE_TARGET_STATE_CLAMPED_BIT_DXR) ? " CLAMPED" : "",
+		         rect_source(s_rect.flags));
 		if (!reported) {
 			s.log("[DisplayXR-PROV] texture target state: phase source = %s%s (flags 0x%x); no woven frame "
 			      "reported yet\n",

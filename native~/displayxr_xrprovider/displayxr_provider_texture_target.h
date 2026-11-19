@@ -56,11 +56,11 @@ extern "C" {
 
 //! dxr_prov_set_texture_target_rect flags.
 #define DXR_TT_RECT_VALID    0x1u //!< a rect is given; clear = "no target" (never infer it from zeros)
-#define DXR_TT_RECT_MEASURED 0x2u //!< the rect was measured on screen, not computed (diagnostic only)
+#define DXR_TT_RECT_MEASURED 0x2u //!< the rect was measured on screen (#459), not computed; logged, never sent
 
 //! Where the woven texture is drawn. THE one entry point for it: whatever knows
-//! where the image lands (today the computed Game view placement, later an
-//! on-screen measurement) feeds this.
+//! where the image lands (the Game view calibration's measured origin when there
+//! is one, else the computed Game view placement) feeds this.
 //!
 //! @p pane_hwnd  the window the offset is relative to - the Game view pane. Its
 //!               top-level ancestor becomes the reference window. NULL: @p x / @p y

@@ -55,6 +55,10 @@ static class Program
               .StartsWith("texture target rect, WINDOWLESS_PHASE CLAMPED |"), "phase: clamped is named");
         Check(P(true, 0, DisplayXRGameViewPlacement.TargetStateWindowlessPhase, false, false, 0)
               == "texture target rect, WINDOWLESS_PHASE | nothing woven yet", "phase: before the first weave");
+        // Where the pushed rect came from (#459): the calibration, or the computed placement.
+        Check(DisplayXRGameViewPlacement.TargetRectSourceText(2) == " | target rect: measured", "rect source: measured");
+        Check(DisplayXRGameViewPlacement.TargetRectSourceText(1) == " | target rect: computed", "rect source: computed");
+        Check(DisplayXRGameViewPlacement.TargetRectSourceText(0) == " | target rect: none pushed", "rect source: none");
         Check(P(true, 0, DisplayXRGameViewPlacement.TargetStateAnchorFallback, true, true, 0).StartsWith("anchor window (runtime ANCHOR_FALLBACK"),
               "phase: the runtime fell back to the anchor");
         // A session that ignores the binding (D3D12 today): no flags, nothing reported.

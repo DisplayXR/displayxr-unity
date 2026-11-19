@@ -490,6 +490,68 @@ test_state()
 	W.root_on_screen_x = W.root_on_screen_y = 0;
 }
 
+// The rect source (#459): the on-screen calibration takes over from the computed
+// placement mid-session, moves the origin by a pixel, and is dropped again.
+static void
+test_rect_source()
+{
+	const uint64_t WL = XR_WIN32_TEXTURE_TARGET_STATE_WINDOWLESS_PHASE_BIT_DXR;
+	g_log.clear();
+	dxr_prov_set_texture_target_rect(nullptr, 0, 0, 0, 0, 0);
+	push_default_rect(); // computed: pane +3,+113
+	CHECK(log_count("rect pushed") == 1 && log_count("[computed]") == 1);
+	CHECK(start_session(9, true, true));
+	XrWin32WindowBindingCreateInfoDXR wb = editor_texture_binding();
+	CHECK(dxr_tt_bind_session(&wb, 1) == 1);
+	CHECK(log_count("binding CHAINED") == 1 && log_count("+(3,113) [computed]") == 1);
+
+	XrWin32TextureTargetFrameDXR f = send_frame(100);
+	report(100, WL, 1020, 406, f.targetRect);
+	CHECK(log_count("texture target state:") == 1 && log_count(", target rect computed") == 1);
+	CHECK(log_count(", target rect measured") == 0);
+
+	// The same rect pushed again, every frame: nothing is logged.
+	for (XrTime t = 101; t < 110; t++) {
+		push_default_rect();
+		f = send_frame(t);
+		report(t, WL, 1020, 406, f.targetRect);
+	}
+	CHECK(log_count("rect pushed") == 1 && log_count("rect now") == 0 && log_count("texture target state:") == 1);
+
+	// The calibration measured the image one pixel to the left: one setter line, one
+	// state line (same runtime flags, another source), the frame carries the new origin,
+	// and no WARN (the runtime wove where it was asked to).
+	for (XrTime t = 110; t < 120; t++) {
+		dxr_prov_set_texture_target_rect(kPane, 2, 113, 1728, 860, DXR_TT_RECT_VALID | DXR_TT_RECT_MEASURED);
+		f = send_frame(t);
+		CHECK(f.targetRect.offset.x == 1019 && f.targetRect.offset.y == 406);
+		report(t, WL, 1019, 406, f.targetRect);
+	}
+	CHECK(log_count("rect now measured") == 1 && log_count("was (3,113 1728x860) [computed]") == 1);
+	CHECK(log_count("texture target state:") == 2 && log_count(", target rect measured") == 1);
+	CHECK(log_count("woven origin (1019,406)") == 1 && log_count("WARN") == 0);
+
+	// The measurement is dropped (the layout changed): back to computed, said once each.
+	for (XrTime t = 120; t < 130; t++) {
+		push_default_rect();
+		f = send_frame(t);
+		report(t, WL, 1020, 406, f.targetRect);
+	}
+	CHECK(log_count("rect now computed") == 1 && log_count("texture target state:") == 3);
+	CHECK(log_count(", target rect computed") == 2 && log_count("WARN") == 0);
+	dxr_tt_on_session_stopped();
+
+	// A restart chains from the last rect, and says which kind it was.
+	dxr_prov_set_texture_target_rect(kPane, 2, 113, 1728, 860, DXR_TT_RECT_VALID | DXR_TT_RECT_MEASURED);
+	g_log.clear();
+	CHECK(start_session(9, true, true));
+	wb = editor_texture_binding();
+	CHECK(dxr_tt_bind_session(&wb, 1) == 1);
+	CHECK(log_count("+(2,113) [measured]") == 1);
+	dxr_tt_on_session_stopped();
+	dxr_prov_set_texture_target_rect(nullptr, 0, 0, 0, 0, 0);
+}
+
 static void
 test_restart_and_refusal()
 {
@@ -620,6 +682,7 @@ main()
 	test_gating();
 	test_chaining_and_frames();
 	test_state();
+	test_rect_source();
 	test_restart_and_refusal();
 #ifdef _WIN32
 	test_win32_resolver(true);

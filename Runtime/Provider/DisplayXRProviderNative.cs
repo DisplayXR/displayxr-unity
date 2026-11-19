@@ -259,14 +259,16 @@ namespace DisplayXR
         /// it the target is CLEARED - absence is never inferred from zeros ((0,0) is a
         /// legitimate offset).</summary>
         public const uint TextureTargetRectValid = 0x1;
-        /// <summary>The rect was measured on screen, not computed (diagnostic only).</summary>
+        /// <summary>The rect was measured on screen by the Game view calibration (#459), not
+        /// computed. Diagnostic: it is logged, the runtime is sent the same rect either way.</summary>
         public const uint TextureTargetRectMeasured = 0x2;
 
         /// <summary>
         /// (#471, runtime ADR-060) Where the woven texture is drawn, for the runtime's
         /// texture target binding (<c>XR_DXR_win32_window_binding</c> spec 9). THE one
-        /// entry point for it: whatever knows where the image lands feeds this (today the
-        /// computed Game view placement; an on-screen measurement can feed it later).
+        /// entry point for it: whatever knows where the image lands feeds this (the image
+        /// origin measured by the Game view calibration when there is one, else the
+        /// computed Game view placement).
         /// <paramref name="x"/>, <paramref name="y"/> = where the texture's texel (0,0) is
         /// drawn, in <paramref name="paneHwnd"/>'s CLIENT area, physical px, y down;
         /// <paramref name="w"/>, <paramref name="h"/> = the size it is drawn at, physical px.

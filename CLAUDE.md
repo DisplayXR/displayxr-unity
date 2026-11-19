@@ -135,7 +135,12 @@ build will tell you. One container run catches them all:
   `windowHandle` (the runtime's `ANCHOR_FALLBACK`, and the whole path on D3D12, which ignores
   the binding until runtime #2382). **One setter** carries the placement,
   `dxr_prov_set_texture_target_rect(pane, x, y, w, h, flags)` in the PANE's client physical px
-  ((0,0) is valid; absence is the missing `VALID` flag): feed it, do not add a second path. The
+  ((0,0) is valid; absence is the missing `VALID` flag): feed it, do not add a second path. The glue
+  resolves ONE image offset per frame (`ResolveImagePlacement`: the origin measured by the
+  #459 on-screen calibration when there is one, else the computed placement; phase nudge on
+  top) and hands the same numbers to the anchor (`displayxr_set_pane_follow`) and to this
+  setter - keep it that way, the two must never disagree. The calibration marker is D3D12-only,
+  so on D3D11 (where the runtime honours the binding today) the rect is the computed one. The
   rect lives outside the per-session state, so a dock <-> undock restart re-chains it. Opt out
   with `DISPLAYXR_PROV_TEXTURE_TARGET=0`. Zones need nothing: in the default window-glue
   arrangement the anchor's client area already IS the target. Write-up:
