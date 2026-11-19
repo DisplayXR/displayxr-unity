@@ -368,6 +368,13 @@ DISPLAYXR_EXPORT int displayxr_dedicated_window_alive(void);
 /// shimmer); the native lockstep follow owns the window position until mouse-up.
 DISPLAYXR_EXPORT int displayxr_host_drag_active(void);
 
+/// (#459) Editor Game-view calibration: read `len` screen pixels from (x, y), going right
+/// (vertical == 0) or down, into out_rgb as 0xFFRRGGBB (0 = outside the desktop, not read).
+/// Coordinates are PHYSICAL virtual-desktop px: the read runs inside a per-monitor-v2 scope,
+/// so never pass numbers obtained under another DPI awareness. Returns the pixels read.
+/// Windows only (implemented in displayxr_win32.c).
+DISPLAYXR_EXPORT int displayxr_read_screen_strip(int x, int y, int len, int vertical, uint32_t *out_rgb);
+
 /// (display-zones port) Get/set the managed overlay window's screen-space
 /// top-left, for app-side window-position persistence (remember/restore across
 /// launches). set is #61-bracketed (size unchanged). Windows overlay only.

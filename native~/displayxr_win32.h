@@ -77,6 +77,9 @@ int displayxr_dedicated_window_alive(void);
 /// (#740 f-up) 1 while the custom host MOVE drag is in progress.
 int displayxr_host_drag_active(void);
 
+/// (#459) Read a 1-px strip of the screen (editor Game-view calibration) - see displayxr_exports.h.
+int displayxr_read_screen_strip(int x, int y, int len, int vertical, uint32_t *out_rgb);
+
 /// Check whether the plugin is running in shell/IPC mode.
 /// Detected via DISPLAYXR_WORKSPACE_SESSION=1 (legacy DISPLAYXR_SHELL_SESSION=1
 /// is also honored) environment variable.
