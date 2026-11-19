@@ -399,9 +399,16 @@ cannot disagree:
 The docked phase nudge is added on top of either. The size is the glue's canvas size in both
 cases (the anchor's client area): under the binding the target rect is the canvas zones are
 laid out in. Before the session starts the rect is the computed one, the rect the anchor is
-born at; the calibration needs a playing view. On D3D11, the only API on which the runtime
-honours the binding today, the calibration does not run (see "D3D11 and the marker" above), so
-there the rect is always the computed one.
+born at; the calibration needs a playing view. On D3D11 the calibration does not run (see
+"D3D11 and the marker" above), so there the rect is always the computed one.
+
+**Which runtime honours it.** D3D11 from runtime v2.55.0. **D3D12 (the editor's usual API),
+Vulkan and OpenGL from runtime v2.69.0**, together with a display processor plug-in that
+declares it can phase from the present origin on that API (for the lenticular vendor plug-in:
+v2.22.0, with a vendor SDK that supports windowless weaving). Older than that on D3D12 the
+binding is ignored and the anchor window phases the weave, exactly as before. Verified on
+hardware (#471): D3D12 editor at 175 %, measured rect, `WINDOWLESS_PHASE`, correct depth through
+Game view resizes.
 
 **The anchor window stays.** It is still created, glued and passed as `windowHandle`:
 
@@ -409,7 +416,7 @@ there the rect is always the computed one.
 |---|---|
 | `WINDOWLESS_PHASE` | the target rect; the runtime hands the anchor to no display processor |
 | `ANCHOR_FALLBACK` | the anchor window, as before (the display processor cannot phase without a window). The rect still defines the canvas |
-| neither, nothing reported | the anchor window: the session cannot honour the binding at all and ignored it. That is D3D12 until DisplayXR/displayxr-runtime#2382 (the runtime logs `XrWin32TextureTargetBindingDXR IGNORED` once) |
+| neither, nothing reported | the anchor window: the session cannot honour the binding at all and ignored it. That is D3D12 on a runtime older than v2.69.0 (DisplayXR/displayxr-runtime#2382; the runtime logs `XrWin32TextureTargetBindingDXR IGNORED` once) |
 
 So a project on D3D11 gets the windowless phase where the display processor offers it, and a
 project on D3D12 runs as before.
@@ -783,8 +790,10 @@ judge the computed anchor), start it, same layouts.
 
 ### Pass C - the texture target binding (#471)
 
-Needs runtime v2.55.0 or later. Do it once on a **D3D11** project (the only API that honours the
-binding today) and once on a **D3D12** project (which must be unchanged).
+Needs runtime v2.55.0 or later. Do it once on a **D3D11** project and once on a **D3D12**
+project. On D3D12 the result depends on the runtime: older than v2.69.0 it must be unchanged
+(anchor window, `IGNORED` logged once); from v2.69.0 with a display processor plug-in that
+phases from the present origin on D3D12 it must report `WINDOWLESS_PHASE`, like D3D11.
 
 - D3D11, docked: `Editor.log` shows `texture target: runtime spec v9, supportsTextureTarget=1
   windowlessPhase=...`, then `binding CHAINED`, then within the first frames `texture target
