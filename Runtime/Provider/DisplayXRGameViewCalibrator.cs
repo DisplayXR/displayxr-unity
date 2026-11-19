@@ -98,6 +98,14 @@ namespace DisplayXR
             return s_gate == 1;
         }
 
+        /// <summary>Off until the next domain reload (the native side is not there).</summary>
+        internal static void Disable()
+        {
+            s_gate = 0;
+            s_showing = false; s_have = false; s_measured = false; s_pendHave = false;
+            AppliedMeasured = false;
+        }
+
         /// <summary>True while the anchor returned by the last <see cref="Tick"/> was measured.</summary>
         internal static bool AppliedMeasured { get; private set; }
         /// <summary>The measured image size (valid while <see cref="AppliedMeasured"/>).</summary>

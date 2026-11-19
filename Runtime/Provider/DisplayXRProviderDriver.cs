@@ -2317,6 +2317,7 @@ namespace DisplayXR
             catch (System.Exception e)
             {
                 // A missing native export (an older plug-in binary): computed placement only.
+                DisplayXRGameViewCalibrator.Disable();
                 if (FirstTimeThisEditorSession("GvCalib.Unavailable"))
                     Debug.LogWarning("[DisplayXR] GameView calibration unavailable, using the computed position: " + e.Message);
                 px = s_calLastInX; py = s_calLastInY;
