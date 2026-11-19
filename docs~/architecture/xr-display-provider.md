@@ -28,6 +28,7 @@ top of this provider, see [ADR-007](../adr/ADR-007-render-path-by-view-count.md)
 | `Runtime/UnitySubsystemsManifest.json` | Registers the display subsystem (`name: "DisplayXR"`, display `id: "DisplayXR Display"`, `libraryName: "displayxr_unity"`). Unity scans package manifests at load. |
 | `native~/displayxr_xrprovider/displayxr_display_provider.cpp` | Unity-facing half: `RegisterLifecycleProvider`, main-thread + graphics-thread provider callbacks, `CreateTexture` handoff, per-frame `PopulateNextFrameDesc` / `SubmitCurrentFrame`. |
 | `native~/displayxr_xrprovider/displayxr_provider_session.{h,cpp}` | Runtime-facing half: loads the DisplayXR runtime via `xrNegotiateLoaderRuntimeInterface`, creates instance/system/session on **Unity's D3D12 device**, enables EXT extensions, creates the `arraySize=2` (SPI) swapchain, consumes `XR_DXR_view_rig` render-ready views, submits the 2-view projection layer. |
+| `native~/displayxr_xrprovider/displayxr_provider_texture_target.{h,cpp}` | Editor texture mode only: the `XR_DXR_win32_window_binding` spec-9 texture target binding (#471). Holds the rect managed code pushes (`dxr_prov_set_texture_target_rect`), resolves it to a reference window + client rect under per-monitor-v2, chains the binding / per-frame / state structs behind the gates, logs the phase source. |
 | `native~/displayxr_unity_plugin.cpp` | `UnityPluginLoad` calls `displayxr_register_xr_display_provider(ifaces)`. Single DLL — no second plugin. |
 | `native~/unity_pluginapi/` | Vendored Unity XR SDK headers (`IUnityXRDisplay.h`, `UnitySubsystemTypes.h`, `UnityXRTypes.h`, …) — Unity ships only graphics headers in the editor; the XR provider headers are sourced from the Unity XR SDK (Unity Companion License). |
 
@@ -150,6 +151,18 @@ the provider logs a one-shot WARN and produces no stereo (same contract as the h
 `XR_DXR_cursor_depth` is enabled when the runtime advertises spec ≥ 5. Enabling it
 costs nothing: the provider chains the cursor request only while the app opts in
 (see [cursor-depth.md](cursor-depth.md)).
+
+`XR_DXR_win32_window_binding` **spec 9, texture target binding** (#471, runtime
+ADR-060) is an *optional* part of an extension that is enabled anyway. The plug-in's
+required floor for that extension stays where it was; the spec-9 structs
+(`XrSystemWin32TextureTargetPropertiesDXR`, `XrWin32TextureTargetBindingDXR`,
+`XrWin32TextureTargetFrameDXR`, `XrWin32TextureTargetStateDXR`) are chained only in
+the **editor's texture mode**, and only when the runtime advertises spec ≥ 9 and its
+system properties say `supportsTextureTarget`. A built player never chains them (it
+keeps the runtime presenting into the plug-in's window). All of it lives in its own
+TU, `native~/displayxr_xrprovider/displayxr_provider_texture_target.{h,cpp}`, with a
+fake-runtime test (`native~/tests/texture_target_test.cpp`). What it does and how to
+read its log: [editor-game-view-placement.md](editor-game-view-placement.md#the-texture-target-binding-runtime-spec-9-471).
 
 ## M2 — native-app parity (implemented)
 

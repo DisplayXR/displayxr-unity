@@ -185,8 +185,14 @@ FAIL=0
 
 echo ""
 echo "=== Required exports ==="
+# The list is taken once and matched from a string, never `defined_syms | grep -q`:
+# grep -q exits at the first match, the producer then dies of SIGPIPE, and under
+# `pipefail` that reads as "no match": a present export reported missing. It showed
+# up in CI when #471 added two exports ("sed: couldn't flush stdout: Broken pipe",
+# then all four "missing" on a library that had them).
+EXPORTED_SYMS="$(defined_syms "$SO")"
 for sym in UnityPluginLoad UnityPluginUnload XRSDKPreInit JNI_OnLoad; do
-    if defined_syms "$SO" | grep -qx "$sym"; then echo "export OK: $sym"
+    if grep -qx "$sym" <<<"$EXPORTED_SYMS"; then echo "export OK: $sym"
     else echo "ERROR: required export missing: $sym"; FAIL=1; fi
 done
 

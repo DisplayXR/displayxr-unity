@@ -17,6 +17,7 @@
 #include "displayxr_provider_desktop.h" // XR_DXR_desktop_control: the app's agent operates the desktop
 #include "displayxr_provider_hands.h" // XR_EXT_hand_tracking: 26-joint hands for the XR Hands subsystem
 #include "displayxr_provider_input.h" // OpenXR actions: controllers + styluses as Unity InputDevices
+#include "displayxr_provider_texture_target.h" // win32_window_binding v9: editor texture target (#471)
 #include "../displayxr_shared_state.h" // displayxr_state_set_stereo_matrices (overlay hit-test)
 #include "../displayxr_window_space_ui.h" // DXR_WSUI_MAX_SLOTS, get_pending_slot
 #include <atomic>     // s_session_generation (#336)
@@ -3941,6 +3942,8 @@ static void ps_locate_extra_zones(XrTime display_time)
 			zone.rect.extent = {z->rect_w, z->rect_h};
 			zone.next = li.next; li.next = &zone;
 		}
+		XrWin32TextureTargetFrameDXR tt_locate; // (#471) same target as the primary locate
+		li.next = dxr_tt_chain_frame(&tt_locate, li.next, li.displayTime, 0);
 		uint32_t vcount = 0;
 		if (XR_SUCCEEDED(s_ps.pfn_locate_views(s_ps.session, &li, &vstate, PS_MAX_VIEWS, &vcount, views)) && vcount >= 1) {
 			uint32_t n = vcount < 2 ? vcount : 2;
@@ -4663,6 +4666,9 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	ps_free_content_mask();
 	memset(&s_ps, 0, sizeof(s_ps));
 	s_wsui_vk_disabled = 0; // a new session gets a fresh chance (see its declaration)
+	// Texture target binding (#471): a new decision per session; the rect C# pushed
+	// lives in that TU's own statics, so it survives this memset and a restart.
+	dxr_tt_on_session_starting(ps_log);
 	s_ps.single_pass = saved_single_pass;
 	s_ps.single_pass_set = saved_single_pass_set;
 	s_ps.transparent_requested = saved_transparent;
@@ -4873,6 +4879,10 @@ int dxr_prov_session_start(const char *runtime_json_path,
 							s_ps.has_desktop_control = props[i].extensionVersion ? props[i].extensionVersion : 1;
 						else if (strcmp(props[i].extensionName, XR_DXR_WAYLAND_SURFACE_BINDING_EXTENSION_NAME) == 0)
 							s_ps.has_wayland_binding = 1;
+						// The ADVERTISED version gates the optional spec-9 texture target
+						// structs (#471); the extension itself is requested as before.
+						else if (strcmp(props[i].extensionName, XR_DXR_WIN32_WINDOW_BINDING_EXTENSION_NAME) == 0)
+							dxr_tt_on_extension_version(props[i].extensionVersion);
 #if defined(__ANDROID__)
 						else if (strcmp(props[i].extensionName, XR_DXR_ANDROID_SURFACE_BINDING_EXTENSION_NAME) == 0)
 							s_has_android_surface_binding = (int)props[i].extensionVersion;
@@ -5188,7 +5198,12 @@ int dxr_prov_session_start(const char *runtime_json_path,
 		htp.next = sp.next;
 		sp.next = &htp;
 	}
-	if (XR_SUCCEEDED(s_ps.pfn_get_system_properties(s_ps.instance, s_ps.system_id, &sp))) {
+	// win32_window_binding v9 (#471): can this system take a texture target? Chained
+	// only against a runtime that advertises spec 9 (the hook returns `next` otherwise).
+	sp.next = dxr_tt_chain_system_properties(sp.next);
+	const XrResult sp_result = s_ps.pfn_get_system_properties(s_ps.instance, s_ps.system_id, &sp);
+	dxr_tt_on_system_properties(XR_SUCCEEDED(sp_result) ? 1 : 0);
+	if (XR_SUCCEEDED(sp_result)) {
 		s_ps.system_hand_tracking = (s_ps.has_hand_tracking && htp.supportsHandTracking == XR_TRUE) ? 1 : 0;
 		s_ps.display_info.width_m = di.displaySizeMeters.width;
 		s_ps.display_info.height_m = di.displaySizeMeters.height;
@@ -5425,6 +5440,25 @@ int dxr_prov_session_start(const char *runtime_json_path,
 		}
 	}
 
+	// Texture target binding (win32_window_binding v9, runtime ADR-060, #471). EDITOR
+	// texture mode only - C# is the one caller of dxr_prov_set_texture_mode(1), so a
+	// built player (and the env-forced diagnostic probe) can never chain it. Default
+	// window-glue arrangement only: under the binding the target rect IS the canvas and
+	// zone / Local2D rects are target-local. Window-glue already has that shape (the
+	// anchor is glued to the image, so the forced zone is (0,0) image-sized and an app
+	// zone is image-relative); the zone-glue and BINDPANE experiments carry the pane's
+	// offset IN the zone rect, which the binding would apply a second time.
+	// windowHandle stays the anchor: the runtime ignores it when it honours the binding
+	// and falls back to it (ANCHOR_FALLBACK) when the display processor cannot phase
+	// without a window; a session that cannot honour the binding at all (D3D12 until
+	// runtime #2382) ignores it with one WARN and weaves through the anchor as before.
+	{
+		const int tt_eligible = s_probe_enabled && !bind_present && s_probe_handle != NULL &&
+		                        s_texture_mode_forced == 1 && dxr_prov_get_external_weave_hwnd() == NULL &&
+		                        s_gv_panel_x == INT32_MIN;
+		dxr_tt_bind_session(&win_binding, tt_eligible);
+	}
+
 	// D3D11 (#195): bind DIRECTLY on Unity's ID3D11Device (no queue — the runtime's
 	// native D3D11 compositor uses the immediate context). D3D12: bind on our own device.
 	XrGraphicsBindingD3D11KHR d3d11 = {};
@@ -5593,7 +5627,17 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	XrSessionCreateInfo sci = {XR_TYPE_SESSION_CREATE_INFO};
 	sci.next = gfx_binding;
 	sci.systemId = s_ps.system_id;
-	if (XR_FAILED(s_ps.pfn_create_session(s_ps.instance, &sci, &s_ps.session))) {
+	XrResult sc_result = s_ps.pfn_create_session(s_ps.instance, &sci, &s_ps.session);
+#ifdef _WIN32
+	// (#471) The texture target binding is optional: if the runtime refuses the session
+	// with it chained (its valid-usage checks on the reference window), create the
+	// session without it rather than lose the editor preview.
+	if (XR_FAILED(sc_result) && dxr_tt_unbind_after_create_failure(&win_binding)) {
+		s_ps.session = XR_NULL_HANDLE;
+		sc_result = s_ps.pfn_create_session(s_ps.instance, &sci, &s_ps.session);
+	}
+#endif
+	if (XR_FAILED(sc_result)) {
 #if defined(__ANDROID__)
 		// dxr_android_on_session is never reached: drop the binding's window ref here (#450).
 		dxr_android_surface_binding_release();
@@ -6195,6 +6239,7 @@ void dxr_prov_session_stop(void)
 	void *lib = s_ps.runtime_lib;
 	ps_free_content_mask();
 	ps_cursor_session_reset();
+	dxr_tt_on_session_stopped(); // (#471) the pushed rect survives; the decision does not
 	memset(&s_ps, 0, sizeof(s_ps));
 	s_ps.runtime_lib = lib;
 }
@@ -7007,7 +7052,12 @@ int dxr_prov_begin_frame(uint32_t *out_image_index, int *out_should_render)
 	if (bdiag) ps_log("[DisplayXR-PROV] D3D11 begin[%u]: pre-waitFrame\n", d11_bframes);
 
 	XrFrameState fs = {XR_TYPE_FRAME_STATE};
+	// (#471) What the runtime used for the last woven frame of a texture-target
+	// session - chained only when this session chained the binding.
+	XrWin32TextureTargetStateDXR tt_state;
+	fs.next = dxr_tt_chain_frame_state(&tt_state, fs.next);
 	if (XR_FAILED(s_ps.pfn_wait_frame(s_ps.session, NULL, &fs))) return 0;
+	if (fs.next == &tt_state) dxr_tt_on_frame_state(&tt_state);
 	if (bdiag) ps_log("[DisplayXR-PROV] D3D11 begin[%u]: waitFrame ok, pre-beginFrame\n", d11_bframes);
 	if (XR_FAILED(s_ps.pfn_begin_frame(s_ps.session, NULL))) return 0;
 	if (bdiag) ps_log("[DisplayXR-PROV] D3D11 begin[%u]: beginFrame ok\n", d11_bframes);
@@ -7112,6 +7162,11 @@ int dxr_prov_begin_frame(uint32_t *out_image_index, int *out_should_render)
 		// spec asks for the hint on at most one locate per frame.
 		PsCursorFrame cursor_frame;
 		ps_cursor_chain(&cursor_frame, &li, &vstate);
+
+		// (#471) Texture target: frame this locate's views to the rect the frame will
+		// be woven for (the same values go on xrEndFrame - one resolve per frame).
+		XrWin32TextureTargetFrameDXR tt_locate;
+		li.next = dxr_tt_chain_frame(&tt_locate, li.next, li.displayTime, 0);
 
 		const int located = XR_SUCCEEDED(s_ps.pfn_locate_views(s_ps.session, &li, &vstate,
 		                                                       PS_MAX_VIEWS, &vcount, views)) && vcount >= 1;
@@ -8391,9 +8446,15 @@ int dxr_prov_submit_frame(uint32_t image_index)
 			ei.next = &content_mask;
 		}
 	}
+	// (#471) Texture target: where this frame's woven texture is drawn. The xrEndFrame
+	// value is the authoritative one (phase, canvas, reported state); nothing is
+	// chained unless the session chained the binding and the rect resolves.
+	XrWin32TextureTargetFrameDXR tt_frame;
+	ei.next = dxr_tt_chain_frame(&tt_frame, ei.next, ei.displayTime, 1);
 	if (d11_diag) ps_log("[DisplayXR-PROV] D3D11 submit[%u]: pre-xrEndFrame (layers=%u)\n", d11_frames, lc);
 	if (subf_trace) ps_log("[DisplayXR-PROV] submit_frame[%u]: xrEndFrame layers=%u (views n=%u)\n", s_subf_n - 1, lc, n);
 	XrResult r = s_ps.pfn_end_frame(s_ps.session, &ei);
+	if (ei.next == &tt_frame) dxr_tt_on_frame_end_result(r);
 	if (subf_trace) ps_log("[DisplayXR-PROV] submit_frame[%u]: post-xrEndFrame r=%d\n", s_subf_n - 1, r);
 	if (d11_diag) ps_log("[DisplayXR-PROV] D3D11 submit[%u]: post-xrEndFrame r=%d\n", d11_frames, r);
 	if (s_ps.graphics_api == DXR_GFX_D3D11 && d11_frames < 100000) d11_frames++;

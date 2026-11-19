@@ -113,6 +113,10 @@ set(SOURCES
     displayxr_xrprovider/displayxr_provider_desktop.cpp
     # XR_EXT_hand_tracking binding: 26-joint hands for the XR Hands subsystem (Runtime/Hands/).
     displayxr_xrprovider/displayxr_provider_hands.cpp
+    # XR_DXR_win32_window_binding v9 texture target binding for the editor texture
+    # mode (#471). Platform-neutral logic (Win32 only in its default resolver), so it
+    # is compiled everywhere and its fake-runtime test runs on any host.
+    displayxr_xrprovider/displayxr_provider_texture_target.cpp
     # OpenXR actions -> UnityEngine.XR InputDevices (controllers + styluses of any
     # DisplayXR input provider): the action binding + the IUnityXRInput provider.
     displayxr_xrprovider/displayxr_provider_input.cpp
@@ -145,6 +149,7 @@ endif()
 list(APPEND HEADERS displayxr_xrprovider/displayxr_provider_session.h)
 list(APPEND HEADERS displayxr_xrprovider/displayxr_provider_mcp.h)
 list(APPEND HEADERS displayxr_xrprovider/displayxr_provider_desktop.h)
+list(APPEND HEADERS displayxr_xrprovider/displayxr_provider_texture_target.h)
 
 if(WIN32)
     list(APPEND SOURCES displayxr_win32.c displayxr_gpu_preference.cpp)
@@ -477,4 +482,12 @@ if(DISPLAYXR_BUILD_TESTS)
     target_compile_features(input_binding_test PRIVATE cxx_std_17)
     target_link_libraries(input_binding_test PRIVATE Threads::Threads)
     add_test(NAME input_binding COMMAND input_binding_test)
+
+    # win32_window_binding v9 texture target (#471): chaining + gating against a
+    # fake runtime and an injected window resolver (no Win32, no Unity).
+    add_executable(texture_target_test tests/texture_target_test.cpp displayxr_xrprovider/displayxr_provider_texture_target.cpp)
+    target_include_directories(texture_target_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/displayxr_xrprovider ${OPENXR_INCLUDE_DIR})
+    target_compile_features(texture_target_test PRIVATE cxx_std_17)
+    target_link_libraries(texture_target_test PRIVATE Threads::Threads)
+    add_test(NAME texture_target COMMAND texture_target_test)
 endif()

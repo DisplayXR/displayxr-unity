@@ -16,7 +16,9 @@ placement, pure C#), `Runtime/Provider/DisplayXRGameViewCalibration.cs` (the cal
 and its decoding, pure C#), `Runtime/Provider/DisplayXRGameViewCalibrator.cs` (when to calibrate,
 the screen read-back, the log line), `Editor/Provider/DisplayXRGameViewWholePixel.cs` (the
 whole-pixel size), `native~/displayxr_xrprovider/displayxr_display_provider.cpp` (the marker, in
-the native mirror blit) and `native~/displayxr_win32.c` (`displayxr_read_screen_strip`).
+the native mirror blit), `native~/displayxr_win32.c` (`displayxr_read_screen_strip`) and
+`native~/displayxr_xrprovider/displayxr_provider_texture_target.cpp` (the texture target binding,
+#471).
 Tests: `Tests~/GameViewPlacement` and `Tests~/GameViewCalibration` (CI runs both with
 `dotnet run --project ... -c Release`). In the placement suite the #420 checks are pinned to
 hardware measurements; the #459 checks are unit tests of the arithmetic and model-consistency
@@ -31,7 +33,7 @@ Four things, all in physical pixels of the pane's own monitor:
 | 1 | Unity draws the Game view's render texture into a rect **as wide as the texture** | a column is dropped or doubled; everything past it sits one pixel off: the eyes swap on one side of a vertical line |
 | 2 | ...and **as high as the texture** | a row is dropped or doubled; through the slanted lens the interlace phase shifts on one side of a horizontal line (crosstalk, not a full swap) |
 | 3 | The woven canvas the runtime renders is **the texture's size** | the native mirror blit stretches the canvas over the texture with a linear sampler: the interlace is resampled over the whole view |
-| 4 | The invisible weave anchor sits on the screen pixel that shows the texture's **first column and row 0** | the whole view is uniformly out of phase (up to a full eye swap) |
+| 4 | The weave is phased from the screen pixel that shows the texture's **first column and row 0**: the invisible anchor window sits there, and with a runtime that takes a texture target (spec 9) the same point is sent as the target rect | the whole view is uniformly out of phase (up to a full eye swap) |
 
 How Unity sizes and draws it (read from the Unity 6000.4.0f1 editor assembly):
 
@@ -322,6 +324,135 @@ labels) cover part of a strip; that is why each axis has two strips in different
 **For other code.** `DisplayXRProviderDriver.TryGetGameViewImageRect(out clientX, out clientY,
 out width, out height, out measured)` (internal) returns the image's top-left in the pane
 window's client area and its size, in physical px, and whether that was measured or computed.
+The texture target rect (next section) is fed from it.
+
+**D3D11 and the marker.** The marker exists only in the D3D12 mirror blit because that is the
+only place where the plug-in itself draws the Game view's pixels. With D3D11 the woven texture
+is opened on Unity's device and wrapped as a Unity texture (`dxr_prov_get_woven_unity_texture`,
+`create_woven_mirror_texture_if_ready`), and the native blit callback
+(`MainBlitToMirrorViewRenderTarget`) returns without drawing, since it is written against
+`IUnityGraphicsD3D12v8`. What reaches the screen there is **Unity's own mirror blit** of that
+texture, from the `blitParams` of `MainQueryMirrorViewBlitDesc` (read from the code; not
+observed in a running D3D11 editor). There is no plug-in draw to put the marker in. Drawing it
+on D3D11 needs one of two new paths, neither of which exists:
+
+- a D3D11 native mirror blit: shaders, a render target view on
+  `IUnityGraphicsD3D11::TextureFromRenderBuffer(rtNative)`, save and restore of Unity's
+  immediate-context state, and first the proof that Unity calls the native callback on D3D11 in
+  both URP and BiRP (the header says the pipeline may not); or
+- a marker texture of the mirror target's size, registered with `CreateTexture` and swapped in
+  as `blitParams[0].srcTexId` for the marker's frames. Unity's blit is the path that split a
+  tall target at its midline with a few pixels of offset (the reason the D3D12 native blit
+  exists), so a marker drawn that way would measure Unity's blit of the marker; whether that is
+  where the woven texture lands has to be shown on a panel.
+
+Until then a D3D11 editor uses the computed position for the anchor and for the target rect.
+
+## The texture target binding (runtime spec 9, #471)
+
+Until `XR_DXR_win32_window_binding` spec 9 the only way to tell the runtime where the woven
+texture reaches the panel was the **anchor window**: an invisible window parked on the image,
+which the vendor weaver bound to and phased from. Runtime v2.55.0 (ADR-060) lets a texture
+session say it directly, as a **reference window** plus a **target rect** in that window's client
+area. It phases the interlace from that rect's live screen position with no window bound to the
+weaver, and reports the origin it wove at.
+
+**What the plug-in sends.** In the editor's docked texture mode, when the runtime advertises
+spec 9 or later and its system properties say `supportsTextureTarget`:
+
+- at `xrCreateSession`, `XrWin32TextureTargetBindingDXR` chained on the window binding;
+- every frame, `XrWin32TextureTargetFrameDXR` on `xrEndFrame` (the authoritative one) and on
+  every `xrLocateViews` of that frame, with identical values (one resolve per frame);
+- at `xrWaitFrame`, `XrWin32TextureTargetStateDXR` to read back what the runtime used.
+
+The **reference window** is the top-level editor window that hosts the Game view pane
+(`GetAncestor(pane, GA_ROOT)`, re-resolved every frame). The **target rect** is where the woven
+texture's texel (0,0) is drawn and the size it is drawn at, in that window's client area,
+physical px.
+
+**One setter.** Managed code states the placement through one native entry point:
+
+```c
+void dxr_prov_set_texture_target_rect(void *pane_hwnd, int32_t x, int32_t y,
+                                      int32_t w, int32_t h, uint32_t flags);
+```
+
+`x`, `y` are in the **pane window's client area**, physical px, y down; `w`, `h` the drawn size;
+`flags` = `DXR_TT_RECT_VALID` (and `DXR_TT_RECT_MEASURED` when the rect was measured on screen
+rather than computed; that one is only logged). Without `VALID` the target is cleared: `(0,0)` is
+a real offset and is never read as "none". Native turns the pane-relative offset into the
+reference window's client px inside a per-monitor-v2 scope, so no desktop coordinate crosses the
+managed boundary (the pane-relative offset is a difference of two rects read in one space, which
+is the same in any DPI awareness).
+
+**One placement per frame.** Every frame the glue resolves one offset of the image inside the
+pane (`ResolveImagePlacement`) and hands the same two numbers, with the same size, to the anchor
+window (`displayxr_set_pane_follow`) and to this setter, so the anchor and the target rect
+cannot disagree:
+
+- when the [on-screen calibration](#on-screen-calibration-condition-4-measured) has measured
+  the image (`TryGetGameViewImageRect` returns `measured`, and its rect is the one the anchor
+  is placed with this frame), the offset is the **measured** origin and the rect carries
+  `DXR_TT_RECT_MEASURED`;
+- otherwise it is the **computed** placement.
+
+The docked phase nudge is added on top of either. The size is the glue's canvas size in both
+cases (the anchor's client area): under the binding the target rect is the canvas zones are
+laid out in. Before the session starts the rect is the computed one, the rect the anchor is
+born at; the calibration needs a playing view. On D3D11, the only API on which the runtime
+honours the binding today, the calibration does not run (see "D3D11 and the marker" above), so
+there the rect is always the computed one.
+
+**The anchor window stays.** It is still created, glued and passed as `windowHandle`:
+
+| Runtime's answer (`XrWin32TextureTargetStateDXR::flags`) | What phases the weave |
+|---|---|
+| `WINDOWLESS_PHASE` | the target rect; the runtime hands the anchor to no display processor |
+| `ANCHOR_FALLBACK` | the anchor window, as before (the display processor cannot phase without a window). The rect still defines the canvas |
+| neither, nothing reported | the anchor window: the session cannot honour the binding at all and ignored it. That is D3D12 until DisplayXR/displayxr-runtime#2382 (the runtime logs `XrWin32TextureTargetBindingDXR IGNORED` once) |
+
+So a project on D3D11 gets the windowless phase where the display processor offers it, and a
+project on D3D12 runs as before.
+
+**Zones, Local2D, window-space UI.** Under the binding the runtime's canvas is the target rect
+and zone / Local2D rects are *target-local*. The default arrangement already has that shape: the
+anchor is glued to the image, so its client area **is** the target; the forced full-pane zone is
+`(0,0)` image-sized, an app-authored zone (`dxr_prov_set_3d_zone_rect`) is image-relative, and
+window-space layers are fractions of the same rect. Nothing in the zone path changed, and the
+forced zone is still submitted (the runtime no longer needs it under the binding; it is what
+sizes the swapchain here). The two opt-in experiments that put the pane's offset *into* the zone
+rect (`DISPLAYXR_PROV_GV_ZONEGLUE`, `DISPLAYXR_PROV_GV_BINDPANE`) do not chain the binding: the
+offset would be applied twice.
+
+**When it is not chained** (each is one log line, and the reason is in the `1:1` line): a built
+player or the floating Game view's present mode; `DISPLAYXR_PROV_TEXTURE_TARGET=0`; a runtime
+older than spec 9, or one whose system properties say no; no rect pushed before the session
+started; the pane has no live top-level window in this process. If the runtime refuses
+`xrCreateSession` with the binding chained, the session is created again without it.
+
+**Restarts.** A dock <-> undock restarts the session and wipes the provider's session state.
+The pushed rect lives outside that state, so the binding is chained again from the last rect
+without waiting for managed code; the per-session decision (advertised spec, system properties)
+is taken afresh.
+
+**Log lines** (`[DisplayXR-PROV] texture target ...`, in `Editor.log`):
+
+| Line | When |
+|---|---|
+| `runtime spec v9, supportsTextureTarget=1 windowlessPhase=1` | every session start against a spec-9 runtime (`windowlessPhase` is the runtime's prediction) |
+| `binding CHAINED - reference window ..., initial rect (...)` | the binding was chained |
+| `... - anchor window only` | it was not, with the reason |
+| `rect pushed - pane ... (x,y WxH) [computed]` | the first rect, and a rect for another pane; `[measured]` when the calibration supplied it |
+| `rect now measured - pane ... (x,y WxH), was (x,y WxH) [computed]` | the calibration took over from the computed placement (or `rect now computed ...` when its measurement was dropped) |
+| `texture target state: phase source = WINDOWLESS_PHASE (the target rect), target rect measured ...; woven origin (x,y) rect (...) vs requested origin (x,y) rect (...)` | **once per state change**: first report, first woven frame, any change of the flags, and a change of the rect's source (`target rect measured` / `target rect computed`) |
+| `WARN the runtime wove at another ORIGIN / for another RECT / CLAMPED ...` | once per change of what disagrees with the request |
+| `the runtime weaves at the requested origin and rect again` | once, after 30 agreeing frames |
+| `no valid target this frame (...) - not sent` | once per episode: the pane's window is gone (a layout reset); the runtime reuses the last rect |
+
+The state is a diagnostic. Nothing is fed back from it into the placement.
+
+`DISPLAYXR_PROV_TEXTURE_TARGET=0` (before the editor starts) turns the whole thing off: no
+spec-9 struct is chained anywhere and the session is the anchor-window session of before.
 
 ## The 1:1 diagnostic (always on in the editor, changes nothing pushed to the runtime)
 
@@ -331,6 +462,7 @@ Each time the numbers have held for 0.35 s and differ from the last line logged,
 [DisplayXR] GameView 1:1: W drawn 1728.00 px for a 1728 px texture (1:1), H drawn 860.00 px for a 860 px texture (1:1)
   | texture=1728x860 glue computed 1728x860 (agree) | target=1728x859.5 px zoom=(1,1.0005817) scale=2.5 (pane dpi 240 = 2.5)
   canvas=1728x860 (= texture) | left border 1 pt = +3 px | anchor at pane +3,+113 | targetInView=(...)pt viewInWindow=(...)pt
+  | phase source: texture target rect, WINDOWLESS_PHASE | woven origin 1020,406 (= requested) | target rect: measured
 ```
 
 | Field | Meaning | Good |
@@ -343,6 +475,8 @@ Each time the numbers have held for 0.35 s and differ from the last line logged,
 | `anchor at pane +dx,+dy` | where the glue put the anchor, relative to the pane's top-left | Free Aspect: `dx == n` (F3) |
 | `scale` / `pane dpi` | the measured pane scale and the window's DPI / 96 | equal |
 | `targetInView` / `viewInWindow` | Unity's raw rects in points, for reference (not used for the verdict: they go through `pixelsPerPoint`) | - |
+| `phase source:` | what phases the weave (#471): `texture target rect, WINDOWLESS_PHASE`, or `anchor window (...)` with the reason (the runtime's `ANCHOR_FALLBACK`, a session that did not bind the target, which is D3D12 today, or why the binding was not chained). With a woven frame reported: the origin the runtime wove at, `(= requested)` or `but requested x,y (DIFFERS)`. A change of the phase source logs a new line | windowless: `(= requested)` |
+| `target rect:` | where the rect pushed for the binding came from: `measured` (the on-screen calibration), `computed`, or `none pushed`. A change logs a new line | `measured` on D3D12; `computed` on D3D11 |
 | `[whole-pixel size]` | the experiment's size is on this view | - |
 | `[present mode ...]` | the Game view is floating: the runtime presents over the pane, so the line is informational and nothing is raised | - |
 
@@ -511,7 +645,9 @@ right and the docked one is not, it is the docked placement.
 
 `%TEMP%\dxr_phase_nudge.txt` holds an integer: pixels to shift the invisible anchor in X. It is
 re-read about twice a second, docked mode only, and moves only the weave's phase, never the
-picture. `%TEMP%\dxr_phase_nudge_y.txt` is the same for Y.
+picture. `%TEMP%\dxr_phase_nudge_y.txt` is the same for Y. The texture target rect (#471) is
+shifted by the same amount, so the nudge works the same whether the runtime phases from the
+anchor or from the rect; the `phase source:` field says which.
 
 ```powershell
 Set-Content $env:TEMP\dxr_phase_nudge.txt 1     # try 1, -1, 2, -2, 3, -3
@@ -645,6 +781,32 @@ judge the computed anchor), start it, same layouts.
   must look as right as pass A did.
 - At 100 / 200 / 300 %: `nothing to do at ... %`, and nothing else changes.
 
+### Pass C - the texture target binding (#471)
+
+Needs runtime v2.55.0 or later. Do it once on a **D3D11** project (the only API that honours the
+binding today) and once on a **D3D12** project (which must be unchanged).
+
+- D3D11, docked: `Editor.log` shows `texture target: runtime spec v9, supportsTextureTarget=1
+  windowlessPhase=...`, then `binding CHAINED`, then within the first frames `texture target
+  state: phase source = WINDOWLESS_PHASE (the target rect)` with `woven origin (x,y)` equal to
+  the `requested origin`. The `1:1` line ends `phase source: texture target rect,
+  WINDOWLESS_PHASE | woven origin x,y (= requested)`. With a display processor that cannot
+  phase windowless (a vendor SDK older than the one that added external routing) the state is
+  `ANCHOR_FALLBACK` instead and the picture must be what it was before.
+- On D3D11 the `1:1` line ends `target rect: computed` and the calibration logs
+  `fell back ... the marker was not drawn`: the rect is the computed placement there. On D3D12,
+  after the calibration line, the `1:1` line reads `target rect: measured` and `Editor.log` has
+  one `texture target: rect now measured`.
+- The picture must be right with nudge 0 wherever pass A's was, and the nudge must still move
+  the phase. Drag the editor window: the woven origin follows, with at most one WARN line per
+  drag. Dock <-> undock twice: each re-dock logs `binding CHAINED` again.
+- A zones scene (`samples/desktop-avatar`: a 3D band with a Local2D bubble above it) must look as
+  it does with `DISPLAYXR_PROV_TEXTURE_TARGET=0`.
+- D3D12: the runtime log has one `XrWin32TextureTargetBindingDXR IGNORED`; the `1:1` line says
+  `phase source: anchor window (the runtime did not bind the texture target)`; everything else
+  as in pass A.
+- A/B at any point: `DISPLAYXR_PROV_TEXTURE_TARGET=0` restores the anchor-only session.
+
 ### What to send back
 
 For every scale x layout x pass: the `GameView calibration:` line(s), the `GameView 1:1:` line, `GameView glue size change:`,
@@ -652,6 +814,12 @@ For every scale x layout x pass: the `GameView calibration:` line(s), the `GameV
 With those numbers F1-F5 can each be confirmed or dropped without another session.
 
 ## Not verified without a panel
+
+The texture target binding (#471) has only been exercised against a fake runtime
+(`native~/tests/texture_target_test.cpp`: the gates, the chain contents, the per-frame protocol,
+the state compare, a restart) and against real Win32 windows for the coordinate resolve. It has
+**not** run against a real runtime: not the windowless phase on a panel, not the anchor fallback,
+not the D3D12 ignore path, not a zones scene under the binding. Pass C is that test.
 
 Everything in the recipe and every finding. In particular: that the whole-pixel size removes the
 175 % seam in this plug-in's texture path (it was reported from another plug-in's editor weave on
@@ -669,3 +837,5 @@ The calibration, as of the change that added it:
 | The marker reaching the screen through Unity's Game view; timing; the measured origin being the right anchor on a panel | **not verified** - Pass 0 |
 | A screen read while the Game view is on an HDR or colour-managed desktop | not verified (the classifier is relative to the brightest channel to allow for it) |
 | D3D11 editor, Vulkan | falls back by design; the fallback line is not verified |
+| The target rect fed from the measured origin (#471) | unit-tested natively (`texture_target_test`: source change, one line each, restart); **not run in an editor** |
+| How the woven texture reaches a D3D11 Game view (Unity's own mirror blit) | read from the code, **not observed** |

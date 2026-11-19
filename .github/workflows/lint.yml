@@ -56,7 +56,7 @@ jobs:
         # Pinned so an upstream renumbering arrives as a deliberate bump of
         # EXTENSIONS_SHA in a PR, not as a red main.
         env:
-          EXTENSIONS_SHA: 1df6f8d2f874f7d18cc8553c048b0328aa705502
+          EXTENSIONS_SHA: c67bf8e133d83cd757489ba78f3d26ffaf7075d2
         run: |
           git init -q "$RUNNER_TEMP/ext"
           git -C "$RUNNER_TEMP/ext" fetch -q --depth 1 https://github.com/DisplayXR/displayxr-extensions "$EXTENSIONS_SHA"

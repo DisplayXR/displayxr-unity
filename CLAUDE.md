@@ -124,6 +124,27 @@ build will tell you. One container run catches them all:
   opaque case is deliberate: the runtime's transparent flag is fixed at `xrCreateSession`,
   so a budget of 0 can arrive for a session that never composites over the desktop, and the
   app's own state must win.
+- **Editor texture target binding (`XR_DXR_win32_window_binding` spec 9, runtime ADR-060,
+  #471)**: in the editor's docked texture mode the provider tells the runtime WHERE the woven
+  texture is drawn (reference window = the pane's top-level window, target rect in its client
+  physical px) instead of relying only on the invisible anchor window. Own TU
+  (`displayxr_provider_texture_target.cpp`), fake-runtime test
+  (`native~/tests/texture_target_test.cpp`). **Optional**: chained only when the runtime
+  ADVERTISES spec >= 9 and its system properties say `supportsTextureTarget`; never in a built
+  player; the plug-in's floor for the extension is unchanged. The anchor window stays as
+  `windowHandle` (the runtime's `ANCHOR_FALLBACK`, and the whole path on D3D12, which ignores
+  the binding until runtime #2382). **One setter** carries the placement,
+  `dxr_prov_set_texture_target_rect(pane, x, y, w, h, flags)` in the PANE's client physical px
+  ((0,0) is valid; absence is the missing `VALID` flag): feed it, do not add a second path. The glue
+  resolves ONE image offset per frame (`ResolveImagePlacement`: the origin measured by the
+  #459 on-screen calibration when there is one, else the computed placement; phase nudge on
+  top) and hands the same numbers to the anchor (`displayxr_set_pane_follow`) and to this
+  setter - keep it that way, the two must never disagree. The calibration marker is D3D12-only,
+  so on D3D11 (where the runtime honours the binding today) the rect is the computed one. The
+  rect lives outside the per-session state, so a dock <-> undock restart re-chains it. Opt out
+  with `DISPLAYXR_PROV_TEXTURE_TARGET=0`. Zones need nothing: in the default window-glue
+  arrangement the anchor's client area already IS the target. Write-up:
+  `docs~/architecture/editor-game-view-placement.md`.
 - **Depth-aware cursor (`XR_DXR_cursor_depth`, runtime ADR-046)**: opt-in
   (`DisplayXRCursorDepth.Enabled` or a `DisplayXRDepthCursor` component). The RUNTIME draws the
   cursor in stereo just in front of the content under it; the provider chains the per-frame

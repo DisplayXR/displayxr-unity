@@ -513,5 +513,79 @@ namespace DisplayXR
             hPx = hPt * pct / 100;
             return true;
         }
+
+        // ---- Texture target binding (#471): what phases the weave ---------------------
+        // The numbers below mirror native~/displayxr_xrprovider/displayxr_provider_texture_target.h
+        // (DXR_TT_WHY_*, DXR_TT_MISMATCH_*) and the runtime's state flags.
+
+        /// <summary>XrWin32TextureTargetStateFlagsDXR: phased from the target rect, no window.</summary>
+        public const uint TargetStateWindowlessPhase = 0x1;
+        /// <summary>...: the display processor cannot phase windowless; the anchor carried the weave.</summary>
+        public const uint TargetStateAnchorFallback = 0x2;
+        public const uint TargetStateSegmented = 0x4;
+        public const uint TargetStateFlatSegment = 0x8;
+        public const uint TargetStateClamped = 0x10;
+
+        /// <summary>
+        /// The phase source, as appended to the <c>GameView 1:1:</c> line. With
+        /// <paramref name="chained"/> false the anchor window phases the weave, as before
+        /// spec 9, and <paramref name="whyNot"/> (DXR_TT_WHY_*) says why. Chained, the
+        /// runtime's reported <paramref name="flags"/> decide: WINDOWLESS_PHASE = the target
+        /// rect itself; ANCHOR_FALLBACK = the anchor window, by the runtime's choice; neither
+        /// = the runtime ignored the binding (a session that cannot honour it).
+        /// </summary>
+        public static string PhaseSourceText(bool chained, int whyNot, uint flags, bool reported,
+                                             bool matched, int mismatch, int wovenX, int wovenY,
+                                             int requestedX, int requestedY)
+        {
+            if (!chained)
+            {
+                string why;
+                switch (whyNot)
+                {
+                    case 1: why = "no session"; break;
+                    case 2: why = "DISPLAYXR_PROV_TEXTURE_TARGET=0"; break;
+                    case 3: why = "not the editor texture mode"; break;
+                    case 4: why = "the runtime predates XR_DXR_win32_window_binding 9"; break;
+                    case 5: why = "the runtime does not support it here"; break;
+                    case 6: why = "no rect before the session started"; break;
+                    case 7: why = "no top-level window for the pane"; break;
+                    case 8: why = "the runtime refused the binding"; break;
+                    default: why = "reason " + whyNot; break;
+                }
+                return "anchor window (texture target not chained: " + why + ")";
+            }
+            string s;
+            if ((flags & TargetStateWindowlessPhase) != 0) s = "texture target rect, WINDOWLESS_PHASE";
+            else if ((flags & TargetStateAnchorFallback) != 0) s = "anchor window (runtime ANCHOR_FALLBACK: the display processor cannot phase without a window)";
+            else s = "anchor window (the runtime did not bind the texture target)";
+            if ((flags & TargetStateSegmented) != 0) s += " SEGMENTED";
+            if ((flags & TargetStateFlatSegment) != 0) s += " FLAT_SEGMENT";
+            if ((flags & TargetStateClamped) != 0) s += " CLAMPED";
+            if (reported)
+            {
+                s += " | woven origin " + wovenX + "," + wovenY;
+                if (matched)
+                    s += (mismatch & 1) != 0 ? " but requested " + requestedX + "," + requestedY + " (DIFFERS)" : " (= requested)";
+                if ((mismatch & 2) != 0) s += " rect DIFFERS";
+            }
+            else if (flags != 0) s += " | nothing woven yet";
+            return s;
+        }
+
+        /// <summary>
+        /// Where the target rect pushed to the runtime came from, as appended to the
+        /// <c>GameView 1:1:</c> line after the phase source: 2 = the on-screen calibration
+        /// measured it (#459), 1 = the computed placement, 0 = no rect pushed.
+        /// </summary>
+        public static string TargetRectSourceText(int source)
+        {
+            switch (source)
+            {
+                case 2: return " | target rect: measured";
+                case 1: return " | target rect: computed";
+                default: return " | target rect: none pushed";
+            }
+        }
     }
 }
