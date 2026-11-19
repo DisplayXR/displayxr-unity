@@ -356,6 +356,18 @@ if [ "$SIGNED" = yes ]; then
       git commit -q -m "Sign displayxr_unity.dll for [VERSION] (Leia EV)" || echo "(upm already signed)"
       git push -f origin upm
       git tag -f "upm/[VERSION]" && git push -f origin "upm/[VERSION]"
+      # Also move the plain [VERSION] tag onto this signing commit (#452), so a
+      # `#[VERSION]` git install gets the SIGNED DLL instead of the unsigned one
+      # committed on main. HEAD is the upm signing commit here. The `Release
+      # [VERSION]` marker stays on main as the history boundary; the GitHub
+      # Release follows the tag name. This push does not re-run the release:
+      # build-native.yml's DetectChanges recognises a tag on a "Sign
+      # displayxr_unity.dll for" commit and builds nothing. Only do this when the
+      # commit above was really made — on the "(upm already signed)" path HEAD is
+      # still the signing commit, which is equally correct.
+      git log -1 --format=%s | grep -q '^Sign displayxr_unity.dll for ' \
+        && git tag -f "[VERSION]" && git push -f origin "[VERSION]" \
+        || echo "⚠ upm HEAD is not a signing commit — [VERSION] tag left on main (unsigned DLL for #[VERSION] git installs)"
       git checkout main
       echo "✅ signed displayxr_unity.dll re-injected into the .tgz asset + upm branch (Valid/Leia EV)."
     fi
@@ -404,8 +416,12 @@ gh release view [VERSION] --repo DisplayXR/displayxr-unity --json tagName,name,a
 ```bash
 git ls-remote origin refs/heads/upm
 git ls-remote origin refs/tags/upm/[VERSION]
+git ls-remote origin refs/tags/[VERSION]
 ```
-- Verify both exist
+- Verify all three exist
+- When SIGNED=yes, `[VERSION]` and `upm/[VERSION]` must be the SAME commit (the
+  signing commit). If `[VERSION]` still points at main, `#[VERSION]` git installs
+  get the unsigned DLL — say so in the report.
 
 ### Step 4.3: Report
 ```
