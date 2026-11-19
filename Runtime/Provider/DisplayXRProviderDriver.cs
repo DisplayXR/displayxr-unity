@@ -74,6 +74,10 @@ namespace DisplayXR
             // (#459) Take a calibration marker down with the glue (no-op unless one is up).
             DisplayXRGameViewCalibrator.Abort();
             s_calLastValid = false; s_imgRectFrame = -1;
+            // (#459) The glue stops (Play ends, dock / undock restarts the subsystem): put
+            // Unity's uniform zoom back on every Game view GVFIT stretched.
+            RestoreGameViewFit();
+            s_gvScaled = s_gvOffPane = false; s_degSince = -1.0; s_degWarned = false;
             DisplayXRDepthBudget.Reset();
             DisplayXRCursorDepth.Reset();
             // No pump will run again: complete every pending desktop action as failed.
@@ -247,6 +251,61 @@ namespace DisplayXR
         static bool  s_diagValid;
         static DisplayXRGameViewPlacement.Pane s_diagPane;
         static float s_diagTargetWPx, s_diagTargetHPx;
+        static Vector2 s_diagZoom;   // the matched view's zoom (docked mode; zero = not read)
+
+        // (#459) A Game view that CANNOT be 1:1 this frame (docked / texture mode only):
+        //   s_gvScaled   its zoom is not 1 (a fixed size Unity fits into the view, or the
+        //                Scale slider): every texel is resampled on the way to the panel;
+        //   s_gvOffPane  the computed anchor came out off the pane (replaced by the area).
+        // While either holds: the anchor stays inside the pane, the picture is shown as
+        // Unity scales it (no usable 3D), the calibration marker is not shown (it cannot be
+        // decoded under scaling - it used to flash three times and fail), and ONE warning
+        // names the cause and the remedy, once the state has held for kDegradedHoldSeconds
+        // (the editor side, DisplayXRGameViewWholePixel, normally fixes the view within a
+        // few tenths of a second by taking it over for the Play session; then no warning).
+        static bool   s_gvScaled, s_gvOffPane;
+        static int    s_gvOffPaneDx, s_gvOffPaneDy;
+        static double s_degSince = -1.0;
+        static bool   s_degWarned;
+        const double  kDegradedHoldSeconds = 1.0;
+
+        /// <summary>(#459) True while the docked Game view cannot be shown texel for pixel
+        /// (zoomed, or the anchor fell off the pane) and the glue is in its degraded mode.</summary>
+        internal static bool GameViewDegraded => s_gvScaled || s_gvOffPane;
+
+        static void WarnGameViewDegradedOnce()
+        {
+            if (!GameViewDegraded || !s_lastAppliedDocked) { s_degSince = -1.0; return; }
+            double now = Time.realtimeSinceStartupAsDouble;
+            if (s_degSince < 0.0) { s_degSince = now; return; }
+            if (s_degWarned || now - s_degSince < kDegradedHoldSeconds) return;
+            s_degWarned = true;
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+            string size = s_diagPane.RtW + "x" + s_diagPane.RtH;
+            string msg;
+            if (s_gvScaled)
+            {
+                string zoom = s_diagZoom.x.ToString("0.##", inv) + "x";
+                msg = "the Game view shows its " + size + " image scaled to " + zoom +
+                      (s_diagZoom.x < 1f ? " (a fixed size larger than the view, which Unity shrinks to fit, or the Scale slider)"
+                                         : " (the Scale slider)") +
+                      ", so no texel lands on one panel pixel and 3D cannot be right. The picture is shown as Unity " +
+                      "scales it, without 3D alignment, and the on-screen calibration is skipped. " +
+                      "Remedy: in the Game view's toolbar select Free Aspect and set Scale to 1x (or pick a fixed size " +
+                      "that fits the view at 1x). The plug-in normally does this by itself for the Play session and puts " +
+                      "your selection back afterwards; it did not here (DISPLAYXR_PROV_GV_TAKEOVER=0, a size or zoom " +
+                      "changed by hand during Play, or editor internals it could not reach).";
+            }
+            else
+            {
+                msg = "the computed image position (pane +" + s_gvOffPaneDx + ",+" + s_gvOffPaneDy + " for a " + size +
+                      " image) is outside the Game view pane, so it was not used: the weave is anchored on the " +
+                      "pane's render area instead and 3D is probably wrong. Remedy: select Free Aspect and Scale 1x " +
+                      "in the Game view's toolbar; if it already is, please report the 'GameView 1:1' log line.";
+            }
+            Debug.LogWarning("[DisplayXR] Game view cannot be shown 1:1: " + msg +
+                             " See docs~/architecture/editor-game-view-placement.md.");
+        }
 
         /// <summary>The Game view the glue is bound to (a UnityEditor.GameView), or null.</summary>
         internal static object MatchedGameView => s_matchedGameView;
@@ -699,6 +758,118 @@ namespace DisplayXR
         static string s_lastFitLog;
         static bool   s_fitSkipLogged;   // (#459) "skipped on the whole-pixel view", once per activation
 
+        // (#459) GVFIT IS ONLY VALID AT ZOOM 1. The row fit is a fraction of a row on a
+        // texture drawn at its own size. On a view whose zoom is anything else (a Fixed
+        // Resolution larger than the area, which Unity fits; the Scale slider off 1x) writing
+        // it made the zoom ANISOTROPIC - (0.279, 1.0002) on hardware: a 4K picture drawn
+        // 3.6x too tall, the anchor computed 700 px above the pane, a black weave, and the
+        // stretched zoom left in the layout after Play. So: at zoom 1 the fit is written; at
+        // any other zoom scale.y is kept equal to scale.x (Unity's own uniform zoom), which
+        // also undoes a stretch left by an earlier frame or an older plug-in. Both values
+        // come from DisplayXRGameViewPlacement.FitZoomY (pure, unit-tested).
+        // WHAT IS PUT BACK, AND WHEN: RestoreGameViewFit sets scale.y = scale.x (and a nudged
+        // translation back) on every Game view. It runs when the glue stops (OnDestroy: Play
+        // ends, dock / undock restarts the subsystem) and, from the editor side
+        // (DisplayXRGameViewWholePixel), on leaving Play, before a domain reload, when the
+        // editor quits, and once at editor load (a layout saved by a killed editor).
+        // A stretched scale.y also stops Unity following its own default zoom
+        // (GameView.UpdateZoomAreaAndParent compares scale.y with the default), so leaving
+        // it behind is not cosmetic.
+        static System.Collections.Generic.Dictionary<int, float> s_fitNudgeOrig;   // view id -> translation.y before "nudge:"
+
+        // GameView.m_ZoomArea (a ZoomableArea) of one view, with its m_Scale / m_Translation
+        // fields resolved. Null when the editor internals are not found.
+        static object ZoomAreaOf(object view)
+        {
+            if (view == null || s_gvType == null) return null;
+            if (s_zoomAreaField == null)
+                for (var t = s_gvType; t != null && s_zoomAreaField == null; t = t.BaseType)
+                    foreach (var fi in t.GetFields(BindingFlags.Instance | BindingFlags.Public |
+                                                   BindingFlags.NonPublic | BindingFlags.DeclaredOnly))
+                        if (fi.Name.ToLowerInvariant().Contains("zoomarea")) { s_zoomAreaField = fi; break; }
+            if (s_zoomAreaField == null) return null;
+            var za = s_zoomAreaField.GetValue(view);
+            if (za == null) return null;
+            if (!s_zoomFieldsResolved)
+            {
+                s_zoomFieldsResolved = true;
+                for (var t = za.GetType(); t != null; t = t.BaseType)
+                    foreach (var fi in t.GetFields(BindingFlags.Instance | BindingFlags.Public |
+                                                   BindingFlags.NonPublic | BindingFlags.DeclaredOnly))
+                    {
+                        if (fi.FieldType != typeof(Vector2)) continue;
+                        if (s_zoomScaleField == null && fi.Name.ToLowerInvariant().Contains("scale"))
+                            s_zoomScaleField = fi;
+                        if (s_zoomTransField == null && fi.Name.ToLowerInvariant().Contains("translation"))
+                            s_zoomTransField = fi;
+                    }
+                if (s_zoomScaleField == null || s_zoomTransField == null)
+                    Debug.Log("[DisplayXR] GVFIT zoom fields: scale=" +
+                              (s_zoomScaleField != null ? s_zoomScaleField.Name : "MISSING") +
+                              " trans=" + (s_zoomTransField != null ? s_zoomTransField.Name : "MISSING"));
+            }
+            return za;
+        }
+
+        /// <summary>(#459) The view's zoom (GameView.m_ZoomArea.m_Scale). False when it cannot be read.</summary>
+        internal static bool TryGetGameViewZoom(object view, out Vector2 zoom)
+        {
+            zoom = default;
+            try
+            {
+                if (s_gvType == null) s_gvType = System.Type.GetType("UnityEditor.GameView,UnityEditor");
+                var za = ZoomAreaOf(view);
+                if (za == null || s_zoomScaleField == null) return false;
+                zoom = (Vector2)s_zoomScaleField.GetValue(za);
+                return zoom.x > 0f && zoom.y > 0f;
+            }
+            catch { return false; }
+        }
+
+        /// <summary>
+        /// (#459) Undo everything GVFIT wrote, on every Game view: scale.y back to scale.x
+        /// (Unity's zoom is uniform), a "nudge:" translation back to what it was. Writes
+        /// nothing on a view that is already uniform, so it is safe to call at any time, in
+        /// or out of Play, and as often as wanted. Returns how many views it changed.
+        /// </summary>
+        internal static int RestoreGameViewFit()
+        {
+            int changed = 0;
+            try
+            {
+                if (s_gvType == null) s_gvType = System.Type.GetType("UnityEditor.GameView,UnityEditor");
+                if (s_gvType == null) return 0;   // a built player
+                var wins = Resources.FindObjectsOfTypeAll(s_gvType);
+                if (wins == null) return 0;
+                foreach (var w in wins)
+                {
+                    try
+                    {
+                        var za = ZoomAreaOf(w);
+                        if (za == null) continue;
+                        if (s_zoomScaleField != null)
+                        {
+                            var sc = (Vector2)s_zoomScaleField.GetValue(za);
+                            float y = DisplayXRGameViewPlacement.RestoredZoomY(sc.x);
+                            if (sc.x > 0f && sc.y > 0f && Mathf.Abs(sc.y - y) > 1e-6f)
+                            { sc.y = y; s_zoomScaleField.SetValue(za, sc); changed++; }
+                        }
+                        if (s_fitNudgeOrig != null && s_zoomTransField != null &&
+                            s_fitNudgeOrig.TryGetValue(w.GetInstanceID(), out float origY))
+                        {
+                            var tr = (Vector2)s_zoomTransField.GetValue(za);
+                            tr.y = origY; s_zoomTransField.SetValue(za, tr); changed++;
+                        }
+                    }
+                    catch { /* one view's internals: try the others */ }
+                }
+                if (s_fitNudgeOrig != null) s_fitNudgeOrig.Clear();
+                s_lastFitLog = null;
+            }
+            catch { }
+            return changed;
+        }
+
         static void ApplyGameViewFit()
         {
             if (!ProbeEnabled() || s_gvType == null) return;
@@ -730,31 +901,9 @@ namespace DisplayXR
             {
                 try
                 {
-                    if (s_zoomAreaField == null)
-                        for (var t = s_gvType; t != null && s_zoomAreaField == null; t = t.BaseType)
-                            foreach (var fi in t.GetFields(BindingFlags.Instance | BindingFlags.Public |
-                                                           BindingFlags.NonPublic | BindingFlags.DeclaredOnly))
-                                if (fi.Name.ToLowerInvariant().Contains("zoomarea")) { s_zoomAreaField = fi; break; }
+                    var za = ZoomAreaOf(w);
                     if (s_zoomAreaField == null) return;
-                    var za = s_zoomAreaField.GetValue(w);
                     if (za == null) continue;
-                    if (!s_zoomFieldsResolved)
-                    {
-                        s_zoomFieldsResolved = true;
-                        for (var t = za.GetType(); t != null; t = t.BaseType)
-                            foreach (var fi in t.GetFields(BindingFlags.Instance | BindingFlags.Public |
-                                                           BindingFlags.NonPublic | BindingFlags.DeclaredOnly))
-                            {
-                                if (fi.FieldType != typeof(Vector2)) continue;
-                                if (s_zoomScaleField == null && fi.Name.ToLowerInvariant().Contains("scale"))
-                                    s_zoomScaleField = fi;
-                                if (s_zoomTransField == null && fi.Name.ToLowerInvariant().Contains("translation"))
-                                    s_zoomTransField = fi;
-                            }
-                        Debug.Log("[DisplayXR] GVFIT zoom fields: scale=" +
-                                  (s_zoomScaleField != null ? s_zoomScaleField.Name : "MISSING") +
-                                  " trans=" + (s_zoomTransField != null ? s_zoomTransField.Name : "MISSING"));
-                    }
 
                     // (#459) The view showing the whole-pixel size is drawn texel for pixel at
                     // zoom 1 (the editor side snapped it): no fit, and none of the overrides.
@@ -773,28 +922,21 @@ namespace DisplayXR
                     if (s_fitSpec == "scale" && s_zoomScaleField != null)
                     {
                         // dest is 0.5 px short of the RT: stretch y so dest rows == RT rows.
-                        // Resolve the GameView's RenderTexture fields here if the GVGEOM
-                        // logger (which also builds this list) isn't enabled — the seam fix
-                        // must not depend on a diagnostic env (it silently no-ops otherwise:
-                        // rt stays null and the seam returns on maximized/floating layouts).
-                        if (s_rtFields == null)
-                        {
-                            s_rtFields = new System.Collections.Generic.List<FieldInfo>();
-                            var rtFlags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
-                            for (var t = s_gvType; t != null; t = t.BaseType)
-                                foreach (var fi in t.GetFields(rtFlags | BindingFlags.DeclaredOnly))
-                                    if (fi.FieldType == typeof(RenderTexture)) s_rtFields.Add(fi);
-                        }
-                        RenderTexture rt = null;
-                        if (s_rtFields != null)
-                            foreach (var rfi in s_rtFields)
-                                if (rfi.GetValue(w) is RenderTexture r && r != null) { rt = r; break; }
-                        if (rt == null || rt.height <= 1) continue;
-                        float target = rt.height / (rt.height - 0.5f);
+                        // The texture is found without the GVGEOM logger: the seam fix must
+                        // not depend on a diagnostic env.
                         var sc = (Vector2)s_zoomScaleField.GetValue(za);
+                        if (!(sc.x > 0f) || !(sc.y > 0f)) continue;
+                        bool zoomOne = DisplayXRGameViewPlacement.IsZoomOne(sc.x);
+                        RenderTexture rt = FirstGameViewRt(w);
+                        // At zoom 1 without a texture (a realloc transient): leave it as it is.
+                        if (zoomOne && (rt == null || rt.height <= 1)) continue;
+                        // (#459) Valid at zoom 1 only; at any other zoom this is scale.x.
+                        float target = DisplayXRGameViewPlacement.FitZoomY(sc.x, rt != null ? rt.height : 0);
                         if (Mathf.Abs(sc.y - target) > 1e-6f)
                         { sc.y = target; s_zoomScaleField.SetValue(za, sc); }
-                        applied = $"scale.y={target:F7} (rt={rt.width}x{rt.height})";
+                        applied = zoomOne
+                            ? $"scale.y={target:F7} (rt={rt.width}x{rt.height})"
+                            : "not applied: the Game view's zoom is not 1 (scale.y kept equal to scale.x)";
                     }
                     else if (s_fitSpec.StartsWith("nudge:") && s_zoomTransField != null)
                     {
@@ -802,20 +944,23 @@ namespace DisplayXR
                             System.Globalization.CultureInfo.InvariantCulture);
                         var tr = (Vector2)s_zoomTransField.GetValue(za);
                         if (Mathf.Abs(tr.y - pt) > 1e-6f)
-                        { tr.y = pt; s_zoomTransField.SetValue(za, tr); }
+                        {
+                            // Remember what Unity had, for RestoreGameViewFit.
+                            if (s_fitNudgeOrig == null) s_fitNudgeOrig = new System.Collections.Generic.Dictionary<int, float>();
+                            int id = w.GetInstanceID();
+                            if (!s_fitNudgeOrig.ContainsKey(id)) s_fitNudgeOrig[id] = tr.y;
+                            tr.y = pt; s_zoomTransField.SetValue(za, tr);
+                        }
                         applied = $"trans.y={pt:F3}pt";
                     }
                     else if (s_fitSpec == "off")
                     {
                         if (s_zoomScaleField != null)
                         {
+                            // (#459) Uniform again: y = x, not 1 (the view may be zoomed).
                             var sc = (Vector2)s_zoomScaleField.GetValue(za);
-                            if (Mathf.Abs(sc.y - 1f) > 1e-6f) { sc.y = 1f; s_zoomScaleField.SetValue(za, sc); }
-                        }
-                        if (s_zoomTransField != null)
-                        {
-                            var tr = (Vector2)s_zoomTransField.GetValue(za);
-                            if (Mathf.Abs(tr.y) > 1e-6f) { tr.y = 0f; s_zoomTransField.SetValue(za, tr); }
+                            float y = DisplayXRGameViewPlacement.RestoredZoomY(sc.x);
+                            if (sc.x > 0f && sc.y > 0f && Mathf.Abs(sc.y - y) > 1e-6f) { sc.y = y; s_zoomScaleField.SetValue(za, sc); }
                         }
                         applied = "off (restored)";
                     }
@@ -1362,12 +1507,13 @@ namespace DisplayXR
         {
             public int RtW, RtH, CanvasW, CanvasH, AnchorDx, AnchorDy;
             public float TargetW, TargetH, ZoomX, ZoomY, Scale, BorderPt;
-            public bool WholePixel, HaveZoom;
+            public bool WholePixel, HaveZoom, Degraded;
             public bool Same(in OneToOneKey o) =>
                 RtW == o.RtW && RtH == o.RtH && CanvasW == o.CanvasW && CanvasH == o.CanvasH
                 && AnchorDx == o.AnchorDx && AnchorDy == o.AnchorDy
                 && TargetW == o.TargetW && TargetH == o.TargetH && ZoomX == o.ZoomX && ZoomY == o.ZoomY
-                && Scale == o.Scale && BorderPt == o.BorderPt && WholePixel == o.WholePixel && HaveZoom == o.HaveZoom;
+                && Scale == o.Scale && BorderPt == o.BorderPt && WholePixel == o.WholePixel && HaveZoom == o.HaveZoom
+                && Degraded == o.Degraded;
         }
         static OneToOneKey s_o2oPend, s_o2oLogged;
         static bool   s_o2oHavePend, s_o2oHaveLogged;
@@ -1417,15 +1563,11 @@ namespace DisplayXR
                     Scale = DisplayXRGameViewPlacement.SnappedScale(s_diagPane.PtToPx),
                     BorderPt = s_diagPane.HaveLeftBorder ? s_diagPane.LeftBorderPt : -1f,
                     WholePixel = s_diagPane.WholePixelFixedSize,
+                    Degraded = GameViewDegraded,
                 };
-                if (s_zoomAreaField != null && s_zoomScaleField != null)
+                if (TryGetGameViewZoom(s_matchedGameView, out Vector2 sc))
                 {
-                    var za = s_zoomAreaField.GetValue(s_matchedGameView);
-                    if (za != null)
-                    {
-                        var sc = (Vector2)s_zoomScaleField.GetValue(za);
-                        key.ZoomX = sc.x; key.ZoomY = sc.y; key.HaveZoom = true;
-                    }
+                    key.ZoomX = sc.x; key.ZoomY = sc.y; key.HaveZoom = true;
                 }
 
                 // Settle: the same hold as the size push, so a splitter drag logs once.
@@ -1499,11 +1641,17 @@ namespace DisplayXR
                 }
                 catch { /* raw rects are a courtesy; the verdict above does not use them */ }
                 if (key.WholePixel) sb.Append(" [whole-pixel size]");
+                if (key.Degraded)
+                    sb.Append(s_gvScaled ? " [zoom is not 1: cannot be 1:1 - picture shown scaled, no calibration]"
+                                         : " [computed anchor was off the pane: anchored on the render area, no calibration]");
                 // Undocked = PRESENT mode: the runtime presents its own window over the pane, so
                 // how Unity draws the texture underneath is not what reaches the panel.
                 if (!s_lastAppliedDocked) sb.Append(" [present mode: covered by the weave window, no warning]");
                 Debug.Log("[DisplayXR] GameView 1:1: " + sb);
                 if (!s_lastAppliedDocked) return;
+                // (#459) A zoomed view: the single "cannot be shown 1:1" warning says it all;
+                // the per-condition warnings below would each repeat it.
+                if (key.Degraded) return;
 
                 // WARNINGS: only for conditions that are certain from values read back from
                 // Unity (the real texture, the target, the zoom, the window DPI), and once per
@@ -1571,6 +1719,7 @@ namespace DisplayXR
         {
             px = py = pw = ph = 0; dbg = null;
             s_diagValid = false;   // (#459) set again by the matched path below
+            s_gvScaled = s_gvOffPane = false;
             if (s_gvType == null)
             {
                 s_gvType = System.Type.GetType("UnityEditor.GameView,UnityEditor");
@@ -1842,6 +1991,14 @@ namespace DisplayXR
                         // that shows the opt-in whole-pixel size.
                         pane.HaveLeftBorder = TryGetMatchedLeftBorderPt(host, out pane.LeftBorderPt);
                         pane.WholePixelFixedSize = SameLiveObject(s_matchedGameView, WholePixelView);
+                        // (#459) The view's zoom, in docked (texture) mode only: there Unity's
+                        // own draw is what reaches the panel, so a zoom other than 1 cannot be
+                        // 1:1 and the zoom-1 arithmetic below does not describe it. A floating
+                        // view is covered by the runtime's own window (present mode) and keeps
+                        // the letterbox placement it always had.
+                        s_diagZoom = default;
+                        if (s_lastAppliedDocked && TryGetGameViewZoom(s_matchedGameView, out s_diagZoom))
+                            pane.ZoomX = s_diagZoom.x;
                         s_diagPane = pane;
                         s_diagTargetWPx = size.x * sizeScale;
                         s_diagTargetHPx = size.y * sizeScale;
@@ -1865,6 +2022,16 @@ namespace DisplayXR
                         int centY = pane.DockedNonMaximized
                             ? RtCentringOffsetY(Mathf.Min(rtH, rh), ptToPx, pch) : 0;
                         DisplayXRGameViewPlacement.Place(pane, centX, centY, out rx, out ry, out rw, out rh);
+                        // (#459) Degraded, not black: a zoomed view was placed by PlaceScaled
+                        // (inside the render area); and whatever the cause, an anchor that
+                        // comes out off the pane is replaced by the render area.
+                        s_gvScaled = DisplayXRGameViewPlacement.IsScaledView(pane.ZoomX);
+                        if (s_lastAppliedDocked)
+                        {
+                            int bx = rx, by = ry;
+                            if (!DisplayXRGameViewPlacement.KeepInsidePane(pane, ref rx, ref ry, ref rw, ref rh))
+                            { s_gvOffPane = true; s_gvOffPaneDx = bx - pane.Left; s_gvOffPaneDy = by - pane.Top; }
+                        }
                     }
                 }
             }
@@ -2292,6 +2459,17 @@ namespace DisplayXR
                 DisplayXRGameViewCalibrator.Abort();
                 return;
             }
+            if (s_diagValid && GameViewDegraded)
+            {
+                // (#459) Zoomed (or the anchor was off the pane): the marker cannot be decoded
+                // under scaling, so it is not shown at all. The computed rect is the answer.
+                s_calLastValid = false;
+                DisplayXRGameViewCalibrator.Abort();
+                s_imgX = px - s_panePhysWin.left; s_imgY = py - s_panePhysWin.top;
+                s_imgW = pw; s_imgH = ph; s_imgMeasured = false;
+                s_imgRectFrame = Time.frameCount;
+                return;
+            }
             if (!s_diagValid)
             {
                 // A transient reading: the glue handed back its last good rect. Keep the
@@ -2393,6 +2571,7 @@ namespace DisplayXR
             // (#459) Is the Game view drawn texel for pixel? Log-only; before the nudge so the
             // logged anchor is the computed one.
             LogGameViewOneToOneOnChange(px, py, pw, ph);
+            WarnGameViewDegradedOnce();   // (#459) one warning when the view cannot be 1:1
             // (#459) Where the image really is: once the layout has settled a marker is read
             // back from the screen and the anchor goes to the MEASURED origin; the computed
             // one above stays as the fallback. The nudge below still applies on top.

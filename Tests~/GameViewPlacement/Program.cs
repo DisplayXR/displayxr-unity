@@ -153,6 +153,102 @@ static class Program
     // What the glue computes today: Mathf.RoundToInt, i.e. halves to even.
     static int GlueRt(double targetPx) => (int)Math.Round(targetPx, MidpointRounding.ToEven);
 
+    // (#459) A zoomed Game view: what GVFIT may write, the degraded placement, the takeover.
+    // The geometry is the hardware session of 2026-11-18 (175 %, docked, the view on
+    // "4K UHD" 3840x2160 fitted at 0.2786 into a 641.43 x 343.86 pt area): the log read
+    // zoom=(0.278587967,1.0002315), anchor at pane +28,+-700, a black weave.
+    static void ZoomedView()
+    {
+        const float Fit4K = 0.278587967f;
+        float fitRow(int h) => h / (h - 0.5f);
+
+        // -- GVFIT's decision: valid at zoom 1 only, never anisotropic otherwise.
+        Check(DisplayXRGameViewPlacement.IsZoomOne(1f) && DisplayXRGameViewPlacement.IsZoomOne(1.00005f)
+              && !DisplayXRGameViewPlacement.IsZoomOne(1.0002315f) && !DisplayXRGameViewPlacement.IsZoomOne(Fit4K)
+              && !DisplayXRGameViewPlacement.IsZoomOne(2f) && !DisplayXRGameViewPlacement.IsZoomOne(0f),
+              "IsZoomOne: 1 is 1; GVFIT's own 1.0002 stretch, 0.2786, 2 and 0 are not");
+        Check(!DisplayXRGameViewPlacement.IsScaledView(0f) && !DisplayXRGameViewPlacement.IsScaledView(1f)
+              && DisplayXRGameViewPlacement.IsScaledView(Fit4K) && DisplayXRGameViewPlacement.IsScaledView(2.747999f),
+              "IsScaledView: an unknown zoom (0) is treated as 1");
+        Check(DisplayXRGameViewPlacement.FitZoomY(1f, 860) == fitRow(860) && DisplayXRGameViewPlacement.FitZoomY(1f, 2160) == fitRow(2160),
+              "GVFIT at zoom 1: rows / (rows - 0.5), as before");
+        Check(DisplayXRGameViewPlacement.FitZoomY(Fit4K, 2160) == Fit4K,
+              "GVFIT on the hardware case (4K at 0.2786): scale.y = scale.x, not 1.0002");
+        Check(DisplayXRGameViewPlacement.FitZoomY(2f, 860) == 2f && DisplayXRGameViewPlacement.FitZoomY(2.747999f, 860) == 2.747999f,
+              "GVFIT with the Scale slider at 2x / 2.75x (250 % logs): scale.y = scale.x");
+        Check(DisplayXRGameViewPlacement.FitZoomY(1f, 0) == 1f && DisplayXRGameViewPlacement.FitZoomY(1f, 1) == 1f,
+              "GVFIT without a texture: uniform");
+        foreach (float zx in new[] { 0.1f, 0.25f, Fit4K, 0.5f, 0.999f, 1.001f, 1.5f, 2f, 2.747999f, 5f, 12.5f })
+            foreach (int rows in new[] { 0, 1, 2, 595, 860, 1080, 2160, 4320 })
+                Check(DisplayXRGameViewPlacement.FitZoomY(zx, rows) == zx, $"GVFIT never makes zoom {zx:R} anisotropic ({rows} rows)");
+        foreach (int rows in new[] { 2, 595, 860, 1080, 2160 })
+        {
+            float fy = DisplayXRGameViewPlacement.FitZoomY(1f, rows);
+            Check(fy > 1f && fy < 1.5f && Math.Abs(rows / (double)fy - (rows - 0.5)) < 1e-3, $"GVFIT at zoom 1, {rows} rows: the fit");
+        }
+        // What is put back afterwards is Unity's uniform zoom, whatever was written.
+        Check(DisplayXRGameViewPlacement.RestoredZoomY(1f) == 1f, "restore after the fit: scale.y = 1");
+        Check(DisplayXRGameViewPlacement.RestoredZoomY(Fit4K) == Fit4K && DisplayXRGameViewPlacement.RestoredZoomY(2f) == 2f,
+              "restore of a zoomed view (the stretched zoom the old code left in the layout): scale.y = scale.x");
+
+        // -- The hardware pane. Host 643.43 x 390.86 pt at 1.75 = 1126 x 684 px.
+        var g = new Geo { Name = "175% docked 4K fitted", L = 627, T = 186, W = 1126, H = 684, Hw = 1126 / 1.75f, Hh = 684 / 1.75f,
+                          RtW = 3840, RtH = 2160, Scale = 1.75f, Target = 2160f };
+        var p = PaneOf(g);
+        int areaTop = p.Top + p.ToolbarPx, areaH = p.ClientH - p.ToolbarPx;
+
+        // Without the zoom (what ran on hardware): the zoom-1 arithmetic centres the UNSCALED
+        // 2160 px target and puts the anchor far above the pane.
+        DisplayXRGameViewPlacement.Place(p, 0, 0, out int ox, out int oy, out int ow, out int oh);
+        Check(oy - p.Top < -600 && oy - p.Top > -800 && ow == 1070 && oh == 602,
+              $"{g.Name}: REGRESSION PIN - the zoom-1 path puts the anchor at pane +{ox - p.Left},+{oy - p.Top} {ow}x{oh} (hardware logged +28,+-700 1070x602)");
+        int kx = ox, ky = oy, kw = ow, kh = oh;
+        Check(!DisplayXRGameViewPlacement.KeepInsidePane(p, ref kx, ref ky, ref kw, ref kh)
+              && kx == p.Left && ky == areaTop && kw == p.ClientW && kh == areaH,
+              $"{g.Name}: an anchor off the pane is replaced by the render area");
+
+        // With the zoom: the scaled picture, centred, inside the render area.
+        p.ZoomX = Fit4K;
+        DisplayXRGameViewPlacement.Place(p, 0, 0, out int x, out int y, out int w, out int h);
+        Check(w == 1070 && h == 602, $"{g.Name}: scaled size {w}x{h} == 3840x2160 x 0.2786 (1070x602, the logged canvas)");
+        Check(x >= p.Left && y >= areaTop && x + w <= p.Left + p.ClientW && y + h <= areaTop + areaH,
+              $"{g.Name}: scaled anchor pane +{x - p.Left},+{y - p.Top} lies inside the render area");
+        Check(x - p.Left == (1126 - 1070) / 2 && y - areaTop == (areaH - 602) / 2, $"{g.Name}: scaled picture is centred");
+        int ix = x, iy = y, iw = w, ih = h;
+        Check(DisplayXRGameViewPlacement.KeepInsidePane(p, ref ix, ref iy, ref iw, ref ih) && ix == x && iy == y && iw == w && ih == h,
+              $"{g.Name}: the scaled anchor is kept as it is");
+
+        // Zoom above 1 (Free Aspect, Scale slider at 2x): a crop that fills the area.
+        var g2 = new Geo { Name = "250% docked Free", L = 1017, T = 293, W = 1733, H = 977, Hw = 1733 / 2.5f, Hh = 977 / 2.5f,
+                           RtW = 1728, RtH = 860, Scale = 2.5f, Target = 859.5f };
+        var p2 = PaneOf(g2);
+        p2.ZoomX = 2f;
+        DisplayXRGameViewPlacement.Place(p2, 3, 0, out x, out y, out w, out h);
+        Check(x == p2.Left && y == p2.Top + p2.ToolbarPx && w == p2.ClientW && h == p2.ClientH - p2.ToolbarPx,
+              $"{g2.Name} at 2x: the anchor is the whole render area ({w}x{h})");
+
+        // Zoom 1, or unknown: nothing changes (the 250 % reference still lands on (1020,406)).
+        foreach (float zx in new[] { 0f, 1f })
+        {
+            p2.ZoomX = zx;
+            DisplayXRGameViewPlacement.Place(p2, 3, 0, out x, out y, out w, out h);
+            Check(x == 1020 && y == 406 && w == 1728 && h == 860, $"{g2.Name} zoom {zx}: reference placement ({x},{y} {w}x{h}) unchanged");
+            int ux = x, uy = y, uw = w, uh = h;
+            Check(DisplayXRGameViewPlacement.KeepInsidePane(p2, ref ux, ref uy, ref uw, ref uh) && ux == x && uy == y,
+                  $"{g2.Name} zoom {zx}: the reference anchor counts as inside the pane");
+        }
+
+        // -- The takeover decision.
+        Check(DisplayXRGameViewPlacement.TakeoverFor(1f, 1f) == DisplayXRGameViewPlacement.Takeover.None
+              && DisplayXRGameViewPlacement.TakeoverFor(0f, 0.3f) == DisplayXRGameViewPlacement.Takeover.None,
+              "takeover: zoom 1 (or unknown) is left alone");
+        Check(DisplayXRGameViewPlacement.TakeoverFor(Fit4K, Math.Min(1122.5f / 3840, 601.75f / 2160)) == DisplayXRGameViewPlacement.Takeover.FreeAspect,
+              "takeover: 4K in a 1122x602 px area cannot be shown at 1x -> Free Aspect");
+        Check(DisplayXRGameViewPlacement.TakeoverFor(2f, 1f) == DisplayXRGameViewPlacement.Takeover.SnapZoom
+              && DisplayXRGameViewPlacement.TakeoverFor(0.5f, 1.4f) == DisplayXRGameViewPlacement.Takeover.SnapZoom,
+              "takeover: Free Aspect at 2x, or a fixed size that fits -> zoom 1, the size is kept");
+    }
+
     static void WholePixelDefinitions()
     {
         // The step: the smallest number of points that is EXACTLY a whole number of pixels.
@@ -623,6 +719,7 @@ static class Program
             Pinned(g, ex, ey, rtW, rtH);
         }
 
+        ZoomedView();
         WholePixelDefinitions();
         ModelConsistency();
 
