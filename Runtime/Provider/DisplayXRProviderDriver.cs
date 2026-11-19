@@ -2296,8 +2296,13 @@ namespace DisplayXR
             {
                 // A transient reading: the glue handed back its last good rect. Keep the
                 // anchor that rect had, so a measured anchor does not jump for one frame.
+                // The image rect of that frame is still the one in use: keep it current, so
+                // TryGetGameViewImageRect answers what the anchor is placed with (#471).
                 if (s_calLastValid && px == s_calLastInX && py == s_calLastInY && pw == s_calLastW && ph == s_calLastH)
-                { px = s_calLastOutX; py = s_calLastOutY; }
+                {
+                    px = s_calLastOutX; py = s_calLastOutY;
+                    if (s_imgRectFrame >= 0) s_imgRectFrame = Time.frameCount;
+                }
                 return;
             }
             var layout = new DisplayXRGameViewCalibrator.Layout
