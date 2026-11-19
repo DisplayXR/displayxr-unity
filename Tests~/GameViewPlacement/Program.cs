@@ -40,6 +40,32 @@ static class Program
         else { s_fail++; Console.WriteLine("FAIL " + what); }
     }
 
+    // (#471) The phase source appended to the "GameView 1:1:" line: which of the texture target
+    // rect and the anchor window phases the weave, from the native state (unit test of the text,
+    // not a hardware pin).
+    static void PhaseSource()
+    {
+        string P(bool chained, int why, uint flags, bool reported, bool matched, int mismatch) =>
+            DisplayXRGameViewPlacement.PhaseSourceText(chained, why, flags, reported, matched, mismatch, 1020, 406, 1021, 406);
+        Check(P(true, 0, DisplayXRGameViewPlacement.TargetStateWindowlessPhase, true, true, 0)
+              == "texture target rect, WINDOWLESS_PHASE | woven origin 1020,406 (= requested)", "phase: windowless, as requested");
+        Check(P(true, 0, DisplayXRGameViewPlacement.TargetStateWindowlessPhase, true, true, 1)
+              == "texture target rect, WINDOWLESS_PHASE | woven origin 1020,406 but requested 1021,406 (DIFFERS)", "phase: windowless, origin differs");
+        Check(P(true, 0, DisplayXRGameViewPlacement.TargetStateWindowlessPhase | DisplayXRGameViewPlacement.TargetStateClamped, true, true, 4)
+              .StartsWith("texture target rect, WINDOWLESS_PHASE CLAMPED |"), "phase: clamped is named");
+        Check(P(true, 0, DisplayXRGameViewPlacement.TargetStateWindowlessPhase, false, false, 0)
+              == "texture target rect, WINDOWLESS_PHASE | nothing woven yet", "phase: before the first weave");
+        Check(P(true, 0, DisplayXRGameViewPlacement.TargetStateAnchorFallback, true, true, 0).StartsWith("anchor window (runtime ANCHOR_FALLBACK"),
+              "phase: the runtime fell back to the anchor");
+        // A session that ignores the binding (D3D12 today): no flags, nothing reported.
+        Check(P(true, 0, 0, false, false, 0) == "anchor window (the runtime did not bind the texture target)", "phase: binding ignored");
+        Check(P(false, 4, 0, false, false, 0) == "anchor window (texture target not chained: the runtime predates XR_DXR_win32_window_binding 9)",
+              "phase: older runtime");
+        Check(P(false, 2, 0, false, false, 0).Contains("DISPLAYXR_PROV_TEXTURE_TARGET=0"), "phase: opt-out");
+        for (int why = 1; why <= 9; why++)
+            Check(P(false, why, 0xFF, true, true, 7).StartsWith("anchor window (texture target not chained: "), "phase: not chained is always the anchor (" + why + ")");
+    }
+
     struct Geo
     {
         public string Name; public int L, T, W, H; public float Hw, Hh; public int RtW, RtH; public bool Max;
@@ -1112,6 +1138,7 @@ static class Program
         OwnerStateMachine();
         WholePixelDefinitions();
         ModelConsistency();
+        PhaseSource();
 
         Console.WriteLine($"GameViewPlacement: {s_pass} passed, {s_fail} failed");
         Environment.Exit(s_fail == 0 ? 0 : 1);

@@ -255,6 +255,50 @@ namespace DisplayXR
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern int displayxr_host_drag_active();
 
+        /// <summary><see cref="dxr_prov_set_texture_target_rect"/>: a rect is given. Without
+        /// it the target is CLEARED - absence is never inferred from zeros ((0,0) is a
+        /// legitimate offset).</summary>
+        public const uint TextureTargetRectValid = 0x1;
+        /// <summary>The rect was measured on screen, not computed (diagnostic only).</summary>
+        public const uint TextureTargetRectMeasured = 0x2;
+
+        /// <summary>
+        /// (#471, runtime ADR-060) Where the woven texture is drawn, for the runtime's
+        /// texture target binding (<c>XR_DXR_win32_window_binding</c> spec 9). THE one
+        /// entry point for it: whatever knows where the image lands feeds this (today the
+        /// computed Game view placement; an on-screen measurement can feed it later).
+        /// <paramref name="x"/>, <paramref name="y"/> = where the texture's texel (0,0) is
+        /// drawn, in <paramref name="paneHwnd"/>'s CLIENT area, physical px, y down;
+        /// <paramref name="w"/>, <paramref name="h"/> = the size it is drawn at, physical px.
+        /// Native resolves the pane's top-level window and the rect in that window's client
+        /// area under per-monitor-v2 awareness, so no desktop coordinate crosses this
+        /// boundary. Push before the session starts and every frame the placement is known;
+        /// the last value survives a session restart. Windows-only effect.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void dxr_prov_set_texture_target_rect(
+            System.IntPtr paneHwnd, int x, int y, int w, int h, uint flags);
+
+        /// <summary>Mirror of the native <c>DxrTextureTargetState</c> (15 x 4 bytes, field for
+        /// field). Codes and bits: <see cref="DisplayXRGameViewPlacement.PhaseSourceText"/>.</summary>
+        [StructLayout(LayoutKind.Sequential)]
+        public struct DxrTextureTargetState
+        {
+            public int chained, whyNot, reported;
+            public uint flags;
+            public int wovenX, wovenY, requestedX, requestedY, matched, mismatch;
+            public int rectX, rectY, rectW, rectH;
+            public int windowlessPredicted;
+        }
+
+        /// <summary>
+        /// (#471) What the runtime did with the texture target on the live session: whether
+        /// the binding was chained (and why not), the phase source the runtime reported, and
+        /// the origin it wove at against the requested one. Diagnostic. Returns 1 when chained.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int dxr_prov_get_texture_target_state(out DxrTextureTargetState state);
+
         /// <summary>
         /// (#459) Game-view calibration marker: 1 = for the next <paramref name="maxMs"/> ms the
         /// native mirror blit draws the position-coded marker

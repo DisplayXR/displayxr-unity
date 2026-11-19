@@ -1596,7 +1596,12 @@ namespace DisplayXR
             public int RtW, RtH, CanvasW, CanvasH, AnchorDx, AnchorDy;
             public float TargetW, TargetH, ZoomX, ZoomY, Scale, BorderPt;
             public bool WholePixel, HaveZoom, Degraded;
+            // (#471) The texture target's phase source: chained / why not / runtime flags /
+            // mismatch, packed - a change of it logs a new line. Not the woven origin (it
+            // moves with the editor window).
+            public long Phase;
             public bool Same(in OneToOneKey o) =>
+                Phase == o.Phase &&
                 RtW == o.RtW && RtH == o.RtH && CanvasW == o.CanvasW && CanvasH == o.CanvasH
                 && AnchorDx == o.AnchorDx && AnchorDy == o.AnchorDy
                 && TargetW == o.TargetW && TargetH == o.TargetH && ZoomX == o.ZoomX && ZoomY == o.ZoomY
@@ -1653,6 +1658,23 @@ namespace DisplayXR
                     WholePixel = s_diagPane.WholePixelFixedSize,
                     Degraded = GameViewDegraded,
                 };
+                // (#471) What phases the weave: the texture target rect (runtime spec 9,
+                // windowless) or the anchor window. Read back from native, which reads it
+                // from the runtime each frame.
+                var tts = default(DisplayXRProviderNative.DxrTextureTargetState);
+                bool haveTts = false;
+                if (s_lastAppliedDocked && Application.platform == RuntimePlatform.WindowsEditor)
+                {
+                    try
+                    {
+                        DisplayXRProviderNative.dxr_prov_get_texture_target_state(out tts);
+                        haveTts = true;
+                        key.Phase = ((long)(tts.chained != 0 ? 1 : 0) << 60) | ((long)(tts.whyNot & 0xF) << 52)
+                                  | ((long)(tts.reported != 0 ? 1 : 0) << 48) | ((long)(tts.mismatch & 0xF) << 40)
+                                  | (tts.flags & 0xFFFFFFFFL);
+                    }
+                    catch (System.EntryPointNotFoundException) { /* older native binary */ }
+                }
                 if (TryGetGameViewZoom(s_matchedGameView, out Vector2 sc))
                 {
                     key.ZoomX = sc.x; key.ZoomY = sc.y; key.HaveZoom = true;
@@ -1728,6 +1750,10 @@ namespace DisplayXR
                         sb.Append(" viewInWindow=(").Append(viw.width.ToString("F3", inv)).Append('x').Append(viw.height.ToString("F3", inv)).Append(")pt");
                 }
                 catch { /* raw rects are a courtesy; the verdict above does not use them */ }
+                if (haveTts)
+                    sb.Append(" | phase source: ").Append(DisplayXRGameViewPlacement.PhaseSourceText(
+                        tts.chained != 0, tts.whyNot, tts.flags, tts.reported != 0, tts.matched != 0,
+                        tts.mismatch, tts.wovenX, tts.wovenY, tts.requestedX, tts.requestedY));
                 if (key.WholePixel) sb.Append(" [whole-pixel size]");
                 if (key.Degraded)
                     sb.Append(s_gvScaled ? " [zoom is not 1: cannot be 1:1 - picture shown scaled, no calibration]"
@@ -2454,6 +2480,7 @@ namespace DisplayXR
                 {
                     DisplayXRProviderNative.dxr_prov_set_external_weave_hwnd(s_hwndCorrHwnd);
                     DisplayXRProviderNative.dxr_prov_set_panel_rect(px - s_hwndCorrX, py - s_hwndCorrY, pw, ph);
+                    ClearTextureTargetRect(); // (#471) window-glue only
                     if (!s_loggedInitOnce)
                     {
                         s_loggedInitOnce = true;
@@ -2469,6 +2496,7 @@ namespace DisplayXR
                     // Pane rect relative to the monitor origin: window client (0,0) == monitor
                     // (mx,my), so the zone rect is monitor-local (== screen when mx,my == 0,0).
                     DisplayXRProviderNative.dxr_prov_set_panel_rect(px - mx, py - my, pw, ph);
+                    ClearTextureTargetRect(); // (#471) window-glue only
                     if (!s_loggedInitOnce)
                     {
                         s_loggedInitOnce = true;
@@ -2478,8 +2506,48 @@ namespace DisplayXR
                     return;
                 }
                 DisplayXRProviderNative.dxr_prov_set_initial_gameview_rect(px, py, pw, ph);
+                // (#471) The texture target binding is chained at session create and needs
+                // its first rect by then.
+                PushTextureTargetRect(px, py, pw, ph);
                 if (!s_loggedInitOnce) { s_loggedInitOnce = true; Debug.Log($"[DisplayXR] GameView initial rect: {dbg}"); }
             }
+        }
+
+        // (#471) Texture target (runtime ADR-060, XR_DXR_win32_window_binding spec 9): tell
+        // native where the woven texture's texel (0,0) is drawn and at what size. x,y are the
+        // SAME numbers the anchor window is placed with (the computed placement, the docked
+        // phase nudge included), expressed relative to the matched pane window - the same
+        // offset displayxr_set_pane_follow takes (the pane is a borderless child window, so
+        // its window origin is its client origin). It is a difference of two rects read in
+        // one space, so it is physical px whatever this process's DPI awareness; native adds
+        // the pane's and the top-level window's positions itself, under per-monitor-v2. No
+        // desktop coordinate crosses the boundary. (0,0) is a valid offset: absence is the
+        // missing Valid flag (ClearTextureTargetRect).
+        // Window-glue arrangement only: zone-glue and BINDPANE carry the pane offset in the
+        // zone rect, and under the binding zone rects are target-local.
+        // An on-screen measurement of where the image really lands (#459) can feed the same
+        // setter later, with TextureTargetRectMeasured.
+        static void PushTextureTargetRect(int px, int py, int pw, int ph)
+        {
+            if (Application.platform != RuntimePlatform.WindowsEditor) return;
+            try
+            {
+                if (s_hwndCorrValid && s_hwndCorrHwnd != System.IntPtr.Zero && pw > 0 && ph > 0
+                    && !BindPaneEnabled() && !ZoneGlueEnabled())
+                    DisplayXRProviderNative.dxr_prov_set_texture_target_rect(
+                        s_hwndCorrHwnd, px - s_hwndCorrX, py - s_hwndCorrY, pw, ph,
+                        DisplayXRProviderNative.TextureTargetRectValid);
+                // No pane matched this frame: keep the last rect. Native re-checks the pane's
+                // window every frame and sends nothing while it is gone.
+            }
+            catch (System.EntryPointNotFoundException) { /* older native binary */ }
+        }
+
+        static void ClearTextureTargetRect()
+        {
+            if (Application.platform != RuntimePlatform.WindowsEditor) return;
+            try { DisplayXRProviderNative.dxr_prov_set_texture_target_rect(System.IntPtr.Zero, 0, 0, 0, 0, 0); }
+            catch (System.EntryPointNotFoundException) { /* older native binary */ }
         }
 
         int m_LastGlueX = int.MinValue, m_LastGlueY, m_LastGlueW, m_LastGlueH;
@@ -2720,6 +2788,9 @@ namespace DisplayXR
             {
                 DisplayXRProviderNative.displayxr_set_pane_follow(
                     s_hwndCorrHwnd, px - s_hwndCorrX, py - s_hwndCorrY, pw, ph);
+                // (#471) The same numbers, every frame, for the texture target binding
+                // (nudge included: it moves the phase, never the picture - as with the anchor).
+                PushTextureTargetRect(px, py, pw, ph);
                 // (#740) New pane matched (layout reset replaced the GameView): drop the
                 // window-glue debounce so the next dxr_prov_set_gameview_rect push fires
                 // even if the new pane landed at the identical rect (the native side also
