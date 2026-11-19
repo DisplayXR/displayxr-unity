@@ -490,4 +490,14 @@ if(DISPLAYXR_BUILD_TESTS)
     target_compile_features(texture_target_test PRIVATE cxx_std_17)
     target_link_libraries(texture_target_test PRIVATE Threads::Threads)
     add_test(NAME texture_target COMMAND texture_target_test)
+
+    # Editor Game-view calibration marker (#459): the HLSL of the native mirror blit, rendered
+    # off screen on the software rasteriser and compared with the marker's definition.
+    if(WIN32)
+        add_executable(gvcal_shader_test tests/gvcal_shader_test.cpp)
+        target_include_directories(gvcal_shader_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/displayxr_xrprovider)
+        target_compile_features(gvcal_shader_test PRIVATE cxx_std_17)
+        target_link_libraries(gvcal_shader_test PRIVATE d3d11 d3dcompiler)
+        add_test(NAME gvcal_shader COMMAND gvcal_shader_test)
+    endif()
 endif()

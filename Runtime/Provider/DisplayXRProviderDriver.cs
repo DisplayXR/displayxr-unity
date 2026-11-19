@@ -416,6 +416,40 @@ namespace DisplayXR
             catch { }
         }
 
+        // (#459) A string kept until the editor quits (null where SessionState is not
+        // reachable): the Game-view calibration's measured layouts.
+        static MethodInfo s_sessGetString, s_sessSetString;
+        static bool s_sessStringResolved;
+        static void ResolveSessionStateString()
+        {
+            if (s_sessStringResolved) return;
+            s_sessStringResolved = true;
+            try
+            {
+                var ss = System.Type.GetType("UnityEditor.SessionState,UnityEditor");
+                if (ss == null) return;
+                var types = new[] { typeof(string), typeof(string) };
+                s_sessGetString = ss.GetMethod("GetString", BindingFlags.Static | BindingFlags.Public, null, types, null);
+                s_sessSetString = ss.GetMethod("SetString", BindingFlags.Static | BindingFlags.Public, null, types, null);
+            }
+            catch { }
+        }
+
+        internal static string SessionGetString(string key)
+        {
+            ResolveSessionStateString();
+            try { if (s_sessGetString != null) return (string)s_sessGetString.Invoke(null, new object[] { key, null }); }
+            catch { }
+            return null;
+        }
+
+        internal static void SessionSetString(string key, string value)
+        {
+            ResolveSessionStateString();
+            try { if (s_sessSetString != null) s_sessSetString.Invoke(null, new object[] { key, value ?? "" }); }
+            catch { }
+        }
+
         static bool FirstTimeThisEditorSession(string key)
         {
             key = "DisplayXR.Once." + key;

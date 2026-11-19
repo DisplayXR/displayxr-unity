@@ -165,9 +165,11 @@ phase from then on. Now:
 | the zoom is not 1 on a size that fits | set back to 1, twice; the third time it is the user's |
 | Play ends (also: domain reload, quit, the main view changes) | the pre-Play size, zoom and scroll come back, **whatever happened in between** |
 
-After every size change the layout key of the calibration changes, so the marker is shown
-and the anchor measured again once the layout has held 0.35 s. A resize therefore ends as:
-follow, settle, re-fit, re-measure, re-anchor.
+After every size change the layout key of the calibration changes, so the anchor is measured
+again once the layout has held 0.35 s **and the mouse button is up** - unless that layout was
+measured before in this editor session, in which case its origin is reused at once and no
+marker is shown. A resize therefore ends as: follow, settle, re-fit, re-measure (or reuse),
+re-anchor.
 
 **The restore is verified.** Selecting a size and setting a zoom in one call does not stick
 (read from the 6000.4.0f1 `GameView` / `ZoomableArea`): `SizeSelectionCallback` does nothing
@@ -248,21 +250,26 @@ is measured.
    rect inside the pane, the texture size, maximized or not, whole-pixel size or not, the scale.
    Where the pane sits on its monitor is not part of it (the image does not move inside its pane
    when the editor window moves).
-2. When that has differed from the calibrated layout and held for 0.35 s (the same settle clock
-   as the size push), the native mirror blit draws a **position-coded marker** instead of the
+2. A layout that differs from the calibrated one is first looked up among the layouts
+   **already measured in this editor session**. A hit is used at once: no marker, no screen
+   read (see [Measured layouts are remembered](#measured-layouts-are-remembered)).
+3. Otherwise, when it has held for 0.35 s (the same settle clock as the size push) and no
+   mouse button is down, the native mirror blit draws a **position-coded marker** over the
    woven image, into the same texture, through the same draw. It reaches the screen exactly
-   where the weave does.
-3. Once the marker has been drawn for two frames and 50 ms have passed, native code reads
-   **1-px strips of the screen** (GDI `BitBlt` from the screen DC, inside a per-monitor-v2
-   scope, physical px): a horizontal one a third (or two thirds) of the way down the image, then
-   a vertical one at the column the horizontal strip just located. Each read costs about 15 ms
-   (measured), so a clean strip ends the read; the second strip of each pair is only read when
-   the first is not clean.
-4. The strips are decoded. On success the marker comes down at once (typically well under
-   0.2 s after it went up), the anchor moves to the measured origin, and one line is logged.
-   The phase nudge (`dxr_phase_nudge.txt`) still applies on top.
-5. If nothing decodes within 0.3 s the marker comes down, the **computed position stays**, one
-   line says why, and the same layout is tried again after 2 s, three times in all.
+   where the weave does. The marker is drawn **only where it is read**: one horizontal strip
+   and one vertical strip, 13 px thick; the rest of the image keeps showing the scene (see
+   [Thin strips](#thin-strips)).
+4. As soon as the marker has been drawn once, native code reads **1-px strips of the screen**
+   (GDI `BitBlt` from the screen DC, inside a per-monitor-v2 scope, physical px): a horizontal
+   one through the horizontal strip, then a vertical one at the column the horizontal strip
+   just located. A read that comes before the marker is on screen says "no marker" and is
+   repeated on the next frame.
+5. The strips are decoded. On success the marker comes down at once, the anchor moves to the
+   measured origin, and one line is logged. The phase nudge (`dxr_phase_nudge.txt`) still
+   applies on top.
+6. If nothing decodes (0.15 s for thin strips that are drawn, 0.3 s otherwise) the marker
+   comes down, the **computed position stays**, one line says why, and the same layout is
+   tried again, three times in all (which marker each attempt draws: [Thin strips](#thin-strips)).
    The computed position is corrected by a **remembered offset** when there is one: where the
    image lands in its pane is Unity's rounding of a centred rect, a function of the scale, the
    margins around the image (pane minus image, per axis), where the computed rect sits in the
@@ -297,14 +304,136 @@ base-5 digits. A block read off the screen therefore names its own texel, and
 A clean `1:1` read cannot be produced by something covering the strip, so when the two strips of
 a pair disagree the clean one wins.
 
-**The log line** (one per calibration):
+### Thin strips
+
+The decoder only ever looks at one screen row and one screen column. So the marker is drawn
+only there (`DisplayXRGameViewCalibration.InMarker`, and the same test in the shader,
+`native~/displayxr_xrprovider/displayxr_gvcal_shader.h`):
+
+- a **horizontal strip** of 13 texture rows (6 on each side of the row that is read: one third
+  of the way down for pair 0, two thirds for pair 1), over the whole width;
+- a **vertical strip** of 13 texture columns in the middle of a row-coded band (near one third
+  of the width for pair 0, two thirds for pair 1), over the whole height.
+
+That is 3.3 % of a 1120x595 image; everything else is the woven scene. Inside a strip
+every texel shows exactly what the whole-image marker shows there, so a strip read off a thin
+marker is, pixel for pixel, the strip read off the whole-image one: **the decoder is unchanged
+and cannot tell them apart** (unit-tested: same origin, verdict, votes and coverage for every
+size seen on hardware).
+
+What the thickness is for: the horizontal strip is read at "computed top + row", so it is found
+while the **computed** top is within 6 px of the real one (measured errors so far: 0 to 2 px).
+Past that the read row shows the scene. A scene can never decode as a measurement - the
+verdict needs nearly every pixel across the width to show its own texel's colour - so that
+read says `no marker`, never a wrong origin, and the plan below draws the whole image next.
+The vertical strip is read at the column the horizontal strip just **measured**; a column
+dropped or doubled before it moves it by at most 4 px, inside the 6.
+
+Which marker each of the three attempts at a layout draws (`PlanStrip`):
+
+| Attempt | Draws |
+|---|---|
+| 1 | thin strips, pair 0 |
+| 2 | after a strip that was **partly covered**: thin strips, pair 1 (elsewhere on the image), 2 s later. After a strip that was drawn and showed **no marker**: the whole image, 0.2 s later, read on the other row first. After a marker that was **never drawn**: thin strips again, 2 s later |
+| 3 | the whole image (thin strips again if nothing was ever drawn) |
+
+So whatever the whole-image marker measured is still measured; it only comes second.
+`DISPLAYXR_PROV_GV_CALIB_FULL=1` draws the whole image on every attempt, as before this
+change (and measures every layout every time, so an A/B run shows the marker each time).
+
+### How long the marker is up
+
+Measured on a 60 Hz desktop (a read-only timing run, nothing drawn): a GDI screen read takes
+**one display refresh whatever its length** (1900x1: 16.6 ms; 1x1000: 16.8 ms; 1900x40:
+16.6 ms); two reads on two threads take two refreshes (they do not overlap); a rectangle costs
+more with its area (1900x1000: 33 ms; 3840x2160: 87 ms). One read cannot cover a full-width row
+and a full-height column except as their bounding rectangle, which is the whole image. So the
+floor is: the marker reaches the screen, plus one refresh per axis.
+
+Before, the marker also waited a fixed 50 ms and for two drawn frames before the first read.
+That is where "8-16 marker frames, 55-71 ms" came from: the count is native blits (an editor
+at 150 to 250 frames a second draws one every 4 to 7 ms), and the time is 50 ms of waiting plus
+the reads. Now nothing is waited for: the first read starts in the frame after the marker was
+first drawn; a read that is too early blocks for the refresh that had to pass anyway and is
+repeated (at most three in a row, then 30 ms apart, bounded by the time limit above). Expected,
+not measured on a panel: two or three display refreshes with the marker up - the one in which
+it appears and one read per axis. `DISPLAYXR_PROV_GV_CALIB_DELAY_MS=n` (0 to 250) waits `n` ms
+after the first marker frame before the first read, should a panel need it.
+
+### Measured layouts are remembered
+
+A clean measurement (both axes `1:1`) is kept for the editor session
+(`DisplayXRGameViewCalibration.LayoutCache`, stored as text in the editor's `SessionState`, so
+the domain reload of every Play does not empty it; 32 layouts, oldest out). When a layout comes
+up again its origin is used immediately, with no marker and no screen read.
+
+A wrong reuse is an inverted image and nothing on screen would catch it, so a hit requires
+**everything** to be identical:
+
+| Must be identical | Why |
+|---|---|
+| the pane window and its monitor (handles) | another pane, another display |
+| the pane's client size | Unity centres the image in it |
+| the pane's **position on the desktop** | not needed by the argument above (the image does not move inside its pane) but nothing verifies a reuse, so it is not assumed; it also covers a pane that moved inside its window |
+| the computed image rect relative to the pane (x, y, width, height) | carries the size selection, the toolbar, the letterbox, the borders |
+| maximized or not, whole-pixel size or not | the kind of size |
+| the display scale | Unity rounds by scale |
+| the size of the texture the mirror blit is drawing into **now** (read from native) against the size the marker was drawn into | the marker measured that texture |
+
+A zoom other than 1 is never calibrated at all, so it never enters the cache. A measurement
+that is not `1:1` is not stored (it is taken again next time, as before). The rule for the
+measurement *in use* is unchanged and deliberately looser: moving the editor window does not
+re-measure. After the move a restart finds no entry for the new position and measures once.
+`DISPLAYXR_PROV_GV_CALIB_CACHE=0` turns the reuse off.
+
+**A splitter drag.** While the size changes every frame nothing is shown (the 0.35 s settle
+clock restarts). A drag that *pauses* used to be measured at the pause and again after the next
+move; now a settled layout also waits for the mouse buttons to be up
+(`DisplayXRGameViewCalibration.Settled`), for at most 3 s, so a drag is measured once, after the
+release. Sizes that were measured before are reused during the drag, with no marker.
+
+**Play start.** Before: up to three markers - the fractional (Free Aspect) size, the
+whole-pixel size selected because the first was not 1:1, and the same layout again after the
+session restarted for the new size (a restart drops the measurement in use). Now:
+
+| | Markers |
+|---|---|
+| first Play of an editor session, fractional scale, whole-pixel size not yet on | two, both thin strips: the Free Aspect size (this is what finds "not 1:1" and turns the whole-pixel size on for the session), then the whole-pixel size. The restart after it reuses |
+| first Play, whole scale or whole-pixel size already on | one, thin strips |
+| every later Play with the same layout | none |
+
+The first measurement on the fractional size is kept: "not 1:1" is *measured*, not predicted
+(finding F1 is why the prediction is not trusted), and it is what decides that the whole-pixel
+size is needed at all. It now costs two thin strips instead of the whole image.
+
+### The log line
+
+One per calibration, and one per reuse (the same reuse is not logged again within 5 s; the
+frame counts and times below are illustrative). Everything up to `the anchor now uses the measured origin` is the format it always
+had; what was drawn, the reads and the cache state are appended:
 
 ```
 [DisplayXR] GameView calibration: measured image origin pane +1,+110 (screen 1501,1327), computed pane +2,+110
-  (measured - computed = -1,0 px) | W 1:1, H 1:1 | texture 1120x595 | 3 marker frames, 84 ms | the anchor now uses the measured origin
+  (measured - computed = -1,0 px) | W 1:1, H 1:1 | texture 1120x595 | 9 marker frames, 38 ms | the anchor now uses the measured origin
+  | marker strips h-row 198 v-col 384 13 px | reads 2, 33 ms after the first marker frame | cache miss (stored)
+[DisplayXR] GameView calibration: measured image origin pane +1,+110 (screen 1501,1327), computed pane +2,+110
+  (measured - computed = -1,0 px) | W 1:1, H 1:1 | texture 1120x595 | 0 marker frames, 0 ms | the anchor now uses the measured origin
+  | marker none | reads 0 | cache hit (3 layouts measured this editor session)
 [DisplayXR] GameView calibration: fell back to the computed origin (pane +3,+113) - the horizontal strips are partly
   covered or filtered (212 px show neither the marker nor a shifted copy of it; another window over the Game view?) [attempt 1 of 3, retrying in 2 s]
+  | marker strips h-row 198 v-col 384 13 px | reads 6, 148 ms after the first marker frame | 31 marker frames, 152 ms
+[DisplayXR] GameView calibration: fell back to the computed origin (pane +2,+120) - no marker on the horizontal strips (0 blocks read)
+  [attempt 1 of 3, retrying in 0.2 s with the whole-image marker] | marker strips h-row 198 v-col 384 13 px | reads 5, ... | ...
 ```
+
+| Appended | Meaning |
+|---|---|
+| `marker strips h-row R v-col C 13 px` | thin strips: texture row `R` and column `C` are the lines read; 13 px thick each |
+| `marker full image` | the whole-image marker (a later attempt, or `DISPLAYXR_PROV_GV_CALIB_FULL=1`) |
+| `marker none` | a reuse: nothing was drawn |
+| `reads N, M ms after the first marker frame` | screen reads, and the time from the first frame the marker was seen drawn to the end. 2 reads is the minimum; each extra one is a read that came before the marker was on screen |
+| `N marker frames, M ms` (unchanged) | native blits that drew the marker; ms from the request to the end |
+| `cache miss (stored)` / `(not stored: not 1:1)` / `(cache off)` / `cache hit (N layouts ...)` | measured now, or reused |
 
 A not-1:1 axis reads `W NOT 1:1 (from column 561 the image is -1 px off, 448 px differ)`.
 
@@ -312,7 +441,8 @@ A not-1:1 axis reads `W NOT 1:1 (from column 561 the image is -1 px off, 448 px 
 or with `DISPLAYXR_PROV_NATIVE_MIRROR=0`, no marker appears, the line says
 `the marker was not drawn`, and the computed position is used, as before. A floating Game view
 (present mode) is not calibrated: the runtime presents its own window there. A Game view that
-is not repainting (Play paused) shows no marker and falls back too (expected, not verified). `DISPLAYXR_PROV_GV_CALIBRATE=0` turns calibration off.
+is not repainting (Play paused) shows no marker and falls back too (expected, not verified). `DISPLAYXR_PROV_GV_CALIBRATE=0` turns calibration off;
+`DISPLAYXR_PROV_GV_CALIB_FULL=1`, `DISPLAYXR_PROV_GV_CALIB_CACHE=0` and `DISPLAYXR_PROV_GV_CALIB_DELAY_MS` are the A/B switches described above.
 A Game view whose zoom is not 1 is never calibrated: no marker is shown while it is scaled
 (see [A fixed-size or zoomed Game view](#a-fixed-size-or-zoomed-game-view)).
 
@@ -662,8 +792,12 @@ wrong view right **is** the anchor's error in that layout; write it down. Start 
 
 No switch. Press Play with the Game view docked.
 
-1. About half a second after Play the Game view flashes a pattern of thin coloured stripes for a
-   fraction of a second, then the image returns. The log has one `GameView calibration:` line.
+1. About half a second after Play two thin coloured lines (one horizontal a third of the way
+   down, one vertical a third of the way across, 13 px thick) appear over the image for a few
+   refreshes; the rest of the image keeps showing the scene. The log has one
+   `GameView calibration:` line ending `| marker strips h-row ... v-col ... 13 px | reads 2, ... | cache miss (stored)`.
+   Note `reads` (2 is the minimum) and both times. Stop and press Play again in the same
+   layout: **no lines on screen**, and the log line ends `| marker none | reads 0 | cache hit (...)`.
 2. `measured image origin ... computed ...`: note `measured - computed`. At 250 % in the
    reference layout expect `(agree)`. At 175 % expect `-1,0` or similar.
 3. Look at the panel: correct depth with `dxr_phase_nudge.txt` at 0 (or absent). **A layout
@@ -671,13 +805,24 @@ No switch. Press Play with the Game view docked.
    to the calibration line: that is an error of the measurement itself.
 4. At 175 % / 125 % without the whole-pixel size: `W NOT 1:1 ...`, then
    `whole-pixel Game view: the measured image is not drawn 1:1 ... - selecting the whole-pixel size`,
-   a second flash, and a second line with `W 1:1, H 1:1`.
-5. Drag a splitter, release: one flash and one line about half a second later. Move the editor
-   window: no flash. Maximize (Shift+Space) and restore: a flash each. Drag the editor to a
-   monitor at another scale: a flash.
+   a second pair of thin lines, and a second line with `W 1:1, H 1:1`. Never a third: after the
+   session restarts for the new size the line reads `cache hit`. The first line ends
+   `cache miss (not stored: not 1:1)`.
+5. Drag a splitter, **hold it still for two seconds with the button down**, drag on, release:
+   no lines on screen until the release, then one pair and one log line about half a second
+   later. Drag it back to exactly the old size: no lines, `cache hit`. Move the editor
+   window: nothing. Maximize (Shift+Space) and restore: lines the first time each way, `cache hit`
+   after that. Drag the editor to a monitor at another scale: lines.
+5a. **Accuracy A/B** (the point of the pass): in one layout, note the measured origin with the
+   default, then start the editor with `DISPLAYXR_PROV_GV_CALIB_FULL=1` (the whole-image marker,
+   every time) and compare `measured image origin pane +x,+y`: it must be identical, at every
+   scale and layout you test. Also once with `DISPLAYXR_PROV_GV_CALIB_CACHE=0`: every Play
+   measures, with thin lines.
 6. Put another window over part of the Game view and resize a splitter under it: the line
    reads `fell back to the computed origin ... partly covered ...`, up to three times 2 s
-   apart; take the window away before the third and it measures.
+   apart (thin pair 0, thin pair 1, the whole image); take the window away before the third and
+   it measures. A window across the full width of the upper third instead: `no marker ...
+   retrying in 0.2 s with the whole-image marker`.
 7. Opt-outs: `DISPLAYXR_PROV_GV_CALIBRATE=0` (no flash, no line, computed anchor),
    `DISPLAYXR_PROV_GV_WHOLEPIXEL=0` (at 175 %: `... keeps the whole-pixel size off`).
 8. With D3D11 as the editor's graphics API: `fell back ... the marker was not drawn`.
@@ -832,8 +977,14 @@ The calibration, as of the change that added it:
 | | Status |
 |---|---|
 | Marker definition and decoding (origin, 1:1, dropped / doubled lines, covered, filtered, colour shifts) | unit-tested on synthetic screens (`Tests~/GameViewCalibration`) |
+| Thin strips decode exactly as the whole image; which marker each attempt draws; the settle rule; the layout cache (equality, text form, bound) | unit-tested (`Tests~/GameViewCalibration`) |
+| The calibrator itself (when a marker is requested and which, the reads, reuse after a restart / a domain reload, a drag with a pause, the log lines) | unit-tested against a **simulated** clock, native plug-in and screen (`Tests~/GameViewCalibration/Stubs.cs`); the simulation shows a requested marker after a set number of frames and charges one refresh per read - a real compositor is a hardware check |
+| A screen read costs one refresh whatever its length, reads do not overlap, a rectangle costs with its area | measured once on a 60 Hz development desktop, reading only; not on the panel |
+| The marker on screen for two or three refreshes; the first read not needing a delay | **not verified** - Pass 0 step 1 (`reads` and the two times in the log line) |
+| Reuse of a measured layout giving the right anchor on a panel (Play after Play, resize and back, restart) | **not verified** - Pass 0 steps 1 and 5; the equality is unit-tested, that an identical layout is drawn at an identical place is Unity's determinism |
+| The mouse-button rule during a real splitter drag (`GetAsyncKeyState` from the editor's main thread) | **not verified** - Pass 0 step 5 |
 | `displayxr_read_screen_strip`: pixel order, orientation, physical coordinates from a DPI-unaware thread, clipping at the desktop edge | checked once on a development machine against a plain test window painted with the marker (1:1 and one dropped column both decoded at the window's true origin); not in CI |
-| The HLSL of the marker | compiles (`fxc`, ps_5_0); **that it draws the same pattern as the C# definition is not verified** |
+| The HLSL of the marker (whole image and thin strips) | rendered off screen on the software rasteriser and compared texel by texel with the definition, hashes pinned on both sides (`native~/tests/gvcal_shader_test.cpp`, Windows CI). Through D3D11; the D3D12 root-constant path of the real blit is not exercised |
 | The marker reaching the screen through Unity's Game view; timing; the measured origin being the right anchor on a panel | **not verified** - Pass 0 |
 | A screen read while the Game view is on an HDR or colour-managed desktop | not verified (the classifier is relative to the brightest channel to allow for it) |
 | D3D11 editor, Vulkan | falls back by design; the fallback line is not verified |

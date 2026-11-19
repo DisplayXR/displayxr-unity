@@ -110,6 +110,8 @@ jobs:
       # Pure C#: the position-coded marker of the editor Game-view calibration and the decoding
       # of 1-px screen strips into the image's origin and its 1:1 verdict (#459), on synthetic
       # screens (1:1, dropped / doubled lines, covered, filtered, colour-shifted captures).
+      # Also the calibrator itself, as shipped, against a simulated clock / native plug-in /
+      # screen: thin strips, the reads, reuse of measured layouts, a splitter drag.
       - name: Game view calibration
         if: needs.DetectChanges.outputs.docs_only != 'true'
         run: dotnet run --project "Tests~/GameViewCalibration" -c Release
@@ -158,6 +160,18 @@ jobs:
           }
           Write-Host "Built successfully: Runtime/Plugins/Windows/x64/displayxr_unity.dll"
           Get-Item "Runtime/Plugins/Windows/x64/displayxr_unity.dll" | Select-Object Name, Length
+
+      # (#459) The editor Game-view calibration marker as the mirror blit's HLSL draws it:
+      # compiled from the shipped source, rendered OFF SCREEN on the software rasteriser
+      # (D3D11 WARP) and compared texel by texel with the marker's definition. Its own build
+      # directory and target, so the plug-in build above is untouched.
+      - name: Calibration marker shader test
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          cmake -S native~ -B native~/build-tests -A x64 -DDISPLAYXR_BUILD_TESTS=ON
+          cmake --build native~/build-tests --config Release --target gvcal_shader_test
+          & "native~/build-tests/Release/gvcal_shader_test.exe"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
       - name: Upload artifact
         if: needs.DetectChanges.outputs.docs_only != 'true'

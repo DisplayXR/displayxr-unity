@@ -313,6 +313,23 @@ namespace DisplayXR
         public static extern void dxr_prov_set_gv_calib_marker(int enable, int maxMs);
 
         /// <summary>
+        /// (#459) The same, choosing WHERE the marker is drawn: <paramref name="strip"/> -1 =
+        /// over the whole image; 0 / 1 = only the k-th horizontal strip and the k-th vertical
+        /// strip (<see cref="DisplayXRGameViewCalibration.InMarker"/>), <paramref name="half"/>
+        /// texels on each side of the row / column that is read, the woven image everywhere
+        /// else. Windows only.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern void dxr_prov_set_gv_calib_marker2(int enable, int maxMs, int strip, int half);
+
+        /// <summary>
+        /// (#459) The size of the Game view texture the native mirror blit last drew into
+        /// (0 x 0: it has not drawn). Returns how many times it has drawn. Windows only.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int dxr_prov_get_gv_mirror_size(out int w, out int h);
+
+        /// <summary>
         /// (#459) How many frames the marker has been drawn since it was last switched on, with
         /// the size of the texture it was drawn into and its row-coded bands (texels).
         /// 0 = not drawn (yet, or not on this graphics API). Windows only.

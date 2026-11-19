@@ -1604,30 +1604,37 @@ static ID3D12DescriptorHeap *s_blit_srvheap  = nullptr; // shader-visible, 1 SRV
 static ID3D12DescriptorHeap *s_blit_rtvheap  = nullptr; // 1 RTV
 static DXGI_FORMAT           s_blit_pso_fmt   = DXGI_FORMAT_UNKNOWN;
 
-// (#459) Game-view calibration marker. For a few frames after the editor Game view's layout
-// settles, C# asks this blit to draw a position-coded pattern INSTEAD of the woven image, into
-// the same mirror RT through the same draw, so it reaches the screen exactly where the weave
-// does; C# then reads 1-px strips of the screen back (displayxr_read_screen_strip) and puts the
-// weave anchor where the pattern really is. The pattern and its decoding are specified in
-// Runtime/Provider/DisplayXRGameViewCalibration.cs: keep PSMain's mk branch in step with it.
+#include "displayxr_gvcal_shader.h"
+
+// (#459) Game-view calibration marker. After the editor Game view's layout settles, C# asks
+// this blit to draw a position-coded pattern over the woven image, into the same mirror RT
+// through the same draw, so it reaches the screen exactly where the weave does; C# then reads
+// 1-px strips of the screen back (displayxr_read_screen_strip) and puts the weave anchor where
+// the pattern really is. The pattern is drawn only where it is read - a thin horizontal strip
+// and a thin vertical strip, the woven image everywhere else - or over the whole image
+// (strip < 0). The pattern, where it is drawn and its decoding are specified in
+// Runtime/Provider/DisplayXRGameViewCalibration.cs; the shader is in displayxr_gvcal_shader.h
+// and tests/gvcal_shader_test.cpp checks it against that definition.
 // Written on the main thread, read on the graphics thread: atomics. The deadline is enforced
 // HERE, so a marker left on by a domain reload or a stopped session takes itself down.
-#define GVCAL_BLOCK    6                 // texels per block (sync + 5 base-5 digits)
-#define GVCAL_BAND_W   (4 * GVCAL_BLOCK) // width of each row-coded band
-#define GVCAL_MIN_SIDE 128
 static std::atomic<int>       s_gvcal_on{0};
+static std::atomic<int>       s_gvcal_strip{-1}, s_gvcal_half{0};
 static std::atomic<ULONGLONG> s_gvcal_deadline{0};
 static std::atomic<int>       s_gvcal_frames{0};
 static std::atomic<int>       s_gvcal_w{0}, s_gvcal_h{0};
+// The mirror RT the blit last drew into, marker or not (the calibration's cache checks it).
+static std::atomic<int>       s_mirror_w{0}, s_mirror_h{0}, s_mirror_draws{0};
 
-static int gvcal_band0(int w) { return w / 3 / GVCAL_BLOCK * GVCAL_BLOCK; }
-static int gvcal_band1(int w) { return 2 * w / 3 / GVCAL_BLOCK * GVCAL_BLOCK; }
-
-extern "C" DISPLAYXR_EXPORT void dxr_prov_set_gv_calib_marker(int enable, int max_ms)
+// strip: < 0 = the whole image; 0 / 1 = the k-th horizontal strip and the k-th vertical strip
+// only, `half` texels on each side of the row / column that is read.
+extern "C" DISPLAYXR_EXPORT void dxr_prov_set_gv_calib_marker2(int enable, int max_ms, int strip, int half)
 {
 	if (enable) {
 		if (max_ms < 1) max_ms = 1;
 		if (max_ms > 2000) max_ms = 2000;
+		s_gvcal_on.store(0); // not drawn while the mode changes
+		s_gvcal_strip.store(strip);
+		s_gvcal_half.store(half);
 		s_gvcal_frames.store(0);
 		s_gvcal_w.store(0); s_gvcal_h.store(0);
 		s_gvcal_deadline.store(GetTickCount64() + (ULONGLONG)max_ms);
@@ -1635,6 +1642,21 @@ extern "C" DISPLAYXR_EXPORT void dxr_prov_set_gv_calib_marker(int enable, int ma
 	} else {
 		s_gvcal_on.store(0);
 	}
+}
+
+// The whole-image marker (the original entry point).
+extern "C" DISPLAYXR_EXPORT void dxr_prov_set_gv_calib_marker(int enable, int max_ms)
+{
+	dxr_prov_set_gv_calib_marker2(enable, max_ms, -1, 0);
+}
+
+// The size of the mirror RT the native blit last drew into (0 x 0: none yet). Returns the
+// number of draws so far.
+extern "C" DISPLAYXR_EXPORT int dxr_prov_get_gv_mirror_size(int *w, int *h)
+{
+	if (w) *w = s_mirror_w.load();
+	if (h) *h = s_mirror_h.load();
+	return s_mirror_draws.load();
 }
 
 extern "C" DISPLAYXR_EXPORT int dxr_prov_get_gv_calib_marker(int *w, int *h, int *band0, int *band1, int *band_w)
@@ -1648,15 +1670,20 @@ extern "C" DISPLAYXR_EXPORT int dxr_prov_get_gv_calib_marker(int *w, int *h, int
 	return s_gvcal_frames.load();
 }
 
-// Graphics thread: is the marker to be drawn into a w x h mirror RT this frame? Fills mk
-// (the shader's uint4: on, band 0 start, band 1 start, band width) and counts the frame.
-static bool gvcal_marker_for_frame(int w, int h, uint32_t mk[4])
+// Graphics thread: is the marker to be drawn into a w x h mirror RT this frame? Fills the
+// shader's mk and st (displayxr_gvcal_shader.h) and counts the frame.
+static bool gvcal_marker_for_frame(int w, int h, uint32_t mk[4], uint32_t st[4])
 {
 	mk[0] = mk[1] = mk[2] = mk[3] = 0;
+	st[0] = st[1] = st[2] = st[3] = 0;
+	s_mirror_w.store(w); s_mirror_h.store(h);
+	s_mirror_draws.fetch_add(1);
 	if (!s_gvcal_on.load()) return false;
 	if (GetTickCount64() >= s_gvcal_deadline.load()) { s_gvcal_on.store(0); return false; }
 	if (w < GVCAL_MIN_SIDE || h < GVCAL_MIN_SIDE) return false;
-	mk[0] = 1; mk[1] = (uint32_t)gvcal_band0(w); mk[2] = (uint32_t)gvcal_band1(w); mk[3] = GVCAL_BAND_W;
+	unsigned umk[4], ust[4];
+	gvcal_fill_constants(w, h, s_gvcal_strip.load(), s_gvcal_half.load(), umk, ust);
+	for (int i = 0; i < 4; i++) { mk[i] = umk[i]; st[i] = ust[i]; }
 	s_gvcal_w.store(w); s_gvcal_h.store(h);
 	s_gvcal_frames.fetch_add(1);
 	return true;
@@ -1683,7 +1710,7 @@ static bool prov_ensure_blit_pipeline(ID3D12Device *dev, DXGI_FORMAT rtFmt)
 		range.BaseShaderRegister = 0; range.OffsetInDescriptorsFromTableStart = 0;
 		D3D12_ROOT_PARAMETER params[2] = {};
 		params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-		params[0].Constants.ShaderRegister = 0; params[0].Constants.Num32BitValues = 8; // srcRect + mk (#459)
+		params[0].Constants.ShaderRegister = 0; params[0].Constants.Num32BitValues = GVCAL_CONSTANTS; // srcRect + mk + st (#459)
 		params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 		params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
 		params[1].DescriptorTable.NumDescriptorRanges = 1;
@@ -1705,27 +1732,7 @@ static bool prov_ensure_blit_pipeline(ID3D12Device *dev, DXGI_FORMAT rtFmt)
 		sig->Release(); if (err) err->Release();
 		if (FAILED(hr)) return false;
 	}
-	static const char *kHLSL =
-		"cbuffer C : register(b0){ float4 srcRect; uint4 mk; }\n"
-		"Texture2D tex : register(t0); SamplerState smp : register(s0);\n"
-		"struct V{ float4 pos:SV_Position; float2 uv:TEXCOORD0; };\n"
-		"V VSMain(uint id:SV_VertexID){ V o; float2 t=float2((id<<1)&2, id&2);\n"
-		"  o.uv=t; o.pos=float4(t*float2(2,-2)+float2(-1,1),0,1); return o; }\n"
-		// (#459) Calibration marker = DisplayXRGameViewCalibration.Code / MarkerIndex / Rgb:
-		// blocks of 6 texels, magenta sync then the block index in base 5 (LSB first) as
-		// red / green / blue / yellow / cyan; columns everywhere, rows inside the two bands.
-		// mk = (on, band 0 start, band 1 start, band width). The woven sample stays outside
-		// the branch (no gradient under flow control).
-		"static const uint kPow5[5] = { 1, 5, 25, 125, 625 };\n"
-		"uint Code(uint t){ uint r = t % 6; uint v = 5;\n"
-		"  if (r != 0) v = ((t / 6) / kPow5[r - 1]) % 5; return v; }\n"
-		"float4 PSMain(V i):SV_Target{ float2 uv=srcRect.xy + i.uv*srcRect.zw; float4 c = tex.Sample(smp, uv);\n"
-		"  if (mk.x != 0) { uint x = (uint)i.pos.x; uint y = (uint)i.pos.y;\n"
-		"    bool band = (x >= mk.y && x < mk.y + mk.w) || (x >= mk.z && x < mk.z + mk.w);\n"
-		"    uint k = Code(band ? y : x);\n"
-		"    c = float4((k == 0 || k == 3 || k == 5) ? 1.0 : 0.0, (k == 1 || k == 3 || k == 4) ? 1.0 : 0.0,\n"
-		"               (k == 2 || k == 4 || k == 5) ? 1.0 : 0.0, 1.0); }\n"
-		"  return c; }\n";
+	const char *kHLSL = kDxrMirrorBlitHLSL; // displayxr_gvcal_shader.h (#459: the calibration marker)
 	ID3DBlob *vs = nullptr, *ps = nullptr, *e1 = nullptr, *e2 = nullptr;
 	if (FAILED(D3DCompile(kHLSL, strlen(kHLSL), nullptr, nullptr, nullptr, "VSMain", "vs_5_0", 0, 0, &vs, &e1)) ||
 	    FAILED(D3DCompile(kHLSL, strlen(kHLSL), nullptr, nullptr, nullptr, "PSMain", "ps_5_0", 0, 0, &ps, &e2))) {
@@ -1799,9 +1806,10 @@ static bool prov_shader_blit_woven(ID3D12Device *dev, IUnityGraphicsD3D12v8 *v8,
 	s_mblit_list->SetDescriptorHeaps(1, heaps);
 	float srcRect[4] = { (float)cx / tw, (float)cy / th, (float)cw / tw, (float)ch / th };
 	s_mblit_list->SetGraphicsRoot32BitConstants(0, 4, srcRect, 0);
-	uint32_t mk[4]; // (#459) calibration marker instead of the woven image, for a few frames
-	gvcal_marker_for_frame((int)rd.Width, (int)rd.Height, mk);
-	s_mblit_list->SetGraphicsRoot32BitConstants(0, 4, mk, 4);
+	uint32_t gv_mk[4], gv_st[4]; // (#459) calibration marker over the woven image, while it is read
+	gvcal_marker_for_frame((int)rd.Width, (int)rd.Height, gv_mk, gv_st);
+	s_mblit_list->SetGraphicsRoot32BitConstants(0, 4, gv_mk, 4);
+	s_mblit_list->SetGraphicsRoot32BitConstants(0, 4, gv_st, 8);
 	s_mblit_list->SetGraphicsRootDescriptorTable(1, srvGpu);
 	s_mblit_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 	s_mblit_list->DrawInstanced(3, 1, 0, 0);
