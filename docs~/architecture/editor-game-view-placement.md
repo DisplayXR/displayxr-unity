@@ -405,7 +405,9 @@ born at; the calibration needs a playing view. On D3D11 the calibration does not
 **Which runtime honours it.** D3D11 from runtime v2.55.0. **D3D12 (the editor's usual API),
 Vulkan and OpenGL from runtime v2.69.0**, together with a display processor plug-in that
 declares it can phase from the present origin on that API (for the lenticular vendor plug-in:
-v2.22.0, with a vendor SDK that supports windowless weaving). Older than that on D3D12 the
+v2.22.0, with a vendor SDK that supports windowless weaving). Install v2.69.1 or later rather
+than v2.69.0 itself (same desktop code, corrected Android package); installer bundle v2.9.37
+carries both. Older than that on D3D12 the
 binding is ignored and the anchor window phases the weave, exactly as before. Verified on
 hardware (#471): D3D12 editor at 175 %, measured rect, `WINDOWLESS_PHASE`, correct depth through
 Game view resizes.
