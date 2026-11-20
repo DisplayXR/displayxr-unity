@@ -28,6 +28,7 @@
 #include <d3dcompiler.h> // native mirror shader blit (urp-editor GameView, BGRA->RGBA)
 #endif
 
+#include "displayxr_mirror_colour.h" // editor Game-view mirror colour policy (unit-tested, #480)
 #include "../unity_pluginapi/IUnityInterface.h"
 #include "../unity_pluginapi/IUnityGraphics.h"
 #ifdef _WIN32
@@ -172,7 +173,20 @@ static bool                   s_woven_tex_created = false;
 #ifdef _WIN32
 static ID3D12CommandAllocator   *s_mblit_alloc = nullptr;
 static ID3D12GraphicsCommandList *s_mblit_list = nullptr;
+// (#480) D3D12 mirror copy (woven -> TYPELESS sRGB-viewable copy for Unity's own blit). A
+// small ring of allocators, each reused only once the frame that used it has completed.
+#define PROV_MCOPY_RING 4
+static ID3D12CommandAllocator   *s_mcopy_alloc[PROV_MCOPY_RING] = {};
+static UINT64                    s_mcopy_fence[PROV_MCOPY_RING] = {};
+static ID3D12GraphicsCommandList *s_mcopy_list = nullptr;
 #endif
+// (#480) Per-session one-shot mirror colour diagnostics; reset in GfxStop.
+static bool     s_mirror_colour_logged = false;  // the "mirror colour:" line at wrap time
+static bool     s_mirror_native_logged = false;  // the native blit's own line
+static bool     s_mirror_path_logged = false;    // which blit path is live, after a settle
+static unsigned s_mirror_submit_n = 0;           // submits with a mirror texture wrapped
+static unsigned s_mirror_native_last = 0;        // s_mirror_submit_n at the last native blit
+static bool     s_mirror_native_seen = false;
 
 // Extra 3D zones (#166 Phase B2): each extra zone gets its own Unity texture(s)
 // (SPI: [i][0] = 2-slice array; MultiPass: [i][0/1] = per-eye) + render pass.
@@ -475,7 +489,9 @@ static void create_extra_zone_textures()
 // dxr_prov_set_color_space_linear), tell Unity to render into an sRGB view so it encodes
 // linear→sRGB on store; the runtime then presents correctly-encoded pixels. Otherwise (docked
 // texture path, Gamma projects, or a runtime with no sRGB format) this is just the UV flag —
-// byte-identical to before. NOT applied to the woven-mirror texture or the UI/zone layers.
+// byte-identical to before. NOT applied to the UI/zone layers. The woven-mirror texture has
+// its own rule (create_woven_mirror_texture_if_ready, #480): it is a blit SOURCE, flagged
+// sRGB so Unity DECODES it, and only where its bytes are encoded and Unity's blit encodes.
 static uint32_t prov_eye_tex_flags(void)
 {
 	uint32_t f = kUnityXRRenderTextureFlagsUVDirectionTopToBottom;
@@ -490,7 +506,12 @@ static void create_woven_mirror_texture_if_ready()
 {
 	if (s_woven_tex_created || !s_display || !s_handle) return;
 	uint32_t ww = 0, wh = 0;
-	void *wov = dxr_prov_get_woven_unity_texture(&ww, &wh);
+	// (#480) What Unity's own mirror blit samples: the woven texture itself, plain - except
+	// for a Linear project on a format-honest runtime, where the woven bytes are ENCODED and
+	// Unity's blit would encode them again. There it is a TYPELESS raw copy flagged sRGB, so
+	// Unity decodes on sample and its encode on store is the identity.
+	int mirror_srgb = 0;
+	void *wov = dxr_prov_get_woven_mirror_texture(&ww, &wh, &mirror_srgb);
 	if (!wov || ww == 0 || wh == 0) return;
 	UnityXRRenderTextureDesc desc; memset(&desc, 0, sizeof(desc));
 	desc.colorFormat = kUnityXRRenderTextureFormatBGRA32; // woven tex is B8G8R8A8_UNORM (fmt 87)
@@ -501,11 +522,26 @@ static void create_woven_mirror_texture_if_ready()
 	desc.height = wh;
 	desc.textureArrayLength = 1;
 	desc.flags = kUnityXRRenderTextureFlagsUVDirectionTopToBottom; // D3D top-left origin
+	if (mirror_srgb) desc.flags |= kUnityXRRenderTextureFlagsSRGB;
 	UnityXRRenderTextureId id = 0;
 	if (s_display->CreateTexture(s_handle, &desc, &id) == kUnitySubsystemErrorCodeSuccess) {
 		s_woven_tex_id = id;
 		s_woven_tex_created = true;
 		prov_log("[DisplayXR-PROV] CreateTexture: wrapped WOVEN shared texture -> GameView mirror\n");
+		if (!s_mirror_colour_logged) {
+			s_mirror_colour_logged = true;
+			char m[400];
+			snprintf(m, sizeof(m),
+			         "[DisplayXR-PROV] mirror colour: project=%s woven_dxgi_format=%d holds=%s | "
+			         "Unity told BGRA32 srgb=%d via %s | fix=%s (#480)\n",
+			         dxr_prov_get_color_space_linear() ? "Linear" : "Gamma",
+			         dxr_prov_get_woven_dxgi_format(),
+			         dxr_prov_woven_is_encoded() ? "ENCODED" : "LINEAR",
+			         mirror_srgb,
+			         mirror_srgb ? "TYPELESS per-frame raw copy (format 90)" : "the woven texture itself",
+			         dxr_prov_mirror_colour_fix_enabled() ? "on" : "OFF (DISPLAYXR_PROV_MIRROR_SRGB=0)");
+			prov_log(m);
+		}
 	} else {
 		prov_log("[DisplayXR-PROV] CreateTexture (woven GameView mirror) failed\n");
 	}
@@ -1457,6 +1493,84 @@ GfxPopulateNextFrameDesc(UnitySubsystemHandle handle, void *userData,
 	return kUnitySubsystemErrorCodeSuccess;
 }
 
+#ifdef _WIN32
+// (#480) D3D12: refresh the TYPELESS mirror copy Unity's own blit samples from the woven
+// texture. Graphics thread, after xrEndFrame. A raw CopyResource within one typeless family
+// (the encoded bytes are not converted), executed on Unity's queue through
+// ExecuteCommandList so Unity keeps tracking the copy's state. The woven texture is not
+// tracked by Unity in this arrangement (it is no longer the wrapped one): it rests in COMMON
+// on both devices and is promoted to COPY_SOURCE implicitly, decaying back afterwards.
+static void prov_refresh_mirror_copy_d3d12(IUnityGraphicsD3D12v8 *v8)
+{
+	void *dstp = nullptr, *srcp = nullptr;
+	dxr_prov_get_woven_mirror_copy_d3d12(&dstp, &srcp);
+	if (!v8 || !dstp || !srcp) return;
+	// The native shader blit samples the woven texture directly; while it is the live path
+	// Unity's own blit is not shown, so the copy would be wasted work.
+	if (s_mirror_native_seen && (s_mirror_submit_n - s_mirror_native_last) < 4) return;
+	ID3D12Device *dev = v8->GetDevice();
+	ID3D12Fence *fence = v8->GetFrameFence();
+	if (!dev) return;
+	const UINT64 done = fence ? fence->GetCompletedValue() : ~(UINT64)0;
+	int slot = -1;
+	for (int i = 0; i < PROV_MCOPY_RING; i++) {
+		if (s_mcopy_alloc[i] && s_mcopy_fence[i] > done) continue; // still in flight
+		slot = i; break;
+	}
+	if (slot < 0) return; // every allocator busy: keep last frame's copy
+	if (!s_mcopy_alloc[slot] &&
+	    FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&s_mcopy_alloc[slot]))))
+		return;
+	if (FAILED(s_mcopy_alloc[slot]->Reset())) return;
+	if (!s_mcopy_list) {
+		if (FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, s_mcopy_alloc[slot], nullptr,
+		                                  IID_PPV_ARGS(&s_mcopy_list))))
+			return;
+	} else if (FAILED(s_mcopy_list->Reset(s_mcopy_alloc[slot], nullptr))) {
+		return;
+	}
+	ID3D12Resource *dst = (ID3D12Resource *)dstp;
+	ID3D12Resource *src = (ID3D12Resource *)srcp;
+	s_mcopy_list->CopyResource(dst, src);
+	// Hand the copy back in COMMON - the state it was created in - so a re-wrap of the
+	// Unity texture (resize) starts from a state that is true.
+	D3D12_RESOURCE_BARRIER b = {}; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	b.Transition.pResource = dst; b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	b.Transition.StateBefore = D3D12_RESOURCE_STATE_COPY_DEST;
+	b.Transition.StateAfter  = D3D12_RESOURCE_STATE_COMMON;
+	s_mcopy_list->ResourceBarrier(1, &b);
+	s_mcopy_list->Close();
+	UnityGraphicsD3D12ResourceState st = {};
+	st.resource = dst; st.expected = D3D12_RESOURCE_STATE_COPY_DEST; st.current = D3D12_RESOURCE_STATE_COMMON;
+	s_mcopy_fence[slot] = v8->ExecuteCommandList(s_mcopy_list, 1, &st);
+}
+#endif // _WIN32
+
+// (#480) After each submitted frame in editor texture mode: keep the D3D12 mirror copy
+// fresh, and say once per session which mirror blit is actually live - the native callback
+// is only a suggestion to Unity ("the rendering pipeline might not call the native blit
+// function even when it is available"), and the two paths convert colour differently.
+static void prov_mirror_after_submit(void)
+{
+	if (s_woven_tex_id == 0) return;
+	s_mirror_submit_n++;
+#ifdef _WIN32
+	if (dxr_prov_get_graphics_api() != DXR_GFX_D3D11 && s_ifaces)
+		prov_refresh_mirror_copy_d3d12(s_ifaces->Get<IUnityGraphicsD3D12v8>());
+#endif
+	if (!s_mirror_path_logged && s_mirror_submit_n >= 120) {
+		s_mirror_path_logged = true;
+		const bool native_live = s_mirror_native_seen && (s_mirror_submit_n - s_mirror_native_last) < 4;
+		char m[256];
+		snprintf(m, sizeof(m),
+		         "[DisplayXR-PROV] mirror colour: blit path after %u frames = %s (#480)\n",
+		         s_mirror_submit_n,
+		         native_live ? "NATIVE shader blit (samples the woven texture directly)"
+		                     : "UNITY blitParams (samples the texture Unity was told about)");
+		prov_log(m);
+	}
+}
+
 UnitySubsystemErrorCode UNITY_INTERFACE_API
 GfxSubmitCurrentFrame(UnitySubsystemHandle handle, void *userData)
 {
@@ -1484,6 +1598,7 @@ GfxSubmitCurrentFrame(UnitySubsystemHandle handle, void *userData)
 	// internally on xrReleaseSwapchainImage. Skip the D3D12-only transition entirely.
 	if (dxr_prov_get_graphics_api() == DXR_GFX_D3D11) {
 		dxr_prov_submit_frame(s_current_image_index);
+		prov_mirror_after_submit();
 		return kUnitySubsystemErrorCodeSuccess;
 	}
 
@@ -1526,6 +1641,7 @@ GfxSubmitCurrentFrame(UnitySubsystemHandle handle, void *userData)
 #endif // _WIN32
 
 	dxr_prov_submit_frame(s_current_image_index);
+	prov_mirror_after_submit();
 	return kUnitySubsystemErrorCodeSuccess;
 }
 
@@ -1537,7 +1653,19 @@ GfxStop(UnitySubsystemHandle handle, void *userData)
 #ifdef _WIN32
 	if (s_mblit_list)  { s_mblit_list->Release();  s_mblit_list  = nullptr; }
 	if (s_mblit_alloc) { s_mblit_alloc->Release(); s_mblit_alloc = nullptr; }
+	if (s_mcopy_list)  { s_mcopy_list->Release();  s_mcopy_list  = nullptr; } // (#480)
+	for (int i = 0; i < PROV_MCOPY_RING; i++) {
+		if (s_mcopy_alloc[i]) { s_mcopy_alloc[i]->Release(); s_mcopy_alloc[i] = nullptr; }
+		s_mcopy_fence[i] = 0;
+	}
 #endif
+	// (#480) Mirror colour diagnostics are per session.
+	s_mirror_colour_logged = false;
+	s_mirror_native_logged = false;
+	s_mirror_path_logged = false;
+	s_mirror_submit_n = 0;
+	s_mirror_native_last = 0;
+	s_mirror_native_seen = false;
 	if (s_session_active) {
 		dxr_prov_session_stop();
 		s_session_active = false;
@@ -1780,7 +1908,7 @@ static bool prov_ensure_blit_pipeline(ID3D12Device *dev, DXGI_FORMAT rtFmt)
 		range.BaseShaderRegister = 0; range.OffsetInDescriptorsFromTableStart = 0;
 		D3D12_ROOT_PARAMETER params[2] = {};
 		params[0].ParameterType = D3D12_ROOT_PARAMETER_TYPE_32BIT_CONSTANTS;
-		params[0].Constants.ShaderRegister = 0; params[0].Constants.Num32BitValues = GVCAL_CONSTANTS; // srcRect + mk + st (#459)
+		params[0].Constants.ShaderRegister = 0; params[0].Constants.Num32BitValues = GVCAL_CONSTANTS; // srcRect + mk + st (#459) + fl (#480)
 		params[0].ShaderVisibility = D3D12_SHADER_VISIBILITY_ALL;
 		params[1].ParameterType = D3D12_ROOT_PARAMETER_TYPE_DESCRIPTOR_TABLE;
 		params[1].DescriptorTable.NumDescriptorRanges = 1;
@@ -1802,7 +1930,7 @@ static bool prov_ensure_blit_pipeline(ID3D12Device *dev, DXGI_FORMAT rtFmt)
 		sig->Release(); if (err) err->Release();
 		if (FAILED(hr)) return false;
 	}
-	const char *kHLSL = kDxrMirrorBlitHLSL; // displayxr_gvcal_shader.h (#459: the calibration marker)
+	const char *kHLSL = kDxrMirrorBlitHLSL; // displayxr_gvcal_shader.h (#459: the calibration marker; #480: the decode)
 	ID3DBlob *vs = nullptr, *ps = nullptr, *e1 = nullptr, *e2 = nullptr;
 	if (FAILED(D3DCompile(kHLSL, strlen(kHLSL), nullptr, nullptr, nullptr, "VSMain", "vs_5_0", 0, 0, &vs, &e1)) ||
 	    FAILED(D3DCompile(kHLSL, strlen(kHLSL), nullptr, nullptr, nullptr, "PSMain", "ps_5_0", 0, 0, &ps, &e2))) {
@@ -1840,7 +1968,31 @@ static bool prov_shader_blit_woven(ID3D12Device *dev, DxrExecuteCommandListFn ex
 	*why = DXR_MB_PIPELINE;
 	if (!dev || !execute || !rt || !src || tw == 0 || th == 0) return false;
 	D3D12_RESOURCE_DESC rd = rt->GetDesc();
-	if (!prov_ensure_blit_pipeline(dev, rd.Format)) return false;
+	// (#480) The view this draw stores through decides the conversion:
+	//  - a typed _SRGB target encodes on store, so encoded woven bytes are decoded in the
+	//    shader first (a typed target cannot be viewed as its UNORM sibling);
+	//  - a typed UNORM target stores what the shader returns (unchanged from before);
+	//  - a TYPELESS target is viewed as UNORM, so encoded bytes land raw - the storage of an
+	//    sRGB texture IS encoded bytes. (A TYPELESS format was never a legal view format, so
+	//    this arm used to fail at pipeline creation and draw nothing.)
+	const DXGI_FORMAT view_fmt =
+	    (DXGI_FORMAT)dxr_mirror_dxgi_view_format((int)rd.Format, dxr_prov_woven_is_encoded());
+	const int decode = dxr_prov_mirror_colour_fix_enabled() &&
+	                   dxr_mirror_native_blit_decodes(dxr_prov_woven_is_encoded(),
+	                                                  dxr_mirror_dxgi_is_srgb((int)view_fmt));
+	if (!s_mirror_native_logged) {
+		s_mirror_native_logged = true;
+		char m[320];
+		snprintf(m, sizeof(m),
+		         "[DisplayXR-PROV] mirror colour: native blit target dxgi_format=%d view=%d (%s) "
+		         "woven holds=%s project=%s -> shader decode=%d (#480)\n",
+		         (int)rd.Format, (int)view_fmt,
+		         dxr_mirror_dxgi_is_srgb((int)view_fmt) ? "encodes on store" : "stores raw",
+		         dxr_prov_woven_is_encoded() ? "ENCODED" : "LINEAR",
+		         dxr_prov_get_color_space_linear() ? "Linear" : "Gamma", decode);
+		prov_log(m);
+	}
+	if (!prov_ensure_blit_pipeline(dev, view_fmt)) return false;
 	*why = DXR_MB_CMDLIST;
 	if (!s_mblit_alloc)
 		dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&s_mblit_alloc));
@@ -1860,7 +2012,7 @@ static bool prov_shader_blit_woven(ID3D12Device *dev, DxrExecuteCommandListFn ex
 	dev->CreateShaderResourceView(src, &sv, srvCpu);
 	// RTV for the mirror RT.
 	D3D12_CPU_DESCRIPTOR_HANDLE rtvCpu = s_blit_rtvheap->GetCPUDescriptorHandleForHeapStart();
-	D3D12_RENDER_TARGET_VIEW_DESC rv = {}; rv.Format = rd.Format; rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+	D3D12_RENDER_TARGET_VIEW_DESC rv = {}; rv.Format = view_fmt; rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
 	dev->CreateRenderTargetView(rt, &rv, rtvCpu);
 
 	s_mblit_alloc->Reset();
@@ -1884,6 +2036,8 @@ static bool prov_shader_blit_woven(ID3D12Device *dev, DxrExecuteCommandListFn ex
 	gvcal_marker_for_frame((int)rd.Width, (int)rd.Height, gv_mk, gv_st);
 	s_mblit_list->SetGraphicsRoot32BitConstants(0, 4, gv_mk, 4);
 	s_mblit_list->SetGraphicsRoot32BitConstants(0, 4, gv_st, 8);
+	uint32_t fl[4] = { (uint32_t)(decode ? 1 : 0), 0, 0, 0 }; // (#480) shader decode
+	s_mblit_list->SetGraphicsRoot32BitConstants(0, 4, fl, 12);
 	s_mblit_list->SetGraphicsRootDescriptorTable(1, srvGpu);
 	s_mblit_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
 	s_mblit_list->DrawInstanced(3, 1, 0, 0);
@@ -1895,6 +2049,8 @@ static bool prov_shader_blit_woven(ID3D12Device *dev, DxrExecuteCommandListFn ex
 	st.resource = rt; st.expected = D3D12_RESOURCE_STATE_COPY_DEST; st.current = D3D12_RESOURCE_STATE_COPY_DEST;
 	execute(s_mblit_list, 1, &st);
 	*why = DXR_MB_DRAWN;
+	s_mirror_native_seen = true;                // (#480) the native path is the live one
+	s_mirror_native_last = s_mirror_submit_n;
 	static bool logged = false;
 	if (!logged) { logged = true;
 		prov_log("[DisplayXR-PROV] native mirror: shader-blit ACTIVE (woven BGRA -> GameView RT RGBA)\n"); }

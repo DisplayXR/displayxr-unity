@@ -462,6 +462,11 @@ if(DISPLAYXR_BUILD_TESTS)
     target_include_directories(cursor_depth_math_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/displayxr_xrprovider)
     target_compile_features(cursor_depth_math_test PRIVATE cxx_std_17)
     add_test(NAME cursor_depth_math COMMAND cursor_depth_math_test)
+    # Editor Game-view mirror colour policy (#480): header-only, no D3D / Unity.
+    add_executable(mirror_colour_test tests/mirror_colour_test.cpp)
+    target_include_directories(mirror_colour_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/displayxr_xrprovider)
+    target_compile_features(mirror_colour_test PRIVATE cxx_std_17)
+    add_test(NAME mirror_colour COMMAND mirror_colour_test)
     # XR_DXR_mcp_tools binding against a fake runtime (queue, restart, UTF-8, gate).
     add_executable(mcp_tools_test tests/mcp_tools_test.cpp displayxr_xrprovider/displayxr_provider_mcp.cpp)
     target_include_directories(mcp_tools_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/displayxr_xrprovider ${OPENXR_INCLUDE_DIR})
