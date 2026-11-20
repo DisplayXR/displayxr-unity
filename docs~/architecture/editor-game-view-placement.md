@@ -69,14 +69,19 @@ real texture and the real zoom, so its line is to be trusted where this table is
   [A fixed-size or zoomed Game view](#a-fixed-size-or-zoomed-game-view)). What it wrote is put
   back (`RestoreGameViewFit`: `m_Scale.y = m_Scale.x` on every Game view) when Play ends, on
   dock / undock, before a domain reload, when the editor quits, and once at editor load.
-- **Columns (condition 1): nothing.** Exact wherever the borders are whole pixels (F2).
-- **Canvas size (condition 3):** the glue drives the canvas to `Mathf.RoundToInt` of Unity's main
-  target size - halves to **even** - not to the texture's own size (F4).
-- **Anchor (condition 4): measured, with the computed position as the fallback.** See
+- **Columns (condition 1): the whole-pixel size**, selected when the image is measured not 1:1,
+  or predicted not 1:1 where nothing can be measured
+  ([Placement without a measurement](#placement-without-a-measurement)). Free Aspect itself is
+  exact wherever the borders are whole pixels (F2).
+- **Canvas size (condition 3):** the glue drives the canvas to Unity's own rounding of its main
+  target size, halves **away from zero** (`DisplayXRGameViewPlacement.TextureSizePx`), which is
+  the texture's size (F4, fixed).
+- **Anchor (condition 4): computed from Unity's own rule, and measured where a marker can be
+  drawn.** See [Placement without a measurement](#placement-without-a-measurement) and
   [On-screen calibration](#on-screen-calibration-condition-4-measured). The computed position:
-  `DisplayXRGameViewPlacement.Place`. Docked Free Aspect: X = pane left +
-  half the pane-minus-texture slack (odd pixel to the left); Y = the row Unity's own rule puts the
-  texture's row 0 on (`RtRow0Y`). Letterboxed: Unity's whole-point rounding of the centred rect.
+  `DisplayXRGameViewPlacement.Place`. X = pane left + `ImageLeftPx` (the pane's real left border
+  plus Unity's whole-point rounding of the centred image, the pixel edge rounded half up);
+  Y = the row Unity's own rule puts the texture's row 0 on (`RtRow0Y`).
   The 250 % reference (pane 1733x977 at (1017,293), texture 1728x860) gives **(1020,406)**,
   hardware-verified, pinned in the tests.
 - **Which Game view:** the one Unity calls the main play-mode view
@@ -100,6 +105,157 @@ real texture and the real zoom, so its line is to be trusted where this table is
   `GetDpiForWindow(pane)` is logged next to the measured scale as a cross-check and is not used
   in any arithmetic (it answers in the window's own DPI awareness, not the caller's).
 - **Resizes:** a changed size is pushed to the runtime only after it has held 0.35 s.
+
+## Placement without a measurement
+
+The marker of the [on-screen calibration](#on-screen-calibration-condition-4-measured) is drawn
+in the plug-in's native mirror blit. Unity decides per render pipeline whether that blit is
+called at all, and with the **Built-in pipeline it never is** (see
+[Why the marker is not drawn](#why-the-marker-is-not-drawn)). So the computed placement has to be
+right on its own; the measurement verifies and overrides it where it exists.
+
+### The column rule
+
+Read from the Unity 6000.4.0f1 editor assembly (`GameView.OnGUI`, `GameView.targetInView`,
+`DockArea.GetBorderSizeInternal`, `HostView.InvokeOnGUI`):
+
+1. The image is centred in the view area: `targetInView.x = (area width - image width) / 2`,
+   in points. For a view that fills its area (Free Aspect) it is 0.
+2. `OnGUI` rounds it to **whole points**, halves to **even**
+   (`screenRect.x = Mathf.Round(screenRect.x)`).
+3. The view's GUI origin is the pane's **left border**: `HostView.borderSize.left`, 1 pt when
+   the pane has a neighbour on its left, 0 pt at the editor window's left edge, maximized and
+   floating.
+4. So the quad's left edge is at `(border + rounded x) x scale` px from the pane's left edge,
+   and the first column is that edge rounded **half up**.
+
+`DisplayXRGameViewPlacement.ImageLeftPx(border, x, scale)` is steps 2 to 4.
+
+**What was wrong.** The whole-pixel path took the border from
+`EditorWindow.position.x - HostView.screenPosition.x`. That difference is 0 for every docked
+pane: `DockArea.UpdateViewRect` rewrites the window's position on every `OnGUI` from the dock
+area's own origin, without the border. The 1:1 line of a pane between two neighbours said
+`left border 0 pt = +0 px`. With 0 pt instead of 1 pt the anchor sat one point left of the image:
+1.5 px at 150 %, 1.75 px at 175 %. The border is now read from `HostView.borderSize`. Free Aspect
+used the half-slack centring, which gives the same column between two neighbours and a wrong one
+at the editor window's edge (F3); it uses the same rule now.
+
+**Every data point, against the rule** (border 1 pt in all of them):
+
+| Source | Scale | Rounded x | Edge | Rule | Observed | Old computed |
+|---|---|---|---|---|---|---|
+| reference pane, hardware-verified (#740) | 250 % | 0 pt | 2.5 px | +3 | +3 | +3 |
+| field report, Free Aspect, correct 3D | 150 % | 0 pt | 1.5 px | +2 | +2 | +2 |
+| field report, whole-pixel forced, `targetInView.x` 0.333 pt | 150 % | 0 pt | 1.5 px | +2 | not measured; +0 was wrong | +0 |
+| calibration, whole-pixel | 175 % | 0 pt | 1.75 px | +2 | measured +2 | +0 |
+| calibration, whole-pixel | 175 % | 1 pt | 3.5 px | +4 | measured +4 | +2 |
+| calibration, whole-pixel, `targetInView.x` 1.857 pt | 175 % | 2 pt | 5.25 px | +5 | measured +5 | +4 |
+| field report, whole-pixel forced, x about 1.4 pt | 125 % | 1 pt | 2.5 px | +3 | not measured; the origin "did not move" | +1 |
+
+The "old computed" column is the same rule with a border of 0 pt, and reproduces every
+computed value that was logged. The image does not follow `targetInView.x` continuously, as
+the field report expected at 150 %: Unity rounds it to whole points first, so 0.333 pt moves
+nothing and 1.4 pt moves the image by exactly one point.
+
+**What the rule does not explain, and what is not measured.**
+
+- An earlier session at 175 % reported an image at pane **+1** for a 1120x595 whole-pixel image
+  in a 1122.5 px area (x = 0.714 pt, rounded 1 pt). The rule gives +4 with a left border and +2
+  without one, never +1. That number was found by eye with the phase nudge ("moving the anchor
+  one pixel fixed it"), before the marker existed, and a nudge is only known modulo the lens
+  period. It is not reproduced by any marker measurement since, and it is not used.
+- A half-pixel edge (x.5) went **up** in all three measured cases (250 %, 150 %, 175 %). At
+  125 % and 225 % it is unmeasured; it occurs there when `border + rounded x` is 2 mod 4. The
+  1:1 line says `half-pixel tie (taken up)` when the anchor rests on it.
+- When `targetInView.x` is exactly a half point (an area an odd number of points wider than
+  the image) float noise decides which way Unity rounds. The glue then uses Unity's own
+  `targetInView.x`, read while the global pixels-per-point equals the pane's scale and kept
+  while the geometry holds; without it the value is derived from the widths and the 1:1 line
+  says `HALF-POINT TIE`. A measurement, where there is one, settles it.
+- The rows (`RtRow0Y`) are unchanged: every calibration line so far agreed with them. The quarter
+  pixel inconsistency of F5 is therefore open in Y only.
+- A second monitor at another scale, and a pane at the editor window's edge, are arithmetic
+  (the border comes from Unity, the scale from the pane): not measured.
+
+### The texture size (F4)
+
+`PlayModeView.RenderView` allocates `(int)Math.Round(target, MidpointRounding.AwayFromZero)`. The
+glue used `Mathf.RoundToInt` (halves to even): `texture=2563x1414 glue computed 2562x1414
+(DISAGREE)` at 175 %. It uses Unity's rounding now (`TextureSizePx`), for the canvas and for
+the anchor's row.
+
+### The whole-pixel size from the prediction
+
+The automatic whole-pixel size waited for a calibration to *measure* "not 1:1". Without a marker
+it waited for ever, and at 125 % / 175 % the view kept a half column missing: the eyes swapped on
+one side of a vertical line. Now, when no marker can be drawn (the calibrator has had an attempt
+end with no marker frame, or `DISPLAYXR_PROV_GV_CALIBRATE=0`) and the geometry read back from Unity
+has said "not 1:1" for one second (`PredictsNotOneToOne`), the size is selected from the
+prediction:
+
+```
+[DisplayXR] whole-pixel Game view: the geometry read from Unity predicts an image that is not drawn 1:1
+  horizontally at 175 % (target 1210.5x601.75 px for a 1211x602 px texture) and it cannot be measured on
+  screen here (Unity was offered the native mirror blit and never calls it: ...) - selecting the whole-pixel size ...
+```
+
+Columns always count (target x zoom against the texture: the numbers the "not drawn 1:1
+horizontally" warning is raised on). Rows count only at 125 / 175 / 225 % (a quarter row, which
+GVFIT cannot fit); at 150 / 250 % GVFIT is exact on the half rows and its verdict on whole rows
+is F1, unverified, so rows alone do not select the size there. Whole scales never do.
+`DISPLAYXR_PROV_GV_WHOLEPIXEL=0` still keeps it off.
+
+### Why the marker is not drawn
+
+`UnityXRMirrorViewBlitDesc::nativeBlitAvailable` only *suggests* the native blit. The scriptable
+pipelines take it up from C# (`XRMirrorView.RenderMirrorView`: `AddGraphicsThreadMirrorViewBlit`
+when `nativeBlitAvailable`). On the **Built-in pipeline** the same build, editor and machine that
+draws the marker under URP shows `MainQueryMirrorViewBlitDesc CALLED` and never
+`native mirror: shader-blit ACTIVE` (175 %, D3D12, Unity 6000.4.0f1, MultiPass): the engine's own
+mirror path queries the descriptor, with a render target, and blits `blitParams` itself. Whether
+it never calls the callback or calls it with something the blit returns on is what the log now
+says, once per session, in `%TEMP%\displayxr_prov_native.log`:
+
+| Line (`[DisplayXR-PROV] native mirror: ...`) | Meaning |
+|---|---|
+| `OFFERED to Unity (nativeBlitAvailable=1; query mode=.. mirrorRtDesc=yes/NULL rtNative=..)` | the first query that offered the native blit. `mirrorRtDesc=NULL`: a scriptable pipeline asked; `yes`: the engine's own mirror path |
+| `BlitToMirrorViewRenderTarget CALLED (mode=.. rtDesc=.. rtNative=.., after N queries ...)` | Unity called the native blit, first time |
+| `shader-blit ACTIVE ...` | it drew |
+| `BlitToMirrorViewRenderTarget returned without drawing: <cause> (reason R, ...)` | it was called and left early; one line per distinct cause: `DISPLAYXR_PROV_NATIVE_MIRROR=0`, no woven texture, no render target descriptor, `rtNative` null, no D3D12 interface (the editor is on D3D11 or Vulkan), no device, `TextureFromRenderBuffer` null, woven texture not open, empty canvas |
+| `... did not draw: the blit pipeline could not be built` / `the command allocator / list ...` | it got as far as drawing and failed |
+| `using IUnityGraphicsD3D12v7 (no v8 in this editor)` | an editor without the v8 interface (2022.3): the blit used to return there; it now runs on v7 |
+| `NEVER CALLED - Unity asked for the mirror blit 240 times, was offered the native blit each time and has not called BlitToMirrorViewRenderTarget once` | this pipeline does not use the native blit |
+
+The calibration line carries the same state:
+`... - the marker was not drawn: Unity was offered the native mirror blit and never calls it: this
+render pipeline (the Built-in one) blits the woven texture itself ... [native mirror blit: offered
+912 times, called 0 times, reason 0]`.
+
+### A marker that does not need the native blit (design, not built)
+
+The marker has to pass through the same draw as the weave to measure where the weave lands.
+Three ways to get one without the native blit, and why none is in this change:
+
+1. **A marker texture in `blitParams`** (the path the Built-in pipeline does use): a texture the
+   size of the woven one with the marker in the canvas rect, registered with `CreateTexture` and
+   swapped in as `blitParams[0].srcTexId` for the marker's frames. It goes through *Unity's*
+   blit with the same source and destination rects as the woven texture, so it measures what the
+   weave does, including any offset that blit adds. Cost: one texture per graphics API
+   (D3D11, D3D12, Vulkan) created and filled natively, kept in step with the canvas size, and the
+   thin strips either baked per request or dropped for the whole image. This is the one to build.
+2. **An editor-side draw into the Game view's texture** after the mirror blit (a full-screen
+   pass whose colour comes from the pixel's own position, as another plug-in's editor weave
+   does on D3D11, D3D12 and Vulkan). Graphics-API independent and all C#. But in the XR path the
+   Game view's texture is written by Unity's mirror blit at a point in the frame no public
+   callback follows on every pipeline (`WaitForEndOfFrame`, `OnGUI` and the pipeline's
+   end-of-frame events each have to be shown to run after it, per pipeline and Unity version);
+   a marker drawn before it is overwritten. And it marks the *texture*, not the weave's path
+   into it: an offset added by the mirror blit would not be seen.
+3. **A D3D11 native mirror blit.** Useless for the Built-in pipeline, which does not call it.
+
+None of them can be checked without a panel and each needs a pass per pipeline, so they are not
+attempted blind. With the placement rule above the marker is a verification, not a
+precondition.
 
 ## A fixed-size or zoomed Game view
 
@@ -437,9 +593,12 @@ had; what was drawn, the reads and the cache state are appended:
 
 A not-1:1 axis reads `W NOT 1:1 (from column 561 the image is -1 px off, 448 px differ)`.
 
-**Where it does not run.** The marker is drawn by the D3D12 native mirror blit, so with D3D11,
-or with `DISPLAYXR_PROV_NATIVE_MIRROR=0`, no marker appears, the line says
-`the marker was not drawn`, and the computed position is used, as before. A floating Game view
+**Where it does not run.** The marker is drawn by the D3D12 native mirror blit, so with the
+**Built-in render pipeline** (Unity does not call that blit there), with D3D11, or with
+`DISPLAYXR_PROV_NATIVE_MIRROR=0`, no marker appears, the line says
+`the marker was not drawn: <why>` ([Why the marker is not drawn](#why-the-marker-is-not-drawn)),
+the computed position is used, and the whole-pixel size is selected from the predicted geometry
+([Placement without a measurement](#placement-without-a-measurement)). A floating Game view
 (present mode) is not calibrated: the runtime presents its own window there. A Game view that
 is not repainting (Play paused) shows no marker and falls back too (expected, not verified). `DISPLAYXR_PROV_GV_CALIBRATE=0` turns calibration off;
 `DISPLAYXR_PROV_GV_CALIB_FULL=1`, `DISPLAYXR_PROV_GV_CALIB_CACHE=0` and `DISPLAYXR_PROV_GV_CALIB_DELAY_MS` are the A/B switches described above.
@@ -610,7 +769,8 @@ Each time the numbers have held for 0.35 s and differ from the last line logged,
 | `H drawn ...` | condition 2, with GVFIT's stretch in the zoom. A mismatch is tagged `predicted, unverified: F1` | `(1:1)` |
 | `texture=WxH glue computed WxH` | the real texture against the size the glue derived from the target (F4) | `(agree)` |
 | `canvas=WxH` | condition 3: what the glue drives the woven canvas to | `(= texture)` |
-| `left border b pt = +n px` | the pane's real left border, from Unity (`EditorWindow.position.x - HostView.screenPosition.x`) | - |
+| `left border b pt = +n px` | the pane's real left border, from Unity (`HostView.borderSize.left`) | 1 pt between two neighbours |
+| `(model: (b + round x) pt x s -> +n, ...)` | the anchor's column as the rule computes it, where `x` came from (`x from Unity` = `targetInView.x`, `x from the widths`, or `image fills the area`), and `HALF-POINT TIE` / `half-pixel tie (taken up)` when it rests on a tie-break | `+n` equals the anchor's `dx`; no tie |
 | `anchor at pane +dx,+dy` | where the glue put the anchor, relative to the pane's top-left | Free Aspect: `dx == n` (F3) |
 | `scale` / `pane dpi` | the measured pane scale and the window's DPI / 96 | equal |
 | `targetInView` / `viewInWindow` | Unity's raw rects in points, for reference (not used for the verdict: they go through `pixelsPerPoint`) | - |
@@ -638,13 +798,13 @@ so it does not repeat on every Play), and never in present mode:
 
 | `DISPLAYXR_PROV_GV_WHOLEPIXEL` | Behaviour |
 |---|---|
-| unset | **automatic**: off until a calibration *measures* an image that is not drawn 1:1 at a fractional scale; then on until the editor quits (so the next Play starts with it). Logged: `whole-pixel Game view: the measured image is not drawn 1:1 horizontally at 175 % - selecting the whole-pixel size ...` |
+| unset | **automatic**: off until a calibration *measures* an image that is not drawn 1:1 at a fractional scale, or, where no marker can be drawn, until the geometry read from Unity has *predicted* it for a second; then on until the editor quits (so the next Play starts with it). Logged: `whole-pixel Game view: the measured image is not drawn 1:1 horizontally at 175 % - selecting the whole-pixel size ...` or `... the geometry read from Unity predicts an image that is not drawn 1:1 ... and it cannot be measured on screen here (...)` |
 | `1` | on from the start at every fractional scale, measured or not (the former opt-in) |
 | `0` | never; a not-1:1 measurement is only logged |
 
 Selecting the size changes the layout, so a second calibration follows and measures the new
-image. With calibration off (`DISPLAYXR_PROV_GV_CALIBRATE=0`, or where the marker is not drawn)
-the automatic mode never turns on: use `=1`.
+image. With calibration off (`DISPLAYXR_PROV_GV_CALIBRATE=0`), or where the marker is not drawn,
+the automatic mode turns on from the prediction.
 
 When it is on (the variable is read once, when the editor starts), during Play, on the main Game view:
 
@@ -657,8 +817,8 @@ When it is on (the variable is read once, when the editor starts), during Play, 
    axis, selected, and the zoom snapped to 1. The image is at most one step smaller than the area
    and centred, with a grey margin.
 3. On that view the driver **skips GVFIT** and computes the anchor as an unstretched letterbox
-   with the pane's real left border (the calibration then replaces that with the measured
-   origin). The whole-pixel size wins there; other Game views and the default path are untouched.
+   with the pane's real left border, `HostView.borderSize.left` (the calibration then replaces
+   that with the measured origin, where it can measure). The whole-pixel size wins there; other Game views and the default path are untouched.
 4. The pre-Play size, zoom and scroll are put back and the custom size removed when Play ends,
    before a domain reload (it comes back afterwards if Play continues), on quit, when the main
    view changes, and when applying it fails part-way - not during Play. Picking another size
@@ -706,7 +866,9 @@ texture). Float noise may flip the rounding, making the rect 0.5 px *wider* inst
 is not 1:1. The whole-pixel experiment is the proposed fix.
 
 **F3. A pane docked at the editor window's left or right edge has one side border, not two.**
-*Arithmetic prediction, unverified on hardware.* The Free Aspect anchor's X is half the slack,
+*Fixed in the arithmetic (the anchor's column comes from the pane's real left border,
+`HostView.borderSize.left`, not from half the slack); the edge layouts are still unverified on
+hardware, and the table below is what the old centring gave.* The Free Aspect anchor's X is half the slack,
 `(slack + 1) / 2`. Between two neighbours at 250 %: slack 5, +3, correct (measured). At an edge:
 
 | Scale | Edge slack | Anchor | Far left: texture, nudge | Far right: texture, nudge |
@@ -718,9 +880,8 @@ The letterbox path has the same assumption (`side = (host - draw) / 2`). The rea
 available from Unity and is what the whole-pixel path already uses; the 1:1 line prints it next to
 the anchor's `dx`.
 
-**F4. The glue's texture size is the rounded target, not the texture.** *The two rounding rules
-are certain (read from the code and from Unity's assembly); the effect on the image is unverified
-on hardware.* The glue uses `Mathf.RoundToInt(target)`, which rounds halves to even; Unity rounds
+**F4. The glue's texture size is the rounded target, not the texture.** *Fixed: the glue rounds
+as Unity does (`TextureSizePx`, halves away from zero). What follows is the finding as it was.* The glue uses `Mathf.RoundToInt(target)`, which rounds halves to even; Unity rounds
 them away from zero. With exact halves they differ wherever the area ends on x.5 with an even
 floor: 859.5 -> 860 both ways (the reference pane), but 860.5 -> 860 for the glue and 861 for
 Unity. That is 275 of the 551 pane heights from 700 to 1250 px at 150 %, 276 at 250 %, and about
@@ -835,6 +996,32 @@ No switch. Press Play with the Game view docked.
 7. Opt-outs: `DISPLAYXR_PROV_GV_CALIBRATE=0` (no flash, no line, computed anchor),
    `DISPLAYXR_PROV_GV_WHOLEPIXEL=0` (at 175 %: `... keeps the whole-pixel size off`).
 8. With D3D11 as the editor's graphics API: `fell back ... the marker was not drawn`.
+
+### Pass M - no marker (Built-in pipeline, D3D11, or `DISPLAYXR_PROV_GV_CALIBRATE=0`)
+
+The placement on its own. Use a **Built-in pipeline** project on D3D12 (no marker is drawn there)
+and, for the comparison, a URP project in the same layout (the marker measures).
+
+1. Built-in, 175 % or 125 %, docked between two panes, no switch. Within three seconds of Play:
+   `GameView calibration: fell back ... - the marker was not drawn: Unity was offered the native
+   mirror blit and never calls it ... [native mirror blit: offered N times, called 0 times, reason 0]`,
+   then `whole-pixel Game view: the geometry read from Unity predicts ... - selecting the
+   whole-pixel size`, then `whole-pixel Game view: selected ...` and a `GameView 1:1:` line with
+   `(1:1)` twice, `(agree)`, `left border 1 pt`, `(model: (1 + round x) pt x 1.75 -> +n, ...)` and
+   `anchor at pane +n` with the same `n`. **No vertical seam, correct depth with nudge 0.** If the
+   depth is uniformly inverted, find the X nudge and send it with the 1:1 line: that is an error
+   of the rule.
+   `%TEMP%\displayxr_prov_native.log` has `native mirror: OFFERED to Unity (... mirrorRtDesc=yes ...)`
+   and, after a few seconds, either `native mirror: NEVER CALLED ...` or
+   `BlitToMirrorViewRenderTarget CALLED ...` followed by one `returned without drawing: ...`.
+2. URP, same scale and layout: the calibration line must read `measured - computed = 0,0 px`
+   (`(agree)`), at every pane width tried. Drag the splitter through a dozen widths: each new
+   width is one more check of the rule against the screen. A line with a non-zero difference,
+   together with its `GameView 1:1:` line, is what to send.
+3. Built-in at 150 % and 250 %: no whole-pixel line (the image is 1:1 without it), anchor as
+   before.
+4. Dock the Game view at the editor window's left edge, then its right edge (URP, so it is
+   measured): `left border 0 pt` at the left edge, `measured - computed = 0,0`.
 
 ### Pass Z - a fixed-size or zoomed Game view
 
@@ -966,7 +1153,11 @@ phases from the present origin on D3D12 it must report `WINDOWLESS_PHASE`, like 
 ### What to send back
 
 For every scale x layout x pass: the `GameView calibration:` line(s), the `GameView 1:1:` line, `GameView glue size change:`,
-`GameView glue matched pane:`, `#740 dock-border:`, any warning, what was seen, and the nudge.
+`GameView glue matched pane:`, `#740 dock-border:` (pane-relative since #459: `BORDER (HostView.borderSize) left .. top ..`,
+`pane-relative: anchor +a, predicted image column +c | anchor-vs-content X error = n px`; the
+former `position*ppp` comparison mixed a global scale into desktop coordinates and read hundreds
+of pixels on a second monitor at another scale), any warning, what was seen, and the nudge.
+From `%TEMP%\displayxr_prov_native.log`: every `native mirror:` line and the `GPU class:` lines.
 With those numbers F1-F5 can each be confirmed or dropped without another session.
 
 ## Not verified without a panel
@@ -999,5 +1190,10 @@ The calibration, as of the change that added it:
 | The marker reaching the screen through Unity's Game view; timing; the measured origin being the right anchor on a panel | **not verified** - Pass 0 |
 | A screen read while the Game view is on an HDR or colour-managed desktop | not verified (the classifier is relative to the brightest channel to allow for it) |
 | D3D11 editor, Vulkan | falls back by design; the fallback line is not verified |
+| The column rule (`ImageLeftPx`) | unit-tested against every logged number (`Tests~/GameViewPlacement`: the 250 % reference, the 150 % field report, three 175 % calibration lines); **not yet run on a panel as shipped** - Pass M |
+| `HostView.borderSize` giving 1 / 0 pt as read from the 6000.4.0f1 assembly; the same member on 2022.3 | **not verified in a running editor** (a warning is logged once if the member is missing, and the side borders are then assumed equal) |
+| The whole-pixel size selected from the prediction, and the weave being right there with no measurement | **not verified** - Pass M step 1 |
+| Why the Built-in pipeline draws no marker | observed: the query is called, the shader blit never becomes active (D3D12, 6000.4.0f1, MultiPass). Which of "never called" and "called and returned" is **not known** until the new `native mirror:` lines are read |
+| The native blit on `IUnityGraphicsD3D12v7` (an editor without v8) | compiles; **not run** |
 | The target rect fed from the measured origin (#471) | unit-tested natively (`texture_target_test`: source change, one line each, restart); **not run in an editor** |
 | How the woven texture reaches a D3D11 Game view (Unity's own mirror blit) | read from the code, **not observed** |
