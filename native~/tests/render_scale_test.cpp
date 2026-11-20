@@ -27,6 +27,7 @@
 //       native~/displayxr_xrprovider/displayxr_provider_render_scale.cpp
 
 #include "displayxr_provider_render_scale.h"
+#include "displayxr_mirror_canvas.h"
 
 #include <math.h>
 #include <stdarg.h>
@@ -491,6 +492,71 @@ test_render_rect_matches_slice(void)
 	m.stop();
 }
 
+// The editor Game view mirror (and the calibration marker drawn through it) is in
+// window / panel pixels: the canvas shown from the woven texture is a function of the
+// pane rect, the zone rect, the window and the woven texture ONLY. Run the session at
+// every scale - the eye texture changes size each time - and the canvas, and the
+// normalised source rect the mirror blit samples, must be the same numbers.
+static void
+test_mirror_independent_of_scale(void)
+{
+	g_rt = FakeRuntime();
+	dxr_prov_set_render_scale(0.0f);
+
+	// Texture mode at 175 %: a 1222x653 pane, the forced full-pane zone, a 3840x2160
+	// woven texture (the layout of the hardware pass that prompted this test).
+	DxrMirrorCanvasIn in = {};
+	in.probe_enabled = 1;
+	in.pane_x = INT32_MIN; in.pane_y = INT32_MIN;
+	in.pane_w = 1222; in.pane_h = 653;
+	in.zone_valid = 1; in.zone_x = 0; in.zone_y = 0; in.zone_w = 1222; in.zone_h = 653;
+	const uint32_t woven_w = 3840, woven_h = 2160;
+
+	Model m;
+	m.base_w = 1222; m.base_h = 653; // zone recommended view size == zone extent
+	m.start();
+	const float scales[] = {1.0f, 0.5f, 1.5f, 0.25f, 2.0f, 0.77f, 1.0f};
+	uint32_t seen_eye_w[7];
+	int i = 0;
+	for (float s : scales) {
+		m.frames(40, s);
+		seen_eye_w[i++] = m.sc_w;
+
+		int32_t x = -1, y = -1, w = -1, h = -1;
+		CHECK(dxr_mirror_canvas(&in, &x, &y, &w, &h) == 1);
+		CHECK(x == 0 && y == 0 && w == 1222 && h == 653);
+		const float src[4] = {(float)x / woven_w, (float)y / woven_h, (float)w / woven_w, (float)h / woven_h};
+		CHECK(src[0] == 0.0f && src[1] == 0.0f && src[2] == 1222.0f / 3840.0f && src[3] == 653.0f / 2160.0f);
+	}
+	// The eye texture really did change under it: 1222, 611, 1833, 306 (305.5 rounded), 2444, 941, 1222.
+	CHECK(seen_eye_w[0] == 1222 && seen_eye_w[1] == 611 && seen_eye_w[2] == 1833 && seen_eye_w[3] == 306);
+	CHECK(seen_eye_w[4] == 2444 && seen_eye_w[5] == 941 && seen_eye_w[6] == 1222);
+	m.stop();
+
+	// The helper's own cases (unchanged behaviour of dxr_prov_get_woven_canvas).
+	int32_t x, y, w, h;
+	// Zone-glue: the pane's published position is the canvas origin; (0,0) is a position.
+	in.pane_x = 640; in.pane_y = 212;
+	CHECK(dxr_mirror_canvas(&in, &x, &y, &w, &h) == 1 && x == 640 && y == 212 && w == 1222 && h == 653);
+	in.pane_x = 0; in.pane_y = 0;
+	CHECK(dxr_mirror_canvas(&in, &x, &y, &w, &h) == 1 && x == 0 && y == 0);
+	// An app-authored sub-pane zone does not shrink the canvas: the pane is shown.
+	in.zone_x = 0; in.zone_y = 77; in.zone_w = 1222; in.zone_h = 576;
+	CHECK(dxr_mirror_canvas(&in, &x, &y, &w, &h) == 1 && y == 0 && w == 1222 && h == 653);
+	// No pane published (or not texture mode): the zone.
+	in.pane_w = 0; in.pane_h = 0;
+	CHECK(dxr_mirror_canvas(&in, &x, &y, &w, &h) == 1 && x == 0 && y == 77 && w == 1222 && h == 576);
+	in.pane_w = 1222; in.pane_h = 653; in.probe_enabled = 0;
+	CHECK(dxr_mirror_canvas(&in, &x, &y, &w, &h) == 1 && y == 77 && h == 576);
+	// Neither: the caller's fallback - the window, else the whole woven texture.
+	in.zone_valid = 0;
+	CHECK(dxr_mirror_canvas(&in, &x, &y, &w, &h) == 0 && x == 0 && y == 0 && w == 0 && h == 0);
+	dxr_mirror_canvas_fallback(1600, 900, woven_w, woven_h, &w, &h);
+	CHECK(w == 1600 && h == 900);
+	dxr_mirror_canvas_fallback(0, 0, woven_w, woven_h, &w, &h);
+	CHECK(w == 3840 && h == 2160);
+}
+
 int
 main(void)
 {
@@ -499,6 +565,7 @@ main(void)
 	test_extent();
 	test_session_flow();
 	test_render_rect_matches_slice();
+	test_mirror_independent_of_scale(); // last: test_session_flow starts from "nobody asked"
 	if (g_fail) {
 		fprintf(stderr, "render_scale_test: %d of %d checks FAILED\n", g_fail, g_checks);
 		return 1;

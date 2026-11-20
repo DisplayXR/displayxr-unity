@@ -19,6 +19,7 @@
 #include "displayxr_provider_input.h" // OpenXR actions: controllers + styluses as Unity InputDevices
 #include "displayxr_provider_texture_target.h" // win32_window_binding v9: editor texture target (#471)
 #include "displayxr_provider_render_scale.h"   // render scale: base size -> allocated eye size (#475)
+#include "displayxr_mirror_canvas.h"           // Game view mirror canvas: window / panel px only
 #include "../displayxr_shared_state.h" // displayxr_state_set_stereo_matrices (overlay hit-test)
 #include "../displayxr_window_space_ui.h" // DXR_WSUI_MAX_SLOTS, get_pending_slot
 #include <atomic>     // s_session_generation (#336)
@@ -4545,22 +4546,22 @@ void dxr_prov_get_woven_canvas(int32_t *x, int32_t *y, int32_t *cw, int32_t *ch,
 	// with a 2D band above it), sampling the zone and stretching it over the Game view
 	// (destRect is the whole RT) magnifies the band — which breaks the lenticular
 	// interlace and hides the 2D bands entirely.
+	//
+	// The arithmetic is in displayxr_mirror_canvas.h, whose inputs are window / panel
+	// pixels only. The eye swapchain size and the render scale (#475) are not inputs:
+	// how many pixels an eye was rendered at never moves or resizes the mirror.
+	DxrMirrorCanvasIn in = {};
+	in.probe_enabled = s_probe_enabled ? 1 : 0;
+	in.pane_x = s_gv_panel_x; in.pane_y = s_gv_panel_y;
+	in.pane_w = s_gv_panel_w; in.pane_h = s_gv_panel_h;
+	in.zone_valid = s_ps.zone_valid ? 1 : 0;
+	in.zone_x = s_ps.zone_x; in.zone_y = s_ps.zone_y;
+	in.zone_w = s_ps.zone_w; in.zone_h = s_ps.zone_h;
 	int32_t rx = 0, ry = 0;
 	int32_t rw = 0, rh = 0;
-	if (s_probe_enabled && s_gv_panel_w > 0 && s_gv_panel_h > 0) {
-		// Zone-glue publishes the pane's screen position; legacy window-glue doesn't
-		// (the weave window origin carries it) → pane sits at the texture top-left.
-		rx = (s_gv_panel_x != INT32_MIN) ? s_gv_panel_x : 0;
-		ry = (s_gv_panel_y != INT32_MIN) ? s_gv_panel_y : 0;
-		rw = s_gv_panel_w; rh = s_gv_panel_h;
-	} else if (s_ps.zone_valid && s_ps.zone_w > 0 && s_ps.zone_h > 0) {
-		rx = s_ps.zone_x; ry = s_ps.zone_y;
-		rw = s_ps.zone_w; rh = s_ps.zone_h;
-	}
-	if (rw <= 0 || rh <= 0) {
+	if (!dxr_mirror_canvas(&in, &rx, &ry, &rw, &rh)) {
 		uint32_t ww = 0, wh = 0; ps_window_size(&ww, &wh);
-		rw = ww ? (int32_t)ww : (int32_t)s_probe_woven_w;
-		rh = wh ? (int32_t)wh : (int32_t)s_probe_woven_h;
+		dxr_mirror_canvas_fallback(ww, wh, s_probe_woven_w, s_probe_woven_h, &rw, &rh);
 	}
 	if (x)  *x  = rx;
 	if (y)  *y  = ry;

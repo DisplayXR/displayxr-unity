@@ -154,6 +154,7 @@ list(APPEND HEADERS displayxr_xrprovider/displayxr_provider_mcp.h)
 list(APPEND HEADERS displayxr_xrprovider/displayxr_provider_desktop.h)
 list(APPEND HEADERS displayxr_xrprovider/displayxr_provider_texture_target.h)
 list(APPEND HEADERS displayxr_xrprovider/displayxr_provider_render_scale.h)
+list(APPEND HEADERS displayxr_xrprovider/displayxr_mirror_canvas.h)
 
 if(WIN32)
     list(APPEND SOURCES displayxr_win32.c displayxr_gpu_preference.cpp)

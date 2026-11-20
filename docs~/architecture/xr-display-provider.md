@@ -447,6 +447,12 @@ target, applied scale, base and allocated size, runtime maximum, allocation coun
 clamp flags). Fake-runtime test: `native~/tests/render_scale_test.cpp`; managed
 rules: `Tests~/RenderScale`.
 
+The Game view mirror and the calibration marker drawn through it take their sizes
+from the mirror render target and from the mirror canvas
+(`displayxr_mirror_canvas.h`: pane rect, zone rect, window, woven texture). The eye
+size is not an input to either, and the same test runs a session at seven scales
+and requires the canvas and the blit's source rect to be the same numbers each time.
+
 ## Android (arm64, Vulkan) — #418
 
 The Android arm follows the **desktop Linux Vulkan** arm: the same own-device + bridge model, the same render-path table (URP/HDRP SPI, BiRP MultiPass), the same provider/session code with `__ANDROID__` arms wherever a plain `#else` would have picked the Metal or Windows path. Android-only glue is in `native~/displayxr_android.{h,cpp}` (logcat tag `DisplayXRUnity`) and `Runtime/Plugins/Android/DisplayXR.androidlib` (manifest entries + the `DisplayXRSurface` Java helper). Design and decisions D1–D7: issue #418; device results: PR #419.
