@@ -18,6 +18,8 @@
 #include "displayxr_provider_hands.h" // XR_EXT_hand_tracking: 26-joint hands for the XR Hands subsystem
 #include "displayxr_provider_input.h" // OpenXR actions: controllers + styluses as Unity InputDevices
 #include "displayxr_provider_texture_target.h" // win32_window_binding v9: editor texture target (#471)
+#include "displayxr_provider_render_scale.h"   // render scale: base size -> allocated eye size (#475)
+#include "displayxr_mirror_canvas.h"           // Game view mirror canvas: window / panel px only
 #include "../displayxr_shared_state.h" // displayxr_state_set_stereo_matrices (overlay hit-test)
 #include "../displayxr_window_space_ui.h" // DXR_WSUI_MAX_SLOTS, get_pending_slot
 #include <atomic>     // s_session_generation (#336)
@@ -651,6 +653,10 @@ typedef struct ProviderSession {
 	XrSwapchain swapchain;
 	uint32_t    sc_width, sc_height, sc_array, sc_image_count;
 	uint32_t    sc_view_count;   // views to SUBMIT (1=2D, 2=3D); arraySize stays 2
+	// Render scale the primary swapchain was ALLOCATED with (#475). The per-frame
+	// render rect uses this one, not the live request, so a scale change in flight
+	// (settling / debouncing) never turns the render into a sub-rect of the slice.
+	float       sc_scale;
 	int64_t     sc_format;
 #ifdef _WIN32
 	XrSwapchainImageD3D12KHR sc_images[PS_MAX_SWAPCHAIN_IMAGES];
@@ -1578,6 +1584,14 @@ static int ps_create_swapchain(void)
 	if (w == 0 || h == 0) { w = s_ps.display_info.pixel_width / 2; h = s_ps.display_info.pixel_height; }
 	if (w == 0 || h == 0) { w = 1920; h = 1080; }
 
+	// Render scale (#475): the eye textures are base x scale. Only the swapchain and
+	// its bridge(s) take the scale - the zone rect, the window and the weave target
+	// stay in window px, so the runtime scales each view into its atlas. Exactly 1.0
+	// is the identity (w/h untouched).
+	const uint32_t base_w = w, base_h = h;
+	const float render_scale = dxr_rs_target();
+	dxr_rs_scale_extent(render_scale, base_w, base_h, &w, &h);
+
 	uint32_t fmt_count = 0;
 	s_ps.pfn_enumerate_swapchain_formats(s_ps.session, 0, &fmt_count, NULL);
 	if (fmt_count == 0) { ps_log("[DisplayXR-PROV] No swapchain formats\n"); return 0; }
@@ -1692,6 +1706,8 @@ static int ps_create_swapchain(void)
 	// active view count only governs how many views we SUBMIT (#172 P4).
 	s_ps.sc_width = w; s_ps.sc_height = h; s_ps.sc_array = 2;
 	s_ps.sc_view_count = ps_active_view_count(); s_ps.sc_format = format;
+	s_ps.sc_scale = render_scale;
+	dxr_rs_note_primary_allocated(render_scale, base_w, base_h, w, h);
 
 	uint32_t count = 0;
 	s_ps.pfn_enumerate_swapchain_images(s_ps.swapchain, 0, &count, NULL);
@@ -2645,6 +2661,9 @@ static void ps_primary_target_size(uint32_t *out_w, uint32_t *out_h)
 		float sx = 0.5f, sy = 0.5f; ps_active_view_scale(&sx, &sy);
 		w = (uint32_t)(ww * sx); h = (uint32_t)(wh * sy);
 	}
+	// Render scale (#475): a changed scale is a changed target size, so it rides the
+	// same debounced live realloc as a window resize. (A zero base stays zero.)
+	dxr_rs_scale_extent(dxr_rs_target(), w, h, &w, &h);
 	*out_w = w; *out_h = h;
 }
 
@@ -3702,6 +3721,7 @@ static int ps_create_extra_zone(ProviderExtraZone *z)
 	ps_query_extra_zone_rec(z);
 	uint32_t w = z->rec_w, h = z->rec_h;
 	if (w == 0 || h == 0) return 0;
+	dxr_rs_scale_extent(dxr_rs_target(), w, h, &w, &h); // render scale (#475): zone eye textures too
 
 	uint32_t fmt_count = 0;
 	s_ps.pfn_enumerate_swapchain_formats(s_ps.session, 0, &fmt_count, NULL);
@@ -3750,6 +3770,7 @@ static int ps_create_extra_zone(ProviderExtraZone *z)
 	ps_query_extra_zone_rec(z);
 	uint32_t w = z->rec_w, h = z->rec_h;
 	if (w == 0 || h == 0) return 0;
+	dxr_rs_scale_extent(dxr_rs_target(), w, h, &w, &h); // render scale (#475): zone eye textures too
 
 	uint32_t fmt_count = 0;
 	s_ps.pfn_enumerate_swapchain_formats(s_ps.session, 0, &fmt_count, NULL);
@@ -3871,6 +3892,7 @@ static void ps_reconcile_extra_zones(void)
 		ps_query_extra_zone_rec(z);
 		uint32_t tw = z->rec_w, th = z->rec_h;
 		if (tw == 0 || th == 0) continue;
+		dxr_rs_scale_extent(dxr_rs_target(), tw, th, &tw, &th); // render scale (#475)
 		if (tw == z->sc_width && th == z->sc_height) {
 			z->realloc_pending_w = 0; z->realloc_pending_h = 0; z->realloc_stable = 0;
 			continue;
@@ -4524,22 +4546,22 @@ void dxr_prov_get_woven_canvas(int32_t *x, int32_t *y, int32_t *cw, int32_t *ch,
 	// with a 2D band above it), sampling the zone and stretching it over the Game view
 	// (destRect is the whole RT) magnifies the band — which breaks the lenticular
 	// interlace and hides the 2D bands entirely.
+	//
+	// The arithmetic is in displayxr_mirror_canvas.h, whose inputs are window / panel
+	// pixels only. The eye swapchain size and the render scale (#475) are not inputs:
+	// how many pixels an eye was rendered at never moves or resizes the mirror.
+	DxrMirrorCanvasIn in = {};
+	in.probe_enabled = s_probe_enabled ? 1 : 0;
+	in.pane_x = s_gv_panel_x; in.pane_y = s_gv_panel_y;
+	in.pane_w = s_gv_panel_w; in.pane_h = s_gv_panel_h;
+	in.zone_valid = s_ps.zone_valid ? 1 : 0;
+	in.zone_x = s_ps.zone_x; in.zone_y = s_ps.zone_y;
+	in.zone_w = s_ps.zone_w; in.zone_h = s_ps.zone_h;
 	int32_t rx = 0, ry = 0;
 	int32_t rw = 0, rh = 0;
-	if (s_probe_enabled && s_gv_panel_w > 0 && s_gv_panel_h > 0) {
-		// Zone-glue publishes the pane's screen position; legacy window-glue doesn't
-		// (the weave window origin carries it) → pane sits at the texture top-left.
-		rx = (s_gv_panel_x != INT32_MIN) ? s_gv_panel_x : 0;
-		ry = (s_gv_panel_y != INT32_MIN) ? s_gv_panel_y : 0;
-		rw = s_gv_panel_w; rh = s_gv_panel_h;
-	} else if (s_ps.zone_valid && s_ps.zone_w > 0 && s_ps.zone_h > 0) {
-		rx = s_ps.zone_x; ry = s_ps.zone_y;
-		rw = s_ps.zone_w; rh = s_ps.zone_h;
-	}
-	if (rw <= 0 || rh <= 0) {
+	if (!dxr_mirror_canvas(&in, &rx, &ry, &rw, &rh)) {
 		uint32_t ww = 0, wh = 0; ps_window_size(&ww, &wh);
-		rw = ww ? (int32_t)ww : (int32_t)s_probe_woven_w;
-		rh = wh ? (int32_t)wh : (int32_t)s_probe_woven_h;
+		dxr_mirror_canvas_fallback(ww, wh, s_probe_woven_w, s_probe_woven_h, &rw, &rh);
 	}
 	if (x)  *x  = rx;
 	if (y)  *y  = ry;
@@ -4669,6 +4691,9 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	// Texture target binding (#471): a new decision per session; the rect C# pushed
 	// lives in that TU's own statics, so it survives this memset and a restart.
 	dxr_tt_on_session_starting(ps_log);
+	// Render scale (#475): the app's number and Unity's last hint live in that TU's
+	// statics too, so a restarted session allocates at the right size straight away.
+	dxr_rs_on_session_starting(ps_log);
 	s_ps.single_pass = saved_single_pass;
 	s_ps.single_pass_set = saved_single_pass_set;
 	s_ps.transparent_requested = saved_transparent;
@@ -5203,6 +5228,10 @@ int dxr_prov_session_start(const char *runtime_json_path,
 	sp.next = dxr_tt_chain_system_properties(sp.next);
 	const XrResult sp_result = s_ps.pfn_get_system_properties(s_ps.instance, s_ps.system_id, &sp);
 	dxr_tt_on_system_properties(XR_SUCCEEDED(sp_result) ? 1 : 0);
+	// Render scale (#475): the largest image the runtime takes bounds a scale above 1.
+	dxr_rs_on_system(s_ps.instance, s_ps.system_id, s_ps.gipa,
+	                 XR_SUCCEEDED(sp_result) ? sp.graphicsProperties.maxSwapchainImageWidth : 0,
+	                 XR_SUCCEEDED(sp_result) ? sp.graphicsProperties.maxSwapchainImageHeight : 0);
 	if (XR_SUCCEEDED(sp_result)) {
 		s_ps.system_hand_tracking = (s_ps.has_hand_tracking && htp.supportsHandTracking == XR_TRUE) ? 1 : 0;
 		s_ps.display_info.width_m = di.displaySizeMeters.width;
@@ -6240,6 +6269,7 @@ void dxr_prov_session_stop(void)
 	ps_free_content_mask();
 	ps_cursor_session_reset();
 	dxr_tt_on_session_stopped(); // (#471) the pushed rect survives; the decision does not
+	dxr_rs_on_session_stopped(); // (#475) the app's scale + Unity's hint survive; the rest does not
 	memset(&s_ps, 0, sizeof(s_ps));
 	s_ps.runtime_lib = lib;
 }
@@ -7077,6 +7107,9 @@ int dxr_prov_begin_frame(uint32_t *out_image_index, int *out_should_render)
 		float sx, sy; ps_active_view_scale(&sx, &sy);
 		uint32_t rw = (uint32_t)(ww * sx);
 		uint32_t rh = (uint32_t)(wh * sy);
+		// Render scale (#475): at the scale the swapchain was ALLOCATED with, so the
+		// rect keeps matching the slice while a new scale is still settling.
+		dxr_rs_scale_extent(s_ps.sc_scale > 0.0f ? s_ps.sc_scale : 1.0f, rw, rh, &rw, &rh);
 		if (rw == 0) rw = 1;
 		if (rh == 0) rh = 1;
 		if (s_ps.sc_width  && rw > s_ps.sc_width)  rw = s_ps.sc_width;

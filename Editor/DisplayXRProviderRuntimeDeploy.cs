@@ -68,6 +68,7 @@ namespace DisplayXR.Editor
 
                 CopyFileInto(dllSrc, Path.Combine(dataDir, "Plugins", "x86_64", "displayxr_unity.dll"));
                 CopyFileInto(manifestSrc, Path.Combine(dataDir, "UnitySubsystems", SubsystemName, "UnitySubsystemsManifest.json"));
+                WritePlayerSettings(dataDir);
             }
             else if (platform == BuildTarget.StandaloneOSX)
             {
@@ -77,6 +78,7 @@ namespace DisplayXR.Editor
                 CopyBundleInto(bundleSrc, Path.Combine(outputPath, "Contents", "PlugIns", "displayxr_unity.bundle"));
                 CopyFileInto(manifestSrc, Path.Combine(outputPath, "Contents", "Resources", "Data",
                     "UnitySubsystems", SubsystemName, "UnitySubsystemsManifest.json"));
+                WritePlayerSettings(Path.Combine(outputPath, "Contents", "Resources", "Data"));
             }
             else if (platform == BuildTarget.StandaloneLinux64)
             {
@@ -103,12 +105,27 @@ namespace DisplayXR.Editor
                 bool transparent = settings != null && settings.transparentOverlay;
                 WriteTextInto(Path.Combine(dataDir, "DisplayXR", "linux_player.json"),
                               "{\n  \"transparent_overlay\": " + (transparent ? "true" : "false") + "\n}\n");
+                WritePlayerSettings(dataDir);
                 // The launcher that picks native Wayland or X11 at launch time
                 // (Editor/DisplayXRLinuxLauncher.sh): <name>.sh next to the player,
                 // for the app's .desktop Exec= line.
                 WriteLinuxLauncher(pkgRoot, exeDir, exeName, Path.GetFileName(outputPath));
             }
             // Other standalone targets are not shipped for the provider today.
+        }
+
+        /// <summary>
+        /// Settings-asset values a built player reads at XR initialization (#475): the
+        /// Render Scale. Always written - with 0 ("not set") when there is no asset or
+        /// the override is off - so a rebuild into the same folder never leaves the
+        /// previous build's value behind. Read by <c>DisplayXRProvider.InitRenderScale</c>.
+        /// </summary>
+        static void WritePlayerSettings(string dataDir)
+        {
+            var settings = DisplayXRManifestSettings.Find();
+            float renderScale = settings != null ? settings.renderScale : DisplayXRRenderScaleMath.Unset;
+            WriteTextInto(Path.Combine(dataDir, DisplayXRRenderScaleMath.PlayerSettingsFile.Replace('/', Path.DirectorySeparatorChar)),
+                          DisplayXRRenderScaleMath.ToPlayerSettingsJson(renderScale));
         }
 
         static void WriteLinuxLauncher(string pkgRoot, string exeDir, string exeName, string playerFile)

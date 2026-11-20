@@ -488,6 +488,12 @@ Look for:
 ## Next Steps
 
 - **Tune the stereo parameters** — see the [Stereo Tunables Reference](../README.md#stereo-tunables-reference) for what each parameter does physically.
+- **Trade resolution for frame rate, or supersample** — set the render scale. Any of these works; the first one that is set wins:
+  - from code, `DisplayXRProvider.RenderScale = 0.75f;` (0.25 to 2; set 0 or call `ClearRenderScale()` to hand the decision back),
+  - without code, **Window > DisplayXR > Manifest Settings > Rendering > Override Render Scale**,
+  - Unity's own knob: `XRSettings.eyeTextureResolutionScale`, or the **Render Scale** slider of the URP asset.
+
+  Below 1 renders fewer pixels per view; above 1 renders more and gives cleaner edges. The picture on the display keeps its size, and 2D UI layers are not affected. The log line `render scale: eye texture 1440x810 = base 1920x1080 x 0.75` confirms what was allocated. Details: [Render scale](architecture/xr-display-provider.md#render-scale-475).
 - **Add a 2D UI overlay** — see [2D UI Overlay](../README.md#2d-ui-overlay) for routing a Canvas to a compositor layer.
 - **Preview in the editor** — just press Play; the provider weaves to a dedicated window on the DisplayXR display (there is no separate preview window).
 - **Deploy to end users** — see [Deploying to End Users](../README.md#deploying-to-end-users) for runtime installation on target machines.

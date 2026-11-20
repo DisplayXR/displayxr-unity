@@ -117,6 +117,9 @@ set(SOURCES
     # mode (#471). Platform-neutral logic (Win32 only in its default resolver), so it
     # is compiled everywhere and its fake-runtime test runs on any host.
     displayxr_xrprovider/displayxr_provider_texture_target.cpp
+    # Render scale (#475): eye texture size = base x scale. Pure arithmetic +
+    # source precedence + settle timer; its fake-runtime test runs on any host.
+    displayxr_xrprovider/displayxr_provider_render_scale.cpp
     # OpenXR actions -> UnityEngine.XR InputDevices (controllers + styluses of any
     # DisplayXR input provider): the action binding + the IUnityXRInput provider.
     displayxr_xrprovider/displayxr_provider_input.cpp
@@ -150,6 +153,8 @@ list(APPEND HEADERS displayxr_xrprovider/displayxr_provider_session.h)
 list(APPEND HEADERS displayxr_xrprovider/displayxr_provider_mcp.h)
 list(APPEND HEADERS displayxr_xrprovider/displayxr_provider_desktop.h)
 list(APPEND HEADERS displayxr_xrprovider/displayxr_provider_texture_target.h)
+list(APPEND HEADERS displayxr_xrprovider/displayxr_provider_render_scale.h)
+list(APPEND HEADERS displayxr_xrprovider/displayxr_mirror_canvas.h)
 
 if(WIN32)
     list(APPEND SOURCES displayxr_win32.c displayxr_gpu_preference.cpp)
@@ -490,4 +495,12 @@ if(DISPLAYXR_BUILD_TESTS)
     target_compile_features(texture_target_test PRIVATE cxx_std_17)
     target_link_libraries(texture_target_test PRIVATE Threads::Threads)
     add_test(NAME texture_target COMMAND texture_target_test)
+
+    # Render scale (#475): the size a swapchain is created at for a given hint /
+    # app value / environment override, against a fake runtime's size limits.
+    add_executable(render_scale_test tests/render_scale_test.cpp displayxr_xrprovider/displayxr_provider_render_scale.cpp)
+    target_include_directories(render_scale_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/displayxr_xrprovider ${OPENXR_INCLUDE_DIR})
+    target_compile_features(render_scale_test PRIVATE cxx_std_17)
+    target_link_libraries(render_scale_test PRIVATE Threads::Threads)
+    add_test(NAME render_scale COMMAND render_scale_test)
 endif()

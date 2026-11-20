@@ -358,6 +358,101 @@ and has no real window geometry (the tracking origin floats to standing height).
 Use it only for bring-up/diagnostics. If the app-owned overlay HWND fails to
 create, GfxStart also falls back to self-host as a safety net.
 
+## Render scale (#475)
+
+The per-eye render textures are allocated at `base x scale`. `base` is what the
+provider always used: window px x the active mode's view scale, or a 3D zone's
+recommended view size. `scale` is one number, 0.25 to 2. Below 1 trades resolution
+for frame rate; above 1 supersamples, which is also the practical answer to
+silhouette aliasing where MSAA does not reach the eye texture (#121). The submitted
+`imageRect` is the whole (scaled) slice, and the runtime scales each view into its
+atlas, so the woven picture keeps its size.
+
+**What is scaled, and what is not.** The primary eye swapchain and its bridge(s),
+and every extra 3D zone's swapchain and bridge(s). Nothing else:
+
+| Stays in window / panel pixels | Why it is unaffected |
+|---|---|
+| Zone rects (`XrDisplayZoneDXR`), the canvas, the window | They say where the picture goes, not how many pixels were rendered for it |
+| The editor texture-mode weave target and the Game view mirror | Separate texture, sized by the pane; the 1:1 weave-to-screen invariant of [editor-game-view-placement.md](editor-game-view-placement.md) holds |
+| Window-space UI and Local2D layers | Own swapchains, sized from the registered texture |
+| Click-through mask, content mask, stereo picking | Window-normalised or window-pixel |
+| Depth cursor and auto-convergence patches | Sampled in UV over the eye texture; the patch covers the same part of the view at any scale |
+
+**Where the number comes from**, highest priority first:
+
+1. `DISPLAYXR_RENDER_SCALE` (environment, read at every session start): a harness
+   and support override. It is read with `getenv`, so set it before the process
+   starts (a managed `Environment.SetEnvironmentVariable` is not seen; use
+   `dxr_prov_set_env` if it must be set in-process).
+2. The app: `DisplayXRProvider.RenderScale`, or the **Override Render Scale** field
+   of the DisplayXR settings asset (`Window > DisplayXR > Manifest Settings`,
+   section *Rendering*). The code value wins over the asset. The asset's value is
+   pushed when Play Mode starts, and stored in `<Data>/DisplayXR/player_settings.json`
+   by the build for Windows, macOS and Linux players (an Android build has no such
+   file: set the property from code there).
+3. Unity's hint, `UnityXRFrameSetupHints::appSetup.textureResolutionScale`. This
+   is what `XRSettings.eyeTextureResolutionScale` and the **URP asset's Render
+   Scale** feed, so both work with no plug-in code. URP writes its asset's value
+   over `XRSettings.eyeTextureResolutionScale` every frame, which is why
+   `DisplayXRProvider.RenderScale` is its own override and not a forward to that
+   property.
+4. 1.0.
+
+**Limits.** The request is clamped to 0.25..2 and rounded to 1/100. A scale above 1
+whose size exceeds the runtime's maximum image size (the tighter of the view
+configuration's `maxImageRect` and the system's `maxSwapchainImage`) is reduced
+uniformly, keeping the aspect, and never below the unscaled base. Exactly 1.0 is
+the identity: the base size bit for bit, no limit applied, so a project that never
+touches the scale allocates exactly what it did before.
+
+**Reallocation.** A scale change is a change of target size, so it rides the live
+tile realloc (#172) that a window resize uses, on every backend, with the same
+GPU drain, graveyard and Unity texture rewrap. Two debounces apply in sequence: a
+changed request becomes the target only after it has held still for 250 ms (an
+animated scale reallocates once, when it stops; the first hint of a session is
+taken at once), then the usual 6 stable frames. The per-frame render rect is taken
+at the scale the swapchain was **allocated** with, not the live request, so a
+scale in flight never turns the render into a sub-rect of the slice.
+
+**Restart.** The app's value, Unity's last hint and the environment override live
+in the render-scale TU's own statics (`displayxr_provider_render_scale.cpp`), not
+in the per-session state, so a dock / undock restart creates its swapchain at the
+scaled size straight away.
+
+**`XRSettings.renderViewportScale` is not honoured.** It would be the cheaper
+dynamic path (a sub-rect of the same texture, no reallocation), but the provider
+owns `viewportRect`, and whether Unity's viewport origin and the submitted
+`imageRect` origin agree for a sub-rect was the open question of #143 and has not
+been re-measured on the provider. The provider logs one line when an app sets it.
+
+**Log lines** (`displayxr_prov_native.log` / the Player log):
+
+```
+[DisplayXR-PROV] render scale: runtime maximum image 3840x2160 (view configuration 3840x2160, system 16384x16384; 0 = not reported)
+[DisplayXR-PROV] render scale: request 0.50 (source=unity)        # source = default | unity | app | env
+[DisplayXR-PROV] render scale: target 1.00 -> 0.50 (request held for 250 ms)
+[DisplayXR-PROV] realloc: primary target 1920x1080 -> 960x540 (settled)
+[DisplayXR-PROV] render scale: eye texture 960x540 = base 1920x1080 x 0.50 (source=unity, allocation #2)
+[DisplayXR-PROV] realloc: primary swapchain+bridge recreated -> 960x540 (OK)
+```
+
+A reduced size adds `[2.00 asked; reduced to the runtime maximum 3840x2160]` to the
+`eye texture` line. The runtime may log `VIEW SIZE MISMATCH` a few times at a scale
+other than 1: that is its note that the app's rect differs from its own view size,
+which is the point here.
+
+`DisplayXRProvider.TryGetRenderScaleState` returns the same facts (request, source,
+target, applied scale, base and allocated size, runtime maximum, allocation count,
+clamp flags). Fake-runtime test: `native~/tests/render_scale_test.cpp`; managed
+rules: `Tests~/RenderScale`.
+
+The Game view mirror and the calibration marker drawn through it take their sizes
+from the mirror render target and from the mirror canvas
+(`displayxr_mirror_canvas.h`: pane rect, zone rect, window, woven texture). The eye
+size is not an input to either, and the same test runs a session at seven scales
+and requires the canvas and the blit's source rect to be the same numbers each time.
+
 ## Android (arm64, Vulkan) — #418
 
 The Android arm follows the **desktop Linux Vulkan** arm: the same own-device + bridge model, the same render-path table (URP/HDRP SPI, BiRP MultiPass), the same provider/session code with `__ANDROID__` arms wherever a plain `#else` would have picked the Metal or Windows path. Android-only glue is in `native~/displayxr_android.{h,cpp}` (logcat tag `DisplayXRUnity`) and `Runtime/Plugins/Android/DisplayXR.androidlib` (manifest entries + the `DisplayXRSurface` Java helper). Design and decisions D1–D7: issue #418; device results: PR #419.
