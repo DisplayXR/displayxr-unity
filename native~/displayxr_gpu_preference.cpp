@@ -16,6 +16,7 @@
 #include <windows.h>
 #include <stdlib.h>
 #include <stdint.h>
+#include <stdio.h>
 #include <dxgi1_4.h>
 
 // NVIDIA Optimus and AMD PowerXpress drivers look for the symbols below in the
@@ -37,6 +38,8 @@ extern "C" {
 // its device getters have internal linkage, so this is the bridge). Valid from
 // UnityPluginLoad onward, i.e. well before the XR loader's Initialize().
 extern "C" int dxr_prov_unity_adapter_luid(int32_t *out_high, uint32_t *out_low);
+// The provider's log (displayxr_display_provider.cpp): %TEMP%\displayxr_prov_native.log.
+extern "C" void dxr_prov_file_log(const char *s);
 
 // Adapter class, matching the runtime's igpu/dgpu keywords.
 enum { DXR_GPU_UNKNOWN = 0, DXR_GPU_INTEGRATED = 1, DXR_GPU_DISCRETE = 2 };
@@ -67,12 +70,38 @@ extern "C" __declspec(dllexport) int dxr_prov_unity_gpu_class(void)
 	if (FAILED(CreateDXGIFactory1(__uuidof(IDXGIFactory1), (void **)&factory)) || !factory)
 		return DXR_GPU_UNKNOWN;
 
+	// (#459) A field report had "Auto -> igpu (matched to Unity's adapter)" on a laptop whose
+	// editor ran on the discrete GPU. What this function saw is not in any log, so it is
+	// now: every adapter with its dedicated VRAM and LUID, Unity's LUID and the verdict,
+	// once per process.
+	static bool s_listed = false;
+	const bool list = !s_listed;
+	s_listed = true;
+	char line[320];
+	if (list) {
+		snprintf(line, sizeof(line), "[DisplayXR-PROV] GPU class: Unity's adapter LUID %08lx:%08lx\n",
+		         (unsigned long)unity.HighPart, (unsigned long)unity.LowPart);
+		dxr_prov_file_log(line);
+	}
+
 	LUID lo_luid = {}, hi_luid = {};
 	SIZE_T lo_vram = 0, hi_vram = 0;
 	int hw_count = 0;
 	IDXGIAdapter1 *ad = NULL;
 	for (UINT i = 0; factory->EnumAdapters1(i, &ad) != DXGI_ERROR_NOT_FOUND; i++) {
 		DXGI_ADAPTER_DESC1 desc = {};
+		if (list && SUCCEEDED(ad->GetDesc1(&desc))) {
+			char name[128] = "";
+			WideCharToMultiByte(CP_UTF8, 0, desc.Description, -1, name, sizeof(name), NULL, NULL);
+			name[sizeof(name) - 1] = 0;
+			snprintf(line, sizeof(line), "[DisplayXR-PROV] GPU class: adapter %u \"%s\" dedicated VRAM %llu MB "
+			         "LUID %08lx:%08lx%s%s\n", i, name,
+			         (unsigned long long)(desc.DedicatedVideoMemory >> 20),
+			         (unsigned long)desc.AdapterLuid.HighPart, (unsigned long)desc.AdapterLuid.LowPart,
+			         (desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE) ? " SOFTWARE (ignored)" : "",
+			         (desc.AdapterLuid.HighPart == unity.HighPart && desc.AdapterLuid.LowPart == unity.LowPart) ? " <- Unity" : "");
+			dxr_prov_file_log(line);
+		}
 		if (SUCCEEDED(ad->GetDesc1(&desc)) && !(desc.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
 			if (hw_count == 0 || desc.DedicatedVideoMemory < lo_vram) {
 				lo_vram = desc.DedicatedVideoMemory; lo_luid = desc.AdapterLuid;
@@ -87,12 +116,26 @@ extern "C" __declspec(dllexport) int dxr_prov_unity_gpu_class(void)
 	}
 	factory->Release();
 
-	if (hw_count < 2) return DXR_GPU_UNKNOWN; // single-GPU: nothing can diverge
-	if (unity.HighPart == lo_luid.HighPart && unity.LowPart == lo_luid.LowPart)
-		return DXR_GPU_INTEGRATED;
-	if (unity.HighPart == hi_luid.HighPart && unity.LowPart == hi_luid.LowPart)
-		return DXR_GPU_DISCRETE;
-	return DXR_GPU_UNKNOWN; // 3+ adapters and Unity is on a middle one
+	int cls = DXR_GPU_UNKNOWN; // single-GPU: nothing can diverge; 3+ adapters and Unity on a middle one
+	if (hw_count >= 2) {
+		if (unity.HighPart == lo_luid.HighPart && unity.LowPart == lo_luid.LowPart)
+			cls = DXR_GPU_INTEGRATED;
+		else if (unity.HighPart == hi_luid.HighPart && unity.LowPart == hi_luid.LowPart)
+			cls = DXR_GPU_DISCRETE;
+		// Every hardware adapter reporting the same dedicated VRAM leaves "least" and "most"
+		// on the same adapter: there is no order to classify by.
+		if (lo_luid.HighPart == hi_luid.HighPart && lo_luid.LowPart == hi_luid.LowPart)
+			cls = DXR_GPU_UNKNOWN;
+	}
+	if (list) {
+		snprintf(line, sizeof(line), "[DisplayXR-PROV] GPU class: %d hardware adapters, least VRAM %llu MB, most "
+		         "%llu MB -> Unity's adapter is %s\n", hw_count, (unsigned long long)(lo_vram >> 20),
+		         (unsigned long long)(hi_vram >> 20),
+		         cls == DXR_GPU_INTEGRATED ? "the one with the least (igpu)" :
+		         cls == DXR_GPU_DISCRETE ? "the one with the most (dgpu)" : "not classified (the runtime's default is left alone)");
+		dxr_prov_file_log(line);
+	}
+	return cls;
 }
 
 // Set a process environment variable so that a LATER-LOADED DLL's getenv() sees it.

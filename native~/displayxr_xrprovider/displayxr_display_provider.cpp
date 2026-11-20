@@ -1577,6 +1577,76 @@ MainUpdateDisplayState(UnitySubsystemHandle handle, void *userData, UnityXRDispl
 // Unity's tiling. Falls back to blitParams if the env is unset, the interface/handles are
 // missing, or the formats aren't copy-compatible (logged; would need a shader blit).
 static int s_native_mirror_env = -1;
+
+// (#459) WHY the native mirror blit does or does not draw. The calibration marker exists only
+// in that blit, and Unity decides per render pipeline whether to call it at all (the SRPs do,
+// from C#: XRMirrorView calls AddGraphicsThreadMirrorViewBlit when nativeBlitAvailable; the
+// header warns "the rendering pipeline might not call the native blit function even when it
+// is available"). So every way out of MainBlitToMirrorViewRenderTarget records its reason
+// and logs it ONCE per session, the query logs once when the blit it offered was never
+// asked for, and C# reads the same state for the calibration's "marker was not drawn" line.
+// The numbers are mirrored in DisplayXRGameViewCalibration.NativeMirrorReasonText.
+enum {
+	DXR_MB_NEVER_CALLED   = 0,  // Unity has not called the native blit (yet)
+	DXR_MB_DRAWN          = 1,  // the shader blit ran
+	DXR_MB_DISABLED       = 2,  // DISPLAYXR_PROV_NATIVE_MIRROR=0
+	DXR_MB_NO_WOVEN_ID    = 3,  // no woven texture registered with Unity (not texture mode)
+	DXR_MB_NO_RT_DESC     = 4,  // Unity passed no mirror render target descriptor
+	DXR_MB_NO_RT_NATIVE   = 5,  // ...or one without a native render buffer
+	DXR_MB_NO_INTERFACES  = 6,  // no IUnityInterfaces
+	DXR_MB_NOT_D3D12      = 7,  // no IUnityGraphicsD3D12v8 / v7 (the editor is not on D3D12)
+	DXR_MB_NO_DEVICE      = 8,  // the interface returned no device
+	DXR_MB_NO_RT_RESOURCE = 9,  // TextureFromRenderBuffer(rtNative) returned null
+	DXR_MB_NO_WOVEN_TEX   = 10, // the woven texture is not open on Unity's device
+	DXR_MB_NO_CANVAS      = 11, // the woven canvas rect is empty
+	DXR_MB_PIPELINE       = 12, // shader compile / PSO / heap creation failed
+	DXR_MB_CMDLIST        = 13, // command allocator / list creation failed
+	DXR_MB_NOT_WINDOWS    = 14, // this build has no native mirror blit
+	DXR_MB_REASONS
+};
+static std::atomic<int>      s_mb_last{DXR_MB_NEVER_CALLED};
+static std::atomic<int>      s_mb_calls{0};     // native blit callbacks this session
+static std::atomic<int>      s_mb_offered{0};   // mirror queries that offered the native blit
+static std::atomic<unsigned> s_mb_logged{0};    // one bit per reason already logged
+static std::atomic<int>      s_mb_never_logged{0};
+static std::atomic<int>      s_mb_query_logged{0};
+// After this many queries that offered the native blit without one call, it is not coming:
+// the editor queries once per Game view repaint, so this is a few seconds of Play.
+#define DXR_MB_NEVER_CALLED_AFTER 240
+
+static void mirror_blit_note(int reason, const char *text)
+{
+	s_mb_last.store(reason);
+	if (reason < 0 || reason >= DXR_MB_REASONS) return;
+	unsigned bit = 1u << reason;
+	if (s_mb_logged.fetch_or(bit) & bit) return;
+	char buf[400];
+	snprintf(buf, sizeof(buf), "[DisplayXR-PROV] native mirror: BlitToMirrorViewRenderTarget %s "
+	         "(reason %d, call %d of this session, %d queries offered it)\n",
+	         text, reason, s_mb_calls.load(), s_mb_offered.load());
+	prov_log(buf);
+}
+
+// A new session logs each reason afresh (the library outlives a Play).
+static void mirror_blit_status_reset()
+{
+	s_mb_last.store(DXR_MB_NEVER_CALLED);
+	s_mb_calls.store(0); s_mb_offered.store(0);
+	s_mb_logged.store(0); s_mb_never_logged.store(0); s_mb_query_logged.store(0);
+}
+
+// The reason the native mirror blit last ended with (DXR_MB_*), with how many mirror queries
+// offered it and how many times Unity called it since the session started. Main thread.
+// Windows only, like the calibration that reads it (the export macro is Windows-only here).
+#ifdef _WIN32
+extern "C" DISPLAYXR_EXPORT int dxr_prov_get_native_mirror_status(int *offered, int *calls)
+{
+	if (offered) *offered = s_mb_offered.load();
+	if (calls) *calls = s_mb_calls.load();
+	return s_mb_last.load();
+}
+#endif
+
 static bool native_mirror_enabled()
 {
 	// DEFAULT ON: the native shader-blit is the GameView mirror path (only engages when a woven
@@ -1760,14 +1830,18 @@ static bool prov_ensure_blit_pipeline(ID3D12Device *dev, DXGI_FORMAT rtFmt)
 
 // Draw the woven canvas sub-rect (src pixels [cx,cy cw x ch] of a tw x th texture) into the
 // full GameView mirror RT. Returns true if it recorded+executed the draw.
-static bool prov_shader_blit_woven(ID3D12Device *dev, IUnityGraphicsD3D12v8 *v8,
+typedef UINT64 (UNITY_INTERFACE_API *DxrExecuteCommandListFn)(ID3D12GraphicsCommandList *, int,
+                                                             UnityGraphicsD3D12ResourceState *);
+static bool prov_shader_blit_woven(ID3D12Device *dev, DxrExecuteCommandListFn execute,
                                    ID3D12Resource *rt, ID3D12Resource *src,
                                    int32_t cx, int32_t cy, int32_t cw, int32_t ch,
-                                   uint32_t tw, uint32_t th)
+                                   uint32_t tw, uint32_t th, int *why)
 {
-	if (!dev || !v8 || !rt || !src || tw == 0 || th == 0) return false;
+	*why = DXR_MB_PIPELINE;
+	if (!dev || !execute || !rt || !src || tw == 0 || th == 0) return false;
 	D3D12_RESOURCE_DESC rd = rt->GetDesc();
 	if (!prov_ensure_blit_pipeline(dev, rd.Format)) return false;
+	*why = DXR_MB_CMDLIST;
 	if (!s_mblit_alloc)
 		dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&s_mblit_alloc));
 	if (!s_mblit_list && s_mblit_alloc) {
@@ -1819,7 +1893,8 @@ static bool prov_shader_blit_woven(ID3D12Device *dev, IUnityGraphicsD3D12v8 *v8,
 	s_mblit_list->Close();
 	UnityGraphicsD3D12ResourceState st = {};
 	st.resource = rt; st.expected = D3D12_RESOURCE_STATE_COPY_DEST; st.current = D3D12_RESOURCE_STATE_COPY_DEST;
-	v8->ExecuteCommandList(s_mblit_list, 1, &st);
+	execute(s_mblit_list, 1, &st);
+	*why = DXR_MB_DRAWN;
 	static bool logged = false;
 	if (!logged) { logged = true;
 		prov_log("[DisplayXR-PROV] native mirror: shader-blit ACTIVE (woven BGRA -> GameView RT RGBA)\n"); }
@@ -1831,26 +1906,64 @@ MainBlitToMirrorViewRenderTarget(UnitySubsystemHandle handle, void *userData,
                                  const UnityXRMirrorViewBlitInfo info)
 {
 	(void)handle; (void)userData;
-	if (!native_mirror_enabled() || s_woven_tex_id == 0) return kUnitySubsystemErrorCodeSuccess;
-	if (!info.mirrorRtDesc || !info.mirrorRtDesc->rtNative || !s_ifaces) return kUnitySubsystemErrorCodeSuccess;
-	IUnityGraphicsD3D12v8 *v8 = s_ifaces->Get<IUnityGraphicsD3D12v8>();
-	if (!v8) return kUnitySubsystemErrorCodeSuccess;
-	ID3D12Device *dev = v8->GetDevice();
-	ID3D12Resource *rt = v8->TextureFromRenderBuffer(info.mirrorRtDesc->rtNative);
+	const UnitySubsystemErrorCode ok = kUnitySubsystemErrorCodeSuccess;
+	// (#459) Every way out says why, once per session (mirror_blit_note): which of these a
+	// machine takes is what decides whether the calibration marker can be drawn there.
+	if (s_mb_calls.fetch_add(1) == 0) {
+		char b[256];
+		snprintf(b, sizeof(b), "[DisplayXR-PROV] native mirror: BlitToMirrorViewRenderTarget CALLED "
+		         "(mode=%d rtDesc=%s rtNative=%s, after %d queries that offered it)\n",
+		         info.mirrorBlitMode, info.mirrorRtDesc ? "yes" : "NULL",
+		         (info.mirrorRtDesc && info.mirrorRtDesc->rtNative) ? "yes" : "NULL", s_mb_offered.load());
+		prov_log(b);
+	}
+	if (!native_mirror_enabled()) { mirror_blit_note(DXR_MB_DISABLED, "returned without drawing: DISPLAYXR_PROV_NATIVE_MIRROR=0"); return ok; }
+	if (s_woven_tex_id == 0) { mirror_blit_note(DXR_MB_NO_WOVEN_ID, "returned without drawing: no woven texture is registered with Unity"); return ok; }
+	if (!info.mirrorRtDesc) { mirror_blit_note(DXR_MB_NO_RT_DESC, "returned without drawing: Unity passed no mirror render target descriptor"); return ok; }
+	if (!info.mirrorRtDesc->rtNative) { mirror_blit_note(DXR_MB_NO_RT_NATIVE, "returned without drawing: the mirror render target descriptor has no native render buffer (rtNative is null)"); return ok; }
+	if (!s_ifaces) { mirror_blit_note(DXR_MB_NO_INTERFACES, "returned without drawing: no IUnityInterfaces"); return ok; }
+	// v8 is Unity 6; an editor that registers only v7 (2022.3) has the same three members
+	// this blit uses (GetDevice, TextureFromRenderBuffer, ExecuteCommandList).
+	ID3D12Device *dev = nullptr;
+	ID3D12Resource *rt = nullptr;
+	DxrExecuteCommandListFn execute = nullptr;
+	if (IUnityGraphicsD3D12v8 *v8 = s_ifaces->Get<IUnityGraphicsD3D12v8>()) {
+		dev = v8->GetDevice();
+		rt = v8->TextureFromRenderBuffer(info.mirrorRtDesc->rtNative);
+		execute = v8->ExecuteCommandList;
+	} else if (IUnityGraphicsD3D12v7 *v7 = s_ifaces->Get<IUnityGraphicsD3D12v7>()) {
+		dev = v7->GetDevice();
+		rt = v7->TextureFromRenderBuffer(info.mirrorRtDesc->rtNative);
+		execute = v7->ExecuteCommandList;
+		static bool v7_logged = false;
+		if (!v7_logged) { v7_logged = true;
+			prov_log("[DisplayXR-PROV] native mirror: using IUnityGraphicsD3D12v7 (no v8 in this editor)\n"); }
+	} else {
+		mirror_blit_note(DXR_MB_NOT_D3D12, "returned without drawing: no IUnityGraphicsD3D12v8 or v7 (the editor is not on D3D12; the native mirror blit is D3D12 only)");
+		return ok;
+	}
+	if (!dev) { mirror_blit_note(DXR_MB_NO_DEVICE, "returned without drawing: IUnityGraphicsD3D12 returned no device"); return ok; }
+	if (!rt) { mirror_blit_note(DXR_MB_NO_RT_RESOURCE, "returned without drawing: TextureFromRenderBuffer(rtNative) returned null (the mirror target is not a texture this interface can resolve)"); return ok; }
 
 	uint32_t ww = 0, wh = 0;
 	ID3D12Resource *src = (ID3D12Resource *)dxr_prov_get_woven_unity_texture(&ww, &wh);
-	if (!dev || !rt || !src) return kUnitySubsystemErrorCodeSuccess;
+	if (!src) { mirror_blit_note(DXR_MB_NO_WOVEN_TEX, "returned without drawing: the woven texture is not open on Unity's D3D12 device"); return ok; }
 
 	int32_t cx = 0, cy = 0, cw = 0, ch = 0; uint32_t tw = 0, th = 0;
 	dxr_prov_get_woven_canvas(&cx, &cy, &cw, &ch, &tw, &th);
-	if (cw <= 0 || ch <= 0 || tw == 0 || th == 0) return kUnitySubsystemErrorCodeSuccess;
+	if (cw <= 0 || ch <= 0 || tw == 0 || th == 0) { mirror_blit_note(DXR_MB_NO_CANVAS, "returned without drawing: the woven canvas rect is empty"); return ok; }
 	// Format-converting SHADER blit: sample the woven canvas sub-rect (BGRA) and draw it,
 	// stretched to fill the GameView mirror RT (RGBA). CopyTextureRegion can't cross the
 	// RGBA/BGRA copy groups, and Unity's blitParams mirror produces black for URP (discarded
 	// inside URP's RenderGraph present) — this native draw writes straight to the presented RT.
-	prov_shader_blit_woven(dev, v8, rt, src, cx, cy, cw, ch, tw, th);
-	return kUnitySubsystemErrorCodeSuccess;
+	int why = DXR_MB_PIPELINE;
+	if (prov_shader_blit_woven(dev, execute, rt, src, cx, cy, cw, ch, tw, th, &why))
+		s_mb_last.store(DXR_MB_DRAWN);
+	else
+		mirror_blit_note(why, why == DXR_MB_CMDLIST
+			? "did not draw: the command allocator / list could not be created"
+			: "did not draw: the blit pipeline could not be built (shader compile, PSO or descriptor heap; see the line above)");
+	return ok;
 }
 #else  // !_WIN32 — macOS: the native mirror blit is D3D12-only; woven mirror not used.
 static UnitySubsystemErrorCode UNITY_INTERFACE_API
@@ -1858,6 +1971,8 @@ MainBlitToMirrorViewRenderTarget(UnitySubsystemHandle handle, void *userData,
                                  const UnityXRMirrorViewBlitInfo info)
 {
 	(void)handle; (void)userData; (void)info;
+	s_mb_calls.fetch_add(1);
+	s_mb_last.store(DXR_MB_NOT_WINDOWS);
 	return kUnitySubsystemErrorCodeSuccess;
 }
 #endif // _WIN32
@@ -1883,6 +1998,30 @@ MainQueryMirrorViewBlitDesc(UnitySubsystemHandle handle, void *userData,
 	// blitParams below are still filled as a fallback (Unity may skip the native callback).
 	desc->nativeBlitAvailable = (native_mirror_enabled() && s_woven_tex_id != 0);
 	desc->nativeBlitInvalidStates = false;
+	if (desc->nativeBlitAvailable) {
+		// (#459) Who asks, and is the blit that was offered ever called? An SRP asks from C#
+		// with no render target (mirrorRtDesc null) and then schedules the native blit
+		// itself; a query that carries the target comes from the engine's own mirror path.
+		// Logged once per session, and once more if the offer is never taken up.
+		int offered = s_mb_offered.fetch_add(1) + 1;
+		if (!s_mb_query_logged.exchange(1)) {
+			char b[256];
+			snprintf(b, sizeof(b), "[DisplayXR-PROV] native mirror: OFFERED to Unity (nativeBlitAvailable=1; "
+			         "query mode=%d mirrorRtDesc=%s rtNative=%s)\n", info.mirrorBlitMode,
+			         info.mirrorRtDesc ? "yes" : "NULL",
+			         (info.mirrorRtDesc && info.mirrorRtDesc->rtNative) ? "yes" : "NULL");
+			prov_log(b);
+		}
+		if (offered >= DXR_MB_NEVER_CALLED_AFTER && s_mb_calls.load() == 0 && !s_mb_never_logged.exchange(1)) {
+			char b[480];
+			snprintf(b, sizeof(b), "[DisplayXR-PROV] native mirror: NEVER CALLED - Unity asked for the mirror blit "
+			         "%d times, was offered the native blit each time and has not called "
+			         "BlitToMirrorViewRenderTarget once (query mirrorRtDesc=%s). This render pipeline blits "
+			         "blitParams itself; the calibration marker, which is drawn in the native blit, cannot "
+			         "appear\n", offered, info.mirrorRtDesc ? "yes: the engine's own mirror path" : "NULL: a scriptable pipeline");
+			prov_log(b);
+		}
+	}
 	// GameView weave-to-texture mirror (Task (a)): if texture mode published a woven
 	// texture, blit its canvas sub-rect into the Game window. Otherwise no mirror blit
 	// (the runtime weaves to its own window — the shipping default).
@@ -2058,6 +2197,7 @@ LifecycleInitialize(UnitySubsystemHandle handle, void *userData)
 	if (s_display->RegisterProvider(handle, &main) != kUnitySubsystemErrorCodeSuccess)
 		return kUnitySubsystemErrorCodeFailure;
 
+	mirror_blit_status_reset(); // (#459) each session logs its mirror-blit reasons afresh
 	prov_log("[DisplayXR-PROV] Lifecycle Initialize: providers registered\n");
 	return kUnitySubsystemErrorCodeSuccess;
 }
