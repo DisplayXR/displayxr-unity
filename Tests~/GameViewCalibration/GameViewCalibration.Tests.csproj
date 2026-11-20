@@ -13,5 +13,9 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="../../Runtime/Provider/DisplayXRGameViewCalibration.cs" Link="DisplayXRGameViewCalibration.cs" />
+    <!-- The calibrator itself (when to show which marker, the reads, the reuse of measured layouts),
+         compiled as shipped against Stubs.cs: a simulated clock, log, native plug-in and screen. -->
+    <Compile Include="../../Runtime/Provider/DisplayXRGameViewCalibrator.cs" Link="DisplayXRGameViewCalibrator.cs" />
+    <Compile Include="../../Runtime/Provider/DisplayXRGameViewPlacement.cs" Link="DisplayXRGameViewPlacement.cs" />
   </ItemGroup>
 </Project>
