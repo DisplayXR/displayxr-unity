@@ -16,7 +16,10 @@ placement, pure C#), `Runtime/Provider/DisplayXRGameViewCalibration.cs` (the cal
 and its decoding, pure C#), `Runtime/Provider/DisplayXRGameViewCalibrator.cs` (when to calibrate,
 the screen read-back, the log line), `Editor/Provider/DisplayXRGameViewWholePixel.cs` (the
 whole-pixel size), `native~/displayxr_xrprovider/displayxr_display_provider.cpp` (the marker, in
-the native mirror blit), `native~/displayxr_win32.c` (`displayxr_read_screen_strip`) and
+the native mirror blits and stamped into the texture Unity's own blit samples),
+`native~/displayxr_xrprovider/displayxr_gvcal_shader.h` and `displayxr_gvcal_stamp.h` (the
+marker's shader, and the contract and decisions of the stamp),
+`native~/displayxr_win32.c` (`displayxr_read_screen_strip`) and
 `native~/displayxr_xrprovider/displayxr_provider_texture_target.cpp` (the texture target binding,
 #471).
 Tests: `Tests~/GameViewPlacement` and `Tests~/GameViewCalibration` (CI runs both with
@@ -77,7 +80,8 @@ real texture and the real zoom, so its line is to be trusted where this table is
   target size, halves **away from zero** (`DisplayXRGameViewPlacement.TextureSizePx`), which is
   the texture's size (F4, fixed).
 - **Anchor (condition 4): computed from Unity's own rule, and measured where a marker can be
-  drawn.** See [Placement without a measurement](#placement-without-a-measurement) and
+  drawn** (since #485: every Windows editor path on D3D11 and D3D12, not yet verified on a panel
+  outside URP + D3D12). See [Placement without a measurement](#placement-without-a-measurement) and
   [On-screen calibration](#on-screen-calibration-condition-4-measured). The computed position:
   `DisplayXRGameViewPlacement.Place`. X = pane left + `ImageLeftPx` (the pane's real left border
   plus Unity's whole-point rounding of the centred image, the pixel edge rounded half up);
@@ -108,11 +112,16 @@ real texture and the real zoom, so its line is to be trusted where this table is
 
 ## Placement without a measurement
 
-The marker of the [on-screen calibration](#on-screen-calibration-condition-4-measured) is drawn
-in the plug-in's native mirror blit. Unity decides per render pipeline whether that blit is
-called at all, and with the **Built-in pipeline it never is** (see
-[Why the marker is not drawn](#why-the-marker-is-not-drawn)). So the computed placement has to be
-right on its own; the measurement verifies and overrides it where it exists.
+The marker of the [on-screen calibration](#on-screen-calibration-condition-4-measured) was, until
+#485, drawn in the plug-in's D3D12 native mirror blit only. Unity decides per render pipeline
+whether that blit is called at all, and with the **Built-in pipeline it never is** (see
+[Why the marker is not drawn](#why-the-marker-is-not-drawn)). Since #485 the marker also goes
+through Unity's own blit there
+([The marker through Unity's own blit](#the-marker-through-unitys-own-blit-485)) and through the
+D3D11 native blit. That is built and unit-tested, **not yet seen on a panel**; and any path can
+still fail to show a marker (an opt-out, a covered Game view, an editor without the interface it
+needs). So the computed placement has to be right on its own; the measurement verifies and
+overrides it where it exists.
 
 ### The column rule
 
@@ -188,10 +197,11 @@ the anchor's row.
 
 The automatic whole-pixel size waited for a calibration to *measure* "not 1:1". Without a marker
 it waited for ever, and at 125 % / 175 % the view kept a half column missing: the eyes swapped on
-one side of a vertical line. Now, when no marker can be drawn (the calibrator has had an attempt
-end with no marker frame, or `DISPLAYXR_PROV_GV_CALIBRATE=0`) and the geometry read back from Unity
-has said "not 1:1" for one second (`PredictsNotOneToOne`), the size is selected from the
-prediction:
+one side of a vertical line. Now, when nothing can be measured (the calibrator's last attempt
+showed nothing of the marker on screen - no marker frame was drawn, or, since #485, one was drawn
+and none of it was found where it was read - or `DISPLAYXR_PROV_GV_CALIBRATE=0`) and the geometry
+read back from Unity has said "not 1:1" for one second (`PredictsNotOneToOne`), the size is
+selected from the prediction:
 
 ```
 [DisplayXR] whole-pixel Game view: the geometry read from Unity predicts an image that is not drawn 1:1
@@ -224,38 +234,83 @@ says, once per session, in `%TEMP%\displayxr_prov_native.log`:
 | `BlitToMirrorViewRenderTarget returned without drawing: <cause> (reason R, ...)` | it was called and left early; one line per distinct cause: `DISPLAYXR_PROV_NATIVE_MIRROR=0`, no woven texture, no render target descriptor, `rtNative` null, no D3D12 interface (the editor is on D3D11 or Vulkan), no device, `TextureFromRenderBuffer` null, woven texture not open, empty canvas |
 | `... did not draw: the blit pipeline could not be built` / `the command allocator / list ...` | it got as far as drawing and failed |
 | `using IUnityGraphicsD3D12v7 (no v8 in this editor)` | an editor without the v8 interface (2022.3): the blit used to return there; it now runs on v7 |
-| `NEVER CALLED - Unity asked for the mirror blit 240 times, was offered the native blit each time and has not called BlitToMirrorViewRenderTarget once` | this pipeline does not use the native blit |
+| `NEVER CALLED - Unity asked for the mirror blit 240 times, was offered the native blit each time and has not called BlitToMirrorViewRenderTarget once` | this pipeline does not use the native blit: the marker goes through Unity's own blit (next section) |
 
-The calibration line carries the same state:
+When no marker frame is drawn at all, the calibration line carries the same state, and the
+account of the other path next to it:
 `... - the marker was not drawn: Unity was offered the native mirror blit and never calls it: this
-render pipeline (the Built-in one) blits the woven texture itself ... [native mirror blit: offered
-912 times, called 0 times, reason 0]`.
+render pipeline (the Built-in one) blits the woven texture itself [native mirror blit: offered
+912 times, called 0 times, reason 0]; and the marker for Unity's own blit of that texture:
+DISPLAYXR_PROV_GV_CALIB_STAMP=0 turns it off [marker texture: stamped 0 times, handed to 0 mirror
+queries, status 2]`.
 
-### A marker that does not need the native blit (design, not built)
+### The marker through Unity's own blit (#485)
 
-The marker has to pass through the same draw as the weave to measure where the weave lands.
-Three ways to get one without the native blit, and why none is in this change:
+**Built, unit-tested, not yet run in an editor.** Pass S of the recipe is the test.
 
-1. **A marker texture in `blitParams`** (the path the Built-in pipeline does use): a texture the
-   size of the woven one with the marker in the canvas rect, registered with `CreateTexture` and
-   swapped in as `blitParams[0].srcTexId` for the marker's frames. It goes through *Unity's*
-   blit with the same source and destination rects as the woven texture, so it measures what the
-   weave does, including any offset that blit adds. Cost: one texture per graphics API
-   (D3D11, D3D12, Vulkan) created and filled natively, kept in step with the canvas size, and the
-   thin strips either baked per request or dropped for the whole image. This is the one to build.
-2. **An editor-side draw into the Game view's texture** after the mirror blit (a full-screen
-   pass whose colour comes from the pixel's own position, as another plug-in's editor weave
-   does on D3D11, D3D12 and Vulkan). Graphics-API independent and all C#. But in the XR path the
-   Game view's texture is written by Unity's mirror blit at a point in the frame no public
-   callback follows on every pipeline (`WaitForEndOfFrame`, `OnGUI` and the pipeline's
-   end-of-frame events each have to be shown to run after it, per pipeline and Unity version);
-   a marker drawn before it is overwritten. And it marks the *texture*, not the weave's path
-   into it: an offset added by the mirror blit would not be seen.
-3. **A D3D11 native mirror blit.** Useless for the Built-in pipeline, which does not call it.
+The marker has to pass through the same draw as the weave to measure where the weave lands. On
+the path where Unity blits `blitParams` itself, that draw is Unity's, so the marker is put into
+what Unity blits (`displayxr_gvcal_stamp.h`, and the `gvstamp_*` functions next to the native
+blits):
 
-None of them can be checked without a panel and each needs a pass per pipeline, so they are not
-attempted blind. With the placement rule above the marker is a verification, not a
-precondition.
+1. **A marker texture.** The first time a marker is requested while Unity's own blit is the live
+   mirror path, a texture the size of the woven one is created on Unity's device and registered
+   with `CreateTexture`, declared exactly as the mirror source Unity already has: `BGRA32`,
+   top-to-bottom, and flagged sRGB (on a `B8G8R8A8_TYPELESS` texture) where the mirror source is
+   the #480 copy, plain `B8G8R8A8_UNORM` otherwise.
+2. **The stamp.** While the marker is requested, after every `xrEndFrame` - where the #480 mirror
+   copy runs, with the same ordering against the runtime's weave (D3D11: the runtime-side
+   context is flushed first; D3D12: a command list on Unity's queue through `ExecuteCommandList`,
+   an allocator reused only once its frame has completed) - one draw of the **same shader as the
+   native blit** writes the woven canvas into that texture through a viewport on the canvas rect.
+   Outside the marker each texel is *loaded* from the woven texture at its own position (byte for
+   byte; no filter); on the strips it is the marker.
+3. **The hand-out.** The mirror query names the marker texture in `blitParams[].srcTexId` instead
+   of the woven one, with the unchanged `srcRect` / `destRect`, for as long as the request lasts,
+   and only when the texture was stamped for that very request and that very canvas. Each such
+   query counts as a marker frame; the read-back starts with the first one.
+
+**No cost while no marker is requested:** nothing is drawn, copied or handed out; the query names
+the woven texture. The standing cost is the texture itself (the woven texture's size, about
+33 MB at 3840x2160), from the first calibration of a session until the mirror texture is wrapped
+again (a resize) or the session stops.
+
+**The geometry contract** is the native blit's, so there is one decoder. There, marker texel
+`(x, y)` is pixel `(x, y)` of the mirror target. Here it is the texel that holds woven-canvas
+pixel `(x, y)`, the marker laid out for an image of the **canvas** size. Unity's blit maps the
+canvas onto the whole mirror target, and the glue drives the canvas to the target's size
+(condition 3), so marker texel `(x, y)` reaches the same screen pixel.
+
+**What is assumed about Unity's blit, and how a run shows it:**
+
+| Assumption | If it does not hold |
+|---|---|
+| Unity takes a different `srcTexId` from one mirror query to the next (it queries every frame on this path: the `offered N times, called 0 times` count) | `gv marker: HANDED` is logged and the calibration says `no marker on the horizontal strips (0 blocks read) ... \| marker drawn by Unity's own blit (...)`, three times; the marker then counts as unavailable and the prediction takes over, as before #485 |
+| Unity's blit treats the marker texture as it treats the woven one (same declaration, same rects) | the marker shows displaced or scaled: `NOT 1:1`, or `no marker` |
+| the blit is 1:1 and unflipped | a vertical flip reads as `no marker` on the vertical strip (the rows run backwards). A split of a tall target into two halves with an offset between them - seen on tall maximized targets, see the comment above `native_mirror_enabled` - reads as `H NOT 1:1 (from row N the image is k px off ...)`: that is the seam, measured |
+| D3D12: the woven texture can be sampled from Unity's queue without a declared state, as the native blit does | the marker frames show a corrupt or black image, and a D3D12 debug layer reports the state |
+| the screen pixel of marker texel (0,0) is the screen pixel of woven texel (0,0) | true by construction: both are the same texel of the same source rect |
+
+**Log lines** (`[DisplayXR-PROV] gv marker: ...`, in `%TEMP%\displayxr_prov_native.log`):
+
+| Line | Meaning |
+|---|---|
+| `marker texture WxH created (D3D11\|D3D12, format F, declared BGRA32 srgb=S as the mirror source id A) -> Unity texture id B` | the texture exists and Unity accepted it. Once per session (and after a resize) |
+| `stamp pipeline ready (D3D12)` | the D3D12 pipeline state for the stamp was built |
+| `STAMPED into the texture Unity's own blit samples (API, request R, thin strips\|whole image, canvas (x,y WxH) of TWxTH, bands at .., strip row .. column .., declared srgb=S, woven wrapped by Unity=0\|1)` | the first stamp of request `R`. One per marker request |
+| `HANDED to Unity's mirror blit (blitParams srcTexId B instead of A, request R, marker laid out for a WxH image at texel (x,y), after N stamps, hand-out 1)` | the first mirror query of request `R` that named the marker texture. From here on it is Unity's blit |
+| `NOT stamped - <why> (status S, request R, renderer id .., canvas .., N frames submitted, native blit calls C)` | once per session and reason: the opt-out; `not needed: Unity calls the native mirror blit` (URP, HDRP); a renderer that is neither D3D11 nor D3D12; no graphics interface (D3D12 needs `IUnityGraphicsD3D12v8`: Unity 6); no woven texture; a canvas that is empty, under 128 px or not inside its texture; the texture, the pipeline or the command list could not be made; a session in its first 8 frames |
+| `drawn by the NATIVE mirror blit (D3D11\|D3D12) into a WxH mirror target, ... (request R)` | the other path: the first marker frame of request `R` in a native blit |
+
+`DISPLAYXR_PROV_GV_CALIB_STAMP=0` (before the editor starts) keeps the marker out of Unity's own
+blit: that path is then not measured, exactly as before #485.
+
+**The alternatives that were not built.** An editor-side draw into the Game view's texture after
+the mirror blit (all C#, graphics-API independent) marks the *texture*, not the weave's path
+into it - an offset added by the mirror blit would not be seen - and no public callback is known
+to follow the mirror blit on every pipeline. Stamping into the #480 mirror copy only covers
+Linear projects; one marker texture for both colour spaces is one path to verify instead of two.
+Vulkan and Metal have no stamp (the editor's texture mode is Windows D3D only).
 
 ## A fixed-size or zoomed Game view
 
@@ -412,7 +467,10 @@ is measured.
 3. Otherwise, when it has held for 0.35 s (the same settle clock as the size push) and no
    mouse button is down, the native mirror blit draws a **position-coded marker** over the
    woven image, into the same texture, through the same draw. It reaches the screen exactly
-   where the weave does. The marker is drawn **only where it is read**: one horizontal strip
+   where the weave does. Where Unity does not call the native blit (the Built-in pipeline) the
+   marker is stamped into the texture Unity's own blit samples instead
+   ([#485](#the-marker-through-unitys-own-blit-485)): the same marker, through the draw the
+   weave takes there. The marker is drawn **only where it is read**: one horizontal strip
    and one vertical strip, 13 px thick; the rest of the image keeps showing the scene (see
    [Thin strips](#thin-strips)).
 4. As soon as the marker has been drawn once, native code reads **1-px strips of the screen**
@@ -590,19 +648,26 @@ had; what was drawn, the reads and the cache state are appended:
 | `reads N, M ms after the first marker frame` | screen reads, and the time from the first frame the marker was seen drawn to the end. 2 reads is the minimum; each extra one is a read that came before the marker was on screen |
 | `N marker frames, M ms` (unchanged) | native blits that drew the marker; ms from the request to the end |
 | `cache miss (stored)` / `(not stored: not 1:1)` / `(cache off)` / `cache hit (N layouts ...)` | measured now, or reused |
+| `marker drawn by the native mirror blit (D3D12)` / `(D3D11)` / `marker drawn by Unity's own blit (stamped into its source texture N times, handed to M mirror queries)` | (#485) which draw carried the marker; the last field of every line of an attempt in which a marker frame was drawn. Absent on a reuse, and when nothing was drawn |
 
 A not-1:1 axis reads `W NOT 1:1 (from column 561 the image is -1 px off, 448 px differ)`.
 
-**Where it does not run.** The marker is drawn by the D3D12 native mirror blit only, so with the
-**Built-in render pipeline** (Unity does not call that blit there), with D3D11 (its native
-mirror blit, #483, draws the woven image but no marker), or with
-`DISPLAYXR_PROV_NATIVE_MIRROR=0`, no marker appears, the line says
-`the marker was not drawn: <why>` ([Why the marker is not drawn](#why-the-marker-is-not-drawn)),
-the computed position is used, and the whole-pixel size is selected from the predicted geometry
+**Where it runs, and where it does not.** The marker is drawn by the native mirror blit on D3D12
+and, since #485, on D3D11 (URP, HDRP), and by Unity's own blit of the stamped marker texture
+where Unity does not call the native blit (the **Built-in render pipeline**, both APIs; also any
+pipeline with `DISPLAYXR_PROV_NATIVE_MIRROR=0`, where a scriptable pipeline's Game view is black
+and nothing is found). Only URP + D3D12 has been seen on a panel. Where no marker frame is drawn
+at all (`DISPLAYXR_PROV_GV_CALIB_STAMP=0` on the Built-in pipeline, an editor on another graphics
+API, D3D12 on an editor without `IUnityGraphicsD3D12v8`) the line says
+`the marker was not drawn: <why>` ([Why the marker is not drawn](#why-the-marker-is-not-drawn));
+where one is drawn and none of it is found, `no marker on the horizontal strips (0 blocks read)`
+with the path that drew it. In both cases the computed position is used and the whole-pixel size
+is selected from the predicted geometry
 ([Placement without a measurement](#placement-without-a-measurement)). A floating Game view
 (present mode) is not calibrated: the runtime presents its own window there. A Game view that
 is not repainting (Play paused) shows no marker and falls back too (expected, not verified). `DISPLAYXR_PROV_GV_CALIBRATE=0` turns calibration off;
-`DISPLAYXR_PROV_GV_CALIB_FULL=1`, `DISPLAYXR_PROV_GV_CALIB_CACHE=0` and `DISPLAYXR_PROV_GV_CALIB_DELAY_MS` are the A/B switches described above.
+`DISPLAYXR_PROV_GV_CALIB_FULL=1`, `DISPLAYXR_PROV_GV_CALIB_CACHE=0` and `DISPLAYXR_PROV_GV_CALIB_DELAY_MS` are the A/B switches described above;
+`DISPLAYXR_PROV_GV_CALIB_STAMP=0` keeps the marker out of Unity's own blit (#485).
 A Game view whose zoom is not 1 is never calibrated: no marker is shown while it is scaled
 (see [A fixed-size or zoomed Game view](#a-fixed-size-or-zoomed-game-view)).
 
@@ -616,11 +681,11 @@ out width, out height, out measured)` (internal) returns the image's top-left in
 window's client area and its size, in physical px, and whether that was measured or computed.
 The texture target rect (next section) is fed from it.
 
-**D3D11 and the marker.** The marker exists only in the D3D12 mirror blit. D3D11 has a native
-mirror blit of its own since #483 (below), but it does not draw the marker: that needs the
-proof, on a panel, that the D3D11 draw lands where Unity shows the Game view, and the D3D11
-path has not been run on hardware yet. Adding it is then small - the shader is shared, the
-D3D11 blit only has to pass `mk` instead of zeros.
+**D3D11 and the marker.** Since #485 the D3D11 native mirror blit (#483, below) draws the marker
+as the D3D12 one does: the shader is shared, and the blit passes the same marker constants, laid
+out for its mirror target. Whether that draw lands where Unity shows the Game view is what the
+marker then measures. **Not yet run on a panel.** The Built-in pipeline on D3D11 goes through
+Unity's own blit, like on D3D12.
 
 **The D3D11 native mirror blit (#483).** Which native blit runs is decided from the
 **renderer id** (`native_mirror_backend` in `displayxr_display_provider.cpp`), never from the
@@ -640,8 +705,8 @@ target is viewed through its UNORM sibling for encoded woven bytes (they land ra
 `_SRGB` sibling for linear ones. One `mirror colour: native blit target dxgi_format=… view=…
 … -> shader decode=N (D3D11, #480)` line per session says which case ran. The #459
 diagnostics (`native mirror: OFFERED…`, `NEVER CALLED`, `CALLED`, `returned without
-drawing: …`) cover the D3D11 path too; a D3D11 blit that draws reports reason 15 (drawn, no
-marker), which the calibration prints as "draws on D3D11, which draws no marker".
+drawing: …`) cover the D3D11 path too; a D3D11 blit that draws reports reason 1, like D3D12
+(reason 15, "drawn, no marker", is retired with #485 and only an older binary reports it).
 `DISPLAYXR_PROV_NATIVE_MIRROR_D3D11=0` turns the D3D11 blit off (the offer is withdrawn and
 one `native mirror: NOT offered` line says why); what the Game view shows then is Unity's own
 `blitParams` mirror, which is **black on URP** on D3D12 and is expected - not observed - to be
@@ -649,7 +714,7 @@ black on URP + D3D11 too, since the discard happens in URP's Game view present, 
 graphics API. BiRP is not affected either way: Unity does not call the native callback there
 and its `blitParams` mirror works.
 
-Until the marker is drawn on D3D11, a D3D11 editor uses the computed position for the anchor and for the target rect.
+A D3D11 editor therefore measures like a D3D12 one (#485, not yet verified on a panel); where the measurement fails it uses the computed position for the anchor and for the target rect.
 
 ## The texture target binding (runtime spec 9, #471)
 
@@ -702,8 +767,9 @@ cannot disagree:
 The docked phase nudge is added on top of either. The size is the glue's canvas size in both
 cases (the anchor's client area): under the binding the target rect is the canvas zones are
 laid out in. Before the session starts the rect is the computed one, the rect the anchor is
-born at; the calibration needs a playing view. On D3D11 the calibration does not run (see
-"D3D11 and the marker" above), so there the rect is always the computed one.
+born at; the calibration needs a playing view. On D3D11 the calibration runs since #485 (see
+"D3D11 and the marker" above; not yet verified on a panel); until a measurement succeeds the
+rect is the computed one.
 
 **Which runtime honours it.** D3D11 from runtime v2.55.0. **D3D12 (the editor's usual API),
 Vulkan and OpenGL from runtime v2.69.0**, together with a display processor plug-in that
@@ -789,7 +855,7 @@ Each time the numbers have held for 0.35 s and differ from the last line logged,
 | `scale` / `pane dpi` | the measured pane scale and the window's DPI / 96 | equal |
 | `targetInView` / `viewInWindow` | Unity's raw rects in points, for reference (not used for the verdict: they go through `pixelsPerPoint`) | - |
 | `phase source:` | what phases the weave (#471): `texture target rect, WINDOWLESS_PHASE`, or `anchor window (...)` with the reason (the runtime's `ANCHOR_FALLBACK`, a session that did not bind the target, which is D3D12 today, or why the binding was not chained). With a woven frame reported: the origin the runtime wove at, `(= requested)` or `but requested x,y (DIFFERS)`. A change of the phase source logs a new line | windowless: `(= requested)` |
-| `target rect:` | where the rect pushed for the binding came from: `measured` (the on-screen calibration), `computed`, or `none pushed`. A change logs a new line | `measured` on D3D12; `computed` on D3D11 |
+| `target rect:` | where the rect pushed for the binding came from: `measured` (the on-screen calibration), `computed`, or `none pushed`. A change logs a new line | `measured` (before #485: `computed` on D3D11 and on the Built-in pipeline) |
 | `[whole-pixel size]` | the experiment's size is on this view | - |
 | `[present mode ...]` | the Game view is floating: the runtime presents over the pane, so the line is informational and nothing is raised | - |
 
@@ -817,8 +883,8 @@ so it does not repeat on every Play), and never in present mode:
 | `0` | never; a not-1:1 measurement is only logged |
 
 Selecting the size changes the layout, so a second calibration follows and measures the new
-image. With calibration off (`DISPLAYXR_PROV_GV_CALIBRATE=0`), or where the marker is not drawn,
-the automatic mode turns on from the prediction.
+image. With calibration off (`DISPLAYXR_PROV_GV_CALIBRATE=0`), or where the marker is not drawn
+or is drawn and not found on screen, the automatic mode turns on from the prediction.
 
 When it is on (the variable is read once, when the editor starts), during Play, on the main Game view:
 
@@ -1009,14 +1075,45 @@ No switch. Press Play with the Game view docked.
    retrying in 0.2 s with the whole-image marker`.
 7. Opt-outs: `DISPLAYXR_PROV_GV_CALIBRATE=0` (no flash, no line, computed anchor),
    `DISPLAYXR_PROV_GV_WHOLEPIXEL=0` (at 175 %: `... keeps the whole-pixel size off`).
-8. With D3D11 as the editor's graphics API: `fell back ... the marker was not drawn`.
+8. With D3D11 as the editor's graphics API: Pass S.
 
-### Pass M - no marker (Built-in pipeline, D3D11, or `DISPLAYXR_PROV_GV_CALIBRATE=0`)
+### Pass S - the marker on the other paths (#485)
 
-The placement on its own. Use a **Built-in pipeline** project on D3D12 (no marker is drawn there)
+One Play per configuration, Game view docked between two panes, no switch, a scale of your
+choice (175 % shows the most). After each, read `Editor.log` (`GameView calibration:`) and
+`%TEMP%\displayxr_prov_native.log` (`gv marker:` and `native mirror:`).
+
+| # | Configuration | Pass: all of these | Fail: any of these |
+|---|---|---|---|
+| S1 | **Built-in, D3D12** | native log: `native mirror: NEVER CALLED` (after a few seconds), `gv marker: marker texture ... created (D3D12, ...)`, `gv marker: stamp pipeline ready (D3D12)`, `gv marker: STAMPED ... (D3D12, request 1, thin strips, ...)`, `gv marker: HANDED to Unity's mirror blit (...)`. `Editor.log`: `GameView calibration: measured image origin ... \| W 1:1, H 1:1 \| ... \| cache miss (stored) \| marker drawn by Unity's own blit (stamped into its source texture N times, handed to M mirror queries)`. On screen: the two thin lines for a few refreshes, the scene around them unchanged in colour | `gv marker: NOT stamped - ...` (send the line); `HANDED` followed by `fell back ... no marker on the horizontal strips (0 blocks read) ... \| marker drawn by Unity's own blit` three times (Unity does not show the marker texture); a black, tinted or torn Game view while the lines should be up; an editor crash or a device-removed error at the first marker |
+| S2 | **Built-in, D3D11** | as S1 with `(D3D11, ...)` and without the `stamp pipeline ready` line | as S1 |
+| S3 | **URP, D3D11** | native log: `native mirror: D3D11 shader-blit ACTIVE`, `gv marker: drawn by the NATIVE mirror blit (D3D11) into a WxH mirror target, thin strips (request 1)`, `gv marker: NOT stamped - not needed: Unity calls the native mirror blit ...`. `Editor.log`: `GameView calibration: measured ... \| marker drawn by the native mirror blit (D3D11)` | `fell back ... the marker was not drawn: ...`; `no marker on the horizontal strips` |
+| S4 | **URP, D3D12** (regression) | as before this change, plus `gv marker: drawn by the NATIVE mirror blit (D3D12) ...` and `... \| marker drawn by the native mirror blit (D3D12)` at the end of the calibration line; the measured origin equal to the one v2.38.0 measured in the same layout; **no** `marker texture ... created` line | a `marker texture ... created` or `STAMPED` line (the stamp ran next to the native blit); a different origin |
+| S5 | **Built-in, Linear colour space** (either API) | as S1 / S2 with `declared BGRA32 srgb=1` and `format 90` in the `marker texture` line, and the scene around the lines **not** changing brightness while they are up | the picture flashing brighter or darker for the marker's frames (the marker texture is declared differently from the mirror source) |
+
+In every passing case then check, as in Pass 0: correct depth with the phase nudge at 0; press
+Play again in the same layout: no lines on screen, `cache hit`; `GameView 1:1:` ends
+`target rect: measured`. At 175 % / 125 % on the Built-in pipeline the whole-pixel size is now
+selected from the **measurement** (`whole-pixel Game view: the measured image is not drawn 1:1
+...`), not from the prediction, and a second pair of lines measures it.
+
+What the measurement says about Unity's blit, on S1 / S2: `measured - computed` is the error of
+the column rule on that path (expected `(agree)`, as on URP); `H NOT 1:1 (from row N the image
+is k px off ...)` on a tall (maximized) view is the mirror blit's split into halves, measured
+for the first time; `red and blue arrive exchanged` would mean Unity reads the marker texture
+with another channel order than the woven one.
+
+A/B: `DISPLAYXR_PROV_GV_CALIB_STAMP=0` on S1 must give exactly Pass M step 1 (v2.38.0's
+behaviour), with the calibration line ending `...; and the marker for Unity's own blit of that
+texture: DISPLAYXR_PROV_GV_CALIB_STAMP=0 turns it off [...]`.
+
+### Pass M - no marker (`DISPLAYXR_PROV_GV_CALIB_STAMP=0` on the Built-in pipeline, or `DISPLAYXR_PROV_GV_CALIBRATE=0`)
+
+The placement on its own. Use a **Built-in pipeline** project on D3D12 started with
+`DISPLAYXR_PROV_GV_CALIB_STAMP=0` (no marker is drawn there then, as before #485)
 and, for the comparison, a URP project in the same layout (the marker measures).
 
-1. Built-in, 175 % or 125 %, docked between two panes, no switch. Within three seconds of Play:
+1. Built-in, 175 % or 125 %, docked between two panes, `DISPLAYXR_PROV_GV_CALIB_STAMP=0`. Within three seconds of Play:
    `GameView calibration: fell back ... - the marker was not drawn: Unity was offered the native
    mirror blit and never calls it ... [native mirror blit: offered N times, called 0 times, reason 0]`,
    then `whole-pixel Game view: the geometry read from Unity predicts ... - selecting the
@@ -1150,10 +1247,9 @@ phases from the present origin on D3D12 it must report `WINDOWLESS_PHASE`, like 
   WINDOWLESS_PHASE | woven origin x,y (= requested)`. With a display processor that cannot
   phase windowless (a vendor SDK older than the one that added external routing) the state is
   `ANCHOR_FALLBACK` instead and the picture must be what it was before.
-- On D3D11 the `1:1` line ends `target rect: computed` and the calibration logs
-  `fell back ... the marker was not drawn`: the rect is the computed placement there. On D3D12,
-  after the calibration line, the `1:1` line reads `target rect: measured` and `Editor.log` has
-  one `texture target: rect now measured`.
+- After the calibration line, the `1:1` line reads `target rect: measured` and `Editor.log` has
+  one `texture target: rect now measured` - on D3D12, and since #485 on D3D11 too (Pass S; where
+  the calibration falls back, the line ends `target rect: computed`).
 - The picture must be right with nudge 0 wherever pass A's was, and the nudge must still move
   the phase. Drag the editor window: the woven origin follows, with at most one WARN line per
   drag. Dock <-> undock twice: each re-dock logs `binding CHAINED` again.
@@ -1171,7 +1267,7 @@ For every scale x layout x pass: the `GameView calibration:` line(s), the `GameV
 `pane-relative: anchor +a, predicted image column +c | anchor-vs-content X error = n px`; the
 former `position*ppp` comparison mixed a global scale into desktop coordinates and read hundreds
 of pixels on a second monitor at another scale), any warning, what was seen, and the nudge.
-From `%TEMP%\displayxr_prov_native.log`: every `native mirror:` line and the `GPU class:` lines.
+From `%TEMP%\displayxr_prov_native.log`: every `native mirror:` and `gv marker:` line, the `mirror colour:` lines and the `GPU class:` lines.
 With those numbers F1-F5 can each be confirmed or dropped without another session.
 
 ## Not verified without a panel
@@ -1201,13 +1297,18 @@ The calibration, as of the change that added it:
 | The mouse-button rule during a real splitter drag (`GetAsyncKeyState` from the editor's main thread) | **not verified** - Pass 0 step 5 |
 | `displayxr_read_screen_strip`: pixel order, orientation, physical coordinates from a DPI-unaware thread, clipping at the desktop edge | checked once on a development machine against a plain test window painted with the marker (1:1 and one dropped column both decoded at the window's true origin); not in CI |
 | The HLSL of the marker (whole image and thin strips) | rendered off screen on the software rasteriser and compared texel by texel with the definition, hashes pinned on both sides (`native~/tests/gvcal_shader_test.cpp`, Windows CI). Through D3D11; the D3D12 root-constant path of the real blit is not exercised |
+| The marker stamp for Unity's own blit (#485): when it runs, what the query hands out, its constants | unit-tested (`gvcal_shader_test`: `dxr_gvstamp_decide`, `dxr_gvstamp_hand_out`, `dxr_gvstamp_fill_constants`) |
+| The stamp draw: the canvas copied byte for byte, the marker laid out in canvas texels, nothing outside the canvas, a canvas off the texture's corner, a TYPELESS target through a UNORM view | rendered on the software rasteriser with the provider's shader and constants (`gvcal_shader_test`, D3D11). **Not** the provider's own draw functions (they need Unity's device), and not D3D12: its command list, the resource states declared to Unity and the allocator ring are **read, not run** |
+| The stamp in an editor: Unity accepting the marker texture, taking it from the mirror query, blitting it like the woven one; the marker on screen; the measured origin being the right anchor on the Built-in pipeline | **not verified** - Pass S (S1, S2, S5) |
+| The marker in the D3D11 native blit (#485) | the shader and constants are the D3D12 ones (tested as above); in an editor **not verified** - Pass S (S3) |
+| The calibrator on the new paths: the line names the path, both accounts when nothing is drawn, "drawn and not found" makes the marker unavailable so the prediction is not kept waiting | unit-tested against the simulated world (`Tests~/GameViewCalibration`: `MarkerPaths`) |
 | The marker reaching the screen through Unity's Game view; timing; the measured origin being the right anchor on a panel | **not verified** - Pass 0 |
 | A screen read while the Game view is on an HDR or colour-managed desktop | not verified (the classifier is relative to the brightest channel to allow for it) |
-| D3D11 editor, Vulkan | falls back by design; the fallback line is not verified |
+| Vulkan (and any renderer that is neither D3D11 nor D3D12) | falls back by design (`gv marker: NOT stamped - the renderer is neither ...`); the fallback line is not verified |
 | The column rule (`ImageLeftPx`) | unit-tested against every logged number (`Tests~/GameViewPlacement`: the 250 % reference, the 150 % field report, three 175 % calibration lines); **not yet run on a panel as shipped** - Pass M |
 | `HostView.borderSize` giving 1 / 0 pt as read from the 6000.4.0f1 assembly; the same member on 2022.3 | **not verified in a running editor** (a warning is logged once if the member is missing, and the side borders are then assumed equal) |
 | The whole-pixel size selected from the prediction, and the weave being right there with no measurement | **not verified** - Pass M step 1 |
-| Why the Built-in pipeline draws no marker | observed: the query is called, the shader blit never becomes active (D3D12, 6000.4.0f1, MultiPass). Which of "never called" and "called and returned" is **not known** until the new `native mirror:` lines are read |
+| Why the Built-in pipeline does not call the native blit | observed on hardware (D3D11 and D3D12, 6000.4.0f1, MultiPass): the query is called every frame, `BlitToMirrorViewRenderTarget` never; Unity blits `blitParams` itself |
 | The native blit on `IUnityGraphicsD3D12v7` (an editor without v8) | compiles; **not run** |
 | The target rect fed from the measured origin (#471) | unit-tested natively (`texture_target_test`: source change, one line each, restart); **not run in an editor** |
 | How the woven texture reaches a D3D11 Game view: the D3D11 native mirror blit on URP (#483), Unity's own mirror blit on BiRP | compiles; **not run in an editor** (image, colour, orientation all unverified) |

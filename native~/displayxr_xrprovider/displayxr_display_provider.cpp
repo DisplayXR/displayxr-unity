@@ -196,7 +196,19 @@ static void prov11_release_blit_pipeline()
 	if (s_blit11_rs)  { s_blit11_rs->Release();  s_blit11_rs  = nullptr; }
 	s_blit11_dev = nullptr;
 }
+// (#485) Calibration marker for Unity's OWN mirror blit (displayxr_gvcal_stamp.h): defined
+// with the mirror blit code below, called from the texture / submit / stop paths above it.
+static void gvstamp_ensure_texture(void);   // graphics thread, with create_textures_if_ready
+static void gvstamp_after_submit(void);     // graphics thread, after xrEndFrame
+static void gvstamp_release(void);          // GfxStop
+static void gvstamp_drop_texture(void);     // destroy_textures: the Unity wrapper and the texture
+// The marker texture as Unity knows it (0 = none). Written on the graphics thread, read by
+// the mirror query on the main thread.
+static std::atomic<uint32_t> s_gvstamp_tex_id{0};
 #endif
+// (#485) What Unity was told the mirror source is when it was wrapped: declared sRGB (#480: then
+// the wrapped texture is the TYPELESS copy, not the woven texture itself).
+static bool s_woven_tex_srgb = false;
 // (#480) Per-session one-shot mirror colour diagnostics; reset in GfxStop.
 static bool     s_mirror_colour_logged = false;  // the "mirror colour:" line at wrap time
 static bool     s_mirror_native_logged = false;  // the native blit's own line
@@ -544,6 +556,7 @@ static void create_woven_mirror_texture_if_ready()
 	if (s_display->CreateTexture(s_handle, &desc, &id) == kUnitySubsystemErrorCodeSuccess) {
 		s_woven_tex_id = id;
 		s_woven_tex_created = true;
+		s_woven_tex_srgb = mirror_srgb != 0; // (#485) the marker texture is declared the same
 		prov_log("[DisplayXR-PROV] CreateTexture: wrapped WOVEN shared texture -> GameView mirror\n");
 		if (!s_mirror_colour_logged) {
 			s_mirror_colour_logged = true;
@@ -567,6 +580,9 @@ static void create_woven_mirror_texture_if_ready()
 void create_textures_if_ready()
 {
 	create_woven_mirror_texture_if_ready();
+#ifdef _WIN32
+	gvstamp_ensure_texture(); // (#485) only while a calibration marker is requested
+#endif
 	if (!s_display || !s_handle) return;
 	// Extra zones can come up alongside / after the primary; keep trying until wrapped.
 	if (s_textures_created) { create_extra_zone_textures(); return; }
@@ -824,6 +840,11 @@ void destroy_textures()
 	s_textures_created = false;
 	if (s_woven_tex_id) { s_display->DestroyTexture(s_handle, s_woven_tex_id); s_woven_tex_id = 0; }
 	s_woven_tex_created = false;
+#ifdef _WIN32
+	// (#485) The calibration marker texture goes with the woven one, wrapper AND texture: the
+	// next calibration makes a fresh one, in a D3D12 state that is known.
+	gvstamp_drop_texture();
+#endif
 }
 
 // Drop one extra zone's Unity texture(s) after a live realloc (#172) so
@@ -1575,6 +1596,9 @@ static void prov_mirror_after_submit(void)
 	// D3D12 only, by the session's backend and not by the interface pointer (#483).
 	if (dxr_prov_get_graphics_api() == DXR_GFX_D3D12 && s_ifaces)
 		prov_refresh_mirror_copy_d3d12(s_ifaces->Get<IUnityGraphicsD3D12v8>());
+	// (#485) While a calibration marker is requested and Unity's own blit is the live mirror
+	// path: put the marker into the texture that blit will be given. Nothing otherwise.
+	gvstamp_after_submit();
 #endif
 	if (!s_mirror_path_logged && s_mirror_submit_n >= 120) {
 		s_mirror_path_logged = true;
@@ -1681,6 +1705,7 @@ GfxStop(UnitySubsystemHandle handle, void *userData)
 		s_mcopy_fence[i] = 0;
 	}
 	prov11_release_blit_pipeline();
+	gvstamp_release(); // (#485)
 #endif
 	// (#480) Mirror colour diagnostics are per session.
 	s_mirror_colour_logged = false;
@@ -1729,8 +1754,9 @@ MainUpdateDisplayState(UnitySubsystemHandle handle, void *userData, UnityXRDispl
 // missing, or the formats aren't copy-compatible (logged; would need a shader blit).
 static int s_native_mirror_env = -1;
 
-// (#459) WHY the native mirror blit does or does not draw. The calibration marker exists only
-// in that blit, and Unity decides per render pipeline whether to call it at all (the SRPs do,
+// (#459) WHY the native mirror blit does or does not draw. The calibration marker is drawn
+// in that blit (where Unity does not call it, it is stamped into the texture Unity blits
+// instead: #485, gvstamp_* below), and Unity decides per render pipeline whether to call it at all (the SRPs do,
 // from C#: XRMirrorView calls AddGraphicsThreadMirrorViewBlit when nativeBlitAvailable; the
 // header warns "the rendering pipeline might not call the native blit function even when it
 // is available"). So every way out of MainBlitToMirrorViewRenderTarget records its reason
@@ -1754,7 +1780,8 @@ enum {
 	DXR_MB_PIPELINE       = 12, // shader compile / PSO / heap creation failed
 	DXR_MB_CMDLIST        = 13, // command allocator / list creation failed
 	DXR_MB_NOT_WINDOWS    = 14, // this build has no native mirror blit
-	DXR_MB_DRAWN_NO_MARKER = 15, // the D3D11 blit ran (#483); it draws no calibration marker
+	DXR_MB_DRAWN_NO_MARKER = 15, // RETIRED (#485): the D3D11 blit draws the marker and reports
+	                             // DXR_MB_DRAWN. The number stays reserved.
 	DXR_MB_REASONS
 };
 static std::atomic<int>      s_mb_last{DXR_MB_NEVER_CALLED};
@@ -1878,6 +1905,7 @@ static ID3D12DescriptorHeap *s_blit_rtvheap  = nullptr; // 1 RTV
 static DXGI_FORMAT           s_blit_pso_fmt   = DXGI_FORMAT_UNKNOWN;
 
 #include "displayxr_gvcal_shader.h"
+#include "displayxr_gvcal_stamp.h" // (#485) the marker for Unity's own blitParams blit
 
 // (#459) Game-view calibration marker. After the editor Game view's layout settles, C# asks
 // this blit to draw a position-coded pattern over the woven image, into the same mirror RT
@@ -1896,7 +1924,14 @@ static std::atomic<ULONGLONG> s_gvcal_deadline{0};
 static std::atomic<int>       s_gvcal_frames{0};
 static std::atomic<int>       s_gvcal_w{0}, s_gvcal_h{0};
 // The mirror RT the blit last drew into, marker or not (the calibration's cache checks it).
+// On the blitParams path (#485) it is the woven canvas: the image Unity's own blit draws.
 static std::atomic<int>       s_mirror_w{0}, s_mirror_h{0}, s_mirror_draws{0};
+// (#485) Each request has a number, so a texture stamped for an earlier request is never
+// taken for this one; and which draw carried the marker last (DXR_GV_PATH_*).
+static std::atomic<unsigned>  s_gvcal_gen{0};
+static std::atomic<int>       s_gvcal_path{DXR_GV_PATH_NONE};
+static std::atomic<int>       s_gvstamp_status{DXR_GS_IDLE};
+static std::atomic<int>       s_gvstamp_stamps{0}, s_gvstamp_handed{0};
 
 // strip: < 0 = the whole image; 0 / 1 = the k-th horizontal strip and the k-th vertical strip
 // only, `half` texels on each side of the row / column that is read.
@@ -1910,11 +1945,36 @@ extern "C" DISPLAYXR_EXPORT void dxr_prov_set_gv_calib_marker2(int enable, int m
 		s_gvcal_half.store(half);
 		s_gvcal_frames.store(0);
 		s_gvcal_w.store(0); s_gvcal_h.store(0);
+		s_gvcal_path.store(DXR_GV_PATH_NONE);
+		s_gvstamp_status.store(DXR_GS_IDLE);
+		s_gvstamp_stamps.store(0); s_gvstamp_handed.store(0);
+		unsigned g = s_gvcal_gen.fetch_add(1) + 1;
+		if (g == 0) s_gvcal_gen.store(1); // 0 means "no request"
 		s_gvcal_deadline.store(GetTickCount64() + (ULONGLONG)max_ms);
 		s_gvcal_on.store(1);
 	} else {
 		s_gvcal_on.store(0);
 	}
+}
+
+// Is a marker requested now? The deadline is enforced here, on whichever thread asks.
+static bool gvcal_requested()
+{
+	if (!s_gvcal_on.load()) return false;
+	if (GetTickCount64() >= s_gvcal_deadline.load()) { s_gvcal_on.store(0); return false; }
+	return true;
+}
+
+// (#485) Which draw carried the marker of the current request (DXR_GV_PATH_*: 0 none yet,
+// 1 / 2 the native mirror blit on D3D12 / D3D11, 3 stamped into the texture Unity's own blit
+// samples), with the stamp's own account: why it did or did not run (DXR_GS_*), how many
+// times the texture was stamped and how many mirror queries were handed it. Main thread.
+extern "C" DISPLAYXR_EXPORT int dxr_prov_get_gv_marker_path(int *stamp_status, int *stamps, int *handed)
+{
+	if (stamp_status) *stamp_status = s_gvstamp_status.load();
+	if (stamps) *stamps = s_gvstamp_stamps.load();
+	if (handed) *handed = s_gvstamp_handed.load();
+	return s_gvcal_path.load();
 }
 
 // The whole-image marker (the original entry point).
@@ -1944,21 +2004,30 @@ extern "C" DISPLAYXR_EXPORT int dxr_prov_get_gv_calib_marker(int *w, int *h, int
 }
 
 // Graphics thread: is the marker to be drawn into a w x h mirror RT this frame? Fills the
-// shader's mk and st (displayxr_gvcal_shader.h) and counts the frame.
-static bool gvcal_marker_for_frame(int w, int h, uint32_t mk[4], uint32_t st[4])
+// shader's mk and st (displayxr_gvcal_shader.h) and counts the frame. path: which native
+// blit asks (DXR_GV_PATH_NATIVE_D3D12 / _D3D11), for the calibration's log line.
+static bool gvcal_marker_for_frame(int w, int h, uint32_t mk[4], uint32_t st[4], int path)
 {
 	mk[0] = mk[1] = mk[2] = mk[3] = 0;
 	st[0] = st[1] = st[2] = st[3] = 0;
 	s_mirror_w.store(w); s_mirror_h.store(h);
 	s_mirror_draws.fetch_add(1);
-	if (!s_gvcal_on.load()) return false;
-	if (GetTickCount64() >= s_gvcal_deadline.load()) { s_gvcal_on.store(0); return false; }
+	if (!gvcal_requested()) return false;
 	if (w < GVCAL_MIN_SIDE || h < GVCAL_MIN_SIDE) return false;
 	unsigned umk[4], ust[4];
 	gvcal_fill_constants(w, h, s_gvcal_strip.load(), s_gvcal_half.load(), umk, ust);
 	for (int i = 0; i < 4; i++) { mk[i] = umk[i]; st[i] = ust[i]; }
 	s_gvcal_w.store(w); s_gvcal_h.store(h);
-	s_gvcal_frames.fetch_add(1);
+	s_gvcal_path.store(path);
+	if (s_gvcal_frames.fetch_add(1) == 0) {
+		// (#485) One line per request: a hardware run reads which draw carried the marker.
+		char m[240];
+		snprintf(m, sizeof(m), "[DisplayXR-PROV] gv marker: drawn by the NATIVE mirror blit (%s) into a %dx%d "
+		         "mirror target, %s (request %u)\n",
+		         path == DXR_GV_PATH_NATIVE_D3D11 ? "D3D11" : "D3D12", w, h,
+		         umk[0] == 1 ? "whole image" : "thin strips", s_gvcal_gen.load());
+		prov_log(m);
+	}
 	return true;
 }
 
@@ -1995,10 +2064,14 @@ static int mirror_native_blit_decode(int target_fmt, int view_fmt, const char *a
 	return decode;
 }
 
-static bool prov_ensure_blit_pipeline(ID3D12Device *dev, DXGI_FORMAT rtFmt)
+// pso / pso_fmt: the pipeline state to (re)build and the format it was built for. The native
+// blit and the marker stamp (#485) each keep their own (their target formats differ); the
+// root signature and the shader source are shared.
+static bool prov_ensure_blit_pipeline(ID3D12Device *dev, DXGI_FORMAT rtFmt,
+                                      ID3D12PipelineState **pso, DXGI_FORMAT *pso_fmt)
 {
-	if (s_blit_pso && s_blit_pso_fmt == rtFmt) return true;
-	if (s_blit_pso) { s_blit_pso->Release(); s_blit_pso = nullptr; }
+	if (*pso && *pso_fmt == rtFmt) return true;
+	if (*pso) { (*pso)->Release(); *pso = nullptr; }
 	if (!s_blit_srvheap) {
 		D3D12_DESCRIPTOR_HEAP_DESC hd = {};
 		hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; hd.NumDescriptors = 1;
@@ -2055,11 +2128,12 @@ static bool prov_ensure_blit_pipeline(ID3D12Device *dev, DXGI_FORMAT rtFmt)
 	pd.PrimitiveTopologyType = D3D12_PRIMITIVE_TOPOLOGY_TYPE_TRIANGLE;
 	pd.NumRenderTargets = 1; pd.RTVFormats[0] = rtFmt;
 	pd.SampleDesc.Count = 1;
-	HRESULT hr = dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(&s_blit_pso));
+	HRESULT hr = dev->CreateGraphicsPipelineState(&pd, IID_PPV_ARGS(pso));
 	vs->Release(); ps->Release();
-	if (FAILED(hr)) { prov_log("[DisplayXR-PROV] native mirror: PSO create failed\n"); return false; }
-	s_blit_pso_fmt = rtFmt;
-	prov_log("[DisplayXR-PROV] native mirror: shader-blit pipeline ready\n");
+	if (FAILED(hr)) { *pso = nullptr; prov_log("[DisplayXR-PROV] native mirror: PSO create failed\n"); return false; }
+	*pso_fmt = rtFmt;
+	prov_log(pso == &s_blit_pso ? "[DisplayXR-PROV] native mirror: shader-blit pipeline ready\n"
+	                            : "[DisplayXR-PROV] gv marker: stamp pipeline ready (D3D12)\n");
 	return true;
 }
 
@@ -2085,7 +2159,7 @@ static bool prov_shader_blit_woven(ID3D12Device *dev, DxrExecuteCommandListFn ex
 	const DXGI_FORMAT view_fmt =
 	    (DXGI_FORMAT)dxr_mirror_dxgi_view_format((int)rd.Format, dxr_prov_woven_is_encoded());
 	const int decode = mirror_native_blit_decode((int)rd.Format, (int)view_fmt, "D3D12");
-	if (!prov_ensure_blit_pipeline(dev, view_fmt)) return false;
+	if (!prov_ensure_blit_pipeline(dev, view_fmt, &s_blit_pso, &s_blit_pso_fmt)) return false;
 	*why = DXR_MB_CMDLIST;
 	if (!s_mblit_alloc)
 		dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&s_mblit_alloc));
@@ -2126,7 +2200,7 @@ static bool prov_shader_blit_woven(ID3D12Device *dev, DxrExecuteCommandListFn ex
 	float srcRect[4] = { (float)cx / tw, (float)cy / th, (float)cw / tw, (float)ch / th };
 	s_mblit_list->SetGraphicsRoot32BitConstants(0, 4, srcRect, 0);
 	uint32_t gv_mk[4], gv_st[4]; // (#459) calibration marker over the woven image, while it is read
-	gvcal_marker_for_frame((int)rd.Width, (int)rd.Height, gv_mk, gv_st);
+	gvcal_marker_for_frame((int)rd.Width, (int)rd.Height, gv_mk, gv_st, DXR_GV_PATH_NATIVE_D3D12);
 	s_mblit_list->SetGraphicsRoot32BitConstants(0, 4, gv_mk, 4);
 	s_mblit_list->SetGraphicsRoot32BitConstants(0, 4, gv_st, 8);
 	uint32_t fl[4] = { (uint32_t)(decode ? 1 : 0), 0, 0, 0 }; // (#480) shader decode
@@ -2167,8 +2241,9 @@ static bool prov_shader_blit_woven(ID3D12Device *dev, DxrExecuteCommandListFn ex
 // UNVERIFIED on hardware in a Linear project: the "mirror colour: native blit target" line
 // logs the storage format, the view and the decision.
 //
-// No calibration marker here (#459): the marker stays D3D12-only until it has been shown on a
-// panel that this draw lands where Unity's Game view shows it.
+// The calibration marker (#459) is drawn here as on D3D12 (#485): the same shader, the same
+// constants, laid out for this mirror target. Whether this draw lands where Unity shows the
+// Game view is exactly what the marker then measures.
 // ---------------------------------------------------------------------------------------
 static bool prov11_ensure_blit_pipeline(ID3D11Device *dev)
 {
@@ -2231,6 +2306,94 @@ static DXGI_FORMAT prov11_mirror_rtv_format(DXGI_FORMAT f)
 	case DXGI_FORMAT_R32G32B32A32_TYPELESS: return DXGI_FORMAT_R32G32B32A32_FLOAT;
 	default:                                return f; // typed: the resource's own format
 	}
+}
+
+// One draw of the mirror blit shader on Unity's immediate context: constants cb, source srv,
+// into rtv through viewport vp (clear: the whole target first). Everything it touches on the
+// context is saved before and put back after. Shared by the native blit (#483) and the
+// marker stamp (#485).
+static void prov11_draw_saved(ID3D11DeviceContext *ctx, ID3D11RenderTargetView *rtv, const D3D11_VIEWPORT *vp,
+                             ID3D11ShaderResourceView *srv, const DxrMirrorBlitConstants *cb, bool clear)
+{
+	// ---- save ----
+	ID3D11RenderTargetView *o_rtv[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+	ID3D11DepthStencilView *o_dsv = nullptr;
+	ctx->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, o_rtv, &o_dsv);
+	UINT o_nvp = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+	D3D11_VIEWPORT o_vp[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+	ctx->RSGetViewports(&o_nvp, o_vp);
+	ID3D11RasterizerState *o_rs = nullptr; ctx->RSGetState(&o_rs);
+	ID3D11BlendState *o_bs = nullptr; FLOAT o_bf[4] = {}; UINT o_sm = 0xFFFFFFFFu;
+	ctx->OMGetBlendState(&o_bs, o_bf, &o_sm);
+	ID3D11DepthStencilState *o_dss = nullptr; UINT o_sref = 0;
+	ctx->OMGetDepthStencilState(&o_dss, &o_sref);
+	D3D11_PRIMITIVE_TOPOLOGY o_topo = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+	ctx->IAGetPrimitiveTopology(&o_topo);
+	ID3D11InputLayout *o_il = nullptr; ctx->IAGetInputLayout(&o_il);
+	ID3D11VertexShader   *o_vs = nullptr; ctx->VSGetShader(&o_vs, nullptr, nullptr);
+	ID3D11PixelShader    *o_ps = nullptr; ctx->PSGetShader(&o_ps, nullptr, nullptr);
+	ID3D11GeometryShader *o_gs = nullptr; ctx->GSGetShader(&o_gs, nullptr, nullptr);
+	ID3D11HullShader     *o_hs = nullptr; ctx->HSGetShader(&o_hs, nullptr, nullptr);
+	ID3D11DomainShader   *o_ds = nullptr; ctx->DSGetShader(&o_ds, nullptr, nullptr);
+	ID3D11Buffer *o_vcb = nullptr; ctx->VSGetConstantBuffers(0, 1, &o_vcb);
+	ID3D11Buffer *o_pcb = nullptr; ctx->PSGetConstantBuffers(0, 1, &o_pcb);
+	ID3D11ShaderResourceView *o_srv = nullptr; ctx->PSGetShaderResources(0, 1, &o_srv);
+	ID3D11SamplerState *o_smp = nullptr; ctx->PSGetSamplers(0, 1, &o_smp);
+
+
+	// ---- draw ----
+	ctx->UpdateSubresource(s_blit11_cb, 0, nullptr, cb, 0, 0);
+	if (clear) { const FLOAT black[4] = { 0.0f, 0.0f, 0.0f, 0.0f }; ctx->ClearRenderTargetView(rtv, black); }
+	ctx->OMSetRenderTargets(1, &rtv, nullptr);
+	ctx->RSSetViewports(1, vp);
+	ctx->RSSetState(s_blit11_rs);                   // solid, no cull, no scissor
+	ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFFu); // opaque overwrite, all channels
+	ctx->OMSetDepthStencilState(nullptr, 0);        // no DSV bound
+	ctx->IASetInputLayout(nullptr);
+	ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+	ctx->VSSetShader(s_blit11_vs, nullptr, 0);
+	ctx->PSSetShader(s_blit11_ps, nullptr, 0);
+	ctx->GSSetShader(nullptr, nullptr, 0);
+	ctx->HSSetShader(nullptr, nullptr, 0);
+	ctx->DSSetShader(nullptr, nullptr, 0);
+	ctx->VSSetConstantBuffers(0, 1, &s_blit11_cb);
+	ctx->PSSetConstantBuffers(0, 1, &s_blit11_cb);
+	ctx->PSSetShaderResources(0, 1, &srv);
+	ctx->PSSetSamplers(0, 1, &s_blit11_smp);
+	ctx->Draw(3, 0);
+
+	// ---- restore ----
+	ctx->PSSetSamplers(0, 1, &o_smp);
+	ctx->PSSetShaderResources(0, 1, &o_srv);
+	ctx->PSSetConstantBuffers(0, 1, &o_pcb);
+	ctx->VSSetConstantBuffers(0, 1, &o_vcb);
+	ctx->DSSetShader(o_ds, nullptr, 0);
+	ctx->HSSetShader(o_hs, nullptr, 0);
+	ctx->GSSetShader(o_gs, nullptr, 0);
+	ctx->PSSetShader(o_ps, nullptr, 0);
+	ctx->VSSetShader(o_vs, nullptr, 0);
+	ctx->IASetPrimitiveTopology(o_topo);
+	ctx->IASetInputLayout(o_il);
+	ctx->OMSetDepthStencilState(o_dss, o_sref);
+	ctx->OMSetBlendState(o_bs, o_bf, o_sm);
+	ctx->RSSetState(o_rs);
+	ctx->RSSetViewports(o_nvp, o_vp);
+	ctx->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, o_rtv, o_dsv);
+	for (ID3D11RenderTargetView *v : o_rtv) if (v) v->Release();
+	if (o_dsv) o_dsv->Release();
+	if (o_rs)  o_rs->Release();
+	if (o_bs)  o_bs->Release();
+	if (o_dss) o_dss->Release();
+	if (o_il)  o_il->Release();
+	if (o_vs)  o_vs->Release();
+	if (o_ps)  o_ps->Release();
+	if (o_gs)  o_gs->Release();
+	if (o_hs)  o_hs->Release();
+	if (o_ds)  o_ds->Release();
+	if (o_vcb) o_vcb->Release();
+	if (o_pcb) o_pcb->Release();
+	if (o_srv) o_srv->Release();
+	if (o_smp) o_smp->Release();
 }
 
 // Draw the woven canvas sub-rect into the whole Game view mirror RT on Unity's D3D11 device.
@@ -2319,93 +2482,20 @@ static bool prov11_shader_blit_woven(IUnityGraphicsD3D11 *d11, UnityRenderBuffer
 		dev->GetImmediateContext(&ctx);
 		if (!ctx) break;
 
-		// ---- save ----
-		ID3D11RenderTargetView *o_rtv[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
-		ID3D11DepthStencilView *o_dsv = nullptr;
-		ctx->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, o_rtv, &o_dsv);
-		UINT o_nvp = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
-		D3D11_VIEWPORT o_vp[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
-		ctx->RSGetViewports(&o_nvp, o_vp);
-		ID3D11RasterizerState *o_rs = nullptr; ctx->RSGetState(&o_rs);
-		ID3D11BlendState *o_bs = nullptr; FLOAT o_bf[4] = {}; UINT o_sm = 0xFFFFFFFFu;
-		ctx->OMGetBlendState(&o_bs, o_bf, &o_sm);
-		ID3D11DepthStencilState *o_dss = nullptr; UINT o_sref = 0;
-		ctx->OMGetDepthStencilState(&o_dss, &o_sref);
-		D3D11_PRIMITIVE_TOPOLOGY o_topo = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
-		ctx->IAGetPrimitiveTopology(&o_topo);
-		ID3D11InputLayout *o_il = nullptr; ctx->IAGetInputLayout(&o_il);
-		ID3D11VertexShader   *o_vs = nullptr; ctx->VSGetShader(&o_vs, nullptr, nullptr);
-		ID3D11PixelShader    *o_ps = nullptr; ctx->PSGetShader(&o_ps, nullptr, nullptr);
-		ID3D11GeometryShader *o_gs = nullptr; ctx->GSGetShader(&o_gs, nullptr, nullptr);
-		ID3D11HullShader     *o_hs = nullptr; ctx->HSGetShader(&o_hs, nullptr, nullptr);
-		ID3D11DomainShader   *o_ds = nullptr; ctx->DSGetShader(&o_ds, nullptr, nullptr);
-		ID3D11Buffer *o_vcb = nullptr; ctx->VSGetConstantBuffers(0, 1, &o_vcb);
-		ID3D11Buffer *o_pcb = nullptr; ctx->PSGetConstantBuffers(0, 1, &o_pcb);
-		ID3D11ShaderResourceView *o_srv = nullptr; ctx->PSGetShaderResources(0, 1, &o_srv);
-		ID3D11SamplerState *o_smp = nullptr; ctx->PSGetSamplers(0, 1, &o_smp);
-
-		// ---- draw ----
-		DxrMirrorBlitConstants cb = {}; // mk / st stay 0: no calibration marker on D3D11
+		DxrMirrorBlitConstants cb = {};
 		cb.srcRect[0] = (float)cx / tw; cb.srcRect[1] = (float)cy / th;
 		cb.srcRect[2] = (float)cw / tw; cb.srcRect[3] = (float)ch / th;
+		// (#485) The calibration marker over the woven image while it is read, as on D3D12:
+		// the same shader and the same constants, laid out for this mirror target.
+		gvcal_marker_for_frame((int)rd.Width, (int)rd.Height, cb.mk, cb.st, DXR_GV_PATH_NATIVE_D3D11);
 		cb.fl[0] = decode ? 1u : 0u; // (#480) shader decode
-		ctx->UpdateSubresource(s_blit11_cb, 0, nullptr, &cb, 0, 0);
-		ctx->OMSetRenderTargets(1, &rtv, nullptr);
 		D3D11_VIEWPORT vp = { 0.0f, 0.0f, (float)rd.Width, (float)rd.Height, 0.0f, 1.0f };
-		ctx->RSSetViewports(1, &vp);
-		ctx->RSSetState(s_blit11_rs);                   // solid, no cull, no scissor
-		ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFFu); // opaque overwrite, all channels
-		ctx->OMSetDepthStencilState(nullptr, 0);        // no DSV bound
-		ctx->IASetInputLayout(nullptr);
-		ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
-		ctx->VSSetShader(s_blit11_vs, nullptr, 0);
-		ctx->PSSetShader(s_blit11_ps, nullptr, 0);
-		ctx->GSSetShader(nullptr, nullptr, 0);
-		ctx->HSSetShader(nullptr, nullptr, 0);
-		ctx->DSSetShader(nullptr, nullptr, 0);
-		ctx->VSSetConstantBuffers(0, 1, &s_blit11_cb);
-		ctx->PSSetConstantBuffers(0, 1, &s_blit11_cb);
-		ctx->PSSetShaderResources(0, 1, &srv);
-		ctx->PSSetSamplers(0, 1, &s_blit11_smp);
-		ctx->Draw(3, 0);
-
-		// ---- restore ----
-		ctx->PSSetSamplers(0, 1, &o_smp);
-		ctx->PSSetShaderResources(0, 1, &o_srv);
-		ctx->PSSetConstantBuffers(0, 1, &o_pcb);
-		ctx->VSSetConstantBuffers(0, 1, &o_vcb);
-		ctx->DSSetShader(o_ds, nullptr, 0);
-		ctx->HSSetShader(o_hs, nullptr, 0);
-		ctx->GSSetShader(o_gs, nullptr, 0);
-		ctx->PSSetShader(o_ps, nullptr, 0);
-		ctx->VSSetShader(o_vs, nullptr, 0);
-		ctx->IASetPrimitiveTopology(o_topo);
-		ctx->IASetInputLayout(o_il);
-		ctx->OMSetDepthStencilState(o_dss, o_sref);
-		ctx->OMSetBlendState(o_bs, o_bf, o_sm);
-		ctx->RSSetState(o_rs);
-		ctx->RSSetViewports(o_nvp, o_vp);
-		ctx->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, o_rtv, o_dsv);
-		for (ID3D11RenderTargetView *v : o_rtv) if (v) v->Release();
-		if (o_dsv) o_dsv->Release();
-		if (o_rs)  o_rs->Release();
-		if (o_bs)  o_bs->Release();
-		if (o_dss) o_dss->Release();
-		if (o_il)  o_il->Release();
-		if (o_vs)  o_vs->Release();
-		if (o_ps)  o_ps->Release();
-		if (o_gs)  o_gs->Release();
-		if (o_hs)  o_hs->Release();
-		if (o_ds)  o_ds->Release();
-		if (o_vcb) o_vcb->Release();
-		if (o_pcb) o_pcb->Release();
-		if (o_srv) o_srv->Release();
-		if (o_smp) o_smp->Release();
+		prov11_draw_saved(ctx, rtv, &vp, srv, &cb, false);
 		drawn = true;
 	} while (0);
 
 	if (drawn) {
-		*why = DXR_MB_DRAWN_NO_MARKER;
+		*why = DXR_MB_DRAWN;
 		s_mirror_native_seen = true;                // (#480) the native path is the live one
 		s_mirror_native_last = s_mirror_submit_n;
 		static bool logged = false;
@@ -2424,6 +2514,442 @@ static bool prov11_shader_blit_woven(IUnityGraphicsD3D11 *d11, UnityRenderBuffer
 	if (rtv) rtv->Release();
 	rtTex->Release();
 	return drawn;
+}
+
+// ---------------------------------------------------------------------------------------
+// (#485) The calibration marker for Unity's OWN mirror blit (blitParams): the Built-in
+// pipeline, which is offered the native blit above and never calls it. The contract, the
+// decision and the reasons are in displayxr_gvcal_stamp.h; this is the part that owns
+// devices.
+//
+// While a marker is requested (gvcal_requested) and the native blit is not the live mirror
+// path: gvstamp_ensure_texture (frame start) makes a texture the size and declaration of the
+// one Unity was told about and wraps it as a second Unity texture; gvstamp_after_submit
+// (after xrEndFrame, where the #480 mirror copy runs, with the same ordering against the
+// runtime's weave) draws the woven canvas into it with the marker; and the mirror query
+// (gvstamp_query_tex_id) names it in blitParams for as long as the request lasts.
+// With no marker requested none of this draws, copies or allocates: the only standing cost
+// is the texture itself, once a first calibration made it, until the mirror textures are
+// wrapped again (destroy_textures) or the session stops.
+//
+// ASSUMED, and logged so one run shows it (the "gv marker:" lines):
+//  - Unity takes a different srcTexId from one mirror query to the next (it queries every
+//    frame on this path: the "offered N times, called 0 times" count).
+//  - Unity's blit treats this texture exactly as the woven one (same declaration, same
+//    srcRect / destRect), so whatever it does to the image it does to the marker.
+//  - D3D12: the woven texture can be sampled from Unity's queue without a declared state, as
+//    the native blit above does (PIXEL_SHADER_RESOURCE after Unity's own blit of it, or
+//    COMMON, which promotes).
+// ---------------------------------------------------------------------------------------
+static ID3D11Texture2D           *s_gvstamp_tex11 = nullptr;
+static ID3D11RenderTargetView    *s_gvstamp_rtv11 = nullptr;
+static ID3D12Resource            *s_gvstamp_tex12 = nullptr;
+static void                      *s_gvstamp_for = nullptr;   // the woven texture it was made for (identity only)
+static uint32_t                   s_gvstamp_tw = 0, s_gvstamp_th = 0;
+static bool                       s_gvstamp_srgb = false;
+static bool                       s_gvstamp_tex_failed = false; // not retried every frame of a session
+static ID3D12PipelineState       *s_gvstamp_pso = nullptr;
+static DXGI_FORMAT                s_gvstamp_pso_fmt = DXGI_FORMAT_UNKNOWN;
+static ID3D12DescriptorHeap      *s_gvstamp_srvheap = nullptr, *s_gvstamp_rtvheap = nullptr;
+#define GVSTAMP_RING 4
+static ID3D12CommandAllocator    *s_gvstamp_alloc[GVSTAMP_RING] = {};
+static UINT64                     s_gvstamp_alloc_fence[GVSTAMP_RING] = {};
+static ID3D12GraphicsCommandList *s_gvstamp_list = nullptr;
+static UINT64                     s_gvstamp_last_fence = 0;
+// The request the texture holds the marker of, and the canvas it was stamped for.
+static std::atomic<unsigned>      s_gvstamp_gen{0};
+static std::atomic<int>           s_gvstamp_cx{0}, s_gvstamp_cy{0}, s_gvstamp_cw{0}, s_gvstamp_ch{0};
+static std::atomic<unsigned>      s_gvstamp_note_logged{0};  // one bit per reason logged this session
+static unsigned                   s_gvstamp_stamp_logged_gen = 0, s_gvstamp_hand_logged_gen = 0;
+
+// DISPLAYXR_PROV_GV_CALIB_STAMP=0: no marker for Unity's own blit (the calibration then falls
+// back to the computed placement there, as before #485). Read once.
+static bool gvstamp_enabled()
+{
+	static int s_env = -1;
+	if (s_env < 0) {
+		const char *e = getenv("DISPLAYXR_PROV_GV_CALIB_STAMP");
+		s_env = (e && e[0] == '0') ? 0 : 1; // default ON
+	}
+	return s_env == 1;
+}
+
+// The graphics API the stamp draws with, from the RENDERER ID (#483), whatever the native
+// mirror switches say: with DISPLAYXR_PROV_NATIVE_MIRROR=0 Unity's own blit is the path.
+static int gvstamp_backend()
+{
+	const int renderer = displayxr_unity_get_renderer();
+	if (renderer == kUnityGfxRendererD3D12) return kNativeMirrorD3D12;
+	if (renderer == kUnityGfxRendererD3D11) return kNativeMirrorD3D11;
+	return kNativeMirrorNone;
+}
+
+// Why the stamp did not run, for C# (dxr_prov_get_gv_marker_path) and, once per session and
+// reason, for the log.
+static void gvstamp_note(int status)
+{
+	s_gvstamp_status.store(status);
+	if (status <= DXR_GS_STAMPED || status >= DXR_GS_REASONS) return;
+	const unsigned bit = 1u << status;
+	if (s_gvstamp_note_logged.fetch_or(bit) & bit) return;
+	const char *t =
+	    status == DXR_GS_DISABLED      ? "DISPLAYXR_PROV_GV_CALIB_STAMP=0" :
+	    status == DXR_GS_NATIVE_LIVE   ? "not needed: Unity calls the native mirror blit, which draws the marker" :
+	    status == DXR_GS_NO_BACKEND    ? "the renderer is neither Direct3D11 nor Direct3D12" :
+	    status == DXR_GS_NO_INTERFACE  ? "Unity gave no graphics interface or device for this renderer (D3D12 needs IUnityGraphicsD3D12v8)" :
+	    status == DXR_GS_NO_WOVEN      ? "no woven texture is open on Unity's device and registered with Unity" :
+	    status == DXR_GS_CANVAS        ? "the woven canvas is empty, under 128 px, or not inside its texture" :
+	    status == DXR_GS_TEXTURE       ? "the marker texture could not be created (see the line above)" :
+	    status == DXR_GS_UNITY_TEXTURE ? "Unity refused the marker texture (CreateTexture failed)" :
+	    status == DXR_GS_PIPELINE      ? "the shader, pipeline state or a view could not be created" :
+	    status == DXR_GS_CMDLIST       ? "no command allocator was free, or the command list could not be made" :
+	                                     "the session has only just started (which mirror path is live is not known yet)";
+	int32_t cx = 0, cy = 0, cw = 0, ch = 0; uint32_t tw = 0, th = 0;
+	dxr_prov_get_woven_canvas(&cx, &cy, &cw, &ch, &tw, &th);
+	char m[420];
+	snprintf(m, sizeof(m), "[DisplayXR-PROV] gv marker: NOT stamped - %s (status %d, request %u, renderer id %d, "
+	         "canvas (%d,%d %dx%d) of %ux%u, %u frames submitted, native blit calls %d)\n",
+	         t, status, s_gvcal_gen.load(), displayxr_unity_get_renderer(), cx, cy, cw, ch, tw, th,
+	         s_mirror_submit_n, s_mb_calls.load());
+	prov_log(m);
+}
+
+// May the marker be stamped now (DXR_GS_STAMPED), or why not? Graphics thread.
+static int gvstamp_wanted(int32_t *cx, int32_t *cy, int32_t *cw, int32_t *ch, uint32_t *tw, uint32_t *th)
+{
+	*cx = *cy = *cw = *ch = 0; *tw = *th = 0;
+	dxr_prov_get_woven_canvas(cx, cy, cw, ch, tw, th);
+	return dxr_gvstamp_decide(gvstamp_enabled() ? 1 : 0,
+	                          dxr_gvstamp_native_live(s_mirror_native_seen ? 1 : 0, s_mirror_submit_n, s_mirror_native_last),
+	                          s_mirror_submit_n, gvstamp_backend() != kNativeMirrorNone ? 1 : 0,
+	                          s_woven_tex_id != 0 ? 1 : 0, *cx, *cy, *cw, *ch, *tw, *th);
+}
+
+// D3D12: do not release a texture a stamp may still be drawing into. Bounded.
+static void gvstamp_wait_d3d12(void)
+{
+	if (s_gvstamp_last_fence == 0 || !s_ifaces || displayxr_unity_get_renderer() != kUnityGfxRendererD3D12) return;
+	IUnityGraphicsD3D12v8 *v8 = s_ifaces->Get<IUnityGraphicsD3D12v8>();
+	ID3D12Fence *f = v8 ? v8->GetFrameFence() : nullptr;
+	for (int i = 0; f && i < 50 && f->GetCompletedValue() < s_gvstamp_last_fence; i++) Sleep(1);
+	s_gvstamp_last_fence = 0;
+}
+
+static void gvstamp_drop_texture(void)
+{
+	s_gvstamp_gen.store(0); // nothing stamped: the query hands nothing out
+	if (uint32_t id = s_gvstamp_tex_id.exchange(0))
+		if (s_display && s_handle) s_display->DestroyTexture(s_handle, id);
+	if (s_gvstamp_rtv11) { s_gvstamp_rtv11->Release(); s_gvstamp_rtv11 = nullptr; }
+	if (s_gvstamp_tex11) { s_gvstamp_tex11->Release(); s_gvstamp_tex11 = nullptr; }
+	if (s_gvstamp_tex12) { gvstamp_wait_d3d12(); s_gvstamp_tex12->Release(); s_gvstamp_tex12 = nullptr; }
+	s_gvstamp_for = nullptr; s_gvstamp_tw = s_gvstamp_th = 0;
+}
+
+static void gvstamp_release(void)
+{
+	gvstamp_drop_texture();
+	if (s_gvstamp_list) { s_gvstamp_list->Release(); s_gvstamp_list = nullptr; }
+	for (int i = 0; i < GVSTAMP_RING; i++) {
+		if (s_gvstamp_alloc[i]) { s_gvstamp_alloc[i]->Release(); s_gvstamp_alloc[i] = nullptr; }
+		s_gvstamp_alloc_fence[i] = 0;
+	}
+	if (s_gvstamp_pso)     { s_gvstamp_pso->Release();     s_gvstamp_pso = nullptr; }
+	if (s_gvstamp_srvheap) { s_gvstamp_srvheap->Release(); s_gvstamp_srvheap = nullptr; }
+	if (s_gvstamp_rtvheap) { s_gvstamp_rtvheap->Release(); s_gvstamp_rtvheap = nullptr; }
+	s_gvstamp_pso_fmt = DXGI_FORMAT_UNKNOWN;
+	s_gvstamp_tex_failed = false;
+	s_gvstamp_note_logged.store(0); // a new session says everything afresh
+	s_gvstamp_stamp_logged_gen = 0; s_gvstamp_hand_logged_gen = 0;
+	s_gvstamp_status.store(DXR_GS_IDLE);
+}
+
+// Frame start, graphics thread (where the other Unity textures are wrapped). Only while a
+// marker is requested and the stamp is the path: make the marker texture for the woven
+// texture as it is now, and wrap it for Unity declared exactly as the woven mirror source.
+static void gvstamp_ensure_texture(void)
+{
+	if (!gvcal_requested() || !s_display || !s_handle || !s_ifaces) return;
+	int32_t cx, cy, cw, ch; uint32_t tw, th;
+	if (gvstamp_wanted(&cx, &cy, &cw, &ch, &tw, &th) != DXR_GS_STAMPED) return; // gvstamp_after_submit says why
+	uint32_t ww = 0, wh = 0;
+	void *woven = dxr_prov_get_woven_unity_texture(&ww, &wh);
+	if (!woven || ww == 0 || wh == 0) return;
+	const bool srgb = s_woven_tex_srgb;
+	const bool fits = (s_gvstamp_tex11 || s_gvstamp_tex12) && s_gvstamp_for == woven &&
+	                  s_gvstamp_tw == ww && s_gvstamp_th == wh && s_gvstamp_srgb == srgb;
+	if (fits && s_gvstamp_tex_id.load() != 0) return;
+	if (s_gvstamp_tex_failed) return;
+	const int backend = gvstamp_backend();
+	// Unity samples a texture declared sRGB through an _SRGB view, which a typed UNORM
+	// texture cannot carry: TYPELESS there, as the #480 copy; plain UNORM otherwise, as the
+	// woven texture. The stamp always stores through a UNORM view, so the bytes land raw.
+	const DXGI_FORMAT tex_fmt = srgb ? DXGI_FORMAT_B8G8R8A8_TYPELESS : DXGI_FORMAT_B8G8R8A8_UNORM;
+	if (!fits) {
+		gvstamp_drop_texture();
+		HRESULT hr = E_FAIL; int woven_fmt = 0;
+		if (backend == kNativeMirrorD3D11) {
+			IUnityGraphicsD3D11 *d11 = s_ifaces->Get<IUnityGraphicsD3D11>();
+			ID3D11Device *dev = d11 ? d11->GetDevice() : nullptr;
+			if (!dev) { gvstamp_note(DXR_GS_NO_INTERFACE); return; }
+			D3D11_TEXTURE2D_DESC td = {};
+			((ID3D11Texture2D *)woven)->GetDesc(&td);
+			woven_fmt = (int)td.Format;
+			td.Format = tex_fmt;
+			td.MipLevels = 1; td.ArraySize = 1; td.SampleDesc.Count = 1; td.SampleDesc.Quality = 0;
+			td.Usage = D3D11_USAGE_DEFAULT; td.CPUAccessFlags = 0;
+			td.MiscFlags = 0; // a plain Unity-device texture: nothing else opens it
+			td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+			hr = (woven_fmt == (int)DXGI_FORMAT_B8G8R8A8_UNORM) ? dev->CreateTexture2D(&td, nullptr, &s_gvstamp_tex11)
+			                                                    : E_INVALIDARG;
+			if (SUCCEEDED(hr) && s_gvstamp_tex11) {
+				D3D11_RENDER_TARGET_VIEW_DESC rv = {};
+				rv.Format = DXGI_FORMAT_B8G8R8A8_UNORM; rv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+				hr = dev->CreateRenderTargetView(s_gvstamp_tex11, &rv, &s_gvstamp_rtv11);
+			}
+			if (FAILED(hr) || !s_gvstamp_tex11 || !s_gvstamp_rtv11) {
+				if (s_gvstamp_rtv11) { s_gvstamp_rtv11->Release(); s_gvstamp_rtv11 = nullptr; }
+				if (s_gvstamp_tex11) { s_gvstamp_tex11->Release(); s_gvstamp_tex11 = nullptr; }
+			}
+		} else {
+			IUnityGraphicsD3D12v8 *v8 = s_ifaces->Get<IUnityGraphicsD3D12v8>();
+			ID3D12Device *dev = v8 ? v8->GetDevice() : nullptr;
+			if (!dev) { gvstamp_note(DXR_GS_NO_INTERFACE); return; }
+			D3D12_RESOURCE_DESC rd = ((ID3D12Resource *)woven)->GetDesc();
+			woven_fmt = (int)rd.Format;
+			rd.Format = tex_fmt;
+			rd.MipLevels = 1; rd.DepthOrArraySize = 1; rd.SampleDesc.Count = 1; rd.SampleDesc.Quality = 0;
+			rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+			D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+			hr = (woven_fmt == (int)DXGI_FORMAT_B8G8R8A8_UNORM)
+			         ? dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd, D3D12_RESOURCE_STATE_COMMON,
+			                                        nullptr, IID_PPV_ARGS(&s_gvstamp_tex12))
+			         : E_INVALIDARG;
+			if (FAILED(hr)) s_gvstamp_tex12 = nullptr;
+		}
+		if (!s_gvstamp_tex11 && !s_gvstamp_tex12) {
+			s_gvstamp_tex_failed = true;
+			char m[260];
+			snprintf(m, sizeof(m), "[DisplayXR-PROV] gv marker: marker texture %ux%u could not be created (%s, woven "
+			         "format %d, wanted format %d, hr=0x%08lX)\n", ww, wh,
+			         backend == kNativeMirrorD3D11 ? "D3D11" : "D3D12", woven_fmt, (int)tex_fmt, (unsigned long)hr);
+			prov_log(m);
+			gvstamp_note(DXR_GS_TEXTURE);
+			return;
+		}
+		s_gvstamp_for = woven; s_gvstamp_tw = ww; s_gvstamp_th = wh; s_gvstamp_srgb = srgb;
+	}
+	// Declared as create_woven_mirror_texture_if_ready declares the mirror source.
+	UnityXRRenderTextureDesc desc; memset(&desc, 0, sizeof(desc));
+	desc.colorFormat = kUnityXRRenderTextureFormatBGRA32;
+	desc.color.nativePtr = s_gvstamp_tex11 ? (void *)s_gvstamp_tex11 : (void *)s_gvstamp_tex12;
+	desc.depthFormat = kUnityXRDepthTextureFormatNone;
+	desc.depth.nativePtr = (void *)(uintptr_t)kUnityXRRenderTextureIdDontCare;
+	desc.width = ww;
+	desc.height = wh;
+	desc.textureArrayLength = 1;
+	desc.flags = kUnityXRRenderTextureFlagsUVDirectionTopToBottom;
+	if (srgb) desc.flags |= kUnityXRRenderTextureFlagsSRGB;
+	UnityXRRenderTextureId id = 0;
+	if (s_display->CreateTexture(s_handle, &desc, &id) != kUnitySubsystemErrorCodeSuccess || id == 0) {
+		s_gvstamp_tex_failed = true;
+		gvstamp_note(DXR_GS_UNITY_TEXTURE);
+		return;
+	}
+	s_gvstamp_gen.store(0);
+	s_gvstamp_tex_id.store((uint32_t)id);
+	char m[300];
+	snprintf(m, sizeof(m), "[DisplayXR-PROV] gv marker: marker texture %ux%u %s (%s, format %d, declared BGRA32 srgb=%d "
+	         "as the mirror source id %u) -> Unity texture id %u\n", ww, wh, fits ? "wrapped again" : "created",
+	         backend == kNativeMirrorD3D11 ? "D3D11" : "D3D12", (int)tex_fmt, srgb ? 1 : 0,
+	         (unsigned)s_woven_tex_id, (unsigned)id);
+	prov_log(m);
+}
+
+static bool gvstamp_draw_d3d11(const DxrMirrorBlitConstants *cb, int32_t cx, int32_t cy, int32_t cw, int32_t ch, int *why)
+{
+	*why = DXR_GS_NO_INTERFACE;
+	IUnityGraphicsD3D11 *d11 = s_ifaces->Get<IUnityGraphicsD3D11>();
+	ID3D11Device *dev = d11 ? d11->GetDevice() : nullptr;
+	if (!dev) return false;
+	*why = DXR_GS_NO_WOVEN;
+	uint32_t ww = 0, wh = 0;
+	ID3D11Texture2D *src = (ID3D11Texture2D *)dxr_prov_get_woven_unity_texture(&ww, &wh);
+	if (!src || (void *)src != s_gvstamp_for || !s_gvstamp_tex11 || !s_gvstamp_rtv11) return false;
+	*why = DXR_GS_PIPELINE;
+	if (!prov11_ensure_blit_pipeline(dev)) return false;
+	ID3D11ShaderResourceView *srv = nullptr;
+	if (FAILED(dev->CreateShaderResourceView(src, nullptr, &srv)) || !srv) return false;
+	ID3D11DeviceContext *ctx = nullptr;
+	dev->GetImmediateContext(&ctx);
+	if (!ctx) { srv->Release(); return false; }
+	// As the #480 copy: this frame's weave must have left the runtime's own context before
+	// Unity's context reads the woven texture.
+	dxr_prov_flush_own_d3d11();
+	D3D11_VIEWPORT vp = { (float)cx, (float)cy, (float)cw, (float)ch, 0.0f, 1.0f };
+	prov11_draw_saved(ctx, s_gvstamp_rtv11, &vp, srv, cb, true);
+	ctx->Release();
+	srv->Release();
+	return true;
+}
+
+static bool gvstamp_draw_d3d12(const DxrMirrorBlitConstants *cb, int32_t cx, int32_t cy, int32_t cw, int32_t ch, int *why)
+{
+	*why = DXR_GS_NO_INTERFACE;
+	IUnityGraphicsD3D12v8 *v8 = s_ifaces->Get<IUnityGraphicsD3D12v8>();
+	ID3D12Device *dev = v8 ? v8->GetDevice() : nullptr;
+	if (!dev) return false;
+	*why = DXR_GS_NO_WOVEN;
+	uint32_t ww = 0, wh = 0;
+	ID3D12Resource *src = (ID3D12Resource *)dxr_prov_get_woven_unity_texture(&ww, &wh);
+	if (!src || (void *)src != s_gvstamp_for || !s_gvstamp_tex12) return false;
+	*why = DXR_GS_PIPELINE;
+	if (!prov_ensure_blit_pipeline(dev, DXGI_FORMAT_B8G8R8A8_UNORM, &s_gvstamp_pso, &s_gvstamp_pso_fmt)) return false;
+	if (!s_gvstamp_srvheap) {
+		D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+		hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_CBV_SRV_UAV; hd.NumDescriptors = 1;
+		hd.Flags = D3D12_DESCRIPTOR_HEAP_FLAG_SHADER_VISIBLE;
+		if (FAILED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&s_gvstamp_srvheap)))) { s_gvstamp_srvheap = nullptr; return false; }
+	}
+	if (!s_gvstamp_rtvheap) {
+		D3D12_DESCRIPTOR_HEAP_DESC hd = {};
+		hd.Type = D3D12_DESCRIPTOR_HEAP_TYPE_RTV; hd.NumDescriptors = 1;
+		if (FAILED(dev->CreateDescriptorHeap(&hd, IID_PPV_ARGS(&s_gvstamp_rtvheap)))) { s_gvstamp_rtvheap = nullptr; return false; }
+	}
+	// An allocator is reused only once the frame that used it has completed (as the #480 copy).
+	*why = DXR_GS_CMDLIST;
+	ID3D12Fence *fence = v8->GetFrameFence();
+	const UINT64 done = fence ? fence->GetCompletedValue() : ~(UINT64)0;
+	int slot = -1;
+	for (int i = 0; i < GVSTAMP_RING; i++) {
+		if (s_gvstamp_alloc[i] && s_gvstamp_alloc_fence[i] > done) continue; // still in flight
+		slot = i; break;
+	}
+	if (slot < 0) return false;
+	if (!s_gvstamp_alloc[slot] &&
+	    FAILED(dev->CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT, IID_PPV_ARGS(&s_gvstamp_alloc[slot])))) {
+		s_gvstamp_alloc[slot] = nullptr;
+		return false;
+	}
+	if (FAILED(s_gvstamp_alloc[slot]->Reset())) return false;
+	if (!s_gvstamp_list) {
+		if (FAILED(dev->CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, s_gvstamp_alloc[slot], s_gvstamp_pso,
+		                                  IID_PPV_ARGS(&s_gvstamp_list)))) { s_gvstamp_list = nullptr; return false; }
+	} else if (FAILED(s_gvstamp_list->Reset(s_gvstamp_alloc[slot], s_gvstamp_pso))) {
+		return false;
+	}
+
+	D3D12_CPU_DESCRIPTOR_HANDLE srvCpu = s_gvstamp_srvheap->GetCPUDescriptorHandleForHeapStart();
+	D3D12_GPU_DESCRIPTOR_HANDLE srvGpu = s_gvstamp_srvheap->GetGPUDescriptorHandleForHeapStart();
+	D3D12_SHADER_RESOURCE_VIEW_DESC sv = {};
+	sv.Shader4ComponentMapping = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+	sv.Format = src->GetDesc().Format; sv.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
+	sv.Texture2D.MipLevels = 1;
+	dev->CreateShaderResourceView(src, &sv, srvCpu);
+	D3D12_CPU_DESCRIPTOR_HANDLE rtvCpu = s_gvstamp_rtvheap->GetCPUDescriptorHandleForHeapStart();
+	D3D12_RENDER_TARGET_VIEW_DESC rv = {};
+	rv.Format = DXGI_FORMAT_B8G8R8A8_UNORM; rv.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+	dev->CreateRenderTargetView(s_gvstamp_tex12, &rv, rtvCpu);
+
+	// Unity hands the marker texture over in RENDER_TARGET (declared below) and gets it back
+	// in COMMON, the state it was created in.
+	s_gvstamp_list->OMSetRenderTargets(1, &rtvCpu, FALSE, nullptr);
+	const FLOAT black[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+	s_gvstamp_list->ClearRenderTargetView(rtvCpu, black, 0, nullptr);
+	D3D12_VIEWPORT vp = { (float)cx, (float)cy, (float)cw, (float)ch, 0.0f, 1.0f };
+	D3D12_RECT sc = { (LONG)cx, (LONG)cy, (LONG)(cx + cw), (LONG)(cy + ch) };
+	s_gvstamp_list->RSSetViewports(1, &vp);
+	s_gvstamp_list->RSSetScissorRects(1, &sc);
+	s_gvstamp_list->SetGraphicsRootSignature(s_blit_rs);
+	ID3D12DescriptorHeap *heaps[] = { s_gvstamp_srvheap };
+	s_gvstamp_list->SetDescriptorHeaps(1, heaps);
+	s_gvstamp_list->SetGraphicsRoot32BitConstants(0, GVCAL_CONSTANTS, cb, 0);
+	s_gvstamp_list->SetGraphicsRootDescriptorTable(1, srvGpu);
+	s_gvstamp_list->IASetPrimitiveTopology(D3D_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+	s_gvstamp_list->DrawInstanced(3, 1, 0, 0);
+	D3D12_RESOURCE_BARRIER b = {}; b.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+	b.Transition.pResource = s_gvstamp_tex12; b.Transition.Subresource = D3D12_RESOURCE_BARRIER_ALL_SUBRESOURCES;
+	b.Transition.StateBefore = D3D12_RESOURCE_STATE_RENDER_TARGET;
+	b.Transition.StateAfter  = D3D12_RESOURCE_STATE_COMMON;
+	s_gvstamp_list->ResourceBarrier(1, &b);
+	s_gvstamp_list->Close();
+	UnityGraphicsD3D12ResourceState st = {};
+	st.resource = s_gvstamp_tex12; st.expected = D3D12_RESOURCE_STATE_RENDER_TARGET; st.current = D3D12_RESOURCE_STATE_COMMON;
+	s_gvstamp_alloc_fence[slot] = v8->ExecuteCommandList(s_gvstamp_list, 1, &st);
+	s_gvstamp_last_fence = s_gvstamp_alloc_fence[slot];
+	return true;
+}
+
+// After xrEndFrame, graphics thread. Without a requested marker this only notes the size of
+// the image Unity's own blit draws (the calibration's cache compares it); it draws nothing.
+static void gvstamp_after_submit(void)
+{
+	if (!gvstamp_enabled()) {
+		if (gvcal_requested()) gvstamp_note(DXR_GS_DISABLED);
+		return;
+	}
+	int32_t cx, cy, cw, ch; uint32_t tw, th;
+	const int want = gvstamp_wanted(&cx, &cy, &cw, &ch, &tw, &th);
+	if (want == DXR_GS_STAMPED) {
+		// Unity's own blit is the live mirror path: the image it draws is the canvas.
+		s_mirror_w.store(cw); s_mirror_h.store(ch);
+		s_mirror_draws.fetch_add(1);
+	}
+	if (!gvcal_requested()) return;
+	if (want != DXR_GS_STAMPED) { gvstamp_note(want); return; }
+	if (s_gvstamp_tex_id.load() == 0) return; // made at the next frame start, or failed (noted there)
+
+	const unsigned gen = s_gvcal_gen.load();
+	const int strip = s_gvcal_strip.load(), half = s_gvcal_half.load();
+	DxrMirrorBlitConstants cb = {};
+	dxr_gvstamp_fill_constants(cx, cy, cw, ch, tw, th, strip, half, cb.srcRect, cb.mk, cb.st, cb.fl);
+	const int backend = gvstamp_backend();
+	int why = DXR_GS_PIPELINE;
+	const bool ok = backend == kNativeMirrorD3D11 ? gvstamp_draw_d3d11(&cb, cx, cy, cw, ch, &why)
+	                                              : gvstamp_draw_d3d12(&cb, cx, cy, cw, ch, &why);
+	if (!ok) { gvstamp_note(why); return; }
+	s_gvstamp_cx.store(cx); s_gvstamp_cy.store(cy); s_gvstamp_cw.store(cw); s_gvstamp_ch.store(ch);
+	s_gvstamp_gen.store(gen); // from now on the mirror query names this texture for request `gen`
+	s_gvstamp_status.store(DXR_GS_STAMPED);
+	s_gvstamp_stamps.fetch_add(1);
+	if (s_gvstamp_stamp_logged_gen != gen) {
+		s_gvstamp_stamp_logged_gen = gen;
+		char m[400];
+		snprintf(m, sizeof(m), "[DisplayXR-PROV] gv marker: STAMPED into the texture Unity's own blit samples (%s, "
+		         "request %u, %s, canvas (%d,%d %dx%d) of %ux%u, bands at %u and %u, strip row %u column %u, "
+		         "declared srgb=%d, woven wrapped by Unity=%d)\n",
+		         backend == kNativeMirrorD3D11 ? "D3D11" : "D3D12", gen, cb.mk[0] == 1 ? "whole image" : "thin strips",
+		         cx, cy, cw, ch, tw, th, cb.mk[1], cb.mk[2], cb.st[0], cb.st[2],
+		         s_gvstamp_srgb ? 1 : 0, s_woven_tex_srgb ? 0 : 1);
+		prov_log(m);
+	}
+}
+
+// The mirror query, main thread: the texture to name in blitParams instead of the woven one
+// for the canvas the query is about to describe, or 0. Counts as a marker frame: this is the
+// moment the marker is on its way to the screen on this path.
+static UnityXRRenderTextureId gvstamp_query_tex_id(int32_t cx, int32_t cy, int32_t cw, int32_t ch)
+{
+	const uint32_t id = s_gvstamp_tex_id.load();
+	if (id == 0) return 0;
+	const unsigned gen = s_gvcal_gen.load();
+	if (!dxr_gvstamp_hand_out(gvcal_requested() ? 1 : 0, gen, s_gvstamp_gen.load(), 1, cx, cy, cw, ch,
+	                          s_gvstamp_cx.load(), s_gvstamp_cy.load(), s_gvstamp_cw.load(), s_gvstamp_ch.load()))
+		return 0;
+	s_gvcal_w.store(cw); s_gvcal_h.store(ch);
+	s_gvcal_path.store(DXR_GV_PATH_STAMP);
+	s_gvcal_frames.fetch_add(1);
+	const int handed = s_gvstamp_handed.fetch_add(1) + 1;
+	if (s_gvstamp_hand_logged_gen != gen) {
+		s_gvstamp_hand_logged_gen = gen;
+		char m[320];
+		snprintf(m, sizeof(m), "[DisplayXR-PROV] gv marker: HANDED to Unity's mirror blit (blitParams srcTexId %u "
+		         "instead of %u, request %u, marker laid out for a %dx%d image at texel (%d,%d), after %d stamps, "
+		         "hand-out %d)\n", (unsigned)id, (unsigned)s_woven_tex_id, gen, cw, ch, cx, cy,
+		         s_gvstamp_stamps.load(), handed);
+		prov_log(m);
+	}
+	return (UnityXRRenderTextureId)id;
 }
 
 static UnitySubsystemErrorCode UNITY_INTERFACE_API
@@ -2467,9 +2993,7 @@ MainBlitToMirrorViewRenderTarget(UnitySubsystemHandle handle, void *userData,
 		if (w <= 0 || h <= 0 || tw11 == 0 || th11 == 0) { mirror_blit_note(DXR_MB_NO_CANVAS, "returned without drawing: the woven canvas rect is empty"); return ok; }
 		int why11 = DXR_MB_PIPELINE;
 		if (prov11_shader_blit_woven(d11, info.mirrorRtDesc->rtNative, src11, x, y, w, h, tw11, th11, &why11))
-			// Drawn, without the calibration marker (D3D12 only): its own reason, so the
-			// calibration's "marker was not drawn" line says that and not "not repainting".
-			s_mb_last.store(DXR_MB_DRAWN_NO_MARKER);
+			s_mb_last.store(DXR_MB_DRAWN); // with the calibration marker when one is requested (#485)
 		else
 			mirror_blit_note(why11,
 				why11 == DXR_MB_NO_DEVICE ? "did not draw: IUnityGraphicsD3D11 returned no device"
@@ -2530,6 +3054,12 @@ MainBlitToMirrorViewRenderTarget(UnitySubsystemHandle handle, void *userData,
 	s_mb_last.store(DXR_MB_NOT_WINDOWS);
 	return kUnitySubsystemErrorCodeSuccess;
 }
+// (#485) No calibration marker off Windows: the mirror query always names the woven texture.
+static UnityXRRenderTextureId gvstamp_query_tex_id(int32_t cx, int32_t cy, int32_t cw, int32_t ch)
+{
+	(void)cx; (void)cy; (void)cw; (void)ch;
+	return 0;
+}
 #endif // _WIN32
 
 UnitySubsystemErrorCode UNITY_INTERFACE_API
@@ -2588,8 +3118,8 @@ MainQueryMirrorViewBlitDesc(UnitySubsystemHandle handle, void *userData,
 			snprintf(b, sizeof(b), "[DisplayXR-PROV] native mirror: NEVER CALLED - Unity asked for the mirror blit "
 			         "%d times, was offered the native blit each time and has not called "
 			         "BlitToMirrorViewRenderTarget once (query mirrorRtDesc=%s). This render pipeline blits "
-			         "blitParams itself; the calibration marker, which is drawn in the native blit, cannot "
-			         "appear\n", offered, info.mirrorRtDesc ? "yes: the engine's own mirror path" : "NULL: a scriptable pipeline");
+			         "blitParams itself; the calibration marker is put into the texture it blits instead "
+			         "(the 'gv marker:' lines, #485)\n", offered, info.mirrorRtDesc ? "yes: the engine's own mirror path" : "NULL: a scriptable pipeline");
 			prov_log(b);
 		}
 	}
@@ -2668,6 +3198,13 @@ MainQueryMirrorViewBlitDesc(UnitySubsystemHandle handle, void *userData,
 				return kUnitySubsystemErrorCodeSuccess;
 			}
 			// --------------------------------------------------------------------------
+			// (#485) What Unity's own blit samples: the woven texture (or its #480 copy) - or,
+			// while a calibration marker is requested and has been stamped for this very
+			// canvas, the marker texture: the woven canvas with the marker in it, declared
+			// the same, so the srcRect / destRect below apply unchanged. Unity only uses this
+			// on the path where it does not call the native blit (the Built-in pipeline).
+			UnityXRRenderTextureId mirror_src_id = gvstamp_query_tex_id(cx, cy, cw, ch);
+			if (mirror_src_id == 0) mirror_src_id = s_woven_tex_id;
 			// Two-tile mirror (DISPLAYXR_PROV_MIRROR_2TILE=1): the phase seam was localized to
 			// the RT vertical MIDLINE (RT-geometric, not content) — Unity splits our single
 			// full-RT blit into a top/bottom half with a ~few-px offset. Hand it the two halves
@@ -2682,11 +3219,11 @@ MainQueryMirrorViewBlitDesc(UnitySubsystemHandle handle, void *userData,
 				float syTop = (float)cy / th;
 				float syBot = ((float)cy + (float)ch * 0.5f) / th;
 				desc->blitParamsCount = 2;
-				desc->blitParams[0].srcTexId = s_woven_tex_id;
+				desc->blitParams[0].srcTexId = mirror_src_id;
 				desc->blitParams[0].srcTexArraySlice = 0;
 				desc->blitParams[0].srcRect = { sx, syTop, sw, shTop };
 				desc->blitParams[0].destRect = { 0.0f, 0.0f, 1.0f, 0.5f };
-				desc->blitParams[1].srcTexId = s_woven_tex_id;
+				desc->blitParams[1].srcTexId = mirror_src_id;
 				desc->blitParams[1].srcTexArraySlice = 0;
 				desc->blitParams[1].srcRect = { sx, syBot, sw, shTop };
 				desc->blitParams[1].destRect = { 0.0f, 0.5f, 1.0f, 0.5f };
@@ -2699,7 +3236,7 @@ MainQueryMirrorViewBlitDesc(UnitySubsystemHandle handle, void *userData,
 				return kUnitySubsystemErrorCodeSuccess;
 			}
 			desc->blitParamsCount = 1;
-			desc->blitParams[0].srcTexId = s_woven_tex_id;
+			desc->blitParams[0].srcTexId = mirror_src_id;
 			desc->blitParams[0].srcTexArraySlice = 0;
 			desc->blitParams[0].srcRect = { (float)cx / tw, (float)cy / th,
 			                                (float)cw / tw, (float)ch / th };

@@ -122,7 +122,7 @@ static class CalibratorTests
               && m.Groups[5].Value == "2" && m.Groups[8].Value == "1120" && m.Groups[9].Value == "595", "...with the measured numbers");
         Cal.BandStarts(1120, out int b0, out _);
         Check(Last().EndsWith(" | marker strips h-row " + Cal.HorizontalStripRow(0, 595) + " v-col " + (b0 + Cal.BandWidth / 2) +
-                              " 13 px | reads 2, 33 ms after the first marker frame | cache miss (stored)"),
+                              " 13 px | reads 2, 33 ms after the first marker frame | cache miss (stored) | marker drawn by the native mirror blit (D3D12)"),
               "...followed by what was drawn, the reads and the cache state");
 
         // Nothing more happens while the layout stays.
@@ -206,7 +206,7 @@ static class CalibratorTests
         Environment.SetEnvironmentVariable("DISPLAYXR_PROV_GV_CALIB_CACHE", "0");
         DomainReload();
         Run(l, 0.8, out x, out y);
-        Check(World.Requests == 4 && x == l.PaneLeft + 1 && Last().EndsWith("cache miss (cache off)"), "DISPLAYXR_PROV_GV_CALIB_CACHE=0 measures a known layout again");
+        Check(World.Requests == 4 && x == l.PaneLeft + 1 && Last().EndsWith("cache miss (cache off) | marker drawn by the native mirror blit (D3D12)"), "DISPLAYXR_PROV_GV_CALIB_CACHE=0 measures a known layout again");
         Environment.SetEnvironmentVariable("DISPLAYXR_PROV_GV_CALIB_CACHE", null);
     }
 
@@ -340,6 +340,92 @@ static class CalibratorTests
         World.MirrorReason = 0; World.MirrorOffered = 0; World.MirrorCalls = 0;
     }
 
+    // (#485) The marker through Unity's own blit (the Built-in pipeline), and a marker that is
+    // drawn but does not reach the screen.
+    static void MarkerPaths()
+    {
+        // The Built-in pipeline: the native blit is never called, the marker is stamped into
+        // the texture Unity blits, and the measurement is the ordinary one.
+        NewEditorSession();
+        var l = Layout(); Place(l);
+        World.MirrorReason = Cal.MirrorNeverCalled; World.MirrorOffered = 900; World.MirrorCalls = 0;
+        World.MarkerPath = Cal.PathStamp; World.StampStatus = Cal.StampStamped; World.Stamps = 3; World.Handed = 2;
+        Run(l, 0.8, out int x, out int y);
+        Check(World.Requests == 1 && Calibrator.AppliedMeasured && x == l.PaneLeft + 1 && y == l.PaneTop + 110 && !Calibrator.MarkerUnavailable,
+              "Unity's own blit carries the marker: measured exactly as through the native blit");
+        Check(kMeasured.IsMatch(Last()) && Last().EndsWith(" | cache miss (stored) | marker drawn by Unity's own blit (stamped into its source texture 3 times, handed to 2 mirror queries)"),
+              "...and the line says which path drew it, appended after everything it had: " + Last());
+
+        // The same on D3D11's native blit (URP + D3D11).
+        NewEditorSession();
+        Place(l);
+        World.MarkerPath = Cal.PathNativeD3D11;
+        Run(l, 0.8, out x, out _);
+        Check(Calibrator.AppliedMeasured && Last().EndsWith(" | marker drawn by the native mirror blit (D3D11)"), "the D3D11 native blit: measured, and named: " + Last());
+
+        // A native binary without the export: measured, nothing appended.
+        NewEditorSession();
+        Place(l);
+        World.OldBinary = true;
+        Run(l, 0.8, out x, out _);
+        Check(Calibrator.AppliedMeasured && Last().EndsWith(" | cache miss (stored)"), "an older native binary: no path is reported and nothing is appended: " + Last());
+
+        // Neither path draws: the Built-in pipeline with the stamp switched off. Both accounts.
+        NewEditorSession();
+        Place(l);
+        World.Draws = false; World.MirrorReason = Cal.MirrorNeverCalled; World.MirrorOffered = 900; World.MirrorCalls = 0;
+        World.StampStatus = Cal.StampDisabled;
+        Run(l, 0.35 + 0.4, out x, out _);
+        Check(Count("the marker was not drawn: Unity was offered the native mirror blit and never calls it") == 1
+              && Last().Contains("; and the marker for Unity's own blit of that texture: DISPLAYXR_PROV_GV_CALIB_STAMP=0 turns it off")
+              && Calibrator.MarkerUnavailable && x == l.X && kFellBack.IsMatch(Last()),
+              "never called and the stamp switched off: the line gives both reasons, the marker is unavailable: " + Last());
+        Check(!Last().Contains("marker drawn by"), "...and names no path, since nothing was drawn");
+
+        // The marker is stamped and handed to Unity's blit, and nothing of it shows on screen
+        // (Unity does not take the texture, or does something else with it). That is said,
+        // and from the first such attempt the marker counts as unavailable, so the driver's
+        // prediction is not kept waiting for a measurement.
+        NewEditorSession();
+        Place(l);
+        World.OnScreen = false;
+        World.MirrorReason = Cal.MirrorNeverCalled; World.MirrorOffered = 900; World.MirrorCalls = 0;
+        World.MarkerPath = Cal.PathStamp; World.StampStatus = Cal.StampStamped; World.Stamps = 30; World.Handed = 30;
+        Run(l, 0.35 + 0.16 + 0.05, out x, out _);
+        Check(World.Requests == 1 && Count("fell back") == 1 && Last().Contains("no marker on the horizontal strips")
+              && Last().EndsWith(" | marker drawn by Unity's own blit (stamped into its source texture 30 times, handed to 30 mirror queries)"),
+              "drawn and not on screen: the truthful 'no marker' line, with the path that drew it: " + Last());
+        Check(Calibrator.MarkerUnavailable && Calibrator.MarkerUnavailableWhy.Contains("none of it showed on the screen")
+              && Calibrator.MarkerUnavailableWhy.Contains("Unity's own blit") && x == l.X,
+              "...the marker is unavailable from that attempt on, with the reason: " + Calibrator.MarkerUnavailableWhy);
+        Run(l, 0.5, out x, out _);
+        Check(World.Requests == 2 && World.RequestedStrips[1] == Cal.StripFull && Calibrator.MarkerUnavailable,
+              "the whole image is tried next and, not showing either, leaves it unavailable (a drawn frame alone does not make it available)");
+        Run(l, 6.0, out x, out _);
+        Check(World.Requests == 3 && Last().Contains("[attempt 3 of 3]") && Calibrator.MarkerUnavailable && !Calibrator.AppliedMeasured && x == l.X,
+              "three attempts, then the computed origin stays and the marker stays unavailable");
+        // It reaches the screen in another layout: measured, available again.
+        World.OnScreen = true;
+        var n = Layout(w: 1100, paneW: 1104); Place(n);
+        Run(n, 0.8, out x, out _);
+        Check(Calibrator.AppliedMeasured && !Calibrator.MarkerUnavailable, "once a layout measures, the marker is available again");
+
+        // A partly covered marker is on screen: not "unavailable".
+        NewEditorSession();
+        Place(l);
+        World.OnScreen = false;
+        Run(l, 0.35 + 0.16 + 0.05, out x, out _);
+        Check(Calibrator.MarkerUnavailable, "(a missed marker first)");
+        World.OnScreen = true;
+        int row = l.PaneTop + 110;
+        World.CoverTop = row; World.CoverBottom = row + 594;
+        World.CoverLeft = World.OriginX + 100; World.CoverRight = World.OriginX + 300;
+        Run(l, 0.8, out x, out _);
+        Check(Count("partly covered") == 1 && !Calibrator.MarkerUnavailable,
+              "a marker that is found partly covered is on screen: measurable, so not unavailable: " + Last());
+        World.MirrorReason = 0; World.MirrorOffered = 0; World.MirrorCalls = 0;
+    }
+
     static void NotOneToOne()
     {
         NewEditorSession();
@@ -386,6 +472,7 @@ static class CalibratorTests
         ThinStripMissed();
         StripCovered();
         NotDrawn();
+        MarkerPaths();
         NotOneToOne();
         FullMarkerSwitch();
     }
