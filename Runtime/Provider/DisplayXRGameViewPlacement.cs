@@ -131,6 +131,12 @@ namespace DisplayXR
             public bool WholePixelFixedSize;
             public bool HaveLeftBorder;
             public float LeftBorderPt;
+            // (#459) Unity's own GameView.targetInView.x in points (valid when HaveTargetX):
+            // the value OnGUI rounds to whole points before it draws. When it is not at hand
+            // the placement derives it as (view width - image width) / 2, which is the same
+            // number except on an exact half point, where float noise decides Unity's side.
+            public bool HaveTargetX;
+            public float TargetXPt;
             // (#459) The view's zoom (GameView.m_ZoomArea.m_Scale.x), 0 = not known (treated
             // as 1). Anything but 1 means Unity draws the texture SCALED: see PlaceScaled.
             public float ZoomX;
@@ -206,7 +212,13 @@ namespace DisplayXR
 
             if (IsChromeSlackOnly(p))
             {
-                x = p.Left + rtCentX;                               // Unity centres the RT horizontally
+                // (#459) With the pane's real left border at hand the column is Unity's own
+                // rule (ImageLeftPx: the image starts at the border, targetInView.x being 0
+                // for a view that fills its area). Between two neighbours that is the latched
+                // #740 centring (250 %: 2.5 px -> +3, hardware-verified); at the editor
+                // window's left or right edge, where the pane has ONE side border, the
+                // centring was a pixel or two off (finding F3).
+                x = p.Left + (p.HaveLeftBorder ? ImageLeftPx(p.LeftBorderPt, 0f, p.PtToPx) : rtCentX);
                 y = row0 ? RtRow0Y(p) + DockedRowBiasPx             // the row of the RT's row 0
                          : p.Top + (p.ClientH - p.RtH) + rtCentY;   // ...above a bottom margin
                 w = p.RtW;
@@ -229,7 +241,8 @@ namespace DisplayXR
             if (p.HaveDrawRect && p.PtToPx > 0.5f && p.PtToPx < 8f)
                 LetterboxOffsets(p.HostWPt, p.DrawWPt, p.DrawHPt, fitW, fitH, p.PtToPx, p.RoundsBottomEdge,
                                  ref offX, ref offY,
-                                 p.WholePixelFixedSize && p.HaveLeftBorder ? p.LeftBorderPt : -1f);
+                                 p.HaveLeftBorder ? p.LeftBorderPt : -1f,
+                                 p.HaveTargetX ? p.TargetXPt : float.NaN);
             x += offX;
             y += offY;
             w = fitW;
@@ -259,22 +272,102 @@ namespace DisplayXR
         /// </summary>
         public static void LetterboxOffsets(float hostWPt, float drawWPt, float drawHPt, int fitW, int fitH,
                                             float ptToPx, bool roundsBottomEdge, ref int offX, ref int offY,
-                                            float leftBorderPt = -1f)
+                                            float leftBorderPt = -1f, float targetXPt = float.NaN)
         {
-            // (#459) leftBorderPt >= 0: the pane's real left border (whole-pixel experiment);
+            // (#459) leftBorderPt >= 0: the pane's real left border (HostView.borderSize.left);
             // otherwise the two side borders are assumed equal, which a pane docked at the
             // editor window's left or right edge is not (it has one border, not two).
             float side = leftBorderPt >= 0f ? leftBorderPt : (hostWPt - drawWPt) * 0.5f;
             if (!(side >= 0f && side <= 4f) || !(drawHPt > 1f)) return;
             ptToPx = SnapScale(ptToPx);
             float rtWPt = fitW / ptToPx, rtHPt = fitH / ptToPx;
-            // pt -> px rounds HALF UP: at 250 % a whole-point edge can fall on x.5 px and Unity's RT
-            // then starts on the NEXT pixel (#740: 5 px of slack measured as +3, not +2).
-            offX = FloorToInt((side + Round((drawWPt - rtWPt) * 0.5f)) * ptToPx + 0.5f);
+            // targetXPt: Unity's own targetInView.x when the driver could read it; else the
+            // same quantity from the two widths. pt -> px rounds HALF UP (ImageLeftPx).
+            float txPt = float.IsNaN(targetXPt) ? (drawWPt - rtWPt) * 0.5f : targetXPt;
+            offX = ImageLeftPx(side, txPt, ptToPx);
             float yPt = roundsBottomEdge ? Round((drawHPt + rtHPt) * 0.5f) - rtHPt
                                          : Round((drawHPt - rtHPt) * 0.5f);
             float fullPt = roundsBottomEdge ? Round(drawHPt) - drawHPt : 0f;
             offY = FloorToInt((yPt - fullPt) * ptToPx + 0.5f);
+        }
+
+        // ---- (#459) The image's first column, and the texture's size ------------------------
+
+        /// <summary>
+        /// (#459) The pane column that shows the image's first texel column, in px from the
+        /// pane's left edge. Unity's rule (GameView.OnGUI, 6000.4.0f1 editor assembly):
+        /// <c>screenRect.x = Mathf.Round(targetInView.x)</c>, whole points, halves to EVEN,
+        /// inside a GUI area whose origin is the pane's left border
+        /// (<c>HostView.borderSize.left</c>: 1 pt with a neighbour on the left, 0 at the
+        /// editor window's left edge, maximized and floating). The quad's left edge is
+        /// therefore at <c>(border + Round(targetInView.x)) x scale</c> px, and the first
+        /// column is that edge rounded HALF UP.
+        ///
+        /// Every on-screen measurement so far, as (border + rounded x) pt -> edge px -> column:
+        ///   250 % Free Aspect   1 pt   2.5  -> 3   (reference pane, hardware-verified, #740)
+        ///   150 % Free Aspect   1 pt   1.5  -> 2   (field report: correct 3D at pane +2)
+        ///   175 % whole-pixel   1 pt   1.75 -> 2   (calibration: measured +2)
+        ///   175 % whole-pixel   2 pt   3.5  -> 4   (calibration: measured +4)
+        ///   175 % whole-pixel   3 pt   5.25 -> 5   (calibration: measured +5)
+        /// The three 175 % rows are the calibration lines "measured +2 / +4 / +5, computed
+        /// +0 / +2 / +4": the computed side used a left border of 0 pt (see the driver's
+        /// TryGetMatchedLeftBorderPt), i.e. floor(R x 1.75 + 0.5) for R = 0, 1, 2.
+        /// x.5 px is a tie; it went UP in all three cases above (250, 150, 175 %). It is
+        /// unmeasured at 125 % and 225 %, where it occurs for (border + x) = 2 mod 4.
+        /// </summary>
+        public static int ImageLeftPx(float leftBorderPt, float targetXPt, float ptToPx)
+        {
+            // The scale as the exact decimal it is (1.75, not 1.75000002), so a tie is a tie.
+            double s = Math.Round((double)SnapScale(ptToPx) * 100.0) / 100.0;
+            double edge = ((double)leftBorderPt + Math.Round((double)targetXPt)) * s;
+            return (int)Math.Floor(edge + 0.5 + 1e-6);
+        }
+
+        /// <summary>True when <see cref="ImageLeftPx"/> rests on a tie-break: the rounded
+        /// point (targetInView.x within 0.01 of a half point - float noise decides Unity's
+        /// side) or the pixel (the edge within 0.01 of x.5 px). Only reported in the log.</summary>
+        public static bool ImageLeftIsTie(float leftBorderPt, float targetXPt, float ptToPx, out bool pointTie, out bool pixelTie)
+        {
+            double s = Math.Round((double)SnapScale(ptToPx) * 100.0) / 100.0;
+            double fx = Math.Abs((double)targetXPt - Math.Floor((double)targetXPt) - 0.5);
+            pointTie = fx < 0.01;
+            double edge = ((double)leftBorderPt + Math.Round((double)targetXPt)) * s;
+            pixelTie = Math.Abs(edge - Math.Floor(edge) - 0.5) < 0.01;
+            return pointTie || pixelTie;
+        }
+
+        /// <summary>
+        /// (#459, finding F4) The size Unity allocates the Game view texture at for a target
+        /// of <paramref name="targetPx"/> px on one axis: rounded half AWAY FROM ZERO
+        /// (PlayModeView.RenderView: <c>(int)Math.Round(targetSize.x, MidpointRounding.AwayFromZero)</c>).
+        /// Mathf.RoundToInt rounds halves to even, which is one short wherever the target ends
+        /// on x.5 with an even floor (2562.5 -> 2562, Unity 2563: "texture=2563x1414 glue
+        /// computed 2562x1414 (DISAGREE)" at 175 %).
+        /// </summary>
+        public static int TextureSizePx(float targetPx) =>
+            (int)Math.Round((double)targetPx, MidpointRounding.AwayFromZero);
+
+        /// <summary>
+        /// (#459) Does the geometry read back from Unity say the image is NOT texel for pixel
+        /// at a scale where the whole-pixel size would fix it? Used to select that size where
+        /// the on-screen measurement cannot run (no marker on this graphics API or render
+        /// pipeline, calibration off). Columns: certain from the target, the zoom and the
+        /// texture. Rows: counted only where the step is above 2 pt (125 / 175 / 225 %: the
+        /// area ends on a quarter row, which GVFIT's half-row stretch cannot make exact); at
+        /// 150 / 250 % GVFIT is exact on the half rows it was built for and its verdict on
+        /// whole rows is finding F1, unverified, so rows alone do not select the size there.
+        /// </summary>
+        public static bool PredictsNotOneToOne(double targetWPx, double targetHPx, int rtW, int rtH,
+                                               float zoomX, float zoomY, float ptToPx,
+                                               out bool columns, out bool rows)
+        {
+            columns = rows = false;
+            int q = WholePixelStepPt(ptToPx);
+            if (q <= 1 || rtW <= 0 || rtH <= 0) return false;
+            if (zoomX > 0f && !IsZoomOne(zoomX)) return false;   // a scaled view is another case
+            columns = !IsOneToOne(DrawnPx(targetWPx, zoomX > 0f ? zoomX : 1f), rtW);
+            rows = q > 2 && !IsOneToOne(DrawnPx(targetHPx, zoomY > 0f ? zoomY : 1f), rtH);
+            return columns || rows;
         }
 
         // ---- (#459) A zoomed Game view, and what GVFIT may write ---------------------------

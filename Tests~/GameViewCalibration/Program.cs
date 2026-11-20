@@ -508,6 +508,17 @@ static class Program
         Check(Cal.RetryDelaySeconds(0, missed) < 0.5, "a thin marker drawn but not found: the whole image follows at once");
         Check(Cal.RetryDelaySeconds(0, covered) == 2.0 && Cal.RetryDelaySeconds(1, covered) == 2.0, "a covered strip waits 2 s (a window is over the Game view)");
         Check(Cal.RetryDelaySeconds(0, none) == 2.0, "a marker that was not drawn waits 2 s");
+        // Why it was not drawn (the native mirror blit's reason, offers and calls).
+        Check(Cal.NativeMirrorReasonText(-1, 0, 0).Contains("older binary"), "no export: says so");
+        Check(Cal.NativeMirrorReasonText(0, 0, 0).Contains("has not asked"), "nothing offered yet");
+        Check(Cal.NativeMirrorReasonText(0, 30, 0).Contains("has not called it so far"), "offered a few times, not called yet");
+        Check(Cal.NativeMirrorReasonText(0, Cal.MirrorNeverCalledAfter, 0).Contains("never calls it"), "offered for seconds, never called");
+        Check(Cal.NativeMirrorReasonText(Cal.MirrorDrawn, 400, 400).Contains("drew no frame while the marker was requested"), "draws, but not now");
+        Check(Cal.NativeMirrorReasonText(Cal.MirrorNotD3D12, 400, 400).Contains("not on D3D12"), "not D3D12");
+        Check(Cal.NativeMirrorReasonText(9, 400, 400).Contains("could not be resolved") && Cal.NativeMirrorReasonText(9, 400, 400).Contains("reason 9"),
+              "a render target the interface cannot resolve, with the raw numbers");
+        for (int r = 2; r <= 15; r++)
+            Check(Cal.NativeMirrorReasonText(r, 10, 10).Length > 20, "reason " + r + " has a text");
         Check(Cal.RetryDelaySeconds(Cal.StripFull, missed) == 2.0 && Cal.RetryDelaySeconds(Cal.StripFull, covered) == 2.0
               && Cal.RetryDelaySeconds(Cal.StripFull, none) == 2.0, "the whole-image marker retries after 2 s, as before");
 
