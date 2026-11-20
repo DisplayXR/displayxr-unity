@@ -53,6 +53,7 @@ namespace DisplayXR
         public static int CoverTop = 0, CoverBottom = -1;   // screen rows covered by another window...
         public static int CoverLeft = int.MinValue, CoverRight = int.MaxValue;   // ...between these columns
         public static bool Draws = true;             // false: the native blit does not run (D3D11, paused)
+        public static int MirrorReason = 0, MirrorOffered = 0, MirrorCalls = 0;   // dxr_prov_get_native_mirror_status
         public static int LatencyFrames = 1;         // marker frames drawn before it is on screen
         public static double ReadSeconds = 1.0 / 60.0;
 
@@ -116,6 +117,13 @@ namespace DisplayXR
             Cal.BandStarts(w, out band0, out band1);
             bandW = Cal.BandWidth;
             return World.MarkerOn ? World.FramesDrawn : 0;
+        }
+
+        // The native blit's own account: World.MirrorReason etc., set by the test.
+        public static int dxr_prov_get_native_mirror_status(out int offered, out int calls)
+        {
+            offered = World.MirrorOffered; calls = World.MirrorCalls;
+            return World.MirrorReason;
         }
 
         public static int dxr_prov_get_gv_mirror_size(out int w, out int h)

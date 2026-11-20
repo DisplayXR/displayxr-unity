@@ -191,6 +191,15 @@ namespace DisplayXR
 
         /// <summary>True while the anchor returned by the last <see cref="Tick"/> was measured.</summary>
         internal static bool AppliedMeasured { get; private set; }
+        /// <summary>True once an attempt ended without the marker having been drawn at all,
+        /// until a marker is drawn: nothing can be measured on screen here (the Built-in
+        /// pipeline, D3D11, a view that does not repaint). The driver then selects the
+        /// whole-pixel size from the predicted geometry instead of waiting for a
+        /// measurement.</summary>
+        internal static bool MarkerUnavailable { get; private set; }
+        /// <summary>Why (valid while <see cref="MarkerUnavailable"/>).</summary>
+        internal static string MarkerUnavailableWhy => s_unavailableWhy ?? "";
+        static string s_unavailableWhy;
         /// <summary>The measured image size (valid while <see cref="AppliedMeasured"/>).</summary>
         internal static int MeasuredW => s_imgW;
         internal static int MeasuredH => s_imgH;
@@ -309,6 +318,7 @@ namespace DisplayXR
             int frames = DisplayXRProviderNative.dxr_prov_get_gv_calib_marker(
                 out int mw, out int mh, out int band0, out int band1, out int bandW);
             if (frames >= 1 && s_firstFrameAt < 0.0) s_firstFrameAt = now;
+            if (frames >= 1) MarkerUnavailable = false;
 
             // Read as soon as the marker has been drawn once. A read blocks until the next
             // composition, so one that comes before the marker is on screen costs a refresh
@@ -330,7 +340,16 @@ namespace DisplayXR
                 || (s_showStrip >= 0 && frames > 0 && now - s_firstFrameAt > kThinShowMaxSeconds))
             {
                 if (frames == 0)
-                    s_why = "the marker was not drawn (it needs the D3D12 native mirror blit and a repainting Game view)";
+                {
+                    // Say WHICH of the things the marker needs is missing: the native blit
+                    // keeps the reason it last ended with.
+                    int reason = -1, offered = 0, calls = 0;
+                    try { reason = DisplayXRProviderNative.dxr_prov_get_native_mirror_status(out offered, out calls); }
+                    catch (System.EntryPointNotFoundException) { }
+                    s_unavailableWhy = Cal.NativeMirrorReasonText(reason, offered, calls);
+                    MarkerUnavailable = true;
+                    s_why = "the marker was not drawn: " + s_unavailableWhy;
+                }
                 Finish(l, false, default, default, mw, mh, frames, now);
             }
         }

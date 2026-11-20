@@ -330,6 +330,16 @@ namespace DisplayXR
         public static extern int dxr_prov_get_gv_mirror_size(out int w, out int h);
 
         /// <summary>
+        /// (#459) Why the native mirror blit does or does not draw: returns the reason it last
+        /// ended with (0 = Unity has not called it, 1 = it drew, 7 = the editor is not on
+        /// D3D12, ...: <see cref="DisplayXRGameViewCalibration.NativeMirrorReasonText"/>),
+        /// with how many mirror queries offered the native blit to Unity since the session
+        /// started and how many times Unity called it.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int dxr_prov_get_native_mirror_status(out int offered, out int calls);
+
+        /// <summary>
         /// (#459) How many frames the marker has been drawn since it was last switched on, with
         /// the size of the texture it was drawn into and its row-coded bands (texels).
         /// 0 = not drawn (yet, or not on this graphics API). Windows only.

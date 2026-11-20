@@ -1583,28 +1583,89 @@ namespace DisplayXR
             catch { return null; }
         }
 
-        // (#459) The matched pane's left border in points: EditorWindow.position (the border
-        // REMOVED) minus HostView.screenPosition (the border INCLUDED). Both are Unity points
-        // of the same window, so the difference needs no scale and no Win32 call. 1 pt between
-        // two docked views, 0 at the editor window's left edge, maximized and floating.
-        static bool TryGetMatchedLeftBorderPt(Rect host, out float borderPt)
+        // (#459) The matched pane's borders in points, from Unity itself: HostView.borderSize
+        // (DockArea.GetBorderSizeInternal: left 1 pt unless the pane touches the editor
+        // window's left edge, right likewise, top 24 pt of tab strip, bottom 2 pt unless it
+        // touches the window's bottom; MaximizedHostView: 0 / 0 / 24 / 4). The view's GUI
+        // origin is that border (HostView.InvokeOnGUI begins its area at the view's margins),
+        // so it is where the image area starts inside the pane.
+        // NOT EditorWindow.position.x - HostView.screenPosition.x, which this used to read:
+        // DockArea.UpdateViewRect rewrites the window's m_Pos on every OnGUI as
+        // (GUIToScreenPoint(0,0), bordered size), i.e. the dock area's own origin with the
+        // border NOT added, so that difference is 0 for every pane ("left border 0 pt = +0 px"
+        // in the 1:1 line of a pane between two neighbours). The whole-pixel placement took
+        // that 0 for the border and put the anchor one point (1.75 px at 175 %) left of the
+        // image: the calibration lines "measured +2 / +4 / +5, computed +0 / +2 / +4".
+        static PropertyInfo s_borderSizeProp;
+        static bool s_borderSizeResolved;
+        static bool TryGetMatchedBordersPt(out float leftPt, out float topPt)
         {
-            borderPt = 0f;
-            if (s_matchedGameView == null) return false;
+            leftPt = topPt = 0f;
+            if (s_matchedGameView == null || s_parentField == null) return false;
             try
             {
-                if (s_posProp == null)
-                    for (var t = s_matchedGameView.GetType(); t != null && s_posProp == null; t = t.BaseType)
-                        s_posProp = t.GetProperty("position",
-                            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
-                if (s_posProp == null) return false;
-                var pos = (Rect)s_posProp.GetValue(s_matchedGameView, null);
-                float b = pos.x - host.x;
-                if (!(b >= -0.01f && b <= 4f)) return false;   // not a border: implausible reading
-                borderPt = Mathf.Max(0f, b);
+                var parent = s_parentField.GetValue(s_matchedGameView);
+                if (parent == null) return false;
+                if (!s_borderSizeResolved)
+                {
+                    s_borderSizeResolved = true;
+                    for (var t = parent.GetType(); t != null && s_borderSizeProp == null; t = t.BaseType)
+                        s_borderSizeProp = t.GetProperty("borderSize",
+                            BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.DeclaredOnly);
+                    if (s_borderSizeProp == null && FirstTimeThisEditorSession("NoBorderSize"))
+                        Debug.LogWarning("[DisplayXR] GameView glue: HostView.borderSize not found (editor internals " +
+                                         "changed?) - the pane's side borders are assumed equal, which is wrong for a " +
+                                         "Game view docked at the editor window's left or right edge.");
+                }
+                if (s_borderSizeProp == null) return false;
+                if (!(s_borderSizeProp.GetValue(parent, null) is RectOffset bo)) return false;
+                if (bo.left < 0 || bo.left > 4 || bo.top < 0) return false;   // not a border: implausible
+                leftPt = bo.left; topPt = bo.top;
                 return true;
             }
             catch { return false; }
+        }
+
+        static bool TryGetMatchedLeftBorderPt(out float borderPt) => TryGetMatchedBordersPt(out borderPt, out _);
+
+        // (#459) Unity's own GameView.targetInView.x, in points: the number OnGUI rounds to
+        // whole points before drawing the image. The getter goes through
+        // EditorGUIUtility.pixelsPerPoint, which outside OnGUI is the scale of whichever view
+        // drew last (and reads 1 at times), so the value is taken only while that global
+        // equals this pane's own scale; otherwise the placement derives the same quantity
+        // from the view and image widths.
+        static bool s_txHave;
+        static float s_txVal, s_txDrawW, s_txScale;
+        static int s_txRtW;
+        static object s_txView;
+        static bool TryGetUnityTargetInViewX(float ptToPx, out float xPt)
+        {
+            xPt = 0f;
+            if (s_matchedGameView == null || s_gvType == null) return false;
+            try
+            {
+                ResolveGameViewRectProps();
+                if (s_targetInViewProp == null || s_pppProp == null) return false;
+                if (!(s_pppProp.GetValue(null, null) is float ppp)) return false;
+                if (Mathf.Abs(ppp - DisplayXRGameViewPlacement.SnappedScale(ptToPx)) > 0.002f) return false;
+                if (!(s_targetInViewProp.GetValue(s_matchedGameView, null) is Rect tiv)) return false;
+                if (float.IsNaN(tiv.x) || float.IsInfinity(tiv.x)) return false;
+                xPt = tiv.x;
+                return true;
+            }
+            catch { return false; }
+        }
+
+        static void ResolveGameViewRectProps()
+        {
+            if (s_o2oRectPropsResolved || s_gvType == null) return;
+            s_o2oRectPropsResolved = true;
+            var flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
+            for (var t = s_gvType; t != null; t = t.BaseType)
+            {
+                if (s_targetInViewProp == null) s_targetInViewProp = t.GetProperty("targetInView", flags | BindingFlags.DeclaredOnly);
+                if (s_viewInWindowProp == null) s_viewInWindowProp = t.GetProperty("viewInWindow", flags | BindingFlags.DeclaredOnly);
+            }
         }
 
         // (#459) IS THE GAME VIEW DRAWN 1:1? One log line each time the numbers settle. A
@@ -1767,16 +1828,24 @@ namespace DisplayXR
                     sb.Append(" | left border ").Append(key.BorderPt.ToString("0.###", inv)).Append(" pt = +")
                       .Append(DisplayXRGameViewPlacement.BorderPx(key.BorderPt, key.Scale)).Append(" px");
                 sb.Append(" | anchor at pane +").Append(key.AnchorDx).Append(",+").Append(key.AnchorDy);
-                if (!s_o2oRectPropsResolved)
+                // (#459) What the anchor's column was computed from, so a wrong column can be
+                // traced to its input: the rounded targetInView.x and where it came from, and
+                // whether the result rests on a tie-break.
+                if (key.BorderPt >= 0f && s_diagPane.DockedNonMaximized && !key.Degraded)
                 {
-                    s_o2oRectPropsResolved = true;
-                    var flags = BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic;
-                    for (var t = s_gvType; t != null; t = t.BaseType)
-                    {
-                        if (s_targetInViewProp == null) s_targetInViewProp = t.GetProperty("targetInView", flags | BindingFlags.DeclaredOnly);
-                        if (s_viewInWindowProp == null) s_viewInWindowProp = t.GetProperty("viewInWindow", flags | BindingFlags.DeclaredOnly);
-                    }
+                    bool chrome = DisplayXRGameViewPlacement.IsChromeSlackOnly(s_diagPane);
+                    float tx = chrome ? 0f
+                        : s_diagPane.HaveTargetX ? s_diagPane.TargetXPt
+                        : (s_diagPane.DrawWPt - s_diagPane.RtW / key.Scale) * 0.5f;
+                    sb.Append(" (model: (").Append(key.BorderPt.ToString("0.###", inv)).Append(" + round ")
+                      .Append(tx.ToString("F3", inv)).Append(") pt x ").Append(key.Scale.ToString("R", inv)).Append(" -> +")
+                      .Append(DisplayXRGameViewPlacement.ImageLeftPx(key.BorderPt, tx, key.Scale))
+                      .Append(chrome ? ", image fills the area" : s_diagPane.HaveTargetX ? ", x from Unity" : ", x from the widths");
+                    if (DisplayXRGameViewPlacement.ImageLeftIsTie(key.BorderPt, tx, key.Scale, out bool ptTie, out bool pxTie))
+                        sb.Append(ptTie ? ", HALF-POINT TIE" : "").Append(pxTie ? ", half-pixel tie (taken up)" : "");
+                    sb.Append(')');
                 }
+                ResolveGameViewRectProps();
                 try
                 {
                     if (s_targetInViewProp != null && s_targetInViewProp.GetValue(s_matchedGameView, null) is Rect tiv)
@@ -1818,7 +1887,8 @@ namespace DisplayXR
                         ", so columns will be dropped/doubled and the image past them sits a pixel off " +
                         "(on a lenticular panel: the eyes swap there). A Windows scale of 100/150/200/250/300 % " +
                         "avoids it; the whole-pixel size fixes it and is selected automatically once the " +
-                        "on-screen calibration measures it (DISPLAYXR_PROV_GV_WHOLEPIXEL=1 selects it from the start)." + kDoc);
+                        "on-screen calibration measures it, or from this prediction where the image cannot be " +
+                        "measured (DISPLAYXR_PROV_GV_WHOLEPIXEL=1 selects it from the start, =0 never)." + kDoc);
                 }
                 if (!glueOk && !s_o2oWarnedGlue)
                 {
@@ -2008,8 +2078,10 @@ namespace DisplayXR
                     // is the worse failure of the two, so the tie must not land there.
                     sizeScale = (dLogical < dPhysical) ? ppp : 1f;
                 }
-                rw = Mathf.RoundToInt(size.x * sizeScale);
-                rh = Mathf.RoundToInt(size.y * sizeScale);
+                // (#459, F4) Unity's own rounding of the target to the texture size: halves
+                // away from zero, not Mathf.RoundToInt's halves to even.
+                rw = DisplayXRGameViewPlacement.TextureSizePx(size.x * sizeScale);
+                rh = DisplayXRGameViewPlacement.TextureSizePx(size.y * sizeScale);
                 // Toolbar = full panel height − render height, both in physical px (units-safe
                 // regardless of `size`'s original units, unlike the old (host−size)×ppp).
                 toolbar = Mathf.Max(0, Mathf.RoundToInt(host.height * ppp) - rh);
@@ -2121,8 +2193,13 @@ namespace DisplayXR
                         // 2560-wide RT into a 2893-wide rect, a uniform 1.13x enlargement
                         // that placed correctly and still looked wrong. The scale is applied
                         // to BOTH axes together so the aspect cannot drift.
-                        int rtW = Mathf.RoundToInt(size.x * sizeScale);
-                        int rtH = Mathf.RoundToInt(size.y * sizeScale);
+                        // (#459, F4) The texture Unity allocates for this target: halves AWAY
+                        // from zero (PlayModeView.RenderView). Mathf.RoundToInt (halves to even)
+                        // came out one short on about half the pane sizes at a fractional scale
+                        // ("texture=2563x1414 glue computed 2562x1414 (DISAGREE)"), which sized
+                        // the woven canvas and the anchor's row for a texture one pixel smaller.
+                        int rtW = DisplayXRGameViewPlacement.TextureSizePx(size.x * sizeScale);
+                        int rtH = DisplayXRGameViewPlacement.TextureSizePx(size.y * sizeScale);
                         // (#420) The chrome-slack vs letterbox decision and both placements are
                         // DisplayXRGameViewPlacement (pure C#, unit-tested): see its comments for
                         // the measurements behind each term. Everything is in THIS pane's
@@ -2142,8 +2219,23 @@ namespace DisplayXR
                         // (#459) The pane's real left border, for the 1:1 diagnostic; the
                         // placement reads it (and drops the GVFIT stretch) only on the view
                         // that shows the opt-in whole-pixel size.
-                        pane.HaveLeftBorder = TryGetMatchedLeftBorderPt(host, out pane.LeftBorderPt);
+                        pane.HaveLeftBorder = TryGetMatchedLeftBorderPt(out pane.LeftBorderPt);
                         pane.WholePixelFixedSize = SameLiveObject(s_matchedGameView, WholePixelView);
+                        // (#459) Unity's own targetInView.x for the image's column (see
+                        // DisplayXRGameViewPlacement.ImageLeftPx); docked texture mode only.
+                        // The global scale the getter depends on comes and goes between frames;
+                        // a value read for this very geometry is kept while the geometry holds,
+                        // so the column cannot alternate between the two sources on a half point.
+                        if (s_lastAppliedDocked && TryGetUnityTargetInViewX(ptToPx, out float txNow))
+                        {
+                            s_txHave = true; s_txVal = txNow;
+                            s_txDrawW = draw.width; s_txRtW = rtW; s_txScale = ptToPx; s_txView = s_matchedGameView;
+                        }
+                        else if (s_txHave && !(s_lastAppliedDocked && s_txDrawW == draw.width && s_txRtW == rtW
+                                               && s_txScale == ptToPx && SameLiveObject(s_txView, s_matchedGameView)))
+                            s_txHave = false;
+                        pane.HaveTargetX = s_txHave;
+                        pane.TargetXPt = s_txHave ? s_txVal : 0f;
                         // (#459) The view's zoom, in docked (texture) mode only: there Unity's
                         // own draw is what reaches the panel, so a zoom other than 1 cannot be
                         // 1:1 and the zoom-1 arithmetic below does not describe it. A floating
@@ -2318,14 +2410,34 @@ namespace DisplayXR
                 var parent = s_parentField.GetValue(s_matchedGameView);
                 if (parent == null) return;
                 var host = (Rect)s_screenPosProp.GetValue(parent, null);       // points, border INCLUDED
-                float borderXpx = (pos.x - host.x) * ppp;                      // the inset we ignore
-                float borderYpx = (pos.y - host.y) * ppp;
+                // (#459) Everything below is RELATIVE TO THE PANE, in the pane's own scale.
+                // The line used to print "anchor-vs-content X error = position x ppp - rx":
+                // Unity points of the whole desktop times ONE global scale, against a
+                // physical desktop x. With a second monitor at another scale that is the
+                // distance between two coordinate systems ("-962.0px" on a 175 % + 150 % pair),
+                // not an error of the anchor. And gv.position - host.screenPos is not the
+                // border (see TryGetMatchedBordersPt): the border is HostView.borderSize.
+                var inv = System.Globalization.CultureInfo.InvariantCulture;
                 string log = $"gv.position=({pos.x:F1},{pos.y:F1} {pos.width:F1}x{pos.height:F1})pt " +
                              $"host.screenPos=({host.x:F1},{host.y:F1} {host.width:F1}x{host.height:F1})pt " +
-                             $"ppp={ppp:F3} | position*ppp=({pos.x * ppp:F1},{pos.y * ppp:F1}) " +
-                             $"hwnd=({s_hwndCorrX},{s_hwndCorrY}) ourRender=({rx},{ry} {rw}x{rh}) | " +
-                             $"BORDER px: x={borderXpx:F1} y={borderYpx:F1} | " +
-                             $"anchor-vs-content X error = {pos.x * ppp - rx:F1}px";
+                             $"ourRender=({rx},{ry} {rw}x{rh}) | ";
+                if (s_panePhysValid && s_diagValid && TryGetMatchedBordersPt(out float bl, out float bt))
+                {
+                    float sc = DisplayXRGameViewPlacement.SnappedScale(s_diagPane.PtToPx);
+                    bool chrome = DisplayXRGameViewPlacement.IsChromeSlackOnly(s_diagPane);
+                    float tx = chrome ? 0f
+                        : s_diagPane.HaveTargetX ? s_diagPane.TargetXPt
+                        : (s_diagPane.DrawWPt - s_diagPane.RtW / sc) * 0.5f;
+                    int contentDx = DisplayXRGameViewPlacement.ImageLeftPx(bl, tx, sc);
+                    int anchorDx = rx - s_panePhysWin.left;
+                    log += "pane scale " + sc.ToString("R", inv) + " | BORDER (HostView.borderSize) left " +
+                           bl.ToString("0.#", inv) + " pt = " + (bl * sc).ToString("0.##", inv) + " px, top " +
+                           bt.ToString("0.#", inv) + " pt = " + (bt * sc).ToString("0.##", inv) + " px | " +
+                           "pane-relative: anchor +" + anchorDx + ", predicted image column +" + contentDx +
+                           " | anchor-vs-content X error = " + (anchorDx - contentDx) + " px";
+                }
+                else
+                    log += "no matched pane or border: anchor-vs-content not evaluated";
                 if (log != s_lastBorderLog)
                 {
                     s_lastBorderLog = log;
@@ -2671,6 +2783,43 @@ namespace DisplayXR
         static int  s_imgX, s_imgY, s_imgW, s_imgH;   // in the pane's client area, physical px
         static bool s_imgMeasured;
 
+        // (#459) THE WHOLE-PIXEL SIZE WITHOUT A MEASUREMENT. The automatic mode used to wait
+        // for a calibration to MEASURE "not 1:1". Where the marker cannot be drawn (the
+        // Built-in pipeline never calls the native mirror blit; D3D11; calibration off) it
+        // waited for ever: at 125 % / 175 % the image stayed half a column short and the eyes
+        // swapped on one side of the view. The geometry read back from Unity already says so
+        // (the same numbers the "not drawn 1:1 horizontally" warning is raised on), so when
+        // it has said so for a second and nothing can measure, the size is selected from the
+        // prediction. Where the marker works, the measurement still decides.
+        const double kPredictHoldSeconds = 1.0;
+        static double s_predictSince = -1.0;
+        static bool s_predictAsked;
+        static void SelectWholePixelFromPrediction(bool measured)
+        {
+            bool cannotMeasure = !DisplayXRGameViewCalibrator.Enabled() || DisplayXRGameViewCalibrator.MarkerUnavailable;
+            if (s_predictAsked || measured || !cannotMeasure || !s_diagValid || s_diagPane.WholePixelFixedSize
+                || !DisplayXRGameViewPlacement.PredictsNotOneToOne(s_diagTargetWPx, s_diagTargetHPx,
+                       s_diagPane.RtW, s_diagPane.RtH, s_diagZoom.x, s_diagZoom.y, s_diagPane.PtToPx,
+                       out bool columns, out bool rows))
+            {
+                s_predictSince = -1.0;
+                return;
+            }
+            double now = Time.realtimeSinceStartupAsDouble;
+            if (s_predictSince < 0.0) { s_predictSince = now; return; }
+            if (now - s_predictSince < kPredictHoldSeconds) return;
+            s_predictSince = -1.0;
+            s_predictAsked = true;   // once per domain: the request is kept for the editor session
+            var inv = System.Globalization.CultureInfo.InvariantCulture;
+            string pct = (DisplayXRGameViewPlacement.SnappedScale(s_diagPane.PtToPx) * 100f).ToString("0.#", inv) + " %";
+            RequestWholePixelAuto("the geometry read from Unity predicts an image that is not drawn 1:1 " +
+                (columns && rows ? "on either axis" : columns ? "horizontally" : "vertically") + " at " + pct +
+                " (target " + s_diagTargetWPx.ToString("R", inv) + "x" + s_diagTargetHPx.ToString("R", inv) +
+                " px for a " + s_diagPane.RtW + "x" + s_diagPane.RtH + " px texture) and it cannot be measured on screen here (" +
+                (DisplayXRGameViewCalibrator.Enabled() ? DisplayXRGameViewCalibrator.MarkerUnavailableWhy
+                                                       : "DISPLAYXR_PROV_GV_CALIBRATE=0") + ")");
+        }
+
         static void ApplyGameViewCalibration(ref int px, ref int py, int pw, int ph)
         {
             bool can = Application.platform == RuntimePlatform.WindowsEditor && s_lastAppliedDocked
@@ -2731,6 +2880,7 @@ namespace DisplayXR
             s_calLastOutX = px; s_calLastOutY = py; s_calLastValid = true;
 
             bool measured = DisplayXRGameViewCalibrator.AppliedMeasured;
+            SelectWholePixelFromPrediction(measured);
             s_imgX = px - layout.PaneLeft; s_imgY = py - layout.PaneTop;
             s_imgW = measured ? DisplayXRGameViewCalibrator.MeasuredW : pw;
             s_imgH = measured ? DisplayXRGameViewCalibrator.MeasuredH : ph;

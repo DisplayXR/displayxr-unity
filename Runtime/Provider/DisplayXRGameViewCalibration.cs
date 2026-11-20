@@ -403,6 +403,53 @@ namespace DisplayXR
         public static double RetryDelaySeconds(int strip, Fail fail) =>
             strip >= 0 && fail == Fail.Missed ? 0.2 : 2.0;
 
+        // The native mirror blit's reasons (DXR_MB_* in
+        // native~/displayxr_xrprovider/displayxr_display_provider.cpp).
+        public const int MirrorNeverCalled = 0, MirrorDrawn = 1, MirrorNotD3D12 = 7;
+        /// <summary>After this many mirror queries that offered the native blit without one
+        /// call, Unity is not going to call it (native: DXR_MB_NEVER_CALLED_AFTER).</summary>
+        public const int MirrorNeverCalledAfter = 240;
+
+        /// <summary>
+        /// Why the marker was not drawn, from the native mirror blit's own state
+        /// (<c>dxr_prov_get_native_mirror_status</c>): the reason it last ended with, how many
+        /// mirror queries offered the native blit to Unity this session and how many times
+        /// Unity called it. <paramref name="reason"/> below 0: the plug-in binary has no such
+        /// export. The marker is drawn in that blit and nowhere else, so each case names what
+        /// would have to be different.
+        /// </summary>
+        public static string NativeMirrorReasonText(int reason, int offered, int calls)
+        {
+            string counts = " [native mirror blit: offered " + offered + " times, called " + calls + " times, reason " + reason + "]";
+            if (reason < 0)
+                return "the native plug-in does not report why (an older binary)";
+            if (calls == 0)
+                return (offered == 0
+                    ? "Unity has not asked for a mirror blit that the plug-in could offer its native blit for (no woven texture yet, DISPLAYXR_PROV_NATIVE_MIRROR=0, or the Game view is not repainting)"
+                    : offered < MirrorNeverCalledAfter
+                        ? "Unity was offered the native mirror blit and has not called it so far"
+                        : "Unity was offered the native mirror blit and never calls it: this render pipeline (the Built-in one) blits the woven texture itself, so no marker can be drawn here and the placement is the computed one")
+                    + counts;
+            switch (reason)
+            {
+                case MirrorDrawn:
+                    return "the native mirror blit draws, but drew no frame while the marker was requested (is the Game view repainting? Play paused, or the editor in the background)" + counts;
+                case 2: return "DISPLAYXR_PROV_NATIVE_MIRROR=0 turns the native mirror blit off" + counts;
+                case 3: return "no woven texture is registered with Unity" + counts;
+                case 4: case 5: return "Unity called the native mirror blit without a render target it can draw into" + counts;
+                case 6: return "the plug-in has no IUnityInterfaces" + counts;
+                case MirrorNotD3D12: return "the editor is not on D3D12 (the native mirror blit, and the marker in it, are D3D12 only)" + counts;
+                case 8: return "Unity's D3D12 interface returned no device" + counts;
+                case 9: return "Unity's mirror render target could not be resolved to a D3D12 texture" + counts;
+                case 10: return "the woven texture is not open on Unity's D3D12 device" + counts;
+                case 11: return "the woven canvas is empty" + counts;
+                case 12: return "the blit pipeline could not be built (shader or pipeline state)" + counts;
+                case 13: return "the blit's command list could not be created" + counts;
+                case 14: return "this platform has no native mirror blit" + counts;
+                default: return "the native mirror blit did not draw" + counts;
+            }
+        }
+
         /// <summary>The longest a settled layout waits for the mouse button to come up.</summary>
         public const double MaxButtonHoldSeconds = 3.0;
 

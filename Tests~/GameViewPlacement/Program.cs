@@ -921,6 +921,113 @@ static class Program
         Check(flx2 == 3, $"MODEL ...and with the border unknown (two equal borders assumed): x {flx2} == 3");
     }
 
+    // (#459) Placement WITHOUT a measurement: the image's first column from Unity's own rule
+    // (GameView.OnGUI: x rounded to whole points, halves to even, inside the pane's left
+    // border; the pixel edge rounded half up), the texture size (halves away from zero) and
+    // the prediction that selects the whole-pixel size where no marker can be drawn.
+    // The rows marked DATA are numbers reported from a panel (calibration log lines, the field
+    // report); the rest are arithmetic.
+    static void MarkerlessPlacement()
+    {
+        int L(float border, float x, float s) => DisplayXRGameViewPlacement.ImageLeftPx(border, x, s);
+
+        // DATA, 175 %, whole-pixel size, pane between two neighbours (left border 1 pt), from
+        // the on-screen calibration: "measured pane +2, computed +0", "measured +4, computed
+        // +2", "measured +5, computed +4". The computed side used a border of 0 pt.
+        Check(L(1f, 0f, 1.75f) == 2 && L(0f, 0f, 1.75f) == 0, "DATA 175 %: x rounds to 0 pt -> measured +2 (the old border-0 arithmetic: +0)");
+        Check(L(1f, 1f, 1.75f) == 4 && L(0f, 1f, 1.75f) == 2, "DATA 175 %: x rounds to 1 pt -> measured +4 (old: +2); 3.5 px is a tie, taken up");
+        Check(L(1f, 2f, 1.75f) == 5 && L(0f, 2f, 1.75f) == 4, "DATA 175 %: x rounds to 2 pt -> measured +5 (old: +4); 5.25 px goes down");
+        // DATA: the 1:1 line of that layout, targetInView=(1.857,1.357 720x340)pt in a
+        // 723.714x342.714 pt view.
+        Check(L(1f, 1.857f, 1.75f) == 5, "DATA 175 %: targetInView.x 1.857 pt -> column +5");
+        // DATA, 250 % reference pane (hardware-verified #740 anchor 1020 for a pane at 1017).
+        Check(L(1f, 0f, 2.5f) == 3, "DATA 250 % Free Aspect: 2.5 px -> +3");
+        // DATA, field report, 150 %: Free Aspect correct at pane +2; with the whole-pixel size
+        // forced the computed origin moved to pane +0 while targetInView.x was 0.333 pt.
+        Check(L(1f, 0f, 1.5f) == 2, "DATA 150 % Free Aspect: 1.5 px -> +2 (reported correct)");
+        Check(L(1f, 0.333f, 1.5f) == 2 && L(0f, 0.333f, 1.5f) == 0,
+              "DATA 150 % whole-pixel, x 0.333 pt: Unity rounds it to 0 pt, the image does not move: +2 (the old arithmetic: +0, reported wrong)");
+        // The field report at 125 %: the image moved (x about 1.4 pt) and the computed origin
+        // did not follow. Predicted, NOT measured: 2 pt = 2.5 px is a tie.
+        Check(L(1f, 0f, 1.25f) == 1 && L(1f, 1.4f, 1.25f) == 3, "MODEL 125 %: Free Aspect +1; x 1.4 pt -> 2.5 px -> +3 (tie, unmeasured at 125 %)");
+        Check(DisplayXRGameViewPlacement.ImageLeftIsTie(1f, 1.4f, 1.25f, out bool pt0, out bool px0) && !pt0 && px0,
+              "MODEL 125 %: ...and the half-pixel tie is reported");
+        Check(!DisplayXRGameViewPlacement.ImageLeftIsTie(1f, 1.857f, 1.75f, out _, out _), "DATA 175 % x 1.857: no tie");
+        Check(DisplayXRGameViewPlacement.ImageLeftIsTie(1f, 1.5f, 1.75f, out bool pt1, out _) && pt1, "a half point is reported as a point tie");
+        // Unity's Mathf.Round: halves to even.
+        Check(L(0f, 0.5f, 1f) == 0 && L(0f, 1.5f, 1f) == 2 && L(0f, 2.5f, 1f) == 2 && L(0f, 3.5f, 1f) == 4, "x rounds halves to even, as Mathf.Round");
+        // Whole scales, and no border (editor window's left edge, maximized, floating).
+        Check(L(1f, 0f, 1f) == 1 && L(1f, 0f, 2f) == 2 && L(1f, 0f, 3f) == 3 && L(0f, 0f, 2.5f) == 0, "whole scales and a pane without a left border");
+        // A measured scale with float noise (3.0000003) is the scale.
+        Check(L(1f, 0f, 2213 / 737.6666f) == 3 && L(1f, 0f, 961 / 549.7142f * 1.0000001f) == L(1f, 0f, 961 / 549.7142f), "a measured scale snaps before the product");
+
+        // The same through Place(): the logged whole-pixel layout (pane 1270 px wide at 175 %:
+        // 725.714 pt host, 723.714 pt area, 720 pt = 1260 px image).
+        var wp = new DisplayXRGameViewPlacement.Pane
+        {
+            Left = 400, Top = 100, ClientW = 1270, ClientH = 682,
+            ToolbarPx = DisplayXRGameViewPlacement.ToolbarPx(389.714f, 342.714f, 1.75f),
+            RtW = 1260, RtH = 595, TargetHPx = 595f, DockedNonMaximized = true, HaveDrawRect = true,
+            HostWPt = 725.714f, DrawWPt = 723.714f, DrawHPt = 342.714f, HostHPt = 389.714f, PtToPx = 1.75f, RoundsBottomEdge = true,
+            WholePixelFixedSize = true, HaveLeftBorder = true, LeftBorderPt = 1f,
+        };
+        DisplayXRGameViewPlacement.Place(wp, 0, 0, out int x, out _, out int w, out int h);
+        Check(x == 405 && w == 1260 && h == 595, $"DATA 175 % whole-pixel 1260x595 with the pane's real border: x pane +{x - 400} == +5 (measured)");
+        var wp0 = wp; wp0.LeftBorderPt = 0f;
+        DisplayXRGameViewPlacement.Place(wp0, 0, 0, out int x0, out _, out _, out _);
+        Check(x0 == 404, $"...and with the border read as 0 pt, as before: pane +{x0 - 400} == +4 (the logged computed origin)");
+        // Unity's own targetInView.x wins over the one derived from the widths.
+        var wpT = wp; wpT.HaveTargetX = true; wpT.TargetXPt = 0.9f;
+        DisplayXRGameViewPlacement.Place(wpT, 0, 0, out int xt, out _, out _, out _);
+        Check(xt == 404, $"Unity's targetInView.x (0.9 pt -> 1 pt -> 3.5 px) is used when it is at hand: pane +{xt - 400} == +4");
+        // Without the border reading the two side borders are assumed equal: the same +5 here.
+        var wpN = wp; wpN.HaveLeftBorder = false;
+        DisplayXRGameViewPlacement.Place(wpN, 0, 0, out int xn, out _, out _, out _);
+        Check(xn == 405, $"border unknown, pane between two neighbours: still pane +{xn - 400} == +5");
+
+        // Free Aspect (chrome slack): with the real border the column no longer depends on
+        // the latched centring. The 250 % reference pane must not move.
+        var refPane = new DisplayXRGameViewPlacement.Pane
+        {
+            Left = 1017, Top = 293, ClientW = 1733, ClientH = 977,
+            ToolbarPx = DisplayXRGameViewPlacement.ToolbarPx(390.8f, 343.8f, 2.5f),
+            RtW = 1728, RtH = 860, TargetHPx = 859.5f, DockedNonMaximized = true, HaveDrawRect = true,
+            HostWPt = 693.2f, DrawWPt = 691.2f, DrawHPt = 343.8f, HostHPt = 390.8f, PtToPx = 2.5f, RoundsBottomEdge = true,
+        };
+        Check(DisplayXRGameViewPlacement.IsChromeSlackOnly(refPane), "the 250 % reference pane is chrome slack");
+        DisplayXRGameViewPlacement.Place(refPane, 3, 0, out int rx, out int ry, out _, out _);
+        var refB = refPane; refB.HaveLeftBorder = true; refB.LeftBorderPt = 1f;
+        DisplayXRGameViewPlacement.Place(refB, 99, 0, out int rbx, out int rby, out _, out _);
+        Check(rx == 1020 && ry == 406 && rbx == 1020 && rby == 406,
+              $"HARDWARE 250 % reference: ({rx},{ry}) with the latch, ({rbx},{rby}) with the border: both (1020,406)");
+        var refEdge = refB; refEdge.LeftBorderPt = 0f;
+        DisplayXRGameViewPlacement.Place(refEdge, 1, 0, out int rex, out _, out _, out _);
+        Check(rex == 1017, $"MODEL 250 % pane at the editor window's left edge (no left border): x {rex} == 1017 (finding F3; the latch gave +1)");
+
+        // F4: the texture size is the target rounded half AWAY from zero.
+        int T(float v) => DisplayXRGameViewPlacement.TextureSizePx(v);
+        Check(T(2562.5f) == 2563 && T(1414.25f) == 1414, "DATA 175 %: target 2562.5 -> texture 2563 (\"texture=2563x1414 glue computed 2562x1414\")");
+        Check(T(1210.5f) == 1211 && T(601.75f) == 602, "DATA 175 %: target 1210.5x601.75 -> texture 1211x602 (logged)");
+        Check(T(859.5f) == 860 && T(860.5f) == 861 && T(1079.5f) == 1080 && T(1728f) == 1728 && T(0.4f) == 0, "halves away from zero; whole targets unchanged");
+
+        // The prediction that selects the whole-pixel size where nothing can be measured.
+        bool P(double tw, double th, int rw, int rh, float zx, float zy, float s, out bool c, out bool r) =>
+            DisplayXRGameViewPlacement.PredictsNotOneToOne(tw, th, rw, rh, zx, zy, s, out c, out r);
+        Check(P(1210.5, 601.75, 1211, 602, 1f, 1.00083125f, 1.75f, out bool c1, out bool r1) && c1 && r1,
+              "DATA 175 % Built-in pipeline run (W drawn 1210.50 for 1211, H 602.25 for 602): predicted not 1:1 on both axes");
+        Check(!P(1728, 859.5, 1728, 860, 1f, 860f / 859.5f, 2.5f, out _, out _), "250 % reference (GVFIT exact on the half row): nothing to select");
+        Check(!P(1469, 720, 1469, 720, 1f, 720f / 719.5f, 1.5f, out _, out bool r2) && !r2,
+              "150 % with a whole-row area under GVFIT (finding F1, unverified): rows alone do not select the size");
+        Check(P(1469.5, 720, 1470, 720, 1f, 1f, 1.5f, out bool c3, out _) && c3, "a half column at 150 % does");
+        Check(!P(1920.5, 1080, 1921, 1080, 1f, 1f, 2f, out _, out _) && !P(1920.5, 1080, 1921, 1080, 1f, 1f, 1.3333f, out _, out _),
+              "a whole scale, or one that is not a whole percent: the whole-pixel size does not apply");
+        Check(!P(1260, 595, 1260, 595, 1f, 1f, 1.75f, out _, out _), "the whole-pixel size itself is 1:1");
+        Check(!P(3840, 2160, 3840, 2160, 0.2786f, 0.2786f, 1.75f, out _, out _), "a zoomed view is the takeover's case, not this one");
+        Check(P(1210.5, 601.75, 1211, 602, 0f, 0f, 1.75f, out _, out _), "an unread zoom counts as 1");
+        Check(P(2100, 1011.25, 2100, 1011, 1f, 1f, 1.75f, out bool c4, out bool r4) && !c4 && r4,
+              "175 % maximized (whole columns, a quarter row): rows select it");
+    }
+
     static void Main()
     {
         // ---- HARDWARE 2026-10-27: DS1 3840x2160, Unity 6000.4.6f1, the pane as logged at the capture
@@ -1143,6 +1250,7 @@ static class Program
         WholePixelDefinitions();
         ModelConsistency();
         PhaseSource();
+        MarkerlessPlacement();
 
         Console.WriteLine($"GameViewPlacement: {s_pass} passed, {s_fail} failed");
         Environment.Exit(s_fail == 0 ? 0 : 1);

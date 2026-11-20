@@ -319,6 +319,25 @@ static class CalibratorTests
         Run(l, 2.5, out x, out _);
         Check(World.Requests == 3 && World.RequestedStrips[2] == 0 && Calibrator.AppliedMeasured && x == l.PaneLeft + 1,
               "once it is drawn, the third attempt measures through thin strips");
+        Check(!Calibrator.MarkerUnavailable, "...and the marker counts as available again");
+
+        // The line says WHY, from the native blit's own account. The Built-in pipeline: the
+        // native blit is offered on every mirror query and never called.
+        NewEditorSession();
+        l = Layout(); Place(l);
+        World.Draws = false; World.MirrorReason = Cal.MirrorNeverCalled; World.MirrorOffered = 900; World.MirrorCalls = 0;
+        Run(l, 0.35 + 0.4, out x, out _);
+        Check(Count("the marker was not drawn: Unity was offered the native mirror blit and never calls it") == 1
+              && Last().Contains("offered 900 times, called 0 times") && Calibrator.MarkerUnavailable
+              && Calibrator.MarkerUnavailableWhy.Contains("never calls it"),
+              "never called: the line names the render pipeline's own blit, and the marker is unavailable: " + Last());
+        // D3D11: called, but there is no D3D12 interface.
+        NewEditorSession();
+        l = Layout(); Place(l);
+        World.Draws = false; World.MirrorReason = Cal.MirrorNotD3D12; World.MirrorOffered = 500; World.MirrorCalls = 500;
+        Run(l, 0.35 + 0.4, out x, out _);
+        Check(Count("the marker was not drawn: the editor is not on D3D12") == 1, "not D3D12: said so: " + Last());
+        World.MirrorReason = 0; World.MirrorOffered = 0; World.MirrorCalls = 0;
     }
 
     static void NotOneToOne()
