@@ -181,8 +181,10 @@ nothing and 1.4 pt moves the image by exactly one point.
   `targetInView.x`, read while the global pixels-per-point equals the pane's scale and kept
   while the geometry holds; without it the value is derived from the widths and the 1:1 line
   says `HALF-POINT TIE`. A measurement, where there is one, settles it.
-- The rows (`RtRow0Y`) are unchanged: every calibration line so far agreed with them. The quarter
-  pixel inconsistency of F5 is therefore open in Y only.
+- The rows (`RtRow0Y`): the whole-pixel view's first row is now its top edge rounded half up,
+  the rule of the columns (#485, see F5: measured +82 for an edge at 82.25 px, where the rule
+  gave +83). Under GVFIT (Free Aspect) the rule is unchanged, and an x.25 edge is still
+  unmeasured there.
 - A second monitor at another scale, and a pane at the editor window's edge, are arithmetic
   (the border comes from Unity, the scale from the pane): not measured.
 
@@ -979,12 +981,27 @@ The diagnostic reports it (`texture=... glue computed ... (DISAGREE)`) and raise
   "150% docked 16:9 L/R" (target 610.5 px: `RtH` 610 -> 611, anchor y 228 -> 227). The Free Aspect
   sweep's inputs use the same half-to-even rounding and would be regenerated.
 
-**F5. The code is inconsistent at a quarter pixel.** *Arithmetic prediction, unverified on
-hardware.* A whole-point edge that falls on x.5 or x.75 px starts on the next pixel (measured at
-250 %, 150 % and 175 %). At x.25 (125 % / 175 %) the X arithmetic (`LetterboxOffsets`, `BorderPx`)
-rounds **down** while the Y arithmetic (`RtRow0Y`) and `LinesShown` take the next pixel **up**.
-One of them is wrong there: in whole-pixel mode at 125 / 175 % expect a possible +-1 on one axis
-only.
+**F5. The code is inconsistent at a quarter pixel.** *Settled for the whole-pixel view (#485,
+measured); open under GVFIT.* A whole-point edge that falls on x.5 or x.75 px starts on the next
+pixel (measured at 250 %, 150 % and 175 %). At x.25 (125 % / 175 %) the X arithmetic
+(`LetterboxOffsets`, `BorderPx`) rounded **down** while the Y arithmetic (`RtRow0Y`) and
+`LinesShown` took the next pixel **up**, and the prediction was a +-1 on one axis only in
+whole-pixel mode. That is what the first measurement on the Built-in pipeline showed (175 %,
+D3D11, D3D12 and a Linear project, identical): whole-pixel 1204x595, `targetInView.y` 1.929 pt,
+Unity rounds the flipped rect to 2 pt, top edge (45 + 2) pt x 1.75 = **82.25 px**; measured
+**+82**, computed +83; the column in the same line (edge 5.25 px) measured +5 as computed. Y was
+the wrong one. A row is shown when its centre is inside the quad, so the first row is the edge
+rounded half up, as for the columns; `RtRow0Y` does that now for the whole-pixel view (drawn
+1:1, GVFIT off). The two rules agree on x.0, x.5 and x.75, so no earlier number moves: the
+150 / 250 % captures have no quarter edge, and the earlier 175 % calibration layout
+(`targetInView.y` 1.357 pt, edge 80.5 px) is a tie that both take up.
+
+Still open: (a) the same edge **under GVFIT** (Free Aspect at 125 / 175 / 225 %), where the
+drawn height is not the texture's and the bottom-edge rule is what every capture so far fits -
+none of them on an x.25 edge; `LinesShown` is unchanged for the same reason. (b) Whether Unity
+rounds the row to whole points at all: 1.929 pt unrounded is 82.125 px, also +82. The two differ
+when the area is 1 to 2 pt higher than the image (`targetInView.y` 0.5 to 1 pt: rounded, +81;
+unrounded, +80).
 
 ## Hardware test recipe
 

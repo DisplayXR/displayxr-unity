@@ -171,6 +171,18 @@ namespace DisplayXR
                                                    : p.RtH / (p.RtH - 0.5); // GVFIT scale.y
             double bottomPt = Math.Round((p.DrawHPt + targetHPt * stretch) * 0.5);
             double bottomPx = p.Top + (topPt + bottomPt) * s;
+            // (#485, finding F5 settled for this case) The whole-pixel view is drawn 1:1, RtH
+            // rows from a top edge at bottomPx - RtH, and a row is shown when its CENTRE is
+            // inside the quad: the first row is the edge rounded half up, exactly the rule of
+            // the columns (ImageLeftPx). Measured through the marker on the Built-in pipeline
+            // at 175 % (D3D11, D3D12, Linear; identical): edge 82.25 px -> row +82, where
+            // "the next row at or below the edge" gave +83. The two rules differ only on an
+            // x.25 edge (125 / 175 / 225 %); x.5 goes up and x.75 goes up under both.
+            if (p.WholePixelFixedSize)
+                return (int)Math.Floor(bottomPx + 0.5 + 1e-6) - p.RtH;
+            // Under GVFIT the drawn height is not RtH, and the rule below is the one every
+            // capture at 150 / 250 / 300 % and the 175 % Free Aspect measurements fit (edges
+            // on x.0, x.5, x.75). An x.25 edge under GVFIT is still unmeasured.
             return (int)Math.Ceiling(bottomPx - 1e-3) - p.RtH;
         }
 
