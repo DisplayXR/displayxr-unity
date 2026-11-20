@@ -9,13 +9,16 @@
 // definition in Runtime/Provider/DisplayXRGameViewCalibration.cs (Code / MarkerIndex /
 // InMarker), which is what the decoder is unit-tested against.
 //
-// The constant block is 12 32-bit values, in this order (root constants on D3D12, a constant
+// The constant block is 16 32-bit values, in this order (root constants on D3D12, a constant
 // buffer on D3D11):
 //   float4 srcRect   the woven canvas inside its texture, in UV (x, y, w, h)
 //   uint4  mk        (mode, band 0 start, band 1 start, band width)
 //                      mode 0 = no marker, 1 = marker over the whole image, 2 = thin strips
 //   uint4  st        thin strips: (row, half, column, half) - the marker is drawn on the rows
 //                      within `half` of `row` and on the columns within `half` of `column`
+//   uint4  fl        (#480) fl.x != 0: decode the woven sample (sRGB EOTF) before it is
+//                      stored. Set when the woven bytes are ENCODED and the target view
+//                      encodes on store (an _SRGB format): displayxr_mirror_colour.h.
 #pragma once
 
 #define GVCAL_BLOCK      6                 // texels per block (sync + 5 base-5 digits)
@@ -23,7 +26,7 @@
 #define GVCAL_MIN_SIDE   128
 #define GVCAL_STRIPS     2                 // strip pairs (DisplayXRGameViewCalibration.StripCount)
 #define GVCAL_HALF_MAX   (GVCAL_BAND_W / 2 - 1) // a vertical strip stays inside its band
-#define GVCAL_CONSTANTS  12                // 32-bit values in the constant block
+#define GVCAL_CONSTANTS  16               // 32-bit values in the constant block
 
 // DisplayXRGameViewCalibration.BandStarts / HorizontalStripRow / VerticalStripColumn.
 static inline int gvcal_band0(int w) { return w / 3 / GVCAL_BLOCK * GVCAL_BLOCK; }
@@ -49,7 +52,7 @@ static inline void gvcal_fill_constants(int w, int h, int strip, int half, unsig
 }
 
 static const char *const kDxrMirrorBlitHLSL =
-	"cbuffer C : register(b0){ float4 srcRect; uint4 mk; uint4 st; }\n"
+	"cbuffer C : register(b0){ float4 srcRect; uint4 mk; uint4 st; uint4 fl; }\n"
 	"Texture2D tex : register(t0); SamplerState smp : register(s0);\n"
 	"struct V{ float4 pos:SV_Position; float2 uv:TEXCOORD0; };\n"
 	"V VSMain(uint id:SV_VertexID){ V o; float2 t=float2((id<<1)&2, id&2);\n"
@@ -63,7 +66,13 @@ static const char *const kDxrMirrorBlitHLSL =
 	"static const uint kPow5[5] = { 1, 5, 25, 125, 625 };\n"
 	"uint Code(uint t){ uint r = t % 6; uint v = 5;\n"
 	"  if (r != 0) v = ((t / 6) / kPow5[r - 1]) % 5; return v; }\n"
+	// (#480) fl.x != 0: the woven bytes are ENCODED and this target view encodes on store
+	// (an _SRGB format), so decode here (sRGB EOTF, as dxr_mirror_srgb_decode) and the
+	// pair is the identity. The marker colours are 0 / 1, which the curve leaves alone.
 	"float4 PSMain(V i):SV_Target{ float2 uv=srcRect.xy + i.uv*srcRect.zw; float4 c = tex.Sample(smp, uv);\n"
+	"  if (fl.x != 0) { float3 e = saturate(c.rgb);\n"
+	"    float3 lo = e / 12.92; float3 hi = pow((e + 0.055) / 1.055, 2.4);\n"
+	"    c.rgb = float3(e.r <= 0.04045 ? lo.r : hi.r, e.g <= 0.04045 ? lo.g : hi.g, e.b <= 0.04045 ? lo.b : hi.b); }\n"
 	"  if (mk.x != 0) { uint x = (uint)i.pos.x; uint y = (uint)i.pos.y;\n"
 	"    bool on = mk.x == 1 || (y + st.y >= st.x && y <= st.x + st.y) || (x + st.w >= st.z && x <= st.z + st.w);\n"
 	"    if (on) {\n"

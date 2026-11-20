@@ -186,6 +186,27 @@ void *dxr_prov_get_bridge_unity_texture_eye(uint32_t eye, uint32_t *width, uint3
 /// it as an external Texture2D on a RawImage overlay (deterministic presentation).
 DISPLAYXR_EXPORT void *dxr_prov_get_woven_unity_texture(uint32_t *width, uint32_t *height);
 
+/// Editor Game-view mirror colour (#480). On a format-honest runtime the woven texture holds
+/// ENCODED bytes in a UNORM format; in a Linear project Unity's mirror blit encodes on store,
+/// so the source has to be sampled through a decoding view or the image is encoded twice
+/// (washed out). Policy + model: displayxr_mirror_colour.h.
+///  - dxr_prov_get_woven_mirror_texture: the texture to hand Unity's own (blitParams) blit and
+///    whether to flag it sRGB. That is the woven texture itself, plain, except for a Linear
+///    project on a format-honest runtime, where it is a TYPELESS per-frame raw copy of it on
+///    Unity's device (a typed UNORM texture cannot carry an _SRGB view) flagged sRGB.
+///  - dxr_prov_get_woven_mirror_copy_d3d12: that copy's (dst, src) on D3D12, NULL when unused -
+///    the display provider records the copy (it owns the Unity command-list plumbing); on
+///    D3D11 the session does it itself after xrEndFrame.
+///  - dxr_prov_woven_is_encoded / dxr_prov_mirror_colour_fix_enabled: inputs to the native
+///    shader blit's decode decision (DISPLAYXR_PROV_MIRROR_SRGB=0 turns the fix off, A/B).
+///  - dxr_prov_get_woven_dxgi_format: the woven texture's real format, for the log line.
+void *dxr_prov_get_woven_mirror_texture(uint32_t *width, uint32_t *height, int *srgb);
+void dxr_prov_get_woven_mirror_copy_d3d12(void **dst, void **src);
+int dxr_prov_woven_is_encoded(void);
+int dxr_prov_woven_mirror_wants_srgb(void);
+int dxr_prov_mirror_colour_fix_enabled(void);
+int dxr_prov_get_woven_dxgi_format(void);
+
 /// The woven content's canvas (== forced zone) sub-rect within the shared texture,
 /// plus the full texture dims, so the presenter can build a normalized uvRect. Exported
 /// for the C# RawImage overlay.

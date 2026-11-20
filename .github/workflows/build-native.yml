@@ -263,6 +263,15 @@ jobs:
             native~/tests/cursor_depth_math_test.cpp -o /tmp/cursor_depth_math_test -lm
           /tmp/cursor_depth_math_test
 
+      # The editor Game-view mirror's colour policy (#480): which case needs a decoding
+      # source, and that decode + encode is the identity on every 8-bit value.
+      - name: Mirror colour policy tests
+        if: needs.DetectChanges.outputs.docs_only != 'true'
+        run: |
+          c++ -std=c++17 -Wall -Wextra -I native~/displayxr_xrprovider \
+            native~/tests/mirror_colour_test.cpp -o /tmp/mirror_colour_test -lm
+          /tmp/mirror_colour_test
+
       # The XR_DXR_mcp_tools binding against a fake runtime: registration survives a
       # session restart, calls queue FIFO with UTF-8 intact, the capability gate holds.
       - name: MCP tools binding tests

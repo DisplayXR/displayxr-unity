@@ -28,6 +28,7 @@
 #include <vector>
 
 #include "displayxr_gvcal_shader.h"
+#include "displayxr_mirror_colour.h" // (#480) the decode the shader's fl.x applies
 
 static int s_pass = 0, s_fail = 0;
 static void check(bool ok, const char *what)
@@ -135,7 +136,8 @@ static bool gpu_init(Gpu &g)
 }
 
 // Render a w x h target with the given constants; out = w * h * 4 bytes, RGBA, row by row.
-static bool gpu_render(Gpu &g, int w, int h, const unsigned mk[4], const unsigned st[4], std::vector<uint8_t> &out)
+static bool gpu_render(Gpu &g, int w, int h, const unsigned mk[4], const unsigned st[4], std::vector<uint8_t> &out,
+                       bool decode = false)
 {
 	D3D11_TEXTURE2D_DESC td = {};
 	td.Width = (UINT)w; td.Height = (UINT)h; td.MipLevels = td.ArraySize = 1; td.Format = DXGI_FORMAT_R8G8B8A8_UNORM;
@@ -148,9 +150,10 @@ static bool gpu_render(Gpu &g, int w, int h, const unsigned mk[4], const unsigne
 	g.dev->CreateTexture2D(&td, nullptr, &stage);
 	bool ok = false;
 	if (rtv && stage) {
-		struct { float src[4]; unsigned mk[4]; unsigned st[4]; } c;
+		struct { float src[4]; unsigned mk[4]; unsigned st[4]; unsigned fl[4]; } c;
 		c.src[0] = 0.0f; c.src[1] = 0.0f; c.src[2] = 1.0f; c.src[3] = 1.0f;
 		memcpy(c.mk, mk, sizeof(c.mk)); memcpy(c.st, st, sizeof(c.st));
+		c.fl[0] = decode ? 1u : 0u; c.fl[1] = c.fl[2] = c.fl[3] = 0; // (#480) shader decode
 		g.ctx->UpdateSubresource(g.cb, 0, nullptr, &c, 0, 0);
 		const float red[4] = {1, 0, 0, 1};
 		g.ctx->ClearRenderTargetView(rtv, red);
@@ -261,6 +264,28 @@ int main()
 	run_case(g, 1120, 595, 0, 0, 0);
 	run_case(g, 1120, 595, 1, 11, 0);
 	run_case(g, 1120, 595, 0, 1, 0);
+
+	// (#480) fl.x = 1: the woven sample is decoded (sRGB EOTF) and the marker is not. The
+	// target here is UNORM, so what is read back is the decoded value itself.
+	{
+		unsigned dmk[4], dst[4];
+		gvcal_fill_constants(300, 200, 0, 6, dmk, dst);
+		std::vector<uint8_t> px;
+		bool ok = gpu_render(g, 300, 200, dmk, dst, px, true);
+		check(ok, "decode: rendered");
+		if (ok) {
+			const uint8_t *scene = &px[(size_t)(5 * 300 + 5) * 4];                  // outside both strips
+			const uint8_t *mark = &px[(size_t)(gvcal_strip_row(0, 200) * 300 + 5) * 4]; // on the row strip
+			auto near_to = [](int a, int b) { return a >= b - 1 && a <= b + 1; };
+			const int want[3] = {dxr_mirror_model_screen_byte(kSceneR, 1, 0), dxr_mirror_model_screen_byte(kSceneG, 1, 0),
+			                     dxr_mirror_model_screen_byte(kSceneB, 1, 0)};
+			char what[200];
+			snprintf(what, sizeof(what), "decode: the scene (%d,%d,%d) is stored as its sRGB decode (%d,%d,%d), drew (%d,%d,%d)",
+			         kSceneR, kSceneG, kSceneB, want[0], want[1], want[2], scene[0], scene[1], scene[2]);
+			check(near_to(scene[0], want[0]) && near_to(scene[1], want[1]) && near_to(scene[2], want[2]), what);
+			check(classify(mark) == ref_marker_index(5, gvcal_strip_row(0, 200), 300), "decode: the marker colours are untouched");
+		}
+	}
 
 	printf("gvcal_shader_test: %d passed, %d failed\n", s_pass, s_fail);
 	return s_fail == 0 ? 0 : 1;

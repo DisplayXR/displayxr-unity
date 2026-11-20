@@ -18,6 +18,7 @@
 #include "displayxr_provider_hands.h" // XR_EXT_hand_tracking: 26-joint hands for the XR Hands subsystem
 #include "displayxr_provider_input.h" // OpenXR actions: controllers + styluses as Unity InputDevices
 #include "displayxr_provider_texture_target.h" // win32_window_binding v9: editor texture target (#471)
+#include "displayxr_mirror_colour.h" // editor Game-view mirror colour policy (unit-tested, #480)
 #include "../displayxr_shared_state.h" // displayxr_state_set_stereo_matrices (overlay hit-test)
 #include "../displayxr_window_space_ui.h" // DXR_WSUI_MAX_SLOTS, get_pending_slot
 #include <atomic>     // s_session_generation (#336)
@@ -1384,6 +1385,14 @@ static void ps_input_publish_rig(const void *rig_chain, float canvas_h_m);
 // On an older runtime, or under the runtime's own escape hatch DXR_COLOR_LEGACY_UNORM_ENCODED=1,
 // D3D/Vulkan stay as they were before #347.
 //
+// THE DOCKED EDITOR MIRROR ON A FORMAT-HONEST RUNTIME (#480). The first paragraph's "Unity's
+// GameView present applies that encode" was written for the passthrough runtime, where a
+// Linear project's woven texture held LINEAR values. A format-honest runtime weaves ENCODED
+// pixels into the shared texture in both colour spaces, so in a Linear project Unity's encode
+// is one too many (washed out) unless the mirror source is sampled through a decoding view.
+// See dxr_prov_woven_mirror_wants_srgb / dxr_prov_get_woven_mirror_texture and
+// displayxr_mirror_colour.h.
+//
 // METAL (#358). The runtime's Metal compositor became format-honest in the first release after
 // v2.32.0 (runtime 23cb3db40, #1901). Metal makes the SAME split, with views instead of copies
 // (zero-copy: Unity renders straight into the swapchain images): a Gamma project renders through
@@ -1501,6 +1510,29 @@ static int64_t ps_encoded_bytes_format(int64_t unorm, const int64_t *formats, ui
 	for (uint32_t i = 0; i < count; i++)
 		if (formats[i] == s) return s;
 	return unorm;
+}
+
+// Editor Game-view mirror (#480). 1 when the runtime-woven texture holds ENCODED bytes that
+// Unity's mirror blit would encode a second time: a Linear project on a format-honest
+// runtime. There the display provider declares the mirror source sRGB (Unity's own blit) or
+// decodes in its shader (native blit), so decode + encode is the identity. Everything else -
+// a Gamma project, a passthrough runtime - keeps the plain declaration and is unchanged.
+// Deliberately NOT derived from s_swapchain_srgb: the mirror texture is wrapped as soon as
+// the session is up, which can be before a zone-sized primary swapchain exists.
+// DISPLAYXR_PROV_MIRROR_SRGB=0 restores the plain declaration (A/B diagnostic).
+int dxr_prov_woven_is_encoded(void)
+{
+	return dxr_mirror_woven_is_encoded(s_color_space_linear, ps_runtime_format_honest());
+}
+int dxr_prov_mirror_colour_fix_enabled(void)
+{
+	const char *e = getenv("DISPLAYXR_PROV_MIRROR_SRGB");
+	return !(e && e[0] == '0');
+}
+int dxr_prov_woven_mirror_wants_srgb(void)
+{
+	if (!dxr_prov_mirror_colour_fix_enabled()) return 0;
+	return dxr_mirror_source_wants_srgb(s_color_space_linear, ps_runtime_format_honest());
 }
 #ifdef _WIN32
 // Map the chosen XR swapchain format id to the DXGI format for the paired bridge/staging
@@ -4183,6 +4215,11 @@ static float s_app_zone_feather[PS_MAX_ZONES] = {};
 #ifdef _WIN32
 static ID3D11Texture2D *s_probe_tex_unity = NULL;
 static ID3D12Resource  *s_probe_tex12_unity = NULL; // D3D12 Unity-device view of the woven shared tex
+// (#480) TYPELESS Unity-device copy of the woven texture, for the one case where Unity must
+// sample it through an _SRGB view (see dxr_prov_get_woven_mirror_texture). NULL otherwise.
+static ID3D11Texture2D *s_probe_mirror11 = NULL;
+static ID3D12Resource  *s_probe_mirror12 = NULL;
+static int              s_probe_mirror_failed = 0; // allocation failed once: stay on the plain path
 #endif
 static uint32_t         s_probe_woven_w = 0, s_probe_woven_h = 0;
 
@@ -4495,6 +4532,104 @@ void *dxr_prov_get_woven_unity_texture(uint32_t *w, uint32_t *h)
 	if (h) *h = s_probe_woven_h;
 	return s_probe_tex_unity ? (void *)s_probe_tex_unity : (void *)s_probe_tex12_unity;
 }
+
+// (#480) The texture Unity's OWN mirror blit (blitParams) samples, and whether to declare
+// it sRGB.
+//
+// The woven texture is B8G8R8A8_UNORM and - on a format-honest runtime - holds ENCODED
+// bytes. In a Linear project Unity's blit encodes on store, so it must sample through a
+// decoding (_SRGB) view. A fully-typed UNORM texture cannot carry one (D3D11 refuses the
+// view outright; D3D12 allows it only under the relaxed casting rules of recent drivers),
+// and the woven texture itself has to stay typed: the runtime builds its render-target
+// view from the texture's own format, and a legacy shared handle cannot be TYPELESS. So
+// Unity is given a B8G8R8A8_TYPELESS texture on its own device instead, refreshed from the
+// woven one by a raw copy each frame (same family: a bit reinterpretation, no conversion).
+//
+// Every other case (Gamma project, passthrough runtime, opt-out, allocation failure)
+// returns the woven texture itself with *srgb = 0 - byte-identical to before.
+void *dxr_prov_get_woven_mirror_texture(uint32_t *w, uint32_t *h, int *srgb)
+{
+	if (srgb) *srgb = 0;
+	void *woven = dxr_prov_get_woven_unity_texture(w, h);
+	if (!woven || !dxr_prov_woven_mirror_wants_srgb() || s_probe_mirror_failed) return woven;
+	if (s_probe_tex_unity && s_ps.unity_d3d11_device) {
+		if (!s_probe_mirror11) {
+			D3D11_TEXTURE2D_DESC td = {};
+			s_probe_tex_unity->GetDesc(&td);
+			const DXGI_FORMAT woven_fmt = td.Format;
+			td.Format = DXGI_FORMAT_B8G8R8A8_TYPELESS;
+			td.MiscFlags = 0; // plain Unity-device texture: nothing else opens it
+			td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+			HRESULT hr = (woven_fmt == DXGI_FORMAT_B8G8R8A8_UNORM)
+			                 ? s_ps.unity_d3d11_device->CreateTexture2D(&td, NULL, &s_probe_mirror11)
+			                 : E_INVALIDARG;
+			if (FAILED(hr) || !s_probe_mirror11) {
+				s_probe_mirror11 = NULL; s_probe_mirror_failed = 1;
+				ps_log("[DisplayXR-PROV] mirror colour: D3D11 TYPELESS mirror copy unavailable "
+				       "(woven format %d, hr=0x%08lX) - plain declaration kept, a Linear project's "
+				       "docked Game view stays washed out (#480)\n", (int)woven_fmt, hr);
+				return woven;
+			}
+		}
+		if (srgb) *srgb = 1;
+		return s_probe_mirror11;
+	}
+	if (s_probe_tex12_unity && s_ps.unity_device) {
+		if (!s_probe_mirror12) {
+			D3D12_RESOURCE_DESC rd = s_probe_tex12_unity->GetDesc();
+			const DXGI_FORMAT woven_fmt = rd.Format;
+			rd.Format = DXGI_FORMAT_B8G8R8A8_TYPELESS;
+			rd.Flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET;
+			D3D12_HEAP_PROPERTIES hp = {}; hp.Type = D3D12_HEAP_TYPE_DEFAULT;
+			HRESULT hr = (woven_fmt == DXGI_FORMAT_B8G8R8A8_UNORM)
+			                 ? s_ps.unity_device->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &rd,
+			                       D3D12_RESOURCE_STATE_COMMON, NULL, __uuidof(ID3D12Resource),
+			                       (void **)&s_probe_mirror12)
+			                 : E_INVALIDARG;
+			if (FAILED(hr) || !s_probe_mirror12) {
+				s_probe_mirror12 = NULL; s_probe_mirror_failed = 1;
+				ps_log("[DisplayXR-PROV] mirror colour: D3D12 TYPELESS mirror copy unavailable "
+				       "(woven format %d, hr=0x%08lX) - plain declaration kept, a Linear project's "
+				       "docked Game view stays washed out unless the native blit runs (#480)\n",
+				       (int)woven_fmt, hr);
+				return woven;
+			}
+		}
+		if (srgb) *srgb = 1;
+		return s_probe_mirror12;
+	}
+	return woven;
+}
+
+// (#480) D3D12: the copy pair for the display provider, which owns the Unity command-list
+// plumbing. Both NULL unless the TYPELESS mirror copy is in use.
+void dxr_prov_get_woven_mirror_copy_d3d12(void **dst, void **src)
+{
+	const int on = (s_probe_mirror12 != NULL && s_probe_tex12_unity != NULL);
+	if (dst) *dst = on ? (void *)s_probe_mirror12 : NULL;
+	if (src) *src = on ? (void *)s_probe_tex12_unity : NULL;
+}
+
+// (#480) The woven texture's DXGI format as Unity's device sees it (0 = none), for the
+// one-shot mirror colour log line.
+int dxr_prov_get_woven_dxgi_format(void)
+{
+	if (s_probe_tex_unity) { D3D11_TEXTURE2D_DESC td = {}; s_probe_tex_unity->GetDesc(&td); return (int)td.Format; }
+	if (s_probe_tex12_unity) return (int)s_probe_tex12_unity->GetDesc().Format;
+	return 0;
+}
+
+// (#480) D3D11: refresh the TYPELESS mirror copy from the woven texture on Unity's immediate
+// context. Graphics thread, after xrEndFrame (this frame's weave is submitted). A raw
+// CopyResource within one typeless family - the encoded bytes are not converted.
+static void ps_probe_refresh_mirror_d3d11(void)
+{
+	if (!s_probe_mirror11 || !s_probe_tex_unity || !s_ps.unity_d3d11_context) return;
+	// Texture mode never presents, so nothing else guarantees the runtime's weave has left
+	// the own context's command buffer: flush it so the copy reads this frame, not the last.
+	if (s_ps.own_d3d11_context) s_ps.own_d3d11_context->Flush();
+	s_ps.unity_d3d11_context->CopyResource(s_probe_mirror11, s_probe_tex_unity);
+}
 #else  // !_WIN32 — macOS: the weave-to-texture probe/mirror is Windows/D3D-only.
 void *dxr_prov_get_woven_unity_texture(uint32_t *w, uint32_t *h)
 {
@@ -4502,6 +4637,19 @@ void *dxr_prov_get_woven_unity_texture(uint32_t *w, uint32_t *h)
 	if (h) *h = 0;
 	return NULL;
 }
+void *dxr_prov_get_woven_mirror_texture(uint32_t *w, uint32_t *h, int *srgb)
+{
+	if (w) *w = 0;
+	if (h) *h = 0;
+	if (srgb) *srgb = 0;
+	return NULL;
+}
+void dxr_prov_get_woven_mirror_copy_d3d12(void **dst, void **src)
+{
+	if (dst) *dst = NULL;
+	if (src) *src = NULL;
+}
+int dxr_prov_get_woven_dxgi_format(void) { return 0; }
 #endif // _WIN32
 
 // The woven content occupies the canvas sub-rect of the shared texture; report it
@@ -4553,6 +4701,9 @@ void dxr_prov_get_woven_canvas(int32_t *x, int32_t *y, int32_t *cw, int32_t *ch,
 #ifdef _WIN32
 static void ps_probe_cleanup(void)
 {
+	if (s_probe_mirror11) { s_probe_mirror11->Release(); s_probe_mirror11 = NULL; } // (#480)
+	if (s_probe_mirror12) { s_probe_mirror12->Release(); s_probe_mirror12 = NULL; }
+	s_probe_mirror_failed = 0;
 	if (s_probe_tex_unity) { s_probe_tex_unity->Release(); s_probe_tex_unity = NULL; }
 	// D3D12 Unity-device view: Release only — the NT handle it was opened from
 	// (s_probe_handle) is CloseHandle'd once in the s_probe_tex12 block below.
@@ -8474,6 +8625,11 @@ int dxr_prov_submit_frame(uint32_t image_index)
 #endif
 		return 0;
 	}
+
+#ifdef _WIN32
+	// (#480) Editor texture mode, Linear project: refresh what Unity's mirror blit samples.
+	ps_probe_refresh_mirror_d3d11();
+#endif
 
 #ifdef _WIN32
 	// PROBE (DISPLAYXR_PROV_BRIDGE_READBACK=1): once, read back the copy-source bridge to
