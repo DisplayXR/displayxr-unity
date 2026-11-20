@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.38.0] - 2026-11-20
+
+### Added
+- **Native log diagnostics for the editor Game-view mirror (#459, #480, #483).** The native log now says which mirror blit is used for the active graphics API and why one is not offered, why the blit did not draw on a given frame, which colour decode was chosen for the mirror target (`mirror colour:` lines), and how the GPU was classified.
+- **Editor Game view: a D3D11 native mirror blit (#483).** The docked Game view on URP + D3D11 now shows the woven image through a native blit on D3D11, as it already did on D3D12. It draws no calibration marker, so the image position on D3D11 is the computed one. Opt out with `DISPLAYXR_PROV_NATIVE_MIRROR_D3D11=0`. Seen on hardware in a Gamma project; the Linear-project colour decode on D3D11 is not yet hardware-verified.
+
+### Fixed
+- **Editor crash entering Play on URP + D3D11 with a docked Game view (#483).** The native mirror blit was offered whatever the graphics API and ran the D3D12 path on a D3D11 device. The blit is now chosen from the active renderer, and a renderer without one is never offered it.
+- **Editor: the docked Game view was washed out in Linear colour-space projects (#480).** The woven mirror image was encoded twice; it is now decoded once, by the view it is sampled through or in the blit's shader.
+- **Editor Game view: image position without a measurement (#459).** The computed position now accounts for the left dock border and for size rounding, and a whole-pixel Game view size is selected automatically where the image cannot be measured on screen, for example on the Built-in pipeline. The native mirror blit also runs on the older D3D12 graphics interface.
+
+### Changed
+- **Editor Game view: the on-screen calibration marker is much quieter (#459).** It is drawn as two thin strips (one horizontal, one vertical) instead of over the whole image, starts reading with the first marker frame instead of after a fixed wait, waits for the mouse buttons to be released after a layout change, and remembers measured layouts for the editor session, so a later Play in the same layout shows no marker at all. Switches: `DISPLAYXR_PROV_GV_CALIB_FULL=1` (whole-image marker, every time), `DISPLAYXR_PROV_GV_CALIB_CACHE=0`, `DISPLAYXR_PROV_GV_CALIB_DELAY_MS`.
+- **Docs: the texture target binding is honoured on D3D12 from runtime v2.69.0; runtime v2.69.1 is the recommended version (#471).**
+
 ## [2.37.0] - 2026-11-19
 
 ### Added

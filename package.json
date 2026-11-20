@@ -1,7 +1,7 @@
 {
   "name": "com.displayxr.unity",
   "displayName": "DisplayXR",
-  "version": "2.37.0",
+  "version": "2.38.0",
   "unity": "2022.3",
   "description": "Unity display provider (IUnityXRDisplay) for the DisplayXR OpenXR runtime: eye-tracked stereo rendering on 3D light field displays. Provides display-centric and camera-centric stereo rigs, runtime-owned Kooima asymmetric frustum projection, 2D/3D display zones and a 2D UI overlay, on BiRP, URP and HDRP. Play Mode runs the provider itself, identical to a built player.",
   "keywords": [
