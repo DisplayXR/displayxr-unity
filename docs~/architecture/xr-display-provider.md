@@ -302,8 +302,9 @@ colour-correct:
    runtime (before v2.21, or `DXR_COLOR_LEGACY_UNORM_ENCODED=1`) writes what Unity
    rendered: linear values for a Linear project, encoded ones for a Gamma project.
 2. **What the blit's store does.** In a Linear project Unity's store into the Game-view
-   target encodes; in a Gamma project nothing converts. The native D3D12 shader blit
-   stores through a view of the target's own format, so an `_SRGB` target encodes.
+   target encodes; in a Gamma project nothing converts. The native shader blit (D3D12,
+   and D3D11 since #483) stores through a view of the target's own format, so an `_SRGB`
+   target encodes.
 3. **How the source is sampled.** Declared plain, it is sampled raw.
 
 Encoded bytes + raw sample + encoding store = encoded twice (washed out: 128 shows as
@@ -312,8 +313,8 @@ case is treated (`displayxr_mirror_colour.h`, tested by `native~/tests/mirror_co
 
 | Blit path | Gamma project | Linear, format-honest runtime | Linear, passthrough runtime |
 |---|---|---|---|
-| Unity `blitParams` (D3D11 editor always; D3D12 whenever Unity does not call the native blit) | woven texture, plain | **TYPELESS per-frame raw copy, flagged sRGB** — Unity decodes on sample, its encode on store is the identity | woven texture, plain (linear bytes, Unity's one encode) |
-| Native D3D12 shader blit | raw | **shader decode when the target view is `_SRGB`**; a TYPELESS target is viewed UNORM (raw) | raw (the view's encode is the one needed) |
+| Unity `blitParams` (whenever Unity does not call the native blit: the Built-in pipeline, `DISPLAYXR_PROV_NATIVE_MIRROR=0`, D3D11 with `DISPLAYXR_PROV_NATIVE_MIRROR_D3D11=0`) | woven texture, plain | **TYPELESS per-frame raw copy, flagged sRGB** — Unity decodes on sample, its encode on store is the identity | woven texture, plain (linear bytes, Unity's one encode) |
+| Native shader blit (D3D12 and D3D11, one shader and one rule) | raw | **shader decode when the target view is `_SRGB`**; a TYPELESS target is viewed UNORM (raw) | raw (the view's encode is the one needed) |
 
 Why a copy: a fully-typed UNORM texture cannot carry an `_SRGB` view on D3D11, and the
 woven texture has to stay typed (the runtime builds its render-target view from the
@@ -325,8 +326,8 @@ on Unity's immediate context after `xrEndFrame`; D3D12 through
 Two log lines per session say what happened (`%TEMP%\displayxr_prov_native.log`):
 `mirror colour: project=… woven_dxgi_format=… holds=… | Unity told BGRA32 srgb=… via …`
 and, after 120 frames, `mirror colour: blit path after N frames = NATIVE … / UNITY …`
-(plus `mirror colour: native blit target dxgi_format=… view=… -> shader decode=…` the
-first time the native blit runs). `DISPLAYXR_PROV_MIRROR_SRGB=0` restores the plain
+(plus `mirror colour: native blit target dxgi_format=… view=… -> shader decode=… (D3D12|D3D11, #480)`
+the first time the native blit runs). `DISPLAYXR_PROV_MIRROR_SRGB=0` restores the plain
 declaration for an A/B. The built player never binds texture mode, so none of this runs
 there.
 
