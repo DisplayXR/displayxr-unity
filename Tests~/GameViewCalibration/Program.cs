@@ -515,6 +515,7 @@ static class Program
         Check(Cal.NativeMirrorReasonText(0, Cal.MirrorNeverCalledAfter, 0).Contains("never calls it"), "offered for seconds, never called");
         Check(Cal.NativeMirrorReasonText(Cal.MirrorDrawn, 400, 400).Contains("drew no frame while the marker was requested"), "draws, but not now");
         Check(Cal.NativeMirrorReasonText(Cal.MirrorNotD3D12, 400, 400).Contains("not on D3D12"), "not D3D12");
+        Check(Cal.NativeMirrorReasonText(Cal.MirrorDrawnNoMarker, 400, 400).Contains("draws on D3D11"), "D3D11: the blit draws, the marker is D3D12 only (#483)");
         Check(Cal.NativeMirrorReasonText(9, 400, 400).Contains("could not be resolved") && Cal.NativeMirrorReasonText(9, 400, 400).Contains("reason 9"),
               "a render target the interface cannot resolve, with the raw numbers");
         for (int r = 2; r <= 15; r++)

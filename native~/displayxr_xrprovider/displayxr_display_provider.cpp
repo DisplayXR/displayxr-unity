@@ -179,6 +179,23 @@ static ID3D12GraphicsCommandList *s_mblit_list = nullptr;
 static ID3D12CommandAllocator   *s_mcopy_alloc[PROV_MCOPY_RING] = {};
 static UINT64                    s_mcopy_fence[PROV_MCOPY_RING] = {};
 static ID3D12GraphicsCommandList *s_mcopy_list = nullptr;
+// D3D11 native mirror blit (#483): pipeline objects on Unity's ID3D11Device. Built on the
+// first blit, released in GfxStop. s_blit11_dev is an identity only (no reference held).
+static ID3D11Device       *s_blit11_dev = nullptr;
+static ID3D11VertexShader *s_blit11_vs  = nullptr;
+static ID3D11PixelShader  *s_blit11_ps  = nullptr;
+static ID3D11SamplerState *s_blit11_smp = nullptr;
+static ID3D11Buffer       *s_blit11_cb  = nullptr;
+static ID3D11RasterizerState *s_blit11_rs = nullptr;
+static void prov11_release_blit_pipeline()
+{
+	if (s_blit11_vs)  { s_blit11_vs->Release();  s_blit11_vs  = nullptr; }
+	if (s_blit11_ps)  { s_blit11_ps->Release();  s_blit11_ps  = nullptr; }
+	if (s_blit11_smp) { s_blit11_smp->Release(); s_blit11_smp = nullptr; }
+	if (s_blit11_cb)  { s_blit11_cb->Release();  s_blit11_cb  = nullptr; }
+	if (s_blit11_rs)  { s_blit11_rs->Release();  s_blit11_rs  = nullptr; }
+	s_blit11_dev = nullptr;
+}
 #endif
 // (#480) Per-session one-shot mirror colour diagnostics; reset in GfxStop.
 static bool     s_mirror_colour_logged = false;  // the "mirror colour:" line at wrap time
@@ -1555,7 +1572,8 @@ static void prov_mirror_after_submit(void)
 	if (s_woven_tex_id == 0) return;
 	s_mirror_submit_n++;
 #ifdef _WIN32
-	if (dxr_prov_get_graphics_api() != DXR_GFX_D3D11 && s_ifaces)
+	// D3D12 only, by the session's backend and not by the interface pointer (#483).
+	if (dxr_prov_get_graphics_api() == DXR_GFX_D3D12 && s_ifaces)
 		prov_refresh_mirror_copy_d3d12(s_ifaces->Get<IUnityGraphicsD3D12v8>());
 #endif
 	if (!s_mirror_path_logged && s_mirror_submit_n >= 120) {
@@ -1609,7 +1627,11 @@ GfxSubmitCurrentFrame(UnitySubsystemHandle handle, void *userData)
 	// coherently across the device boundary (a D3D12 shared resource must be in
 	// COMMON at a cross-device sync point). Without this the own-device copy reads
 	// incoherent/empty memory → black. Pairs with the shared sync fence.
-	IUnityGraphicsD3D12v8 *v8 = s_ifaces->Get<IUnityGraphicsD3D12v8>();
+	// D3D12 ONLY (#483): Unity hands out a non-null IUnityGraphicsD3D12v8 on a device that is
+	// not D3D12, and calling through it there faults - so the interface pointer is not a
+	// renderer test. Gate on the backend the session was bound with.
+	IUnityGraphicsD3D12v8 *v8 = (dxr_prov_get_graphics_api() == DXR_GFX_D3D12)
+	                                ? s_ifaces->Get<IUnityGraphicsD3D12v8>() : nullptr;
 	if (v8) {
 		uint32_t bw = 0, bh = 0, ba = 0;
 		if (dxr_prov_get_single_pass()) {
@@ -1658,6 +1680,7 @@ GfxStop(UnitySubsystemHandle handle, void *userData)
 		if (s_mcopy_alloc[i]) { s_mcopy_alloc[i]->Release(); s_mcopy_alloc[i] = nullptr; }
 		s_mcopy_fence[i] = 0;
 	}
+	prov11_release_blit_pipeline();
 #endif
 	// (#480) Mirror colour diagnostics are per session.
 	s_mirror_colour_logged = false;
@@ -1722,7 +1745,8 @@ enum {
 	DXR_MB_NO_RT_DESC     = 4,  // Unity passed no mirror render target descriptor
 	DXR_MB_NO_RT_NATIVE   = 5,  // ...or one without a native render buffer
 	DXR_MB_NO_INTERFACES  = 6,  // no IUnityInterfaces
-	DXR_MB_NOT_D3D12      = 7,  // no IUnityGraphicsD3D12v8 / v7 (the editor is not on D3D12)
+	DXR_MB_NOT_D3D12      = 7,  // the renderer has no native blit (not D3D12 / D3D11, #483), or
+	                            // Unity has no graphics interface for the renderer it reports
 	DXR_MB_NO_DEVICE      = 8,  // the interface returned no device
 	DXR_MB_NO_RT_RESOURCE = 9,  // TextureFromRenderBuffer(rtNative) returned null
 	DXR_MB_NO_WOVEN_TEX   = 10, // the woven texture is not open on Unity's device
@@ -1730,6 +1754,7 @@ enum {
 	DXR_MB_PIPELINE       = 12, // shader compile / PSO / heap creation failed
 	DXR_MB_CMDLIST        = 13, // command allocator / list creation failed
 	DXR_MB_NOT_WINDOWS    = 14, // this build has no native mirror blit
+	DXR_MB_DRAWN_NO_MARKER = 15, // the D3D11 blit ran (#483); it draws no calibration marker
 	DXR_MB_REASONS
 };
 static std::atomic<int>      s_mb_last{DXR_MB_NEVER_CALLED};
@@ -1789,7 +1814,57 @@ static bool native_mirror_enabled()
 	return s_native_mirror_env == 1;
 }
 
-#ifdef _WIN32  // native mirror blit is D3D12-only (macOS stub below)
+// Which native mirror blit exists for the renderer Unity is running (#483). The blit is
+// written per graphics API, and the API has to be read from the RENDERER ID: asking Unity for
+// IUnityGraphicsD3D12v8 returns a non-null interface on a D3D11 device too, and its
+// TextureFromRenderBuffer then faults (the editor crashed entering Play on URP + D3D11).
+// So both the offer (nativeBlitAvailable) and the callback go through this, and anything that
+// is not listed here is never offered: Unity then mirrors through blitParams.
+//   D3D12 - the original shader blit.
+//   D3D11 - the same shader on Unity's immediate context. Opt out with
+//           DISPLAYXR_PROV_NATIVE_MIRROR_D3D11=0 (back to "not offered" on D3D11).
+enum { kNativeMirrorNone = 0, kNativeMirrorD3D12 = 1, kNativeMirrorD3D11 = 2 };
+static int native_mirror_backend()
+{
+	if (!native_mirror_enabled()) return kNativeMirrorNone;
+#ifdef _WIN32
+	const int renderer = displayxr_unity_get_renderer();
+	if (renderer == kUnityGfxRendererD3D12) return kNativeMirrorD3D12;
+	if (renderer == kUnityGfxRendererD3D11) {
+		static int s_d3d11_env = -1;
+		if (s_d3d11_env < 0) {
+			const char *e = getenv("DISPLAYXR_PROV_NATIVE_MIRROR_D3D11");
+			s_d3d11_env = (e && e[0] == '0') ? 0 : 1; // default ON
+		}
+		return s_d3d11_env == 1 ? kNativeMirrorD3D11 : kNativeMirrorNone;
+	}
+#endif
+	return kNativeMirrorNone;
+}
+
+// One line, once, when a woven texture exists but no native blit is offered for it - the
+// state in which the docked Game view depends on Unity's blitParams mirror (black on URP).
+static void native_mirror_log_not_offered()
+{
+	static bool logged = false;
+	if (logged) return;
+	logged = true;
+	const int renderer = displayxr_unity_get_renderer();
+	char buf[320];
+	if (renderer == kUnityGfxRendererD3D11)
+		_snprintf_s(buf, sizeof(buf), _TRUNCATE,
+		            "[DisplayXR-PROV] native mirror: NOT offered - renderer is Direct3D11 and "
+		            "DISPLAYXR_PROV_NATIVE_MIRROR_D3D11=0; Unity's blitParams mirror is used "
+		            "(a black docked Game view is expected on URP)\n");
+	else
+		_snprintf_s(buf, sizeof(buf), _TRUNCATE,
+		            "[DisplayXR-PROV] native mirror: NOT offered - renderer id %d has no native blit "
+		            "(D3D12 and D3D11 only); Unity's blitParams mirror is used "
+		            "(a black docked Game view is expected on URP)\n", renderer);
+	prov_log(buf);
+}
+
+#ifdef _WIN32  // native mirror blit is D3D12 / D3D11 only (stub below for the other platforms)
 // Native shader blit (urp-editor-black-screen fix): sample the woven texture (BGRA, fmt 87)
 // and DRAW it into the GameView mirror RT (RGBA, fmt 28) — a format-converting blit that
 // CopyTextureRegion cannot do (RGBA and BGRA are different DXGI copy groups). Unity's own
@@ -1887,6 +1962,39 @@ static bool gvcal_marker_for_frame(int w, int h, uint32_t mk[4], uint32_t st[4])
 	return true;
 }
 
+// The mirror blit's shader, shared by the D3D12 and the D3D11 (#483) blit: a full-target
+// triangle sampling srcRect of the woven texture. One source for both (and for
+// tests/gvcal_shader_test.cpp): displayxr_gvcal_shader.h, with the calibration marker (#459)
+// and the decode (#480). b0 = { float4 srcRect; uint4 mk; uint4 st; uint4 fl; } =
+// GVCAL_CONSTANTS 32-bit values: root constants on D3D12, a constant buffer on D3D11.
+static const char *const kHLSL = kDxrMirrorBlitHLSL;
+struct DxrMirrorBlitConstants { float srcRect[4]; uint32_t mk[4]; uint32_t st[4]; uint32_t fl[4]; };
+static_assert(sizeof(DxrMirrorBlitConstants) == GVCAL_CONSTANTS * 4, "the shader's constant block");
+
+// (#480) Does the native blit decode what it samples? One rule for both APIs, from the view
+// the draw really stores through (displayxr_mirror_colour.h): an _SRGB view encodes on
+// store, so ENCODED woven bytes are decoded in the shader first and the pair is the
+// identity; any other view stores what the shader returns. Says so once per session.
+static int mirror_native_blit_decode(int target_fmt, int view_fmt, const char *api)
+{
+	const int encoded = dxr_prov_woven_is_encoded();
+	const int decode = dxr_prov_mirror_colour_fix_enabled() &&
+	                   dxr_mirror_native_blit_decodes(encoded, dxr_mirror_dxgi_is_srgb(view_fmt));
+	if (!s_mirror_native_logged) {
+		s_mirror_native_logged = true;
+		char m[320];
+		snprintf(m, sizeof(m),
+		         "[DisplayXR-PROV] mirror colour: native blit target dxgi_format=%d view=%d (%s) "
+		         "woven holds=%s project=%s -> shader decode=%d (%s, #480)\n",
+		         target_fmt, view_fmt,
+		         dxr_mirror_dxgi_is_srgb(view_fmt) ? "encodes on store" : "stores raw",
+		         encoded ? "ENCODED" : "LINEAR",
+		         dxr_prov_get_color_space_linear() ? "Linear" : "Gamma", decode, api);
+		prov_log(m);
+	}
+	return decode;
+}
+
 static bool prov_ensure_blit_pipeline(ID3D12Device *dev, DXGI_FORMAT rtFmt)
 {
 	if (s_blit_pso && s_blit_pso_fmt == rtFmt) return true;
@@ -1930,7 +2038,6 @@ static bool prov_ensure_blit_pipeline(ID3D12Device *dev, DXGI_FORMAT rtFmt)
 		sig->Release(); if (err) err->Release();
 		if (FAILED(hr)) return false;
 	}
-	const char *kHLSL = kDxrMirrorBlitHLSL; // displayxr_gvcal_shader.h (#459: the calibration marker; #480: the decode)
 	ID3DBlob *vs = nullptr, *ps = nullptr, *e1 = nullptr, *e2 = nullptr;
 	if (FAILED(D3DCompile(kHLSL, strlen(kHLSL), nullptr, nullptr, nullptr, "VSMain", "vs_5_0", 0, 0, &vs, &e1)) ||
 	    FAILED(D3DCompile(kHLSL, strlen(kHLSL), nullptr, nullptr, nullptr, "PSMain", "ps_5_0", 0, 0, &ps, &e2))) {
@@ -1977,21 +2084,7 @@ static bool prov_shader_blit_woven(ID3D12Device *dev, DxrExecuteCommandListFn ex
 	//    this arm used to fail at pipeline creation and draw nothing.)
 	const DXGI_FORMAT view_fmt =
 	    (DXGI_FORMAT)dxr_mirror_dxgi_view_format((int)rd.Format, dxr_prov_woven_is_encoded());
-	const int decode = dxr_prov_mirror_colour_fix_enabled() &&
-	                   dxr_mirror_native_blit_decodes(dxr_prov_woven_is_encoded(),
-	                                                  dxr_mirror_dxgi_is_srgb((int)view_fmt));
-	if (!s_mirror_native_logged) {
-		s_mirror_native_logged = true;
-		char m[320];
-		snprintf(m, sizeof(m),
-		         "[DisplayXR-PROV] mirror colour: native blit target dxgi_format=%d view=%d (%s) "
-		         "woven holds=%s project=%s -> shader decode=%d (#480)\n",
-		         (int)rd.Format, (int)view_fmt,
-		         dxr_mirror_dxgi_is_srgb((int)view_fmt) ? "encodes on store" : "stores raw",
-		         dxr_prov_woven_is_encoded() ? "ENCODED" : "LINEAR",
-		         dxr_prov_get_color_space_linear() ? "Linear" : "Gamma", decode);
-		prov_log(m);
-	}
+	const int decode = mirror_native_blit_decode((int)rd.Format, (int)view_fmt, "D3D12");
 	if (!prov_ensure_blit_pipeline(dev, view_fmt)) return false;
 	*why = DXR_MB_CMDLIST;
 	if (!s_mblit_alloc)
@@ -2057,6 +2150,282 @@ static bool prov_shader_blit_woven(ID3D12Device *dev, DxrExecuteCommandListFn ex
 	return true;
 }
 
+// ---------------------------------------------------------------------------------------
+// D3D11 native mirror blit (#483). Same job and same shader as the D3D12 blit above, on
+// Unity's immediate context (this callback runs on Unity's graphics thread, the only user of
+// that context: the runtime weaves on its own device in the editor).
+//
+// Colour (#480): the same rule as the D3D12 blit, through the same helpers
+// (dxr_mirror_dxgi_view_format + mirror_native_blit_decode). The view the draw stores through
+// decides: a typed target is viewed as itself, and if that is an _SRGB format the shader
+// decodes ENCODED woven bytes first (decode + encode on store = the identity); an 8-bit
+// TYPELESS target (what Unity allocates on D3D11: storage 27, seen on hardware in a Gamma
+// project with an RTV of 28) is viewed through its UNORM sibling when the woven bytes are
+// encoded, so they land raw, and through its _SRGB sibling when they are linear. Where this
+// has to fall back to Unity's own view of the target, the decode follows THAT view's format,
+// so an _SRGB view in a Linear project decodes exactly as on D3D12.
+// UNVERIFIED on hardware in a Linear project: the "mirror colour: native blit target" line
+// logs the storage format, the view and the decision.
+//
+// No calibration marker here (#459): the marker stays D3D12-only until it has been shown on a
+// panel that this draw lands where Unity's Game view shows it.
+// ---------------------------------------------------------------------------------------
+static bool prov11_ensure_blit_pipeline(ID3D11Device *dev)
+{
+	if (s_blit11_dev == dev && s_blit11_vs && s_blit11_ps && s_blit11_smp && s_blit11_cb && s_blit11_rs) return true;
+	prov11_release_blit_pipeline();
+	ID3DBlob *vs = nullptr, *ps = nullptr, *e1 = nullptr, *e2 = nullptr;
+	HRESULT hv = D3DCompile(kHLSL, strlen(kHLSL), nullptr, nullptr, nullptr, "VSMain", "vs_5_0", 0, 0, &vs, &e1);
+	HRESULT hp = D3DCompile(kHLSL, strlen(kHLSL), nullptr, nullptr, nullptr, "PSMain", "ps_5_0", 0, 0, &ps, &e2);
+	if (e1) e1->Release();
+	if (e2) e2->Release();
+	bool ok = SUCCEEDED(hv) && SUCCEEDED(hp) && vs && ps;
+	if (ok) ok = SUCCEEDED(dev->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr, &s_blit11_vs));
+	if (ok) ok = SUCCEEDED(dev->CreatePixelShader(ps->GetBufferPointer(), ps->GetBufferSize(), nullptr, &s_blit11_ps));
+	if (vs) vs->Release();
+	if (ps) ps->Release();
+	if (ok) {
+		D3D11_SAMPLER_DESC sd = {};
+		sd.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR; // as the D3D12 static sampler
+		sd.AddressU = sd.AddressV = sd.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+		sd.ComparisonFunc = D3D11_COMPARISON_NEVER;
+		sd.MaxLOD = D3D11_FLOAT32_MAX;
+		ok = SUCCEEDED(dev->CreateSamplerState(&sd, &s_blit11_smp));
+	}
+	if (ok) {
+		D3D11_BUFFER_DESC bd = {};
+		bd.ByteWidth = sizeof(DxrMirrorBlitConstants); // srcRect + mk + st (#459) + fl (#480)
+		bd.Usage = D3D11_USAGE_DEFAULT;
+		bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+		ok = SUCCEEDED(dev->CreateBuffer(&bd, nullptr, &s_blit11_cb));
+	}
+	if (ok) {
+		D3D11_RASTERIZER_DESC rs = {};
+		rs.FillMode = D3D11_FILL_SOLID; // as the D3D12 PSO: solid, no cull, no scissor
+		rs.CullMode = D3D11_CULL_NONE;
+		rs.DepthClipEnable = TRUE;
+		ok = SUCCEEDED(dev->CreateRasterizerState(&rs, &s_blit11_rs));
+	}
+	if (!ok) {
+		prov11_release_blit_pipeline();
+		static bool logged = false;
+		if (!logged) { logged = true;
+			prov_log("[DisplayXR-PROV] native mirror: D3D11 shader-blit pipeline FAILED (compile/create)\n"); }
+		return false;
+	}
+	s_blit11_dev = dev;
+	prov_log("[DisplayXR-PROV] native mirror: D3D11 shader-blit pipeline ready\n");
+	return true;
+}
+
+// The view format for a Game view target of format f. The 8-bit RGBA / BGRA families go
+// through the shared colour policy (#480: UNORM for encoded woven bytes, _SRGB for linear
+// ones); the other typeless families have no such choice here and take their plain member.
+static DXGI_FORMAT prov11_mirror_rtv_format(DXGI_FORMAT f)
+{
+	f = (DXGI_FORMAT)dxr_mirror_dxgi_view_format((int)f, dxr_prov_woven_is_encoded());
+	switch (f) {
+	case DXGI_FORMAT_B8G8R8X8_TYPELESS:     return DXGI_FORMAT_B8G8R8X8_UNORM;
+	case DXGI_FORMAT_R10G10B10A2_TYPELESS:  return DXGI_FORMAT_R10G10B10A2_UNORM;
+	case DXGI_FORMAT_R16G16B16A16_TYPELESS: return DXGI_FORMAT_R16G16B16A16_FLOAT;
+	case DXGI_FORMAT_R32G32B32A32_TYPELESS: return DXGI_FORMAT_R32G32B32A32_FLOAT;
+	default:                                return f; // typed: the resource's own format
+	}
+}
+
+// Draw the woven canvas sub-rect into the whole Game view mirror RT on Unity's D3D11 device.
+// Everything this touches on the immediate context is put back before returning (Unity is
+// also told to re-validate its state after each callback, see GfxStart).
+static bool prov11_shader_blit_woven(IUnityGraphicsD3D11 *d11, UnityRenderBuffer rb, ID3D11Texture2D *src,
+                                     int32_t cx, int32_t cy, int32_t cw, int32_t ch,
+                                     uint32_t tw, uint32_t th, int *why)
+{
+	static bool s_fail_logged = false;
+	ID3D11Device *dev = d11->GetDevice();
+	ID3D11Resource *rtRes = d11->TextureFromRenderBuffer(rb); // not AddRef'd by Unity
+	// (#459) The reason this ends with, for mirror_blit_note: each way out below sets it.
+	*why = !dev ? DXR_MB_NO_DEVICE : !rtRes ? DXR_MB_NO_RT_RESOURCE : DXR_MB_PIPELINE;
+	if (!dev || !rtRes || !src || tw == 0 || th == 0) {
+		if (!s_fail_logged) { s_fail_logged = true; char m[160];
+			_snprintf_s(m, sizeof(m), _TRUNCATE,
+			            "[DisplayXR-PROV] native mirror: D3D11 blit skipped (dev=%d rt=%d src=%d)\n",
+			            dev ? 1 : 0, rtRes ? 1 : 0, src ? 1 : 0);
+			prov_log(m); }
+		return false;
+	}
+	ID3D11Texture2D *rtTex = nullptr;
+	if (FAILED(rtRes->QueryInterface(__uuidof(ID3D11Texture2D), (void **)&rtTex)) || !rtTex) {
+		if (!s_fail_logged) { s_fail_logged = true;
+			prov_log("[DisplayXR-PROV] native mirror: D3D11 blit skipped (mirror RT is not a 2D texture)\n"); }
+		*why = DXR_MB_NO_RT_RESOURCE;
+		return false;
+	}
+	D3D11_TEXTURE2D_DESC rd; rtTex->GetDesc(&rd);
+	D3D11_TEXTURE2D_DESC sdsc; src->GetDesc(&sdsc);
+
+	ID3D11RenderTargetView   *rtv = nullptr;
+	ID3D11ShaderResourceView *srv = nullptr;
+	ID3D11DeviceContext      *ctx = nullptr;
+	bool drawn = false;
+	bool unity_rtv = false; // fell back to Unity's own view of the RT
+	const DXGI_FORMAT rtvFmt = prov11_mirror_rtv_format(rd.Format);
+	do {
+		if (!prov11_ensure_blit_pipeline(dev)) break;
+		D3D11_RENDER_TARGET_VIEW_DESC rv = {};
+		rv.Format = rtvFmt;
+		if (rd.SampleDesc.Count > 1 && rd.ArraySize == 1) {
+			rv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DMS;
+		} else if (rd.SampleDesc.Count > 1) {
+			rv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DMSARRAY;
+			rv.Texture2DMSArray.FirstArraySlice = 0; rv.Texture2DMSArray.ArraySize = 1;
+		} else if (rd.ArraySize > 1) {
+			rv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2DARRAY;
+			rv.Texture2DArray.MipSlice = 0;
+			rv.Texture2DArray.FirstArraySlice = 0; rv.Texture2DArray.ArraySize = 1;
+		} else {
+			rv.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
+			rv.Texture2D.MipSlice = 0;
+		}
+		HRESULT hr = dev->CreateRenderTargetView(rtTex, &rv, &rtv);
+		if (FAILED(hr) || !rtv) {
+			// A format this cannot view (an unlisted typeless family): use Unity's own view
+			// rather than leave the Game view unpainted. Its sRGB-ness is then Unity's.
+			rtv = d11->RTVFromRenderBuffer(rb);
+			if (!rtv) {
+				if (!s_fail_logged) { s_fail_logged = true; char m[200];
+					_snprintf_s(m, sizeof(m), _TRUNCATE,
+					            "[DisplayXR-PROV] native mirror: D3D11 blit skipped (no RTV: RT fmt %d, "
+					            "tried %d, hr=0x%08X)\n", (int)rd.Format, (int)rtvFmt, (unsigned)hr);
+					prov_log(m); }
+				*why = DXR_MB_NO_RT_RESOURCE;
+				break;
+			}
+			rtv->AddRef(); // balance the Release below
+			unity_rtv = true;
+		}
+		// (#480) Decode or not, from the view this draw REALLY stores through (ours, or
+		// Unity's own after the fallback above): the same rule and the same line as D3D12.
+		D3D11_RENDER_TARGET_VIEW_DESC used = {};
+		rtv->GetDesc(&used);
+		const int decode = mirror_native_blit_decode((int)rd.Format, (int)used.Format, "D3D11");
+		if (FAILED(dev->CreateShaderResourceView(src, nullptr, &srv)) || !srv) {
+			if (!s_fail_logged) { s_fail_logged = true; char m[160];
+				_snprintf_s(m, sizeof(m), _TRUNCATE,
+				            "[DisplayXR-PROV] native mirror: D3D11 blit skipped (no SRV on the woven "
+				            "texture, fmt %d)\n", (int)sdsc.Format);
+				prov_log(m); }
+			break;
+		}
+		dev->GetImmediateContext(&ctx);
+		if (!ctx) break;
+
+		// ---- save ----
+		ID3D11RenderTargetView *o_rtv[D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT] = {};
+		ID3D11DepthStencilView *o_dsv = nullptr;
+		ctx->OMGetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, o_rtv, &o_dsv);
+		UINT o_nvp = D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE;
+		D3D11_VIEWPORT o_vp[D3D11_VIEWPORT_AND_SCISSORRECT_OBJECT_COUNT_PER_PIPELINE];
+		ctx->RSGetViewports(&o_nvp, o_vp);
+		ID3D11RasterizerState *o_rs = nullptr; ctx->RSGetState(&o_rs);
+		ID3D11BlendState *o_bs = nullptr; FLOAT o_bf[4] = {}; UINT o_sm = 0xFFFFFFFFu;
+		ctx->OMGetBlendState(&o_bs, o_bf, &o_sm);
+		ID3D11DepthStencilState *o_dss = nullptr; UINT o_sref = 0;
+		ctx->OMGetDepthStencilState(&o_dss, &o_sref);
+		D3D11_PRIMITIVE_TOPOLOGY o_topo = D3D11_PRIMITIVE_TOPOLOGY_UNDEFINED;
+		ctx->IAGetPrimitiveTopology(&o_topo);
+		ID3D11InputLayout *o_il = nullptr; ctx->IAGetInputLayout(&o_il);
+		ID3D11VertexShader   *o_vs = nullptr; ctx->VSGetShader(&o_vs, nullptr, nullptr);
+		ID3D11PixelShader    *o_ps = nullptr; ctx->PSGetShader(&o_ps, nullptr, nullptr);
+		ID3D11GeometryShader *o_gs = nullptr; ctx->GSGetShader(&o_gs, nullptr, nullptr);
+		ID3D11HullShader     *o_hs = nullptr; ctx->HSGetShader(&o_hs, nullptr, nullptr);
+		ID3D11DomainShader   *o_ds = nullptr; ctx->DSGetShader(&o_ds, nullptr, nullptr);
+		ID3D11Buffer *o_vcb = nullptr; ctx->VSGetConstantBuffers(0, 1, &o_vcb);
+		ID3D11Buffer *o_pcb = nullptr; ctx->PSGetConstantBuffers(0, 1, &o_pcb);
+		ID3D11ShaderResourceView *o_srv = nullptr; ctx->PSGetShaderResources(0, 1, &o_srv);
+		ID3D11SamplerState *o_smp = nullptr; ctx->PSGetSamplers(0, 1, &o_smp);
+
+		// ---- draw ----
+		DxrMirrorBlitConstants cb = {}; // mk / st stay 0: no calibration marker on D3D11
+		cb.srcRect[0] = (float)cx / tw; cb.srcRect[1] = (float)cy / th;
+		cb.srcRect[2] = (float)cw / tw; cb.srcRect[3] = (float)ch / th;
+		cb.fl[0] = decode ? 1u : 0u; // (#480) shader decode
+		ctx->UpdateSubresource(s_blit11_cb, 0, nullptr, &cb, 0, 0);
+		ctx->OMSetRenderTargets(1, &rtv, nullptr);
+		D3D11_VIEWPORT vp = { 0.0f, 0.0f, (float)rd.Width, (float)rd.Height, 0.0f, 1.0f };
+		ctx->RSSetViewports(1, &vp);
+		ctx->RSSetState(s_blit11_rs);                   // solid, no cull, no scissor
+		ctx->OMSetBlendState(nullptr, nullptr, 0xFFFFFFFFu); // opaque overwrite, all channels
+		ctx->OMSetDepthStencilState(nullptr, 0);        // no DSV bound
+		ctx->IASetInputLayout(nullptr);
+		ctx->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+		ctx->VSSetShader(s_blit11_vs, nullptr, 0);
+		ctx->PSSetShader(s_blit11_ps, nullptr, 0);
+		ctx->GSSetShader(nullptr, nullptr, 0);
+		ctx->HSSetShader(nullptr, nullptr, 0);
+		ctx->DSSetShader(nullptr, nullptr, 0);
+		ctx->VSSetConstantBuffers(0, 1, &s_blit11_cb);
+		ctx->PSSetConstantBuffers(0, 1, &s_blit11_cb);
+		ctx->PSSetShaderResources(0, 1, &srv);
+		ctx->PSSetSamplers(0, 1, &s_blit11_smp);
+		ctx->Draw(3, 0);
+
+		// ---- restore ----
+		ctx->PSSetSamplers(0, 1, &o_smp);
+		ctx->PSSetShaderResources(0, 1, &o_srv);
+		ctx->PSSetConstantBuffers(0, 1, &o_pcb);
+		ctx->VSSetConstantBuffers(0, 1, &o_vcb);
+		ctx->DSSetShader(o_ds, nullptr, 0);
+		ctx->HSSetShader(o_hs, nullptr, 0);
+		ctx->GSSetShader(o_gs, nullptr, 0);
+		ctx->PSSetShader(o_ps, nullptr, 0);
+		ctx->VSSetShader(o_vs, nullptr, 0);
+		ctx->IASetPrimitiveTopology(o_topo);
+		ctx->IASetInputLayout(o_il);
+		ctx->OMSetDepthStencilState(o_dss, o_sref);
+		ctx->OMSetBlendState(o_bs, o_bf, o_sm);
+		ctx->RSSetState(o_rs);
+		ctx->RSSetViewports(o_nvp, o_vp);
+		ctx->OMSetRenderTargets(D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, o_rtv, o_dsv);
+		for (ID3D11RenderTargetView *v : o_rtv) if (v) v->Release();
+		if (o_dsv) o_dsv->Release();
+		if (o_rs)  o_rs->Release();
+		if (o_bs)  o_bs->Release();
+		if (o_dss) o_dss->Release();
+		if (o_il)  o_il->Release();
+		if (o_vs)  o_vs->Release();
+		if (o_ps)  o_ps->Release();
+		if (o_gs)  o_gs->Release();
+		if (o_hs)  o_hs->Release();
+		if (o_ds)  o_ds->Release();
+		if (o_vcb) o_vcb->Release();
+		if (o_pcb) o_pcb->Release();
+		if (o_srv) o_srv->Release();
+		if (o_smp) o_smp->Release();
+		drawn = true;
+	} while (0);
+
+	if (drawn) {
+		*why = DXR_MB_DRAWN_NO_MARKER;
+		s_mirror_native_seen = true;                // (#480) the native path is the live one
+		s_mirror_native_last = s_mirror_submit_n;
+		static bool logged = false;
+		if (!logged) { logged = true; char m[320];
+			_snprintf_s(m, sizeof(m), _TRUNCATE,
+			            "[DisplayXR-PROV] native mirror: D3D11 shader-blit ACTIVE (woven %ux%u fmt %d -> "
+			            "GameView RT %ux%u fmt %d, RTV %s fmt %d, samples %u, array %u)\n",
+			            (unsigned)sdsc.Width, (unsigned)sdsc.Height, (int)sdsc.Format,
+			            (unsigned)rd.Width, (unsigned)rd.Height, (int)rd.Format,
+			            unity_rtv ? "UNITY'S" : "own", unity_rtv ? -1 : (int)rtvFmt,
+			            (unsigned)rd.SampleDesc.Count, (unsigned)rd.ArraySize);
+			prov_log(m); }
+	}
+	if (ctx) ctx->Release();
+	if (srv) srv->Release();
+	if (rtv) rtv->Release();
+	rtTex->Release();
+	return drawn;
+}
+
 static UnitySubsystemErrorCode UNITY_INTERFACE_API
 MainBlitToMirrorViewRenderTarget(UnitySubsystemHandle handle, void *userData,
                                  const UnityXRMirrorViewBlitInfo info)
@@ -2078,8 +2447,38 @@ MainBlitToMirrorViewRenderTarget(UnitySubsystemHandle handle, void *userData,
 	if (!info.mirrorRtDesc) { mirror_blit_note(DXR_MB_NO_RT_DESC, "returned without drawing: Unity passed no mirror render target descriptor"); return ok; }
 	if (!info.mirrorRtDesc->rtNative) { mirror_blit_note(DXR_MB_NO_RT_NATIVE, "returned without drawing: the mirror render target descriptor has no native render buffer (rtNative is null)"); return ok; }
 	if (!s_ifaces) { mirror_blit_note(DXR_MB_NO_INTERFACES, "returned without drawing: no IUnityInterfaces"); return ok; }
-	// v8 is Unity 6; an editor that registers only v7 (2022.3) has the same three members
-	// this blit uses (GetDevice, TextureFromRenderBuffer, ExecuteCommandList).
+	// The renderer decides which blit runs, never the interface pointer (#483): Unity returns
+	// a non-null IUnityGraphicsD3D12v8 on a D3D11 device and faults inside it.
+	const int backend = native_mirror_backend();
+	if (backend == kNativeMirrorNone) {
+		// Not offered for this renderer (MainQueryMirrorViewBlitDesc), so not expected here.
+		mirror_blit_note(DXR_MB_NOT_D3D12, "returned without drawing: this renderer has no native mirror blit (D3D12 and D3D11 only; D3D11 is off with DISPLAYXR_PROV_NATIVE_MIRROR_D3D11=0)");
+		return ok;
+	}
+	if (backend == kNativeMirrorD3D11) {
+		IUnityGraphicsD3D11 *d11 = s_ifaces->Get<IUnityGraphicsD3D11>();
+		if (!d11) { mirror_blit_note(DXR_MB_NOT_D3D12, "returned without drawing: no IUnityGraphicsD3D11 although the renderer is Direct3D11"); return ok; }
+		uint32_t ww11 = 0, wh11 = 0;
+		// On D3D11 this is the ID3D11Texture2D opened on Unity's device (the session TU).
+		ID3D11Texture2D *src11 = (ID3D11Texture2D *)dxr_prov_get_woven_unity_texture(&ww11, &wh11);
+		if (!src11) { mirror_blit_note(DXR_MB_NO_WOVEN_TEX, "returned without drawing: the woven texture is not open on Unity's D3D11 device"); return ok; }
+		int32_t x = 0, y = 0, w = 0, h = 0; uint32_t tw11 = 0, th11 = 0;
+		dxr_prov_get_woven_canvas(&x, &y, &w, &h, &tw11, &th11);
+		if (w <= 0 || h <= 0 || tw11 == 0 || th11 == 0) { mirror_blit_note(DXR_MB_NO_CANVAS, "returned without drawing: the woven canvas rect is empty"); return ok; }
+		int why11 = DXR_MB_PIPELINE;
+		if (prov11_shader_blit_woven(d11, info.mirrorRtDesc->rtNative, src11, x, y, w, h, tw11, th11, &why11))
+			// Drawn, without the calibration marker (D3D12 only): its own reason, so the
+			// calibration's "marker was not drawn" line says that and not "not repainting".
+			s_mb_last.store(DXR_MB_DRAWN_NO_MARKER);
+		else
+			mirror_blit_note(why11,
+				why11 == DXR_MB_NO_DEVICE ? "did not draw: IUnityGraphicsD3D11 returned no device"
+				: why11 == DXR_MB_NO_RT_RESOURCE ? "did not draw: the mirror render target could not be resolved to a D3D11 2D texture with a render target view (see the 'D3D11 blit skipped' line)"
+				: "did not draw: the D3D11 blit pipeline or the woven texture's view could not be created (see the line above)");
+		return ok;
+	}
+	// D3D12. v8 is Unity 6; an editor that registers only v7 (2022.3) has the same three
+	// members this blit uses (GetDevice, TextureFromRenderBuffer, ExecuteCommandList).
 	ID3D12Device *dev = nullptr;
 	ID3D12Resource *rt = nullptr;
 	DxrExecuteCommandListFn execute = nullptr;
@@ -2095,7 +2494,7 @@ MainBlitToMirrorViewRenderTarget(UnitySubsystemHandle handle, void *userData,
 		if (!v7_logged) { v7_logged = true;
 			prov_log("[DisplayXR-PROV] native mirror: using IUnityGraphicsD3D12v7 (no v8 in this editor)\n"); }
 	} else {
-		mirror_blit_note(DXR_MB_NOT_D3D12, "returned without drawing: no IUnityGraphicsD3D12v8 or v7 (the editor is not on D3D12; the native mirror blit is D3D12 only)");
+		mirror_blit_note(DXR_MB_NOT_D3D12, "returned without drawing: no IUnityGraphicsD3D12v8 or v7 although the renderer is Direct3D12");
 		return ok;
 	}
 	if (!dev) { mirror_blit_note(DXR_MB_NO_DEVICE, "returned without drawing: IUnityGraphicsD3D12 returned no device"); return ok; }
@@ -2121,7 +2520,7 @@ MainBlitToMirrorViewRenderTarget(UnitySubsystemHandle handle, void *userData,
 			: "did not draw: the blit pipeline could not be built (shader compile, PSO or descriptor heap; see the line above)");
 	return ok;
 }
-#else  // !_WIN32 — macOS: the native mirror blit is D3D12-only; woven mirror not used.
+#else  // !_WIN32 — the native mirror blit is D3D12 / D3D11 only; woven mirror not used.
 static UnitySubsystemErrorCode UNITY_INTERFACE_API
 MainBlitToMirrorViewRenderTarget(UnitySubsystemHandle handle, void *userData,
                                  const UnityXRMirrorViewBlitInfo info)
@@ -2152,7 +2551,23 @@ MainQueryMirrorViewBlitDesc(UnitySubsystemHandle handle, void *userData,
 	// When the native mirror blit is enabled and a woven texture exists, tell Unity we'll do
 	// the blit ourselves (MainBlitToMirrorViewRenderTarget) — avoids Unity's tiling seam. The
 	// blitParams below are still filled as a fallback (Unity may skip the native callback).
-	desc->nativeBlitAvailable = (native_mirror_enabled() && s_woven_tex_id != 0);
+	// Offered ONLY for a renderer that has a native blit (#483): an offer the callback cannot
+	// honour is a crash (D3D12 interface on a D3D11 device) or an unpainted Game view.
+	{
+		const int backend = native_mirror_backend();
+		desc->nativeBlitAvailable = (backend != kNativeMirrorNone && s_woven_tex_id != 0);
+		if (s_woven_tex_id != 0 && native_mirror_enabled()) {
+			if (backend == kNativeMirrorNone) {
+				native_mirror_log_not_offered();
+			} else {
+				static bool o_logged = false;
+				if (!o_logged) { o_logged = true;
+					prov_log(backend == kNativeMirrorD3D11
+					             ? "[DisplayXR-PROV] native mirror: offered (renderer Direct3D11, D3D11 shader blit)\n"
+					             : "[DisplayXR-PROV] native mirror: offered (renderer Direct3D12, D3D12 shader blit)\n"); }
+			}
+		}
+	}
 	desc->nativeBlitInvalidStates = false;
 	if (desc->nativeBlitAvailable) {
 		// (#459) Who asks, and is the blit that was offered ever called? An SRP asks from C#

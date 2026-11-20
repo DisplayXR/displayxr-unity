@@ -405,7 +405,7 @@ namespace DisplayXR
 
         // The native mirror blit's reasons (DXR_MB_* in
         // native~/displayxr_xrprovider/displayxr_display_provider.cpp).
-        public const int MirrorNeverCalled = 0, MirrorDrawn = 1, MirrorNotD3D12 = 7;
+        public const int MirrorNeverCalled = 0, MirrorDrawn = 1, MirrorNotD3D12 = 7, MirrorDrawnNoMarker = 15;
         /// <summary>After this many mirror queries that offered the native blit without one
         /// call, Unity is not going to call it (native: DXR_MB_NEVER_CALLED_AFTER).</summary>
         public const int MirrorNeverCalledAfter = 240;
@@ -438,7 +438,7 @@ namespace DisplayXR
                 case 3: return "no woven texture is registered with Unity" + counts;
                 case 4: case 5: return "Unity called the native mirror blit without a render target it can draw into" + counts;
                 case 6: return "the plug-in has no IUnityInterfaces" + counts;
-                case MirrorNotD3D12: return "the editor is not on D3D12 (the native mirror blit, and the marker in it, are D3D12 only)" + counts;
+                case MirrorNotD3D12: return "the editor is not on D3D12 or D3D11 (no native mirror blit for this renderer; the marker in it is D3D12 only)" + counts;
                 case 8: return "Unity's D3D12 interface returned no device" + counts;
                 case 9: return "Unity's mirror render target could not be resolved to a D3D12 texture" + counts;
                 case 10: return "the woven texture is not open on Unity's D3D12 device" + counts;
@@ -446,6 +446,7 @@ namespace DisplayXR
                 case 12: return "the blit pipeline could not be built (shader or pipeline state)" + counts;
                 case 13: return "the blit's command list could not be created" + counts;
                 case 14: return "this platform has no native mirror blit" + counts;
+                case MirrorDrawnNoMarker: return "the native mirror blit draws on D3D11, which draws no marker (the calibration marker is D3D12 only): the placement is the computed one" + counts;
                 default: return "the native mirror blit did not draw" + counts;
             }
         }

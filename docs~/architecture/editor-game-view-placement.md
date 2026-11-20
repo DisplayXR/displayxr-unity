@@ -593,8 +593,9 @@ had; what was drawn, the reads and the cache state are appended:
 
 A not-1:1 axis reads `W NOT 1:1 (from column 561 the image is -1 px off, 448 px differ)`.
 
-**Where it does not run.** The marker is drawn by the D3D12 native mirror blit, so with the
-**Built-in render pipeline** (Unity does not call that blit there), with D3D11, or with
+**Where it does not run.** The marker is drawn by the D3D12 native mirror blit only, so with the
+**Built-in render pipeline** (Unity does not call that blit there), with D3D11 (its native
+mirror blit, #483, draws the woven image but no marker), or with
 `DISPLAYXR_PROV_NATIVE_MIRROR=0`, no marker appears, the line says
 `the marker was not drawn: <why>` ([Why the marker is not drawn](#why-the-marker-is-not-drawn)),
 the computed position is used, and the whole-pixel size is selected from the predicted geometry
@@ -615,27 +616,40 @@ out width, out height, out measured)` (internal) returns the image's top-left in
 window's client area and its size, in physical px, and whether that was measured or computed.
 The texture target rect (next section) is fed from it.
 
-**D3D11 and the marker.** The marker exists only in the D3D12 mirror blit because that is the
-only place where the plug-in itself draws the Game view's pixels. With D3D11 the woven texture
-is opened on Unity's device and wrapped as a Unity texture (`dxr_prov_get_woven_unity_texture`,
-`create_woven_mirror_texture_if_ready`), and the native blit callback
-(`MainBlitToMirrorViewRenderTarget`) returns without drawing, since it is written against
-`IUnityGraphicsD3D12v8`. What reaches the screen there is **Unity's own mirror blit** of that
-texture, from the `blitParams` of `MainQueryMirrorViewBlitDesc` (read from the code; not
-observed in a running D3D11 editor). There is no plug-in draw to put the marker in. Drawing it
-on D3D11 needs one of two new paths, neither of which exists:
+**D3D11 and the marker.** The marker exists only in the D3D12 mirror blit. D3D11 has a native
+mirror blit of its own since #483 (below), but it does not draw the marker: that needs the
+proof, on a panel, that the D3D11 draw lands where Unity shows the Game view, and the D3D11
+path has not been run on hardware yet. Adding it is then small - the shader is shared, the
+D3D11 blit only has to pass `mk` instead of zeros.
 
-- a D3D11 native mirror blit: shaders, a render target view on
-  `IUnityGraphicsD3D11::TextureFromRenderBuffer(rtNative)`, save and restore of Unity's
-  immediate-context state, and first the proof that Unity calls the native callback on D3D11 in
-  both URP and BiRP (the header says the pipeline may not); or
-- a marker texture of the mirror target's size, registered with `CreateTexture` and swapped in
-  as `blitParams[0].srcTexId` for the marker's frames. Unity's blit is the path that split a
-  tall target at its midline with a few pixels of offset (the reason the D3D12 native blit
-  exists), so a marker drawn that way would measure Unity's blit of the marker; whether that is
-  where the woven texture lands has to be shown on a panel.
+**The D3D11 native mirror blit (#483).** Which native blit runs is decided from the
+**renderer id** (`native_mirror_backend` in `displayxr_display_provider.cpp`), never from the
+interface pointer: Unity returns a non-null `IUnityGraphicsD3D12v8` on a D3D11 device, and
+calling `TextureFromRenderBuffer` through it faults (the editor crashed entering Play on
+URP + D3D11, because the blit was offered and run whatever the renderer). The offer
+(`nativeBlitAvailable`) and the callback use the same test, so a renderer with no native blit
+is never offered one.
 
-Until then a D3D11 editor uses the computed position for the anchor and for the target rect.
+On D3D11 the woven texture is opened on Unity's device (`dxr_prov_get_woven_unity_texture`)
+and the callback draws it into `IUnityGraphicsD3D11::TextureFromRenderBuffer(rtNative)` on
+Unity's immediate context, with the same shader as D3D12, saving and restoring the state it
+touches. Colour follows the D3D12 rule through the same helpers (#480,
+`displayxr_mirror_colour.h`): a typed target is viewed in its own format, and when that view
+is `_SRGB` and the woven bytes are encoded the shader decodes them first; an 8-bit typeless
+target is viewed through its UNORM sibling for encoded woven bytes (they land raw) and its
+`_SRGB` sibling for linear ones. One `mirror colour: native blit target dxgi_format=… view=…
+… -> shader decode=N (D3D11, #480)` line per session says which case ran. The #459
+diagnostics (`native mirror: OFFERED…`, `NEVER CALLED`, `CALLED`, `returned without
+drawing: …`) cover the D3D11 path too; a D3D11 blit that draws reports reason 15 (drawn, no
+marker), which the calibration prints as "draws on D3D11, which draws no marker".
+`DISPLAYXR_PROV_NATIVE_MIRROR_D3D11=0` turns the D3D11 blit off (the offer is withdrawn and
+one `native mirror: NOT offered` line says why); what the Game view shows then is Unity's own
+`blitParams` mirror, which is **black on URP** on D3D12 and is expected - not observed - to be
+black on URP + D3D11 too, since the discard happens in URP's Game view present, not in the
+graphics API. BiRP is not affected either way: Unity does not call the native callback there
+and its `blitParams` mirror works.
+
+Until the marker is drawn on D3D11, a D3D11 editor uses the computed position for the anchor and for the target rect.
 
 ## The texture target binding (runtime spec 9, #471)
 
@@ -1196,4 +1210,4 @@ The calibration, as of the change that added it:
 | Why the Built-in pipeline draws no marker | observed: the query is called, the shader blit never becomes active (D3D12, 6000.4.0f1, MultiPass). Which of "never called" and "called and returned" is **not known** until the new `native mirror:` lines are read |
 | The native blit on `IUnityGraphicsD3D12v7` (an editor without v8) | compiles; **not run** |
 | The target rect fed from the measured origin (#471) | unit-tested natively (`texture_target_test`: source change, one line each, restart); **not run in an editor** |
-| How the woven texture reaches a D3D11 Game view (Unity's own mirror blit) | read from the code, **not observed** |
+| How the woven texture reaches a D3D11 Game view: the D3D11 native mirror blit on URP (#483), Unity's own mirror blit on BiRP | compiles; **not run in an editor** (image, colour, orientation all unverified) |
