@@ -4630,7 +4630,16 @@ static void ps_probe_refresh_mirror_d3d11(void)
 	if (s_ps.own_d3d11_context) s_ps.own_d3d11_context->Flush();
 	s_ps.unity_d3d11_context->CopyResource(s_probe_mirror11, s_probe_tex_unity);
 }
+
+// (#485) D3D11: the same flush, for the display provider's calibration-marker stamp, which
+// reads the woven texture on Unity's context right after xrEndFrame exactly as the copy
+// above does. No-op when there is no own context (a built player's zero-copy session).
+void dxr_prov_flush_own_d3d11(void)
+{
+	if (s_ps.own_d3d11_context) s_ps.own_d3d11_context->Flush();
+}
 #else  // !_WIN32 — macOS: the weave-to-texture probe/mirror is Windows/D3D-only.
+void dxr_prov_flush_own_d3d11(void) {}
 void *dxr_prov_get_woven_unity_texture(uint32_t *w, uint32_t *h)
 {
 	if (w) *w = 0;

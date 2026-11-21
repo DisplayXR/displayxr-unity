@@ -515,7 +515,29 @@ static class Program
         Check(Cal.NativeMirrorReasonText(0, Cal.MirrorNeverCalledAfter, 0).Contains("never calls it"), "offered for seconds, never called");
         Check(Cal.NativeMirrorReasonText(Cal.MirrorDrawn, 400, 400).Contains("drew no frame while the marker was requested"), "draws, but not now");
         Check(Cal.NativeMirrorReasonText(Cal.MirrorNotD3D12, 400, 400).Contains("not on D3D12"), "not D3D12");
-        Check(Cal.NativeMirrorReasonText(Cal.MirrorDrawnNoMarker, 400, 400).Contains("draws on D3D11"), "D3D11: the blit draws, the marker is D3D12 only (#483)");
+        Check(Cal.NativeMirrorReasonText(Cal.MirrorDrawnNoMarker, 400, 400).Contains("draws on D3D11") &&
+              Cal.NativeMirrorReasonText(Cal.MirrorDrawnNoMarker, 400, 400).Contains("older than this script"),
+              "reason 15 is retired (#485: the D3D11 blit draws the marker): only an older binary reports it, and the text says so");
+        Check(!Cal.NativeMirrorReasonText(0, Cal.MirrorNeverCalledAfter, 0).Contains("no marker can be drawn"),
+              "never called no longer claims that no marker can be drawn (#485)");
+
+        // (#485) The marker for Unity's own blit: the stamp's account, and the two together.
+        for (int st = 0; st <= 13; st++)
+            Check(Cal.StampStatusText(st, 2, 1).Length > 20 && Cal.StampStatusText(st, 2, 1).Contains("status " + st), "stamp status " + st + " has a text with its number");
+        Check(Cal.StampStatusText(Cal.StampDisabled, 0, 0).Contains("DISPLAYXR_PROV_GV_CALIB_STAMP=0"), "stamp: the opt-out is named");
+        Check(Cal.StampStatusText(Cal.StampStamped, 4, 0).Contains("no mirror query came to take it") &&
+              Cal.StampStatusText(Cal.StampStamped, 4, 3).Contains("handed to Unity's blit"), "stamp: stamped but not taken, against stamped and taken");
+        Check(Cal.StampStatusText(Cal.StampNoInterface, 0, 0).Contains("IUnityGraphicsD3D12v8"), "stamp: no interface names the one it needs");
+        string both = Cal.MarkerNotDrawnText(Cal.MirrorNeverCalled, Cal.MirrorNeverCalledAfter, 0, Cal.StampCanvas, 0, 0);
+        Check(both.Contains("never calls it") && both.Contains("; and the marker for Unity's own blit of that texture: the woven canvas is empty"),
+              "not drawn: the native blit's account and the stamp's, in one sentence: " + both);
+        Check(Cal.MarkerNotDrawnText(Cal.MirrorDrawn, 400, 400, Cal.StampNativeLive, 0, 0) == Cal.NativeMirrorReasonText(Cal.MirrorDrawn, 400, 400),
+              "not drawn: where Unity calls the native blit the stamp is not mentioned");
+        Check(Cal.MarkerNotDrawnText(Cal.MirrorNeverCalled, 900, 0, -1, 0, 0) == Cal.NativeMirrorReasonText(Cal.MirrorNeverCalled, 900, 0),
+              "not drawn: an older binary has no stamp account");
+        Check(Cal.MarkerPathText(Cal.PathNone, 0, 0) == "" && Cal.MarkerPathText(Cal.PathNativeD3D12, 0, 0).Contains("(D3D12)") &&
+              Cal.MarkerPathText(Cal.PathNativeD3D11, 0, 0).Contains("(D3D11)") && Cal.MarkerPathText(Cal.PathStamp, 5, 4).Contains("stamped into its source texture 5 times, handed to 4"),
+              "the path that drew the marker has a text; none has none");
         Check(Cal.NativeMirrorReasonText(9, 400, 400).Contains("could not be resolved") && Cal.NativeMirrorReasonText(9, 400, 400).Contains("reason 9"),
               "a render target the interface cannot resolve, with the raw numbers");
         for (int r = 2; r <= 15; r++)

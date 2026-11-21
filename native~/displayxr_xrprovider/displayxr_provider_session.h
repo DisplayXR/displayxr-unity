@@ -206,6 +206,9 @@ int dxr_prov_woven_is_encoded(void);
 int dxr_prov_woven_mirror_wants_srgb(void);
 int dxr_prov_mirror_colour_fix_enabled(void);
 int dxr_prov_get_woven_dxgi_format(void);
+/// (#485) D3D11 editor session: flush the runtime-side (own) device context, so a read of the
+/// woven texture on Unity's context that follows sees this frame's weave. No-op elsewhere.
+void dxr_prov_flush_own_d3d11(void);
 
 /// The woven content's canvas (== forced zone) sub-rect within the shared texture,
 /// plus the full texture dims, so the presenter can build a normalized uvRect. Exported

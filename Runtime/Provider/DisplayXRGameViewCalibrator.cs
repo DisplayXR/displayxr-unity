@@ -15,7 +15,8 @@ namespace DisplayXR
     /// snaps fractional points differently by scale and layout: at 175 % the image landed
     /// one pixel left of the computed position, which is the other eye). So it is MEASURED:
     /// once the layout has held for <see cref="DisplayXRProviderDriver.GameViewSettleSeconds"/>
-    /// the native mirror blit draws a position-coded marker
+    /// the mirror path that is live (the native mirror blit, or Unity's own blit of a texture
+    /// the marker was stamped into: #485) draws a position-coded marker
     /// (<see cref="DisplayXRGameViewCalibration"/>) over the woven image - two thin strips,
     /// one along the screen row and one along the screen column that are read back - until
     /// those two 1-px strips of the screen have been read, and the anchor goes where the
@@ -32,11 +33,15 @@ namespace DisplayXR
     /// (<see cref="Cal.LayoutCache"/>): no marker at all. A layout is only measured once it
     /// has settled AND the mouse button is up (<see cref="Cal.Settled"/>).
     ///
-    /// Windows editor, docked (texture) mode, D3D12 native mirror blit only: that is where
-    /// the marker is drawn. Everywhere else nothing is shown and nothing changes.
+    /// Windows editor, docked (texture) mode, D3D12 and D3D11: the marker is drawn by the
+    /// native mirror blit where Unity calls it (the scriptable pipelines) and through Unity's
+    /// own blit where it does not (the Built-in pipeline; #485). Everywhere else nothing is
+    /// shown and nothing changes.
     /// Opt out with <c>DISPLAYXR_PROV_GV_CALIBRATE=0</c>. A/B switches:
     /// <c>DISPLAYXR_PROV_GV_CALIB_FULL=1</c> draws the marker over the whole image, as before;
-    /// <c>DISPLAYXR_PROV_GV_CALIB_CACHE=0</c> measures every layout, every time.
+    /// <c>DISPLAYXR_PROV_GV_CALIB_CACHE=0</c> measures every layout, every time;
+    /// <c>DISPLAYXR_PROV_GV_CALIB_STAMP=0</c> (read natively) keeps the marker out of Unity's
+    /// own blit, which is then not measured, as before #485.
     ///
     /// DPI: every coordinate here is PHYSICAL px (the pane rect the driver read under
     /// per-monitor-v2 awareness; the screen is read by native code inside the same pinned
@@ -191,11 +196,13 @@ namespace DisplayXR
 
         /// <summary>True while the anchor returned by the last <see cref="Tick"/> was measured.</summary>
         internal static bool AppliedMeasured { get; private set; }
-        /// <summary>True once an attempt ended without the marker having been drawn at all,
-        /// until a marker is drawn: nothing can be measured on screen here (the Built-in
-        /// pipeline, D3D11, a view that does not repaint). The driver then selects the
-        /// whole-pixel size from the predicted geometry instead of waiting for a
-        /// measurement.</summary>
+        /// <summary>True while the last attempt showed NOTHING of the marker on screen: it
+        /// was not drawn at all (neither mirror path could, a view that does not repaint), or
+        /// (#485) it was drawn and no part of it was found where it was read (a mirror path
+        /// that does not reach the screen as assumed). False again once an attempt measures,
+        /// or finds the marker partly covered. While it is true nothing can be measured on
+        /// screen here, and the driver selects the whole-pixel size from the predicted
+        /// geometry instead of waiting for a measurement.</summary>
         internal static bool MarkerUnavailable { get; private set; }
         /// <summary>Why (valid while <see cref="MarkerUnavailable"/>).</summary>
         internal static string MarkerUnavailableWhy => s_unavailableWhy ?? "";
@@ -318,7 +325,6 @@ namespace DisplayXR
             int frames = DisplayXRProviderNative.dxr_prov_get_gv_calib_marker(
                 out int mw, out int mh, out int band0, out int band1, out int bandW);
             if (frames >= 1 && s_firstFrameAt < 0.0) s_firstFrameAt = now;
-            if (frames >= 1) MarkerUnavailable = false;
 
             // Read as soon as the marker has been drawn once. A read blocks until the next
             // composition, so one that comes before the marker is on screen costs a refresh
@@ -342,16 +348,27 @@ namespace DisplayXR
                 if (frames == 0)
                 {
                     // Say WHICH of the things the marker needs is missing: the native blit
-                    // keeps the reason it last ended with.
+                    // keeps the reason it last ended with, and so does the stamp for Unity's
+                    // own blit (#485).
                     int reason = -1, offered = 0, calls = 0;
                     try { reason = DisplayXRProviderNative.dxr_prov_get_native_mirror_status(out offered, out calls); }
                     catch (System.EntryPointNotFoundException) { }
-                    s_unavailableWhy = Cal.NativeMirrorReasonText(reason, offered, calls);
+                    MarkerPath(out int stamp, out int stamps, out int handed);
+                    s_unavailableWhy = Cal.MarkerNotDrawnText(reason, offered, calls, stamp, stamps, handed);
                     MarkerUnavailable = true;
                     s_why = "the marker was not drawn: " + s_unavailableWhy;
                 }
                 Finish(l, false, default, default, mw, mh, frames, now);
             }
+        }
+
+        // (#485) Which draw carried the marker (Cal.Path*), with the stamp's account.
+        // stampStatus -1: a native plug-in binary without the export.
+        static int MarkerPath(out int stampStatus, out int stamps, out int handed)
+        {
+            stampStatus = -1; stamps = 0; handed = 0;
+            try { return DisplayXRProviderNative.dxr_prov_get_gv_marker_path(out stampStatus, out stamps, out handed); }
+            catch (System.EntryPointNotFoundException) { stampStatus = -1; return Cal.PathNone; }
         }
 
         static string Describe(string axis, in Cal.Axis a)
@@ -471,6 +488,15 @@ namespace DisplayXR
         static void Finish(in Layout l, bool ok, in Cal.Axis ax, in Cal.Axis ay, int mw, int mh, int frames, double now)
         {
             s_showing = false;
+            // (#485) Which mirror path drew the marker - read before it is taken down - goes
+            // at the very end of the line (the line is only ever appended to).
+            string pathText = "";
+            if (frames > 0)
+            {
+                int path = MarkerPath(out _, out int stamps, out int handed);
+                pathText = Cal.MarkerPathText(path, stamps, handed);
+            }
+            string pathFact = pathText.Length > 0 ? " | " + pathText : "";
             DisplayXRProviderNative.dxr_prov_set_gv_calib_marker(0, 0);
             s_have = true; s_key = s_showKey; s_measured = ok;
             s_attempts++;
@@ -482,6 +508,18 @@ namespace DisplayXR
             if (!ok)
             {
                 s_lastFail = frames <= 0 ? Cal.Fail.NotDrawn : s_whyCovered ? Cal.Fail.Covered : Cal.Fail.Missed;
+                // Can anything be measured on screen here? Not when nothing was drawn (set by
+                // Poll, with the reason) and not when what was drawn showed nowhere on the
+                // rows that were read: on a mirror path that does not reach the screen as
+                // assumed the driver must not wait for a measurement that will not come. A
+                // marker that is partly covered is on screen: measurable.
+                if (s_lastFail == Cal.Fail.Missed)
+                {
+                    MarkerUnavailable = true;
+                    s_unavailableWhy = "the marker was drawn" + (pathText.Length > 0 ? " (" + pathText + ")" : "") +
+                                       " and none of it showed on the screen where it was read";
+                }
+                else if (s_lastFail == Cal.Fail.Covered) MarkerUnavailable = false;
                 double retry = Cal.RetryDelaySeconds(s_showStrip, s_lastFail);
                 s_retryAt = now + retry;
                 s_fallbackOffset = s_offsets.TryGetValue(OffsetKey(s_showKey), out Vector2Int off);
@@ -497,9 +535,10 @@ namespace DisplayXR
                               ? ", retrying in " + retry.ToString("0.#", System.Globalization.CultureInfo.InvariantCulture) + " s" +
                                 (Cal.PlanStrip(s_attempts, s_lastFail, FullForced()) < 0 && s_showStrip >= 0 ? " with the whole-image marker" : "") + "]"
                               : "]") +
-                          facts + " | " + frames + " marker frames, " + ((now - s_showSince) * 1000.0).ToString("0") + " ms");
+                          facts + " | " + frames + " marker frames, " + ((now - s_showSince) * 1000.0).ToString("0") + " ms" + pathFact);
                 return;
             }
+            MarkerUnavailable = false;
 
             s_dx = ax.Origin - l.PaneLeft; s_dy = ay.Origin - l.PaneTop;
             s_imgW = mw; s_imgH = mh;
@@ -519,7 +558,7 @@ namespace DisplayXR
             }
             Debug.Log(MeasuredLine(l, s_showKey, mw, mh, AxisText("W", "column", ax) + ", " + AxisText("H", "row", ay),
                                    ax.SwappedRB || ay.SwappedRB, frames, (now - s_showSince) * 1000.0) +
-                      facts + " | cache miss" + (cached ? " (stored)" : !CacheEnabled() ? " (cache off)" : " (not stored: not 1:1)"));
+                      facts + " | cache miss" + (cached ? " (stored)" : !CacheEnabled() ? " (cache off)" : " (not stored: not 1:1)") + pathFact);
 
             if (oneX && oneY) return;
             // Not texel for pixel: at a fractional scale the whole-pixel size fixes it.

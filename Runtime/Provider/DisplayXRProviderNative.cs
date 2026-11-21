@@ -306,8 +306,9 @@ namespace DisplayXR
         /// native mirror blit draws the position-coded marker
         /// (<see cref="DisplayXRGameViewCalibration"/>) into the Game view's texture instead of
         /// the woven image; 0 = back to the woven image now. The time limit is enforced
-        /// natively, so a marker can never outlive a domain reload. Windows editor, D3D12
-        /// native mirror blit only (the export exists on Windows only).
+        /// natively, so a marker can never outlive a domain reload. Windows editor: the D3D12
+        /// and D3D11 native mirror blits, and (#485) the texture Unity's own mirror blit
+        /// samples where Unity does not call the native one (the export exists on Windows only).
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern void dxr_prov_set_gv_calib_marker(int enable, int maxMs);
@@ -324,7 +325,8 @@ namespace DisplayXR
 
         /// <summary>
         /// (#459) The size of the Game view texture the native mirror blit last drew into
-        /// (0 x 0: it has not drawn). Returns how many times it has drawn. Windows only.
+        /// (0 x 0: it has not drawn); where Unity's own blit is the mirror path (#485), the
+        /// size of the woven canvas it draws. Returns how many times. Windows only.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern int dxr_prov_get_gv_mirror_size(out int w, out int h);
@@ -341,11 +343,23 @@ namespace DisplayXR
 
         /// <summary>
         /// (#459) How many frames the marker has been drawn since it was last switched on, with
-        /// the size of the texture it was drawn into and its row-coded bands (texels).
+        /// the size of the image it was laid out for and its row-coded bands (texels).
         /// 0 = not drawn (yet, or not on this graphics API). Windows only.
         /// </summary>
         [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
         public static extern int dxr_prov_get_gv_calib_marker(out int w, out int h, out int band0, out int band1, out int bandW);
+
+        /// <summary>
+        /// (#485) Which draw carried the marker of the current request: 0 none yet, 1 / 2 the
+        /// native mirror blit on D3D12 / D3D11, 3 Unity's own mirror blit, through the marker
+        /// stamped into the texture it samples
+        /// (<see cref="DisplayXRGameViewCalibration.MarkerPathText"/>). With the stamp's own
+        /// account: why it did or did not run
+        /// (<see cref="DisplayXRGameViewCalibration.StampStatusText"/>), how many times the
+        /// texture was stamped and how many mirror queries were handed it. Windows only.
+        /// </summary>
+        [DllImport(LibName, CallingConvention = CallingConvention.Cdecl)]
+        public static extern int dxr_prov_get_gv_marker_path(out int stampStatus, out int stamps, out int handed);
 
         /// <summary>
         /// (#459) Read a 1-px strip of the SCREEN: <paramref name="len"/> pixels from (x, y),

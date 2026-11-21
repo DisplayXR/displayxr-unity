@@ -54,6 +54,10 @@ namespace DisplayXR
         public static int CoverLeft = int.MinValue, CoverRight = int.MaxValue;   // ...between these columns
         public static bool Draws = true;             // false: the native blit does not run (D3D11, paused)
         public static int MirrorReason = 0, MirrorOffered = 0, MirrorCalls = 0;   // dxr_prov_get_native_mirror_status
+        // dxr_prov_get_gv_marker_path (#485): which draw carries the marker, and the stamp's account.
+        public static int MarkerPath = 1, StampStatus = 3, Stamps = 0, Handed = 0;
+        public static bool OldBinary;                // no dxr_prov_get_gv_marker_path export
+        public static bool OnScreen = true;          // false: the marker is drawn but never reaches the screen
         public static int LatencyFrames = 1;         // marker frames drawn before it is on screen
         public static double ReadSeconds = 1.0 / 60.0;
 
@@ -68,6 +72,7 @@ namespace DisplayXR
             OriginX = OriginY = 0; TexW = TexH = 0; DropColumnAt = -1; CoverTop = 0; CoverBottom = -1;
             CoverLeft = int.MinValue; CoverRight = int.MaxValue;
             Draws = true; LatencyFrames = 1; MarkerOn = false; Strip = 0; Half = 0; FramesDrawn = 0;
+            MarkerPath = 1; StampStatus = 3; Stamps = 0; Handed = 0; OldBinary = false; OnScreen = true;
             Reads = Requests = MaxFramesDrawn = FullRequests = 0;
             RequestedStrips.Clear();
         }
@@ -92,7 +97,7 @@ namespace DisplayXR
             int drawnW = DropColumnAt >= 0 ? TexW - 1 : TexW;
             if (rx < 0 || y < 0 || rx >= drawnW || y >= TexH) return 0x383838u;
             int x = DropColumnAt >= 0 && rx >= DropColumnAt ? rx + 1 : rx;
-            bool visible = MarkerOn && Draws && FramesDrawn >= LatencyFrames;
+            bool visible = MarkerOn && Draws && OnScreen && FramesDrawn >= LatencyFrames;
             int k = visible ? Cal.MarkerIndexAt(x, y, TexW, TexH, Strip, Half) : Cal.Scene;
             return k == Cal.Scene ? ScenePixel(x, y) : Cal.Rgb(k);
         }
@@ -124,6 +129,14 @@ namespace DisplayXR
         {
             offered = World.MirrorOffered; calls = World.MirrorCalls;
             return World.MirrorReason;
+        }
+
+        // Which draw carried the marker: World.MarkerPath etc., set by the test.
+        public static int dxr_prov_get_gv_marker_path(out int stampStatus, out int stamps, out int handed)
+        {
+            if (World.OldBinary) throw new EntryPointNotFoundException("dxr_prov_get_gv_marker_path");
+            stampStatus = World.StampStatus; stamps = World.Stamps; handed = World.Handed;
+            return World.FramesDrawn > 0 ? World.MarkerPath : Cal.PathNone;
         }
 
         public static int dxr_prov_get_gv_mirror_size(out int w, out int h)

@@ -19,6 +19,16 @@
 //   uint4  fl        (#480) fl.x != 0: decode the woven sample (sRGB EOTF) before it is
 //                      stored. Set when the woven bytes are ENCODED and the target view
 //                      encodes on store (an _SRGB format): displayxr_mirror_colour.h.
+//                    (#485) fl.y, fl.z: the target pixel that is the marker's texel (0, 0).
+//                      0, 0 for the native mirror blit (the image fills its target). The
+//                      marker stamp (displayxr_gvcal_stamp.h) draws the woven canvas into a
+//                      texture the size of the woven one, through a viewport on the canvas
+//                      rect, and passes the canvas origin here, so the marker is laid out
+//                      in CANVAS texels there exactly as it is in target texels here.
+//                    (#485) fl.w != 0: the target is the size of the source and each pixel
+//                      shows the source texel at its own position: Load it instead of
+//                      sampling (an exact copy). The stamp sets it; the native blit, whose
+//                      target is another texture of another size, never does.
 #pragma once
 
 #define GVCAL_BLOCK      6                 // texels per block (sync + 5 base-5 digits)
@@ -70,10 +80,15 @@ static const char *const kDxrMirrorBlitHLSL =
 	// (an _SRGB format), so decode here (sRGB EOTF, as dxr_mirror_srgb_decode) and the
 	// pair is the identity. The marker colours are 0 / 1, which the curve leaves alone.
 	"float4 PSMain(V i):SV_Target{ float2 uv=srcRect.xy + i.uv*srcRect.zw; float4 c = tex.Sample(smp, uv);\n"
+	// (#485) fl.w != 0: source and target are the same size and this pixel shows the source
+	// texel at its own position, so it is LOADED, not filtered: byte for byte, whatever the
+	// precision of the interpolated uv (a filtered 1:1 sample was seen one step off).
+	"  if (fl.w != 0) c = tex.Load(int3((int)i.pos.x, (int)i.pos.y, 0));\n"
 	"  if (fl.x != 0) { float3 e = saturate(c.rgb);\n"
 	"    float3 lo = e / 12.92; float3 hi = pow((e + 0.055) / 1.055, 2.4);\n"
 	"    c.rgb = float3(e.r <= 0.04045 ? lo.r : hi.r, e.g <= 0.04045 ? lo.g : hi.g, e.b <= 0.04045 ? lo.b : hi.b); }\n"
-	"  if (mk.x != 0) { uint x = (uint)i.pos.x; uint y = (uint)i.pos.y;\n"
+	// (#485) fl.yz = the target pixel of the marker's texel (0,0): 0,0 in the native blit.
+	"  if (mk.x != 0) { uint x = (uint)i.pos.x - fl.y; uint y = (uint)i.pos.y - fl.z;\n"
 	"    bool on = mk.x == 1 || (y + st.y >= st.x && y <= st.x + st.y) || (x + st.w >= st.z && x <= st.z + st.w);\n"
 	"    if (on) {\n"
 	"      bool band = (x >= mk.y && x < mk.y + mk.w) || (x >= mk.z && x < mk.z + mk.w);\n"

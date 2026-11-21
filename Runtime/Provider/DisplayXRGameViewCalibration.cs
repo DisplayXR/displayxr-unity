@@ -18,7 +18,9 @@ namespace DisplayXR
     ///
     /// THE MARKER. While it is measured the native mirror blit draws this pattern over the
     /// woven image, into the very render texture the woven image goes to, so it reaches the
-    /// screen through exactly the path the weave takes; by default only on the two thin strips
+    /// screen through exactly the path the weave takes (where Unity blits the woven texture
+    /// itself instead - the Built-in pipeline - the pattern is put into the texture it blits,
+    /// laid out over the woven canvas: #485); by default only on the two thin strips
     /// that are read back (<see cref="InMarker"/>), the woven image everywhere else. Each texel is one of six SATURATED
     /// colours (every channel fully on or fully off), so a Gamma / Linear mismatch on the way
     /// to the screen cannot move one into another, and a swapped red / blue is detected
@@ -370,7 +372,7 @@ namespace DisplayXR
         /// <summary>Why an attempt failed.</summary>
         public enum Fail
         {
-            /// <summary>The marker was never drawn (no native blit, a view that is not repainting).</summary>
+            /// <summary>The marker was never drawn (neither mirror path drew it, a view that is not repainting).</summary>
             NotDrawn,
             /// <summary>Drawn, but the strip that was read shows no marker.</summary>
             Missed,
@@ -411,12 +413,13 @@ namespace DisplayXR
         public const int MirrorNeverCalledAfter = 240;
 
         /// <summary>
-        /// Why the marker was not drawn, from the native mirror blit's own state
+        /// Why the NATIVE MIRROR BLIT did not draw the marker, from its own state
         /// (<c>dxr_prov_get_native_mirror_status</c>): the reason it last ended with, how many
         /// mirror queries offered the native blit to Unity this session and how many times
         /// Unity called it. <paramref name="reason"/> below 0: the plug-in binary has no such
-        /// export. The marker is drawn in that blit and nowhere else, so each case names what
-        /// would have to be different.
+        /// export. That blit is one of the two places the marker is drawn; the other is the
+        /// texture Unity's own blit samples (<see cref="StampStatusText"/>), and
+        /// <see cref="MarkerNotDrawnText"/> puts the two accounts together.
         /// </summary>
         public static string NativeMirrorReasonText(int reason, int offered, int calls)
         {
@@ -428,7 +431,7 @@ namespace DisplayXR
                     ? "Unity has not asked for a mirror blit that the plug-in could offer its native blit for (no woven texture yet, DISPLAYXR_PROV_NATIVE_MIRROR=0, or the Game view is not repainting)"
                     : offered < MirrorNeverCalledAfter
                         ? "Unity was offered the native mirror blit and has not called it so far"
-                        : "Unity was offered the native mirror blit and never calls it: this render pipeline (the Built-in one) blits the woven texture itself, so no marker can be drawn here and the placement is the computed one")
+                        : "Unity was offered the native mirror blit and never calls it: this render pipeline (the Built-in one) blits the woven texture itself")
                     + counts;
             switch (reason)
             {
@@ -438,16 +441,80 @@ namespace DisplayXR
                 case 3: return "no woven texture is registered with Unity" + counts;
                 case 4: case 5: return "Unity called the native mirror blit without a render target it can draw into" + counts;
                 case 6: return "the plug-in has no IUnityInterfaces" + counts;
-                case MirrorNotD3D12: return "the editor is not on D3D12 or D3D11 (no native mirror blit for this renderer; the marker in it is D3D12 only)" + counts;
-                case 8: return "Unity's D3D12 interface returned no device" + counts;
-                case 9: return "Unity's mirror render target could not be resolved to a D3D12 texture" + counts;
-                case 10: return "the woven texture is not open on Unity's D3D12 device" + counts;
+                case MirrorNotD3D12: return "the editor is not on D3D12 or D3D11 (no native mirror blit for this renderer)" + counts;
+                case 8: return "Unity's graphics interface returned no device" + counts;
+                case 9: return "Unity's mirror render target could not be resolved to a texture the native blit can draw into" + counts;
+                case 10: return "the woven texture is not open on Unity's device" + counts;
                 case 11: return "the woven canvas is empty" + counts;
                 case 12: return "the blit pipeline could not be built (shader or pipeline state)" + counts;
                 case 13: return "the blit's command list could not be created" + counts;
                 case 14: return "this platform has no native mirror blit" + counts;
-                case MirrorDrawnNoMarker: return "the native mirror blit draws on D3D11, which draws no marker (the calibration marker is D3D12 only): the placement is the computed one" + counts;
+                case MirrorDrawnNoMarker: return "the native mirror blit draws on D3D11 without a marker (a native plug-in binary older than this script: since #485 the D3D11 blit draws it)" + counts;
                 default: return "the native mirror blit did not draw" + counts;
+            }
+        }
+
+        // (#485) The marker for Unity's OWN mirror blit: why the stamp did or did not run
+        // (DXR_GS_* in native~/displayxr_xrprovider/displayxr_gvcal_stamp.h), and which draw
+        // carried the marker (DXR_GV_PATH_*).
+        public const int StampIdle = 0, StampStamped = 1, StampDisabled = 2, StampNativeLive = 3, StampNoBackend = 4,
+                         StampNoInterface = 5, StampNoWoven = 6, StampCanvas = 7, StampTexture = 8, StampUnityTexture = 9,
+                         StampPipeline = 10, StampCmdList = 11, StampSettling = 12;
+        public const int PathNone = 0, PathNativeD3D12 = 1, PathNativeD3D11 = 2, PathStamp = 3;
+
+        /// <summary>
+        /// Why the marker did not reach Unity's own mirror blit, from the native stamp's
+        /// account (<c>dxr_prov_get_gv_marker_path</c>): its status, how many times the marker
+        /// texture was stamped for this request and how many mirror queries were handed it.
+        /// </summary>
+        public static string StampStatusText(int status, int stamps, int handed)
+        {
+            string counts = " [marker texture: stamped " + stamps + " times, handed to " + handed + " mirror queries, status " + status + "]";
+            switch (status)
+            {
+                case StampIdle: return "no frame was submitted while the marker was requested" + counts;
+                case StampStamped:
+                    return (handed > 0
+                        ? "it was stamped and handed to Unity's blit"
+                        : "it was stamped, but no mirror query came to take it while the marker was requested (is the Game view repainting?)") + counts;
+                case StampDisabled: return "DISPLAYXR_PROV_GV_CALIB_STAMP=0 turns it off" + counts;
+                case StampNativeLive: return "not used, because Unity calls the native mirror blit" + counts;
+                case StampNoBackend: return "the editor is not on D3D11 or D3D12" + counts;
+                case StampNoInterface: return "Unity gave no graphics interface or device for it (on D3D12 it needs IUnityGraphicsD3D12v8: Unity 6)" + counts;
+                case StampNoWoven: return "no woven texture is open on Unity's device and registered with Unity" + counts;
+                case StampCanvas: return "the woven canvas is empty, under " + MinTexels + " px, or not inside its texture" + counts;
+                case StampTexture: return "the marker texture could not be created" + counts;
+                case StampUnityTexture: return "Unity refused the marker texture" + counts;
+                case StampPipeline: return "its shader, pipeline state or a view could not be created" + counts;
+                case StampCmdList: return "its command list could not be made" + counts;
+                case StampSettling: return "the session has only just started" + counts;
+                default: return "it was not stamped" + counts;
+            }
+        }
+
+        /// <summary>
+        /// Why no marker frame was drawn at all: the native mirror blit's account, and - unless
+        /// that blit is the live mirror path, or the binary is older than the stamp
+        /// (<paramref name="stampStatus"/> below 0) - the account of the marker for Unity's own
+        /// blit. Either would have been enough.
+        /// </summary>
+        public static string MarkerNotDrawnText(int reason, int offered, int calls, int stampStatus, int stamps, int handed)
+        {
+            string native = NativeMirrorReasonText(reason, offered, calls);
+            if (stampStatus < 0 || stampStatus == StampNativeLive) return native;
+            return native + "; and the marker for Unity's own blit of that texture: " + StampStatusText(stampStatus, stamps, handed);
+        }
+
+        /// <summary>Which draw carried the marker, for the calibration's line ("" = not reported).</summary>
+        public static string MarkerPathText(int path, int stamps, int handed)
+        {
+            switch (path)
+            {
+                case PathNativeD3D12: return "marker drawn by the native mirror blit (D3D12)";
+                case PathNativeD3D11: return "marker drawn by the native mirror blit (D3D11)";
+                case PathStamp:
+                    return "marker drawn by Unity's own blit (stamped into its source texture " + stamps + " times, handed to " + handed + " mirror queries)";
+                default: return "";
             }
         }
 

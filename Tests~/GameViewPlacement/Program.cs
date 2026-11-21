@@ -985,6 +985,57 @@ static class Program
         DisplayXRGameViewPlacement.Place(wpN, 0, 0, out int xn, out _, out _, out _);
         Check(xn == 405, $"border unknown, pane between two neighbours: still pane +{xn - 400} == +5");
 
+        // DATA (#485), 175 %, Built-in pipeline, measured through the marker in Unity's own blit
+        // on D3D11, D3D12 and a Linear project, all three identical. Pane at (712,205);
+        // viewInWindow 691.714x343.857 pt; 47 pt of tab strip, toolbar and bottom border.
+        // Whole-pixel 1204x595 (688x340 pt), targetInView=(1.857,1.929): "measured image origin
+        // pane +5,+82 (screen 717,287), computed pane +5,+83". The top edge is
+        // (45 + 2) pt x 1.75 = 82.25 px: a row is shown when its centre is in the quad, so the
+        // first row is +82 (the edge rounded half up, as the columns), not +83.
+        var bi = new DisplayXRGameViewPlacement.Pane
+        {
+            Left = 712, Top = 205, ClientW = 1214, ClientH = 684,
+            ToolbarPx = DisplayXRGameViewPlacement.ToolbarPx(390.857f, 343.857f, 1.75f),
+            RtW = 1204, RtH = 595, TargetHPx = 595f, DockedNonMaximized = true, HaveDrawRect = true,
+            HostWPt = 693.714f, DrawWPt = 691.714f, DrawHPt = 343.857f, HostHPt = 390.857f, PtToPx = 1.75f, RoundsBottomEdge = true,
+            WholePixelFixedSize = true, HaveLeftBorder = true, LeftBorderPt = 1f, HaveTargetX = true, TargetXPt = 1.857f,
+        };
+        DisplayXRGameViewPlacement.Place(bi, 0, 0, out int bix, out int biy, out int biw, out int bih);
+        Check(bix == 717 && biy == 287 && biw == 1204 && bih == 595,
+              $"DATA 175 % Built-in whole-pixel 1204x595: anchor pane +{bix - 712},+{biy - 205} == +5,+82 (measured; the row rule gave +83 before)");
+        // The same pane on Free Aspect (texture 1211x602 for a 1210.5x602.25 px target, GVFIT
+        // on): "computed pane +2,+79", and the measurement agreed on the row (H 1:1 at +79) and,
+        // for texel 0, on the column ("from column 0 the image is +1 px off" the majority origin
+        // +1: the left half of a 1211 px texture drawn 1210.5 px wide is at +2, the right half
+        // at +1). The GVFIT row rule is unchanged.
+        var biFree = bi; biFree.WholePixelFixedSize = false; biFree.HaveTargetX = false;
+        biFree.RtW = 1211; biFree.RtH = 602; biFree.TargetHPx = 602.25f;
+        DisplayXRGameViewPlacement.Place(biFree, 0, 0, out int bfx, out int bfy, out _, out _);
+        Check(bfx == 714 && bfy == 284, $"DATA 175 % Built-in Free Aspect 1211x602: anchor pane +{bfx - 712},+{bfy - 205} == +2,+79 (row measured, column of texel 0)");
+        // The whole-pixel row rule against the column rule, edge by edge at 175 % (top edge =
+        // (45 + r) pt): x.75 -> up, x.5 -> up (tie, as the columns), x.25 -> DOWN, x.0 -> itself.
+        // Only the x.25 case differs from the rule before #485; r = 1 (x.5) is the layout of the
+        // earlier calibration lines (targetInView.y 1.357 pt), whose rows agreed under both.
+        int[] wantRow = { 79, 81, 82, 84 };   // 78.75, 80.5, 82.25, 84.0
+        for (int r = 0; r < 4; r++)
+        {
+            var q = bi; q.Top = 0;
+            q.DrawHPt = 340f + 2f * r; q.HostHPt = q.DrawHPt + 47f;   // margin r pt above and below
+            Check(DisplayXRGameViewPlacement.RtRow0Y(q) == wantRow[r],
+                  $"175 % whole-pixel, top edge {(45 + r) * 1.75} px: row {DisplayXRGameViewPlacement.RtRow0Y(q)} == {wantRow[r]}");
+        }
+        // 150 % and 250 % have no quarter-pixel edge: nothing moves there.
+        foreach (float sc in new[] { 1.5f, 2.5f })
+            for (int r = 0; r < 4; r++)
+            {
+                var q = bi; q.Top = 0; q.PtToPx = sc; q.RtH = (int)(340 * sc); q.TargetHPx = q.RtH;
+                q.DrawHPt = 340f + 2f * r; q.HostHPt = q.DrawHPt + 47f;
+                var g = q; g.WholePixelFixedSize = false;
+                double bottom = (45 + 340 + r) * (double)sc;
+                Check(DisplayXRGameViewPlacement.RtRow0Y(q) == (int)Math.Ceiling(bottom - 1e-3) - q.RtH,
+                      $"{sc * 100} % whole-pixel, margin {r} pt: the row is the one the rule before #485 gave");
+            }
+
         // Free Aspect (chrome slack): with the real border the column no longer depends on
         // the latched centring. The 250 % reference pane must not move.
         var refPane = new DisplayXRGameViewPlacement.Pane
