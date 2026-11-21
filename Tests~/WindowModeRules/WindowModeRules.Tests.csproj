@@ -1,0 +1,17 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Unit tests for Samples~/WindowMode/DisplayXRWindowModeRules.cs (pure C#, no UnityEngine;
+       #477): the remembered window's PlayerPrefs string, which remembered sizes and positions
+       are safe to apply, which display a position belongs to, and when a window has settled
+       after a mode switch. Lives under Tests~ so Unity never imports it.
+       Run: dotnet run -c Release -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net8.0</TargetFramework>
+    <Nullable>disable</Nullable>
+    <ImplicitUsings>disable</ImplicitUsings>
+    <RollForward>Major</RollForward>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../../Samples~/WindowMode/DisplayXRWindowModeRules.cs" Link="DisplayXRWindowModeRules.cs" />
+  </ItemGroup>
+</Project>

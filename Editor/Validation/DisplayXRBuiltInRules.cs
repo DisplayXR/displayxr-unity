@@ -129,6 +129,30 @@ namespace DisplayXR.Editor
 
             Add(new DisplayXRValidationRule
             {
+                Id = "fullscreen-mode",
+                Title = "Windows: fullscreen mode is not Exclusive Fullscreen",
+                Explanation =
+                    "The provider's window handling has no path for exclusive full screen. " +
+                    "DisplayXRTargetDisplay refuses to move such a window onto the 3D panel, and " +
+                    "the native move behind it only knows a windowed window and a borderless one " +
+                    "that covers its monitor (Fullscreen Window). The 3D picture is also not drawn " +
+                    "into Unity's window: the provider presents it in its own borderless window " +
+                    "above Unity's, shown by the desktop compositor and following Unity's window. " +
+                    "Exclusive full screen is the one mode where Unity's own swap chain owns the " +
+                    "output instead, and it holds the display it was created on. The package is " +
+                    "not tested in that mode. This is the launch default only: a script can still " +
+                    "switch mode at run time.",
+                Severity = Severity.Warning,
+                Platforms = Platforms.Windows,
+                Order = 55,
+                Check = CheckFullscreenMode,
+                Fix = FixFullscreenMode,
+                FixDescription = "Set Fullscreen Mode to Fullscreen Window (Player Settings > " +
+                                 "Resolution and Presentation)",
+            });
+
+            Add(new DisplayXRValidationRule
+            {
                 Id = "android-arm64",
                 Title = "Android: ARM64 (IL2CPP)",
                 Explanation =
@@ -486,6 +510,48 @@ namespace DisplayXR.Editor
                     "or #upm/vX.Y.Z (or the release tarball).", severity);
             return Result.Fail("Not in the package folder: " + list + ". Reinstall the package, or " +
                                "build it from native~/ in a source checkout.", severity);
+        }
+
+        // ==== fullscreen-mode ===================================================
+        // Source: the ExclusiveFullScreen refusal in DisplayXRTargetDisplay.Move
+        // (Runtime/DisplayXRTargetDisplay.cs); ps_window_is_full_screen / ps_cover_monitor /
+        // ps_fit_window_to_monitor in native~/displayxr_xrprovider/displayxr_provider_session.cpp
+        // (the two window shapes the move knows); displayxr_get_app_main_view and
+        // parent_subclass_proc in native~/displayxr_win32.c (the provider's own window above
+        // Unity's). PlayerSettings.fullScreenMode is one value for every desktop target; only
+        // Windows has an exclusive mode.
+
+        static Result CheckFullscreenMode(DisplayXRValidationContext c)
+        {
+            Result off;
+            if (DisplayXRProjectValidation.LoaderNotEnabled(c, out off)) return off;
+            string mode = PlayerSettings.fullScreenMode.ToString();
+            switch (DisplayXRFullscreenRules.Classify(c.Platform, mode))
+            {
+                case DisplayXRFullscreenRules.Verdict.Ok:
+                    return Result.Pass(mode + ".");
+                case DisplayXRFullscreenRules.Verdict.ExclusiveNotSupported:
+                    return Result.Fail(
+                        "Fullscreen Mode is Exclusive Fullscreen. The player then starts in a mode " +
+                        "the provider's window handling does not cover: start-up placement " +
+                        "(DisplayXRTargetDisplay) leaves the window on the display it opened on, and " +
+                        "the 3D picture is presented in a separate window above it. Use Fullscreen " +
+                        "Window (borderless) to fill the 3D panel.");
+                default:
+                    return Result.NotApplicable();
+            }
+        }
+
+        static void FixFullscreenMode(DisplayXRValidationContext c)
+        {
+            string recommended = DisplayXRFullscreenRules.Recommend(
+                c.Platform, PlayerSettings.fullScreenMode.ToString());
+            FullScreenMode mode;
+            if (!Enum.TryParse(recommended, out mode)) return;
+            PlayerSettings.fullScreenMode = mode;
+            Debug.Log("[DisplayXR] Fullscreen Mode set to " + mode + " (Player Settings > Resolution " +
+                      "and Presentation). A player that already ran on this machine may still open " +
+                      "in the mode it last saved.");
         }
 
         // ==== android-arm64 =====================================================

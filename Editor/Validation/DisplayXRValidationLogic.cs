@@ -279,6 +279,69 @@ namespace DisplayXR.Editor
     }
 
     /// <summary>
+    /// The player's default fullscreen mode (Player Settings > Resolution and
+    /// Presentation). Modes are named as <c>UnityEngine.FullScreenMode.ToString()</c>.
+    /// Source of truth, all on Windows, the only platform with an exclusive mode:
+    /// <list type="bullet">
+    /// <item><c>DisplayXRTargetDisplay.Move</c> refuses to move an
+    /// <c>ExclusiveFullScreen</c> window onto the 3D panel
+    /// (<c>Runtime/DisplayXRTargetDisplay.cs</c>).</item>
+    /// <item>The native move it calls, <c>ps_move_window_to_display</c>, knows two window
+    /// shapes only: a windowed one (<c>ps_fit_window_to_monitor</c>) and a borderless
+    /// one covering its monitor, which is <c>FullScreenWindow</c>
+    /// (<c>ps_window_is_full_screen</c> / <c>ps_cover_monitor</c>, in
+    /// <c>native~/displayxr_xrprovider/displayxr_provider_session.cpp</c>).</item>
+    /// <item>The 3D picture is not drawn into Unity's window: the provider presents it in
+    /// its own borderless window above Unity's, which the desktop compositor shows and
+    /// which follows Unity's window from its move and size messages
+    /// (<c>displayxr_get_app_main_view</c> / <c>parent_subclass_proc</c>, in
+    /// <c>native~/displayxr_win32.c</c>). Exclusive full screen is the one mode in which
+    /// Unity's own swap chain, not the desktop compositor, owns the output.</item>
+    /// </list>
+    /// </summary>
+    public static class DisplayXRFullscreenRules
+    {
+        public const string ExclusiveFullScreen = "ExclusiveFullScreen";
+        public const string FullScreenWindow = "FullScreenWindow";
+        public const string MaximizedWindow = "MaximizedWindow";
+        public const string Windowed = "Windowed";
+
+        public enum Verdict
+        {
+            /// <summary>A mode the provider's window handling covers.</summary>
+            Ok,
+            /// <summary>Windows, exclusive full screen: not covered.</summary>
+            ExclusiveNotSupported,
+            /// <summary>Nothing to judge (another platform, or no mode name).</summary>
+            Unknown,
+        }
+
+        /// <summary>
+        /// Judge the default fullscreen mode of a build target. Only Windows has an
+        /// exclusive mode (elsewhere Unity treats the value as a borderless window), so
+        /// only Windows is judged.
+        /// </summary>
+        public static Verdict Classify(DisplayXRValidationPlatforms platform, string fullScreenMode)
+        {
+            if (platform != DisplayXRValidationPlatforms.Windows || string.IsNullOrEmpty(fullScreenMode))
+                return Verdict.Unknown;
+            return fullScreenMode == ExclusiveFullScreen ? Verdict.ExclusiveNotSupported : Verdict.Ok;
+        }
+
+        /// <summary>
+        /// The mode the Fix writes: the project's own when it is supported, else
+        /// <c>FullScreenWindow</c> - still full screen, as the project asked, and the
+        /// shape the start-up placement makes cover the 3D panel.
+        /// </summary>
+        public static string Recommend(DisplayXRValidationPlatforms platform, string fullScreenMode)
+        {
+            return Classify(platform, fullScreenMode) == Verdict.ExclusiveNotSupported
+                ? FullScreenWindow
+                : fullScreenMode;
+        }
+    }
+
+    /// <summary>
     /// How a <c>GameObject/...</c> menu item treats a multi-selection. From the Hierarchy's
     /// right-click menu Unity invokes the item once PER selected object, each time with
     /// that object as the command's context; from the main menu bar it invokes it once,

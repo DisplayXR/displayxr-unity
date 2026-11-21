@@ -14,9 +14,12 @@ Drop-in keyboard + mouse handler for navigating around a DisplayXR rig camera. B
 | Tab | Cycle active rig (via `DisplayXRRigManager.CycleNext`) |
 | V | Toggle 2D / 3D display mode |
 | Space | Reset pose to scene-load values |
-| F11 | Toggle fullscreen |
 | I | Screenshot |
 | ESC | Quit |
+
+F11 (fullscreen) moved to the **Window Mode** sample (`DisplayXRWindowModeSample`), which goes
+full screen on the 3D panel and puts the window back at its remembered size and position. Add
+it next to this controller if you want the key.
 
 ## How to use
 

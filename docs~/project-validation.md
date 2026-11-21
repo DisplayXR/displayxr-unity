@@ -108,6 +108,7 @@ are about the editor machine or the installed packages and do not depend on it.
 | [`other-xr-loader`](#other-xr-loader) | Warning / Error | all supported | yes (not in Fix All) |
 | [`graphics-api`](#graphics-api) | Error / Warning / note | all supported | yes |
 | [`native-plugin`](#native-plugin) | Error / note | all supported | no |
+| [`fullscreen-mode`](#fullscreen-mode) | Warning | Windows | yes |
 | [`android-arm64`](#android-arm64) | Error / Warning | Android | yes |
 | [`android-min-sdk`](#android-min-sdk) | Warning | Android | yes |
 | [`linux-transparent-overlay`](#linux-transparent-overlay) | Warning | Linux | yes |
@@ -224,6 +225,36 @@ are about the editor machine or the installed packages and do not depend on it.
     is found through its `Editor` assembly definition and treated as a source checkout.
 - **Source of truth:** `Runtime/Plugins/`, `.gitignore`, the install note in the README.
 - **Fix:** none.
+
+### fullscreen-mode
+
+**Windows: the player's Fullscreen Mode is not Exclusive Fullscreen.**
+
+- **Why:** the provider's window handling has no path for exclusive full screen.
+  - Start-up placement refuses it: `DisplayXRTargetDisplay` does not move an
+    `ExclusiveFullScreen` window onto the 3D panel and logs a warning, so the app stays on
+    the display it opened on.
+  - The native move behind it knows two window shapes only: a windowed window, which it
+    fits to the panel, and a borderless window that covers its monitor (Fullscreen Window),
+    which it makes cover the panel.
+  - The 3D picture is not drawn into Unity's window. The provider presents it in its own
+    borderless window above Unity's, which the desktop compositor shows and which follows
+    Unity's window from its move and size messages. Exclusive full screen is the one mode in
+    which Unity's own swap chain owns the output instead.
+
+  The package is not tested in that mode. Fullscreen Window (borderless) fills the panel and
+  is what the start-up placement and the Window Mode sample (`Samples~/WindowMode`) use.
+- **Scope:** the launch default in Player Settings > Resolution and Presentation. A script
+  that switches to `FullScreenMode.ExclusiveFullScreen` at run time is not seen. macOS and
+  Linux have no exclusive mode, so the rule does not apply there, although the setting is
+  one value for all desktop targets.
+- **Source of truth:** `DisplayXRTargetDisplay.Move` (`Runtime/DisplayXRTargetDisplay.cs`);
+  `ps_window_is_full_screen`, `ps_cover_monitor` and `ps_fit_window_to_monitor` in
+  `native~/displayxr_xrprovider/displayxr_provider_session.cpp`;
+  `displayxr_get_app_main_view` and `parent_subclass_proc` in `native~/displayxr_win32.c`.
+- **Fix:** sets Fullscreen Mode to Fullscreen Window. A player that already ran on the
+  machine can still open in the mode it saved last time. The finding is a warning, so
+  Fix All Errors does not take it.
 
 ### android-arm64
 
@@ -418,7 +449,7 @@ compiled only when URP 17 or newer is installed.
 | File | Role |
 |---|---|
 | `Editor/Validation/DisplayXRValidationCore.cs` | Rule, result, registry, evaluation, summary, ignore-list file. Pure C#. |
-| `Editor/Validation/DisplayXRValidationLogic.cs` | The decisions behind the built-in rules (graphics APIs, loader order, native files, Android, versions). Pure C#. |
+| `Editor/Validation/DisplayXRValidationLogic.cs` | The decisions behind the built-in rules (graphics APIs, loader order, native files, fullscreen mode, Android, versions). Pure C#. |
 | `Editor/Validation/DisplayXRProjectValidation.cs` | Unity side: context, evaluation, ignore list, build hook, shared project queries. |
 | `Editor/Validation/DisplayXRBuiltInRules.cs` | The package's rules. |
 | `Editor/URP/DisplayXRUrpValidationRules.cs` | The URP-only rules. |

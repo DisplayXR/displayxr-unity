@@ -181,7 +181,6 @@ namespace DisplayXR
             HandleScrollZoom();
             HandleReset();
             HandleQuit();
-            HandleFullscreen();
             HandleModeCycle();
             HandleScreenshot();
         }
@@ -677,11 +676,10 @@ namespace DisplayXR
 #endif
         }
 
-        private void HandleFullscreen()
-        {
-            if (GetKeyDown(KeyCode.F11))
-                Screen.fullScreen = !Screen.fullScreen;
-        }
+        // F11 (fullscreen) is not handled here any more (#477): a bare
+        // Screen.fullScreen = !Screen.fullScreen keeps the full-screen resolution on the
+        // way back, so the "window" is as large as the monitor, and it knows nothing of
+        // the 3D panel. The Window Mode sample (DisplayXRWindowModeSample) owns that key.
 
         private void HandleModeCycle()
         {
