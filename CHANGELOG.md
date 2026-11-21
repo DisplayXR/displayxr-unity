@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.38.1] - 2026-11-21
+
+### Added
+- **Editor Game view: the on-screen calibration marker is drawn on every Windows editor path (#485).** The measurement of where the docked Game view image sits on screen (#459) drew its marker in the D3D12 native mirror blit only, so only URP + D3D12 was measured. The D3D11 native mirror blit (URP + D3D11) now draws the same marker. On the Built-in pipeline, where Unity does its own mirror blit (D3D11 and D3D12), the woven image is drawn with the marker into a plug-in-owned texture that Unity is handed as the mirror source for the marker frames only; nothing is drawn, copied or handed out while no marker is requested. The `GameView calibration:` log line now names the path that drew the marker, and a marker that is drawn but not found on screen counts as unavailable, so the predicted whole-pixel Game view size is no longer kept waiting. Opt out with `DISPLAYXR_PROV_GV_CALIB_STAMP=0`.
+
+### Fixed
+- **Editor Game view: 1 px vertical position error at 125 / 175 / 225 % display scale (#485).** The first row of the whole-pixel Game view is now its top edge rounded half up, the same rule as for columns. Only an edge on a quarter pixel changes; 100 / 150 / 200 / 250 % are unaffected.
+
+### Verified
+- **The D3D11 Linear-project mirror colour decode added in 2.38.0 has since been hardware-verified:** a flat grey of 128 reads 128 in the docked Game view.
+
 ## [2.38.0] - 2026-11-20
 
 ### Added
