@@ -1221,8 +1221,10 @@ namespace DisplayXR
         /// <summary>
         /// Read + consume the overlay's accumulated mouse-wheel delta since
         /// the last call (Win32 raw units, 120 per notch; positive = wheel
-        /// forward). Returns 0 in the editor or when no transparent overlay
-        /// is active.
+        /// forward), on Windows, macOS and Linux players. Returns 0 in the
+        /// editor or when no transparent overlay is active. The value is not
+        /// always a multiple of 120: smooth (touchpad) scrolling can give a
+        /// fraction of a notch, so divide by 120f, not 120.
         ///
         /// The plugin no longer resizes the overlay window on wheel events
         /// (that was experimental in v1.2.0/v1.2.1 and removed in v1.2.2).
@@ -1244,6 +1246,14 @@ namespace DisplayXR
             int acc = m_MacWheelAccum;
             m_MacWheelAccum = 0;
             return acc;
+#elif UNITY_STANDALONE_LINUX && !UNITY_EDITOR
+            // Linux (#487): Unity's window takes the real pointer events, so
+            // Mouse.current.scroll is live (see UpdatePointerFromInputSystem).
+            // LateUpdate accumulates it into m_LinuxWheelAccum in the same Win32
+            // units as the macOS path; this call reads and zeroes it.
+            int accLinux = m_LinuxWheelAccum;
+            m_LinuxWheelAccum = 0;
+            return accLinux;
 #else
             return 0;
 #endif
@@ -1251,6 +1261,9 @@ namespace DisplayXR
 
 #if UNITY_STANDALONE_OSX
         private int m_MacWheelAccum;
+#endif
+#if UNITY_STANDALONE_LINUX && !UNITY_EDITOR
+        private int m_LinuxWheelAccum;
 #endif
 
         // Manual ray-triangle test against the baked skinned mesh.
@@ -1327,17 +1340,28 @@ namespace DisplayXR
         {
             Vector2 pos;
             bool left, right;
+            float wheel;
 #if HAS_INPUT_SYSTEM
             var mouse = Mouse.current;
             if (mouse == null) return;
             pos = mouse.position.ReadValue();
             left = mouse.leftButton.isPressed;
             right = mouse.rightButton.isPressed;
+            wheel = mouse.scroll.ReadValue().y;
 #else
             pos = Input.mousePosition;
             left = Input.GetMouseButton(0);
             right = Input.GetMouseButton(1);
+            wheel = Input.mouseScrollDelta.y;
 #endif
+            // (#487) Wheel for ConsumeWheelDelta(), in Win32 units (120 per notch, positive
+            // = wheel forward) like the Windows native poll and the macOS path. The Input
+            // System's default (UniformAcrossAllPlatforms) and the legacy Input Manager
+            // report about 1 per notch; a project set to KeepPlatformSpecificInputRange can
+            // already report about 120. Scale by magnitude, as the DefaultInputController
+            // sample's GetScrollDelta does, so both read the same.
+            if (Mathf.Abs(wheel) > 0.001f)
+                m_LinuxWheelAccum += Mathf.RoundToInt(Mathf.Abs(wheel) >= 10f ? wheel : wheel * 120f);
             // Unity screen space is bottom-left; these properties are window-client
             // pixels, top-left origin (what the Windows native poll reports). Rounded
             // to whole pixels like the macOS path, so PointerDelta is whole pixels too.

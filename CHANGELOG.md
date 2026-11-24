@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Linux: `DisplayXRTransparentOverlay.ConsumeWheelDelta()` always returned 0, so wheel zoom did nothing in transparent-overlay apps (#487).** The method had a Windows branch (native poll) and a macOS branch (`Mouse.current.scroll`), and every other player returned 0. On Linux Unity's window takes the real pointer events (#332), so the overlay now accumulates `Mouse.current.scroll` in `LateUpdate` as the macOS path does (`Input.mouseScrollDelta` without the Input System) and returns it in Win32 units, 120 per notch. The Input System's default reports about 1 per notch and `KeepPlatformSpecificInputRange` can report about 120, so the value is scaled by magnitude, as the DefaultInputController sample does.
+
 ## [2.38.1] - 2026-11-21
 
 ### Added
