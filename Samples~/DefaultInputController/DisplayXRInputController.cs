@@ -79,6 +79,21 @@ namespace DisplayXR
             Application.runInBackground = true;
 #if ENABLE_INPUT_SYSTEM
             InputSystem.settings.backgroundBehavior = InputSettings.BackgroundBehavior.IgnoreFocus;
+            // If the app lost focus while it was still loading (the user clicked another
+            // window, or another window popped up) and Run In Background is on in the Player
+            // settings, the Input System's default ResetAndDisableNonBackgroundDevices has
+            // already disabled the devices that cannot run in the background, the keyboard
+            // among them. Under IgnoreFocus it never re-enables them when focus comes back, so
+            // the keys would stay dead for the whole run (DisplayXR/displayxr-runtime#2800).
+            // Turn the ones this controller reads back on.
+            foreach (var device in InputSystem.devices)
+            {
+                if ((device is Keyboard || device is Mouse || device is Touchscreen) && !device.enabled)
+                {
+                    InputSystem.EnableDevice(device);
+                    Debug.Log($"[DisplayXRInputController] re-enabled {device.name}, disabled by a focus loss during startup");
+                }
+            }
 #if UNITY_EDITOR
             InputSystem.settings.editorInputBehaviorInPlayMode =
                 InputSettings.EditorInputBehaviorInPlayMode.AllDeviceInputAlwaysGoesToGameView;
