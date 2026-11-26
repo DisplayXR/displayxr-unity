@@ -7,6 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **DefaultInputController sample: the keyboard stayed dead for the whole run when the app lost focus while it was loading (DisplayXR/displayxr-runtime#2800).** With Run In Background on, the Input System's default `ResetAndDisableNonBackgroundDevices` disables the devices that cannot run in the background, the keyboard among them, when the app loses focus, for example when the user clicks another window in the first seconds or another window pops up. `Start()` then switches to `IgnoreFocus`, and under `IgnoreFocus` the Input System never re-enables them when focus comes back (`InputManager.OnFocusChanged` returns before its re-enable step). `Start()` now re-enables a disabled keyboard, mouse or touchscreen right after the switch. Apps that copied the sample need the same change.
+
 ## [2.38.2] - 2026-11-23
 
 ### Fixed
